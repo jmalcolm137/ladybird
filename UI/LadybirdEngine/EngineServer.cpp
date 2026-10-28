@@ -324,7 +324,7 @@ EngineServer::Tab& EngineServer::create_tab(Gfx::IntSize viewport_size, bool is_
 
     m_active_tab_id = id;
     send_tab_created(tab_ref);
-    ensure_frame_buffer(tab_ref);
+    ensure_frame_buffer(tab_ref, tab_ref.viewport_size);
     send_frame(tab_ref);
     return tab_ref;
 }
@@ -340,7 +340,7 @@ EngineServer::Tab& EngineServer::create_child_tab(Tab& parent, WebView::Canonica
     wire_tab(tab_ref);
 
     send_tab_created(tab_ref);
-    ensure_frame_buffer(tab_ref);
+    ensure_frame_buffer(tab_ref, tab_ref.viewport_size);
     send_frame(tab_ref);
     send_url(tab_ref);
     send_title(tab_ref);
@@ -863,10 +863,10 @@ void EngineServer::destroy_frame_buffer(Tab& tab)
     tab.frame_write_slot = 0;
 }
 
-bool EngineServer::ensure_frame_buffer(Tab& tab)
+bool EngineServer::ensure_frame_buffer(Tab& tab, Gfx::IntSize dimensions)
 {
-    auto width = tab.viewport_size.width();
-    auto height = tab.viewport_size.height();
+    auto width = dimensions.width();
+    auto height = dimensions.height();
     if (width <= 0 || height <= 0)
         return false;
 
@@ -997,6 +997,11 @@ void EngineServer::handle_undo_redo(u64 tab_id, bool redo)
 
 void EngineServer::send_frame(Tab& tab)
 {
+    if (tab.view->zoom_level() != tab.last_reported_zoom) {
+        warnln("LadybirdEngine: tab {} page zoom changed {} -> {}", tab.id, tab.last_reported_zoom, tab.view->zoom_level());
+        tab.last_reported_zoom = tab.view->zoom_level();
+    }
+
     auto bitmap = tab.view->displayed_bitmap();
     if (!bitmap)
         return;
@@ -1005,10 +1010,17 @@ void EngineServer::send_frame(Tab& tab)
     if (size.is_empty())
         return;
 
-    if (size != tab.viewport_size)
-        tab.viewport_size = size;
+    if (tab.last_reported_frame_size != size) {
+        if (getenv("LADYBIRD_SDE_TRACE_FRAMES"))
+            warnln("LadybirdEngine: tab {} viewport {}x{} frame {}x{} zoom {}", tab.id, tab.viewport_size.width(), tab.viewport_size.height(), size.width(), size.height(), tab.view->zoom_level());
+        tab.last_reported_frame_size = size;
+    }
 
-    if (!ensure_frame_buffer(tab))
+    // A painted frame can briefly be larger than the requested viewport during a
+    // resize. Size the ring for the frame, but do not feed the frame size back
+    // into the requested viewport: doing so makes the host oscillate between the
+    // old and new size and the frontend scales frames up and down.
+    if (!ensure_frame_buffer(tab, size))
         return;
 
     auto slot = tab.frame_write_slot;

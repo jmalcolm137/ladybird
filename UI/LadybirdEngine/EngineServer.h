@@ -61,6 +61,8 @@ private:
         u64 parent { 0 };
         NonnullOwnPtr<WebView::HeadlessWebView> view;
         Gfx::IntSize viewport_size;
+        double last_reported_zoom { 1.0 };
+        Gfx::IntSize last_reported_frame_size;
         // The frame buffer is one POSIX shared-memory object with a small ring
         // of fixed-size slots. The chrome maps the same object, so presenting a
         // frame costs one copy into the slot and one small control message.
@@ -111,7 +113,7 @@ private:
     Tab& create_child_tab(Tab& parent, WebView::CanonicalTraversable&);
     void wire_tab(Tab&);
     void destroy_tab(u64 tab_id);
-    bool ensure_frame_buffer(Tab&);
+    bool ensure_frame_buffer(Tab&, Gfx::IntSize);
     void destroy_frame_buffer(Tab&);
     void send_frame(Tab&);
     void send_event(JsonObject);
