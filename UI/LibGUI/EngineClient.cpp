@@ -168,11 +168,20 @@ void EngineClient::read_available()
                 break;
 
             auto line_length = *newline_index;
-            auto line = StringView { reinterpret_cast<char const*>(m_read_buffer.data()), line_length };
-            if (!line.is_empty() && line.ends_with('\r'))
-                line = line.substring_view(0, line.length() - 1);
-            dispatch_line(line);
+            auto line_view = StringView { reinterpret_cast<char const*>(m_read_buffer.data()), line_length };
+            if (!line_view.is_empty() && line_view.ends_with('\r'))
+                line_view = line_view.substring_view(0, line_view.length() - 1);
+
+            // Remove the command from the buffer before dispatching it. A
+            // dispatch can open a nested event loop (a file picker or a menu),
+            // during which the socket notifier can call read_available again.
+            auto line = String::from_utf8(line_view);
             m_read_buffer.remove(0, line_length + 1);
+            if (line.is_error()) {
+                warnln("Ladybird: could not decode engine event: {}", line.error());
+                continue;
+            }
+            dispatch_line(line.value().bytes_as_string_view());
         }
     }
 }
