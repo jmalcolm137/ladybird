@@ -2142,6 +2142,15 @@ Optional<ViewImplementation::DisplayedFrame> ViewImplementation::displayed_frame
     return {};
 }
 
+RefPtr<Gfx::Bitmap> ViewImplementation::displayed_bitmap() const
+{
+    if (m_has_usable_bitmap && m_front_bitmap.shared_image_buffer)
+        return m_front_bitmap.shared_image_buffer->bitmap_if_present();
+    if (m_backup_shared_image_buffer)
+        return m_backup_shared_image_buffer->bitmap_if_present();
+    return {};
+}
+
 // The compositor draws the browser's overlays over the frame it presents, at the pixel ratio it painted the frame at,
 // and the frame may be scaled to fit the view.
 ViewImplementation::UIOverlayPosition ViewImplementation::ui_overlay_position(Web::DevicePixelPoint position) const

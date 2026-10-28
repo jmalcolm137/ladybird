@@ -63,6 +63,13 @@ else()
     add_subdirectory("Qt")
 endif()
 
+# The LibGUI port's headless Ladybird process. It is an alternative UI-process
+# backend, not part of Ladybird's own Qt UI, so it needs the resource and helper
+# targets the Qt frontend just declared.
+if (LINUX AND NOT ANDROID AND NOT VCPKG_TARGET_ANDROID)
+    add_subdirectory("LadybirdEngine")
+endif()
+
 if (NOT TARGET ladybird)
     message(FATAL_ERROR "UI Framework selection must declare a ladybird target")
 endif()

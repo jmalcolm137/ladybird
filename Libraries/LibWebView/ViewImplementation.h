@@ -142,6 +142,9 @@ public:
     String const& handle() const { return m_window_handle; }
 
     void server_did_paint(Badge<WebContentPage>, i32 bitmap_id, Gfx::IntSize size, Gfx::IntRect damage_rect, double device_pixel_ratio);
+    // The pixels of the frame the view is presenting, when the backing store is CPU-visible. A frontend that presents
+    // the frame itself (rather than handing it to a compositor) uses this after the view reports a new frame.
+    RefPtr<Gfx::Bitmap> displayed_bitmap() const;
 
     void set_window_position(Gfx::IntPoint);
     void set_window_size(Gfx::IntSize);

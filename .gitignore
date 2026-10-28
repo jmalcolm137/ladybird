@@ -67,3 +67,7 @@ Meta/CMake/vcpkg/user-variables.cmake
 .DS_Store
 
 __pycache__
+
+# Ladybird SDE
+build/chrome/
+Tools/__pycache__/
