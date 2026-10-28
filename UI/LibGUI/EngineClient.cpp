@@ -13,6 +13,7 @@
 #include <LibCore/Directory.h>
 #include <LibCore/Environment.h>
 #include <LibCore/LocalServer.h>
+#include <LibCore/Notifier.h>
 #include <LibCore/Process.h>
 #include <LibCore/Socket.h>
 #include <LibCore/StandardPaths.h>
@@ -40,8 +41,9 @@ EngineClient::~EngineClient()
         JsonObject quit;
         quit.set("type"sv, "quit"sv);
         send(quit);
-        m_socket->close();
+        flush_writes();
     }
+    close_socket();
 
     while (!m_frame_buffers.is_empty())
         destroy_frame_buffer(m_frame_buffers.begin()->key);
@@ -129,6 +131,14 @@ void EngineClient::accept_connection(NonnullOwnPtr<Core::LocalSocket> socket)
         read_available();
     };
 
+    if (auto fd = m_socket->fd(); fd.has_value()) {
+        m_write_notifier = Core::Notifier::construct(*fd, Core::Notifier::Type::Write);
+        m_write_notifier->on_activation = [this] {
+            flush_writes();
+        };
+        m_write_notifier->set_enabled(false);
+    }
+
     if (on_connected)
         on_connected();
 }
@@ -142,10 +152,9 @@ void EngineClient::read_available()
     while (true) {
         auto result = m_socket->read_some(buffer.span());
         if (result.is_error()) {
-            if (result.error().is_errno() && result.error().code() == EAGAIN)
+            if (result.error().is_errno() && (result.error().code() == EAGAIN || result.error().code() == EWOULDBLOCK))
                 return;
-            m_socket->close();
-            m_socket.clear();
+            close_socket();
             if (on_disconnected)
                 on_disconnected();
             return;
@@ -153,8 +162,7 @@ void EngineClient::read_available()
 
         auto bytes = result.release_value();
         if (bytes.is_empty()) {
-            m_socket->close();
-            m_socket.clear();
+            close_socket();
             if (on_disconnected)
                 on_disconnected();
             return;
@@ -339,9 +347,59 @@ void EngineClient::send(JsonObject const& event)
     StringBuilder builder;
     builder.append(text);
     builder.append('\n');
+    auto bytes = builder.string_view().bytes();
+    m_write_buffer.append(bytes.data(), bytes.size());
+    flush_writes();
+}
 
-    if (auto result = m_socket->write_until_depleted(builder.string_view().bytes()); result.is_error())
-        warnln("Ladybird: could not write to engine: {}", result.error());
+void EngineClient::flush_writes()
+{
+    if (!m_socket) {
+        m_write_buffer.clear();
+        return;
+    }
+
+    while (!m_write_buffer.is_empty()) {
+        auto result = m_socket->write_some(m_write_buffer.span());
+        if (result.is_error()) {
+            if (result.error().is_errno() && (result.error().code() == EAGAIN || result.error().code() == EWOULDBLOCK)) {
+                if (m_write_notifier)
+                    m_write_notifier->set_enabled(true);
+                return;
+            }
+
+            warnln("Ladybird: could not write to engine: {}", result.error());
+            close_socket();
+            if (on_disconnected)
+                on_disconnected();
+            return;
+        }
+
+        auto written = result.value();
+        if (written == 0) {
+            close_socket();
+            if (on_disconnected)
+                on_disconnected();
+            return;
+        }
+        m_write_buffer.remove(0, written);
+    }
+
+    if (m_write_notifier)
+        m_write_notifier->set_enabled(false);
+}
+
+void EngineClient::close_socket()
+{
+    if (m_write_notifier) {
+        m_write_notifier->close();
+        m_write_notifier.clear();
+    }
+    if (m_socket) {
+        m_socket->close();
+        m_socket.clear();
+    }
+    m_write_buffer.clear();
 }
 
 void EngineClient::send_simple(StringView type, u64 tab_id)

@@ -114,6 +114,7 @@ private:
     void destroy_frame_buffer(Tab&);
     void send_frame(Tab&);
     void send_event(JsonObject);
+    void flush_writes();
     void send_simple_event(StringView type, u64 tab_id);
     void send_tab_created(Tab&);
     void send_url(Tab&);
@@ -138,6 +139,8 @@ private:
     ByteString m_frame_directory;
     Core::AnonymousBuffer m_theme;
     Vector<u8> m_read_buffer;
+    Vector<u8> m_write_buffer;
+    RefPtr<Core::Notifier> m_write_notifier;
     HashMap<u64, NonnullOwnPtr<Tab>> m_tabs;
     u64 m_next_tab_id { 1 };
     u64 m_active_tab_id { 0 };

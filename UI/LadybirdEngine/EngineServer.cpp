@@ -15,6 +15,7 @@
 #include <AK/Utf16String.h>
 #include <LibCore/EventLoop.h>
 #include <LibCore/File.h>
+#include <LibCore/Notifier.h>
 #include <LibCore/Socket.h>
 #include <LibCore/System.h>
 #include <LibGfx/Bitmap.h>
@@ -78,6 +79,10 @@ EngineServer::EngineServer(NonnullOwnPtr<Core::LocalSocket> socket, ByteString f
 EngineServer::~EngineServer()
 {
     EngineApplication::the().set_open_blank_new_tab_handler({});
+    if (m_write_notifier) {
+        m_write_notifier->close();
+        m_write_notifier.clear();
+    }
     for (auto& [id, tab] : m_tabs) {
         destroy_frame_buffer(*tab);
         auto favicon_path = ByteString::formatted("{}/favicon-{}.png", m_frame_directory, id);
@@ -94,6 +99,14 @@ ErrorOr<void> EngineServer::start()
     m_socket->on_ready_to_read = [this] {
         read_available();
     };
+
+    if (auto fd = m_socket->fd(); fd.has_value()) {
+        m_write_notifier = Core::Notifier::construct(*fd, Core::Notifier::Type::Write);
+        m_write_notifier->on_activation = [this] {
+            flush_writes();
+        };
+        m_write_notifier->set_enabled(false);
+    }
 
     JsonObject hello;
     hello.set("type"sv, "hello"sv);
@@ -1011,11 +1024,37 @@ void EngineServer::send_event(JsonObject event)
     StringBuilder builder;
     builder.append(serialized.bytes_as_string_view());
     builder.append('\n');
+    auto bytes = builder.string_view().bytes();
+    m_write_buffer.append(bytes.data(), bytes.size());
+    flush_writes();
+}
 
-    if (auto result = m_socket->write_until_depleted(builder.string_view().bytes()); result.is_error()) {
-        warnln("LadybirdEngine: socket write failed: {}", result.error());
-        quit();
+void EngineServer::flush_writes()
+{
+    while (!m_write_buffer.is_empty()) {
+        auto result = m_socket->write_some(m_write_buffer.span());
+        if (result.is_error()) {
+            if (result.error().is_errno() && (result.error().code() == EAGAIN || result.error().code() == EWOULDBLOCK)) {
+                if (m_write_notifier)
+                    m_write_notifier->set_enabled(true);
+                return;
+            }
+
+            warnln("LadybirdEngine: socket write failed: {}", result.error());
+            quit();
+            return;
+        }
+
+        auto written = result.value();
+        if (written == 0) {
+            quit();
+            return;
+        }
+        m_write_buffer.remove(0, written);
     }
+
+    if (m_write_notifier)
+        m_write_notifier->set_enabled(false);
 }
 
 void EngineServer::send_simple_event(StringView type, u64 tab_id)

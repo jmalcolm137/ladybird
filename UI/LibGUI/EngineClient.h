@@ -93,6 +93,8 @@ private:
     void handle_frame(JsonObject const&);
     void send(JsonObject const&);
     void send_simple(StringView type, u64 tab_id);
+    void flush_writes();
+    void close_socket();
 
     FrameBuffer* frame_buffer_for_tab(u64 tab_id);
     void destroy_frame_buffer(u64 tab_id);
@@ -102,6 +104,8 @@ private:
     RefPtr<Core::LocalServer> m_server;
     OwnPtr<Core::LocalSocket> m_socket;
     Vector<u8> m_read_buffer;
+    Vector<u8> m_write_buffer;
+    RefPtr<Core::Notifier> m_write_notifier;
     HashMap<u64, NonnullOwnPtr<FrameBuffer>> m_frame_buffers;
     bool m_quitting { false };
 };
