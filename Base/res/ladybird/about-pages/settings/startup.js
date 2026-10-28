@@ -17,6 +17,10 @@ restorePreviousSession.addEventListener("change", () => {
     ladybird.sendMessage("setRestorePreviousSession", restorePreviousSession.checked);
 });
 
+newTabPageURL.addEventListener("focus", () => {
+    newTabPageURL.select();
+});
+
 newTabPageURL.addEventListener("change", () => {
     newTabPageURL.classList.remove("success");
     newTabPageURL.classList.remove("error");

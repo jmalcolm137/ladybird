@@ -587,7 +587,7 @@ void EngineServer::handle_create_tab(JsonObject const& command)
     if (auto url = command.get_string("url"sv); url.has_value() && !url->is_empty())
         tab.view->load_from_user_input(url->bytes_as_string_view());
     else
-        tab.view->load(URL::URL::about("newtab"sv));
+        tab.view->load(WebView::Application::settings().new_tab_page_url());
 }
 
 void EngineServer::handle_activate_tab(u64 tab_id)
@@ -612,8 +612,10 @@ void EngineServer::handle_navigate(u64 tab_id, JsonObject const& command)
         return;
 
     auto url = command.get_string("url"sv);
-    if (!url.has_value())
+    if (!url.has_value() || url->is_empty()) {
+        tab->view->load(WebView::Application::settings().new_tab_page_url());
         return;
+    }
 
     if (command.get_bool("user_input"sv).value_or(true))
         tab->view->load_from_user_input(url->bytes_as_string_view());

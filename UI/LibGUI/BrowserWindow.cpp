@@ -233,7 +233,7 @@ void BrowserWindow::create_actions()
     m_new_tab_action->set_status_tip("Open a new tab"_string);
 
     m_home_action = GUI::Action::create("&Home"sv, load_icon("/res/icons/16x16/go-home.png"sv), [this](auto&) {
-        navigate_active("about:newtab"_string);
+        navigate_active(String {});
     }, m_window.ptr());
     m_home_action->set_status_tip("Open the new tab page"_string);
 
