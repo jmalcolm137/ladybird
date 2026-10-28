@@ -21,19 +21,38 @@
 
 namespace LadybirdSDE {
 
+class BrowserSession;
+
 class BrowserWindow {
     AK_MAKE_NONCOPYABLE(BrowserWindow);
 
 public:
-    static ErrorOr<NonnullOwnPtr<BrowserWindow>> create(Vector<String> initial_urls = {}, bool private_window = false);
+    BrowserWindow(BrowserSession&, EngineClient&, bool private_window);
     ~BrowserWindow();
 
     void show();
 
-private:
-    BrowserWindow() = default;
+    bool has_tab(u64 tab_id) const;
+    bool has_request(u64 request_id) const;
+    void adopt_engine_tab(u64 tab_id, u64 request_id);
+    void handle_engine_tab_event(JsonObject const&, u64 tab_id);
+    void handle_engine_global_event(JsonObject const&);
+    void handle_engine_connected();
+    void handle_engine_disconnected();
+    void handle_engine_frame(u64 tab_id, Gfx::Bitmap const*);
+    void close_engine_tabs();
 
-    ErrorOr<void> initialize(ByteString engine_path, Vector<String> initial_urls, bool private_window);
+    Vector<String> tab_urls() const;
+    size_t active_tab_index() const;
+    Gfx::IntSize window_size() const;
+    void set_window_size(Gfx::IntSize);
+    void activate_tab_index(size_t);
+    bool is_private() const { return m_private; }
+
+private:
+    friend class BrowserSession;
+
+    ErrorOr<void> initialize(Vector<String> initial_urls);
     void create_actions();
     void create_menus();
     void create_initial_tabs(Vector<String> const& initial_urls);
@@ -58,21 +77,12 @@ private:
     void show_tab_context_menu(BrowserTab&, Gfx::IntPoint);
     void close_other_tabs(BrowserTab&);
     void duplicate_tab(BrowserTab&);
-    void save_session();
-    bool load_session(Vector<String>& urls, Optional<Gfx::IntSize>& window_size, Optional<size_t>& active_tab);
-    void restore_previous_session();
-    ByteString session_path() const;
-
-    void on_engine_connected();
-    void on_engine_event(JsonObject const&);
-    void on_engine_frame(u64 tab_id, Gfx::Bitmap const*);
-    void on_engine_disconnected();
-
     static ByteString string_for_key(JsonObject const&, StringView key);
 
+    BrowserSession& m_session;
+    EngineClient* m_engine { nullptr };
     RefPtr<GUI::Window> m_window;
     RefPtr<GUI::TabWidget> m_tab_widget;
-    OwnPtr<EngineClient> m_engine;
 
     RefPtr<GUI::Action> m_back_action;
     RefPtr<GUI::Action> m_forward_action;
@@ -109,14 +119,10 @@ private:
     Vector<DownloadEntry> m_downloads;
     RefPtr<DownloadsWindow> m_downloads_window;
     RefPtr<GUI::Menu> m_tab_context_menu;
-    bool m_session_saved { false };
     bool m_show_bookmarks_bar { true };
-    RefPtr<Core::Timer> m_engine_start_timer;
     RefPtr<Gfx::Bitmap const> m_bookmark_icon;
     RefPtr<Gfx::Bitmap const> m_bookmark_filled_icon;
 
-    u64 m_next_request_id { 1 };
-    u64 m_next_window_id { 1 };
     bool m_private { false };
 };
 

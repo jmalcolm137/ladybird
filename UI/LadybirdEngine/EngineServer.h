@@ -58,6 +58,7 @@ private:
 
         u64 id { 0 };
         u64 request_id { 0 };
+        u64 parent { 0 };
         NonnullOwnPtr<WebView::HeadlessWebView> view;
         Gfx::IntSize viewport_size;
         // The frame buffer is one POSIX shared-memory object with a small ring
@@ -106,7 +107,7 @@ private:
     void handle_download_action(JsonObject const&);
 
     Tab* tab_for_id(u64 tab_id);
-    Tab& create_tab(Gfx::IntSize viewport_size, bool is_private, u64 request_id = 0);
+    Tab& create_tab(Gfx::IntSize viewport_size, bool is_private, u64 request_id = 0, u64 parent = 0);
     Tab& create_child_tab(Tab& parent, WebView::CanonicalTraversable&);
     void wire_tab(Tab&);
     void destroy_tab(u64 tab_id);

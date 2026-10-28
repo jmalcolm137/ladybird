@@ -79,6 +79,7 @@ EngineServer::EngineServer(NonnullOwnPtr<Core::LocalSocket> socket, ByteString f
 EngineServer::~EngineServer()
 {
     EngineApplication::the().set_open_blank_new_tab_handler({});
+    EngineApplication::the().set_open_new_window_handler({});
     if (m_write_notifier) {
         m_write_notifier->close();
         m_write_notifier.clear();
@@ -113,6 +114,15 @@ ErrorOr<void> EngineServer::start()
     hello.set("protocol"sv, static_cast<unsigned>(protocol_version));
     send_event(move(hello));
 
+    EngineApplication::the().set_open_new_window_handler([this](URL::URL const& url, WebView::IsPrivate is_private) {
+        JsonObject event;
+        event.set("type"sv, "open_window"sv);
+        event.set("url"sv, url.to_string());
+        event.set("private"sv, is_private == WebView::IsPrivate::Yes);
+        event.set("parent"sv, m_active_tab_id);
+        send_event(move(event));
+    });
+
     EngineApplication::the().set_open_blank_new_tab_handler([this](Web::HTML::ActivateTab) -> Optional<WebView::ViewImplementation&> {
         auto viewport_size = Gfx::IntSize { 1024, 768 };
         auto is_private = WebView::IsPrivate::No;
@@ -120,7 +130,7 @@ ErrorOr<void> EngineServer::start()
             viewport_size = active->viewport_size;
             is_private = active->view->is_private();
         }
-        auto& tab = create_tab(viewport_size, is_private == WebView::IsPrivate::Yes, 0);
+        auto& tab = create_tab(viewport_size, is_private == WebView::IsPrivate::Yes, 0, m_active_tab_id);
         return static_cast<WebView::ViewImplementation&>(*tab.view);
     });
 
@@ -302,13 +312,14 @@ EngineServer::Tab* EngineServer::tab_for_id(u64 tab_id)
     return it->value.ptr();
 }
 
-EngineServer::Tab& EngineServer::create_tab(Gfx::IntSize viewport_size, bool is_private, u64 request_id)
+EngineServer::Tab& EngineServer::create_tab(Gfx::IntSize viewport_size, bool is_private, u64 request_id, u64 parent)
 {
     auto id = m_next_tab_id++;
     auto view = EngineHeadlessWebView::create(m_theme, viewport_size.to_type<Web::DevicePixels>(), is_private ? WebView::IsPrivate::Yes : WebView::IsPrivate::No);
 
     m_tabs.set(id, make<Tab>(id, request_id, move(view), viewport_size));
     auto& tab_ref = *m_tabs.find(id)->value;
+    tab_ref.parent = parent;
     wire_tab(tab_ref);
 
     m_active_tab_id = id;
@@ -325,6 +336,7 @@ EngineServer::Tab& EngineServer::create_child_tab(Tab& parent, WebView::Canonica
 
     m_tabs.set(id, make<Tab>(id, 0, move(view), parent.viewport_size));
     auto& tab_ref = *m_tabs.find(id)->value;
+    tab_ref.parent = parent.id;
     wire_tab(tab_ref);
 
     send_tab_created(tab_ref);
@@ -1075,6 +1087,8 @@ void EngineServer::send_tab_created(Tab& tab)
     event.set("request"sv, tab.request_id);
     event.set("width"sv, tab.viewport_size.width());
     event.set("height"sv, tab.viewport_size.height());
+    if (tab.parent != 0)
+        event.set("parent"sv, tab.parent);
     send_event(move(event));
 }
 

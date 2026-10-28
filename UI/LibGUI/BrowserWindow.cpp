@@ -5,6 +5,7 @@
  */
 
 #include "BrowserWindow.h"
+#include "BrowserSession.h"
 
 #include <AK/JsonArray.h>
 #include <AK/JsonParser.h>
@@ -25,33 +26,6 @@
 #include <LibGfx/Bitmap.h>
 
 namespace LadybirdSDE {
-
-static Optional<ByteString> find_engine_path()
-{
-    if (auto configured = Core::Environment::get("LADYBIRD_ENGINE_HOST"sv); configured.has_value() && !configured->is_empty())
-        return configured->to_byte_string();
-
-    auto executable = Core::System::current_executable_path();
-    if (executable.is_error())
-        return {};
-
-    auto directory = LexicalPath::dirname(executable.value());
-    Vector<ByteString> candidates;
-    candidates.append(LexicalPath::join(directory, "LadybirdEngine"sv).string());
-    candidates.append(LexicalPath::join(directory, ".."sv, "libexec"sv, "LadybirdEngine"sv).string());
-    candidates.append(LexicalPath::join(directory, ".."sv, ".."sv, "Build"sv, "release"sv, "libexec"sv, "LadybirdEngine"sv).string());
-    candidates.append("/usr/lib/sde-next/libexec/LadybirdEngine"sv);
-    candidates.append("/usr/lib/sde/libexec/LadybirdEngine"sv);
-    candidates.append("/usr/local/libexec/LadybirdEngine"sv);
-
-    for (auto const& candidate : candidates) {
-        auto file = Core::File::open(candidate, Core::File::OpenMode::Read);
-        if (!file.is_error())
-            return candidate;
-    }
-
-    return {};
-}
 
 static RefPtr<Gfx::Bitmap const> load_icon(StringView path)
 {
@@ -79,24 +53,14 @@ static DownloadEntry download_entry_from_json(JsonObject const& object)
     return entry;
 }
 
-ErrorOr<NonnullOwnPtr<BrowserWindow>> BrowserWindow::create(Vector<String> initial_urls, bool private_window)
+BrowserWindow::BrowserWindow(BrowserSession& session, EngineClient& engine, bool private_window)
+    : m_session(session)
+    , m_engine(&engine)
+    , m_private(private_window)
 {
-    auto engine_path = find_engine_path();
-    if (!engine_path.has_value())
-        return Error::from_string_literal("LadybirdEngine was not found next to the browser or in libexec");
-
-    auto window = adopt_own(*new BrowserWindow());
-    TRY(window->initialize(*engine_path, move(initial_urls), private_window));
-    return window;
 }
 
-BrowserWindow::~BrowserWindow()
-{
-    if (!m_session_saved)
-        save_session();
-    if (m_engine)
-        m_engine->quit();
-}
+BrowserWindow::~BrowserWindow() = default;
 
 ByteString BrowserWindow::string_for_key(JsonObject const& object, StringView key)
 {
@@ -105,11 +69,10 @@ ByteString BrowserWindow::string_for_key(JsonObject const& object, StringView ke
     return {};
 }
 
-ErrorOr<void> BrowserWindow::initialize(ByteString engine_path, Vector<String> initial_urls, bool private_window)
+ErrorOr<void> BrowserWindow::initialize(Vector<String> initial_urls)
 {
-    m_private = private_window;
     m_window = GUI::Window::construct();
-    m_window->set_title(private_window ? "Ladybird (Private)"sv : "Ladybird"sv);
+    m_window->set_title(m_private ? "Ladybird (Private)"sv : "Ladybird"sv);
     m_window->resize(1000, 520);
     m_window->set_icon(GUI::Icon::default_icon("app-browser"sv).bitmap_for_size(32));
 
@@ -143,47 +106,10 @@ ErrorOr<void> BrowserWindow::initialize(ByteString engine_path, Vector<String> i
     };
 
     m_window->on_close = [this] {
-        save_session();
-        if (m_engine)
-            m_engine->quit();
-        GUI::Application::the()->quit(0);
+        m_session.window_will_close(*this);
     };
 
-    m_engine = TRY(EngineClient::launch(engine_path));
-    m_engine->on_connected = [this] {
-        on_engine_connected();
-    };
-    m_engine->on_event = [this](JsonObject const& event) {
-        on_engine_event(event);
-    };
-    m_engine->on_frame = [this](u64 tab_id, Gfx::Bitmap const* frame) {
-        on_engine_frame(tab_id, frame);
-    };
-    m_engine->on_disconnected = [this] {
-        on_engine_disconnected();
-    };
-
-    m_engine_start_timer = Core::Timer::create_single_shot(30000, [this] {
-        if (m_engine && m_engine->is_connected())
-            return;
-        warnln("Ladybird: the engine host did not connect");
-        for (auto& tab : m_tabs)
-            tab->set_status("Could not start the Ladybird engine."sv);
-    });
-    m_engine_start_timer->start();
-
-    Vector<String> restored_urls;
-    Optional<Gfx::IntSize> restored_size;
-    Optional<size_t> restored_active_tab;
-    if (initial_urls.is_empty() && !m_private && load_session(restored_urls, restored_size, restored_active_tab)) {
-        if (restored_size.has_value())
-            m_window->resize(*restored_size);
-        create_initial_tabs(restored_urls);
-        if (restored_active_tab.has_value() && *restored_active_tab < m_tabs.size())
-            m_tab_widget->set_active_widget(m_tabs[*restored_active_tab]->root().ptr());
-    } else {
-        create_initial_tabs(initial_urls);
-    }
+    create_initial_tabs(initial_urls);
     return {};
 }
 
@@ -237,37 +163,11 @@ void BrowserWindow::create_actions()
     }, m_window.ptr());
     m_home_action->set_status_tip("Open the new tab page"_string);
 
-    auto spawn_window = [this](bool private_window) {
-        auto executable = Core::System::current_executable_path();
-        if (executable.is_error())
-            return;
-
-        Vector<ByteString> arguments;
-        if (private_window)
-            arguments.append("--private"sv);
-
-        // A Ladybird profile belongs to one UI process. Each window therefore
-        // gets its own child profile rather than contending for the first
-        // window's database lock.
-        auto previous_profile = Core::Environment::get("LADYBIRD_SDE_PROFILE"sv);
-        auto base_profile = previous_profile.has_value() ? previous_profile->to_byte_string() : ByteString { "libgui" };
-        auto window_profile = ByteString::formatted("{}-window-{}-{}", base_profile, getpid(), m_next_window_id++);
-        (void)Core::Environment::set("LADYBIRD_SDE_PROFILE"sv, window_profile, Core::Environment::Overwrite::Yes);
-        auto result = Core::Process::spawn(executable.value(), arguments);
-        if (previous_profile.has_value())
-            (void)Core::Environment::set("LADYBIRD_SDE_PROFILE"sv, *previous_profile, Core::Environment::Overwrite::Yes);
-        else
-            (void)Core::Environment::unset("LADYBIRD_SDE_PROFILE"sv);
-
-        if (result.is_error())
-            warnln("Ladybird: could not open a new window: {}", result.error());
-    };
-
-    m_new_window_action = GUI::Action::create("New &Window"sv, { Mod_Ctrl, Key_N }, [spawn_window](auto&) {
-        spawn_window(false);
+    m_new_window_action = GUI::Action::create("New &Window"sv, { Mod_Ctrl, Key_N }, [this](auto&) {
+        m_session.create_window({}, false);
     }, m_window.ptr());
-    m_new_private_window_action = GUI::Action::create("New &Private Window"sv, { static_cast<u8>(Mod_Ctrl | Mod_Shift), Key_N }, [spawn_window](auto&) {
-        spawn_window(true);
+    m_new_private_window_action = GUI::Action::create("New &Private Window"sv, { static_cast<u8>(Mod_Ctrl | Mod_Shift), Key_N }, [this](auto&) {
+        m_session.create_window({}, true);
     }, m_window.ptr());
 
     m_bookmarks_bar_action = GUI::Action::create_checkable("Show &Bookmarks Bar"sv, { static_cast<u8>(Mod_Ctrl | Mod_Shift), Key_B }, [this](auto& action) {
@@ -370,7 +270,7 @@ void BrowserWindow::create_actions()
     m_downloads_action->set_status_tip("Show downloads"_string);
 
     m_restore_session_action = GUI::Action::create("Restore Previous &Session"sv, [this](auto&) {
-        restore_previous_session();
+        m_session.restore_previous_session();
     }, m_window.ptr());
     m_restore_session_action->set_status_tip("Reopen the tabs from the previous session"_string);
 
@@ -390,10 +290,7 @@ void BrowserWindow::create_menus()
     file_menu.add_action(*m_previous_tab_action);
     file_menu.add_separator();
     file_menu.add_action(GUI::CommonActions::make_quit_action([this](auto&) {
-        save_session();
-        if (m_engine)
-            m_engine->quit();
-        GUI::Application::the()->quit(0);
+        m_session.quit();
     }));
 
     auto& edit_menu = *m_window->add_menu("&Edit"_string);
@@ -501,7 +398,7 @@ BrowserTab& BrowserWindow::add_tab(String const& url, bool activate, bool reques
 
     if (request_engine_tab) {
         if (m_engine->is_connected())
-            tab_pointer->create_engine_tab(m_next_request_id++, url, m_private);
+            tab_pointer->create_engine_tab(m_session.next_request_id(), url, m_private);
         else
             tab_pointer->set_status("Starting the Ladybird engine..."sv);
     }
@@ -638,40 +535,43 @@ void BrowserWindow::navigate_active(String const& url)
         tab->navigate(url);
 }
 
-void BrowserWindow::on_engine_connected()
+void BrowserWindow::handle_engine_connected()
 {
-    if (m_engine_start_timer)
-        m_engine_start_timer->stop();
-
     for (auto& tab : m_tabs) {
         if (!tab->is_attached()) {
-            tab->create_engine_tab(m_next_request_id++, tab->initial_url(), m_private);
+            tab->create_engine_tab(m_session.next_request_id(), tab->initial_url(), m_private);
             tab->set_status(""sv);
         }
     }
 }
 
-void BrowserWindow::on_engine_event(JsonObject const& event)
+bool BrowserWindow::has_tab(u64 tab_id) const
+{
+    return tab_for_id(tab_id) != nullptr;
+}
+
+bool BrowserWindow::has_request(u64 request_id) const
+{
+    return tab_for_request(request_id) != nullptr;
+}
+
+void BrowserWindow::adopt_engine_tab(u64 tab_id, u64 request_id)
+{
+    auto* tab = request_id != 0 ? tab_for_request(request_id) : nullptr;
+    if (!tab) {
+        // A tab the engine or a page opened on behalf of this window.
+        auto& new_tab = add_tab(String {}, true, false);
+        tab = &new_tab;
+    }
+
+    tab->attach_tab_id(tab_id);
+    m_tab_widget->set_active_widget(tab->root().ptr());
+    update_action_state();
+}
+
+void BrowserWindow::handle_engine_global_event(JsonObject const& event)
 {
     auto type = string_for_key(event, "type"sv);
-
-    if (type == "tab_created"sv) {
-        auto tab_id = event.get_u64("tab"sv);
-        auto request_id = event.get_u64("request"sv).value_or(0);
-        if (!tab_id.has_value())
-            return;
-
-        auto* tab = request_id != 0 ? tab_for_request(request_id) : nullptr;
-        if (!tab) {
-            // A tab the page opened (window.open / target=_blank).
-            auto& new_tab = add_tab(String {}, true, false);
-            tab = &new_tab;
-        }
-        tab->attach_tab_id(*tab_id);
-        m_tab_widget->set_active_widget(tab->root().ptr());
-        update_action_state();
-        return;
-    }
 
     if (type == "downloads"sv) {
         Vector<DownloadEntry> downloads;
@@ -708,16 +608,16 @@ void BrowserWindow::on_engine_event(JsonObject const& event)
         m_bookmarks = move(bookmarks);
         for (auto& tab : m_tabs)
             tab->set_bookmarks(m_bookmarks);
-        return;
     }
+}
 
-    auto tab_id = event.get_u64("tab"sv);
-    if (!tab_id.has_value())
-        return;
-
-    auto* tab = tab_for_id(*tab_id);
+void BrowserWindow::handle_engine_tab_event(JsonObject const& event, u64 tab_id)
+{
+    auto* tab = tab_for_id(tab_id);
     if (!tab)
         return;
+
+    auto type = string_for_key(event, "type"sv);
 
     if (type == "title"sv) {
         tab->set_title(String::from_byte_string(string_for_key(event, "title"sv)).release_value());
@@ -770,6 +670,64 @@ void BrowserWindow::on_engine_event(JsonObject const& event)
     } else if (type == "tab_crashed"sv) {
         tab->set_crashed(true);
     }
+}
+
+void BrowserWindow::handle_engine_frame(u64 tab_id, Gfx::Bitmap const* frame)
+{
+    if (auto* tab = tab_for_id(tab_id))
+        tab->web_view().set_frame(frame);
+}
+
+void BrowserWindow::handle_engine_disconnected()
+{
+    for (auto& tab : m_tabs)
+        tab->set_status("The Ladybird engine disconnected."sv);
+}
+
+void BrowserWindow::close_engine_tabs()
+{
+    for (auto& tab : m_tabs) {
+        if (tab->is_attached())
+            m_engine->close_tab(tab->tab_id());
+        tab->detach();
+    }
+}
+
+Vector<String> BrowserWindow::tab_urls() const
+{
+    Vector<String> urls;
+    for (auto const& tab : m_tabs) {
+        auto url = tab->current_url();
+        urls.append(url.is_empty() ? "about:newtab"_string : move(url));
+    }
+    return urls;
+}
+
+size_t BrowserWindow::active_tab_index() const
+{
+    auto* active = active_tab();
+    for (size_t i = 0; i < m_tabs.size(); ++i) {
+        if (m_tabs[i].ptr() == active)
+            return i;
+    }
+    return 0;
+}
+
+Gfx::IntSize BrowserWindow::window_size() const
+{
+    return m_window ? m_window->size() : Gfx::IntSize { 1000, 520 };
+}
+
+void BrowserWindow::set_window_size(Gfx::IntSize size)
+{
+    if (m_window)
+        m_window->resize(size.width(), size.height());
+}
+
+void BrowserWindow::activate_tab_index(size_t index)
+{
+    if (index < m_tabs.size())
+        m_tab_widget->set_active_widget(m_tabs[index]->root().ptr());
 }
 
 void BrowserWindow::handle_download_event(JsonObject const& event)
@@ -847,144 +805,6 @@ void BrowserWindow::close_other_tabs(BrowserTab& keep)
         if (tab_is_live(tab))
             close_tab(*tab);
     }
-}
-
-ByteString BrowserWindow::session_path() const
-{
-    auto profile = Core::Environment::get("LADYBIRD_SDE_PROFILE"sv);
-    auto profile_name = profile.has_value() ? profile->to_byte_string() : ByteString { "libgui" };
-    return LexicalPath::join(Core::StandardPaths::config_directory(), "ladybird-sde"sv, ByteString::formatted("session-{}.json", profile_name)).string();
-}
-
-void BrowserWindow::save_session()
-{
-    if (m_private || !m_window || m_session_saved)
-        return;
-    if (Core::Environment::has("LADYBIRD_SDE_DISABLE_SESSION_RESTORE"sv))
-        return;
-
-    auto path = session_path();
-    if (auto result = Core::Directory::create(LexicalPath::dirname(path), Core::Directory::CreateDirectories::Yes); result.is_error())
-        return;
-
-    JsonArray tabs;
-    Optional<size_t> active_index;
-    for (size_t i = 0; i < m_tabs.size(); ++i) {
-        auto& tab = *m_tabs[i];
-        auto url = tab.current_url();
-        JsonObject entry;
-        entry.set("url"sv, url.is_empty() ? StringView { "about:newtab"sv } : url.bytes_as_string_view());
-        tabs.must_append(move(entry));
-        if (&tab == active_tab())
-            active_index = i;
-    }
-
-    if (tabs.is_empty())
-        return;
-
-    JsonObject session;
-    session.set("tabs"sv, move(tabs));
-    session.set("width"sv, m_window->width());
-    session.set("height"sv, m_window->height());
-    if (active_index.has_value())
-        session.set("active"sv, *active_index);
-
-    auto file = Core::File::open(path, Core::File::OpenMode::Write | Core::File::OpenMode::Truncate);
-    if (file.is_error())
-        return;
-    auto serialized = session.to_byte_string();
-    if (file.value()->write_until_depleted(serialized.bytes()).is_error())
-        return;
-    file.value()->close();
-    m_session_saved = true;
-}
-
-bool BrowserWindow::load_session(Vector<String>& urls, Optional<Gfx::IntSize>& window_size, Optional<size_t>& active_tab)
-{
-    if (Core::Environment::has("LADYBIRD_SDE_DISABLE_SESSION_RESTORE"sv))
-        return false;
-
-    auto file = Core::File::open(session_path(), Core::File::OpenMode::Read);
-    if (file.is_error())
-        return false;
-
-    auto contents = file.value()->read_until_eof();
-    if (contents.is_error())
-        return false;
-
-    auto buffer = contents.release_value();
-    StringView json { reinterpret_cast<char const*>(buffer.data()), buffer.size() };
-    auto parsed = JsonParser { json }.parse();
-    if (parsed.is_error() || !parsed.value().is_object())
-        return false;
-
-    auto const& session = parsed.value().as_object();
-    if (auto width = session.get_i64("width"sv); width.has_value() && *width > 0) {
-        auto height = session.get_i64("height"sv).value_or(0);
-        if (height > 0)
-            window_size = Gfx::IntSize { static_cast<int>(*width), static_cast<int>(height) };
-    }
-
-    auto tabs = session.get_array("tabs"sv);
-    if (!tabs.has_value())
-        return false;
-
-    for (auto const& value : tabs->values()) {
-        if (!value.is_object())
-            continue;
-        auto url = value.as_object().get_byte_string("url"sv);
-        if (url.has_value() && !url->is_empty())
-            urls.append(String::from_byte_string(url.value()).release_value());
-    }
-
-    if (urls.is_empty())
-        return false;
-
-    if (auto active = session.get_u64("active"sv); active.has_value())
-        active_tab = static_cast<size_t>(*active);
-    return true;
-}
-
-void BrowserWindow::restore_previous_session()
-{
-    Vector<String> urls;
-    Optional<Gfx::IntSize> window_size;
-    Optional<size_t> restored_active_tab;
-    if (!load_session(urls, window_size, restored_active_tab)) {
-        if (auto* tab = active_tab())
-            tab->set_status("There is no previous session to restore."sv);
-        return;
-    }
-
-    if (window_size.has_value())
-        m_window->resize(*window_size);
-
-    if (m_tabs.size() == 1 && (m_tabs[0]->current_url().is_empty() || m_tabs[0]->current_url() == "about:newtab"sv)) {
-        auto& blank_tab = *m_tabs[0];
-        if (blank_tab.is_attached())
-            m_engine->close_tab(blank_tab.tab_id());
-        remove_tab(blank_tab);
-    }
-
-    for (auto& url : urls)
-        add_tab(url, false);
-
-    if (restored_active_tab.has_value() && *restored_active_tab < m_tabs.size())
-        m_tab_widget->set_active_widget(m_tabs[*restored_active_tab]->root().ptr());
-    update_action_state();
-    update_window_title();
-}
-
-void BrowserWindow::on_engine_frame(u64 tab_id, Gfx::Bitmap const* frame)
-{
-    if (auto* tab = tab_for_id(tab_id))
-        tab->web_view().set_frame(frame);
-}
-
-void BrowserWindow::on_engine_disconnected()
-{
-    for (auto& tab : m_tabs)
-        tab->set_status("The Ladybird engine disconnected."sv);
 }
 
 void BrowserWindow::show()

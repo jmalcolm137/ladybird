@@ -28,6 +28,9 @@ public:
     using OpenBlankNewTabHandler = Function<Optional<WebView::ViewImplementation&>(Web::HTML::ActivateTab)>;
     void set_open_blank_new_tab_handler(OpenBlankNewTabHandler handler) { m_open_blank_new_tab_handler = move(handler); }
 
+    using OpenNewWindowHandler = Function<void(URL::URL const&, WebView::IsPrivate)>;
+    void set_open_new_window_handler(OpenNewWindowHandler handler) { m_open_new_window_handler = move(handler); }
+
 protected:
     virtual void create_platform_arguments(Core::ArgsParser&) override;
     virtual void create_platform_options(WebView::BrowserOptions&, WebView::RequestServerOptions&, WebView::WebContentOptions&) override;
@@ -41,7 +44,7 @@ private:
     ByteString m_engine_socket_path;
     ByteString m_frame_directory;
     mutable OpenBlankNewTabHandler m_open_blank_new_tab_handler;
-    mutable u64 m_next_window_id { 1 };
+    mutable OpenNewWindowHandler m_open_new_window_handler;
 };
 
 }

@@ -36,27 +36,12 @@ Optional<WebView::ViewImplementation&> EngineApplication::open_blank_new_tab(Web
 
 void EngineApplication::open_url_in_new_window(URL::URL const& url, WebView::IsPrivate is_private)
 {
-    auto frontend = Core::Environment::get("LADYBIRD_SDE_FRONTEND"sv);
-    if (!frontend.has_value())
+    if (m_open_new_window_handler) {
+        m_open_new_window_handler(url, is_private);
         return;
+    }
 
-    Vector<ByteString> arguments;
-    if (is_private == WebView::IsPrivate::Yes)
-        arguments.append("--private"sv);
-    arguments.append(url.to_string().to_byte_string());
-
-    auto previous_profile = Core::Environment::get("LADYBIRD_SDE_PROFILE"sv);
-    auto base_profile = previous_profile.has_value() ? previous_profile->to_byte_string() : ByteString { "libgui" };
-    auto window_profile = ByteString::formatted("{}-window-{}-{}", base_profile, getpid(), m_next_window_id++);
-    (void)Core::Environment::set("LADYBIRD_SDE_PROFILE"sv, window_profile, Core::Environment::Overwrite::Yes);
-    auto spawn_result = Core::Process::spawn(*frontend, arguments);
-    if (previous_profile.has_value())
-        (void)Core::Environment::set("LADYBIRD_SDE_PROFILE"sv, *previous_profile, Core::Environment::Overwrite::Yes);
-    else
-        (void)Core::Environment::unset("LADYBIRD_SDE_PROFILE"sv);
-
-    if (spawn_result.is_error())
-        warnln("LadybirdEngine: could not open a new window for '{}': {}", url, spawn_result.error());
+    warnln("LadybirdEngine: no frontend is connected to open a new window for '{}'", url);
 }
 
 void EngineApplication::open_navigation_in_new_window(Web::HTML::PreparedNavigationDescriptor navigation, WebView::IsPrivate is_private)

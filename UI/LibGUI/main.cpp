@@ -4,7 +4,7 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-#include "BrowserWindow.h"
+#include "BrowserSession.h"
 
 #include <LibGUI/Application.h>
 #include <LibMain/Main.h>
@@ -26,12 +26,12 @@ ErrorOr<int> serenity_main(Main::Arguments arguments)
         urls.append(String::from_utf8(argument).release_value());
     }
 
-    auto window = LadybirdSDE::BrowserWindow::create(move(urls), private_window);
-    if (window.is_error()) {
-        warnln("Ladybird: {}", window.error());
+    auto session = LadybirdSDE::BrowserSession::create(move(urls), private_window);
+    if (session.is_error()) {
+        warnln("Ladybird: {}", session.error());
         return 1;
     }
 
-    window.value()->show();
+    session.value()->show();
     return app->exec();
 }

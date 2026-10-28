@@ -143,11 +143,10 @@ navigating the real engine.
 * Edit menu with undo/redo, cut/copy/paste through the SDE clipboard, select all,
   and find-in-page.
 * New window and new private window (`--private`), with the private window's
-  tabs created in a private browsing session in the engine. Each window runs
-  its own engine process, so it uses a child profile
-  (`<profile>-window-<pid>-<n>`): a Ladybird profile is owned by one UI
-  process. Bookmarks and settings in a secondary window are therefore separate
-  from the first window's.
+  tabs created in a private browsing session in the engine. Every normal window
+  in one frontend process shares the same engine host and profile, so tabs,
+  bookmarks, settings, history, and downloads are shared. A window is only a
+  view over its own subset of the engine's tabs.
 * Page, link, image, and media context menus. The engine builds the menu model
   (including spelling, text editing, open/copy/download actions); the frontend
   renders it as a native LibGUI menu.
@@ -158,8 +157,9 @@ navigating the real engine.
 * File picker for `<input type=file>` and native `<select>` dropdowns.
 * Find-in-page match count in the find bar.
 * A click-to-reload crash overlay for a crashed WebContent process.
-* Session restore: normal windows reopen their previous tabs on startup, and
-  History → Restore Previous Session reopens them on demand. Set
+* Session restore: every normal window (not just the last one) reopens with its
+  previous tabs, size, and active tab on startup, and History → Restore
+  Previous Session reopens them on demand. Set
   `LADYBIRD_SDE_DISABLE_SESSION_RESTORE=1` to disable this (the headless test
   does).
 * View Source (`Ctrl+U`).

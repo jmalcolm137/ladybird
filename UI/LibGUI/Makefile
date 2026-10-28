@@ -47,6 +47,7 @@ LDLIBS += \
 
 SOURCES := \
 	BrowserTab.cpp \
+	BrowserSession.cpp \
 	BrowserWindow.cpp \
 	DownloadsWindow.cpp \
 	EngineClient.cpp \

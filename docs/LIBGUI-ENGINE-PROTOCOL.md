@@ -42,7 +42,8 @@ Version: `Shared/EngineProtocol.h`.
 | `type` | Fields | Meaning |
 |---|---|---|
 | `hello` | `protocol` | Protocol handshake. |
-| `tab_created` | `tab`, `request`, `width`, `height` | The view exists; attach the matching frontend tab. |
+| `tab_created` | `tab`, `request`, `width`, `height`, `parent` | The view exists; attach the matching frontend tab. `request` matches a frontend request; otherwise `parent` names the tab whose window should receive the engine-created tab. |
+| `open_window` | `url`, `private`, `parent` | The page asked for a new native window. The frontend creates it in-process so it shares the engine and profile; `parent` is the requesting tab. |
 | `tab_closed` | `tab` | The view is gone. |
 | `tab_crashed` | `tab` | The WebContent process died. |
 | `url` | `tab`, `url`, `bookmarked` | Active document URL and bookmark state. |
@@ -69,3 +70,9 @@ Version: `Shared/EngineProtocol.h`.
 
 The engine writes into the ring round-robin. The frontend wraps the slot in a
 `Gfx::Bitmap` and paints it; no pixel data is serialized.
+
+One engine host serves one frontend process. The frontend may create several
+LibGUI windows, each owning a subset of the engine's tabs. Tab-scoped events are
+routed by `tab`; `request` and `parent` let the frontend attach engine-created
+tabs to the window that asked for them. Windows do not get their own profiles or
+engine processes.

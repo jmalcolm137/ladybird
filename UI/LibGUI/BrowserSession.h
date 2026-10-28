@@ -1,0 +1,70 @@
+/*
+ * Copyright (c) 2026, Ladybird SDE contributors
+ *
+ * SPDX-License-Identifier: BSD-2-Clause
+ */
+
+#pragma once
+
+#include "EngineClient.h"
+
+#include <AK/ByteString.h>
+#include <AK/NonnullOwnPtr.h>
+#include <AK/Optional.h>
+#include <AK/Vector.h>
+#include <LibGfx/Forward.h>
+#include <LibGfx/Size.h>
+
+namespace LadybirdSDE {
+
+class BrowserWindow;
+
+// Owns the one engine host for this frontend process and every LibGUI window
+// attached to it. Windows share tabs, bookmarks, settings, history, and the
+// engine profile; a window is only a view over a subset of the host's tabs.
+class BrowserSession {
+    AK_MAKE_NONCOPYABLE(BrowserSession);
+
+public:
+    static ErrorOr<NonnullOwnPtr<BrowserSession>> create(Vector<String> initial_urls = {}, bool private_window = false);
+    ~BrowserSession();
+
+    void show();
+    void quit();
+
+    BrowserWindow* create_window(Vector<String> urls = {}, bool private_window = false);
+    void restore_previous_session();
+
+    u64 next_request_id() { return m_next_request_id++; }
+    EngineClient& engine() { return *m_engine; }
+
+    // Called by a BrowserWindow when its native window is closing.
+    void window_will_close(BrowserWindow&);
+
+private:
+    BrowserSession() = default;
+
+    ErrorOr<void> initialize(Vector<String> initial_urls, bool private_window);
+    BrowserWindow* create_window_internal(Vector<String> urls, bool private_window, Optional<Gfx::IntSize> size = {}, Optional<size_t> active_tab = {});
+
+    BrowserWindow* window_for_tab(u64 tab_id);
+    BrowserWindow* window_for_request(u64 request_id);
+    BrowserWindow* active_window() const;
+
+    void on_engine_connected();
+    void on_engine_event(JsonObject const&);
+    void on_engine_frame(u64 tab_id, Gfx::Bitmap const*);
+    void on_engine_disconnected();
+    void handle_open_window(JsonObject const&);
+
+    ByteString session_path() const;
+    void save_session();
+    bool load_session();
+    bool load_legacy_session(JsonObject const&);
+
+    OwnPtr<EngineClient> m_engine;
+    Vector<NonnullOwnPtr<BrowserWindow>> m_windows;
+    u64 m_next_request_id { 1 };
+};
+
+}
