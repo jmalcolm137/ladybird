@@ -31,14 +31,20 @@ void WebContentView::paint_event(GUI::PaintEvent& event)
         if (m_frame->size() == size()) {
             painter.blit({ 0, 0 }, *m_frame, m_frame->rect());
         } else {
+            // A frame can briefly be a different size while the engine catches up
+            // with a window resize. Scaling it to fit makes the page text grow and
+            // shrink, which reads as the page zooming for no reason. Draw it at
+            // its native size instead (cropping or leaving an edge blank for a
+            // frame); the next frame will match the view again.
             static Gfx::IntSize last_frame_size;
             static Gfx::IntSize last_widget_size;
             if (m_frame->size() != last_frame_size || size() != last_widget_size) {
-                warnln("Ladybird: scaling a {}x{} frame into a {}x{} view", m_frame->size().width(), m_frame->size().height(), size().width(), size().height());
+                warnln("Ladybird: painting a {}x{} frame into a {}x{} view without scaling", m_frame->size().width(), m_frame->size().height(), size().width(), size().height());
                 last_frame_size = m_frame->size();
                 last_widget_size = size();
             }
-            painter.draw_scaled_bitmap(rect(), *m_frame, m_frame->rect());
+            painter.fill_rect(rect(), palette().color(Gfx::ColorRole::Base));
+            painter.blit({ 0, 0 }, *m_frame, m_frame->rect().intersected(rect()));
         }
     } else {
         painter.fill_rect(rect(), palette().color(Gfx::ColorRole::Base));
