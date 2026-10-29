@@ -22,6 +22,29 @@ WebContentView::WebContentView()
     set_override_cursor(Gfx::StandardCursor::Arrow);
 }
 
+void WebContentView::set_frame(Gfx::Bitmap const* frame, u64 sequence, Gfx::IntRect damage, bool full)
+{
+    // Replacing the frame releases the old shared-memory slot. The engine must
+    // not reuse a slot while this widget can still paint from it.
+    if (m_frame && m_frame_sequence != 0 && m_frame_sequence != sequence) {
+        if (on_frame_ack)
+            on_frame_ack(m_frame_sequence);
+    }
+
+    m_frame = frame;
+    m_frame_sequence = frame ? sequence : 0;
+
+    if (!m_frame) {
+        update();
+        return;
+    }
+
+    if (full || damage.is_empty() || m_frame->size() != size())
+        update();
+    else
+        update(damage.intersected(rect()));
+}
+
 void WebContentView::paint_event(GUI::PaintEvent& event)
 {
     GUI::Painter painter(*this);

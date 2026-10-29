@@ -37,10 +37,14 @@ have deliberately different C++ foundations:
 The process boundary keeps both halves honest instead of teaching either stack
 the other's graphics types. It also preserves Ladybird's process isolation and
 crash recovery. Frames are published in a **three-slot POSIX shared-memory ring**
-per tab. The engine copies a completed frame once into the next slot and sends a
-small JSON message naming the slot; the frontend wraps that slot in a
-`Gfx::Bitmap` and paints it. Nothing is encoded, sent over the socket, or read
-back from disk. Input and navigation are small control messages.
+per tab. The engine copies a completed frame into a free slot and sends a small
+JSON message naming the slot; the frontend wraps that slot in a `Gfx::Bitmap`
+and paints it. A slot remains in flight until the frontend acknowledges that it
+has replaced the frame, so the engine cannot overwrite pixels still on screen;
+when all slots are busy, intermediate paints are coalesced. In steady state only
+the damaged region is copied, with full copies reserved for first frames,
+resizes, and stale slots. Nothing is encoded, sent over the socket, or read back
+from disk. Input and navigation are small control messages.
 
 The frontend **does not** contain a web engine. The engine host **does not**
 draw chrome. Replacing either half leaves the other intact.
@@ -183,6 +187,8 @@ Still to wire to the frontend:
 * Address-bar autocomplete and search suggestions
 * Rich clipboard types, drag and drop, and IME composition
 * HiDPI frame scaling (the engine host currently paints at the logical scale)
+* GPU/zero-copy frame sharing; the engine still CPU-copies pixels into the ring,
+  although steady-state updates now copy only damaged regions
 * Settings that need a native dialog rather than the internal settings page
 
 The control protocol is deliberately small and append-only so each of these can

@@ -11,6 +11,7 @@
 #include <AK/RefPtr.h>
 #include <LibGUI/Widget.h>
 #include <LibGfx/Forward.h>
+#include <LibGfx/Rect.h>
 #include <LibGfx/Size.h>
 
 namespace LadybirdSDE {
@@ -26,11 +27,7 @@ public:
     void set_tab_id(u64 tab_id) { m_tab_id = tab_id; }
     u64 tab_id() const { return m_tab_id; }
 
-    void set_frame(Gfx::Bitmap const* frame)
-    {
-        m_frame = frame;
-        update();
-    }
+    void set_frame(Gfx::Bitmap const* frame, u64 sequence, Gfx::IntRect damage, bool full);
 
     void set_page_cursor(StringView cursor_name);
     void set_crashed(bool crashed) { m_crashed = crashed; update(); }
@@ -44,6 +41,7 @@ public:
     Function<void(bool focused)> on_focus_change;
     Function<void()> on_go_back;
     Function<void()> on_go_forward;
+    Function<void(u64 sequence)> on_frame_ack;
 
 protected:
     virtual void paint_event(GUI::PaintEvent&) override;
@@ -64,6 +62,7 @@ private:
 
     u64 m_tab_id { 0 };
     Gfx::Bitmap const* m_frame { nullptr };
+    u64 m_frame_sequence { 0 };
     int m_click_count { 1 };
     bool m_crashed { false };
 };

@@ -298,6 +298,8 @@ void EngineServer::dispatch_command(JsonObject const& command)
             handle_file_picker_response(*tab_id, command);
         } else if (*type == "select_dropdown_closed"sv) {
             handle_select_dropdown_closed(*tab_id, command);
+        } else if (*type == "frame_ack"sv) {
+            handle_frame_ack(*tab_id, command);
         } else {
             warnln("LadybirdEngine: unknown command '{}'", *type);
         }
@@ -325,7 +327,7 @@ EngineServer::Tab& EngineServer::create_tab(Gfx::IntSize viewport_size, bool is_
     m_active_tab_id = id;
     send_tab_created(tab_ref);
     ensure_frame_buffer(tab_ref, tab_ref.viewport_size);
-    send_frame(tab_ref);
+    on_view_painted(tab_ref);
     return tab_ref;
 }
 
@@ -341,7 +343,7 @@ EngineServer::Tab& EngineServer::create_child_tab(Tab& parent, WebView::Canonica
 
     send_tab_created(tab_ref);
     ensure_frame_buffer(tab_ref, tab_ref.viewport_size);
-    send_frame(tab_ref);
+    on_view_painted(tab_ref);
     send_url(tab_ref);
     send_title(tab_ref);
     send_loading_state(tab_ref, tab_ref.view->is_loading());
@@ -354,7 +356,7 @@ void EngineServer::wire_tab(Tab& tab)
 
     tab.view->on_ready_to_paint = [this, tab_id] {
         if (auto* tab = tab_for_id(tab_id))
-            send_frame(*tab);
+            on_view_painted(*tab);
     };
 
     tab.view->on_title_change = [this, tab_id](Utf16String const&) {
@@ -860,7 +862,9 @@ void EngineServer::destroy_frame_buffer(Tab& tab)
         tab.frame_buffer_name = {};
     }
     tab.frame_slot_size = 0;
+    tab.frame_buffer_dimensions = {};
     tab.frame_write_slot = 0;
+    reset_frame_tracking(tab);
 }
 
 bool EngineServer::ensure_frame_buffer(Tab& tab, Gfx::IntSize dimensions)
@@ -871,12 +875,16 @@ bool EngineServer::ensure_frame_buffer(Tab& tab, Gfx::IntSize dimensions)
         return false;
 
     auto slot_size = static_cast<size_t>(width) * static_cast<size_t>(height) * 4;
-    if (tab.frame_mapping && tab.frame_slot_size >= slot_size)
+    if (tab.frame_mapping && tab.frame_slot_size >= slot_size && tab.frame_buffer_dimensions == dimensions)
         return true;
 
+    // Recreate on a size change even when the old slots are large enough: the
+    // in-flight slots still contain the old dimensions, and their acks refer to
+    // a layout the frontend can no longer use safely.
     destroy_frame_buffer(tab);
 
     tab.frame_slot_size = slot_size;
+    tab.frame_buffer_dimensions = dimensions;
 
     auto name = ByteString::formatted("/ladybird-sde-{}-{}-{}", ::getpid(), tab.id, m_next_frame_buffer_id++);
     int fd = ::shm_open(name.characters(), O_RDWR | O_CREAT | O_EXCL, 0600);
@@ -995,12 +1003,86 @@ void EngineServer::handle_undo_redo(u64 tab_id, bool redo)
         tab->view->undo();
 }
 
-void EngineServer::send_frame(Tab& tab)
+void EngineServer::reset_frame_tracking(Tab& tab)
+{
+    tab.frame_slot_states.clear();
+    tab.frame_slot_states.ensure_capacity(tab.frame_slots);
+    for (int i = 0; i < tab.frame_slots; ++i)
+        tab.frame_slot_states.append({});
+    tab.frame_damage_history.clear();
+    tab.frame_content_size = {};
+    tab.frame_write_slot = 0;
+}
+
+void EngineServer::on_view_painted(Tab& tab)
 {
     if (tab.view->zoom_level() != tab.last_reported_zoom) {
         warnln("LadybirdEngine: tab {} page zoom changed {} -> {}", tab.id, tab.last_reported_zoom, tab.view->zoom_level());
         tab.last_reported_zoom = tab.view->zoom_level();
     }
+
+    ++tab.presented_sequence;
+    tab.frame_damage_history.append({ tab.presented_sequence, tab.view->last_presented_damage_rect() });
+    if (tab.frame_damage_history.size() > 512)
+        tab.frame_damage_history.remove(0, tab.frame_damage_history.size() - 512);
+    tab.frame_dirty = true;
+    try_send_frame(tab);
+}
+
+Gfx::IntRect EngineServer::damage_since(Tab& tab, u64 content_sequence, u64 latest_sequence, Gfx::IntSize size, bool& needs_full_copy)
+{
+    needs_full_copy = false;
+    auto frame_rect = Gfx::IntRect { 0, 0, size.width(), size.height() };
+    if (content_sequence >= latest_sequence)
+        return {};
+    if (content_sequence == 0) {
+        needs_full_copy = true;
+        return frame_rect;
+    }
+
+    bool found_damage = false;
+    bool found_first = false;
+    u64 first_sequence = 0;
+    Gfx::IntRect union_rect;
+    for (auto const& damage : tab.frame_damage_history) {
+        if (damage.sequence <= content_sequence)
+            continue;
+        if (damage.sequence > latest_sequence)
+            break;
+        if (!found_first) {
+            first_sequence = damage.sequence;
+            found_first = true;
+        }
+        found_damage = true;
+        auto rect = damage.rect.intersected(frame_rect);
+        if (rect.is_empty())
+            continue;
+        union_rect = union_rect.is_empty() ? rect : union_rect.united(rect);
+    }
+
+    if (!found_damage || first_sequence > content_sequence + 1) {
+        // The slot is older than the damage history we retained, so we cannot
+        // know every changed pixel. Fall back to a full copy.
+        needs_full_copy = true;
+        return frame_rect;
+    }
+
+    if (union_rect.is_empty())
+        return union_rect;
+
+    auto frame_area = static_cast<u64>(size.width()) * static_cast<u64>(size.height());
+    auto union_area = static_cast<u64>(union_rect.width()) * static_cast<u64>(union_rect.height());
+    if (frame_area != 0 && union_area * 5 > frame_area * 3) {
+        needs_full_copy = true;
+        return frame_rect;
+    }
+    return union_rect;
+}
+
+void EngineServer::try_send_frame(Tab& tab)
+{
+    if (!tab.frame_dirty)
+        return;
 
     auto bitmap = tab.view->displayed_bitmap();
     if (!bitmap)
@@ -1023,15 +1105,69 @@ void EngineServer::send_frame(Tab& tab)
     if (!ensure_frame_buffer(tab, size))
         return;
 
-    auto slot = tab.frame_write_slot;
-    tab.frame_write_slot = (tab.frame_write_slot + 1) % tab.frame_slots;
+    if (tab.frame_content_size != size) {
+        reset_frame_tracking(tab);
+        tab.frame_content_size = size;
+    }
+    if (tab.frame_slot_states.size() != static_cast<size_t>(tab.frame_slots))
+        reset_frame_tracking(tab);
+
+    int slot = -1;
+    u64 best_content_sequence = 0;
+    for (int i = 0; i < tab.frame_slots; ++i) {
+        auto const& state = tab.frame_slot_states[i];
+        if (state.in_flight)
+            continue;
+        if (slot < 0 || state.content_sequence > best_content_sequence) {
+            slot = i;
+            best_content_sequence = state.content_sequence;
+        }
+    }
+    if (slot < 0) {
+        // All slots are still owned by the frontend. Keep frame_dirty set; the
+        // next ack will publish the latest frame and intermediate frames are
+        // coalesced instead of overwriting pixels in use.
+        return;
+    }
+
+    auto& slot_state = tab.frame_slot_states[slot];
+    bool full_copy = slot_state.content_sequence == 0;
+    bool needs_full_copy = false;
+    auto damage = Gfx::IntRect { 0, 0, size.width(), size.height() };
+    if (!full_copy) {
+        damage = damage_since(tab, slot_state.content_sequence, tab.presented_sequence, size, needs_full_copy);
+        full_copy = needs_full_copy;
+    }
+
+    if (!full_copy && damage.is_empty()) {
+        slot_state.content_sequence = tab.presented_sequence;
+        tab.frame_dirty = false;
+        return;
+    }
+
     auto* destination = static_cast<u8*>(tab.frame_mapping) + (static_cast<size_t>(slot) * tab.frame_slot_size);
     auto stride = static_cast<size_t>(size.width()) * 4;
 
-    for (int y = 0; y < size.height(); ++y)
-        memcpy(destination + (static_cast<size_t>(y) * stride), bitmap->scanline_u8(y), stride);
+    if (full_copy) {
+        damage = { 0, 0, size.width(), size.height() };
+        for (int y = 0; y < size.height(); ++y)
+            memcpy(destination + (static_cast<size_t>(y) * stride), bitmap->scanline_u8(y), stride);
+    } else {
+        for (int y = damage.y(); y < damage.bottom(); ++y) {
+            memcpy(destination + (static_cast<size_t>(y) * stride) + static_cast<size_t>(damage.x()) * 4,
+                bitmap->scanline_u8(y) + static_cast<size_t>(damage.x()) * 4,
+                static_cast<size_t>(damage.width()) * 4);
+        }
+    }
 
-    auto sequence = ++tab.frame_sequence;
+    slot_state.content_sequence = tab.presented_sequence;
+    slot_state.in_flight_sequence = tab.presented_sequence;
+    slot_state.in_flight = true;
+    tab.frame_write_slot = (slot + 1) % tab.frame_slots;
+    tab.frame_dirty = false;
+
+    if (getenv("LADYBIRD_SDE_TRACE_FRAMES"))
+        warnln("LadybirdEngine: tab {} frame {} slot {} full={} damage {}x{}+{},{}", tab.id, tab.presented_sequence, slot, full_copy, damage.width(), damage.height(), damage.x(), damage.y());
 
     JsonObject event;
     event.set("type"sv, "frame"sv);
@@ -1040,8 +1176,34 @@ void EngineServer::send_frame(Tab& tab)
     event.set("width"sv, size.width());
     event.set("height"sv, size.height());
     event.set("stride"sv, static_cast<u64>(stride));
-    event.set("sequence"sv, sequence);
+    event.set("sequence"sv, tab.presented_sequence);
+    event.set("full"sv, full_copy);
+    event.set("damage_x"sv, damage.x());
+    event.set("damage_y"sv, damage.y());
+    event.set("damage_width"sv, damage.width());
+    event.set("damage_height"sv, damage.height());
     send_event(move(event));
+}
+
+void EngineServer::handle_frame_ack(u64 tab_id, JsonObject const& command)
+{
+    auto* tab = tab_for_id(tab_id);
+    if (!tab)
+        return;
+
+    auto sequence = command.get_u64("sequence"sv);
+    if (!sequence.has_value())
+        return;
+
+    for (auto& slot : tab->frame_slot_states) {
+        if (slot.in_flight && slot.in_flight_sequence == *sequence) {
+            slot.in_flight = false;
+            slot.in_flight_sequence = 0;
+        }
+    }
+
+    if (tab->frame_dirty)
+        try_send_frame(*tab);
 }
 
 void EngineServer::send_event(JsonObject event)

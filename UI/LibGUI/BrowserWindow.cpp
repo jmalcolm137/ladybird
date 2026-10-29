@@ -487,6 +487,9 @@ void BrowserWindow::activate_tab(BrowserTab& tab)
 {
     if (tab.is_attached())
         m_engine->activate_tab(tab.tab_id());
+    // A background tab may have received only damage updates. Repaint the
+    // complete last frame when it becomes visible again.
+    tab.web_view().update();
     update_action_state();
     update_window_title();
 }
@@ -672,10 +675,10 @@ void BrowserWindow::handle_engine_tab_event(JsonObject const& event, u64 tab_id)
     }
 }
 
-void BrowserWindow::handle_engine_frame(u64 tab_id, Gfx::Bitmap const* frame)
+void BrowserWindow::handle_engine_frame(u64 tab_id, Gfx::Bitmap const* frame, u64 sequence, Gfx::IntRect damage, bool full)
 {
     if (auto* tab = tab_for_id(tab_id))
-        tab->web_view().set_frame(frame);
+        tab->web_view().set_frame(frame, sequence, damage, full);
 }
 
 void BrowserWindow::handle_engine_disconnected()

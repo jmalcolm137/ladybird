@@ -18,6 +18,7 @@
 #include <LibCore/Forward.h>
 #include <LibGfx/Cursor.h>
 #include <LibGfx/Forward.h>
+#include <LibGfx/Rect.h>
 #include <LibGfx/Size.h>
 #include <LibURL/Origin.h>
 #include <LibURL/URL.h>
@@ -31,8 +32,9 @@
 
 namespace LadybirdSDE {
 
-// One engine host per LibGUI window. The host owns the views; the chrome owns
-// the tabs. The mapping is by id, and every event names the tab it belongs to.
+// One engine host per LibGUI frontend process. The host owns the views; the
+// chrome owns the windows and tabs. The mapping is by id, and every event names
+// the tab it belongs to.
 class EngineServer : private WebView::FileDownloaderObserver {
     AK_MAKE_NONCOPYABLE(EngineServer);
     AK_ALLOC_WITH_KMALLOC;
@@ -63,17 +65,35 @@ private:
         Gfx::IntSize viewport_size;
         double last_reported_zoom { 1.0 };
         Gfx::IntSize last_reported_frame_size;
+
+        struct FrameSlotState {
+            u64 content_sequence { 0 };
+            u64 in_flight_sequence { 0 };
+            bool in_flight { false };
+        };
+        struct FrameDamage {
+            u64 sequence { 0 };
+            Gfx::IntRect rect;
+        };
+
         // The frame buffer is one POSIX shared-memory object with a small ring
         // of fixed-size slots. The chrome maps the same object, so presenting a
-        // frame costs one copy into the slot and one small control message.
+        // frame costs one copy into the slot and one small control message. A
+        // slot stays in flight until the chrome reports that it replaced it, so
+        // the engine never overwrites pixels the frontend may still display.
         int frame_fd { -1 };
         void* frame_mapping { nullptr };
         size_t frame_mapping_size { 0 };
         size_t frame_slot_size { 0 };
+        Gfx::IntSize frame_buffer_dimensions;
         int frame_slots { 3 };
         int frame_write_slot { 0 };
         ByteString frame_buffer_name;
-        u32 frame_sequence { 0 };
+        u64 presented_sequence { 0 };
+        Gfx::IntSize frame_content_size;
+        bool frame_dirty { false };
+        Vector<FrameSlotState> frame_slot_states;
+        Vector<FrameDamage> frame_damage_history;
         bool focused { false };
         bool closing { false };
         Vector<NonnullRefPtr<WebView::Action>> context_menu_actions;
@@ -107,6 +127,7 @@ private:
     void handle_file_picker_response(u64 tab_id, JsonObject const&);
     void handle_select_dropdown_closed(u64 tab_id, JsonObject const&);
     void handle_download_action(JsonObject const&);
+    void handle_frame_ack(u64 tab_id, JsonObject const&);
 
     Tab* tab_for_id(u64 tab_id);
     Tab& create_tab(Gfx::IntSize viewport_size, bool is_private, u64 request_id = 0, u64 parent = 0);
@@ -115,7 +136,10 @@ private:
     void destroy_tab(u64 tab_id);
     bool ensure_frame_buffer(Tab&, Gfx::IntSize);
     void destroy_frame_buffer(Tab&);
-    void send_frame(Tab&);
+    void reset_frame_tracking(Tab&);
+    void on_view_painted(Tab&);
+    void try_send_frame(Tab&);
+    Gfx::IntRect damage_since(Tab&, u64 content_sequence, u64 latest_sequence, Gfx::IntSize, bool& needs_full_copy);
     void send_event(JsonObject);
     void flush_writes();
     void send_simple_event(StringView type, u64 tab_id);

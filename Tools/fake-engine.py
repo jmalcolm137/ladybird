@@ -78,9 +78,10 @@ def main():
         os.write(fd, data)
         os.close(fd)
         send({"type": "frame", "tab": tab_id, "slot": 0, "width": width, "height": height,
-              "stride": width * 4, "sequence": 1})
+              "stride": width * 4, "sequence": 1, "full": True,
+              "damage_x": 0, "damage_y": 0, "damage_width": width, "damage_height": height})
 
-    send({"type": "hello", "protocol": 2})
+    send({"type": "hello", "protocol": 4})
     send({"type": "downloads", "items": []})
     send({"type": "bookmarks", "items": [
         {"title": "SerenityOS", "url": "https://serenityos.org/"},

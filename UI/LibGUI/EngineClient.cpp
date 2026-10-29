@@ -249,7 +249,7 @@ void EngineClient::destroy_frame_buffer(u64 tab_id)
         return;
 
     if (on_frame)
-        on_frame(tab_id, nullptr);
+        on_frame(tab_id, nullptr, 0, {}, true);
 
     (*buffer)->bitmaps.clear();
     if ((*buffer)->data)
@@ -334,8 +334,19 @@ void EngineClient::handle_frame(JsonObject const& event)
         bitmap = created.release_value();
     }
 
+    auto sequence = event.get_u64("sequence"sv).value_or(0);
+    bool full = event.get_bool("full"sv).value_or(true);
+    Gfx::IntRect damage { 0, 0, size.width(), size.height() };
+    if (!full) {
+        auto damage_x = event.get_i64("damage_x"sv).value_or(0);
+        auto damage_y = event.get_i64("damage_y"sv).value_or(0);
+        auto damage_width = event.get_i64("damage_width"sv).value_or(size.width());
+        auto damage_height = event.get_i64("damage_height"sv).value_or(size.height());
+        damage = Gfx::IntRect { static_cast<int>(damage_x), static_cast<int>(damage_y), static_cast<int>(damage_width), static_cast<int>(damage_height) }.intersected({ 0, 0, size.width(), size.height() });
+    }
+
     if (on_frame)
-        on_frame(*tab_id, bitmap.ptr());
+        on_frame(*tab_id, bitmap.ptr(), sequence, damage, full);
 }
 
 void EngineClient::send(JsonObject const& event)
@@ -625,6 +636,15 @@ void EngineClient::download_action(StringView action, u64 id)
     event.set("type"sv, "download_action"sv);
     event.set("action"sv, action);
     event.set("id"sv, id);
+    send(event);
+}
+
+void EngineClient::frame_ack(u64 tab_id, u64 sequence)
+{
+    JsonObject event;
+    event.set("type"sv, "frame_ack"sv);
+    event.set("tab"sv, tab_id);
+    event.set("sequence"sv, sequence);
     send(event);
 }
 

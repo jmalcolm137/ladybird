@@ -298,8 +298,10 @@ void ViewImplementation::server_did_paint(Badge<WebContentPage>, i32 bitmap_id, 
 
     release_backing_store(did_swap_bitmap ? previous_front_bitmap_id : bitmap_id);
 
-    if (did_swap_bitmap)
+    if (did_swap_bitmap) {
+        m_last_presented_damage_rect = damage_rect;
         did_accept_presented_backing_store(bitmap_id, damage_rect);
+    }
     if (did_swap_bitmap && m_crash_state.has_value() && m_crash_state->recovery_started)
         set_crash_state({});
     if (did_swap_bitmap)

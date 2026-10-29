@@ -146,6 +146,9 @@ public:
     // the frame itself (rather than handing it to a compositor) uses this after the view reports a new frame.
     RefPtr<Gfx::Bitmap> displayed_bitmap() const;
 
+    // Damage reported by the WebContent compositor for the most recently presented frame. This is in frame pixels.
+    Gfx::IntRect last_presented_damage_rect() const { return m_last_presented_damage_rect; }
+
     void set_window_position(Gfx::IntPoint);
     void set_window_size(Gfx::IntSize);
     void set_system_visibility_state(Web::HTML::VisibilityState);
@@ -777,6 +780,7 @@ protected:
     SharedBitmap m_front_bitmap;
     Vector<SharedBitmap> m_other_bitmaps;
     bool m_has_usable_bitmap { false };
+    Gfx::IntRect m_last_presented_damage_rect;
 
     // Set once an assistive technology asked for the page tree; every display page the view shows from then on gets
     // asked for its tree too.

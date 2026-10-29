@@ -18,6 +18,7 @@
 #include <AK/Vector.h>
 #include <LibCore/Forward.h>
 #include <LibGfx/Forward.h>
+#include <LibGfx/Rect.h>
 #include <LibGfx/Size.h>
 
 namespace LadybirdSDE {
@@ -64,11 +65,12 @@ public:
     void file_picker_response(u64 tab_id, String const& path);
     void select_dropdown_closed(u64 tab_id, Optional<u32> selected);
     void download_action(StringView action, u64 id);
+    void frame_ack(u64 tab_id, u64 sequence);
     void quit();
 
     Function<void()> on_connected;
     Function<void(JsonObject const&)> on_event;
-    Function<void(u64 tab_id, Gfx::Bitmap const*)> on_frame;
+    Function<void(u64 tab_id, Gfx::Bitmap const*, u64 sequence, Gfx::IntRect damage, bool full)> on_frame;
     Function<void()> on_disconnected;
 
 private:

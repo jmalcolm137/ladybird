@@ -39,7 +39,7 @@ public:
     void handle_engine_global_event(JsonObject const&);
     void handle_engine_connected();
     void handle_engine_disconnected();
-    void handle_engine_frame(u64 tab_id, Gfx::Bitmap const*);
+    void handle_engine_frame(u64 tab_id, Gfx::Bitmap const*, u64 sequence, Gfx::IntRect damage, bool full);
     void close_engine_tabs();
 
     Vector<String> tab_urls() const;
