@@ -160,7 +160,9 @@ navigating the real engine.
 * Permission prompts for page requests such as the microphone.
 * File picker for `<input type=file>` and native `<select>` dropdowns.
 * Find-in-page match count in the find bar.
-* A click-to-reload crash overlay for a crashed WebContent process.
+* A click-to-reload crash overlay for a crashed WebContent process, and an
+  unresponsive-page banner that hard-reloads a renderer spinning without
+  presenting frames.
 * Session restore: every normal window (not just the last one) reopens with its
   previous tabs, size, and active tab on startup, and History → Restore
   Previous Session reopens them on demand. Set

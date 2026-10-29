@@ -123,6 +123,10 @@ BrowserTab::BrowserTab(EngineClient& engine, GUI::Window& window, GUI::Action& b
     m_web_view->on_go_back = [this] { go_back(); };
     m_web_view->on_go_forward = [this] { go_forward(); };
     m_web_view->on_reload = [this] { reload(); };
+    m_web_view->on_force_reload = [this] {
+        if (on_hard_reload)
+            on_hard_reload();
+    };
     m_web_view->on_frame_ack = [this](u64 sequence) {
         if (is_attached())
             m_engine.frame_ack(m_tab_id, sequence);
@@ -340,6 +344,12 @@ void BrowserTab::set_crashed(bool crashed)
     m_web_view->set_crashed(crashed);
     if (crashed)
         set_status("The page crashed. Click the page to reload."sv);
+}
+
+void BrowserTab::set_unresponsive(bool unresponsive)
+{
+    m_web_view->set_unresponsive(unresponsive);
+    set_status(unresponsive ? "The page is not responding. Click the banner to reload."sv : ""sv);
 }
 
 void BrowserTab::set_find_result(u64 current, Optional<u64> total)

@@ -390,6 +390,10 @@ BrowserTab& BrowserWindow::add_tab(String const& url, bool activate, bool reques
         if (active_tab() == tab_pointer)
             update_window_title();
     };
+    tab->on_hard_reload = [this, tab_pointer] {
+        if (tab_is_live(tab_pointer))
+            hard_reload_tab(*tab_pointer);
+    };
 
     m_tabs.append(move(tab));
     tab_pointer->set_bookmarks(m_bookmarks);
@@ -472,6 +476,20 @@ BrowserTab* BrowserWindow::tab_for_request(u64 request_id) const
             return tab.ptr();
     }
     return nullptr;
+}
+
+void BrowserWindow::hard_reload_tab(BrowserTab& tab)
+{
+    auto url = tab.current_url();
+    if (url.is_empty())
+        url = tab.initial_url();
+
+    if (tab.is_attached())
+        m_engine->close_tab(tab.tab_id());
+    tab.detach();
+    tab.set_unresponsive(false);
+    tab.set_status("Reloading..."sv);
+    tab.create_engine_tab(m_session.next_request_id(), url, m_private);
 }
 
 bool BrowserWindow::tab_is_live(BrowserTab const* tab) const
@@ -672,6 +690,8 @@ void BrowserWindow::handle_engine_tab_event(JsonObject const& event, u64 tab_id)
         m_window->set_fullscreen(event.get_bool("fullscreen"sv).value_or(false));
     } else if (type == "tab_crashed"sv) {
         tab->set_crashed(true);
+    } else if (type == "tab_unresponsive"sv) {
+        tab->set_unresponsive(event.get_bool("unresponsive"sv).value_or(true));
     }
 }
 

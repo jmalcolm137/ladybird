@@ -26,6 +26,7 @@ void WebContentView::set_frame(Gfx::Bitmap const* frame, u64 sequence, Gfx::IntR
 {
     // Replacing the frame releases the old shared-memory slot. The engine must
     // not reuse a slot while this widget can still paint from it.
+    bool previous_was_painted = m_frame_was_painted;
     if (m_frame && m_frame_sequence != 0 && m_frame_sequence != sequence) {
         if (on_frame_ack)
             on_frame_ack(m_frame_sequence);
@@ -33,13 +34,17 @@ void WebContentView::set_frame(Gfx::Bitmap const* frame, u64 sequence, Gfx::IntR
 
     m_frame = frame;
     m_frame_sequence = frame ? sequence : 0;
+    m_frame_was_painted = false;
 
     if (!m_frame) {
         update();
         return;
     }
 
-    if (full || damage.is_empty() || m_frame->size() != size())
+    // If the previous frame was replaced before it was painted, the widget's
+    // backing store is older than the damage rectangle describes. Repaint the
+    // whole frame in that case.
+    if (full || !previous_was_painted || damage.is_empty() || m_frame->size() != size())
         update();
     else
         update(damage.intersected(rect()));
@@ -76,7 +81,13 @@ void WebContentView::paint_event(GUI::PaintEvent& event)
     if (m_crashed) {
         painter.fill_rect(rect(), Gfx::Color::from_argb(0xa0202020));
         painter.draw_text(rect(), "The page crashed — click to reload"sv, font(), Gfx::TextAlignment::Center, Gfx::Color::from_rgb(0xffffff));
+    } else if (m_unresponsive) {
+        Gfx::IntRect banner { 0, 0, width(), 34 };
+        painter.fill_rect(banner, Gfx::Color::from_argb(0xdd202020));
+        painter.draw_text(banner, "Page unresponsive — click to reload"sv, font(), Gfx::TextAlignment::Center, Gfx::Color::from_rgb(0xffffff));
     }
+
+    m_frame_was_painted = m_frame != nullptr;
 }
 
 void WebContentView::resize_event(GUI::ResizeEvent& event)
@@ -89,6 +100,13 @@ void WebContentView::resize_event(GUI::ResizeEvent& event)
 void WebContentView::mousedown_event(GUI::MouseEvent& event)
 {
     set_focus(true);
+
+    if (m_unresponsive && event.position().y() < 34) {
+        if (on_force_reload)
+            on_force_reload();
+        event.accept();
+        return;
+    }
 
     if (m_crashed) {
         if (on_reload)

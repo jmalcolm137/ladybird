@@ -80,6 +80,8 @@ EngineServer::~EngineServer()
 {
     EngineApplication::the().set_open_blank_new_tab_handler({});
     EngineApplication::the().set_open_new_window_handler({});
+    if (m_unresponsive_timer)
+        m_unresponsive_timer->stop();
     if (m_write_notifier) {
         m_write_notifier->close();
         m_write_notifier.clear();
@@ -108,6 +110,11 @@ ErrorOr<void> EngineServer::start()
         };
         m_write_notifier->set_enabled(false);
     }
+
+    m_unresponsive_timer = Core::Timer::create_repeating(AK::Duration::from_milliseconds(1000), [this] {
+        check_unresponsive_tabs();
+    });
+    m_unresponsive_timer->start();
 
     JsonObject hello;
     hello.set("type"sv, "hello"sv);
@@ -744,7 +751,10 @@ void EngineServer::handle_wheel(u64 tab_id, JsonObject const& command)
     event.wheel_tick_120ths_x = Web::wheel_tick_120ths_from_pixel_delta(event.wheel_delta_x, event.wheel_delta_precision);
     event.wheel_tick_120ths_y = Web::wheel_tick_120ths_from_pixel_delta(event.wheel_delta_y, event.wheel_delta_precision);
 
+    if (getenv("LADYBIRD_SDE_TRACE_FRAMES"))
+        warnln("LadybirdEngine: tab {} wheel delta {}x{}", tab_id, event.wheel_delta_x, event.wheel_delta_y);
     tab->view->enqueue_input_event(move(event));
+    note_user_input(*tab);
 }
 
 void EngineServer::handle_key(u64 tab_id, JsonObject const& command)
@@ -777,8 +787,11 @@ void EngineServer::handle_key(u64 tab_id, JsonObject const& command)
     // ordinary typing in the LibGUI frontend.
     auto has_command_modifier = (event.modifiers & (Web::UIEvents::KeyModifier::Mod_Ctrl | Web::UIEvents::KeyModifier::Mod_Alt | Web::UIEvents::KeyModifier::Mod_Super)) != Web::UIEvents::KeyModifier::Mod_None;
     event.should_insert_text = event.type == Web::KeyEvent::Type::KeyDown && event.code_point != 0 && !has_command_modifier;
+    auto should_watch_for_frame = event.type == Web::KeyEvent::Type::KeyDown && !event.repeat;
 
     tab->view->enqueue_input_event(move(event));
+    if (should_watch_for_frame)
+        note_user_input(*tab);
 }
 
 void EngineServer::handle_dialog_response(u64 tab_id, JsonObject const& command)
@@ -1182,6 +1195,120 @@ void EngineServer::try_send_frame(Tab& tab)
     event.set("damage_y"sv, damage.y());
     event.set("damage_width"sv, damage.width());
     event.set("damage_height"sv, damage.height());
+    send_event(move(event));
+    note_frame_presented(tab, tab.presented_sequence);
+}
+
+void EngineServer::note_user_input(Tab& tab)
+{
+    if (tab.waiting_for_frame)
+        return;
+    if (getenv("LADYBIRD_SDE_TRACE_FRAMES"))
+        warnln("LadybirdEngine: tab {} waiting for frame after input", tab.id);
+    tab.waiting_for_frame = true;
+    tab.input_wait_started = MonotonicTime::now();
+    tab.last_cpu_sample_time = tab.input_wait_started;
+    tab.last_cpu_ticks = web_content_cpu_ticks(tab.view->web_content_pid()).value_or(0);
+}
+
+void EngineServer::note_frame_presented(Tab& tab, u64 sequence)
+{
+    (void)sequence;
+    tab.has_presented_frame = true;
+
+    if (tab.unresponsive_reported) {
+        // A frame that was already queued when the renderer spun can arrive
+        // after the watchdog fires. Require two subsequent frames before
+        // declaring the page responsive again; a genuinely recovered page will
+        // paint again, while a single stale frame will not clear the banner.
+        if (++tab.responsive_frame_count < 2)
+            return;
+        tab.unresponsive_reported = false;
+        tab.responsive_frame_count = 0;
+        set_unresponsive(tab, false);
+    }
+
+    tab.waiting_for_frame = false;
+}
+
+Optional<u64> EngineServer::web_content_cpu_ticks(pid_t pid)
+{
+    if (pid <= 0)
+        return {};
+    auto file = Core::File::open(ByteString::formatted("/proc/{}/stat", pid), Core::File::OpenMode::Read);
+    if (file.is_error())
+        return {};
+    auto contents = file.value()->read_until_eof();
+    if (contents.is_error())
+        return {};
+
+    auto buffer = contents.release_value();
+    StringView text { reinterpret_cast<char const*>(buffer.data()), buffer.size() };
+    Optional<size_t> close_paren;
+    for (size_t i = text.length(); i > 0; --i) {
+        if (text[i - 1] == ')') {
+            close_paren = i - 1;
+            break;
+        }
+    }
+    if (!close_paren.has_value())
+        return {};
+    auto fields = text.substring_view(*close_paren + 1).trim_whitespace().split_view(' ');
+    // After the comm field, fields[0] is state and utime/stime are fields 14 and 15.
+    if (fields.size() < 13)
+        return {};
+    auto utime = fields[11].to_number<u64>();
+    auto stime = fields[12].to_number<u64>();
+    if (!utime.has_value() || !stime.has_value())
+        return {};
+    return *utime + *stime;
+}
+
+void EngineServer::check_unresponsive_tabs()
+{
+    auto now = MonotonicTime::now();
+    static auto const clock_ticks_per_second = static_cast<double>(::sysconf(_SC_CLK_TCK));
+    for (auto& [id, tab] : m_tabs) {
+        (void)id;
+        if (!tab->waiting_for_frame || !tab->has_presented_frame || tab->unresponsive_reported)
+            continue;
+
+        auto waited_ms = (now - tab->input_wait_started).to_milliseconds();
+        if (waited_ms < 1500)
+            continue;
+
+        auto ticks = web_content_cpu_ticks(tab->view->web_content_pid());
+        if (!ticks.has_value())
+            continue;
+
+        auto sample_ms = (now - tab->last_cpu_sample_time).to_milliseconds();
+        auto previous_ticks = tab->last_cpu_ticks;
+        tab->last_cpu_sample_time = now;
+        tab->last_cpu_ticks = *ticks;
+
+        if (sample_ms <= 0 || previous_ticks == 0 || clock_ticks_per_second <= 0)
+            continue;
+
+        auto used_ticks = *ticks >= previous_ticks ? *ticks - previous_ticks : 0;
+        auto cpu_fraction = (static_cast<double>(used_ticks) / clock_ticks_per_second) * 1000.0 / static_cast<double>(sample_ms);
+        if (getenv("LADYBIRD_SDE_TRACE_FRAMES"))
+            warnln("LadybirdEngine: tab {} unresponsive check waited={}ms cpu={}% ticks={}", tab->id, waited_ms, static_cast<int>(cpu_fraction * 100), *ticks);
+        if (waited_ms >= 2500 && cpu_fraction >= 0.5) {
+            tab->unresponsive_reported = true;
+            tab->responsive_frame_count = 0;
+            set_unresponsive(*tab, true);
+        }
+    }
+}
+
+void EngineServer::set_unresponsive(Tab& tab, bool unresponsive)
+{
+    if (getenv("LADYBIRD_SDE_TRACE_FRAMES"))
+        warnln("LadybirdEngine: tab {} unresponsive={}", tab.id, unresponsive);
+    JsonObject event;
+    event.set("type"sv, "tab_unresponsive"sv);
+    event.set("tab"sv, tab.id);
+    event.set("unresponsive"sv, unresponsive);
     send_event(move(event));
 }
 

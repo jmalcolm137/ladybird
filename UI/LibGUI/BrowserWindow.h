@@ -63,6 +63,7 @@ private:
     BrowserTab* active_tab() const;
     BrowserTab* tab_for_widget(GUI::Widget&) const;
     BrowserTab* tab_for_id(u64) const;
+    void hard_reload_tab(BrowserTab&);
     BrowserTab* tab_for_request(u64) const;
     bool tab_is_live(BrowserTab const*) const;
 

@@ -47,6 +47,7 @@ Version: `Shared/EngineProtocol.h`.
 | `open_window` | `url`, `private`, `parent` | The page asked for a new native window. The frontend creates it in-process so it shares the engine and profile; `parent` is the requesting tab. |
 | `tab_closed` | `tab` | The view is gone. |
 | `tab_crashed` | `tab` | The WebContent process died. |
+| `tab_unresponsive` | `tab`, `unresponsive` | The renderer is spinning without presenting frames after input; the frontend offers a reload. A later frame clears it. |
 | `url` | `tab`, `url`, `bookmarked` | Active document URL and bookmark state. |
 | `title` | `tab`, `title` | Document title. |
 | `favicon` | `tab`, `path` or empty | PNG favicon written to the frame directory. |

@@ -32,6 +32,8 @@ public:
     void set_page_cursor(StringView cursor_name);
     void set_crashed(bool crashed) { m_crashed = crashed; update(); }
     bool is_crashed() const { return m_crashed; }
+    void set_unresponsive(bool unresponsive) { m_unresponsive = unresponsive; update(); }
+    bool is_unresponsive() const { return m_unresponsive; }
 
     Function<void(Gfx::IntSize)> on_resize;
     Function<void()> on_reload;
@@ -41,6 +43,7 @@ public:
     Function<void(bool focused)> on_focus_change;
     Function<void()> on_go_back;
     Function<void()> on_go_forward;
+    Function<void()> on_force_reload;
     Function<void(u64 sequence)> on_frame_ack;
 
 protected:
@@ -63,8 +66,10 @@ private:
     u64 m_tab_id { 0 };
     Gfx::Bitmap const* m_frame { nullptr };
     u64 m_frame_sequence { 0 };
+    bool m_frame_was_painted { false };
     int m_click_count { 1 };
     bool m_crashed { false };
+    bool m_unresponsive { false };
 };
 
 }

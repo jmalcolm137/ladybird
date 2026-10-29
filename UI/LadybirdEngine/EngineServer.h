@@ -13,6 +13,7 @@
 #include <AK/NonnullOwnPtr.h>
 #include <AK/OwnPtr.h>
 #include <AK/String.h>
+#include <AK/Time.h>
 #include <AK/Vector.h>
 #include <LibCore/AnonymousBuffer.h>
 #include <LibCore/Forward.h>
@@ -92,6 +93,13 @@ private:
         u64 presented_sequence { 0 };
         Gfx::IntSize frame_content_size;
         bool frame_dirty { false };
+        bool waiting_for_frame { false };
+        bool has_presented_frame { false };
+        bool unresponsive_reported { false };
+        u8 responsive_frame_count { 0 };
+        MonotonicTime input_wait_started;
+        MonotonicTime last_cpu_sample_time;
+        u64 last_cpu_ticks { 0 };
         Vector<FrameSlotState> frame_slot_states;
         Vector<FrameDamage> frame_damage_history;
         bool focused { false };
@@ -128,6 +136,11 @@ private:
     void handle_select_dropdown_closed(u64 tab_id, JsonObject const&);
     void handle_download_action(JsonObject const&);
     void handle_frame_ack(u64 tab_id, JsonObject const&);
+    void note_user_input(Tab&);
+    void note_frame_presented(Tab&, u64 sequence);
+    void check_unresponsive_tabs();
+    void set_unresponsive(Tab&, bool);
+    Optional<u64> web_content_cpu_ticks(pid_t);
 
     Tab* tab_for_id(u64 tab_id);
     Tab& create_tab(Gfx::IntSize viewport_size, bool is_private, u64 request_id = 0, u64 parent = 0);
@@ -168,6 +181,7 @@ private:
     Vector<u8> m_read_buffer;
     Vector<u8> m_write_buffer;
     RefPtr<Core::Notifier> m_write_notifier;
+    RefPtr<Core::Timer> m_unresponsive_timer;
     HashMap<u64, NonnullOwnPtr<Tab>> m_tabs;
     u64 m_next_tab_id { 1 };
     u64 m_active_tab_id { 0 };

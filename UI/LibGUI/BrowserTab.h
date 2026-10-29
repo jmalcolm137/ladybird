@@ -75,6 +75,7 @@ public:
     void set_cursor(StringView name);
     void set_status(StringView);
     void set_crashed(bool crashed);
+    void set_unresponsive(bool unresponsive);
     void set_find_result(u64 current, Optional<u64> total);
     void show_dialog(StringView kind, StringView message, StringView default_text = {});
     void show_context_menu(JsonArray const& items, Gfx::IntPoint screen_position);
@@ -92,6 +93,7 @@ public:
     Function<void(bool)> on_loading_change;
     Function<void(Gfx::Bitmap const*)> on_favicon_change;
     Function<void(bool)> on_bookmark_change;
+    Function<void()> on_hard_reload;
 
 private:
     static StringView button_name(GUI::MouseButton);
