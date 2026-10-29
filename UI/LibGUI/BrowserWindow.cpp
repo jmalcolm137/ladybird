@@ -19,6 +19,8 @@
 #include <LibCore/System.h>
 #include <LibGUI/Application.h>
 #include <LibGUI/BoxLayout.h>
+#include <LibGUI/Button.h>
+#include <LibGUI/Label.h>
 #include <LibGUI/Clipboard.h>
 #include <LibGUI/Dialog.h>
 #include <LibGUI/Icon.h>
@@ -108,7 +110,21 @@ ErrorOr<void> BrowserWindow::initialize(Vector<InitialTab> initial_tabs, Optiona
     m_window->resize(1000, 520);
     m_window->set_icon(GUI::Icon::default_icon("app-browser"sv).bitmap_for_size(32));
 
-    m_tab_widget = m_window->set_main_widget<GUI::TabWidget>();
+    auto main_widget = m_window->set_main_widget<GUI::Widget>();
+    main_widget->set_layout<GUI::VerticalBoxLayout>(GUI::Margins {}, 0);
+
+    m_devtools_bar = main_widget->add<GUI::Widget>();
+    m_devtools_bar->set_fixed_height(30);
+    m_devtools_bar->set_fill_with_background_color(true);
+    m_devtools_bar->set_layout<GUI::HorizontalBoxLayout>(GUI::Margins { 8, 3 }, 6);
+    m_devtools_bar->set_visible(false);
+
+    m_devtools_label = m_devtools_bar->add<GUI::Label>(""_string);
+    m_devtools_label->set_preferred_width(GUI::SpecialDimension::Grow);
+    m_devtools_label->set_text_alignment(Gfx::TextAlignment::CenterLeft);
+
+    m_tab_widget = main_widget->add<GUI::TabWidget>();
+    m_tab_widget->set_preferred_size(GUI::SpecialDimension::Grow, GUI::SpecialDimension::Grow);
     m_tab_widget->set_container_margins(GUI::Margins {});
     m_tab_widget->set_uniform_tabs(true);
     m_tab_widget->set_close_button_enabled(true);
@@ -142,6 +158,7 @@ ErrorOr<void> BrowserWindow::initialize(Vector<InitialTab> initial_tabs, Optiona
     };
 
     create_initial_tabs(initial_tabs, active_tab, lazy_load);
+    set_devtools_state(m_session.devtools_port());
     return {};
 }
 
@@ -281,11 +298,10 @@ void BrowserWindow::create_actions()
         auto* tab = active_tab();
         if (!tab || !tab->is_attached())
             return;
-        auto data = GUI::Clipboard::the().fetch_data_and_type();
-        if (!data.mime_type.starts_with("text/"sv))
+        auto items = m_session.clipboard_items_for_paste();
+        if (items.is_empty())
             return;
-        auto text = StringView { reinterpret_cast<char const*>(data.data.data()), data.data.size() };
-        m_engine->paste(tab->tab_id(), text);
+        m_engine->paste(tab->tab_id(), move(items));
     }, m_window.ptr());
     m_select_all_action = GUI::Action::create("Select &All"sv, { Mod_Ctrl, Key_A }, [this](auto&) {
         if (auto* tab = active_tab(); tab && tab->is_attached())
@@ -316,6 +332,17 @@ void BrowserWindow::create_actions()
             tab->show_site_info_dialog();
     }, m_window.ptr());
     m_site_info_action->set_status_tip("Show connection and zoom information"_string);
+
+    m_toggle_devtools_action = GUI::Action::create("Enable &DevTools"sv, { static_cast<u8>(Mod_Ctrl | Mod_Shift), Key_I }, { 0, Key_F12 }, [this](auto&) {
+        m_session.toggle_devtools();
+    }, m_window.ptr());
+    m_toggle_devtools_action->set_status_tip("Enable or disable the DevTools server"_string);
+
+    m_open_devtools_client_action = GUI::Action::create("Open DevTools &Client"sv, [this](auto&) {
+        m_session.open_devtools_client();
+    }, m_window.ptr());
+    m_open_devtools_client_action->set_status_tip("Open a Firefox DevTools client for the active tab"_string);
+    m_open_devtools_client_action->set_enabled(false);
 
     m_back_action->set_enabled(false);
     m_forward_action->set_enabled(false);
@@ -384,6 +411,10 @@ void BrowserWindow::create_menus()
     }, m_window.ptr()));
     tools_menu.add_action(*m_site_info_action);
     tools_menu.add_action(*m_downloads_action);
+    tools_menu.add_separator();
+    auto inspect_menu = tools_menu.add_submenu("&Inspect"_string);
+    inspect_menu->add_action(*m_toggle_devtools_action);
+    inspect_menu->add_action(*m_open_devtools_client_action);
 
     auto& help_menu = *m_window->add_menu("&Help"_string);
     help_menu.add_action(GUI::CommonActions::make_about_action("Ladybird"_string, GUI::Icon::default_icon("app-browser"sv), m_window.ptr()));
@@ -404,6 +435,33 @@ void BrowserWindow::create_initial_tabs(Vector<InitialTab> const& initial_tabs, 
         auto is_active = i == active_index;
         add_tab(initial_tabs[i].url, is_active, is_active || !lazy_load, lazy_load && !is_active, initial_tabs[i].session_tab_id);
     }
+}
+
+void BrowserWindow::set_devtools_state(Optional<u16> port)
+{
+    auto enabled = port.has_value();
+    m_toggle_devtools_action->set_text(enabled ? "Disable &DevTools"sv : "Enable &DevTools"sv);
+    m_open_devtools_client_action->set_enabled(enabled);
+
+    if (m_devtools_label && enabled)
+        m_devtools_label->set_text(String::formatted("DevTools is enabled on port {} (Tools > Inspect opens the client)", *port).release_value());
+    if (m_devtools_bar) {
+        m_devtools_bar->set_visible(enabled);
+        if (auto* parent = m_devtools_bar->parent_widget())
+            parent->invalidate_layout();
+    }
+    if (m_window)
+        m_window->update();
+}
+
+void BrowserWindow::show_engine_error(String const& message)
+{
+    // This arrives in response to a menu action, while the menu popup is still being torn down. A modal dialog
+    // there re-enters the menu's event handling; the status bar is a safe place for a short-lived error.
+    if (auto* tab = active_tab())
+        tab->set_status(message);
+    else
+        warnln("Ladybird: {}", message);
 }
 
 void BrowserWindow::set_session_window_id(u64 session_window_id)

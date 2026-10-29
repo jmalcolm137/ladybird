@@ -8,6 +8,7 @@
 #include "EngineApplication.h"
 
 #include <AK/Array.h>
+#include <AK/Base64.h>
 #include <AK/JsonArray.h>
 #include <AK/JsonParser.h>
 #include <AK/LexicalPath.h>
@@ -25,6 +26,7 @@
 #include <LibGfx/SystemTheme.h>
 #include <LibURL/Parser.h>
 #include <LibURL/URL.h>
+#include <LibWebCommon/Clipboard/SystemClipboard.h>
 #include <LibWebCommon/HTML/VisibilityState.h>
 #include <LibWebCommon/HTML/ActivateTab.h>
 #include <LibWebCommon/HTML/WebViewHints.h>
@@ -47,6 +49,8 @@
 #include <unistd.h>
 
 namespace LadybirdSDE {
+
+static JsonArray clipboard_item_to_json(Web::Clipboard::SystemClipboardItem const&);
 
 // A headless view for a top-level tab. The base class turns links opened in a
 // new tab or window into child views that no chrome could see; the engine host
@@ -84,6 +88,8 @@ EngineServer::~EngineServer()
     EngineApplication::the().set_open_blank_new_tab_handler({});
     EngineApplication::the().set_open_new_window_handler({});
     EngineApplication::the().set_active_web_view_provider({});
+    EngineApplication::the().set_clipboard_write_handler({});
+    EngineApplication::the().set_devtools_event_handler({});
     if (m_unresponsive_timer)
         m_unresponsive_timer->stop();
     if (m_resolver_watch_timer)
@@ -137,6 +143,15 @@ ErrorOr<void> EngineServer::start()
     hello.set("protocol"sv, static_cast<unsigned>(protocol_version));
     send_event(move(hello));
 
+    // DevTools may already be running: the frontend asked the engine to start it with --devtools, before the
+    // control socket existed. Tell the chrome now so it can show the banner.
+    if (auto port = EngineApplication::the().devtools_port_if_enabled(); port.has_value()) {
+        JsonObject event;
+        event.set("type"sv, "devtools_enabled"sv);
+        event.set("port"sv, static_cast<u64>(*port));
+        send_event(move(event));
+    }
+
     EngineApplication::the().set_open_new_window_handler([this](URL::URL const& url, WebView::IsPrivate is_private) {
         JsonObject event;
         event.set("type"sv, "open_window"sv);
@@ -150,6 +165,25 @@ ErrorOr<void> EngineServer::start()
         if (auto* tab = tab_for_id(m_active_tab_id))
             return static_cast<WebView::ViewImplementation&>(*tab->view);
         return {};
+    });
+
+    EngineApplication::the().set_clipboard_write_handler([this](Web::Clipboard::SystemClipboardItem const& item) {
+        auto items = clipboard_item_to_json(item);
+        if (items.is_empty())
+            return;
+
+        JsonObject event;
+        event.set("type"sv, "clipboard_write"sv);
+        event.set("items"sv, move(items));
+        send_event(move(event));
+    });
+
+    EngineApplication::the().set_devtools_event_handler([this](bool enabled, u16 port) {
+        JsonObject event;
+        event.set("type"sv, enabled ? "devtools_enabled"sv : "devtools_disabled"sv);
+        if (enabled)
+            event.set("port"sv, static_cast<u64>(port));
+        send_event(move(event));
     });
 
     EngineApplication::the().set_open_blank_new_tab_handler([this](Web::HTML::ActivateTab) -> Optional<WebView::ViewImplementation&> {
@@ -264,6 +298,12 @@ void EngineServer::dispatch_command(JsonObject const& command)
         quit();
     } else if (*type == "download_action"sv) {
         handle_download_action(command);
+    } else if (*type == "clipboard_changed"sv) {
+        handle_clipboard_changed(command);
+    } else if (*type == "toggle_devtools"sv) {
+        handle_toggle_devtools();
+    } else if (*type == "open_devtools_client"sv) {
+        handle_open_devtools_client();
     } else if (*type == "close_window"sv) {
         handle_close_window(command);
     } else if (*type == "window_geometry"sv) {
@@ -1253,6 +1293,83 @@ void EngineServer::handle_toggle_bookmark(u64 tab_id)
     send_bookmarks();
 }
 
+static bool clipboard_mime_is_textual(String const& name)
+{
+    return name.starts_with_bytes("text/"sv)
+        || name == "application/json"sv
+        || name == "application/xml"sv
+        || name == "application/xhtml+xml"sv
+        || name == "image/svg+xml"sv;
+}
+
+static JsonObject clipboard_representation_to_json(Web::Clipboard::SystemClipboardRepresentation const& representation)
+{
+    JsonObject object;
+    object.set("name"sv, representation.name);
+
+    auto const* bytes = representation.data.get_pointer<ByteString>();
+    if (!bytes)
+        return object;
+
+    if (clipboard_mime_is_textual(representation.name)) {
+        if (auto text = String::from_utf8(bytes->view()); !text.is_error()) {
+            object.set("data"sv, text.value());
+            return object;
+        }
+    }
+
+    auto encoded = encode_base64(bytes->bytes());
+    if (encoded.is_error())
+        return object;
+    object.set("data"sv, encoded.value());
+    object.set("encoding"sv, "base64"sv);
+    return object;
+}
+
+static JsonArray clipboard_item_to_json(Web::Clipboard::SystemClipboardItem const& item)
+{
+    JsonArray items;
+    for (auto const& representation : item.system_clipboard_representations) {
+        auto object = clipboard_representation_to_json(representation);
+        if (object.has("data"sv))
+            items.must_append(move(object));
+    }
+    return items;
+}
+
+static Optional<Web::Clipboard::SystemClipboardItem> clipboard_item_from_json(JsonArray const& items)
+{
+    Vector<Web::Clipboard::SystemClipboardRepresentation> representations;
+
+    for (auto const& value : items.values()) {
+        if (!value.is_object())
+            continue;
+
+        auto const& object = value.as_object();
+        auto name = object.get_string("name"sv);
+        auto data = object.get_string("data"sv);
+        if (!name.has_value() || !data.has_value())
+            continue;
+
+        ByteString bytes;
+        auto encoding = object.get_string("encoding"sv);
+        if (encoding.has_value() && *encoding == "base64"sv) {
+            auto decoded = decode_base64(*data);
+            if (decoded.is_error())
+                continue;
+            bytes = ByteString::copy(decoded.value());
+        } else {
+            bytes = data->to_byte_string();
+        }
+
+        representations.append({ move(*name), move(bytes) });
+    }
+
+    if (representations.is_empty())
+        return {};
+    return Web::Clipboard::SystemClipboardItem { move(representations) };
+}
+
 void EngineServer::handle_clipboard_copy(u64 tab_id, bool cut)
 {
     auto* tab = tab_for_id(tab_id);
@@ -1278,12 +1395,51 @@ void EngineServer::handle_paste(u64 tab_id, JsonObject const& command)
     if (!tab)
         return;
 
-    auto text = command.get_string("text"sv);
-    if (!text.has_value())
+    if (auto items = command.get_array("items"sv); items.has_value() && !items->is_empty()) {
+        if (auto item = clipboard_item_from_json(*items); item.has_value())
+            EngineApplication::the().cache_clipboard_item_from_frontend(item.release_value());
+    } else if (auto text = command.get_string("text"sv); text.has_value()) {
+        EngineApplication::the().cache_clipboard_item_from_frontend({ { { "text/plain"_string, text->to_byte_string() } } });
+    } else {
+        return;
+    }
+
+    tab->view->paste_from_clipboard();
+}
+
+void EngineServer::handle_clipboard_changed(JsonObject const& command)
+{
+    auto items = command.get_array("items"sv);
+    if (!items.has_value())
         return;
 
-    WebView::Application::the().insert_clipboard_entry({ "text/plain"_string, text->to_byte_string() });
-    tab->view->paste_from_clipboard();
+    // An empty list means the desktop clipboard was cleared; forget the cached item so page-initiated reads do not
+    // return something the user can no longer paste.
+    if (auto item = clipboard_item_from_json(*items); item.has_value())
+        EngineApplication::the().cache_clipboard_item_from_frontend(item.release_value());
+    else
+        EngineApplication::the().cache_clipboard_item_from_frontend({});
+}
+
+void EngineServer::handle_toggle_devtools()
+{
+    if (auto result = WebView::Application::the().toggle_devtools_enabled(); result.is_error()) {
+        JsonObject event;
+        event.set("type"sv, "devtools_error"sv);
+        event.set("message"sv, MUST(String::formatted("Unable to start DevTools: {}", result.error())));
+        send_event(move(event));
+    }
+}
+
+void EngineServer::handle_open_devtools_client()
+{
+    if (auto result = WebView::Application::the().launch_devtools_client(); result.is_error()) {
+        warnln("LadybirdEngine: unable to open the DevTools client: {}", result.error());
+        JsonObject event;
+        event.set("type"sv, "devtools_error"sv);
+        event.set("message"sv, MUST(String::formatted("Unable to open the DevTools client: {}", result.error())));
+        send_event(move(event));
+    }
 }
 
 void EngineServer::handle_select_all(u64 tab_id)

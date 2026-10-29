@@ -19,6 +19,7 @@
 namespace LadybirdSDE {
 
 class BrowserWindow;
+class ClipboardBridge;
 
 // Owns the one engine host for this frontend process and every LibGUI window
 // attached to it. Windows share tabs, bookmarks, settings, history, and the
@@ -27,7 +28,7 @@ class BrowserSession {
     AK_MAKE_NONCOPYABLE(BrowserSession);
 
 public:
-    static ErrorOr<NonnullOwnPtr<BrowserSession>> create(Vector<String> initial_urls = {}, bool private_window = false);
+    static ErrorOr<NonnullOwnPtr<BrowserSession>> create(Vector<String> initial_urls = {}, bool private_window = false, Optional<u16> devtools_port = {});
     ~BrowserSession();
 
     void show();
@@ -43,6 +44,13 @@ public:
 
     u64 next_request_id() { return m_next_request_id++; }
     EngineClient& engine() { return *m_engine; }
+
+    // DevTools state belongs to the engine host; every window only mirrors it.
+    void toggle_devtools();
+    void open_devtools_client();
+    Optional<u16> devtools_port() const { return m_devtools_port; }
+
+    JsonArray clipboard_items_for_paste();
 
     // Called by a BrowserWindow when its native window is closing.
     void window_will_close(BrowserWindow&);
@@ -77,6 +85,7 @@ private:
     };
 
     OwnPtr<EngineClient> m_engine;
+    OwnPtr<ClipboardBridge> m_clipboard;
     Vector<NonnullOwnPtr<BrowserWindow>> m_windows;
     Vector<ClosedTab> m_closed_tabs;
     u64 m_next_request_id { 1 };
@@ -86,6 +95,7 @@ private:
     bool m_waiting_for_session_plan { false };
     bool m_session_plan_received { false };
     Vector<String> m_pending_initial_urls;
+    Optional<u16> m_devtools_port;
 };
 
 }

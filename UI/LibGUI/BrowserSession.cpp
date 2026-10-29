@@ -7,6 +7,7 @@
 #include "BrowserSession.h"
 
 #include "BrowserWindow.h"
+#include "ClipboardBridge.h"
 
 #include <AK/JsonArray.h>
 #include <AK/JsonParser.h>
@@ -79,14 +80,15 @@ static Optional<Gfx::IntPoint> position_from_object(JsonObject const& object)
     return Gfx::IntPoint { static_cast<int>(*x), static_cast<int>(*y) };
 }
 
-ErrorOr<NonnullOwnPtr<BrowserSession>> BrowserSession::create(Vector<String> initial_urls, bool private_window)
+ErrorOr<NonnullOwnPtr<BrowserSession>> BrowserSession::create(Vector<String> initial_urls, bool private_window, Optional<u16> devtools_port)
 {
     auto engine_path = find_engine_path();
     if (!engine_path.has_value())
         return Error::from_string_literal("LadybirdEngine was not found next to the browser or in libexec");
 
     auto session = adopt_own(*new BrowserSession());
-    session->m_engine = TRY(EngineClient::launch(*engine_path));
+    session->m_engine = TRY(EngineClient::launch(*engine_path, devtools_port));
+    session->m_clipboard = make<ClipboardBridge>(*session->m_engine);
 
     auto* session_pointer = session.ptr();
     session->m_engine->on_connected = [session_pointer] {
@@ -102,6 +104,7 @@ ErrorOr<NonnullOwnPtr<BrowserSession>> BrowserSession::create(Vector<String> ini
         session_pointer->on_engine_disconnected();
     };
 
+    session->m_clipboard->start();
     TRY(session->initialize(move(initial_urls), private_window));
     return session;
 }
@@ -111,6 +114,15 @@ BrowserSession::~BrowserSession()
     if (m_autosave_timer)
         m_autosave_timer->stop();
     save_session();
+
+    // Destroying the engine client tears down the frame buffers, and that reports a cleared frame for every tab.
+    // The windows are already gone by then, so stop the callbacks before the members are destroyed.
+    if (m_engine) {
+        m_engine->on_frame = {};
+        m_engine->on_event = {};
+        m_engine->on_connected = {};
+        m_engine->on_disconnected = {};
+    }
 }
 
 ErrorOr<void> BrowserSession::initialize(Vector<String> initial_urls, bool private_window)
@@ -324,6 +336,22 @@ void BrowserSession::on_engine_connected()
 {
     for (auto& window : m_windows)
         window->handle_engine_connected();
+    m_clipboard->send_current_clipboard();
+}
+
+void BrowserSession::toggle_devtools()
+{
+    m_engine->toggle_devtools();
+}
+
+void BrowserSession::open_devtools_client()
+{
+    m_engine->open_devtools_client();
+}
+
+JsonArray BrowserSession::clipboard_items_for_paste()
+{
+    return m_clipboard->items_for_paste();
 }
 
 void BrowserSession::on_engine_event(JsonObject const& event)
@@ -332,6 +360,34 @@ void BrowserSession::on_engine_event(JsonObject const& event)
 
     if (type == "session_plan"sv) {
         handle_session_plan(event);
+        return;
+    }
+
+    if (type == "clipboard_write"sv) {
+        m_clipboard->apply_engine_clipboard(event);
+        return;
+    }
+
+    if (type == "devtools_enabled"sv) {
+        m_devtools_port = static_cast<u16>(event.get_u64("port"sv).value_or(0));
+        for (auto& window : m_windows)
+            window->set_devtools_state(m_devtools_port);
+        return;
+    }
+
+    if (type == "devtools_disabled"sv) {
+        m_devtools_port.clear();
+        for (auto& window : m_windows)
+            window->set_devtools_state({});
+        return;
+    }
+
+    if (type == "devtools_error"sv) {
+        auto message = String::from_byte_string(event.get_byte_string("message"sv).value_or({})).release_value();
+        if (auto* window = active_window())
+            window->show_engine_error(message);
+        else
+            warnln("Ladybird: {}", message);
         return;
     }
 

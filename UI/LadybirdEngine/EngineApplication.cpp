@@ -67,6 +67,44 @@ Optional<WebView::ViewImplementation&> EngineApplication::active_web_view() cons
     return m_active_web_view_provider();
 }
 
+void EngineApplication::insert_clipboard_item(Web::Clipboard::SystemClipboardItem item)
+{
+    // Keep the item so page-initiated reads (navigator.clipboard.read) and paste see the same data, then hand it to
+    // the chrome process, which owns the real desktop clipboard.
+    WebView::Application::insert_clipboard_item(item);
+    if (m_clipboard_write_handler)
+        m_clipboard_write_handler(item);
+}
+
+void EngineApplication::cache_clipboard_item_from_frontend(Web::Clipboard::SystemClipboardItem item)
+{
+    // Qualified call: the frontend is reporting the desktop clipboard, so do not echo it back as a page write.
+    WebView::Application::insert_clipboard_item(move(item));
+}
+
+Optional<u16> EngineApplication::devtools_port_if_enabled() const
+{
+    if (!m_devtools_enabled)
+        return {};
+    return static_cast<u16>(browser_options().devtools_port.value_or(0));
+}
+
+void EngineApplication::on_devtools_enabled() const
+{
+    m_devtools_enabled = true;
+    WebView::Application::on_devtools_enabled();
+    if (m_devtools_event_handler)
+        m_devtools_event_handler(true, browser_options().devtools_port.value_or(0));
+}
+
+void EngineApplication::on_devtools_disabled() const
+{
+    m_devtools_enabled = false;
+    WebView::Application::on_devtools_disabled();
+    if (m_devtools_event_handler)
+        m_devtools_event_handler(false, 0);
+}
+
 WebView::SessionLaunchPolicy EngineApplication::launch_restore_policy() const
 {
     if (WebView::Application::settings().restore_previous_session())

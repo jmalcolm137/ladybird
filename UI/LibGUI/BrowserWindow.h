@@ -58,6 +58,8 @@ public:
     u64 id() const { return m_id; }
     u64 session_window_id() const { return m_session_window_id; }
     void set_session_window_id(u64 session_window_id);
+    void set_devtools_state(Optional<u16> port);
+    void show_engine_error(String const& message);
     void handle_session_tab_registered(u64 request_id, u64 session_tab_id);
 
 private:
@@ -134,6 +136,10 @@ private:
     RefPtr<GUI::Action> m_view_source_action;
     RefPtr<GUI::Action> m_downloads_action;
     RefPtr<GUI::Action> m_site_info_action;
+    RefPtr<GUI::Action> m_toggle_devtools_action;
+    RefPtr<GUI::Action> m_open_devtools_client_action;
+    RefPtr<GUI::Widget> m_devtools_bar;
+    RefPtr<GUI::Label> m_devtools_label;
 
     Vector<NonnullOwnPtr<BrowserTab>> m_tabs;
     Vector<BookmarkEntry> m_bookmarks;

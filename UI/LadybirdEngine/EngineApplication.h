@@ -9,6 +9,7 @@
 #include <AK/ByteString.h>
 #include <AK/Function.h>
 #include <AK/Optional.h>
+#include <LibWebCommon/Clipboard/SystemClipboard.h>
 #include <LibWebCommon/HTML/PreparedNavigationDescriptor.h>
 #include <LibWebView/Application.h>
 #include <LibWebView/FileDownloader.h>
@@ -34,8 +35,21 @@ public:
     using ActiveWebViewProvider = Function<Optional<WebView::ViewImplementation&>()>;
     void set_active_web_view_provider(ActiveWebViewProvider provider) { m_active_web_view_provider = move(provider); }
 
+    // The clipboard and the DevTools client window belong to the chrome process. These handlers carry the engine's
+    // side of that conversation over the control socket.
+    using ClipboardWriteHandler = Function<void(Web::Clipboard::SystemClipboardItem const&)>;
+    void set_clipboard_write_handler(ClipboardWriteHandler handler) { m_clipboard_write_handler = move(handler); }
+    void cache_clipboard_item_from_frontend(Web::Clipboard::SystemClipboardItem);
+
+    using DevToolsEventHandler = Function<void(bool enabled, u16 port)>;
+    void set_devtools_event_handler(DevToolsEventHandler handler) { m_devtools_event_handler = move(handler); }
+    Optional<u16> devtools_port_if_enabled() const;
+
 protected:
     virtual Optional<WebView::ViewImplementation&> active_web_view() const override;
+    virtual void insert_clipboard_item(Web::Clipboard::SystemClipboardItem) override;
+    virtual void on_devtools_enabled() const override;
+    virtual void on_devtools_disabled() const override;
     virtual void create_platform_arguments(Core::ArgsParser&) override;
     virtual void create_platform_options(WebView::BrowserOptions&, WebView::RequestServerOptions&, WebView::WebContentOptions&) override;
     virtual WebView::SessionLaunchPolicy launch_restore_policy() const override;
@@ -52,6 +66,9 @@ private:
     mutable OpenBlankNewTabHandler m_open_blank_new_tab_handler;
     mutable OpenNewWindowHandler m_open_new_window_handler;
     ActiveWebViewProvider m_active_web_view_provider;
+    ClipboardWriteHandler m_clipboard_write_handler;
+    DevToolsEventHandler m_devtools_event_handler;
+    mutable bool m_devtools_enabled { false };
 };
 
 }

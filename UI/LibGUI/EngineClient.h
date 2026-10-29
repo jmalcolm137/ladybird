@@ -9,6 +9,7 @@
 #include <AK/ByteString.h>
 #include <AK/Function.h>
 #include <AK/HashMap.h>
+#include <AK/JsonArray.h>
 #include <AK/JsonObject.h>
 #include <AK/NonnullOwnPtr.h>
 #include <AK/Optional.h>
@@ -31,7 +32,7 @@ class EngineClient {
     AK_MAKE_NONCOPYABLE(EngineClient);
 
 public:
-    static ErrorOr<NonnullOwnPtr<EngineClient>> launch(ByteString engine_path);
+    static ErrorOr<NonnullOwnPtr<EngineClient>> launch(ByteString engine_path, Optional<u16> devtools_port = {});
     ~EngineClient();
 
     bool is_connected() const { return m_socket != nullptr; }
@@ -57,7 +58,10 @@ public:
     void find_previous(u64 tab_id);
     void toggle_bookmark(u64 tab_id);
     void copy(u64 tab_id, bool cut = false);
-    void paste(u64 tab_id, StringView text);
+    void paste(u64 tab_id, JsonArray items);
+    void set_clipboard_items(JsonArray items);
+    void toggle_devtools();
+    void open_devtools_client();
     void select_all(u64 tab_id);
     void undo(u64 tab_id);
     void redo(u64 tab_id);
@@ -105,6 +109,7 @@ private:
     FrameBuffer* frame_buffer_for_tab(u64 tab_id);
     void destroy_frame_buffer(u64 tab_id);
 
+    Optional<u16> m_devtools_port;
     ByteString m_runtime_directory;
     ByteString m_socket_path;
     RefPtr<Core::LocalServer> m_server;

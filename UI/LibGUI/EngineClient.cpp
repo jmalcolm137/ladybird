@@ -53,7 +53,7 @@ EngineClient::~EngineClient()
     (void)Core::System::rmdir(m_runtime_directory);
 }
 
-ErrorOr<NonnullOwnPtr<EngineClient>> EngineClient::launch(ByteString engine_path)
+ErrorOr<NonnullOwnPtr<EngineClient>> EngineClient::launch(ByteString engine_path, Optional<u16> devtools_port)
 {
     auto runtime_root = TRY(Core::StandardPaths::runtime_directory());
     auto runtime_directory = ByteString::formatted("{}/ladybird-sde-{}", runtime_root, ::getpid());
@@ -63,6 +63,7 @@ ErrorOr<NonnullOwnPtr<EngineClient>> EngineClient::launch(ByteString engine_path
     (void)Core::System::unlink(socket_path);
 
     auto client = adopt_own(*new EngineClient(runtime_directory, socket_path));
+    client->m_devtools_port = devtools_port;
 
     auto server = Core::LocalServer::construct();
     server->on_accept = [client = client.ptr()](NonnullOwnPtr<Core::LocalSocket> socket) {
@@ -96,6 +97,12 @@ ErrorOr<void> EngineClient::spawn_engine(ByteString const& engine_path)
     }
     if (Core::Environment::has("LADYBIRD_SDE_DISABLE_SANDBOX"sv))
         arguments.append("--disable-sandbox"sv);
+    if (m_devtools_port.has_value()) {
+        if (*m_devtools_port == 0)
+            arguments.append("--devtools"sv);
+        else
+            arguments.append(ByteString::formatted("--devtools={}", *m_devtools_port));
+    }
 
     // New windows opened from an engine context menu start another LibGUI
     // frontend, so tell the engine where this executable lives.
@@ -607,12 +614,34 @@ void EngineClient::copy(u64 tab_id, bool cut)
     send_simple(cut ? "cut"sv : "copy"sv, tab_id);
 }
 
-void EngineClient::paste(u64 tab_id, StringView text)
+void EngineClient::paste(u64 tab_id, JsonArray items)
 {
     JsonObject event;
     event.set("type"sv, "paste"sv);
     event.set("tab"sv, tab_id);
-    event.set("text"sv, text);
+    event.set("items"sv, move(items));
+    send(event);
+}
+
+void EngineClient::set_clipboard_items(JsonArray items)
+{
+    JsonObject event;
+    event.set("type"sv, "clipboard_changed"sv);
+    event.set("items"sv, move(items));
+    send(event);
+}
+
+void EngineClient::toggle_devtools()
+{
+    JsonObject event;
+    event.set("type"sv, "toggle_devtools"sv);
+    send(event);
+}
+
+void EngineClient::open_devtools_client()
+{
+    JsonObject event;
+    event.set("type"sv, "open_devtools_client"sv);
     send(event);
 }
 

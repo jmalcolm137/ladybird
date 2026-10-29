@@ -146,6 +146,16 @@ navigating the real engine.
   window titles.
 * Edit menu with undo/redo, cut/copy/paste through the SDE clipboard, select all,
   and find-in-page.
+* Rich clipboard: WebContent's copy path is used while the page has focus, so
+  text/HTML selections and images keep their representations. The frontend maps
+  them to the SDE clipboard (choosing text over HTML for other applications)
+  and remembers the full item so pasting back into the browser preserves
+  formatting. Images are converted between `image/png` and the SDE bitmap
+  clipboard, and page-initiated clipboard reads see the desktop clipboard.
+* DevTools: Tools → Inspect → Enable DevTools, or start the browser with
+  `--devtools[=port]`. A banner shows the listening port; Tools → Inspect →
+  Open DevTools Client launches the same Firefox client as the Qt frontend,
+  and `Ctrl+Shift+I` / `F12` toggles the server.
 * New window and new private window (`--private`), with the private window's
   tabs created in a private browsing session in the engine. Every normal window
   in one frontend process shares the same engine host and profile, so tabs,
@@ -189,8 +199,7 @@ The remaining UI work is tracked in
 [`docs/UI-ROADMAP.md`](docs/UI-ROADMAP.md). Recent additions are address-bar
 autocomplete and search suggestions, reopen-closed-tab, tab search, bookmark
 folders and overflow, a site indicator/popover, and a visible zoom percentage.
-Platform work (HiDPI, IME, drag and drop, rich clipboard, accessibility)
-follows. GPU/zero-copy frame sharing is deliberately shelved because it
+Platform work (HiDPI, IME, drag and drop, accessibility) follows. GPU/zero-copy frame sharing is deliberately shelved because it
 destabilized scrolling and resizing; the stable rendering path is the
 acknowledged shared-memory ring with damage-only copies.
 

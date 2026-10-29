@@ -5,7 +5,7 @@ line-oriented JSON protocol over a Unix socket. Frame pixels never travel over
 the socket: the engine publishes a POSIX shared-memory ring per tab and the
 frontend maps it.
 
-Version: 8. `Shared/EngineProtocol.h` is authoritative.
+Version: 9. `Shared/EngineProtocol.h` is authoritative.
 
 ## Frontend → engine
 
@@ -26,8 +26,8 @@ Version: 8. `Shared/EngineProtocol.h` is authoritative.
 | `find` | `tab`, `query` | Start/replace find-in-page; empty ends it. |
 | `find_next` / `find_previous` | `tab` | Move between matches. |
 | `toggle_bookmark` | `tab` | Toggle the current URL in the bookmark store. |
-| `copy` / `cut` | `tab` | Put the page selection on the clipboard. |
-| `paste` | `tab`, `text` | Paste text into the page. |
+| `copy` / `cut` | `tab` | Put the page selection on the clipboard as plain text. In-page Ctrl+C/Ctrl+X use WebContent's rich copy path instead. |
+| `paste` | `tab`, `items` | Paste clipboard representations into the page. `items` has the same shape as `clipboard_write`. The legacy `text` field is still accepted. |
 | `select_all`, `undo`, `redo` | `tab` | Editing commands. |
 | `zoom` | `tab`, `direction` | `in`, `out`, or `reset`. The engine answers with `zoom_changed`. |
 | `dialog_response` | `tab`, `kind`, `accept`, `text` | Answer an alert/confirm/prompt. |
@@ -37,6 +37,9 @@ Version: 8. `Shared/EngineProtocol.h` is authoritative.
 | `select_dropdown_closed` | `tab`, `selected` | Answer a `<select>` popup; omit `selected` when canceled. |
 | `frame_ack` | `tab`, `sequence` | The frontend has replaced the frame it was displaying. The engine may reuse that shared-memory slot. |
 | `download_action` | `action`, `id` | `open`, `show_in_folder`, `pause`, `resume`, `cancel`, or `clear`. |
+| `clipboard_changed` | `items` | The desktop clipboard changed. Representations are `{name, data}`; binary data adds `{"encoding": "base64"}`. The engine caches them for page-initiated reads and pastes. An empty list clears the cache. |
+| `toggle_devtools` | | Enable or disable the DevTools server in the engine host. |
+| `open_devtools_client` | | Ask the engine host to launch the Firefox DevTools client for the active tab. |
 | `register_session_tab` | `session_window`, `request`, `window`, `url` | Register a lazily restored tab in the native session store without creating a view. The engine answers with `session_tab_registered`. |
 | `window_geometry` | `session_window`, `x`, `y`, `width`, `height`, `maximized` | Persist a frontend window's geometry in the native session store. |
 | `close_window` | `session_window`, `active` | Mark a frontend window closed in the native session store. |
@@ -66,7 +69,11 @@ Version: 8. `Shared/EngineProtocol.h` is authoritative.
 | `link_hover` | `tab`, `url` or empty | Link under the pointer. |
 | `cursor` | `tab`, `cursor` | Page cursor name. |
 | `dialog` | `tab`, `kind`, `message`, `default` | Page opened a dialog. |
-| `clipboard` | `tab`, `text` | Copy/cut result for the frontend clipboard. |
+| `clipboard` | `tab`, `text` | Plain-text result of the `copy`/`cut` commands. |
+| `clipboard_write` | `items` | The page wrote to the clipboard. The frontend puts the best representation on the desktop clipboard and remembers the whole item. |
+| `devtools_enabled` | `port` | The DevTools server is listening. Sent at connection time too when the engine was started with `--devtools`. |
+| `devtools_disabled` | | The DevTools server stopped. |
+| `devtools_error` | `message` | Enabling DevTools or launching the client failed. |
 | `fullscreen` | `tab`, `fullscreen` | Page requested/left fullscreen. |
 | `bookmarks` | `items` | The bookmark tree for the bookmarks bar. Each item has `id`, `type` (`bookmark` or `folder`), `title`, and either `url` or nested `items`. |
 | `context_menu` | `tab`, `kind`, `x`, `y`, `items` | Page/link/image/media menu. Items have `text`, `action`, `enabled`, `checkable`, `checked`, or `separator`; `items` on a submenu entry nests. |

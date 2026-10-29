@@ -49,6 +49,7 @@ SOURCES := \
 	BrowserTab.cpp \
 	BrowserSession.cpp \
 	BrowserWindow.cpp \
+	ClipboardBridge.cpp \
 	DownloadsWindow.cpp \
 	EngineClient.cpp \
 	WebContentView.cpp \

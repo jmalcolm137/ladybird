@@ -48,13 +48,20 @@ reference for behaviour and options.
   information to the frame protocol and scale in the frontend.
 - **IME composition**: forward composition events, not only key events.
 - **Drag and drop**: links, files, tabs, and text.
-- **Rich clipboard**: HTML, images, and file lists in addition to text.
+- **Rich clipboard**: **Done:** WebContent's rich copy path, text/HTML and
+  image representations, and page-initiated clipboard reads. The SDE clipboard
+  stores one MIME type per item, so other applications receive the best single
+  representation (plain text for rich text), while the browser keeps the full
+  item for pasting back into a page. File lists still need the portal to carry
+  multiple types.
 - **Accessibility**: expose web-content accessibility through the LibGUI/AT-SPI
   bridge.
 
 ## P3: Diagnostics and advanced features
 
-- DevTools (inspect, console, network)
+- **DevTools**: **Done:** the engine host runs the upstream DevTools server,
+  the frontend exposes Tools → Inspect, `Ctrl+Shift+I`/`F12`, `--devtools[=port]`,
+  and a port banner; the client is the upstream Firefox client.
 - Web compatibility report flow
 - Crash report submission UI
 - Process manager / performance monitor
@@ -108,5 +115,5 @@ scroll, resize, multi-window, and session-restore tests.
    management dialogs remain).
 4. ~~Zoom percentage and address-bar polish~~ (done).
 5. Downloads private filtering/pruning, find match case, file-picker filters.
-6. HiDPI, IME, drag and drop, rich clipboard.
-7. DevTools and the remaining diagnostics.
+6. HiDPI, IME, and drag and drop.
+7. The remaining diagnostics (compatibility report, crash submission UI, process monitor).

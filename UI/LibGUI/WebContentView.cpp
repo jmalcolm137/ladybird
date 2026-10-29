@@ -174,7 +174,19 @@ void WebContentView::keydown_event(GUI::KeyEvent& event)
         on_key("down"sv, key_view, event.code_point(), event.modifiers());
     }
 
-    // Let command modifiers and registered window shortcuts (F5, F11, ...)
+    // Editing shortcuts belong to the page while it has focus, so WebCore runs its own copy/paste path with the
+    // full set of clipboard representations. Letting the window actions fire as well would copy the same selection
+    // twice, once as plain text.
+    auto key = event.key();
+    auto page_edits = event.ctrl() && !event.alt() && !event.super()
+        && (key == Key_X || key == Key_V || key == Key_A || key == Key_Z || key == Key_Y
+            || (key == Key_C && !event.shift()));
+    if (page_edits) {
+        event.accept();
+        return;
+    }
+
+    // Let other command modifiers and registered window shortcuts (F5, F11, ...)
     // reach the window's actions. A plain key press belongs to the page.
     auto* action = window() ? window()->action_for_shortcut(GUI::Shortcut(static_cast<u8>(event.modifiers()), event.key())) : nullptr;
     if (event.ctrl() || event.alt() || event.super() || action != nullptr)

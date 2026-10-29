@@ -148,6 +148,9 @@ private:
     void handle_toggle_bookmark(u64 tab_id);
     void handle_clipboard_copy(u64 tab_id, bool cut);
     void handle_paste(u64 tab_id, JsonObject const&);
+    void handle_clipboard_changed(JsonObject const&);
+    void handle_toggle_devtools();
+    void handle_open_devtools_client();
     void handle_select_all(u64 tab_id);
     void handle_undo_redo(u64 tab_id, bool redo);
     void handle_context_menu_action(u64 tab_id, JsonObject const&);
