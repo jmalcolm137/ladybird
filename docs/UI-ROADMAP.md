@@ -60,7 +60,7 @@ reference for behaviour and options.
 ## P3: Diagnostics and advanced features
 
 - **DevTools**: **Done:** the engine host runs the upstream DevTools server,
-  the frontend exposes Tools → Inspect, `Ctrl+Shift+I`/`F12`, `--devtools[=port]`,
+  the frontend exposes Tools → Enable/Open DevTools, `Ctrl+Shift+I`/`F12`, `--devtools[=port]`,
   and a port banner; the client is the upstream Firefox client.
 - Web compatibility report flow
 - Crash report submission UI

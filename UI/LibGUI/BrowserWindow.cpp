@@ -412,9 +412,10 @@ void BrowserWindow::create_menus()
     tools_menu.add_action(*m_site_info_action);
     tools_menu.add_action(*m_downloads_action);
     tools_menu.add_separator();
-    auto inspect_menu = tools_menu.add_submenu("&Inspect"_string);
-    inspect_menu->add_action(*m_toggle_devtools_action);
-    inspect_menu->add_action(*m_open_devtools_client_action);
+    // Keep these flat: activating an item in a nested LibGUI submenu tears the parent popup down in an order the
+    // SDE compositor rejects.
+    tools_menu.add_action(*m_toggle_devtools_action);
+    tools_menu.add_action(*m_open_devtools_client_action);
 
     auto& help_menu = *m_window->add_menu("&Help"_string);
     help_menu.add_action(GUI::CommonActions::make_about_action("Ladybird"_string, GUI::Icon::default_icon("app-browser"sv), m_window.ptr()));
@@ -444,7 +445,7 @@ void BrowserWindow::set_devtools_state(Optional<u16> port)
     m_open_devtools_client_action->set_enabled(enabled);
 
     if (m_devtools_label && enabled)
-        m_devtools_label->set_text(String::formatted("DevTools is enabled on port {} (Tools > Inspect opens the client)", *port).release_value());
+        m_devtools_label->set_text(String::formatted("DevTools is enabled on port {} (Tools > Open DevTools Client)", *port).release_value());
     if (m_devtools_bar) {
         m_devtools_bar->set_visible(enabled);
         if (auto* parent = m_devtools_bar->parent_widget())

@@ -152,10 +152,10 @@ navigating the real engine.
   and remembers the full item so pasting back into the browser preserves
   formatting. Images are converted between `image/png` and the SDE bitmap
   clipboard, and page-initiated clipboard reads see the desktop clipboard.
-* DevTools: Tools → Inspect → Enable DevTools, or start the browser with
-  `--devtools[=port]`. A banner shows the listening port; Tools → Inspect →
-  Open DevTools Client launches the same Firefox client as the Qt frontend,
-  and `Ctrl+Shift+I` / `F12` toggles the server.
+* DevTools: Tools → Enable DevTools, or start the browser with
+  `--devtools[=port]`. A banner shows the listening port; Tools → Open DevTools
+  Client launches the same Firefox client as the Qt frontend, and
+  `Ctrl+Shift+I` / `F12` toggles the server.
 * New window and new private window (`--private`), with the private window's
   tabs created in a private browsing session in the engine. Every normal window
   in one frontend process shares the same engine host and profile, so tabs,
