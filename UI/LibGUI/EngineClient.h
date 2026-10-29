@@ -65,12 +65,12 @@ public:
     void file_picker_response(u64 tab_id, String const& path);
     void select_dropdown_closed(u64 tab_id, Optional<u32> selected);
     void download_action(StringView action, u64 id);
-    void frame_ack(u64 tab_id, u64 sequence);
+    void frame_ack(u64 tab_id, u64 sequence, u64 generation);
     void quit();
 
     Function<void()> on_connected;
     Function<void(JsonObject const&)> on_event;
-    Function<void(u64 tab_id, Gfx::Bitmap const*, u64 sequence, Gfx::IntRect damage, bool full)> on_frame;
+    Function<void(u64 tab_id, Gfx::Bitmap const*, u64 sequence, u64 generation, Gfx::IntRect damage, bool full)> on_frame;
     Function<void()> on_disconnected;
 
 private:
@@ -88,8 +88,11 @@ private:
     explicit EngineClient(ByteString runtime_directory, ByteString socket_path);
 
     ErrorOr<void> spawn_engine(ByteString const& engine_path);
+    ErrorOr<void> create_frame_channel();
     void accept_connection(NonnullOwnPtr<Core::LocalSocket>);
     void read_available();
+    void read_frames();
+    void handle_direct_frame(JsonObject const&, int fd);
     void dispatch_line(StringView);
     void handle_frame_buffer(JsonObject const&);
     void handle_frame(JsonObject const&);
@@ -105,6 +108,10 @@ private:
     ByteString m_socket_path;
     RefPtr<Core::LocalServer> m_server;
     OwnPtr<Core::LocalSocket> m_socket;
+    int m_engine_frame_fd { -1 };
+    OwnPtr<Core::LocalSocket> m_frame_socket;
+    Vector<u8> m_frame_read_buffer;
+    HashMap<u64, RefPtr<Gfx::Bitmap>> m_direct_frames;
     Vector<u8> m_read_buffer;
     Vector<u8> m_write_buffer;
     RefPtr<Core::Notifier> m_write_notifier;

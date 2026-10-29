@@ -24,6 +24,7 @@ class EngineApplication final : public WebView::Application {
 public:
     ByteString const& engine_socket_path() const { return m_engine_socket_path; }
     ByteString const& frame_directory() const { return m_frame_directory; }
+    int frame_socket_fd() const { return m_frame_socket_fd; }
 
     using OpenBlankNewTabHandler = Function<Optional<WebView::ViewImplementation&>(Web::HTML::ActivateTab)>;
     void set_open_blank_new_tab_handler(OpenBlankNewTabHandler handler) { m_open_blank_new_tab_handler = move(handler); }
@@ -43,6 +44,7 @@ protected:
 private:
     ByteString m_engine_socket_path;
     ByteString m_frame_directory;
+    int m_frame_socket_fd { -1 };
     mutable OpenBlankNewTabHandler m_open_blank_new_tab_handler;
     mutable OpenNewWindowHandler m_open_new_window_handler;
 };

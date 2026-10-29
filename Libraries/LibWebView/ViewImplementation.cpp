@@ -296,11 +296,18 @@ void ViewImplementation::server_did_paint(Badge<WebContentPage>, i32 bitmap_id, 
     dbgln_if(COMPOSITOR_DEBUG, "[Compositor] UI received presented bitmap {} for page {} size={}x{} did_swap={} front={}",
         bitmap_id, page().id(), size.width(), size.height(), did_swap_bitmap, m_front_bitmap.id);
 
-    release_backing_store(did_swap_bitmap ? previous_front_bitmap_id : bitmap_id);
-
     if (did_swap_bitmap) {
+        auto previous_generation = m_front_bitmap_generation;
+        ++m_front_bitmap_generation;
+        if (m_defer_backing_store_release && previous_front_bitmap_id >= 0)
+            m_deferred_backing_store_releases.append({ previous_front_bitmap_id, previous_generation });
+        else
+            release_backing_store(previous_front_bitmap_id);
+
         m_last_presented_damage_rect = damage_rect;
         did_accept_presented_backing_store(bitmap_id, damage_rect);
+    } else {
+        release_backing_store(bitmap_id);
     }
     if (did_swap_bitmap && m_crash_state.has_value() && m_crash_state->recovery_started)
         set_crash_state({});
@@ -309,6 +316,21 @@ void ViewImplementation::server_did_paint(Badge<WebContentPage>, i32 bitmap_id, 
 
     if (did_swap_bitmap && on_ready_to_paint)
         on_ready_to_paint();
+}
+
+void ViewImplementation::release_backing_stores_through(u64 generation)
+{
+    Vector<DeferredBackingStoreRelease> remaining;
+    remaining.ensure_capacity(m_deferred_backing_store_releases.size());
+    for (auto const& release : m_deferred_backing_store_releases) {
+        if (release.generation <= generation) {
+            if (release.bitmap_id >= 0)
+                release_backing_store(release.bitmap_id);
+        } else {
+            remaining.append(release);
+        }
+    }
+    m_deferred_backing_store_releases = move(remaining);
 }
 
 void ViewImplementation::release_backing_store(i32 bitmap_id)

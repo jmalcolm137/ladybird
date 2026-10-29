@@ -85,8 +85,8 @@ ErrorOr<NonnullOwnPtr<BrowserSession>> BrowserSession::create(Vector<String> ini
     session->m_engine->on_event = [session_pointer](JsonObject const& event) {
         session_pointer->on_engine_event(event);
     };
-    session->m_engine->on_frame = [session_pointer](u64 tab_id, Gfx::Bitmap const* frame, u64 sequence, Gfx::IntRect damage, bool full) {
-        session_pointer->on_engine_frame(tab_id, frame, sequence, damage, full);
+    session->m_engine->on_frame = [session_pointer](u64 tab_id, Gfx::Bitmap const* frame, u64 sequence, u64 generation, Gfx::IntRect damage, bool full) {
+        session_pointer->on_engine_frame(tab_id, frame, sequence, generation, damage, full);
     };
     session->m_engine->on_disconnected = [session_pointer] {
         session_pointer->on_engine_disconnected();
@@ -225,10 +225,10 @@ void BrowserSession::on_engine_event(JsonObject const& event)
         window->handle_engine_tab_event(event, *tab_id);
 }
 
-void BrowserSession::on_engine_frame(u64 tab_id, Gfx::Bitmap const* frame, u64 sequence, Gfx::IntRect damage, bool full)
+void BrowserSession::on_engine_frame(u64 tab_id, Gfx::Bitmap const* frame, u64 sequence, u64 generation, Gfx::IntRect damage, bool full)
 {
     if (auto* window = window_for_tab(tab_id))
-        window->handle_engine_frame(tab_id, frame, sequence, damage, full);
+        window->handle_engine_frame(tab_id, frame, sequence, generation, damage, full);
 }
 
 void BrowserSession::on_engine_disconnected()

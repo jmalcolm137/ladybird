@@ -53,7 +53,7 @@ private:
 
     void on_engine_connected();
     void on_engine_event(JsonObject const&);
-    void on_engine_frame(u64 tab_id, Gfx::Bitmap const*, u64 sequence, Gfx::IntRect damage, bool full);
+    void on_engine_frame(u64 tab_id, Gfx::Bitmap const*, u64 sequence, u64 generation, Gfx::IntRect damage, bool full);
     void on_engine_disconnected();
     void handle_open_window(JsonObject const&);
 
