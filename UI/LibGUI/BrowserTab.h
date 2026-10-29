@@ -51,6 +51,9 @@ public:
     u64 tab_id() const { return m_tab_id; }
     u64 request_id() const { return m_request_id; }
     bool is_attached() const { return m_tab_id != 0; }
+    bool engine_tab_requested() const { return m_engine_tab_requested; }
+    bool is_lazy() const { return m_lazy; }
+    void set_lazy(bool lazy) { m_lazy = lazy; }
     bool can_go_back() const { return m_can_go_back; }
     bool can_go_forward() const { return m_can_go_forward; }
     bool is_bookmarked() const { return m_bookmarked; }
@@ -146,6 +149,8 @@ private:
 
     u64 m_tab_id { 0 };
     u64 m_window_id { 0 };
+    bool m_engine_tab_requested { false };
+    bool m_lazy { false };
     u64 m_request_id { 0 };
     String m_initial_url;
     String m_title;

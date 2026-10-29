@@ -342,12 +342,15 @@ void BrowserTab::create_engine_tab(u64 request_id, String const& url, bool priva
     m_request_id = request_id;
     m_initial_url = url;
     m_private = private_tab;
+    m_engine_tab_requested = true;
     m_engine.create_tab(content_size(), url, request_id, private_tab, m_window_id);
 }
 
 void BrowserTab::attach_tab_id(u64 tab_id)
 {
     m_tab_id = tab_id;
+    m_engine_tab_requested = true;
+    m_lazy = false;
     m_engine.activate_tab(tab_id, m_window_id);
     m_engine.resize(tab_id, content_size());
     m_engine.set_focus(tab_id, m_web_view->is_focused());
@@ -356,6 +359,7 @@ void BrowserTab::attach_tab_id(u64 tab_id)
 void BrowserTab::detach()
 {
     m_tab_id = 0;
+    m_engine_tab_requested = false;
 }
 
 void BrowserTab::navigate(String const& url)

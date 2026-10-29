@@ -179,10 +179,10 @@ bool BrowserSession::reopen_closed_tab()
     return true;
 }
 
-BrowserWindow* BrowserSession::create_window_internal(Vector<String> urls, bool private_window, Optional<Gfx::IntSize> size, Optional<Gfx::IntPoint> position, Optional<size_t> active_tab, bool maximized)
+BrowserWindow* BrowserSession::create_window_internal(Vector<String> urls, bool private_window, Optional<Gfx::IntSize> size, Optional<Gfx::IntPoint> position, Optional<size_t> active_tab, bool maximized, bool lazy_load)
 {
     auto window = make<BrowserWindow>(*this, *m_engine, m_next_window_id++, private_window);
-    if (auto result = window->initialize(move(urls)); result.is_error()) {
+    if (auto result = window->initialize(move(urls), active_tab, lazy_load); result.is_error()) {
         warnln("Ladybird: could not create a browser window: {}", result.error());
         return nullptr;
     }
@@ -464,7 +464,7 @@ bool BrowserSession::load_session()
         if (auto active = entry.get_u64("active"sv); active.has_value())
             active_tab = static_cast<size_t>(*active);
 
-        create_window_internal(move(urls), false, size_from_object(entry), position_from_object(entry), active_tab, entry.get_bool("maximized"sv).value_or(false));
+        create_window_internal(move(urls), false, size_from_object(entry), position_from_object(entry), active_tab, entry.get_bool("maximized"sv).value_or(false), true);
     }
 
     return !m_windows.is_empty();
@@ -484,7 +484,7 @@ bool BrowserSession::load_legacy_session(JsonObject const& session)
     if (auto active = session.get_u64("active"sv); active.has_value())
         active_tab = static_cast<size_t>(*active);
 
-    return create_window_internal(move(urls), false, size_from_object(session), position_from_object(session), active_tab, session.get_bool("maximized"sv).value_or(false)) != nullptr;
+    return create_window_internal(move(urls), false, size_from_object(session), position_from_object(session), active_tab, session.get_bool("maximized"sv).value_or(false), true) != nullptr;
 }
 
 }

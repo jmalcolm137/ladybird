@@ -92,7 +92,7 @@ ByteString BrowserWindow::string_for_key(JsonObject const& object, StringView ke
     return {};
 }
 
-ErrorOr<void> BrowserWindow::initialize(Vector<String> initial_urls)
+ErrorOr<void> BrowserWindow::initialize(Vector<String> initial_urls, Optional<size_t> active_tab, bool lazy_load)
 {
     m_window = GUI::Window::construct();
     m_window->set_title(m_private ? "Ladybird (Private)"sv : "Ladybird"sv);
@@ -132,7 +132,7 @@ ErrorOr<void> BrowserWindow::initialize(Vector<String> initial_urls)
         m_session.window_will_close(*this);
     };
 
-    create_initial_tabs(initial_urls);
+    create_initial_tabs(initial_urls, active_tab, lazy_load);
     return {};
 }
 
@@ -387,15 +387,21 @@ void BrowserWindow::create_menus()
     help_menu.add_action(GUI::CommonActions::make_about_action("Ladybird"_string, GUI::Icon::default_icon("app-browser"sv), m_window.ptr()));
 }
 
-void BrowserWindow::create_initial_tabs(Vector<String> const& initial_urls)
+void BrowserWindow::create_initial_tabs(Vector<String> const& initial_urls, Optional<size_t> active_tab, bool lazy_load)
 {
     if (initial_urls.is_empty()) {
         add_tab(String {}, true);
         return;
     }
 
-    for (size_t i = 0; i < initial_urls.size(); ++i)
-        add_tab(initial_urls[i], i + 1 == initial_urls.size());
+    auto active_index = active_tab.value_or(initial_urls.size() - 1);
+    if (active_index >= initial_urls.size())
+        active_index = initial_urls.size() - 1;
+
+    for (size_t i = 0; i < initial_urls.size(); ++i) {
+        auto is_active = i == active_index;
+        add_tab(initial_urls[i], is_active, is_active || !lazy_load, lazy_load && !is_active);
+    }
 }
 
 void BrowserWindow::reopen_tab(String const& url)
@@ -403,12 +409,13 @@ void BrowserWindow::reopen_tab(String const& url)
     add_tab(url, true);
 }
 
-BrowserTab& BrowserWindow::add_tab(String const& url, bool activate, bool request_engine_tab)
+BrowserTab& BrowserWindow::add_tab(String const& url, bool activate, bool request_engine_tab, bool lazy)
 {
     auto tab = make<BrowserTab>(*m_engine, *m_window, *m_back_action, *m_forward_action, *m_reload_action, *m_stop_action, *m_bookmark_action, *m_home_action, *m_new_tab_action, *m_downloads_action);
     auto* tab_pointer = tab.ptr();
     tab->set_window_id(m_id);
     tab->set_initial_url(url);
+    tab->set_lazy(lazy);
 
     tab->on_title_change = [this, tab_pointer](String const& title) {
         if (!tab_is_live(tab_pointer))
@@ -455,6 +462,8 @@ BrowserTab& BrowserWindow::add_tab(String const& url, bool activate, bool reques
             tab_pointer->create_engine_tab(m_session.next_request_id(), url, m_private);
         else
             tab_pointer->set_status("Starting the Ladybird engine..."sv);
+    } else if (lazy) {
+        tab_pointer->set_status("Not loaded"sv);
     }
 
     if (activate)
@@ -557,6 +566,7 @@ bool BrowserWindow::tab_is_live(BrowserTab const* tab) const
 
 void BrowserWindow::activate_tab(BrowserTab& tab)
 {
+    ensure_tab_loaded(tab);
     if (tab.is_attached())
         m_engine->activate_tab(tab.tab_id(), m_id);
     // A background tab may have received only damage updates. Repaint the
@@ -615,11 +625,23 @@ void BrowserWindow::navigate_active(String const& url)
 void BrowserWindow::handle_engine_connected()
 {
     for (auto& tab : m_tabs) {
-        if (!tab->is_attached()) {
+        if (!tab->is_attached() && !tab->is_lazy()) {
             tab->create_engine_tab(m_session.next_request_id(), tab->initial_url(), m_private);
             tab->set_status(""sv);
         }
     }
+}
+
+void BrowserWindow::ensure_tab_loaded(BrowserTab& tab)
+{
+    if (tab.is_attached() || tab.engine_tab_requested())
+        return;
+
+    tab.set_lazy(false);
+    if (m_engine->is_connected())
+        tab.create_engine_tab(m_session.next_request_id(), tab.initial_url(), m_private);
+    else
+        tab.set_status("Starting the Ladybird engine..."sv);
 }
 
 bool BrowserWindow::has_tab(u64 tab_id) const
@@ -779,6 +801,8 @@ Vector<String> BrowserWindow::tab_urls() const
     Vector<String> urls;
     for (auto const& tab : m_tabs) {
         auto url = tab->current_url();
+        if (url.is_empty())
+            url = tab->initial_url();
         urls.append(url.is_empty() ? "about:newtab"_string : move(url));
     }
     return urls;

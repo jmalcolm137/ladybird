@@ -51,7 +51,7 @@ private:
     BrowserSession() = default;
 
     ErrorOr<void> initialize(Vector<String> initial_urls, bool private_window);
-    BrowserWindow* create_window_internal(Vector<String> urls, bool private_window, Optional<Gfx::IntSize> size = {}, Optional<Gfx::IntPoint> position = {}, Optional<size_t> active_tab = {}, bool maximized = false);
+    BrowserWindow* create_window_internal(Vector<String> urls, bool private_window, Optional<Gfx::IntSize> size = {}, Optional<Gfx::IntPoint> position = {}, Optional<size_t> active_tab = {}, bool maximized = false, bool lazy_load = false);
 
     BrowserWindow* window_for_tab(u64 tab_id);
     BrowserWindow* window_for_id(u64 window_id);

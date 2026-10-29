@@ -59,12 +59,13 @@ public:
 private:
     friend class BrowserSession;
 
-    ErrorOr<void> initialize(Vector<String> initial_urls);
+    ErrorOr<void> initialize(Vector<String> initial_urls, Optional<size_t> active_tab = {}, bool lazy_load = false);
     void create_actions();
     void create_menus();
-    void create_initial_tabs(Vector<String> const& initial_urls);
+    void create_initial_tabs(Vector<String> const& initial_urls, Optional<size_t> active_tab, bool lazy_load);
 
-    BrowserTab& add_tab(String const& url, bool activate, bool request_engine_tab = true);
+    BrowserTab& add_tab(String const& url, bool activate, bool request_engine_tab = true, bool lazy = false);
+    void ensure_tab_loaded(BrowserTab&);
     void close_tab(BrowserTab&);
     void remove_tab(BrowserTab&);
     BrowserTab* active_tab() const;
