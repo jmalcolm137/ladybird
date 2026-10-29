@@ -123,9 +123,9 @@ BrowserTab::BrowserTab(EngineClient& engine, GUI::Window& window, GUI::Action& b
     m_web_view->on_go_back = [this] { go_back(); };
     m_web_view->on_go_forward = [this] { go_forward(); };
     m_web_view->on_reload = [this] { reload(); };
-    m_web_view->on_frame_ack = [this](u64 sequence, u64 generation) {
+    m_web_view->on_frame_ack = [this](u64 sequence) {
         if (is_attached())
-            m_engine.frame_ack(m_tab_id, sequence, generation);
+            m_engine.frame_ack(m_tab_id, sequence);
     };
 
     // Keep the window association explicit; the tab itself lives in a TabWidget.

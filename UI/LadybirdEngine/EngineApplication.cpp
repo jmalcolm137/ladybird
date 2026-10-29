@@ -17,7 +17,6 @@ void EngineApplication::create_platform_arguments(Core::ArgsParser& args_parser)
 {
     args_parser.add_option(m_engine_socket_path, "Unix socket to accept the LibGUI chrome connection on", "engine-socket", 0, "path");
     args_parser.add_option(m_frame_directory, "Directory in which to publish frame files", "frame-directory", 0, "path");
-    args_parser.add_option(m_frame_socket_fd, "Inherited SOCK_SEQPACKET fd for zero-copy frame buffers", "frame-fd", 0, "fd");
 }
 
 static void open_with_system(ByteString const& path)

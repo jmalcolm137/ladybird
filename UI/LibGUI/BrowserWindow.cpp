@@ -675,10 +675,10 @@ void BrowserWindow::handle_engine_tab_event(JsonObject const& event, u64 tab_id)
     }
 }
 
-void BrowserWindow::handle_engine_frame(u64 tab_id, Gfx::Bitmap const* frame, u64 sequence, u64 generation, Gfx::IntRect damage, bool full)
+void BrowserWindow::handle_engine_frame(u64 tab_id, Gfx::Bitmap const* frame, u64 sequence, Gfx::IntRect damage, bool full)
 {
     if (auto* tab = tab_for_id(tab_id))
-        tab->web_view().set_frame(frame, sequence, generation, damage, full);
+        tab->web_view().set_frame(frame, sequence, damage, full);
 }
 
 void BrowserWindow::handle_engine_disconnected()

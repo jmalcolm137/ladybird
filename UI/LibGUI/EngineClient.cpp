@@ -19,10 +19,6 @@
 #include <LibCore/StandardPaths.h>
 #include <LibCore/System.h>
 #include <LibGfx/Bitmap.h>
-#include <fcntl.h>
-#include <sys/mman.h>
-#include <sys/socket.h>
-#include <unistd.h>
 #include <LibGUI/Event.h>
 #include <Shared/EngineProtocol.h>
 #include <errno.h>
@@ -76,7 +72,6 @@ ErrorOr<NonnullOwnPtr<EngineClient>> EngineClient::launch(ByteString engine_path
         return Error::from_string_literal("Could not listen on the Ladybird engine socket");
 
     client->m_server = move(server);
-    TRY(client->create_frame_channel());
     TRY(client->spawn_engine(engine_path));
     return client;
 }
@@ -101,10 +96,6 @@ ErrorOr<void> EngineClient::spawn_engine(ByteString const& engine_path)
     }
     if (Core::Environment::has("LADYBIRD_SDE_DISABLE_SANDBOX"sv))
         arguments.append("--disable-sandbox"sv);
-    if (m_engine_frame_fd >= 0) {
-        arguments.append("--frame-fd"sv);
-        arguments.append(ByteString::number(m_engine_frame_fd));
-    }
 
     // New windows opened from an engine context menu start another LibGUI
     // frontend, so tell the engine where this executable lives.
@@ -116,45 +107,7 @@ ErrorOr<void> EngineClient::spawn_engine(ByteString const& engine_path)
     // The engine host inherits the environment. It finds WebContent and the
     // resource tree relative to its own path, so the wheel does not need a
     // special prefix here.
-    auto spawn_result = Core::Process::spawn(engine_path, arguments, {}, Core::Process::KeepAsChild::Yes);
-    if (m_engine_frame_fd >= 0) {
-        ::close(m_engine_frame_fd);
-        m_engine_frame_fd = -1;
-    }
-    TRY(spawn_result);
-    return {};
-}
-
-ErrorOr<void> EngineClient::create_frame_channel()
-{
-    int fds[2];
-    if (::socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, fds) < 0)
-        return Error::from_errno(errno);
-
-    // The engine end must survive exec. The frontend end stays close-on-exec.
-    if (::fcntl(fds[1], F_SETFD, 0) < 0) {
-        ::close(fds[0]);
-        ::close(fds[1]);
-        return Error::from_errno(errno);
-    }
-
-    auto socket_or_error = Core::LocalSocket::adopt_fd(fds[0]);
-    if (socket_or_error.is_error()) {
-        ::close(fds[0]);
-        ::close(fds[1]);
-        return socket_or_error.release_error();
-    }
-    auto socket = socket_or_error.release_value();
-    if (auto result = socket->set_blocking(false); result.is_error()) {
-        ::close(fds[1]);
-        return result.release_error();
-    }
-    socket->on_ready_to_read = [this] {
-        read_frames();
-    };
-    m_frame_socket = move(socket);
-    m_engine_frame_fd = fds[1];
-    m_frame_read_buffer.resize(64 * 1024);
+    TRY(Core::Process::spawn(engine_path, arguments, {}, Core::Process::KeepAsChild::Yes));
     return {};
 }
 
@@ -188,90 +141,6 @@ void EngineClient::accept_connection(NonnullOwnPtr<Core::LocalSocket> socket)
 
     if (on_connected)
         on_connected();
-}
-
-void EngineClient::read_frames()
-{
-    while (m_frame_socket) {
-        Vector<int> fds;
-        auto result = m_frame_socket->receive_message(m_frame_read_buffer, MSG_DONTWAIT, fds);
-        if (result.is_error()) {
-            if (result.error().is_errno() && (result.error().code() == EAGAIN || result.error().code() == EWOULDBLOCK))
-                break;
-            warnln("Ladybird: zero-copy frame read failed: {}", result.error());
-            m_frame_socket->close();
-            m_frame_socket = nullptr;
-            break;
-        }
-
-        auto bytes = result.value();
-        if (bytes.is_empty())
-            break;
-
-        int fd = fds.is_empty() ? -1 : fds.take_first();
-        for (auto extra : fds)
-            ::close(extra);
-
-        auto parsed = JsonParser { StringView { reinterpret_cast<char const*>(bytes.data()), bytes.size() } }.parse();
-        if (parsed.is_error() || !parsed.value().is_object()) {
-            if (fd >= 0)
-                ::close(fd);
-            continue;
-        }
-        handle_direct_frame(parsed.value().as_object(), fd);
-    }
-}
-
-void EngineClient::handle_direct_frame(JsonObject const& event, int fd)
-{
-    auto tab_id = event.get_u64("tab"sv);
-    auto width = event.get_i64("width"sv);
-    auto height = event.get_i64("height"sv);
-    auto pitch = event.get_u64("pitch"sv);
-    auto sequence = event.get_u64("sequence"sv).value_or(0);
-    auto generation = event.get_u64("generation"sv).value_or(0);
-    if (!tab_id.has_value() || !width.has_value() || !height.has_value() || !pitch.has_value() || fd < 0) {
-        if (fd >= 0)
-            ::close(fd);
-        return;
-    }
-
-    auto size = Gfx::IntSize { static_cast<int>(*width), static_cast<int>(*height) };
-    auto length = static_cast<size_t>(*pitch) * static_cast<size_t>(*height);
-    auto* data = ::mmap(nullptr, length, PROT_READ, MAP_SHARED, fd, 0);
-    if (data == MAP_FAILED) {
-        warnln("Ladybird: could not map zero-copy frame: {}", strerror(errno));
-        ::close(fd);
-        return;
-    }
-    ::close(fd);
-
-    auto created = Gfx::Bitmap::create_wrapper(Gfx::BitmapFormat::BGRA8888, size, 1, *pitch, data, [data, length] {
-        (void)::munmap(data, length);
-    });
-    if (created.is_error()) {
-        warnln("Ladybird: could not wrap zero-copy frame: {}", created.error());
-        (void)::munmap(data, length);
-        return;
-    }
-
-    bool full = event.get_bool("full"sv).value_or(true);
-    Gfx::IntRect damage { 0, 0, size.width(), size.height() };
-    if (!full) {
-        auto x = event.get_i64("damage_x"sv).value_or(0);
-        auto y = event.get_i64("damage_y"sv).value_or(0);
-        auto w = event.get_i64("damage_width"sv).value_or(size.width());
-        auto h = event.get_i64("damage_height"sv).value_or(size.height());
-        damage = Gfx::IntRect { static_cast<int>(x), static_cast<int>(y), static_cast<int>(w), static_cast<int>(h) }.intersected({ 0, 0, size.width(), size.height() });
-    }
-
-    // Keep the old mapping alive until the callback has installed the new one.
-    auto old = m_direct_frames.take(*tab_id);
-    auto bitmap = created.release_value();
-    auto* bitmap_pointer = bitmap.ptr();
-    m_direct_frames.set(*tab_id, move(bitmap));
-    if (on_frame)
-        on_frame(*tab_id, bitmap_pointer, sequence, generation, damage, full);
 }
 
 void EngineClient::read_available()
@@ -379,10 +248,8 @@ void EngineClient::destroy_frame_buffer(u64 tab_id)
     if (!buffer.has_value())
         return;
 
-    auto direct = m_direct_frames.take(tab_id);
     if (on_frame)
-        on_frame(tab_id, nullptr, 0, 0, {}, true);
-    direct.clear();
+        on_frame(tab_id, nullptr, 0, {}, true);
 
     (*buffer)->bitmaps.clear();
     if ((*buffer)->data)
@@ -478,10 +345,8 @@ void EngineClient::handle_frame(JsonObject const& event)
         damage = Gfx::IntRect { static_cast<int>(damage_x), static_cast<int>(damage_y), static_cast<int>(damage_width), static_cast<int>(damage_height) }.intersected({ 0, 0, size.width(), size.height() });
     }
 
-    auto direct = m_direct_frames.take(*tab_id);
     if (on_frame)
-        on_frame(*tab_id, bitmap.ptr(), sequence, event.get_u64("generation"sv).value_or(0), damage, full);
-    direct.clear();
+        on_frame(*tab_id, bitmap.ptr(), sequence, damage, full);
 }
 
 void EngineClient::send(JsonObject const& event)
@@ -774,13 +639,12 @@ void EngineClient::download_action(StringView action, u64 id)
     send(event);
 }
 
-void EngineClient::frame_ack(u64 tab_id, u64 sequence, u64 generation)
+void EngineClient::frame_ack(u64 tab_id, u64 sequence)
 {
     JsonObject event;
     event.set("type"sv, "frame_ack"sv);
     event.set("tab"sv, tab_id);
     event.set("sequence"sv, sequence);
-    event.set("generation"sv, generation);
     send(event);
 }
 

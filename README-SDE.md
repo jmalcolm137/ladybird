@@ -36,19 +36,15 @@ have deliberately different C++ foundations:
 
 The process boundary keeps both halves honest instead of teaching either stack
 the other's graphics types. It also preserves Ladybird's process isolation and
-crash recovery. The normal frame path is **zero-copy**: the engine sends a
-duplicate of the compositor bitmap's anonymous-buffer fd over an inherited
-`SOCK_SEQPACKET` channel, and the frontend maps that bitmap read-only and paints
-it. The engine defers releasing the compositor backing store until the frontend
-acknowledges that it has replaced the frame, so pixels cannot be overwritten
-while still on screen. Frames are paced at the output rate (60 Hz by default) and
-intermediate paints are coalesced when the frontend is behind.
-
-A **three-slot POSIX shared-memory ring** remains as a fallback for bitmaps
-without a shareable fd. In that path the engine copies a completed frame into a
-free slot and sends a small JSON message naming it; steady-state copies are
-limited to the damaged region, with full copies reserved for first frames,
-resizes, and stale slots. Input and navigation are small control messages.
+crash recovery. Frames are published in a **three-slot POSIX shared-memory ring**
+per tab. The engine copies a completed frame into a free slot and sends a small
+JSON message naming the slot; the frontend wraps that slot in a `Gfx::Bitmap`
+and paints it. A slot remains in flight until the frontend acknowledges that it
+has replaced the frame, so the engine cannot overwrite pixels still on screen;
+when all slots are busy, intermediate paints are coalesced. In steady state only
+the damaged region is copied, with full copies reserved for first frames,
+resizes, and stale slots. Nothing is encoded, sent over the socket, or read back
+from disk. Input and navigation are small control messages.
 
 The frontend **does not** contain a web engine. The engine host **does not**
 draw chrome. Replacing either half leaves the other intact.
@@ -173,8 +169,7 @@ navigating the real engine.
 * View Source (`Ctrl+U`).
 * Internal pages from the Ladybird engine: `about:settings`, `about:history`,
   `about:bookmarks`, `about:downloads`.
-* Zero-copy frame delivery through a shared compositor bitmap, with a
-  damage-aware shared-memory ring fallback and acknowledged buffer lifetime.
+* Frame delivery through shared memory with no per-frame socket payload.
 
 ## Parity with the Qt frontend
 
@@ -192,8 +187,8 @@ Still to wire to the frontend:
 * Address-bar autocomplete and search suggestions
 * Rich clipboard types, drag and drop, and IME composition
 * HiDPI frame scaling (the engine host currently paints at the logical scale)
-* GPU/DMA-BUF compositor presentation; the normal CPU path is zero-copy through
-  shared bitmaps, while the fallback ring still copies damaged regions
+* GPU/zero-copy frame sharing; the engine still CPU-copies pixels into the ring,
+  although steady-state updates now copy only damaged regions
 * Settings that need a native dialog rather than the internal settings page
 
 The control protocol is deliberately small and append-only so each of these can
@@ -201,12 +196,10 @@ be added without touching the other half.
 
 ## Protocol
 
-The control wire format is one JSON object per line over a Unix socket. Frame
-pixels normally travel on a separate inherited `SOCK_SEQPACKET` channel as a
-shared bitmap fd; the frontend acknowledges replacement through `frame_ack`. The
-engine also supports a POSIX shared-memory ring per tab, announced with
-`frame_buffer`, for bitmaps that cannot be shared directly. The frontend sends
-commands such as `create_tab`, `navigate`, `resize`, `mouse`,
+The wire format is one JSON object per line over a Unix socket. The engine
+creates a POSIX shared-memory object per tab and announces it with
+`frame_buffer`; each `frame` event names a slot and the live dimensions. The
+frontend sends commands such as `create_tab`, `navigate`, `resize`, `mouse`,
 `wheel`, `key`, `find`, `find_next`, `toggle_bookmark`, `context_menu_action`,
 `permission_response`, `file_picker_response`, `select_dropdown_closed`,
 `download_action`, and `quit`.

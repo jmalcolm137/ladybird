@@ -149,14 +149,6 @@ public:
     // Damage reported by the WebContent compositor for the most recently presented frame. This is in frame pixels.
     Gfx::IntRect last_presented_damage_rect() const { return m_last_presented_damage_rect; }
 
-    // A frontend that keeps the presented bitmap mapped in another process must
-    // hold its compositor backing store until it has replaced that frame. When
-    // deferred, releases are queued and the frontend calls
-    // release_backing_stores_through() with the generation it acknowledged.
-    void set_defer_backing_store_release(bool defer) { m_defer_backing_store_release = defer; }
-    u64 displayed_bitmap_generation() const { return m_front_bitmap_generation; }
-    void release_backing_stores_through(u64 generation);
-
     void set_window_position(Gfx::IntPoint);
     void set_window_size(Gfx::IntSize);
     void set_system_visibility_state(Web::HTML::VisibilityState);
@@ -789,13 +781,6 @@ protected:
     Vector<SharedBitmap> m_other_bitmaps;
     bool m_has_usable_bitmap { false };
     Gfx::IntRect m_last_presented_damage_rect;
-    bool m_defer_backing_store_release { false };
-    u64 m_front_bitmap_generation { 0 };
-    struct DeferredBackingStoreRelease {
-        i32 bitmap_id { -1 };
-        u64 generation { 0 };
-    };
-    Vector<DeferredBackingStoreRelease> m_deferred_backing_store_releases;
 
     // Set once an assistive technology asked for the page tree; every display page the view shows from then on gets
     // asked for its tree too.

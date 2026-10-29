@@ -40,7 +40,7 @@ class EngineServer : private WebView::FileDownloaderObserver {
     AK_ALLOC_WITH_KMALLOC;
 
 public:
-    EngineServer(NonnullOwnPtr<Core::LocalSocket> socket, OwnPtr<Core::LocalSocket> frame_socket, ByteString frame_directory, Core::AnonymousBuffer theme);
+    EngineServer(NonnullOwnPtr<Core::LocalSocket> socket, ByteString frame_directory, Core::AnonymousBuffer theme);
     ~EngineServer();
 
     ErrorOr<void> start();
@@ -92,8 +92,6 @@ private:
         u64 presented_sequence { 0 };
         Gfx::IntSize frame_content_size;
         bool frame_dirty { false };
-        u64 last_direct_sequence { 0 };
-        Vector<u64> direct_generations_in_flight;
         Vector<FrameSlotState> frame_slot_states;
         Vector<FrameDamage> frame_damage_history;
         bool focused { false };
@@ -138,17 +136,9 @@ private:
     void destroy_tab(u64 tab_id);
     bool ensure_frame_buffer(Tab&, Gfx::IntSize);
     void destroy_frame_buffer(Tab&);
-    enum class DirectFrameResult {
-        Sent,
-        Retry,
-        Unavailable,
-    };
     void reset_frame_tracking(Tab&);
     void on_view_painted(Tab&);
-    void request_frame_send();
-    void flush_dirty_frames();
     void try_send_frame(Tab&);
-    DirectFrameResult try_send_direct_frame(Tab&, Gfx::Bitmap&, Gfx::IntRect damage, bool full);
     Gfx::IntRect damage_since(Tab&, u64 content_sequence, u64 latest_sequence, Gfx::IntSize, bool& needs_full_copy);
     void send_event(JsonObject);
     void flush_writes();
@@ -173,9 +163,6 @@ private:
     virtual void download_removed(u64 id, WebView::IsPrivate) override;
 
     NonnullOwnPtr<Core::LocalSocket> m_socket;
-    OwnPtr<Core::LocalSocket> m_frame_socket;
-    RefPtr<Core::Notifier> m_frame_write_notifier;
-    RefPtr<Core::Timer> m_frame_pacing_timer;
     ByteString m_frame_directory;
     Core::AnonymousBuffer m_theme;
     Vector<u8> m_read_buffer;

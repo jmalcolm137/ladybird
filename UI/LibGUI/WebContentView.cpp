@@ -22,30 +22,24 @@ WebContentView::WebContentView()
     set_override_cursor(Gfx::StandardCursor::Arrow);
 }
 
-void WebContentView::set_frame(Gfx::Bitmap const* frame, u64 sequence, u64 generation, Gfx::IntRect damage, bool full)
+void WebContentView::set_frame(Gfx::Bitmap const* frame, u64 sequence, Gfx::IntRect damage, bool full)
 {
-    // Replacing the frame releases the old shared-memory buffer. The engine must
-    // not reuse a backing store while this widget can still paint from it.
-    bool previous_was_painted = m_frame_was_painted;
+    // Replacing the frame releases the old shared-memory slot. The engine must
+    // not reuse a slot while this widget can still paint from it.
     if (m_frame && m_frame_sequence != 0 && m_frame_sequence != sequence) {
         if (on_frame_ack)
-            on_frame_ack(m_frame_sequence, m_frame_generation);
+            on_frame_ack(m_frame_sequence);
     }
 
     m_frame = frame;
     m_frame_sequence = frame ? sequence : 0;
-    m_frame_generation = frame ? generation : 0;
-    m_frame_was_painted = false;
 
     if (!m_frame) {
         update();
         return;
     }
 
-    // If the previous frame was replaced before it was painted, the widget's
-    // backing store is older than the damage rectangle describes. Repaint the
-    // whole frame in that case.
-    if (full || !previous_was_painted || damage.is_empty() || m_frame->size() != size())
+    if (full || damage.is_empty() || m_frame->size() != size())
         update();
     else
         update(damage.intersected(rect()));
@@ -83,8 +77,6 @@ void WebContentView::paint_event(GUI::PaintEvent& event)
         painter.fill_rect(rect(), Gfx::Color::from_argb(0xa0202020));
         painter.draw_text(rect(), "The page crashed — click to reload"sv, font(), Gfx::TextAlignment::Center, Gfx::Color::from_rgb(0xffffff));
     }
-
-    m_frame_was_painted = m_frame != nullptr;
 }
 
 void WebContentView::resize_event(GUI::ResizeEvent& event)
@@ -143,7 +135,7 @@ void WebContentView::doubleclick_event(GUI::MouseEvent& event)
 void WebContentView::mousewheel_event(GUI::MouseEvent& event)
 {
     // LibGUI reports wheel motion in notches; the engine wants pixel deltas.
-    static constexpr int scroll_step_size = 48;
+    static constexpr int scroll_step_size = 24;
     if (on_wheel)
         on_wheel(event.position(), event.wheel_delta_x() * scroll_step_size, event.wheel_delta_y() * scroll_step_size, event.modifiers());
     event.accept();

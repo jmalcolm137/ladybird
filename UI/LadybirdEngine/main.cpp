@@ -12,7 +12,6 @@
 #include <LibCore/Socket.h>
 #include <LibGfx/SystemTheme.h>
 #include <LibWebCommon/WebView/Utilities.h>
-#include <fcntl.h>
 #include <signal.h>
 
 ErrorOr<int> ladybird_main(Main::Arguments arguments)
@@ -29,18 +28,11 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
     }
 
     auto socket = TRY(Core::LocalSocket::connect(app->engine_socket_path()));
-    OwnPtr<Core::LocalSocket> frame_socket;
-    if (app->frame_socket_fd() >= 0) {
-        // The engine owns the frame channel; helper processes must not keep it
-        // alive after exec.
-        (void)::fcntl(app->frame_socket_fd(), F_SETFD, FD_CLOEXEC);
-        frame_socket = TRY(Core::LocalSocket::adopt_fd(app->frame_socket_fd()));
-    }
 
     auto theme_path = LexicalPath::join(WebView::s_ladybird_resource_root.view(), "themes"sv, "Default.ini"sv);
     auto theme = TRY(Gfx::load_system_theme(theme_path.string()));
 
-    auto server = make<LadybirdSDE::EngineServer>(move(socket), move(frame_socket), app->frame_directory(), move(theme));
+    auto server = make<LadybirdSDE::EngineServer>(move(socket), app->frame_directory(), move(theme));
     TRY(server->start());
 
     Core::EventLoop::register_signal(SIGINT, [](int) {

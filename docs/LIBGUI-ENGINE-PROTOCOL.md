@@ -34,7 +34,7 @@ Version: `Shared/EngineProtocol.h`.
 | `permission_response` | `tab`, `request`, `granted` | Answer a page permission request. |
 | `file_picker_response` | `tab`, `path` | Answer a file picker request; empty cancels. |
 | `select_dropdown_closed` | `tab`, `selected` | Answer a `<select>` popup; omit `selected` when canceled. |
-| `frame_ack` | `tab`, `sequence`, `generation` | The frontend has replaced the frame it was displaying. The engine may reuse the shared-memory slot or release the direct backing store. |
+| `frame_ack` | `tab`, `sequence` | The frontend has replaced the frame it was displaying. The engine may reuse that shared-memory slot. |
 | `download_action` | `action`, `id` | `open`, `show_in_folder`, `pause`, `resume`, `cancel`, or `clear`. |
 | `quit` | | Shut the engine host down. |
 
@@ -67,24 +67,16 @@ Version: `Shared/EngineProtocol.h`.
 | `download_added` / `download_updated` | `download` | A download was added or changed (`id`, `url`, `destination`, `status`, `downloaded`, `total`, `progress`, `can_resume`, `private`, `error`). |
 | `download_removed` | `id`, `private` | A download left the list. |
 | `frame_buffer` | `tab`, `name`, `slots`, `slot_size`, `width`, `height` | Map this shared-memory object. |
-| `frame` | `tab`, `slot`, `width`, `height`, `stride`, `sequence`, `generation`, `direct`, `full`, `damage_x`, `damage_y`, `damage_width`, `damage_height` | A copied frame in `slot`, or a zero-copy frame on the separate frame-fd socket (`direct: true`, `pitch` instead of `stride`). `generation` identifies the engine backing store for acknowledgement. |
-
-The engine normally sends zero-copy frames on the inherited `SOCK_SEQPACKET`
-frame-fd socket: the message carries a duplicate of the compositor bitmap's
-anonymous-buffer fd, and the frontend maps it read-only. The engine holds that
-backing store until the frontend acknowledges replacement. If the bitmap has no
-shareable fd, or the direct send would block, the engine falls back to the
-three-slot POSIX shared-memory ring described below.
+| `frame` | `tab`, `slot`, `width`, `height`, `stride`, `sequence`, `full`, `damage_x`, `damage_y`, `damage_width`, `damage_height` | The slot holds a new frame. `full` means the whole slot was rewritten; otherwise only the damage rectangle changed. |
 
 The engine writes into a free slot in the ring. The frontend wraps the slot in a
-`Gfx::Bitmap` and paints it; no pixel data is serialized. A slot or direct
-backing store stays in flight until the frontend sends `frame_ack`, so the engine
-never overwrites pixels the frontend may still display. When all ring slots are
-in flight, the engine coalesces new paints and publishes only the latest one
-after an acknowledgement. In steady state it copies just the damaged region into
-a slot whose contents are an older frame; a full copy is used for the first
-frame, after a resize, or when the retained damage history can no longer describe
-every changed pixel. Direct frames avoid the copy entirely.
+`Gfx::Bitmap` and paints it; no pixel data is serialized. A slot stays in flight
+until the frontend sends `frame_ack`, so the engine never overwrites pixels the
+frontend may still display. When all slots are in flight, the engine coalesces
+new paints and publishes only the latest one after an acknowledgement. In steady
+state it copies just the damaged region into a slot whose contents are an older
+frame; a full copy is used for the first frame, after a resize, or when the
+retained damage history can no longer describe every changed pixel.
 
 One engine host serves one frontend process. The frontend may create several
 LibGUI windows, each owning a subset of the engine's tabs. Tab-scoped events are

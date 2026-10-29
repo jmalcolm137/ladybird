@@ -18,7 +18,6 @@
 #include <LibCore/Notifier.h>
 #include <LibCore/Socket.h>
 #include <LibCore/System.h>
-#include <LibCore/Timer.h>
 #include <LibGfx/Bitmap.h>
 #include <LibGfx/ImageFormats/PNGWriter.h>
 #include <LibGfx/SystemTheme.h>
@@ -42,7 +41,6 @@
 #include <fcntl.h>
 #include <string.h>
 #include <sys/mman.h>
-#include <sys/socket.h>
 #include <unistd.h>
 
 namespace LadybirdSDE {
@@ -71,9 +69,8 @@ protected:
     virtual WebView::ViewImplementation* create_view_for_new_tab_or_window(WebView::IsPrivate) override { return nullptr; }
 };
 
-EngineServer::EngineServer(NonnullOwnPtr<Core::LocalSocket> socket, OwnPtr<Core::LocalSocket> frame_socket, ByteString frame_directory, Core::AnonymousBuffer theme)
+EngineServer::EngineServer(NonnullOwnPtr<Core::LocalSocket> socket, ByteString frame_directory, Core::AnonymousBuffer theme)
     : m_socket(move(socket))
-    , m_frame_socket(move(frame_socket))
     , m_frame_directory(move(frame_directory))
     , m_theme(move(theme))
 {
@@ -83,15 +80,9 @@ EngineServer::~EngineServer()
 {
     EngineApplication::the().set_open_blank_new_tab_handler({});
     EngineApplication::the().set_open_new_window_handler({});
-    if (m_frame_pacing_timer)
-        m_frame_pacing_timer->stop();
     if (m_write_notifier) {
         m_write_notifier->close();
         m_write_notifier.clear();
-    }
-    if (m_frame_write_notifier) {
-        m_frame_write_notifier->close();
-        m_frame_write_notifier.clear();
     }
     for (auto& [id, tab] : m_tabs) {
         destroy_frame_buffer(*tab);
@@ -117,28 +108,6 @@ ErrorOr<void> EngineServer::start()
         };
         m_write_notifier->set_enabled(false);
     }
-    if (m_frame_socket) {
-        (void)m_frame_socket->set_blocking(false);
-        if (auto fd = m_frame_socket->fd(); fd.has_value()) {
-            m_frame_write_notifier = Core::Notifier::construct(*fd, Core::Notifier::Type::Write);
-            m_frame_write_notifier->on_activation = [this] {
-                m_frame_write_notifier->set_enabled(false);
-                request_frame_send();
-            };
-            m_frame_write_notifier->set_enabled(false);
-        }
-    }
-
-    auto pacing_interval = 16;
-    if (auto const* refresh = getenv("SDE_OUTPUT_REFRESH"); refresh && *refresh) {
-        auto hz = atoi(refresh);
-        if (hz > 0)
-            pacing_interval = max(1, 1000 / hz);
-    }
-    m_frame_pacing_timer = Core::Timer::create_repeating(AK::Duration::from_milliseconds(pacing_interval), [this] {
-        flush_dirty_frames();
-    });
-    m_frame_pacing_timer->stop();
 
     JsonObject hello;
     hello.set("type"sv, "hello"sv);
@@ -385,8 +354,6 @@ void EngineServer::wire_tab(Tab& tab)
 {
     auto tab_id = tab.id;
 
-    tab.view->set_defer_backing_store_release(true);
-
     tab.view->on_ready_to_paint = [this, tab_id] {
         if (auto* tab = tab_for_id(tab_id))
             on_view_painted(*tab);
@@ -612,7 +579,6 @@ void EngineServer::destroy_tab(u64 tab_id)
     if (!tab.has_value())
         return;
 
-    (*tab)->view->release_backing_stores_through(~0ull);
     destroy_frame_buffer(**tab);
     auto favicon_path = ByteString::formatted("{}/favicon-{}.png", m_frame_directory, tab_id);
     (void)Core::System::unlink(favicon_path.view());
@@ -774,8 +740,6 @@ void EngineServer::handle_wheel(u64 tab_id, JsonObject const& command)
 
     event.wheel_delta_x = command.get_double_with_precision_loss("delta_x"sv).value_or(0.0);
     event.wheel_delta_y = command.get_double_with_precision_loss("delta_y"sv).value_or(0.0);
-    if (getenv("LADYBIRD_SDE_TRACE_FRAMES"))
-        warnln("LadybirdEngine: tab {} wheel at {},{} delta {}x{}", tab_id, event.position.x(), event.position.y(), event.wheel_delta_x, event.wheel_delta_y);
     event.wheel_delta_precision = Web::WheelDeltaPrecision::Discrete;
     event.wheel_tick_120ths_x = Web::wheel_tick_120ths_from_pixel_delta(event.wheel_delta_x, event.wheel_delta_precision);
     event.wheel_tick_120ths_y = Web::wheel_tick_120ths_from_pixel_delta(event.wheel_delta_y, event.wheel_delta_precision);
@@ -1062,31 +1026,7 @@ void EngineServer::on_view_painted(Tab& tab)
     if (tab.frame_damage_history.size() > 512)
         tab.frame_damage_history.remove(0, tab.frame_damage_history.size() - 512);
     tab.frame_dirty = true;
-    request_frame_send();
-}
-
-void EngineServer::request_frame_send()
-{
-    if (!m_frame_pacing_timer) {
-        flush_dirty_frames();
-        return;
-    }
-    if (!m_frame_pacing_timer->is_active())
-        m_frame_pacing_timer->start();
-}
-
-void EngineServer::flush_dirty_frames()
-{
-    bool any_dirty = false;
-    for (auto& [id, tab] : m_tabs) {
-        (void)id;
-        if (!tab->frame_dirty)
-            continue;
-        try_send_frame(*tab);
-        any_dirty |= tab->frame_dirty;
-    }
-    if (!any_dirty && m_frame_pacing_timer)
-        m_frame_pacing_timer->stop();
+    try_send_frame(tab);
 }
 
 Gfx::IntRect EngineServer::damage_since(Tab& tab, u64 content_sequence, u64 latest_sequence, Gfx::IntSize size, bool& needs_full_copy)
@@ -1139,68 +1079,6 @@ Gfx::IntRect EngineServer::damage_since(Tab& tab, u64 content_sequence, u64 late
     return union_rect;
 }
 
-EngineServer::DirectFrameResult EngineServer::try_send_direct_frame(Tab& tab, Gfx::Bitmap& bitmap, Gfx::IntRect damage, bool full)
-{
-    if (!m_frame_socket)
-        return DirectFrameResult::Unavailable;
-    if (tab.direct_generations_in_flight.size() >= 2)
-        return DirectFrameResult::Retry;
-
-    auto fd = bitmap.anonymous_buffer().fd();
-    if (fd < 0)
-        return DirectFrameResult::Unavailable;
-
-    auto size = bitmap.size();
-    auto generation = tab.view->displayed_bitmap_generation();
-    JsonObject event;
-    event.set("type"sv, "frame"sv);
-    event.set("tab"sv, tab.id);
-    event.set("direct"sv, true);
-    event.set("width"sv, size.width());
-    event.set("height"sv, size.height());
-    event.set("pitch"sv, static_cast<u64>(bitmap.pitch()));
-    event.set("sequence"sv, tab.presented_sequence);
-    event.set("generation"sv, generation);
-    event.set("full"sv, full);
-    event.set("damage_x"sv, damage.x());
-    event.set("damage_y"sv, damage.y());
-    event.set("damage_width"sv, damage.width());
-    event.set("damage_height"sv, damage.height());
-
-    auto serialized = event.serialized();
-    StringBuilder builder;
-    builder.append(serialized.bytes_as_string_view());
-    builder.append('\n');
-    auto bytes = builder.string_view().bytes();
-    Vector<int, 1> fds;
-    fds.append(fd);
-    auto result = m_frame_socket->send_message(bytes, MSG_DONTWAIT, move(fds));
-    if (result.is_error()) {
-        if (result.error().is_errno() && (result.error().code() == EAGAIN || result.error().code() == EWOULDBLOCK)) {
-            if (m_frame_write_notifier)
-                m_frame_write_notifier->set_enabled(true);
-            return DirectFrameResult::Retry;
-        }
-        warnln("LadybirdEngine: zero-copy frame send failed: {}", result.error());
-        if (m_frame_write_notifier) {
-            m_frame_write_notifier->close();
-            m_frame_write_notifier.clear();
-        }
-        m_frame_socket->close();
-        m_frame_socket = nullptr;
-        return DirectFrameResult::Unavailable;
-    }
-    if (result.value() != bytes.size()) {
-        warnln("LadybirdEngine: short zero-copy frame send");
-        return DirectFrameResult::Retry;
-    }
-
-    if (getenv("LADYBIRD_SDE_TRACE_FRAMES"))
-        warnln("LadybirdEngine: tab {} direct frame {} generation {} full={} damage {}x{}+{},{}", tab.id, tab.presented_sequence, generation, full, damage.width(), damage.height(), damage.x(), damage.y());
-    tab.direct_generations_in_flight.append(generation);
-    return DirectFrameResult::Sent;
-}
-
 void EngineServer::try_send_frame(Tab& tab)
 {
     if (!tab.frame_dirty)
@@ -1218,34 +1096,6 @@ void EngineServer::try_send_frame(Tab& tab)
         if (getenv("LADYBIRD_SDE_TRACE_FRAMES"))
             warnln("LadybirdEngine: tab {} viewport {}x{} frame {}x{} zoom {}", tab.id, tab.viewport_size.width(), tab.viewport_size.height(), size.width(), size.height(), tab.view->zoom_level());
         tab.last_reported_frame_size = size;
-    }
-
-    // Prefer zero-copy: hand the frontend the compositor's own shareable bitmap
-    // and hold the backing store until it acknowledges replacement. If the
-    // bitmap has no shareable fd, fall through to the copied ring.
-    if (m_frame_socket && !getenv("LADYBIRD_SDE_DISABLE_ZERO_COPY")) {
-        bool full = tab.last_direct_sequence == 0;
-        bool needs_full_copy = false;
-        auto frame_rect = Gfx::IntRect { 0, 0, size.width(), size.height() };
-        auto damage = frame_rect;
-        if (!full) {
-            damage = damage_since(tab, tab.last_direct_sequence, tab.presented_sequence, size, needs_full_copy);
-            full = needs_full_copy;
-        }
-        if (!full && damage.is_empty()) {
-            tab.last_direct_sequence = tab.presented_sequence;
-            tab.frame_dirty = false;
-            return;
-        }
-
-        auto result = try_send_direct_frame(tab, *bitmap, damage, full);
-        if (result == DirectFrameResult::Sent) {
-            tab.last_direct_sequence = tab.presented_sequence;
-            tab.frame_dirty = false;
-            return;
-        }
-        if (result == DirectFrameResult::Retry)
-            return;
     }
 
     // A painted frame can briefly be larger than the requested viewport during a
@@ -1327,8 +1177,6 @@ void EngineServer::try_send_frame(Tab& tab)
     event.set("height"sv, size.height());
     event.set("stride"sv, static_cast<u64>(stride));
     event.set("sequence"sv, tab.presented_sequence);
-    event.set("generation"sv, tab.view->displayed_bitmap_generation());
-    event.set("direct"sv, false);
     event.set("full"sv, full_copy);
     event.set("damage_x"sv, damage.x());
     event.set("damage_y"sv, damage.y());
@@ -1347,11 +1195,6 @@ void EngineServer::handle_frame_ack(u64 tab_id, JsonObject const& command)
     if (!sequence.has_value())
         return;
 
-    if (auto generation = command.get_u64("generation"sv); generation.has_value() && *generation != 0) {
-        tab->direct_generations_in_flight.remove_first_matching([&](auto candidate) { return candidate == *generation; });
-        tab->view->release_backing_stores_through(*generation);
-    }
-
     for (auto& slot : tab->frame_slot_states) {
         if (slot.in_flight && slot.in_flight_sequence == *sequence) {
             slot.in_flight = false;
@@ -1360,7 +1203,7 @@ void EngineServer::handle_frame_ack(u64 tab_id, JsonObject const& command)
     }
 
     if (tab->frame_dirty)
-        request_frame_send();
+        try_send_frame(*tab);
 }
 
 void EngineServer::send_event(JsonObject event)
