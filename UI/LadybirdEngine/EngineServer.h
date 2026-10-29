@@ -99,6 +99,7 @@ private:
         bool unresponsive_reported { false };
         u8 responsive_frame_count { 0 };
         unsigned input_events_since_frame { 0 };
+        unsigned wheel_events_since_frame { 0 };
         MonotonicTime input_wait_started;
         MonotonicTime last_cpu_sample_time;
         u64 last_cpu_ticks { 0 };

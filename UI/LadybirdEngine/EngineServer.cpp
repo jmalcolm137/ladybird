@@ -787,6 +787,7 @@ void EngineServer::handle_wheel(u64 tab_id, JsonObject const& command)
 
     if (getenv("LADYBIRD_SDE_TRACE_FRAMES"))
         warnln("LadybirdEngine: tab {} wheel delta {}x{}", tab_id, event.wheel_delta_x, event.wheel_delta_y);
+    ++tab->wheel_events_since_frame;
     tab->view->enqueue_input_event(move(event));
     note_user_input(*tab);
 }
@@ -1251,6 +1252,7 @@ void EngineServer::note_frame_presented(Tab& tab, u64 sequence)
     (void)sequence;
     tab.has_presented_frame = true;
     tab.input_events_since_frame = 0;
+    tab.wheel_events_since_frame = 0;
 
     if (tab.unresponsive_reported) {
         // A frame that was already queued when the renderer spun can arrive
@@ -1333,7 +1335,7 @@ void EngineServer::check_unresponsive_tabs()
             tab->unresponsive_reported = true;
             tab->responsive_frame_count = 0;
             set_unresponsive(*tab, true);
-        } else if (waited_ms >= 12000 && tab->input_events_since_frame >= 4 && cpu_fraction < 0.5) {
+        } else if (waited_ms >= 12000 && tab->wheel_events_since_frame >= 4 && cpu_fraction < 0.5) {
             // A renderer can also deadlock without spinning. Input is queued but
             // no frame arrives; after several attempts to move the page, offer a
             // hard reload rather than leaving the client area frozen.
