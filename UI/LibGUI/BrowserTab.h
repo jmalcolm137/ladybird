@@ -50,6 +50,7 @@ public:
     bool can_go_forward() const { return m_can_go_forward; }
     bool is_bookmarked() const { return m_bookmarked; }
 
+    void set_window_id(u64 window_id) { m_window_id = window_id; }
     void create_engine_tab(u64 request_id, String const& url, bool private_tab = false);
     void set_initial_url(String const& url) { m_initial_url = url; }
     String const& initial_url() const { return m_initial_url; }
@@ -116,6 +117,7 @@ private:
     bool m_select_dropdown_visible { false };
 
     u64 m_tab_id { 0 };
+    u64 m_window_id { 0 };
     u64 m_request_id { 0 };
     String m_initial_url;
     String m_title;

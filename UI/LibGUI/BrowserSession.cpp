@@ -16,6 +16,7 @@
 #include <LibCore/File.h>
 #include <LibCore/StandardPaths.h>
 #include <LibCore/System.h>
+#include <LibCore/Timer.h>
 #include <LibGUI/Application.h>
 
 namespace LadybirdSDE {
@@ -69,6 +70,15 @@ static Optional<Gfx::IntSize> size_from_object(JsonObject const& object)
     return Gfx::IntSize { static_cast<int>(*width), static_cast<int>(*height) };
 }
 
+static Optional<Gfx::IntPoint> position_from_object(JsonObject const& object)
+{
+    auto x = object.get_i64("x"sv);
+    auto y = object.get_i64("y"sv);
+    if (!x.has_value() || !y.has_value())
+        return {};
+    return Gfx::IntPoint { static_cast<int>(*x), static_cast<int>(*y) };
+}
+
 ErrorOr<NonnullOwnPtr<BrowserSession>> BrowserSession::create(Vector<String> initial_urls, bool private_window)
 {
     auto engine_path = find_engine_path();
@@ -98,16 +108,28 @@ ErrorOr<NonnullOwnPtr<BrowserSession>> BrowserSession::create(Vector<String> ini
 
 BrowserSession::~BrowserSession()
 {
+    if (m_autosave_timer)
+        m_autosave_timer->stop();
     save_session();
 }
 
 ErrorOr<void> BrowserSession::initialize(Vector<String> initial_urls, bool private_window)
 {
-    if (initial_urls.is_empty() && !private_window && load_session())
+    if (initial_urls.is_empty() && !private_window && should_restore_session() && load_session()) {
+        m_autosave_timer = Core::Timer::create_repeating(30 * 1000, [this] {
+            save_session();
+        });
+        m_autosave_timer->start();
         return {};
+    }
 
     if (!create_window_internal(move(initial_urls), private_window))
         return Error::from_string_literal("Unable to create the browser window");
+
+    m_autosave_timer = Core::Timer::create_repeating(30 * 1000, [this] {
+        save_session();
+    });
+    m_autosave_timer->start();
     return {};
 }
 
@@ -130,9 +152,9 @@ BrowserWindow* BrowserSession::create_window(Vector<String> urls, bool private_w
     return create_window_internal(move(urls), private_window);
 }
 
-BrowserWindow* BrowserSession::create_window_internal(Vector<String> urls, bool private_window, Optional<Gfx::IntSize> size, Optional<size_t> active_tab)
+BrowserWindow* BrowserSession::create_window_internal(Vector<String> urls, bool private_window, Optional<Gfx::IntSize> size, Optional<Gfx::IntPoint> position, Optional<size_t> active_tab, bool maximized)
 {
-    auto window = make<BrowserWindow>(*this, *m_engine, private_window);
+    auto window = make<BrowserWindow>(*this, *m_engine, m_next_window_id++, private_window);
     if (auto result = window->initialize(move(urls)); result.is_error()) {
         warnln("Ladybird: could not create a browser window: {}", result.error());
         return nullptr;
@@ -141,12 +163,16 @@ BrowserWindow* BrowserSession::create_window_internal(Vector<String> urls, bool 
     auto* window_pointer = window.ptr();
     m_windows.append(move(window));
 
+    if (position.has_value())
+        window_pointer->set_window_position(*position);
     if (size.has_value())
         window_pointer->set_window_size(*size);
     if (active_tab.has_value())
         window_pointer->activate_tab_index(*active_tab);
 
     window_pointer->show();
+    if (maximized)
+        window_pointer->set_maximized(true);
     return window_pointer;
 }
 
@@ -161,6 +187,15 @@ BrowserWindow* BrowserSession::window_for_tab(u64 tab_id)
 {
     for (auto& window : m_windows) {
         if (window->has_tab(tab_id))
+            return window.ptr();
+    }
+    return nullptr;
+}
+
+BrowserWindow* BrowserSession::window_for_id(u64 window_id)
+{
+    for (auto& window : m_windows) {
+        if (window->id() == window_id)
             return window.ptr();
     }
     return nullptr;
@@ -196,6 +231,10 @@ void BrowserSession::on_engine_event(JsonObject const& event)
             target = window_for_request(request_id);
         } else if (auto parent = event.get_u64("parent"sv); parent.has_value()) {
             target = window_for_tab(*parent);
+        }
+        if (!target) {
+            if (auto window_id = event.get_u64("window"sv); window_id.has_value())
+                target = window_for_id(*window_id);
         }
         if (!target)
             target = active_window();
@@ -283,6 +322,25 @@ ByteString BrowserSession::session_path() const
     return LexicalPath::join(Core::StandardPaths::config_directory(), "ladybird-sde"sv, ByteString::formatted("session-{}.json", profile_name)).string();
 }
 
+bool BrowserSession::should_restore_session() const
+{
+    auto profile = Core::Environment::get("LADYBIRD_SDE_PROFILE"sv);
+    auto profile_name = profile.has_value() ? profile->to_byte_string() : ByteString { "libgui" };
+    auto settings_path = LexicalPath::join(Core::StandardPaths::config_directory(), "Ladybird"sv, "Profiles"sv, profile_name, "Settings.json"sv).string();
+    auto file = Core::File::open(settings_path, Core::File::OpenMode::Read);
+    if (file.is_error())
+        return false;
+    auto contents = file.value()->read_until_eof();
+    if (contents.is_error())
+        return false;
+    auto buffer = contents.release_value();
+    StringView json { reinterpret_cast<char const*>(buffer.data()), buffer.size() };
+    auto parsed = JsonParser { json }.parse();
+    if (parsed.is_error() || !parsed.value().is_object())
+        return false;
+    return parsed.value().as_object().get_bool("restorePreviousSession"sv).value_or(false);
+}
+
 void BrowserSession::save_session()
 {
     if (Core::Environment::has("LADYBIRD_SDE_DISABLE_SESSION_RESTORE"sv))
@@ -303,9 +361,13 @@ void BrowserSession::save_session()
             continue;
 
         auto size = window->window_size();
+        auto position = window->window_position();
         JsonObject entry;
+        entry.set("x"sv, position.x());
+        entry.set("y"sv, position.y());
         entry.set("width"sv, size.width());
         entry.set("height"sv, size.height());
+        entry.set("maximized"sv, window->is_maximized());
         entry.set("active"sv, static_cast<u64>(window->active_tab_index()));
         entry.set("tabs"sv, move(tabs));
         windows.must_append(move(entry));
@@ -372,7 +434,7 @@ bool BrowserSession::load_session()
         if (auto active = entry.get_u64("active"sv); active.has_value())
             active_tab = static_cast<size_t>(*active);
 
-        create_window_internal(move(urls), false, size_from_object(entry), active_tab);
+        create_window_internal(move(urls), false, size_from_object(entry), position_from_object(entry), active_tab, entry.get_bool("maximized"sv).value_or(false));
     }
 
     return !m_windows.is_empty();
@@ -392,7 +454,7 @@ bool BrowserSession::load_legacy_session(JsonObject const& session)
     if (auto active = session.get_u64("active"sv); active.has_value())
         active_tab = static_cast<size_t>(*active);
 
-    return create_window_internal(move(urls), false, size_from_object(session), active_tab) != nullptr;
+    return create_window_internal(move(urls), false, size_from_object(session), position_from_object(session), active_tab, session.get_bool("maximized"sv).value_or(false)) != nullptr;
 }
 
 }

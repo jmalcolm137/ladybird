@@ -36,9 +36,9 @@ public:
 
     bool is_connected() const { return m_socket != nullptr; }
 
-    void create_tab(Gfx::IntSize viewport_size, String const& url, u64 request_id, bool private_tab = false);
+    void create_tab(Gfx::IntSize viewport_size, String const& url, u64 request_id, bool private_tab = false, u64 window_id = 0);
     void close_tab(u64 tab_id);
-    void activate_tab(u64 tab_id);
+    void activate_tab(u64 tab_id, u64 window_id = 0);
     void navigate(u64 tab_id, String const& url, bool user_input = true);
     void go_back(u64 tab_id);
     void go_forward(u64 tab_id);

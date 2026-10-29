@@ -126,18 +126,21 @@ ErrorOr<void> EngineServer::start()
         event.set("type"sv, "open_window"sv);
         event.set("url"sv, url.to_string());
         event.set("private"sv, is_private == WebView::IsPrivate::Yes);
-        event.set("parent"sv, m_active_tab_id);
+        event.set("parent"sv, m_focused_tab_id != 0 ? m_focused_tab_id : m_active_tab_id);
         send_event(move(event));
     });
 
     EngineApplication::the().set_open_blank_new_tab_handler([this](Web::HTML::ActivateTab) -> Optional<WebView::ViewImplementation&> {
         auto viewport_size = Gfx::IntSize { 1024, 768 };
         auto is_private = WebView::IsPrivate::No;
-        if (auto* active = tab_for_id(m_active_tab_id)) {
+        auto parent_id = m_focused_tab_id != 0 ? m_focused_tab_id : m_active_tab_id;
+        u64 window_id = 0;
+        if (auto* active = tab_for_id(parent_id)) {
             viewport_size = active->viewport_size;
             is_private = active->view->is_private();
+            window_id = active->window_id;
         }
-        auto& tab = create_tab(viewport_size, is_private == WebView::IsPrivate::Yes, 0, m_active_tab_id);
+        auto& tab = create_tab(viewport_size, is_private == WebView::IsPrivate::Yes, 0, parent_id, window_id);
         return static_cast<WebView::ViewImplementation&>(*tab.view);
     });
 
@@ -246,7 +249,7 @@ void EngineServer::dispatch_command(JsonObject const& command)
         }
 
         if (*type == "activate"sv) {
-            handle_activate_tab(*tab_id);
+            handle_activate_tab(*tab_id, command);
         } else if (*type == "navigate"sv) {
             handle_navigate(*tab_id, command);
         } else if (*type == "back"sv) {
@@ -321,7 +324,7 @@ EngineServer::Tab* EngineServer::tab_for_id(u64 tab_id)
     return it->value.ptr();
 }
 
-EngineServer::Tab& EngineServer::create_tab(Gfx::IntSize viewport_size, bool is_private, u64 request_id, u64 parent)
+EngineServer::Tab& EngineServer::create_tab(Gfx::IntSize viewport_size, bool is_private, u64 request_id, u64 parent, u64 window_id)
 {
     auto id = m_next_tab_id++;
     auto view = EngineHeadlessWebView::create(m_theme, viewport_size.to_type<Web::DevicePixels>(), is_private ? WebView::IsPrivate::Yes : WebView::IsPrivate::No);
@@ -329,9 +332,12 @@ EngineServer::Tab& EngineServer::create_tab(Gfx::IntSize viewport_size, bool is_
     m_tabs.set(id, make<Tab>(id, request_id, move(view), viewport_size));
     auto& tab_ref = *m_tabs.find(id)->value;
     tab_ref.parent = parent;
+    tab_ref.window_id = window_id;
     wire_tab(tab_ref);
 
     m_active_tab_id = id;
+    if (window_id != 0 && !m_window_active_tabs.contains(window_id))
+        m_window_active_tabs.set(window_id, id);
     send_tab_created(tab_ref);
     ensure_frame_buffer(tab_ref, tab_ref.viewport_size);
     on_view_painted(tab_ref);
@@ -346,6 +352,7 @@ EngineServer::Tab& EngineServer::create_child_tab(Tab& parent, WebView::Canonica
     m_tabs.set(id, make<Tab>(id, 0, move(view), parent.viewport_size));
     auto& tab_ref = *m_tabs.find(id)->value;
     tab_ref.parent = parent.id;
+    tab_ref.window_id = parent.window_id;
     wire_tab(tab_ref);
 
     send_tab_created(tab_ref);
@@ -592,8 +599,22 @@ void EngineServer::destroy_tab(u64 tab_id)
 
     send_simple_event("tab_closed"sv, tab_id);
 
+    if (m_focused_tab_id == tab_id)
+        m_focused_tab_id = 0;
     if (m_active_tab_id == tab_id && !m_tabs.is_empty())
         m_active_tab_id = m_tabs.begin()->key;
+    for (auto& [window_id, active_tab_id] : m_window_active_tabs) {
+        if (active_tab_id == tab_id) {
+            active_tab_id = 0;
+            for (auto& [candidate_id, candidate] : m_tabs) {
+                if (candidate->window_id == window_id) {
+                    active_tab_id = candidate_id;
+                    break;
+                }
+            }
+            break;
+        }
+    }
 }
 
 void EngineServer::handle_create_tab(JsonObject const& command)
@@ -603,7 +624,8 @@ void EngineServer::handle_create_tab(JsonObject const& command)
     auto is_private = command.get_bool("private"sv).value_or(false);
 
     auto request_id = command.get_u64("request"sv).value_or(0);
-    auto& tab = create_tab({ max(static_cast<int>(width), 1), max(static_cast<int>(height), 1) }, is_private, request_id);
+    auto window_id = command.get_u64("window"sv).value_or(0);
+    auto& tab = create_tab({ max(static_cast<int>(width), 1), max(static_cast<int>(height), 1) }, is_private, request_id, 0, window_id);
 
     if (auto url = command.get_string("url"sv); url.has_value() && !url->is_empty())
         tab.view->load_from_user_input(url->bytes_as_string_view());
@@ -611,18 +633,26 @@ void EngineServer::handle_create_tab(JsonObject const& command)
         tab.view->load(WebView::Application::settings().new_tab_page_url());
 }
 
-void EngineServer::handle_activate_tab(u64 tab_id)
+void EngineServer::handle_activate_tab(u64 tab_id, JsonObject const& command)
 {
     auto* tab = tab_for_id(tab_id);
     if (!tab)
         return;
 
+    auto window_id = command.get_u64("window"sv).value_or(tab->window_id);
+    if (window_id != 0) {
+        tab->window_id = window_id;
+        m_window_active_tabs.set(window_id, tab_id);
+    }
     m_active_tab_id = tab_id;
+
     for (auto& [id, other_tab] : m_tabs) {
-        if (id == tab_id)
-            other_tab->view->set_system_visibility_state(Web::HTML::VisibilityState::Visible);
+        bool visible = false;
+        if (other_tab->window_id != 0)
+            visible = m_window_active_tabs.get(other_tab->window_id).value_or(0) == id;
         else
-            other_tab->view->set_system_visibility_state(Web::HTML::VisibilityState::Hidden);
+            visible = id == tab_id;
+        other_tab->view->set_system_visibility_state(visible ? Web::HTML::VisibilityState::Visible : Web::HTML::VisibilityState::Hidden);
     }
 }
 
@@ -667,6 +697,10 @@ void EngineServer::handle_focus(u64 tab_id, JsonObject const& command)
         return;
 
     tab->focused = command.get_bool("focused"sv).value_or(false);
+    if (tab->focused)
+        m_focused_tab_id = tab->id;
+    else if (m_focused_tab_id == tab->id)
+        m_focused_tab_id = 0;
     tab->view->set_has_system_focus(tab->focused);
 }
 
@@ -1201,6 +1235,7 @@ void EngineServer::try_send_frame(Tab& tab)
 
 void EngineServer::note_user_input(Tab& tab)
 {
+    ++tab.input_events_since_frame;
     if (tab.waiting_for_frame)
         return;
     if (getenv("LADYBIRD_SDE_TRACE_FRAMES"))
@@ -1215,6 +1250,7 @@ void EngineServer::note_frame_presented(Tab& tab, u64 sequence)
 {
     (void)sequence;
     tab.has_presented_frame = true;
+    tab.input_events_since_frame = 0;
 
     if (tab.unresponsive_reported) {
         // A frame that was already queued when the renderer spun can arrive
@@ -1294,6 +1330,13 @@ void EngineServer::check_unresponsive_tabs()
         if (getenv("LADYBIRD_SDE_TRACE_FRAMES"))
             warnln("LadybirdEngine: tab {} unresponsive check waited={}ms cpu={}% ticks={}", tab->id, waited_ms, static_cast<int>(cpu_fraction * 100), *ticks);
         if (waited_ms >= 2500 && cpu_fraction >= 0.5) {
+            tab->unresponsive_reported = true;
+            tab->responsive_frame_count = 0;
+            set_unresponsive(*tab, true);
+        } else if (waited_ms >= 12000 && tab->input_events_since_frame >= 4 && cpu_fraction < 0.5) {
+            // A renderer can also deadlock without spinning. Input is queued but
+            // no frame arrives; after several attempts to move the page, offer a
+            // hard reload rather than leaving the client area frozen.
             tab->unresponsive_reported = true;
             tab->responsive_frame_count = 0;
             set_unresponsive(*tab, true);
@@ -1390,6 +1433,8 @@ void EngineServer::send_tab_created(Tab& tab)
     event.set("height"sv, tab.viewport_size.height());
     if (tab.parent != 0)
         event.set("parent"sv, tab.parent);
+    if (tab.window_id != 0)
+        event.set("window"sv, tab.window_id);
     send_event(move(event));
 }
 

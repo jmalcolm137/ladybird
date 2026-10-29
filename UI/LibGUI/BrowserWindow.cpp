@@ -53,9 +53,10 @@ static DownloadEntry download_entry_from_json(JsonObject const& object)
     return entry;
 }
 
-BrowserWindow::BrowserWindow(BrowserSession& session, EngineClient& engine, bool private_window)
+BrowserWindow::BrowserWindow(BrowserSession& session, EngineClient& engine, u64 window_id, bool private_window)
     : m_session(session)
     , m_engine(&engine)
+    , m_id(window_id)
     , m_private(private_window)
 {
 }
@@ -358,6 +359,7 @@ BrowserTab& BrowserWindow::add_tab(String const& url, bool activate, bool reques
 {
     auto tab = make<BrowserTab>(*m_engine, *m_window, *m_back_action, *m_forward_action, *m_reload_action, *m_stop_action, *m_bookmark_action, *m_home_action, *m_new_tab_action, *m_downloads_action);
     auto* tab_pointer = tab.ptr();
+    tab->set_window_id(m_id);
     tab->set_initial_url(url);
 
     tab->on_title_change = [this, tab_pointer](String const& title) {
@@ -504,7 +506,7 @@ bool BrowserWindow::tab_is_live(BrowserTab const* tab) const
 void BrowserWindow::activate_tab(BrowserTab& tab)
 {
     if (tab.is_attached())
-        m_engine->activate_tab(tab.tab_id());
+        m_engine->activate_tab(tab.tab_id(), m_id);
     // A background tab may have received only damage updates. Repaint the
     // complete last frame when it becomes visible again.
     tab.web_view().update();
@@ -745,6 +747,28 @@ void BrowserWindow::set_window_size(Gfx::IntSize size)
 {
     if (m_window)
         m_window->resize(size.width(), size.height());
+}
+
+Gfx::IntPoint BrowserWindow::window_position() const
+{
+    return m_window ? m_window->position() : Gfx::IntPoint {};
+}
+
+void BrowserWindow::set_window_position(Gfx::IntPoint position)
+{
+    if (m_window)
+        m_window->move_to(position);
+}
+
+bool BrowserWindow::is_maximized() const
+{
+    return m_window && m_window->is_maximized();
+}
+
+void BrowserWindow::set_maximized(bool maximized)
+{
+    if (m_window)
+        m_window->set_maximized(maximized);
 }
 
 void BrowserWindow::activate_tab_index(size_t index)

@@ -421,7 +421,7 @@ void EngineClient::send_simple(StringView type, u64 tab_id)
     send(event);
 }
 
-void EngineClient::create_tab(Gfx::IntSize viewport_size, String const& url, u64 request_id, bool private_tab)
+void EngineClient::create_tab(Gfx::IntSize viewport_size, String const& url, u64 request_id, bool private_tab, u64 window_id)
 {
     JsonObject event;
     event.set("type"sv, "create_tab"sv);
@@ -430,11 +430,25 @@ void EngineClient::create_tab(Gfx::IntSize viewport_size, String const& url, u64
     event.set("height"sv, viewport_size.height());
     event.set("url"sv, url.bytes_as_string_view());
     event.set("private"sv, private_tab);
+    if (window_id != 0)
+        event.set("window"sv, window_id);
     send(event);
 }
 
-void EngineClient::close_tab(u64 tab_id) { send_simple("close_tab"sv, tab_id); }
-void EngineClient::activate_tab(u64 tab_id) { send_simple("activate"sv, tab_id); }
+void EngineClient::activate_tab(u64 tab_id, u64 window_id)
+{
+    JsonObject event;
+    event.set("type"sv, "activate"sv);
+    event.set("tab"sv, tab_id);
+    if (window_id != 0)
+        event.set("window"sv, window_id);
+    send(event);
+}
+
+void EngineClient::close_tab(u64 tab_id)
+{
+    send_simple("close_tab"sv, tab_id);
+}
 
 void EngineClient::navigate(u64 tab_id, String const& url, bool user_input)
 {

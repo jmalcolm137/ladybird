@@ -11,8 +11,8 @@ Version: `Shared/EngineProtocol.h`.
 
 | `type` | Fields | Meaning |
 |---|---|---|
-| `create_tab` | `request`, `width`, `height`, `url`, `private` | Create a view and a tab. `request` is echoed in `tab_created`. |
-| `activate` | `tab` | Make a tab visible and hide the others. |
+| `create_tab` | `request`, `width`, `height`, `url`, `private`, `window` | Create a view and a tab. `request` is echoed in `tab_created`; `window` associates the tab with a frontend window. |
+| `activate` | `tab`, `window` | Make this tab the active tab of `window`; the active tab of every other window stays visible. |
 | `navigate` | `tab`, `url`, `user_input` | Load a URL, or run the URL/search-input path. |
 | `back` / `forward` | `tab` | Traverse session history. |
 | `reload` | `tab`, `bypass_cache` | Reload. |
@@ -43,7 +43,7 @@ Version: `Shared/EngineProtocol.h`.
 | `type` | Fields | Meaning |
 |---|---|---|
 | `hello` | `protocol` | Protocol handshake. |
-| `tab_created` | `tab`, `request`, `width`, `height`, `parent` | The view exists; attach the matching frontend tab. `request` matches a frontend request; otherwise `parent` names the tab whose window should receive the engine-created tab. |
+| `tab_created` | `tab`, `request`, `width`, `height`, `parent`, `window` | The view exists; attach the matching frontend tab. `request` matches a frontend request; otherwise `parent`/`window` name the owning window. |
 | `open_window` | `url`, `private`, `parent` | The page asked for a new native window. The frontend creates it in-process so it shares the engine and profile; `parent` is the requesting tab. |
 | `tab_closed` | `tab` | The view is gone. |
 | `tab_crashed` | `tab` | The WebContent process died. |

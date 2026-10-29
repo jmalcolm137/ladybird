@@ -27,7 +27,7 @@ class BrowserWindow {
     AK_MAKE_NONCOPYABLE(BrowserWindow);
 
 public:
-    BrowserWindow(BrowserSession&, EngineClient&, bool private_window);
+    BrowserWindow(BrowserSession&, EngineClient&, u64 window_id, bool private_window);
     ~BrowserWindow();
 
     void show();
@@ -46,8 +46,13 @@ public:
     size_t active_tab_index() const;
     Gfx::IntSize window_size() const;
     void set_window_size(Gfx::IntSize);
+    Gfx::IntPoint window_position() const;
+    void set_window_position(Gfx::IntPoint);
+    bool is_maximized() const;
+    void set_maximized(bool);
     void activate_tab_index(size_t);
     bool is_private() const { return m_private; }
+    u64 id() const { return m_id; }
 
 private:
     friend class BrowserSession;
@@ -82,6 +87,7 @@ private:
 
     BrowserSession& m_session;
     EngineClient* m_engine { nullptr };
+    u64 m_id { 0 };
     RefPtr<GUI::Window> m_window;
     RefPtr<GUI::TabWidget> m_tab_widget;
 

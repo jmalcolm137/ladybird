@@ -62,6 +62,7 @@ private:
         u64 id { 0 };
         u64 request_id { 0 };
         u64 parent { 0 };
+        u64 window_id { 0 };
         NonnullOwnPtr<WebView::HeadlessWebView> view;
         Gfx::IntSize viewport_size;
         double last_reported_zoom { 1.0 };
@@ -97,6 +98,7 @@ private:
         bool has_presented_frame { false };
         bool unresponsive_reported { false };
         u8 responsive_frame_count { 0 };
+        unsigned input_events_since_frame { 0 };
         MonotonicTime input_wait_started;
         MonotonicTime last_cpu_sample_time;
         u64 last_cpu_ticks { 0 };
@@ -113,7 +115,7 @@ private:
     void dispatch_command(JsonObject const&);
 
     void handle_create_tab(JsonObject const&);
-    void handle_activate_tab(u64 tab_id);
+    void handle_activate_tab(u64 tab_id, JsonObject const&);
     void handle_navigate(u64 tab_id, JsonObject const&);
     void handle_resize(u64 tab_id, JsonObject const&);
     void handle_focus(u64 tab_id, JsonObject const&);
@@ -143,7 +145,7 @@ private:
     Optional<u64> web_content_cpu_ticks(pid_t);
 
     Tab* tab_for_id(u64 tab_id);
-    Tab& create_tab(Gfx::IntSize viewport_size, bool is_private, u64 request_id = 0, u64 parent = 0);
+    Tab& create_tab(Gfx::IntSize viewport_size, bool is_private, u64 request_id = 0, u64 parent = 0, u64 window_id = 0);
     Tab& create_child_tab(Tab& parent, WebView::CanonicalTraversable&);
     void wire_tab(Tab&);
     void destroy_tab(u64 tab_id);
@@ -185,6 +187,8 @@ private:
     HashMap<u64, NonnullOwnPtr<Tab>> m_tabs;
     u64 m_next_tab_id { 1 };
     u64 m_active_tab_id { 0 };
+    u64 m_focused_tab_id { 0 };
+    HashMap<u64, u64> m_window_active_tabs;
     u64 m_next_frame_buffer_id { 1 };
     u64 m_next_permission_id { 1 };
     bool m_quitting { false };

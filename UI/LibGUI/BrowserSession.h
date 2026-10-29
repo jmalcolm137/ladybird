@@ -12,6 +12,7 @@
 #include <AK/NonnullOwnPtr.h>
 #include <AK/Optional.h>
 #include <AK/Vector.h>
+#include <LibCore/Forward.h>
 #include <LibGfx/Forward.h>
 #include <LibGfx/Size.h>
 
@@ -45,9 +46,10 @@ private:
     BrowserSession() = default;
 
     ErrorOr<void> initialize(Vector<String> initial_urls, bool private_window);
-    BrowserWindow* create_window_internal(Vector<String> urls, bool private_window, Optional<Gfx::IntSize> size = {}, Optional<size_t> active_tab = {});
+    BrowserWindow* create_window_internal(Vector<String> urls, bool private_window, Optional<Gfx::IntSize> size = {}, Optional<Gfx::IntPoint> position = {}, Optional<size_t> active_tab = {}, bool maximized = false);
 
     BrowserWindow* window_for_tab(u64 tab_id);
+    BrowserWindow* window_for_id(u64 window_id);
     BrowserWindow* window_for_request(u64 request_id);
     BrowserWindow* active_window() const;
 
@@ -58,6 +60,7 @@ private:
     void handle_open_window(JsonObject const&);
 
     ByteString session_path() const;
+    bool should_restore_session() const;
     void save_session();
     bool load_session();
     bool load_legacy_session(JsonObject const&);
@@ -65,6 +68,8 @@ private:
     OwnPtr<EngineClient> m_engine;
     Vector<NonnullOwnPtr<BrowserWindow>> m_windows;
     u64 m_next_request_id { 1 };
+    u64 m_next_window_id { 1 };
+    RefPtr<Core::Timer> m_autosave_timer;
 };
 
 }

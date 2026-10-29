@@ -149,8 +149,9 @@ navigating the real engine.
 * New window and new private window (`--private`), with the private window's
   tabs created in a private browsing session in the engine. Every normal window
   in one frontend process shares the same engine host and profile, so tabs,
-  bookmarks, settings, history, and downloads are shared. A window is only a
-  view over its own subset of the engine's tabs.
+  bookmarks, settings, history, and downloads are shared. A window is a view
+  over its own subset of the engine's tabs; each window keeps its own active tab
+  visible while the other windows continue to render.
 * Page, link, image, and media context menus. The engine builds the menu model
   (including spelling, text editing, open/copy/download actions); the frontend
   renders it as a native LibGUI menu.
@@ -164,8 +165,10 @@ navigating the real engine.
   unresponsive-page banner that hard-reloads a renderer spinning without
   presenting frames.
 * Session restore: every normal window (not just the last one) reopens with its
-  previous tabs, size, and active tab on startup, and History → Restore
-  Previous Session reopens them on demand. Set
+  previous tabs, size, position, maximized state, and active tab on startup. The
+  “Restore previous windows and tabs” setting is honored, and a 30-second
+  autosave preserves a crash-recovery snapshot. History → Restore Previous
+  Session reopens the saved session on demand. Set
   `LADYBIRD_SDE_DISABLE_SESSION_RESTORE=1` to disable this (the headless test
   does).
 * View Source (`Ctrl+U`).
