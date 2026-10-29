@@ -131,7 +131,7 @@ private:
     RefPtr<GUI::Menu> m_select_dropdown;
     RefPtr<GUI::Menu> m_site_menu;
     RefPtr<GUI::Menu> m_zoom_menu;
-    RefPtr<GUI::Window> m_autocomplete_popup;
+    RefPtr<GUI::Widget> m_autocomplete_overlay;
     RefPtr<GUI::TableView> m_autocomplete_table;
     RefPtr<GUI::JsonArrayModel> m_autocomplete_model;
     RefPtr<Core::Timer> m_autocomplete_timer;

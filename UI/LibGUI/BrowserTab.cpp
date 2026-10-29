@@ -160,14 +160,12 @@ BrowserTab::BrowserTab(EngineClient& engine, GUI::Window& window, GUI::Action& b
             m_autocomplete_hide_timer->start();
     };
 
-    m_autocomplete_popup = GUI::Window::construct(&window);
-    m_autocomplete_popup->set_window_type(GUI::WindowType::Autocomplete);
-    m_autocomplete_popup->set_obey_widget_min_size(false);
-    m_autocomplete_popup->set_frameless(true);
+    m_autocomplete_overlay = GUI::Widget::construct();
+    m_autocomplete_overlay->set_fill_with_background_color(true);
+    m_autocomplete_overlay->set_layout<GUI::VerticalBoxLayout>(GUI::Margins { 0 }, 0);
+    m_autocomplete_overlay->set_visible(false);
 
-    auto autocomplete_widget = m_autocomplete_popup->set_main_widget<GUI::Widget>();
-    autocomplete_widget->set_fill_with_background_color(true);
-    autocomplete_widget->set_layout<GUI::VerticalBoxLayout>(GUI::Margins { 0 }, 0);
+    auto autocomplete_widget = m_autocomplete_overlay;
 
     Vector<GUI::JsonArrayModel::FieldSpec> autocomplete_fields;
     autocomplete_fields.append({ "title"sv, "Title"_string, Gfx::TextAlignment::CenterLeft });
@@ -185,8 +183,6 @@ BrowserTab::BrowserTab(EngineClient& engine, GUI::Window& window, GUI::Action& b
     m_autocomplete_table->on_activation = [this](auto const&) {
         accept_autocomplete();
     };
-
-    m_autocomplete_popup->hide();
 
     m_autocomplete_timer = Core::Timer::create_single_shot(120, [this] {
         request_autocomplete();
@@ -265,6 +261,7 @@ BrowserTab::BrowserTab(EngineClient& engine, GUI::Window& window, GUI::Action& b
     m_statusbar->set_text(String {});
 
     m_web_view->on_resize = [this](Gfx::IntSize size) {
+        hide_autocomplete();
         if (is_attached())
             m_engine.resize(m_tab_id, size);
     };
@@ -297,6 +294,15 @@ BrowserTab::BrowserTab(EngineClient& engine, GUI::Window& window, GUI::Action& b
             m_engine.frame_ack(m_tab_id, sequence);
     };
 
+    // The suggestion list is an in-window overlay, not a separate window. It
+    // cannot take keyboard focus from the location box or float above other
+    // applications when the browser is minimized or covered. Removing it from
+    // the root layout lets it float over the bookmark bar and page.
+    m_root->add_child(*m_autocomplete_overlay);
+    if (m_root->layout())
+        m_root->layout()->remove_widget(*m_autocomplete_overlay);
+
+    (void)window;
     set_zoom_level(1.0);
     update_site_button();
 }
@@ -619,7 +625,7 @@ void BrowserTab::set_autocomplete_results(u64 request_id, JsonArray const& items
         m_autocomplete_texts.append(String::from_byte_string(text).release_value());
     }
 
-    if (!m_autocomplete_model || !m_autocomplete_table || !m_autocomplete_popup)
+    if (!m_autocomplete_model || !m_autocomplete_table || !m_autocomplete_overlay)
         return;
 
     m_autocomplete_model->update();
@@ -631,13 +637,18 @@ void BrowserTab::set_autocomplete_results(u64 request_id, JsonArray const& items
     m_autocomplete_table->set_cursor(m_autocomplete_model->index(0), GUI::AbstractView::SelectionUpdate::Set);
 
     auto location_rect = m_location_box->screen_relative_rect();
-    auto width = max(location_rect.width(), 420);
+    auto root_rect = m_root->screen_relative_rect();
+    auto x = max(0, location_rect.x() - root_rect.x());
+    auto y = max(0, location_rect.bottom() - root_rect.y());
+    auto available_width = max(1, m_root->width() - x);
+    auto available_height = max(1, m_root->height() - y - (m_statusbar ? m_statusbar->height() : 0));
+    auto width = min(max(location_rect.width(), 420), available_width);
     auto height = min(300, m_autocomplete_model->row_count() * 24 + 4);
-    m_autocomplete_popup->resize(width, height);
-    m_autocomplete_popup->move_to(location_rect.bottom_left());
+    height = min(height, available_height);
+    m_autocomplete_overlay->set_relative_rect(Gfx::IntRect { x, y, width, height });
     m_autocomplete_table->set_column_width(0, width / 3);
     m_autocomplete_table->set_column_width(1, width - width / 3);
-    m_autocomplete_popup->show();
+    m_autocomplete_overlay->set_visible(true);
 
     m_autocomplete_visible = true;
     if (m_autocomplete_hide_timer)
@@ -663,8 +674,8 @@ void BrowserTab::hide_autocomplete()
 {
     if (m_autocomplete_hide_timer)
         m_autocomplete_hide_timer->stop();
-    if (m_autocomplete_popup)
-        m_autocomplete_popup->hide();
+    if (m_autocomplete_overlay)
+        m_autocomplete_overlay->set_visible(false);
 
     m_autocomplete_visible = false;
     m_autocomplete_rows.clear();
