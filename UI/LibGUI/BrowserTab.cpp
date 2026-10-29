@@ -586,6 +586,18 @@ void BrowserTab::update_site_button()
     m_site_menu = menu;
 }
 
+void BrowserTab::show_site_info_dialog()
+{
+    auto url = current_url();
+    auto identity = url.is_empty()
+        ? SiteIdentity { "No page loaded"_string, {} }
+        : site_identity_for_url(url);
+    auto percent = static_cast<int>(m_zoom_level * 100.0 + 0.5);
+    auto subject = identity.host.is_empty() ? url : identity.host;
+    auto text = String::formatted("{}: {}\nZoom: {}%", identity.security, subject, percent).release_value();
+    GUI::MessageBox::show(m_root->window(), text, "Site Information"sv, GUI::MessageBox::Type::Information, GUI::MessageBox::InputType::OK);
+}
+
 void BrowserTab::set_autocomplete_results(u64 request_id, JsonArray const& items, bool)
 {
     if (request_id != m_autocomplete_request_id)

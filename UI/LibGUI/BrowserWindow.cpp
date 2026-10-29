@@ -302,6 +302,12 @@ void BrowserWindow::create_actions()
     }, m_window.ptr());
     m_downloads_action->set_status_tip("Show downloads"_string);
 
+    m_site_info_action = GUI::Action::create("Site &Information"sv, [this](auto&) {
+        if (auto* tab = active_tab())
+            tab->show_site_info_dialog();
+    }, m_window.ptr());
+    m_site_info_action->set_status_tip("Show connection and zoom information"_string);
+
     m_restore_session_action = GUI::Action::create("Restore Previous &Session"sv, [this](auto&) {
         m_session.restore_previous_session();
     }, m_window.ptr());
@@ -374,6 +380,7 @@ void BrowserWindow::create_menus()
     tools_menu.add_action(GUI::Action::create("&Settings"sv, [this](auto&) {
         navigate_active("about:settings"_string);
     }, m_window.ptr()));
+    tools_menu.add_action(*m_site_info_action);
     tools_menu.add_action(*m_downloads_action);
 
     auto& help_menu = *m_window->add_menu("&Help"_string);
@@ -583,6 +590,7 @@ void BrowserWindow::update_action_state()
     m_close_tab_action->set_enabled(tab != nullptr);
     m_reopen_closed_tab_action->set_enabled(m_session.closed_tab_count() > 0);
     m_bookmark_action->set_enabled(tab != nullptr);
+    m_site_info_action->set_enabled(tab != nullptr);
     m_find_action->set_enabled(tab != nullptr);
     m_zoom_in_action->set_enabled(tab != nullptr);
     m_zoom_out_action->set_enabled(tab != nullptr);

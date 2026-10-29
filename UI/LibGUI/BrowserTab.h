@@ -85,6 +85,7 @@ public:
     void set_find_result(u64 current, Optional<u64> total);
     void set_zoom_level(double zoom_level);
     void set_autocomplete_results(u64 request_id, JsonArray const& items, bool final);
+    void show_site_info_dialog();
     void show_dialog(StringView kind, StringView message, StringView default_text = {});
     void show_context_menu(JsonArray const& items, Gfx::IntPoint screen_position);
     void show_permission_prompt(StringView name, StringView origin, u64 request_id);

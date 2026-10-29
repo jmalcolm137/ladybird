@@ -126,6 +126,7 @@ private:
     RefPtr<GUI::Action> m_reset_zoom_action;
     RefPtr<GUI::Action> m_view_source_action;
     RefPtr<GUI::Action> m_downloads_action;
+    RefPtr<GUI::Action> m_site_info_action;
     RefPtr<GUI::Action> m_restore_session_action;
 
     Vector<NonnullOwnPtr<BrowserTab>> m_tabs;
