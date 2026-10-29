@@ -13,11 +13,13 @@
 #include <AK/LexicalPath.h>
 #include <AK/StringBuilder.h>
 #include <AK/Utf16String.h>
+#include <LibCore/Environment.h>
 #include <LibCore/EventLoop.h>
 #include <LibCore/File.h>
 #include <LibCore/Notifier.h>
 #include <LibCore/Socket.h>
 #include <LibCore/System.h>
+#include <LibCore/Timer.h>
 #include <LibGfx/Bitmap.h>
 #include <LibGfx/ImageFormats/PNGWriter.h>
 #include <LibGfx/SystemTheme.h>
@@ -35,6 +37,7 @@
 #include <LibWebView/BookmarkStore.h>
 #include <LibWebView/HeadlessWebView.h>
 #include <LibWebView/Menu.h>
+#include <LibWebView/RequestServerManager.h>
 #include <LibWebView/ViewImplementation.h>
 #include <Shared/EngineProtocol.h>
 #include <errno.h>
@@ -82,6 +85,8 @@ EngineServer::~EngineServer()
     EngineApplication::the().set_open_new_window_handler({});
     if (m_unresponsive_timer)
         m_unresponsive_timer->stop();
+    if (m_resolver_watch_timer)
+        m_resolver_watch_timer->stop();
     if (m_write_notifier) {
         m_write_notifier->close();
         m_write_notifier.clear();
@@ -115,6 +120,16 @@ ErrorOr<void> EngineServer::start()
         check_unresponsive_tabs();
     });
     m_unresponsive_timer->start();
+
+    // Landlock pins /etc/resolv.conf by inode. NetworkManager replaces the file
+    // when the network changes, which leaves the running RequestServers unable
+    // to read the new resolver configuration. Watch the files and ask the
+    // manager to relaunch the helpers before the next navigation.
+    snapshot_resolver_files();
+    m_resolver_watch_timer = Core::Timer::create_repeating(AK::Duration::from_milliseconds(2000), [this] {
+        check_resolver_files();
+    });
+    m_resolver_watch_timer->start();
 
     JsonObject hello;
     hello.set("type"sv, "hello"sv);
@@ -252,6 +267,8 @@ void EngineServer::dispatch_command(JsonObject const& command)
             handle_activate_tab(*tab_id, command);
         } else if (*type == "navigate"sv) {
             handle_navigate(*tab_id, command);
+        } else if (*type == "autocomplete"sv) {
+            handle_autocomplete(*tab_id, command);
         } else if (*type == "back"sv) {
             if (auto* tab = tab_for_id(*tab_id))
                 tab->view->traverse_the_history_by_delta(-1);
@@ -333,6 +350,7 @@ EngineServer::Tab& EngineServer::create_tab(Gfx::IntSize viewport_size, bool is_
     auto& tab_ref = *m_tabs.find(id)->value;
     tab_ref.parent = parent;
     tab_ref.window_id = window_id;
+    wire_autocomplete(tab_ref);
     wire_tab(tab_ref);
 
     m_active_tab_id = id;
@@ -353,6 +371,7 @@ EngineServer::Tab& EngineServer::create_child_tab(Tab& parent, WebView::Canonica
     auto& tab_ref = *m_tabs.find(id)->value;
     tab_ref.parent = parent.id;
     tab_ref.window_id = parent.window_id;
+    wire_autocomplete(tab_ref);
     wire_tab(tab_ref);
 
     send_tab_created(tab_ref);
@@ -362,6 +381,17 @@ EngineServer::Tab& EngineServer::create_child_tab(Tab& parent, WebView::Canonica
     send_title(tab_ref);
     send_loading_state(tab_ref, tab_ref.view->is_loading());
     return tab_ref;
+}
+
+void EngineServer::wire_autocomplete(Tab& tab)
+{
+    auto is_private = tab.view->is_private() == WebView::IsPrivate::Yes;
+    tab.autocomplete = new WebView::Autocomplete(is_private ? WebView::IsPrivate::Yes : WebView::IsPrivate::No);
+
+    auto tab_id = tab.id;
+    tab.autocomplete->on_autocomplete_query_complete = [this, tab_id](WebView::AutocompleteQueryID query_id, Vector<WebView::AutocompleteSuggestion> suggestions, WebView::AutocompleteResultKind kind) {
+        send_autocomplete_results(tab_id, query_id, move(suggestions), kind);
+    };
 }
 
 void EngineServer::wire_tab(Tab& tab)
@@ -672,6 +702,26 @@ void EngineServer::handle_navigate(u64 tab_id, JsonObject const& command)
         tab->view->load_from_user_input(url->bytes_as_string_view());
     else if (auto parsed = URL::Parser::basic_parse(url->bytes_as_string_view()); parsed.has_value())
         tab->view->load(*parsed);
+}
+
+void EngineServer::handle_autocomplete(u64 tab_id, JsonObject const& command)
+{
+    auto* tab = tab_for_id(tab_id);
+    if (!tab || !tab->autocomplete)
+        return;
+
+    auto request_id = command.get_u64("request"sv);
+    if (!request_id.has_value())
+        return;
+
+    auto query = command.get_string("query"sv);
+    if (!query.has_value() || query->is_empty()) {
+        tab->autocomplete->cancel_pending_query();
+        send_autocomplete_results(tab_id, *request_id, {}, WebView::AutocompleteResultKind::Final);
+        return;
+    }
+
+    tab->autocomplete->query_autocomplete_engine(*request_id, *query);
 }
 
 void EngineServer::handle_resize(u64 tab_id, JsonObject const& command)
@@ -1065,8 +1115,8 @@ void EngineServer::reset_frame_tracking(Tab& tab)
 void EngineServer::on_view_painted(Tab& tab)
 {
     if (tab.view->zoom_level() != tab.last_reported_zoom) {
-        warnln("LadybirdEngine: tab {} page zoom changed {} -> {}", tab.id, tab.last_reported_zoom, tab.view->zoom_level());
         tab.last_reported_zoom = tab.view->zoom_level();
+        send_zoom_changed(tab);
     }
 
     ++tab.presented_sequence;
@@ -1302,6 +1352,86 @@ Optional<u64> EngineServer::web_content_cpu_ticks(pid_t pid)
     return *utime + *stime;
 }
 
+void EngineServer::snapshot_resolver_files()
+{
+    static constexpr Array<StringView, 4> resolver_paths {
+        "/etc/resolv.conf"sv,
+        "/etc/hosts"sv,
+        "/etc/nsswitch.conf"sv,
+        "/etc/host.conf"sv,
+    };
+
+    Vector<StringView> paths;
+    if (auto configured = Core::Environment::get("LADYBIRD_SDE_RESOLVER_FILES"sv); configured.has_value() && !configured->is_empty()) {
+        for (auto path : configured->split_view(':'))
+            paths.append(path);
+    } else {
+        for (auto path : resolver_paths)
+            paths.append(path);
+    }
+
+    m_resolver_files.clear();
+    m_resolver_files.ensure_capacity(paths.size());
+
+    for (auto path : paths) {
+        ResolverFileState state;
+        state.path = path.to_byte_string();
+
+        if (auto result = Core::System::stat(path); !result.is_error()) {
+            auto const& metadata = result.value();
+            state.exists = true;
+            state.device = metadata.st_dev;
+            state.inode = metadata.st_ino;
+            state.mtime = metadata.st_mtime;
+            state.size = metadata.st_size;
+        }
+
+        m_resolver_files.append(move(state));
+    }
+}
+
+void EngineServer::check_resolver_files()
+{
+    if (m_quitting)
+        return;
+
+    bool changed = false;
+    Vector<ResolverFileState> current_states;
+    current_states.ensure_capacity(m_resolver_files.size());
+
+    for (auto const& previous : m_resolver_files) {
+        ResolverFileState current;
+        current.path = previous.path;
+
+        if (auto result = Core::System::stat(previous.path.view()); !result.is_error()) {
+            auto const& metadata = result.value();
+            current.exists = true;
+            current.device = metadata.st_dev;
+            current.inode = metadata.st_ino;
+            current.mtime = metadata.st_mtime;
+            current.size = metadata.st_size;
+        }
+
+        if (current.exists != previous.exists
+            || current.device != previous.device
+            || current.inode != previous.inode
+            || current.mtime != previous.mtime
+            || current.size != previous.size) {
+            changed = true;
+        }
+
+        current_states.append(move(current));
+    }
+
+    m_resolver_files = move(current_states);
+
+    if (!changed)
+        return;
+
+    warnln("LadybirdEngine: resolver configuration changed; restarting RequestServers");
+    WebView::RequestServerManager::the().restart_all_for_resolver_change();
+}
+
 void EngineServer::check_unresponsive_tabs()
 {
     auto now = MonotonicTime::now();
@@ -1471,6 +1601,40 @@ void EngineServer::send_loading_state(Tab& tab, bool loading)
     send_history_state(tab);
 }
 
+void EngineServer::send_zoom_changed(Tab& tab)
+{
+    JsonObject event;
+    event.set("type"sv, "zoom_changed"sv);
+    event.set("tab"sv, tab.id);
+    event.set("zoom"sv, tab.view->zoom_level());
+    send_event(move(event));
+}
+
+void EngineServer::send_autocomplete_results(u64 tab_id, u64 query_id, Vector<WebView::AutocompleteSuggestion> suggestions, WebView::AutocompleteResultKind kind)
+{
+    JsonArray items;
+    for (auto const& suggestion : suggestions) {
+        JsonObject item;
+        item.set("text"sv, suggestion.text);
+        item.set("display"sv, WebView::autocomplete_suggestion_display_text(suggestion));
+        if (suggestion.title.has_value())
+            item.set("title"sv, *suggestion.title);
+        if (suggestion.subtitle.has_value())
+            item.set("subtitle"sv, *suggestion.subtitle);
+        item.set("source"sv, static_cast<int>(suggestion.source));
+        item.set("search"sv, suggestion.source == WebView::AutocompleteSuggestionSource::Search);
+        items.must_append(move(item));
+    }
+
+    JsonObject event;
+    event.set("type"sv, "autocomplete_results"sv);
+    event.set("tab"sv, tab_id);
+    event.set("request"sv, query_id);
+    event.set("final"sv, kind == WebView::AutocompleteResultKind::Final);
+    event.set("items"sv, move(items));
+    send_event(move(event));
+}
+
 void EngineServer::send_history_state(Tab& tab)
 {
     JsonObject event;
@@ -1492,20 +1656,35 @@ void EngineServer::send_dialog(Tab& tab, StringView kind, StringView message, St
     send_event(move(event));
 }
 
+static void append_bookmark_items(JsonArray& items, Vector<WebView::BookmarkItem> const& source)
+{
+    for (auto const& item : source) {
+        JsonObject entry;
+        entry.set("id"sv, item.id);
+
+        if (item.is_folder()) {
+            auto const& folder = item.folder();
+            entry.set("type"sv, "folder"sv);
+            entry.set("title"sv, folder.title.value_or("Folder"_string));
+
+            JsonArray children;
+            append_bookmark_items(children, folder.children);
+            entry.set("items"sv, move(children));
+        } else {
+            auto const& bookmark = item.bookmark();
+            entry.set("type"sv, "bookmark"sv);
+            entry.set("title"sv, bookmark.title.value_or(bookmark.url.to_string()));
+            entry.set("url"sv, bookmark.url.to_string());
+        }
+
+        items.must_append(move(entry));
+    }
+}
+
 void EngineServer::send_bookmarks()
 {
     JsonArray items;
-    for (auto const& item : WebView::Application::bookmark_store().root_items()) {
-        if (!item.is_bookmark())
-            continue;
-
-        auto const& bookmark = item.bookmark();
-        JsonObject entry;
-        auto title = bookmark.title.has_value() ? *bookmark.title : bookmark.url.to_string();
-        entry.set("title"sv, title);
-        entry.set("url"sv, bookmark.url.to_string());
-        items.must_append(move(entry));
-    }
+    append_bookmark_items(items, WebView::Application::bookmark_store().root_items());
 
     JsonObject event;
     event.set("type"sv, "bookmarks"sv);

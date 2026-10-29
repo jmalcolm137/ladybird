@@ -32,6 +32,8 @@ public:
 
     void show();
 
+    void reopen_tab(String const& url);
+
     bool has_tab(u64 tab_id) const;
     bool has_request(u64 request_id) const;
     void adopt_engine_tab(u64 tab_id, u64 request_id);
@@ -81,6 +83,9 @@ private:
     void update_downloads(JsonObject const&);
     void handle_download_event(JsonObject const&);
     void show_tab_context_menu(BrowserTab&, Gfx::IntPoint);
+    void show_tab_search();
+    void add_bookmark_menu_items(GUI::Menu&, Vector<BookmarkEntry> const&);
+    void rebuild_bookmarks_menu();
     void close_other_tabs(BrowserTab&);
     void duplicate_tab(BrowserTab&);
     static ByteString string_for_key(JsonObject const&, StringView key);
@@ -102,8 +107,10 @@ private:
     RefPtr<GUI::Action> m_new_private_window_action;
     RefPtr<GUI::Action> m_bookmarks_bar_action;
     RefPtr<GUI::Action> m_close_tab_action;
+    RefPtr<GUI::Action> m_reopen_closed_tab_action;
     RefPtr<GUI::Action> m_next_tab_action;
     RefPtr<GUI::Action> m_previous_tab_action;
+    RefPtr<GUI::Action> m_search_tabs_action;
     RefPtr<GUI::Action> m_bookmark_action;
     RefPtr<GUI::Action> m_find_action;
     RefPtr<GUI::Action> m_fullscreen_action;
@@ -126,6 +133,7 @@ private:
     Vector<DownloadEntry> m_downloads;
     RefPtr<DownloadsWindow> m_downloads_window;
     RefPtr<GUI::Menu> m_tab_context_menu;
+    RefPtr<GUI::Menu> m_bookmarks_menu;
     bool m_show_bookmarks_bar { true };
     RefPtr<Gfx::Bitmap const> m_bookmark_icon;
     RefPtr<Gfx::Bitmap const> m_bookmark_filled_icon;

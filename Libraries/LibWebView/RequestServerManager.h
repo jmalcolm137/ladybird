@@ -10,6 +10,7 @@
 #include <AK/HashTable.h>
 #include <AK/Optional.h>
 #include <AK/RefCounted.h>
+#include <AK/Types.h>
 #include <AK/Utf16String.h>
 #include <AK/WeakPtr.h>
 #include <AK/Weakable.h>
@@ -38,6 +39,7 @@ public:
     Optional<Utf16String> const& site() const { return m_site; }
     BrowsingSession& session() const { return *m_session; }
     ByteString const& cache_path() const { return m_cache_path; }
+    pid_t pid() const { return m_pid; }
 
     Requests::RequestControlClient& control_client() { return *m_control_client; }
     Requests::RequestClient& ui_client() { return *m_ui_client; }
@@ -60,6 +62,7 @@ private:
     RefPtr<Requests::RequestClient> m_ui_client;
     HashTable<int> m_client_ids;
     RefPtr<Core::Timer> m_idle_timer;
+    pid_t m_pid { -1 };
     bool m_retired { false };
 
     // As last reported by the RequestServer.
@@ -94,6 +97,12 @@ public:
 
     void disk_cache_settings_changed();
     void dns_settings_changed();
+
+    // RequestServer's Landlock rules pin the resolver files by inode. When a
+    // network manager replaces /etc/resolv.conf, the old rules no longer cover
+    // the file at that path. Terminate the helpers so this manager relaunches
+    // them with a fresh ruleset and reconnects the existing clients.
+    void restart_all_for_resolver_change();
 
     NonnullRefPtr<Core::Promise<Requests::CacheSizes>> estimate_cache_size_accessed_since(UnixDateTime since);
     NonnullRefPtr<Core::Promise<Empty>> clear_cache(UnixDateTime since);

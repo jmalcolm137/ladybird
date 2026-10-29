@@ -10,6 +10,7 @@
 #include <LibCore/DirIterator.h>
 #include <LibCore/EventLoop.h>
 #include <LibCore/File.h>
+#include <LibCore/System.h>
 #include <LibFileSystem/FileSystem.h>
 #include <LibHTTP/Cache/Utilities.h>
 #include <LibWebView/Application.h>
@@ -18,6 +19,7 @@
 #include <LibWebView/RequestServerSiteBindings.h>
 #include <LibWebView/WebContentClient.h>
 #include <LibWebView/WorkerProcessManager.h>
+#include <signal.h>
 
 namespace WebView {
 
@@ -122,7 +124,9 @@ ErrorOr<void> RequestServerManager::launch_process(RequestServerInstance& instan
 {
     // Private sessions keep nothing on disk. Every RequestServer of a session would open the same cache otherwise.
     auto disk_cache_mode = instance.session().is_private() == IsPrivate::Yes ? HTTPDiskCacheMode::Disabled : Application::request_server_options().http_disk_cache_mode;
-    auto control_client = TRY(launch_request_server_process(instance.cache_path(), instance.site(), uses_site_request_servers(), disk_cache_mode));
+    ChildIdentity identity;
+    auto control_client = TRY(launch_request_server_process(instance.cache_path(), instance.site(), uses_site_request_servers(), disk_cache_mode, &identity));
+    instance.m_pid = identity.pid;
 
     auto weak_instance = instance.make_weak_ptr();
     control_client->on_client_disconnected = [weak_instance](int client_id) {
@@ -196,6 +200,8 @@ void RequestServerManager::did_lose_process(RequestServerInstance& instance)
     if (Core::EventLoop::current().was_exit_requested())
         return;
 
+    instance.m_pid = -1;
+
     // The process took every client with it; nothing will report their disconnection.
     auto lost_client_ids = move(instance.m_client_ids);
     for (auto client_id : lost_client_ids)
@@ -227,6 +233,7 @@ void RequestServerManager::did_lose_process(RequestServerInstance& instance)
 void RequestServerManager::retire(RequestServerInstance& instance)
 {
     instance.m_retired = true;
+    instance.m_pid = -1;
     // The process exits once its last client is gone; dropping the control connection and the UI client sees to that.
     m_instances.remove_first_matching([&](auto const& candidate) { return candidate.ptr() == &instance; });
 
@@ -255,6 +262,19 @@ void RequestServerManager::dns_settings_changed()
 {
     for (auto& instance : m_instances)
         apply_dns_settings(instance->control_client());
+}
+
+void RequestServerManager::restart_all_for_resolver_change()
+{
+    for (auto& instance : Vector { m_instances }) {
+        if (instance->m_pid <= 0)
+            continue;
+        if (!instance->m_control_client || !instance->m_control_client->is_open())
+            continue;
+        // The control client reports the exit, which relaunches the helper and
+        // reconnects every client that was bound to it.
+        (void)Core::System::kill(instance->m_pid, SIGTERM);
+    }
 }
 
 ByteString RequestServerManager::sites_directory() const

@@ -184,17 +184,14 @@ status bar, and Serenity menus) because that is what "a LibGUI application"
 looks like in the SDE, while the engine and the available options come from the
 same Ladybird checkout as Qt.
 
-Still to wire to the frontend:
-
-* DevTools, download-history pruning, and the web-compat/report flows
-* Bookmark/history management UI beyond the engine's internal pages (the bar
-  currently shows root bookmarks only)
-* Address-bar autocomplete and search suggestions
-* Rich clipboard types, drag and drop, and IME composition
-* HiDPI frame scaling (the engine host currently paints at the logical scale)
-* GPU/zero-copy frame sharing; the engine still CPU-copies pixels into the ring,
-  although steady-state updates now copy only damaged regions
-* Settings that need a native dialog rather than the internal settings page
+The remaining UI work is tracked in
+[`docs/UI-ROADMAP.md`](docs/UI-ROADMAP.md). Recent additions are address-bar
+autocomplete and search suggestions, reopen-closed-tab, tab search, bookmark
+folders and overflow, a site indicator/popover, and a visible zoom percentage.
+Platform work (HiDPI, IME, drag and drop, rich clipboard, accessibility)
+follows. GPU/zero-copy frame sharing is deliberately shelved because it
+destabilized scrolling and resizing; the stable rendering path is the
+acknowledged shared-memory ring with damage-only copies.
 
 The control protocol is deliberately small and append-only so each of these can
 be added without touching the other half.
@@ -204,10 +201,12 @@ be added without touching the other half.
 The wire format is one JSON object per line over a Unix socket. The engine
 creates a POSIX shared-memory object per tab and announces it with
 `frame_buffer`; each `frame` event names a slot and the live dimensions. The
-frontend sends commands such as `create_tab`, `navigate`, `resize`, `mouse`,
-`wheel`, `key`, `find`, `find_next`, `toggle_bookmark`, `context_menu_action`,
-`permission_response`, `file_picker_response`, `select_dropdown_closed`,
-`download_action`, and `quit`.
+frontend sends commands such as `create_tab`, `navigate`, `autocomplete`,
+`resize`, `mouse`, `wheel`, `key`, `find`, `find_next`, `toggle_bookmark`,
+`context_menu_action`, `permission_response`, `file_picker_response`,
+`select_dropdown_closed`, `download_action`, and `quit`. The engine also emits
+`zoom_changed` and `autocomplete_results`; the bookmark list is a tree of
+bookmarks and folders.
 
 The shared constants are in `Shared/EngineProtocol.h`; the protocol version is
 checked by the frontend.

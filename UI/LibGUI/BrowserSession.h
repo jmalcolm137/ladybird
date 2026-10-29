@@ -36,6 +36,11 @@ public:
     BrowserWindow* create_window(Vector<String> urls = {}, bool private_window = false);
     void restore_previous_session();
 
+    // Tabs closed by the user, newest last. Private tabs are not retained.
+    void note_closed_tab(String const& url, String const& title, bool private_tab);
+    bool reopen_closed_tab();
+    size_t closed_tab_count() const { return m_closed_tabs.size(); }
+
     u64 next_request_id() { return m_next_request_id++; }
     EngineClient& engine() { return *m_engine; }
 
@@ -65,8 +70,14 @@ private:
     bool load_session();
     bool load_legacy_session(JsonObject const&);
 
+    struct ClosedTab {
+        String url;
+        String title;
+    };
+
     OwnPtr<EngineClient> m_engine;
     Vector<NonnullOwnPtr<BrowserWindow>> m_windows;
+    Vector<ClosedTab> m_closed_tabs;
     u64 m_next_request_id { 1 };
     u64 m_next_window_id { 1 };
     RefPtr<Core::Timer> m_autosave_timer;

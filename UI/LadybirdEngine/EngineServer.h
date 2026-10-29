@@ -26,6 +26,7 @@
 #include <LibWebCommon/HTML/FileFilter.h>
 #include <LibWebCommon/HTML/SelectItem.h>
 #include <LibWebCommon/HTML/SelectedFile.h>
+#include <LibWebView/Autocomplete.h>
 #include <LibWebView/FileDownloader.h>
 #include <LibWebView/Forward.h>
 #include <LibWebView/HeadlessWebView.h>
@@ -59,11 +60,17 @@ private:
         {
         }
 
+        ~Tab()
+        {
+            delete autocomplete;
+        }
+
         u64 id { 0 };
         u64 request_id { 0 };
         u64 parent { 0 };
         u64 window_id { 0 };
         NonnullOwnPtr<WebView::HeadlessWebView> view;
+        WebView::Autocomplete* autocomplete { nullptr };
         Gfx::IntSize viewport_size;
         double last_reported_zoom { 1.0 };
         Gfx::IntSize last_reported_frame_size;
@@ -118,6 +125,7 @@ private:
     void handle_create_tab(JsonObject const&);
     void handle_activate_tab(u64 tab_id, JsonObject const&);
     void handle_navigate(u64 tab_id, JsonObject const&);
+    void handle_autocomplete(u64 tab_id, JsonObject const&);
     void handle_resize(u64 tab_id, JsonObject const&);
     void handle_focus(u64 tab_id, JsonObject const&);
     void handle_mouse(u64 tab_id, JsonObject const&);
@@ -145,9 +153,21 @@ private:
     void set_unresponsive(Tab&, bool);
     Optional<u64> web_content_cpu_ticks(pid_t);
 
+    struct ResolverFileState {
+        ByteString path;
+        u64 device { 0 };
+        u64 inode { 0 };
+        i64 mtime { 0 };
+        i64 size { 0 };
+        bool exists { false };
+    };
+    void snapshot_resolver_files();
+    void check_resolver_files();
+
     Tab* tab_for_id(u64 tab_id);
     Tab& create_tab(Gfx::IntSize viewport_size, bool is_private, u64 request_id = 0, u64 parent = 0, u64 window_id = 0);
     Tab& create_child_tab(Tab& parent, WebView::CanonicalTraversable&);
+    void wire_autocomplete(Tab&);
     void wire_tab(Tab&);
     void destroy_tab(u64 tab_id);
     bool ensure_frame_buffer(Tab&, Gfx::IntSize);
@@ -164,6 +184,8 @@ private:
     void send_title(Tab&);
     void send_loading_state(Tab&, bool loading);
     void send_history_state(Tab&);
+    void send_zoom_changed(Tab&);
+    void send_autocomplete_results(u64 tab_id, u64 query_id, Vector<WebView::AutocompleteSuggestion>, WebView::AutocompleteResultKind);
     void send_dialog(Tab&, StringView kind, StringView message, StringView default_text = {});
     void send_cursor(Tab&, Gfx::Cursor const&);
     void send_bookmarks();
@@ -185,6 +207,8 @@ private:
     Vector<u8> m_write_buffer;
     RefPtr<Core::Notifier> m_write_notifier;
     RefPtr<Core::Timer> m_unresponsive_timer;
+    RefPtr<Core::Timer> m_resolver_watch_timer;
+    Vector<ResolverFileState> m_resolver_files;
     HashMap<u64, NonnullOwnPtr<Tab>> m_tabs;
     u64 m_next_tab_id { 1 };
     u64 m_active_tab_id { 0 };

@@ -9,12 +9,73 @@
 #include <LibGUI/BoxLayout.h>
 #include <LibGUI/FilePicker.h>
 #include <LibGUI/InputBox.h>
+#include <LibGUI/JsonArrayModel.h>
 #include <LibGUI/Menu.h>
 #include <LibGUI/MessageBox.h>
+#include <LibGUI/TableView.h>
 #include <LibGUI/ToolbarContainer.h>
+#include <LibCore/Timer.h>
 #include <LibGfx/Bitmap.h>
 
 namespace LadybirdSDE {
+
+class MenuButton final : public GUI::Button {
+    C_OBJECT(MenuButton);
+public:
+    Function<void()> on_menu_request;
+    virtual ~MenuButton() override = default;
+
+private:
+    explicit MenuButton(String text)
+        : Button(move(text))
+    {
+    }
+
+    virtual void mousedown_event(GUI::MouseEvent& event) override
+    {
+        if (on_menu_request) {
+            on_menu_request();
+            event.accept();
+            return;
+        }
+        Button::mousedown_event(event);
+    }
+};
+
+struct SiteIdentity {
+    String security;
+    String host;
+};
+
+static SiteIdentity site_identity_for_url(String const& url)
+{
+    SiteIdentity identity { "Site information"_string, {} };
+
+    auto url_view = url.bytes_as_string_view();
+    if (url_view.starts_with("https:"sv))
+        identity.security = "Secure connection"_string;
+    else if (url_view.starts_with("http:"sv))
+        identity.security = "Not secure"_string;
+    else if (url_view.starts_with("file:"sv))
+        identity.security = "Local file"_string;
+    else if (url_view.starts_with("about:"sv))
+        identity.security = "Browser page"_string;
+    else if (url_view.starts_with("view-source:"sv))
+        identity.security = "View source"_string;
+
+    auto view = url_view;
+    auto scheme_separator = view.find("://"sv);
+    if (scheme_separator.has_value()) {
+        auto rest = view.substring_view(*scheme_separator + 3);
+        size_t end = 0;
+        while (end < rest.length() && rest[end] != '/' && rest[end] != '?' && rest[end] != '#')
+            ++end;
+        if (end > 0)
+            identity.host = String::from_utf8(rest.substring_view(0, end)).release_value();
+    }
+
+    return identity;
+}
 
 BrowserTab::BrowserTab(EngineClient& engine, GUI::Window& window, GUI::Action& back_action, GUI::Action& forward_action, GUI::Action& reload_action, GUI::Action& stop_action, GUI::Action& bookmark_action, GUI::Action& home_action, GUI::Action& new_tab_action, GUI::Action& downloads_action)
     : m_engine(engine)
@@ -37,6 +98,16 @@ BrowserTab::BrowserTab(EngineClient& engine, GUI::Window& window, GUI::Action& b
     m_toolbar->add_action(downloads_action);
     m_toolbar->add_separator();
 
+    auto& site_button = m_toolbar->add<MenuButton>("Site"_string);
+    site_button.set_button_style(Gfx::ButtonStyle::Coolbar);
+    site_button.set_fixed_height(22);
+    site_button.set_fixed_width(76);
+    site_button.on_menu_request = [this, &site_button] {
+        if (m_site_menu)
+            m_site_menu->popup(site_button.screen_relative_rect().bottom_left(), {}, site_button.rect());
+    };
+    m_site_button = site_button;
+
     m_bookmarks_bar = m_root->add<GUI::Widget>();
     m_bookmarks_bar->set_fixed_height(28);
     m_bookmarks_bar->set_layout<GUI::HorizontalBoxLayout>(GUI::Margins { 4 }, 4);
@@ -47,12 +118,106 @@ BrowserTab::BrowserTab(EngineClient& engine, GUI::Window& window, GUI::Action& b
     m_location_box->set_preferred_width(GUI::SpecialDimension::Grow);
     m_location_box->set_fixed_height(24);
     m_location_box->on_return_pressed = [this] {
+        if (m_autocomplete_visible) {
+            accept_autocomplete();
+            return;
+        }
+
         auto text = String::from_byte_string(m_location_box->text()).release_value();
         if (text.is_empty())
             return;
         navigate(text);
         m_web_view->set_focus(true);
     };
+    m_location_box->on_change = [this] {
+        if (m_location_box->text().is_empty()) {
+            hide_autocomplete();
+            return;
+        }
+
+        if (m_autocomplete_timer) {
+            m_autocomplete_timer->stop();
+            m_autocomplete_timer->start();
+        }
+    };
+    m_location_box->on_up_pressed = [this] {
+        move_autocomplete_selection(-1);
+    };
+    m_location_box->on_down_pressed = [this] {
+        move_autocomplete_selection(1);
+    };
+    m_location_box->on_escape_pressed = [this] {
+        hide_autocomplete();
+    };
+    m_location_box->on_focusin = [this] {
+        if (!m_location_box->text().is_empty() && m_autocomplete_timer) {
+            m_autocomplete_timer->stop();
+            m_autocomplete_timer->start();
+        }
+    };
+    m_location_box->on_focusout = [this] {
+        if (m_autocomplete_hide_timer)
+            m_autocomplete_hide_timer->start();
+    };
+
+    m_autocomplete_popup = GUI::Window::construct(&window);
+    m_autocomplete_popup->set_window_type(GUI::WindowType::Autocomplete);
+    m_autocomplete_popup->set_obey_widget_min_size(false);
+    m_autocomplete_popup->set_frameless(true);
+
+    auto autocomplete_widget = m_autocomplete_popup->set_main_widget<GUI::Widget>();
+    autocomplete_widget->set_fill_with_background_color(true);
+    autocomplete_widget->set_layout<GUI::VerticalBoxLayout>(GUI::Margins { 0 }, 0);
+
+    Vector<GUI::JsonArrayModel::FieldSpec> autocomplete_fields;
+    autocomplete_fields.append({ "title"sv, "Title"_string, Gfx::TextAlignment::CenterLeft });
+    autocomplete_fields.append({ "display"sv, "Address"_string, Gfx::TextAlignment::CenterLeft });
+    m_autocomplete_model = GUI::JsonArrayModel::create_from_source([this]() -> ErrorOr<JsonArray> {
+        return m_autocomplete_rows;
+    },
+        move(autocomplete_fields));
+
+    m_autocomplete_table = autocomplete_widget->add<GUI::TableView>();
+    m_autocomplete_table->set_model(m_autocomplete_model);
+    m_autocomplete_table->set_frame_style(Gfx::FrameStyle::Plain);
+    m_autocomplete_table->set_column_headers_visible(false);
+    m_autocomplete_table->set_activates_on_selection(true);
+    m_autocomplete_table->on_activation = [this](auto const&) {
+        accept_autocomplete();
+    };
+
+    m_autocomplete_popup->hide();
+
+    m_autocomplete_timer = Core::Timer::create_single_shot(120, [this] {
+        request_autocomplete();
+    });
+    m_autocomplete_hide_timer = Core::Timer::create_single_shot(200, [this] {
+        hide_autocomplete();
+    });
+
+    auto& zoom_button = m_toolbar->add<MenuButton>("100%"_string);
+    zoom_button.set_button_style(Gfx::ButtonStyle::Coolbar);
+    zoom_button.set_fixed_height(22);
+    zoom_button.set_fixed_width(52);
+    zoom_button.on_menu_request = [this, &zoom_button] {
+        if (m_zoom_menu)
+            m_zoom_menu->popup(zoom_button.screen_relative_rect().bottom_left(), {}, zoom_button.rect());
+    };
+    m_zoom_button = zoom_button;
+
+    m_zoom_menu = GUI::Menu::construct("Zoom"_string);
+    m_zoom_menu->add_action(GUI::Action::create("Zoom &In"sv, [this](auto&) {
+        if (is_attached())
+            m_engine.set_zoom(m_tab_id, "in"sv);
+    }));
+    m_zoom_menu->add_action(GUI::Action::create("Zoom &Out"sv, [this](auto&) {
+        if (is_attached())
+            m_engine.set_zoom(m_tab_id, "out"sv);
+    }));
+    m_zoom_menu->add_action(GUI::Action::create("&Reset Zoom"sv, [this](auto&) {
+        if (is_attached())
+            m_engine.set_zoom(m_tab_id, "reset"sv);
+    }));
 
     m_web_view = m_root->add<WebContentView>();
     m_web_view->set_preferred_size(GUI::SpecialDimension::Grow, GUI::SpecialDimension::Grow);
@@ -132,8 +297,8 @@ BrowserTab::BrowserTab(EngineClient& engine, GUI::Window& window, GUI::Action& b
             m_engine.frame_ack(m_tab_id, sequence);
     };
 
-    // Keep the window association explicit; the tab itself lives in a TabWidget.
-    (void)window;
+    set_zoom_level(1.0);
+    update_site_button();
 }
 
 StringView BrowserTab::button_name(GUI::MouseButton button)
@@ -185,6 +350,7 @@ void BrowserTab::detach()
 
 void BrowserTab::navigate(String const& url)
 {
+    hide_autocomplete();
     if (is_attached())
         m_engine.navigate(m_tab_id, url, true);
 }
@@ -234,6 +400,28 @@ void BrowserTab::hide_find_bar()
     m_web_view->set_focus(true);
 }
 
+void BrowserTab::add_bookmark_menu_items(GUI::Menu& menu, Vector<BookmarkEntry> const& items)
+{
+    for (auto const& item : items) {
+        if (item.is_folder) {
+            auto submenu = menu.add_submenu(item.title);
+            add_bookmark_menu_items(*submenu, item.children);
+        } else {
+            menu.add_action(GUI::Action::create(item.title.bytes_as_string_view(), [this, url = item.url](auto&) {
+                navigate(url);
+            }));
+        }
+    }
+}
+
+static int bookmark_button_width(String const& title, bool is_folder)
+{
+    auto width = static_cast<int>(title.bytes_as_string_view().length()) * 7 + 24;
+    if (is_folder)
+        width += 12;
+    return min(width, 240);
+}
+
 void BrowserTab::set_bookmarks(Vector<BookmarkEntry> const& bookmarks)
 {
     Vector<NonnullRefPtr<GUI::Widget>> children;
@@ -244,15 +432,42 @@ void BrowserTab::set_bookmarks(Vector<BookmarkEntry> const& bookmarks)
     for (auto& child : children)
         m_bookmarks_bar->remove_child(*child);
 
+    if (!bookmarks.is_empty()) {
+        // A stable overflow entry at the leading edge keeps every bookmark
+        // reachable when the bar is narrower than its contents.
+        auto& overflow = m_bookmarks_bar->add<MenuButton>("»"_string);
+        overflow.set_button_style(Gfx::ButtonStyle::Coolbar);
+        overflow.set_fixed_height(22);
+        overflow.set_fixed_width(28);
+        auto overflow_menu = GUI::Menu::construct("Bookmarks"_string);
+        add_bookmark_menu_items(*overflow_menu, bookmarks);
+        overflow.on_menu_request = [&overflow, menu = move(overflow_menu)] {
+            menu->popup(overflow.screen_relative_rect().bottom_left(), {}, overflow.rect());
+        };
+    }
+
     for (auto const& bookmark : bookmarks) {
-        auto& button = m_bookmarks_bar->add<GUI::Button>(bookmark.title);
+        auto title = bookmark.title;
+        if (bookmark.is_folder)
+            title = String::formatted("{} ▸", title).release_value();
+
+        auto& button = m_bookmarks_bar->add<MenuButton>(title);
         button.set_button_style(Gfx::ButtonStyle::Coolbar);
         button.set_fixed_height(22);
-        button.set_fixed_width(static_cast<int>(bookmark.title.bytes_as_string_view().length()) * 7 + 24);
-        button.set_tooltip(bookmark.url);
-        button.on_click = [this, url = bookmark.url](auto) {
-            navigate(url);
-        };
+        button.set_fixed_width(bookmark_button_width(title, bookmark.is_folder));
+
+        if (bookmark.is_folder) {
+            auto menu = GUI::Menu::construct(title);
+            add_bookmark_menu_items(*menu, bookmark.children);
+            button.on_menu_request = [&button, menu = move(menu)] {
+                menu->popup(button.screen_relative_rect().bottom_left(), {}, button.rect());
+            };
+        } else {
+            button.set_tooltip(bookmark.url);
+            button.on_click = [this, url = bookmark.url](auto) {
+                navigate(url);
+            };
+        }
     }
 
     m_has_bookmarks = !bookmarks.is_empty();
@@ -294,11 +509,191 @@ void BrowserTab::set_history(bool can_go_back, bool can_go_forward)
 
 void BrowserTab::set_url(String const& url)
 {
-    if (m_location_box->text() == url.to_byte_string())
+    hide_autocomplete();
+
+    if (m_location_box->text() != url.to_byte_string()) {
+        m_location_box->set_text(url.bytes_as_string_view());
+        if (on_url_change)
+            on_url_change(url);
+    }
+    update_site_button();
+}
+
+void BrowserTab::set_zoom_level(double zoom_level)
+{
+    if (zoom_level <= 0)
+        zoom_level = 1.0;
+    m_zoom_level = zoom_level;
+
+    if (!m_zoom_button)
         return;
-    m_location_box->set_text(url.bytes_as_string_view());
-    if (on_url_change)
-        on_url_change(url);
+
+    auto percent = static_cast<int>(zoom_level * 100.0 + 0.5);
+    auto text = String::formatted("{}%", percent).release_value();
+    m_zoom_button->set_text(text);
+}
+
+void BrowserTab::update_site_button()
+{
+    if (!m_site_button)
+        return;
+
+    auto url = current_url();
+    auto identity = url.is_empty()
+        ? SiteIdentity { "No page loaded"_string, {} }
+        : site_identity_for_url(url);
+
+    auto label = "Site"_string;
+    if (identity.security == "Secure connection"sv)
+        label = "Secure"_string;
+    else if (identity.security == "Not secure"sv)
+        label = "Not secure"_string;
+    else if (identity.security == "Local file"sv)
+        label = "Local"_string;
+    else if (identity.security == "Browser page"sv)
+        label = "Page"_string;
+    m_site_button->set_text(label);
+
+    auto menu = GUI::Menu::construct("Site"_string);
+    auto add_information = [&](String const& text) {
+        auto action = GUI::Action::create(text.bytes_as_string_view(), [](auto&) {});
+        action->set_enabled(false);
+        menu->add_action(action);
+    };
+
+    add_information(identity.security);
+    if (!identity.host.is_empty())
+        add_information(identity.host);
+
+    menu->add_separator();
+    menu->add_action(GUI::Action::create("Zoom &In"sv, [this](auto&) {
+        if (is_attached())
+            m_engine.set_zoom(m_tab_id, "in"sv);
+    }));
+    menu->add_action(GUI::Action::create("Zoom &Out"sv, [this](auto&) {
+        if (is_attached())
+            m_engine.set_zoom(m_tab_id, "out"sv);
+    }));
+    menu->add_action(GUI::Action::create("&Reset Zoom"sv, [this](auto&) {
+        if (is_attached())
+            m_engine.set_zoom(m_tab_id, "reset"sv);
+    }));
+    menu->add_separator();
+    menu->add_action(GUI::Action::create("Site &Settings"sv, [this](auto&) {
+        navigate("about:settings"_string);
+    }));
+
+    m_site_menu = menu;
+}
+
+void BrowserTab::set_autocomplete_results(u64 request_id, JsonArray const& items, bool)
+{
+    if (request_id != m_autocomplete_request_id)
+        return;
+
+    if (items.is_empty()) {
+        hide_autocomplete();
+        return;
+    }
+
+    m_autocomplete_rows = items;
+    m_autocomplete_texts.clear();
+    m_autocomplete_texts.ensure_capacity(m_autocomplete_rows.size());
+
+    for (auto const& value : m_autocomplete_rows.values()) {
+        if (!value.is_object())
+            continue;
+        auto text = value.as_object().get_byte_string("text"sv).value_or({});
+        m_autocomplete_texts.append(String::from_byte_string(text).release_value());
+    }
+
+    if (!m_autocomplete_model || !m_autocomplete_table || !m_autocomplete_popup)
+        return;
+
+    m_autocomplete_model->update();
+    if (m_autocomplete_model->row_count() == 0) {
+        hide_autocomplete();
+        return;
+    }
+
+    m_autocomplete_table->set_cursor(m_autocomplete_model->index(0), GUI::AbstractView::SelectionUpdate::Set);
+
+    auto location_rect = m_location_box->screen_relative_rect();
+    auto width = max(location_rect.width(), 420);
+    auto height = min(300, m_autocomplete_model->row_count() * 24 + 4);
+    m_autocomplete_popup->resize(width, height);
+    m_autocomplete_popup->move_to(location_rect.bottom_left());
+    m_autocomplete_table->set_column_width(0, width / 3);
+    m_autocomplete_table->set_column_width(1, width - width / 3);
+    m_autocomplete_popup->show();
+
+    m_autocomplete_visible = true;
+    if (m_autocomplete_hide_timer)
+        m_autocomplete_hide_timer->stop();
+}
+
+void BrowserTab::request_autocomplete()
+{
+    if (!is_attached())
+        return;
+
+    auto query = String::from_byte_string(m_location_box->text()).release_value();
+    if (query.is_empty()) {
+        hide_autocomplete();
+        return;
+    }
+
+    auto request_id = ++m_autocomplete_request_id;
+    m_engine.autocomplete(m_tab_id, request_id, query);
+}
+
+void BrowserTab::hide_autocomplete()
+{
+    if (m_autocomplete_hide_timer)
+        m_autocomplete_hide_timer->stop();
+    if (m_autocomplete_popup)
+        m_autocomplete_popup->hide();
+
+    m_autocomplete_visible = false;
+    m_autocomplete_rows.clear();
+    m_autocomplete_texts.clear();
+    if (m_autocomplete_model)
+        m_autocomplete_model->update();
+}
+
+void BrowserTab::accept_autocomplete()
+{
+    auto selection = m_autocomplete_table ? m_autocomplete_table->selection().first() : GUI::ModelIndex {};
+    if (!selection.is_valid()) {
+        hide_autocomplete();
+        return;
+    }
+
+    auto row = selection.row();
+    if (row < 0 || row >= static_cast<int>(m_autocomplete_texts.size())) {
+        hide_autocomplete();
+        return;
+    }
+
+    auto text = m_autocomplete_texts[row];
+    hide_autocomplete();
+    if (text.is_empty())
+        return;
+
+    m_location_box->set_text(text.bytes_as_string_view());
+    navigate(text);
+    m_web_view->set_focus(true);
+}
+
+void BrowserTab::move_autocomplete_selection(int delta)
+{
+    if (!m_autocomplete_visible || !m_autocomplete_table || delta == 0)
+        return;
+
+    auto movement = delta < 0
+        ? GUI::AbstractView::CursorMovement::Up
+        : GUI::AbstractView::CursorMovement::Down;
+    m_autocomplete_table->move_cursor(movement, GUI::AbstractView::SelectionUpdate::Set);
 }
 
 void BrowserTab::set_title(String const& title)

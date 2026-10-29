@@ -81,7 +81,7 @@ def main():
               "stride": width * 4, "sequence": 1, "full": True,
               "damage_x": 0, "damage_y": 0, "damage_width": width, "damage_height": height})
 
-    send({"type": "hello", "protocol": 6})
+    send({"type": "hello", "protocol": 7})
     send({"type": "downloads", "items": []})
     send({"type": "bookmarks", "items": [
         {"title": "SerenityOS", "url": "https://serenityos.org/"},

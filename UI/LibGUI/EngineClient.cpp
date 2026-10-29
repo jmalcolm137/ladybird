@@ -460,6 +460,16 @@ void EngineClient::navigate(u64 tab_id, String const& url, bool user_input)
     send(event);
 }
 
+void EngineClient::autocomplete(u64 tab_id, u64 request_id, String const& query)
+{
+    JsonObject event;
+    event.set("type"sv, "autocomplete"sv);
+    event.set("tab"sv, tab_id);
+    event.set("request"sv, request_id);
+    event.set("query"sv, query.bytes_as_string_view());
+    send(event);
+}
+
 void EngineClient::go_back(u64 tab_id) { send_simple("back"sv, tab_id); }
 void EngineClient::go_forward(u64 tab_id) { send_simple("forward"sv, tab_id); }
 

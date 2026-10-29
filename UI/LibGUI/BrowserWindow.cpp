@@ -18,10 +18,15 @@
 #include <LibCore/Timer.h>
 #include <LibCore/System.h>
 #include <LibGUI/Application.h>
+#include <LibGUI/BoxLayout.h>
 #include <LibGUI/Clipboard.h>
+#include <LibGUI/Dialog.h>
 #include <LibGUI/Icon.h>
+#include <LibGUI/JsonArrayModel.h>
 #include <LibGUI/Menu.h>
 #include <LibGUI/MessageBox.h>
+#include <LibGUI/TableView.h>
+#include <LibGUI/TextBox.h>
 #include <LibGUI/Widget.h>
 #include <LibGfx/Bitmap.h>
 
@@ -33,6 +38,23 @@ static RefPtr<Gfx::Bitmap const> load_icon(StringView path)
     if (bitmap.is_error())
         return nullptr;
     return bitmap.release_value();
+}
+
+static BookmarkEntry bookmark_entry_from_json(JsonObject const& object)
+{
+    BookmarkEntry entry;
+    entry.title = String::from_byte_string(object.get_byte_string("title"sv).value_or({})).release_value();
+    entry.url = String::from_byte_string(object.get_byte_string("url"sv).value_or({})).release_value();
+    entry.is_folder = object.get_byte_string("type"sv).value_or({}) == "folder"sv;
+
+    if (auto items = object.get_array("items"sv); items.has_value()) {
+        for (auto const& value : items->values()) {
+            if (value.is_object())
+                entry.children.append(bookmark_entry_from_json(value.as_object()));
+        }
+    }
+
+    return entry;
 }
 
 static DownloadEntry download_entry_from_json(JsonObject const& object)
@@ -184,12 +206,22 @@ void BrowserWindow::create_actions()
     }, m_window.ptr());
     m_close_tab_action->set_status_tip("Close the current tab"_string);
 
+    m_reopen_closed_tab_action = GUI::Action::create("&Reopen Closed Tab"sv, { static_cast<u8>(Mod_Ctrl | Mod_Shift), Key_T }, [this](auto&) {
+        m_session.reopen_closed_tab();
+    }, m_window.ptr());
+    m_reopen_closed_tab_action->set_status_tip("Reopen the most recently closed tab"_string);
+
     m_next_tab_action = GUI::Action::create("&Next Tab"sv, GUI::Shortcut(Mod_Ctrl, Key_PageDown), [this](auto&) {
         m_tab_widget->activate_next_tab();
     }, m_window.ptr());
     m_previous_tab_action = GUI::Action::create("&Previous Tab"sv, GUI::Shortcut(static_cast<u8>(Mod_Ctrl | Mod_Shift), Key_PageUp), [this](auto&) {
         m_tab_widget->activate_previous_tab();
     }, m_window.ptr());
+
+    m_search_tabs_action = GUI::Action::create("&Search Tabs…"sv, { static_cast<u8>(Mod_Ctrl | Mod_Shift), Key_A }, [this](auto&) {
+        show_tab_search();
+    }, m_window.ptr());
+    m_search_tabs_action->set_status_tip("Find an open tab"_string);
 
     m_bookmark_action = GUI::Action::create_checkable("&Bookmark This Page"sv, { Mod_Ctrl, Key_D }, m_bookmark_icon, [this](auto&) {
         if (auto* tab = active_tab(); tab && tab->is_attached())
@@ -286,9 +318,11 @@ void BrowserWindow::create_menus()
     file_menu.add_action(*m_new_window_action);
     file_menu.add_action(*m_new_private_window_action);
     file_menu.add_action(*m_close_tab_action);
+    file_menu.add_action(*m_reopen_closed_tab_action);
     file_menu.add_separator();
     file_menu.add_action(*m_next_tab_action);
     file_menu.add_action(*m_previous_tab_action);
+    file_menu.add_action(*m_search_tabs_action);
     file_menu.add_separator();
     file_menu.add_action(GUI::CommonActions::make_quit_action([this](auto&) {
         m_session.quit();
@@ -326,6 +360,8 @@ void BrowserWindow::create_menus()
     bookmarks_menu.add_action(GUI::Action::create("Show &Bookmarks"sv, [this](auto&) {
         navigate_active("about:bookmarks"_string);
     }, m_window.ptr()));
+    bookmarks_menu.add_separator();
+    m_bookmarks_menu = bookmarks_menu.add_submenu("All &Bookmarks"_string);
 
     auto& history_menu = *m_window->add_menu("&History"_string);
     history_menu.add_action(GUI::Action::create("Show &History"sv, [this](auto&) {
@@ -353,6 +389,11 @@ void BrowserWindow::create_initial_tabs(Vector<String> const& initial_urls)
 
     for (size_t i = 0; i < initial_urls.size(); ++i)
         add_tab(initial_urls[i], i + 1 == initial_urls.size());
+}
+
+void BrowserWindow::reopen_tab(String const& url)
+{
+    add_tab(url, true);
 }
 
 BrowserTab& BrowserWindow::add_tab(String const& url, bool activate, bool request_engine_tab)
@@ -419,6 +460,10 @@ BrowserTab& BrowserWindow::add_tab(String const& url, bool activate, bool reques
 
 void BrowserWindow::close_tab(BrowserTab& tab)
 {
+    auto url = tab.current_url();
+    if (!url.is_empty())
+        m_session.note_closed_tab(url, tab.display_title(), m_private);
+
     if (m_tabs.size() == 1) {
         // Closing the last tab closes the window, like the SerenityOS Browser.
         m_window->close();
@@ -536,6 +581,7 @@ void BrowserWindow::update_action_state()
     m_reload_action->set_enabled(tab != nullptr);
     m_stop_action->set_enabled(tab != nullptr);
     m_close_tab_action->set_enabled(tab != nullptr);
+    m_reopen_closed_tab_action->set_enabled(m_session.closed_tab_count() > 0);
     m_bookmark_action->set_enabled(tab != nullptr);
     m_find_action->set_enabled(tab != nullptr);
     m_zoom_in_action->set_enabled(tab != nullptr);
@@ -619,16 +665,12 @@ void BrowserWindow::handle_engine_global_event(JsonObject const& event)
         Vector<BookmarkEntry> bookmarks;
         if (auto items = event.get_array("items"sv); items.has_value()) {
             for (auto const& value : items->values()) {
-                if (!value.is_object())
-                    continue;
-                auto const& object = value.as_object();
-                BookmarkEntry entry;
-                entry.title = String::from_byte_string(string_for_key(object, "title"sv)).release_value();
-                entry.url = String::from_byte_string(string_for_key(object, "url"sv)).release_value();
-                bookmarks.append(move(entry));
+                if (value.is_object())
+                    bookmarks.append(bookmark_entry_from_json(value.as_object()));
             }
         }
         m_bookmarks = move(bookmarks);
+        rebuild_bookmarks_menu();
         for (auto& tab : m_tabs)
             tab->set_bookmarks(m_bookmarks);
     }
@@ -651,6 +693,12 @@ void BrowserWindow::handle_engine_tab_event(JsonObject const& event, u64 tab_id)
             update_bookmark_action();
     } else if (type == "loading"sv) {
         tab->set_loading(event.get_bool("loading"sv).value_or(false));
+    } else if (type == "zoom_changed"sv) {
+        tab->set_zoom_level(event.get_double_with_precision_loss("zoom"sv).value_or(1.0));
+    } else if (type == "autocomplete_results"sv) {
+        auto request_id = event.get_u64("request"sv).value_or(0);
+        if (auto items = event.get_array("items"sv); items.has_value())
+            tab->set_autocomplete_results(request_id, *items, event.get_bool("final"sv).value_or(true));
     } else if (type == "find_result"sv) {
         auto current = event.get_u64("current"sv).value_or(0);
         auto total = event.get_u64("total"sv);
@@ -806,6 +854,127 @@ void BrowserWindow::show_downloads()
     m_downloads_window->show();
 }
 
+void BrowserWindow::add_bookmark_menu_items(GUI::Menu& menu, Vector<BookmarkEntry> const& items)
+{
+    for (auto const& item : items) {
+        if (item.is_folder) {
+            auto submenu = menu.add_submenu(item.title);
+            add_bookmark_menu_items(*submenu, item.children);
+        } else {
+            menu.add_action(GUI::Action::create(item.title.bytes_as_string_view(), [this, url = item.url](auto&) {
+                navigate_active(url);
+            }));
+        }
+    }
+}
+
+void BrowserWindow::rebuild_bookmarks_menu()
+{
+    if (!m_bookmarks_menu)
+        return;
+
+    m_bookmarks_menu->remove_all_actions();
+    if (m_bookmarks.is_empty()) {
+        auto empty = GUI::Action::create("No bookmarks"sv, [](auto&) {});
+        empty->set_enabled(false);
+        m_bookmarks_menu->add_action(empty);
+        return;
+    }
+
+    add_bookmark_menu_items(*m_bookmarks_menu, m_bookmarks);
+}
+
+void BrowserWindow::show_tab_search()
+{
+    auto dialog = GUI::Dialog::construct(m_window.ptr());
+    dialog->set_title("Search Tabs"sv);
+    dialog->resize(560, 380);
+
+    auto main_widget = dialog->set_main_widget<GUI::Widget>();
+    main_widget->set_fill_with_background_color(true);
+    main_widget->set_layout<GUI::VerticalBoxLayout>(GUI::Margins { 6 }, 6);
+
+    auto& search_box = main_widget->add<GUI::TextBox>();
+    search_box.set_placeholder("Search tabs"sv);
+    search_box.set_fixed_height(26);
+
+    Vector<size_t> filtered_indices;
+    Vector<GUI::JsonArrayModel::FieldSpec> tab_fields;
+    tab_fields.append({ "title"sv, "Title"_string, Gfx::TextAlignment::CenterLeft });
+    tab_fields.append({ "url"sv, "Address"_string, Gfx::TextAlignment::CenterLeft });
+    auto model = GUI::JsonArrayModel::create_from_source([&]() -> ErrorOr<JsonArray> {
+        filtered_indices.clear();
+
+        auto query = search_box.text();
+        JsonArray rows;
+        for (size_t index = 0; index < m_tabs.size(); ++index) {
+            auto& tab = *m_tabs[index];
+            auto title = tab.display_title();
+            auto url = tab.current_url();
+
+            if (!query.is_empty()
+                && !title.contains(query, CaseSensitivity::CaseInsensitive)
+                && !url.contains(query, CaseSensitivity::CaseInsensitive)) {
+                continue;
+            }
+
+            JsonObject row;
+            row.set("title"sv, title.bytes_as_string_view());
+            row.set("url"sv, url.bytes_as_string_view());
+            rows.must_append(move(row));
+            filtered_indices.append(index);
+        }
+        return rows;
+    },
+        move(tab_fields));
+
+    auto& table = main_widget->add<GUI::TableView>();
+    table.set_model(model);
+    table.set_column_headers_visible(false);
+    table.set_column_width(0, 220);
+    table.set_column_width(1, 310);
+
+    Optional<size_t> selected_index;
+
+    auto accept_selection = [&] {
+        auto selection = table.selection().first();
+        if (!selection.is_valid())
+            return;
+        auto row = selection.row();
+        if (row < 0 || row >= static_cast<int>(filtered_indices.size()))
+            return;
+        selected_index = filtered_indices[row];
+        dialog->done(GUI::Dialog::ExecResult::OK);
+    };
+
+    table.on_activation = [&](auto const&) {
+        accept_selection();
+    };
+
+    search_box.on_change = [&] {
+        model->update();
+        if (model->row_count() > 0)
+            table.set_cursor(model->index(0), GUI::AbstractView::SelectionUpdate::Set);
+    };
+    search_box.on_return_pressed = [&] {
+        accept_selection();
+    };
+    search_box.on_escape_pressed = [&] {
+        dialog->done(GUI::Dialog::ExecResult::Cancel);
+    };
+
+    model->update();
+    if (model->row_count() > 0)
+        table.set_cursor(model->index(0), GUI::AbstractView::SelectionUpdate::Set);
+    search_box.set_focus(true);
+
+    if (dialog->exec() != GUI::Dialog::ExecResult::OK || !selected_index.has_value())
+        return;
+
+    if (*selected_index < m_tabs.size())
+        activate_tab(*m_tabs[*selected_index]);
+}
+
 void BrowserWindow::show_tab_context_menu(BrowserTab& tab, Gfx::IntPoint screen_position)
 {
     auto* tab_pointer = &tab;
@@ -831,6 +1000,8 @@ void BrowserWindow::show_tab_context_menu(BrowserTab& tab, Gfx::IntPoint screen_
         if (tab_is_live(tab_pointer))
             close_other_tabs(*tab_pointer);
     }));
+    menu->add_separator();
+    menu->add_action(*m_reopen_closed_tab_action);
 
     m_tab_context_menu = menu;
     m_tab_context_menu->popup(screen_position);

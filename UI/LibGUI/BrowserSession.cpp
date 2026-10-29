@@ -152,6 +152,33 @@ BrowserWindow* BrowserSession::create_window(Vector<String> urls, bool private_w
     return create_window_internal(move(urls), private_window);
 }
 
+void BrowserSession::note_closed_tab(String const& url, String const& title, bool private_tab)
+{
+    // A private tab must not become visible in a normal window later.
+    if (private_tab || url.is_empty())
+        return;
+
+    m_closed_tabs.append({ url, title });
+    if (m_closed_tabs.size() > 20)
+        m_closed_tabs.remove(0);
+}
+
+bool BrowserSession::reopen_closed_tab()
+{
+    if (m_closed_tabs.is_empty())
+        return false;
+
+    auto closed = m_closed_tabs.take_last();
+    auto* window = active_window();
+    if (!window)
+        window = create_window({}, false);
+    if (!window)
+        return false;
+
+    window->reopen_tab(closed.url);
+    return true;
+}
+
 BrowserWindow* BrowserSession::create_window_internal(Vector<String> urls, bool private_window, Optional<Gfx::IntSize> size, Optional<Gfx::IntPoint> position, Optional<size_t> active_tab, bool maximized)
 {
     auto window = make<BrowserWindow>(*this, *m_engine, m_next_window_id++, private_window);

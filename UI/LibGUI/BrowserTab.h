@@ -14,8 +14,11 @@
 #include <AK/NonnullRefPtr.h>
 #include <AK/Optional.h>
 #include <AK/String.h>
+#include <AK/Vector.h>
+#include <LibCore/Forward.h>
 #include <LibGUI/Action.h>
 #include <LibGUI/Button.h>
+#include <LibGUI/Forward.h>
 #include <LibGUI/Label.h>
 #include <LibGUI/Statusbar.h>
 #include <LibGUI/TextBox.h>
@@ -29,6 +32,8 @@ namespace LadybirdSDE {
 struct BookmarkEntry {
     String title;
     String url;
+    bool is_folder { false };
+    Vector<BookmarkEntry> children;
 };
 
 // One browser tab: a Serenity-style toolbar, the page view, and a status bar.
@@ -78,6 +83,8 @@ public:
     void set_crashed(bool crashed);
     void set_unresponsive(bool unresponsive);
     void set_find_result(u64 current, Optional<u64> total);
+    void set_zoom_level(double zoom_level);
+    void set_autocomplete_results(u64 request_id, JsonArray const& items, bool final);
     void show_dialog(StringView kind, StringView message, StringView default_text = {});
     void show_context_menu(JsonArray const& items, Gfx::IntPoint screen_position);
     void show_permission_prompt(StringView name, StringView origin, u64 request_id);
@@ -100,11 +107,19 @@ private:
     static StringView button_name(GUI::MouseButton);
     void add_context_menu_items(GUI::Menu&, JsonArray const&);
     void add_select_dropdown_items(GUI::Menu&, JsonArray const&, bool in_group = false);
+    void add_bookmark_menu_items(GUI::Menu&, Vector<BookmarkEntry> const&);
+    void update_site_button();
+    void request_autocomplete();
+    void hide_autocomplete();
+    void accept_autocomplete();
+    void move_autocomplete_selection(int delta);
 
     EngineClient& m_engine;
     NonnullRefPtr<GUI::Widget> m_root;
     RefPtr<GUI::Toolbar> m_toolbar;
+    RefPtr<GUI::Button> m_site_button;
     RefPtr<GUI::TextBox> m_location_box;
+    RefPtr<GUI::Button> m_zoom_button;
     RefPtr<WebContentView> m_web_view;
     RefPtr<GUI::Widget> m_bookmarks_bar;
     RefPtr<GUI::Widget> m_find_bar;
@@ -113,7 +128,19 @@ private:
     RefPtr<GUI::Statusbar> m_statusbar;
     RefPtr<GUI::Menu> m_context_menu;
     RefPtr<GUI::Menu> m_select_dropdown;
+    RefPtr<GUI::Menu> m_site_menu;
+    RefPtr<GUI::Menu> m_zoom_menu;
+    RefPtr<GUI::Window> m_autocomplete_popup;
+    RefPtr<GUI::TableView> m_autocomplete_table;
+    RefPtr<GUI::JsonArrayModel> m_autocomplete_model;
+    RefPtr<Core::Timer> m_autocomplete_timer;
+    RefPtr<Core::Timer> m_autocomplete_hide_timer;
+    JsonArray m_autocomplete_rows;
+    Vector<String> m_autocomplete_texts;
+    u64 m_autocomplete_request_id { 0 };
+    bool m_autocomplete_visible { false };
     Optional<u32> m_selected_select_item;
+    double m_zoom_level { 1.0 };
     bool m_select_dropdown_visible { false };
 
     u64 m_tab_id { 0 };

@@ -5,7 +5,7 @@ line-oriented JSON protocol over a Unix socket. Frame pixels never travel over
 the socket: the engine publishes a POSIX shared-memory ring per tab and the
 frontend maps it.
 
-Version: `Shared/EngineProtocol.h`.
+Version: 7. `Shared/EngineProtocol.h` is authoritative.
 
 ## Frontend → engine
 
@@ -14,6 +14,7 @@ Version: `Shared/EngineProtocol.h`.
 | `create_tab` | `request`, `width`, `height`, `url`, `private`, `window` | Create a view and a tab. `request` is echoed in `tab_created`; `window` associates the tab with a frontend window. |
 | `activate` | `tab`, `window` | Make this tab the active tab of `window`; the active tab of every other window stays visible. |
 | `navigate` | `tab`, `url`, `user_input` | Load a URL, or run the URL/search-input path. |
+| `autocomplete` | `tab`, `request`, `query` | Query history/bookmarks/search suggestions. `request` is echoed in `autocomplete_results`; an empty query cancels. |
 | `back` / `forward` | `tab` | Traverse session history. |
 | `reload` | `tab`, `bypass_cache` | Reload. |
 | `stop` | `tab` | Stop loading. |
@@ -28,7 +29,7 @@ Version: `Shared/EngineProtocol.h`.
 | `copy` / `cut` | `tab` | Put the page selection on the clipboard. |
 | `paste` | `tab`, `text` | Paste text into the page. |
 | `select_all`, `undo`, `redo` | `tab` | Editing commands. |
-| `zoom` | `tab`, `direction` | `in`, `out`, or `reset`. |
+| `zoom` | `tab`, `direction` | `in`, `out`, or `reset`. The engine answers with `zoom_changed`. |
 | `dialog_response` | `tab`, `kind`, `accept`, `text` | Answer an alert/confirm/prompt. |
 | `context_menu_action` | `tab`, `action` | Invoke a menu item from the last `context_menu` event. |
 | `permission_response` | `tab`, `request`, `granted` | Answer a page permission request. |
@@ -54,12 +55,14 @@ Version: `Shared/EngineProtocol.h`.
 | `loading` | `tab`, `loading` | Load state. |
 | `history` | `tab`, `can_go_back`, `can_go_forward` | History button state. |
 | `find_result` | `tab`, `current`, `total` | Current and total find-in-page matches. |
+| `zoom_changed` | `tab`, `zoom` | The page zoom level changed. |
+| `autocomplete_results` | `tab`, `request`, `final`, `items` | Suggestions for an `autocomplete` query. Items have `text` (the value to navigate to), `display` (the URL or query to show), optional `title` and `subtitle`, `source`, and `search`. `final` marks the last update for the query. |
 | `link_hover` | `tab`, `url` or empty | Link under the pointer. |
 | `cursor` | `tab`, `cursor` | Page cursor name. |
 | `dialog` | `tab`, `kind`, `message`, `default` | Page opened a dialog. |
 | `clipboard` | `tab`, `text` | Copy/cut result for the frontend clipboard. |
 | `fullscreen` | `tab`, `fullscreen` | Page requested/left fullscreen. |
-| `bookmarks` | `items` | Root bookmarks (`title`, `url`) for the bookmarks bar. |
+| `bookmarks` | `items` | The bookmark tree for the bookmarks bar. Each item has `id`, `type` (`bookmark` or `folder`), `title`, and either `url` or nested `items`. |
 | `context_menu` | `tab`, `kind`, `x`, `y`, `items` | Page/link/image/media menu. Items have `text`, `action`, `enabled`, `checkable`, `checked`, or `separator`; `items` on a submenu entry nests. |
 | `permission` | `tab`, `request`, `name`, `origin` | Page permission prompt. |
 | `file_picker` | `tab`, `multiple`, `filters` | Page opened a file picker. |
