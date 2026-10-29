@@ -484,7 +484,11 @@ BrowserTab& BrowserWindow::add_tab(String const& url, bool activate, bool reques
     m_tabs.append(move(tab));
     tab_pointer->set_bookmarks(m_bookmarks);
     tab_pointer->set_bookmarks_bar_visible(m_show_bookmarks_bar);
-    m_tab_widget->add_tab(tab_pointer->root(), "New Tab"_string);
+
+    // A restored tab that has not loaded yet shows its URL until the page
+    // provides a title, matching the reference frontend.
+    auto tab_title = lazy && !url.is_empty() ? url : "New Tab"_string;
+    m_tab_widget->add_tab(tab_pointer->root(), tab_title);
 
     if (request_engine_tab) {
         if (m_engine->is_connected())
