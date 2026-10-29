@@ -49,11 +49,10 @@ reference for behaviour and options.
 - **IME composition**: forward composition events, not only key events.
 - **Drag and drop**: links, files, tabs, and text.
 - **Rich clipboard**: **Done:** WebContent's rich copy path, text/HTML and
-  image representations, and page-initiated clipboard reads. The SDE clipboard
-  stores one MIME type per item, so other applications receive the best single
-  representation (plain text for rich text), while the browser keeps the full
-  item for pasting back into a page. File lists still need the portal to carry
-  multiple types.
+  image representations, and page-initiated clipboard reads. The LibWM
+  clipboard portal now carries a list of representations per item, so
+  text/plain, text/html, and images are all available to other applications at
+  the same time.
 - **Accessibility**: expose web-content accessibility through the LibGUI/AT-SPI
   bridge.
 

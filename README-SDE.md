@@ -54,7 +54,10 @@ draw chrome. Replacing either half leaves the other intact.
 Requirements are those of both projects:
 
 * Ladybird's Linux build dependencies (see `Documentation/BuildInstructionsLadybird.md`)
-* A LibGUI-for-Wayland Lagom build (`../libgui-wayland/build/lagom`)
+* A LibGUI-for-Wayland Lagom build (`../libgui-wayland/build/lagom`). The rich
+  clipboard needs the multi-format clipboard support from libgui-wayland
+  (`patches/0085-libgui-multi-format-clipboard.patch` and the LibWM changes on
+  its `main` branch).
 * The SDE's `WindowServer` only for the headless test, not for normal use
 
 ```sh
@@ -147,11 +150,12 @@ navigating the real engine.
 * Edit menu with undo/redo, cut/copy/paste through the SDE clipboard, select all,
   and find-in-page.
 * Rich clipboard: WebContent's copy path is used while the page has focus, so
-  text/HTML selections and images keep their representations. The frontend maps
-  them to the SDE clipboard (choosing text over HTML for other applications)
-  and remembers the full item so pasting back into the browser preserves
-  formatting. Images are converted between `image/png` and the SDE bitmap
-  clipboard, and page-initiated clipboard reads see the desktop clipboard.
+  text/HTML selections and images keep their representations. The frontend
+  stores the whole representation list in the SDE clipboard through the
+  multi-format clipboard portal, so text/plain, text/html, and images coexist
+  on one clipboard item; other applications pick the type they understand.
+  Images cross the engine boundary as `image/png`, and page-initiated clipboard
+  reads see the desktop clipboard.
 * DevTools: Tools → Enable DevTools, or start the browser with
   `--devtools[=port]`. A banner shows the listening port; Tools → Open DevTools
   Client launches the same Firefox client as the Qt frontend, and
