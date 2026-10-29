@@ -143,7 +143,7 @@ void WebContentView::doubleclick_event(GUI::MouseEvent& event)
 void WebContentView::mousewheel_event(GUI::MouseEvent& event)
 {
     // LibGUI reports wheel motion in notches; the engine wants pixel deltas.
-    static constexpr int scroll_step_size = 24;
+    static constexpr int scroll_step_size = 48;
     if (on_wheel)
         on_wheel(event.position(), event.wheel_delta_x() * scroll_step_size, event.wheel_delta_y() * scroll_step_size, event.modifiers());
     event.accept();

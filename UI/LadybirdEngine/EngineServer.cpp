@@ -774,6 +774,8 @@ void EngineServer::handle_wheel(u64 tab_id, JsonObject const& command)
 
     event.wheel_delta_x = command.get_double_with_precision_loss("delta_x"sv).value_or(0.0);
     event.wheel_delta_y = command.get_double_with_precision_loss("delta_y"sv).value_or(0.0);
+    if (getenv("LADYBIRD_SDE_TRACE_FRAMES"))
+        warnln("LadybirdEngine: tab {} wheel at {},{} delta {}x{}", tab_id, event.position.x(), event.position.y(), event.wheel_delta_x, event.wheel_delta_y);
     event.wheel_delta_precision = Web::WheelDeltaPrecision::Discrete;
     event.wheel_tick_120ths_x = Web::wheel_tick_120ths_from_pixel_delta(event.wheel_delta_x, event.wheel_delta_precision);
     event.wheel_tick_120ths_y = Web::wheel_tick_120ths_from_pixel_delta(event.wheel_delta_y, event.wheel_delta_precision);
