@@ -187,7 +187,11 @@ BrowserTab::BrowserTab(EngineClient& engine, GUI::Window& window, GUI::Action& b
     m_autocomplete_timer = Core::Timer::create_single_shot(120, [this] {
         request_autocomplete();
     });
-    m_autocomplete_hide_timer = Core::Timer::create_single_shot(200, [this] {
+    m_autocomplete_hide_timer = Core::Timer::create_single_shot(50, [this] {
+        // A click on the suggestion list moves focus to the table; let that
+        // click finish instead of closing the list underneath it.
+        if (m_autocomplete_table && m_autocomplete_table->is_focused())
+            return;
         hide_autocomplete();
     });
 
@@ -609,6 +613,13 @@ void BrowserTab::set_autocomplete_results(u64 request_id, JsonArray const& items
     if (request_id != m_autocomplete_request_id)
         return;
 
+    // A result that arrives after the location box lost focus must not reopen
+    // the list over the page.
+    if (!m_location_box->is_focused()) {
+        hide_autocomplete();
+        return;
+    }
+
     if (items.is_empty()) {
         hide_autocomplete();
         return;
@@ -678,6 +689,9 @@ void BrowserTab::hide_autocomplete()
         m_autocomplete_overlay->set_visible(false);
 
     m_autocomplete_visible = false;
+    // Invalidate any request still in flight so a late result cannot reopen
+    // the list after navigation or focus loss.
+    ++m_autocomplete_request_id;
     m_autocomplete_rows.clear();
     m_autocomplete_texts.clear();
     if (m_autocomplete_model)
