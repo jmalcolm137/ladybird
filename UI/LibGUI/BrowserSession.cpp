@@ -383,7 +383,8 @@ void BrowserSession::save_session()
     JsonObject session;
     session.set("windows"sv, move(windows));
 
-    auto file = Core::File::open(path, Core::File::OpenMode::Write | Core::File::OpenMode::Truncate);
+    auto temporary_path = ByteString::formatted("{}.tmp", path);
+    auto file = Core::File::open(temporary_path, Core::File::OpenMode::Write | Core::File::OpenMode::Truncate);
     if (file.is_error())
         return;
 
@@ -391,6 +392,8 @@ void BrowserSession::save_session()
     if (file.value()->write_until_depleted(serialized.bytes()).is_error())
         return;
     file.value()->close();
+    if (Core::System::rename(temporary_path, path).is_error())
+        (void)Core::System::unlink(temporary_path);
 }
 
 bool BrowserSession::load_session()
