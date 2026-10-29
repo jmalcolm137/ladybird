@@ -31,6 +31,7 @@
 #include <LibWebView/Forward.h>
 #include <LibWebView/HeadlessWebView.h>
 #include <LibWebView/Menu.h>
+#include <LibWebView/SessionStore.h>
 
 namespace LadybirdSDE {
 
@@ -69,6 +70,7 @@ private:
         u64 request_id { 0 };
         u64 parent { 0 };
         u64 window_id { 0 };
+        Optional<WebView::SessionTabId> session_tab_id;
         NonnullOwnPtr<WebView::HeadlessWebView> view;
         WebView::Autocomplete* autocomplete { nullptr };
         Gfx::IntSize viewport_size;
@@ -114,6 +116,8 @@ private:
         Vector<FrameDamage> frame_damage_history;
         bool focused { false };
         bool closing { false };
+        Optional<String> pending_navigation;
+        bool pending_navigation_user_input { true };
         Vector<NonnullRefPtr<WebView::Action>> context_menu_actions;
         HashMap<u64, Function<void(bool)>> pending_permissions;
     };
@@ -123,8 +127,12 @@ private:
     void dispatch_command(JsonObject const&);
 
     void handle_create_tab(JsonObject const&);
+    void handle_close_window(JsonObject const&);
+    void handle_window_geometry(JsonObject const&);
     void handle_activate_tab(u64 tab_id, JsonObject const&);
     void handle_navigate(u64 tab_id, JsonObject const&);
+    void perform_navigation(Tab&, String const&, bool user_input);
+    void flush_pending_navigation(Tab&);
     void handle_autocomplete(u64 tab_id, JsonObject const&);
     void handle_resize(u64 tab_id, JsonObject const&);
     void handle_focus(u64 tab_id, JsonObject const&);
@@ -195,6 +203,8 @@ private:
     void send_select_dropdown(Tab&, Gfx::IntPoint, i32 minimum_width, Vector<Web::HTML::SelectItem> const&);
     void send_downloads();
     void send_download_event(StringView type, WebView::FileDownloader::Download const&);
+    void send_session_plan();
+    WebView::SessionWindowId session_window_for(u64 frontend_window_id, bool create);
     JsonObject download_to_json(WebView::FileDownloader::Download const&);
     virtual void download_added(WebView::FileDownloader::Download const&) override;
     virtual void download_updated(WebView::FileDownloader::Download const&) override;
@@ -214,6 +224,7 @@ private:
     u64 m_active_tab_id { 0 };
     u64 m_focused_tab_id { 0 };
     HashMap<u64, u64> m_window_active_tabs;
+    HashMap<u64, WebView::SessionWindowId> m_session_windows;
     u64 m_next_frame_buffer_id { 1 };
     u64 m_next_permission_id { 1 };
     bool m_quitting { false };

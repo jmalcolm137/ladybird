@@ -421,7 +421,7 @@ void EngineClient::send_simple(StringView type, u64 tab_id)
     send(event);
 }
 
-void EngineClient::create_tab(Gfx::IntSize viewport_size, String const& url, u64 request_id, bool private_tab, u64 window_id)
+void EngineClient::create_tab(Gfx::IntSize viewport_size, String const& url, u64 request_id, bool private_tab, u64 window_id, u64 session_tab_id, u64 session_window_id)
 {
     JsonObject event;
     event.set("type"sv, "create_tab"sv);
@@ -432,6 +432,10 @@ void EngineClient::create_tab(Gfx::IntSize viewport_size, String const& url, u64
     event.set("private"sv, private_tab);
     if (window_id != 0)
         event.set("window"sv, window_id);
+    if (session_tab_id != 0)
+        event.set("session_tab"sv, session_tab_id);
+    if (session_window_id != 0)
+        event.set("session_window"sv, session_window_id);
     send(event);
 }
 
@@ -660,6 +664,28 @@ void EngineClient::download_action(StringView action, u64 id)
     event.set("type"sv, "download_action"sv);
     event.set("action"sv, action);
     event.set("id"sv, id);
+    send(event);
+}
+
+void EngineClient::window_geometry(u64 session_window_id, Gfx::IntPoint position, Gfx::IntSize size, bool maximized)
+{
+    JsonObject event;
+    event.set("type"sv, "window_geometry"sv);
+    event.set("session_window"sv, session_window_id);
+    event.set("x"sv, position.x());
+    event.set("y"sv, position.y());
+    event.set("width"sv, size.width());
+    event.set("height"sv, size.height());
+    event.set("maximized"sv, maximized);
+    send(event);
+}
+
+void EngineClient::close_window(u64 session_window_id, u64 active_tab_index)
+{
+    JsonObject event;
+    event.set("type"sv, "close_window"sv);
+    event.set("session_window"sv, session_window_id);
+    event.set("active"sv, active_tab_index);
     send(event);
 }
 

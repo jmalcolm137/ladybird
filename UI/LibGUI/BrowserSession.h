@@ -60,6 +60,7 @@ private:
 
     void on_engine_connected();
     void on_engine_event(JsonObject const&);
+    void handle_session_plan(JsonObject const&);
     void on_engine_frame(u64 tab_id, Gfx::Bitmap const*, u64 sequence, Gfx::IntRect damage, bool full);
     void on_engine_disconnected();
     void handle_open_window(JsonObject const&);
@@ -81,6 +82,9 @@ private:
     u64 m_next_request_id { 1 };
     u64 m_next_window_id { 1 };
     RefPtr<Core::Timer> m_autosave_timer;
+    RefPtr<Core::Timer> m_session_plan_timeout;
+    bool m_waiting_for_session_plan { false };
+    bool m_session_plan_received { false };
 };
 
 }

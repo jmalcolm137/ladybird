@@ -36,7 +36,7 @@ public:
 
     bool is_connected() const { return m_socket != nullptr; }
 
-    void create_tab(Gfx::IntSize viewport_size, String const& url, u64 request_id, bool private_tab = false, u64 window_id = 0);
+    void create_tab(Gfx::IntSize viewport_size, String const& url, u64 request_id, bool private_tab = false, u64 window_id = 0, u64 session_tab_id = 0, u64 session_window_id = 0);
     void close_tab(u64 tab_id);
     void activate_tab(u64 tab_id, u64 window_id = 0);
     void navigate(u64 tab_id, String const& url, bool user_input = true);
@@ -66,6 +66,8 @@ public:
     void file_picker_response(u64 tab_id, String const& path);
     void select_dropdown_closed(u64 tab_id, Optional<u32> selected);
     void download_action(StringView action, u64 id);
+    void window_geometry(u64 session_window_id, Gfx::IntPoint position, Gfx::IntSize size, bool maximized);
+    void close_window(u64 session_window_id, u64 active_tab_index);
     void frame_ack(u64 tab_id, u64 sequence);
     void quit();
 

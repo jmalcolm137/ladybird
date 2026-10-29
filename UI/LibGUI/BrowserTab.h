@@ -29,6 +29,11 @@
 
 namespace LadybirdSDE {
 
+struct InitialTab {
+    String url;
+    u64 session_tab_id { 0 };
+};
+
 struct BookmarkEntry {
     String title;
     String url;
@@ -54,6 +59,9 @@ public:
     bool engine_tab_requested() const { return m_engine_tab_requested; }
     bool is_lazy() const { return m_lazy; }
     void set_lazy(bool lazy) { m_lazy = lazy; }
+    u64 session_tab_id() const { return m_session_tab_id; }
+    void set_session_tab_id(u64 session_tab_id) { m_session_tab_id = session_tab_id; }
+    void set_session_window_id(u64 session_window_id) { m_session_window_id = session_window_id; }
     bool can_go_back() const { return m_can_go_back; }
     bool can_go_forward() const { return m_can_go_forward; }
     bool is_bookmarked() const { return m_bookmarked; }
@@ -151,6 +159,8 @@ private:
     u64 m_window_id { 0 };
     bool m_engine_tab_requested { false };
     bool m_lazy { false };
+    u64 m_session_tab_id { 0 };
+    u64 m_session_window_id { 0 };
     u64 m_request_id { 0 };
     String m_initial_url;
     String m_title;

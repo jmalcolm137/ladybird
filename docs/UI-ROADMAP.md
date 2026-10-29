@@ -70,6 +70,22 @@ pacing previously caused scroll and freeze regressions, so they stay off until a
 design is proven not to destabilize the UI. Any future work must be gated by
 scroll, resize, multi-window, and session-restore tests.
 
+## Engine-host parity
+
+- **Native session restore:** the engine host now uses `SessionStore` /
+  `SessionHistorySnapshot` for startup recovery, including full per-tab
+  history. Restored background tabs are lazy.
+- **Active view:** `EngineApplication` exposes the active `ViewImplementation`
+  to the shared `Application` actions and session machinery.
+- **Navigation ordering:** `EngineServer` queues a navigation while the current
+  load is committing, preventing UI/WebContent session-history races.
+- **Headless view:** `HeadlessWebView` is upstream Ladybird's native headless
+  view, not a custom replacement. The engine host cannot use a GUI
+  `WebContentView` because it has no native window; the remaining native
+  lifecycle responsibilities live in `EngineServer`.
+- **Regression harness:** `scripts/compare-frontends.sh [url]` compares the
+  upstream Qt and LibGUI frontends headlessly and fails on a crash signature.
+
 ## Deployment gaps
 
 - `/usr/lib/sde-next` still contains the older `libgui-wayland` framework, so

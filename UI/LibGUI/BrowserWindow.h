@@ -27,7 +27,7 @@ class BrowserWindow {
     AK_MAKE_NONCOPYABLE(BrowserWindow);
 
 public:
-    BrowserWindow(BrowserSession&, EngineClient&, u64 window_id, bool private_window);
+    BrowserWindow(BrowserSession&, EngineClient&, u64 window_id, bool private_window, u64 session_window_id = 0);
     ~BrowserWindow();
 
     void show();
@@ -55,16 +55,19 @@ public:
     void activate_tab_index(size_t);
     bool is_private() const { return m_private; }
     u64 id() const { return m_id; }
+    u64 session_window_id() const { return m_session_window_id; }
+    void set_session_window_id(u64 session_window_id);
 
 private:
     friend class BrowserSession;
 
     ErrorOr<void> initialize(Vector<String> initial_urls, Optional<size_t> active_tab = {}, bool lazy_load = false);
+    ErrorOr<void> initialize(Vector<InitialTab> initial_tabs, Optional<size_t> active_tab, bool lazy_load);
     void create_actions();
     void create_menus();
-    void create_initial_tabs(Vector<String> const& initial_urls, Optional<size_t> active_tab, bool lazy_load);
+    void create_initial_tabs(Vector<InitialTab> const& initial_tabs, Optional<size_t> active_tab, bool lazy_load);
 
-    BrowserTab& add_tab(String const& url, bool activate, bool request_engine_tab = true, bool lazy = false);
+    BrowserTab& add_tab(String const& url, bool activate, bool request_engine_tab = true, bool lazy = false, u64 session_tab_id = 0);
     void ensure_tab_loaded(BrowserTab&);
     void close_tab(BrowserTab&);
     void remove_tab(BrowserTab&);
@@ -94,6 +97,7 @@ private:
     BrowserSession& m_session;
     EngineClient* m_engine { nullptr };
     u64 m_id { 0 };
+    u64 m_session_window_id { 0 };
     RefPtr<GUI::Window> m_window;
     RefPtr<GUI::TabWidget> m_tab_widget;
 
@@ -128,7 +132,6 @@ private:
     RefPtr<GUI::Action> m_view_source_action;
     RefPtr<GUI::Action> m_downloads_action;
     RefPtr<GUI::Action> m_site_info_action;
-    RefPtr<GUI::Action> m_restore_session_action;
 
     Vector<NonnullOwnPtr<BrowserTab>> m_tabs;
     Vector<BookmarkEntry> m_bookmarks;

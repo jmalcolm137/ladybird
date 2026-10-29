@@ -31,9 +31,15 @@ public:
     using OpenNewWindowHandler = Function<void(URL::URL const&, WebView::IsPrivate)>;
     void set_open_new_window_handler(OpenNewWindowHandler handler) { m_open_new_window_handler = move(handler); }
 
+    using ActiveWebViewProvider = Function<Optional<WebView::ViewImplementation&>()>;
+    void set_active_web_view_provider(ActiveWebViewProvider provider) { m_active_web_view_provider = move(provider); }
+
 protected:
+    virtual Optional<WebView::ViewImplementation&> active_web_view() const override;
     virtual void create_platform_arguments(Core::ArgsParser&) override;
     virtual void create_platform_options(WebView::BrowserOptions&, WebView::RequestServerOptions&, WebView::WebContentOptions&) override;
+    virtual WebView::SessionLaunchPolicy launch_restore_policy() const override;
+    virtual bool should_coordinate_browser_process() const override { return false; }
     virtual void open_download(WebView::FileDownloader::Download const&) const override;
     virtual void show_download_in_folder(WebView::FileDownloader::Download const&) const override;
     virtual Optional<WebView::ViewImplementation&> open_blank_new_tab(Web::HTML::ActivateTab) const override;
@@ -45,6 +51,7 @@ private:
     ByteString m_frame_directory;
     mutable OpenBlankNewTabHandler m_open_blank_new_tab_handler;
     mutable OpenNewWindowHandler m_open_new_window_handler;
+    ActiveWebViewProvider m_active_web_view_provider;
 };
 
 }

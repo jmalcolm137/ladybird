@@ -83,6 +83,7 @@ EngineServer::~EngineServer()
 {
     EngineApplication::the().set_open_blank_new_tab_handler({});
     EngineApplication::the().set_open_new_window_handler({});
+    EngineApplication::the().set_active_web_view_provider({});
     if (m_unresponsive_timer)
         m_unresponsive_timer->stop();
     if (m_resolver_watch_timer)
@@ -145,6 +146,12 @@ ErrorOr<void> EngineServer::start()
         send_event(move(event));
     });
 
+    EngineApplication::the().set_active_web_view_provider([this]() -> Optional<WebView::ViewImplementation&> {
+        if (auto* tab = tab_for_id(m_active_tab_id))
+            return static_cast<WebView::ViewImplementation&>(*tab->view);
+        return {};
+    });
+
     EngineApplication::the().set_open_blank_new_tab_handler([this](Web::HTML::ActivateTab) -> Optional<WebView::ViewImplementation&> {
         auto viewport_size = Gfx::IntSize { 1024, 768 };
         auto is_private = WebView::IsPrivate::No;
@@ -159,6 +166,7 @@ ErrorOr<void> EngineServer::start()
         return static_cast<WebView::ViewImplementation&>(*tab.view);
     });
 
+    send_session_plan();
     send_bookmarks();
     send_downloads();
     return {};
@@ -256,6 +264,10 @@ void EngineServer::dispatch_command(JsonObject const& command)
         quit();
     } else if (*type == "download_action"sv) {
         handle_download_action(command);
+    } else if (*type == "close_window"sv) {
+        handle_close_window(command);
+    } else if (*type == "window_geometry"sv) {
+        handle_window_geometry(command);
     } else {
         auto tab_id = command.get_u64("tab"sv);
         if (!tab_id.has_value()) {
@@ -427,6 +439,7 @@ void EngineServer::wire_tab(Tab& tab)
             send_loading_state(*tab, false);
             send_url(*tab);
             send_history_state(*tab);
+            flush_pending_navigation(*tab);
         }
     };
 
@@ -655,12 +668,124 @@ void EngineServer::handle_create_tab(JsonObject const& command)
 
     auto request_id = command.get_u64("request"sv).value_or(0);
     auto window_id = command.get_u64("window"sv).value_or(0);
+    auto session_tab = command.get_u64("session_tab"sv);
+    auto session_window = command.get_u64("session_window"sv);
+
     auto& tab = create_tab({ max(static_cast<int>(width), 1), max(static_cast<int>(height), 1) }, is_private, request_id, 0, window_id);
+
+    auto* store = WebView::Application::session_store(WebView::IsPrivate::No);
+
+    if (session_window.has_value() && *session_window != 0)
+        m_session_windows.set(window_id, static_cast<WebView::SessionWindowId>(*session_window));
+
+    if (!is_private && store) {
+        if (session_tab.has_value() && *session_tab != 0) {
+            auto tab_id = static_cast<WebView::SessionTabId>(*session_tab);
+            tab.session_tab_id = tab_id;
+            tab.view->set_session_tab_id(tab_id);
+        } else {
+            auto initial_url = WebView::Application::settings().new_tab_page_url();
+            if (auto url = command.get_string("url"sv); url.has_value() && !url->is_empty()) {
+                if (auto parsed = URL::Parser::basic_parse(url->bytes_as_string_view()); parsed.has_value())
+                    initial_url = parsed.release_value();
+            }
+            auto session_window_id = session_window_for(window_id, true);
+            auto tab_id = store->tab_opened({
+                .window_id = session_window_id,
+                .initial_url = move(initial_url),
+                .insertion_index = {},
+                .is_active = WebView::SessionStore::IsActive::No,
+            });
+            if (!tab_id.is_error()) {
+                tab.session_tab_id = tab_id.value();
+                tab.view->set_session_tab_id(tab_id.value());
+            }
+        }
+    }
+
+    if (tab.session_tab_id.has_value() && store) {
+        auto history = store->load_tab_history(*tab.session_tab_id);
+        if (history.has_value() && !tab.view->restore_session_history_from_snapshot(history.release_value()).is_error())
+            return;
+    }
 
     if (auto url = command.get_string("url"sv); url.has_value() && !url->is_empty())
         tab.view->load_from_user_input(url->bytes_as_string_view());
     else
         tab.view->load(WebView::Application::settings().new_tab_page_url());
+}
+
+void EngineServer::handle_close_window(JsonObject const& command)
+{
+    auto session_window = command.get_u64("session_window"sv);
+    if (!session_window.has_value() || *session_window == 0)
+        return;
+
+    auto window_id = static_cast<WebView::SessionWindowId>(*session_window);
+    if (auto* store = WebView::Application::session_store(WebView::IsPrivate::No)) {
+        auto active_tab = static_cast<i64>(command.get_u64("active"sv).value_or(0));
+        (void)store->window_closing({
+            .window_id = window_id,
+            .active_tab_index = active_tab,
+            .closed_at = UnixDateTime::now(),
+        });
+    }
+
+    Vector<u64> windows_to_remove;
+    for (auto const& [frontend_window_id, mapped_window_id] : m_session_windows) {
+        if (mapped_window_id == window_id)
+            windows_to_remove.append(frontend_window_id);
+    }
+    for (auto frontend_window_id : windows_to_remove)
+        m_session_windows.remove(frontend_window_id);
+}
+
+void EngineServer::handle_window_geometry(JsonObject const& command)
+{
+    auto session_window = command.get_u64("session_window"sv);
+    if (!session_window.has_value() || *session_window == 0)
+        return;
+
+    auto* store = WebView::Application::session_store(WebView::IsPrivate::No);
+    if (!store)
+        return;
+
+    store->window_geometry_changed(
+        static_cast<WebView::SessionWindowId>(*session_window),
+        {
+            .x = static_cast<i32>(command.get_i64("x"sv).value_or(0)),
+            .y = static_cast<i32>(command.get_i64("y"sv).value_or(0)),
+            .width = static_cast<i32>(command.get_i64("width"sv).value_or(0)),
+            .height = static_cast<i32>(command.get_i64("height"sv).value_or(0)),
+            .maximized = command.get_bool("maximized"sv).value_or(false),
+        });
+}
+
+WebView::SessionWindowId EngineServer::session_window_for(u64 frontend_window_id, bool create)
+{
+    if (auto it = m_session_windows.find(frontend_window_id); it != m_session_windows.end())
+        return it->value;
+
+    if (!create)
+        return 0;
+
+    auto* store = WebView::Application::session_store(WebView::IsPrivate::No);
+    if (!store)
+        return 0;
+
+    auto session_window_id = store->window_opened();
+    if (session_window_id.is_error())
+        return 0;
+
+    m_session_windows.set(frontend_window_id, session_window_id.value());
+
+    JsonObject event;
+    event.set("type"sv, "session_window"sv);
+    event.set("window"sv, frontend_window_id);
+    event.set("session_window"sv, static_cast<u64>(session_window_id.value()));
+    send_event(move(event));
+
+    return session_window_id.value();
 }
 
 void EngineServer::handle_activate_tab(u64 tab_id, JsonObject const& command)
@@ -675,6 +800,10 @@ void EngineServer::handle_activate_tab(u64 tab_id, JsonObject const& command)
         m_window_active_tabs.set(window_id, tab_id);
     }
     m_active_tab_id = tab_id;
+    if (tab->session_tab_id.has_value()) {
+        if (auto* store = WebView::Application::session_store(WebView::IsPrivate::No))
+            store->active_tab_changed(*tab->session_tab_id);
+    }
 
     for (auto& [id, other_tab] : m_tabs) {
         bool visible = false;
@@ -693,15 +822,45 @@ void EngineServer::handle_navigate(u64 tab_id, JsonObject const& command)
         return;
 
     auto url = command.get_string("url"sv);
-    if (!url.has_value() || url->is_empty()) {
-        tab->view->load(WebView::Application::settings().new_tab_page_url());
+    auto user_input = command.get_bool("user_input"sv).value_or(true);
+
+    // The UI process owns the session-history mirror. Starting a new navigation
+
+    // while the previous one is still committing can hand WebContent a target
+    // entry from the wrong document state. Queue the latest requested
+    // navigation and start it when the current load finishes.
+    if (tab->view->is_loading() || tab->pending_navigation.has_value()) {
+        tab->pending_navigation = url.has_value() && !url->is_empty()
+            ? *url
+            : WebView::Application::settings().new_tab_page_url().to_string();
+        tab->pending_navigation_user_input = user_input;
         return;
     }
 
-    if (command.get_bool("user_input"sv).value_or(true))
-        tab->view->load_from_user_input(url->bytes_as_string_view());
-    else if (auto parsed = URL::Parser::basic_parse(url->bytes_as_string_view()); parsed.has_value())
-        tab->view->load(*parsed);
+    perform_navigation(*tab, url.has_value() ? *url : String {}, user_input);
+}
+
+void EngineServer::perform_navigation(Tab& tab, String const& url, bool user_input)
+{
+    if (url.is_empty()) {
+        tab.view->load(WebView::Application::settings().new_tab_page_url());
+        return;
+    }
+
+    if (user_input)
+        tab.view->load_from_user_input(url.bytes_as_string_view());
+    else if (auto parsed = URL::Parser::basic_parse(url.bytes_as_string_view()); parsed.has_value())
+        tab.view->load(*parsed);
+}
+
+void EngineServer::flush_pending_navigation(Tab& tab)
+{
+    if (!tab.pending_navigation.has_value())
+        return;
+
+    auto url = tab.pending_navigation.release_value();
+    auto user_input = tab.pending_navigation_user_input;
+    perform_navigation(tab, url, user_input);
 }
 
 void EngineServer::handle_autocomplete(u64 tab_id, JsonObject const& command)
@@ -908,6 +1067,16 @@ void EngineServer::handle_close_tab(u64 tab_id)
     auto* tab = tab_for_id(tab_id);
     if (!tab || tab->closing)
         return;
+
+    if (tab->view->is_private() == WebView::IsPrivate::No && tab->session_tab_id.has_value()) {
+        if (auto* store = WebView::Application::session_store(WebView::IsPrivate::No)) {
+            (void)store->tab_closed({
+                .tab_id = *tab->session_tab_id,
+                .closed_at = UnixDateTime::now(),
+                .keep_for_reopening = WebView::SessionStore::KeepForReopening::Yes,
+            });
+        }
+    }
 
     tab->closing = true;
     tab->view->request_close();
@@ -1944,6 +2113,45 @@ JsonObject EngineServer::download_to_json(WebView::FileDownloader::Download cons
     if (download.error.has_value())
         object.set("error"sv, *download.error);
     return object;
+}
+
+void EngineServer::send_session_plan()
+{
+    JsonArray windows;
+
+    if (!Core::Environment::has("LADYBIRD_SDE_DISABLE_SESSION_RESTORE"sv) && WebView::Application::settings().restore_previous_session()) {
+        if (auto* store = WebView::Application::session_store(WebView::IsPrivate::No)) {
+            for (auto const& restored_window : store->take_launch_plan()) {
+                JsonArray tabs;
+                for (auto const& tab : restored_window.tabs) {
+                    JsonObject entry;
+                    entry.set("session_tab"sv, static_cast<u64>(tab.tab_id));
+                    entry.set("url"sv, tab.url.to_string());
+                    entry.set("pinned"sv, tab.pinned);
+                    tabs.must_append(move(entry));
+                }
+
+                JsonObject window;
+                window.set("window"sv, static_cast<u64>(restored_window.window_id));
+                window.set("active"sv, static_cast<u64>(restored_window.active_tab_index));
+                window.set("tabs"sv, move(tabs));
+                if (restored_window.geometry.has_value()) {
+                    auto const& geometry = *restored_window.geometry;
+                    window.set("x"sv, geometry.x);
+                    window.set("y"sv, geometry.y);
+                    window.set("width"sv, geometry.width);
+                    window.set("height"sv, geometry.height);
+                    window.set("maximized"sv, geometry.maximized);
+                }
+                windows.must_append(move(window));
+            }
+        }
+    }
+
+    JsonObject event;
+    event.set("type"sv, "session_plan"sv);
+    event.set("windows"sv, move(windows));
+    send_event(move(event));
 }
 
 void EngineServer::send_downloads()

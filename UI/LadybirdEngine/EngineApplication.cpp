@@ -10,6 +10,7 @@
 #include <LibCore/ArgsParser.h>
 #include <LibCore/Environment.h>
 #include <LibCore/Process.h>
+#include <LibWebView/SessionStore.h>
 
 namespace LadybirdSDE {
 
@@ -59,11 +60,26 @@ void EngineApplication::show_download_in_folder(WebView::FileDownloader::Downloa
     open_with_system(LexicalPath::dirname(download.destination.string()));
 }
 
+Optional<WebView::ViewImplementation&> EngineApplication::active_web_view() const
+{
+    if (!m_active_web_view_provider)
+        return {};
+    return m_active_web_view_provider();
+}
+
+WebView::SessionLaunchPolicy EngineApplication::launch_restore_policy() const
+{
+    if (WebView::Application::settings().restore_previous_session())
+        return WebView::SessionLaunchPolicy::Everything;
+    return WebView::SessionLaunchPolicy::PinnedOnly;
+}
+
 void EngineApplication::create_platform_options(WebView::BrowserOptions& browser_options, WebView::RequestServerOptions&, WebView::WebContentOptions& web_content_options)
 {
     // The chrome is a separate process. Do not join an existing browser, and do
-    // not create a window: this process only hosts pages.
-    browser_options.headless_mode = WebView::HeadlessMode::Manual;
+    // not create a window: this process only hosts pages. Do not set
+    // headless_mode here: it would replace the persistent session store with a
+    // transient one, losing native session-history restore.
 
     // Frames have to come back as CPU-visible shared bitmaps so the LibGUI
     // process can paint them without importing GPU handles across processes.

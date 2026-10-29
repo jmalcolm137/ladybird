@@ -115,22 +115,96 @@ BrowserSession::~BrowserSession()
 
 ErrorOr<void> BrowserSession::initialize(Vector<String> initial_urls, bool private_window)
 {
-    if (initial_urls.is_empty() && !private_window && should_restore_session() && load_session()) {
-        m_autosave_timer = Core::Timer::create_repeating(30 * 1000, [this] {
-            save_session();
+    if (initial_urls.is_empty() && !private_window && should_restore_session() && !Core::Environment::has("LADYBIRD_SDE_DISABLE_SESSION_RESTORE"sv)) {
+        // The engine host owns the native session store and sends its launch plan once connected. Wait for it so
+        // restored tabs and their history are registered under the same session IDs.
+        m_waiting_for_session_plan = true;
+        m_session_plan_timeout = Core::Timer::create_single_shot(2000, [this] {
+            if (m_session_plan_received)
+                return;
+            m_waiting_for_session_plan = false;
+            if (m_windows.is_empty())
+                create_window_internal({}, false);
         });
-        m_autosave_timer->start();
-        return {};
+        m_session_plan_timeout->start();
+    } else {
+        if (!create_window_internal(move(initial_urls), private_window))
+            return Error::from_string_literal("Unable to create the browser window");
     }
-
-    if (!create_window_internal(move(initial_urls), private_window))
-        return Error::from_string_literal("Unable to create the browser window");
 
     m_autosave_timer = Core::Timer::create_repeating(30 * 1000, [this] {
         save_session();
     });
     m_autosave_timer->start();
     return {};
+}
+
+void BrowserSession::handle_session_plan(JsonObject const& event)
+{
+    if (m_session_plan_received)
+        return;
+
+    m_session_plan_received = true;
+    m_waiting_for_session_plan = false;
+    if (m_session_plan_timeout)
+        m_session_plan_timeout->stop();
+
+    auto windows = event.get_array("windows"sv);
+    if (!windows.has_value() || windows->is_empty()) {
+        // Migration path for sessions written before the engine host used the
+        // native SessionStore. Once those tabs are open they are registered
+        // with the native store, and later launches use session_plan.
+        if (m_windows.is_empty() && load_session())
+            return;
+        if (m_windows.is_empty())
+            create_window_internal({}, false);
+        return;
+    }
+
+    for (auto const& value : windows->values()) {
+        if (!value.is_object())
+            continue;
+        auto const& object = value.as_object();
+
+        Vector<InitialTab> tabs;
+        if (auto tab_values = object.get_array("tabs"sv); tab_values.has_value()) {
+            for (auto const& tab_value : tab_values->values()) {
+                if (!tab_value.is_object())
+                    continue;
+                auto const& tab_object = tab_value.as_object();
+                InitialTab tab;
+                tab.url = String::from_byte_string(tab_object.get_byte_string("url"sv).value_or({})).release_value();
+                tab.session_tab_id = tab_object.get_u64("session_tab"sv).value_or(0);
+                tabs.append(move(tab));
+            }
+        }
+
+        auto session_window_id = object.get_u64("window"sv).value_or(0);
+        auto window = make<BrowserWindow>(*this, *m_engine, m_next_window_id++, false, session_window_id);
+        auto active_tab = object.get_u64("active"sv);
+        if (auto result = window->initialize(move(tabs), active_tab.has_value() ? Optional<size_t> { static_cast<size_t>(*active_tab) } : Optional<size_t> {}, true); result.is_error()) {
+            warnln("Ladybird: could not restore a browser window: {}", result.error());
+            continue;
+        }
+
+        auto* window_pointer = window.ptr();
+        m_windows.append(move(window));
+
+        if (auto width = object.get_i64("width"sv); width.has_value()) {
+            if (auto height = object.get_i64("height"sv); height.has_value() && *width > 0 && *height > 0)
+                window_pointer->set_window_size({ static_cast<int>(*width), static_cast<int>(*height) });
+        }
+        if (auto x = object.get_i64("x"sv); x.has_value()) {
+            if (auto y = object.get_i64("y"sv); y.has_value())
+                window_pointer->set_window_position({ static_cast<int>(*x), static_cast<int>(*y) });
+        }
+        window_pointer->show();
+        if (object.get_bool("maximized"sv).value_or(false))
+            window_pointer->set_maximized(true);
+    }
+
+    if (m_windows.is_empty())
+        create_window_internal({}, false);
 }
 
 void BrowserSession::show()
@@ -246,6 +320,21 @@ void BrowserSession::on_engine_connected()
 void BrowserSession::on_engine_event(JsonObject const& event)
 {
     auto type = event.get_byte_string("type"sv).value_or({});
+
+    if (type == "session_plan"sv) {
+        handle_session_plan(event);
+        return;
+    }
+
+    if (type == "session_window"sv) {
+        auto window_id = event.get_u64("window"sv);
+        auto session_window_id = event.get_u64("session_window"sv);
+        if (window_id.has_value() && session_window_id.has_value()) {
+            if (auto* window = window_for_id(*window_id))
+                window->set_session_window_id(*session_window_id);
+        }
+        return;
+    }
 
     if (type == "tab_created"sv) {
         auto tab_id = event.get_u64("tab"sv);
@@ -372,6 +461,16 @@ void BrowserSession::save_session()
 {
     if (Core::Environment::has("LADYBIRD_SDE_DISABLE_SESSION_RESTORE"sv))
         return;
+
+    for (auto& window : m_windows) {
+        if (window->session_window_id() != 0) {
+            m_engine->window_geometry(
+                window->session_window_id(),
+                window->window_position(),
+                window->window_size(),
+                window->is_maximized());
+        }
+    }
 
     JsonArray windows;
     for (auto& window : m_windows) {

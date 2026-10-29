@@ -75,10 +75,11 @@ static DownloadEntry download_entry_from_json(JsonObject const& object)
     return entry;
 }
 
-BrowserWindow::BrowserWindow(BrowserSession& session, EngineClient& engine, u64 window_id, bool private_window)
+BrowserWindow::BrowserWindow(BrowserSession& session, EngineClient& engine, u64 window_id, bool private_window, u64 session_window_id)
     : m_session(session)
     , m_engine(&engine)
     , m_id(window_id)
+    , m_session_window_id(session_window_id)
     , m_private(private_window)
 {
 }
@@ -93,6 +94,14 @@ ByteString BrowserWindow::string_for_key(JsonObject const& object, StringView ke
 }
 
 ErrorOr<void> BrowserWindow::initialize(Vector<String> initial_urls, Optional<size_t> active_tab, bool lazy_load)
+{
+    Vector<InitialTab> initial_tabs;
+    for (auto& url : initial_urls)
+        initial_tabs.append({ move(url), 0 });
+    return initialize(move(initial_tabs), active_tab, lazy_load);
+}
+
+ErrorOr<void> BrowserWindow::initialize(Vector<InitialTab> initial_tabs, Optional<size_t> active_tab, bool lazy_load)
 {
     m_window = GUI::Window::construct();
     m_window->set_title(m_private ? "Ladybird (Private)"sv : "Ladybird"sv);
@@ -132,7 +141,7 @@ ErrorOr<void> BrowserWindow::initialize(Vector<String> initial_urls, Optional<si
         m_session.window_will_close(*this);
     };
 
-    create_initial_tabs(initial_urls, active_tab, lazy_load);
+    create_initial_tabs(initial_tabs, active_tab, lazy_load);
     return {};
 }
 
@@ -308,11 +317,6 @@ void BrowserWindow::create_actions()
     }, m_window.ptr());
     m_site_info_action->set_status_tip("Show connection and zoom information"_string);
 
-    m_restore_session_action = GUI::Action::create("Restore Previous &Session"sv, [this](auto&) {
-        m_session.restore_previous_session();
-    }, m_window.ptr());
-    m_restore_session_action->set_status_tip("Reopen the tabs from the previous session"_string);
-
     m_back_action->set_enabled(false);
     m_forward_action->set_enabled(false);
 }
@@ -373,8 +377,6 @@ void BrowserWindow::create_menus()
     history_menu.add_action(GUI::Action::create("Show &History"sv, [this](auto&) {
         navigate_active("about:history"_string);
     }, m_window.ptr()));
-    history_menu.add_separator();
-    history_menu.add_action(*m_restore_session_action);
 
     auto& tools_menu = *m_window->add_menu("&Tools"_string);
     tools_menu.add_action(GUI::Action::create("&Settings"sv, [this](auto&) {
@@ -387,21 +389,28 @@ void BrowserWindow::create_menus()
     help_menu.add_action(GUI::CommonActions::make_about_action("Ladybird"_string, GUI::Icon::default_icon("app-browser"sv), m_window.ptr()));
 }
 
-void BrowserWindow::create_initial_tabs(Vector<String> const& initial_urls, Optional<size_t> active_tab, bool lazy_load)
+void BrowserWindow::create_initial_tabs(Vector<InitialTab> const& initial_tabs, Optional<size_t> active_tab, bool lazy_load)
 {
-    if (initial_urls.is_empty()) {
+    if (initial_tabs.is_empty()) {
         add_tab(String {}, true);
         return;
     }
 
-    auto active_index = active_tab.value_or(initial_urls.size() - 1);
-    if (active_index >= initial_urls.size())
-        active_index = initial_urls.size() - 1;
+    auto active_index = active_tab.value_or(initial_tabs.size() - 1);
+    if (active_index >= initial_tabs.size())
+        active_index = initial_tabs.size() - 1;
 
-    for (size_t i = 0; i < initial_urls.size(); ++i) {
+    for (size_t i = 0; i < initial_tabs.size(); ++i) {
         auto is_active = i == active_index;
-        add_tab(initial_urls[i], is_active, is_active || !lazy_load, lazy_load && !is_active);
+        add_tab(initial_tabs[i].url, is_active, is_active || !lazy_load, lazy_load && !is_active, initial_tabs[i].session_tab_id);
     }
+}
+
+void BrowserWindow::set_session_window_id(u64 session_window_id)
+{
+    m_session_window_id = session_window_id;
+    for (auto& tab : m_tabs)
+        tab->set_session_window_id(session_window_id);
 }
 
 void BrowserWindow::reopen_tab(String const& url)
@@ -409,13 +418,15 @@ void BrowserWindow::reopen_tab(String const& url)
     add_tab(url, true);
 }
 
-BrowserTab& BrowserWindow::add_tab(String const& url, bool activate, bool request_engine_tab, bool lazy)
+BrowserTab& BrowserWindow::add_tab(String const& url, bool activate, bool request_engine_tab, bool lazy, u64 session_tab_id)
 {
     auto tab = make<BrowserTab>(*m_engine, *m_window, *m_back_action, *m_forward_action, *m_reload_action, *m_stop_action, *m_bookmark_action, *m_home_action, *m_new_tab_action, *m_downloads_action);
     auto* tab_pointer = tab.ptr();
     tab->set_window_id(m_id);
     tab->set_initial_url(url);
     tab->set_lazy(lazy);
+    tab->set_session_tab_id(session_tab_id);
+    tab->set_session_window_id(m_session_window_id);
 
     tab->on_title_change = [this, tab_pointer](String const& title) {
         if (!tab_is_live(tab_pointer))
@@ -638,6 +649,7 @@ void BrowserWindow::ensure_tab_loaded(BrowserTab& tab)
         return;
 
     tab.set_lazy(false);
+    tab.set_session_window_id(m_session_window_id);
     if (m_engine->is_connected())
         tab.create_engine_tab(m_session.next_request_id(), tab.initial_url(), m_private);
     else
@@ -794,6 +806,8 @@ void BrowserWindow::close_engine_tabs()
             m_engine->close_tab(tab->tab_id());
         tab->detach();
     }
+    if (m_session_window_id != 0)
+        m_engine->close_window(m_session_window_id, active_tab_index());
 }
 
 Vector<String> BrowserWindow::tab_urls() const

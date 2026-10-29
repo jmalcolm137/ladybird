@@ -164,11 +164,12 @@ navigating the real engine.
 * A click-to-reload crash overlay for a crashed WebContent process, and an
   unresponsive-page banner that hard-reloads a renderer spinning without
   presenting frames.
-* Session restore: every normal window (not just the last one) reopens with its
-  previous tabs, size, position, maximized state, and active tab on startup. The
-  “Restore previous windows and tabs” setting is honored, and a 30-second
-  autosave preserves a crash-recovery snapshot. History → Restore Previous
-  Session reopens the saved session on demand. Set
+* Session restore uses the engine host's native `SessionStore` and
+  `SessionHistorySnapshot` data, not a URL-only frontend list. Every normal
+  window reopens with its tabs, full session history, size, position,
+  maximized state, and active tab. Restored background tabs are lazy: they do
+  not create an engine view or start loading until selected. The “Restore
+  previous windows and tabs” setting is honored. Set
   `LADYBIRD_SDE_DISABLE_SESSION_RESTORE=1` to disable this (the headless test
   does).
 * View Source (`Ctrl+U`).
@@ -194,7 +195,14 @@ destabilized scrolling and resizing; the stable rendering path is the
 acknowledged shared-memory ring with damage-only copies.
 
 The control protocol is deliberately small and append-only so each of these can
-be added without touching the other half.
+be added without touching the other half. Navigation commands are serialized:
+if a tab is still loading, the engine queues the latest requested navigation
+and starts it when the current load finishes, rather than letting the UI and
+WebContent session-history mirrors race.
+
+`scripts/compare-frontends.sh [url]` runs the same URL through the upstream Qt
+frontend and the LibGUI frontend headlessly and fails on a crash signature. It
+is a regression smoke test, not a pixel comparison.
 
 ## Protocol
 

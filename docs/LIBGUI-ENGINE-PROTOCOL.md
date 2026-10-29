@@ -5,13 +5,13 @@ line-oriented JSON protocol over a Unix socket. Frame pixels never travel over
 the socket: the engine publishes a POSIX shared-memory ring per tab and the
 frontend maps it.
 
-Version: 7. `Shared/EngineProtocol.h` is authoritative.
+Version: 8. `Shared/EngineProtocol.h` is authoritative.
 
 ## Frontend → engine
 
 | `type` | Fields | Meaning |
 |---|---|---|
-| `create_tab` | `request`, `width`, `height`, `url`, `private`, `window` | Create a view and a tab. `request` is echoed in `tab_created`; `window` associates the tab with a frontend window. |
+| `create_tab` | `request`, `width`, `height`, `url`, `private`, `window`, `session_tab`, `session_window` | Create a view and a tab. `request` is echoed in `tab_created`; `window` associates the tab with a frontend window. `session_tab`/`session_window` identify a natively restored tab/window so its session history can be restored from the engine's `SessionStore`. |
 | `activate` | `tab`, `window` | Make this tab the active tab of `window`; the active tab of every other window stays visible. |
 | `navigate` | `tab`, `url`, `user_input` | Load a URL, or run the URL/search-input path. |
 | `autocomplete` | `tab`, `request`, `query` | Query history/bookmarks/search suggestions. `request` is echoed in `autocomplete_results`; an empty query cancels. |
@@ -37,6 +37,8 @@ Version: 7. `Shared/EngineProtocol.h` is authoritative.
 | `select_dropdown_closed` | `tab`, `selected` | Answer a `<select>` popup; omit `selected` when canceled. |
 | `frame_ack` | `tab`, `sequence` | The frontend has replaced the frame it was displaying. The engine may reuse that shared-memory slot. |
 | `download_action` | `action`, `id` | `open`, `show_in_folder`, `pause`, `resume`, `cancel`, or `clear`. |
+| `window_geometry` | `session_window`, `x`, `y`, `width`, `height`, `maximized` | Persist a frontend window's geometry in the native session store. |
+| `close_window` | `session_window`, `active` | Mark a frontend window closed in the native session store. |
 | `quit` | | Shut the engine host down. |
 
 ## Engine → frontend
@@ -44,6 +46,8 @@ Version: 7. `Shared/EngineProtocol.h` is authoritative.
 | `type` | Fields | Meaning |
 |---|---|---|
 | `hello` | `protocol` | Protocol handshake. |
+| `session_plan` | `windows` | Native startup-recovery plan. Each window has `window`, `active`, optional geometry, and `tabs`; each tab has `session_tab`, `url`, and `pinned`. Sent once after `hello`. An empty list means open the default window. |
+| `session_window` | `window`, `session_window` | The engine assigned a native session-window ID to a frontend window. The frontend stores it for geometry and close reporting. |
 | `tab_created` | `tab`, `request`, `width`, `height`, `parent`, `window` | The view exists; attach the matching frontend tab. `request` matches a frontend request; otherwise `parent`/`window` name the owning window. |
 | `open_window` | `url`, `private`, `parent` | The page asked for a new native window. The frontend creates it in-process so it shares the engine and profile; `parent` is the requesting tab. |
 | `tab_closed` | `tab` | The view is gone. |
