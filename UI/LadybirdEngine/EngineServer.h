@@ -129,6 +129,7 @@ private:
     void handle_create_tab(JsonObject const&);
     void handle_close_window(JsonObject const&);
     void handle_window_geometry(JsonObject const&);
+    void handle_register_session_tab(JsonObject const&);
     void handle_activate_tab(u64 tab_id, JsonObject const&);
     void handle_navigate(u64 tab_id, JsonObject const&);
     void perform_navigation(Tab&, String const&, bool user_input);

@@ -689,6 +689,17 @@ void EngineClient::close_window(u64 session_window_id, u64 active_tab_index)
     send(event);
 }
 
+void EngineClient::register_session_tab(u64 session_window_id, String const& url, u64 request_id, u64 window_id)
+{
+    JsonObject event;
+    event.set("type"sv, "register_session_tab"sv);
+    event.set("session_window"sv, session_window_id);
+    event.set("request"sv, request_id);
+    event.set("window"sv, window_id);
+    event.set("url"sv, url.bytes_as_string_view());
+    send(event);
+}
+
 void EngineClient::frame_ack(u64 tab_id, u64 sequence)
 {
     JsonObject event;

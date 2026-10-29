@@ -57,6 +57,7 @@ public:
     u64 id() const { return m_id; }
     u64 session_window_id() const { return m_session_window_id; }
     void set_session_window_id(u64 session_window_id);
+    void handle_session_tab_registered(u64 request_id, u64 session_tab_id);
 
 private:
     friend class BrowserSession;
@@ -139,6 +140,7 @@ private:
     RefPtr<DownloadsWindow> m_downloads_window;
     RefPtr<GUI::Menu> m_tab_context_menu;
     RefPtr<GUI::Menu> m_bookmarks_menu;
+    HashMap<u64, BrowserTab*> m_pending_session_tab_requests;
     bool m_show_bookmarks_bar { true };
     RefPtr<Gfx::Bitmap const> m_bookmark_icon;
     RefPtr<Gfx::Bitmap const> m_bookmark_filled_icon;

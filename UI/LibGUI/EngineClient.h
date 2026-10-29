@@ -68,6 +68,7 @@ public:
     void download_action(StringView action, u64 id);
     void window_geometry(u64 session_window_id, Gfx::IntPoint position, Gfx::IntSize size, bool maximized);
     void close_window(u64 session_window_id, u64 active_tab_index);
+    void register_session_tab(u64 session_window_id, String const& url, u64 request_id, u64 window_id);
     void frame_ack(u64 tab_id, u64 sequence);
     void quit();
 

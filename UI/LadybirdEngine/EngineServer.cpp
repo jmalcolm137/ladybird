@@ -268,6 +268,8 @@ void EngineServer::dispatch_command(JsonObject const& command)
         handle_close_window(command);
     } else if (*type == "window_geometry"sv) {
         handle_window_geometry(command);
+    } else if (*type == "register_session_tab"sv) {
+        handle_register_session_tab(command);
     } else {
         auto tab_id = command.get_u64("tab"sv);
         if (!tab_id.has_value()) {
@@ -678,7 +680,7 @@ void EngineServer::handle_create_tab(JsonObject const& command)
     if (session_window.has_value() && *session_window != 0)
         m_session_windows.set(window_id, static_cast<WebView::SessionWindowId>(*session_window));
 
-    if (!is_private && store) {
+    if (!is_private && store && !Core::Environment::has("LADYBIRD_SDE_DISABLE_SESSION_RESTORE"sv)) {
         if (session_tab.has_value() && *session_tab != 0) {
             auto tab_id = static_cast<WebView::SessionTabId>(*session_tab);
             tab.session_tab_id = tab_id;
@@ -759,6 +761,37 @@ void EngineServer::handle_window_geometry(JsonObject const& command)
             .height = static_cast<i32>(command.get_i64("height"sv).value_or(0)),
             .maximized = command.get_bool("maximized"sv).value_or(false),
         });
+}
+
+void EngineServer::handle_register_session_tab(JsonObject const& command)
+{
+    auto* store = WebView::Application::session_store(WebView::IsPrivate::No);
+    auto session_window = command.get_u64("session_window"sv);
+    auto request = command.get_u64("request"sv);
+    auto window = command.get_u64("window"sv).value_or(0);
+    auto url = command.get_string("url"sv);
+    if (!store || !session_window.has_value() || !request.has_value() || !url.has_value() || url->is_empty())
+        return;
+
+    auto parsed = URL::Parser::basic_parse(url->bytes_as_string_view());
+    if (!parsed.has_value())
+        return;
+
+    auto tab_id = store->tab_opened({
+        .window_id = static_cast<WebView::SessionWindowId>(*session_window),
+        .initial_url = parsed.release_value(),
+        .insertion_index = {},
+        .is_active = WebView::SessionStore::IsActive::No,
+    });
+    if (tab_id.is_error())
+        return;
+
+    JsonObject event;
+    event.set("type"sv, "session_tab_registered"sv);
+    event.set("request"sv, *request);
+    event.set("window"sv, window);
+    event.set("session_tab"sv, static_cast<u64>(tab_id.value()));
+    send_event(move(event));
 }
 
 WebView::SessionWindowId EngineServer::session_window_for(u64 frontend_window_id, bool create)

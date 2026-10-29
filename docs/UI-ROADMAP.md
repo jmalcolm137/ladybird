@@ -74,7 +74,8 @@ scroll, resize, multi-window, and session-restore tests.
 
 - **Native session restore:** the engine host now uses `SessionStore` /
   `SessionHistorySnapshot` for startup recovery, including full per-tab
-  history. Restored background tabs are lazy.
+  history. Restored background tabs are lazy and are registered with the
+  native store even before they load, so they survive the next launch.
 - **Active view:** `EngineApplication` exposes the active `ViewImplementation`
   to the shared `Application` actions and session machinery.
 - **Navigation ordering:** `EngineServer` queues a navigation while the current

@@ -37,6 +37,7 @@ Version: 8. `Shared/EngineProtocol.h` is authoritative.
 | `select_dropdown_closed` | `tab`, `selected` | Answer a `<select>` popup; omit `selected` when canceled. |
 | `frame_ack` | `tab`, `sequence` | The frontend has replaced the frame it was displaying. The engine may reuse that shared-memory slot. |
 | `download_action` | `action`, `id` | `open`, `show_in_folder`, `pause`, `resume`, `cancel`, or `clear`. |
+| `register_session_tab` | `session_window`, `request`, `window`, `url` | Register a lazily restored tab in the native session store without creating a view. The engine answers with `session_tab_registered`. |
 | `window_geometry` | `session_window`, `x`, `y`, `width`, `height`, `maximized` | Persist a frontend window's geometry in the native session store. |
 | `close_window` | `session_window`, `active` | Mark a frontend window closed in the native session store. |
 | `quit` | | Shut the engine host down. |
@@ -48,6 +49,7 @@ Version: 8. `Shared/EngineProtocol.h` is authoritative.
 | `hello` | `protocol` | Protocol handshake. |
 | `session_plan` | `windows` | Native startup-recovery plan. Each window has `window`, `active`, optional geometry, and `tabs`; each tab has `session_tab`, `url`, and `pinned`. Sent once after `hello`. An empty list means open the default window. |
 | `session_window` | `window`, `session_window` | The engine assigned a native session-window ID to a frontend window. The frontend stores it for geometry and close reporting. |
+| `session_tab_registered` | `request`, `window`, `session_tab` | The native session store assigned an ID to a lazily restored tab. |
 | `tab_created` | `tab`, `request`, `width`, `height`, `parent`, `window` | The view exists; attach the matching frontend tab. `request` matches a frontend request; otherwise `parent`/`window` name the owning window. |
 | `open_window` | `url`, `private`, `parent` | The page asked for a new native window. The frontend creates it in-process so it shares the engine and profile; `parent` is the requesting tab. |
 | `tab_closed` | `tab` | The view is gone. |

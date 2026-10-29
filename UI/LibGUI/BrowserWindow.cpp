@@ -411,6 +411,24 @@ void BrowserWindow::set_session_window_id(u64 session_window_id)
     m_session_window_id = session_window_id;
     for (auto& tab : m_tabs)
         tab->set_session_window_id(session_window_id);
+
+    // Legacy URL-only sessions restore background tabs lazily. Register those
+    // tabs with the native session store now, without loading them, so the next
+    // launch can restore them from session_plan.
+    for (auto& tab : m_tabs) {
+        if (!tab->is_lazy() || tab->session_tab_id() != 0)
+            continue;
+        auto request_id = m_session.next_request_id();
+        m_pending_session_tab_requests.set(request_id, tab.ptr());
+        m_engine->register_session_tab(session_window_id, tab->initial_url(), request_id, m_id);
+    }
+}
+
+void BrowserWindow::handle_session_tab_registered(u64 request_id, u64 session_tab_id)
+{
+    auto tab = m_pending_session_tab_requests.take(request_id);
+    if (tab.has_value())
+        (*tab)->set_session_tab_id(session_tab_id);
 }
 
 void BrowserWindow::reopen_tab(String const& url)

@@ -326,6 +326,17 @@ void BrowserSession::on_engine_event(JsonObject const& event)
         return;
     }
 
+    if (type == "session_tab_registered"sv) {
+        auto window_id = event.get_u64("window"sv);
+        auto request_id = event.get_u64("request"sv);
+        auto session_tab_id = event.get_u64("session_tab"sv);
+        if (window_id.has_value() && request_id.has_value() && session_tab_id.has_value()) {
+            if (auto* window = window_for_id(*window_id))
+                window->handle_session_tab_registered(*request_id, *session_tab_id);
+        }
+        return;
+    }
+
     if (type == "session_window"sv) {
         auto window_id = event.get_u64("window"sv);
         auto session_window_id = event.get_u64("session_window"sv);
