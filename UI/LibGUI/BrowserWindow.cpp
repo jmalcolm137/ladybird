@@ -436,6 +436,14 @@ void BrowserWindow::reopen_tab(String const& url)
     add_tab(url, true);
 }
 
+void BrowserWindow::open_startup_urls(Vector<String> const& urls)
+{
+    // The reference frontend opens URLs passed on the command line in the
+    // restored window, as tabs after the restored ones.
+    for (size_t i = 0; i < urls.size(); ++i)
+        add_tab(urls[i], i == 0);
+}
+
 BrowserTab& BrowserWindow::add_tab(String const& url, bool activate, bool request_engine_tab, bool lazy, u64 session_tab_id)
 {
     auto tab = make<BrowserTab>(*m_engine, *m_window, *m_back_action, *m_forward_action, *m_reload_action, *m_stop_action, *m_bookmark_action, *m_home_action, *m_new_tab_action, *m_downloads_action);

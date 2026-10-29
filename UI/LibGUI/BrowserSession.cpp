@@ -115,16 +115,19 @@ BrowserSession::~BrowserSession()
 
 ErrorOr<void> BrowserSession::initialize(Vector<String> initial_urls, bool private_window)
 {
-    if (initial_urls.is_empty() && !private_window && should_restore_session() && !Core::Environment::has("LADYBIRD_SDE_DISABLE_SESSION_RESTORE"sv)) {
+    if (!private_window && should_restore_session() && !Core::Environment::has("LADYBIRD_SDE_DISABLE_SESSION_RESTORE"sv)) {
         // The engine host owns the native session store and sends its launch plan once connected. Wait for it so
-        // restored tabs and their history are registered under the same session IDs.
+        // restored tabs and their history are registered under the same session IDs. URLs passed on the command
+        // line open in the restored window, as in the reference frontend.
+        m_pending_initial_urls = move(initial_urls);
         m_waiting_for_session_plan = true;
         m_session_plan_timeout = Core::Timer::create_single_shot(2000, [this] {
             if (m_session_plan_received)
                 return;
+            m_session_plan_received = true;
             m_waiting_for_session_plan = false;
             if (m_windows.is_empty())
-                create_window_internal({}, false);
+                create_window_internal(move(m_pending_initial_urls), false);
         });
         m_session_plan_timeout->start();
     } else {
@@ -153,11 +156,12 @@ void BrowserSession::handle_session_plan(JsonObject const& event)
     if (!windows.has_value() || windows->is_empty()) {
         // Migration path for sessions written before the engine host used the
         // native SessionStore. Once those tabs are open they are registered
-        // with the native store, and later launches use session_plan.
-        if (m_windows.is_empty() && load_session())
+        // with the native store, and later launches use session_plan. Do not
+        // resurrect an old URL-only session when the user passed URLs.
+        if (m_windows.is_empty() && m_pending_initial_urls.is_empty() && load_session())
             return;
         if (m_windows.is_empty())
-            create_window_internal({}, false);
+            create_window_internal(move(m_pending_initial_urls), false);
         return;
     }
 
@@ -203,8 +207,13 @@ void BrowserSession::handle_session_plan(JsonObject const& event)
             window_pointer->set_maximized(true);
     }
 
-    if (m_windows.is_empty())
-        create_window_internal({}, false);
+    if (m_windows.is_empty()) {
+        create_window_internal(move(m_pending_initial_urls), false);
+        return;
+    }
+
+    if (!m_pending_initial_urls.is_empty() && !m_windows.is_empty())
+        m_windows.last()->open_startup_urls(m_pending_initial_urls);
 }
 
 void BrowserSession::show()

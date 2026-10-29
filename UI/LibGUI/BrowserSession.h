@@ -85,6 +85,7 @@ private:
     RefPtr<Core::Timer> m_session_plan_timeout;
     bool m_waiting_for_session_plan { false };
     bool m_session_plan_received { false };
+    Vector<String> m_pending_initial_urls;
 };
 
 }

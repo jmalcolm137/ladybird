@@ -33,6 +33,7 @@ public:
     void show();
 
     void reopen_tab(String const& url);
+    void open_startup_urls(Vector<String> const& urls);
 
     bool has_tab(u64 tab_id) const;
     bool has_request(u64 request_id) const;
