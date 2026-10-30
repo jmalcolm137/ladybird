@@ -41,6 +41,7 @@ public:
     ~DownloadsWindow();
 
     void set_downloads(Vector<DownloadEntry> const&);
+    void set_private_filter(bool private_only);
     void show();
 
 private:
@@ -49,6 +50,7 @@ private:
     void refresh();
     JsonArray rows() const;
     DownloadEntry const* selected_download() const;
+    Vector<DownloadEntry const*> visible_downloads() const;
     void perform_action_on_selection(StringView action);
     void pause_or_resume_selection();
 
@@ -58,6 +60,7 @@ private:
     RefPtr<GUI::JsonArrayModel> m_model;
     RefPtr<GUI::Label> m_summary;
     Vector<DownloadEntry> m_downloads;
+    bool m_private_only { false };
 };
 
 }

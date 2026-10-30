@@ -31,14 +31,14 @@ reference for behaviour and options.
 | Area | Remaining work |
 |---|---|
 | Address bar | **Done:** autocomplete and search suggestions are exposed over the control socket and shown in a keyboard-navigable popup. Inline completion is still future work. |
-| Tabs | **Partially done:** reopen closed tab (`Ctrl+Shift+T`) and tab search are wired. Still missing: pin tab, mute/audio indicator, move tab to a new window, close tabs to the right, and a visible all-tabs overflow strip. |
-| Bookmarks | **Partially done:** the bar renders folders and nested menus and has a leading overflow menu. Still missing: chrome-level add/edit/delete/reorder dialogs. `about:bookmarks` already provides management. |
-| History | The History menu only has “Show History”. Add recent entries, search, and clear actions in the chrome. `about:history` handles deletion. |
-| Downloads | The native Downloads window shows private-session downloads and lacks per-session pruning. Filter by the active session and use the engine's pruning action. `about:downloads` already behaves correctly. |
-| Site info | **Done (basic):** the address bar shows a Secure/Not secure/Local/Page indicator with a menu for host, zoom, and settings. Certificate details, permission summaries, and per-site settings are still future work. |
-| Find | Add a match-case toggle (the engine already supports case sensitivity). |
+| Tabs | **Done:** reopen closed tab, tab search, pin tab, mute/audio indicator, move tab to a new window, close tabs to the right, and a Tabs menu listing every tab. An icon-based overflow strip is still a cosmetic alternative. |
+| Bookmarks | **Mostly done:** the bar renders folders and nested menus and has a leading overflow menu; the chrome can add, edit, and remove the current page's bookmark. Reordering and folder management still live in `about:bookmarks`. |
+| History | **Done:** the History menu lists recent entries, clears history after confirmation, and links to `about:history`. Search remains on the history page. |
+| Downloads | **Done:** the window filters to the active window's session and Clear Completed prunes only that session. |
+| Site info | **Mostly done:** the indicator shows host, security state, zoom, site settings, the permission decisions made this session, and a Forget action. Certificate details need a new engine API; permission memory is in-memory. |
+| Find | **Done:** the find bar has a match-case toggle. |
 | Zoom | **Done:** the engine emits `zoom_changed` and the toolbar shows the current percentage with zoom controls. |
-| File picker | Support multiple files and pass the page's filters to the picker. |
+| File picker | **Partially done:** the page's filters reach the picker. Multiple selection needs a multi-select LibGUI file picker; the engine and protocol already accept a list. |
 | Settings | Native dialogs only where `about:settings` cannot express the choice; this is low priority. |
 
 ## P2: Platform integration

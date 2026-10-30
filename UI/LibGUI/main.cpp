@@ -6,12 +6,22 @@
 
 #include "BrowserSession.h"
 
+#include <LibCore/EventLoop.h>
 #include <LibGUI/Application.h>
 #include <LibMain/Main.h>
+#include <signal.h>
 
 ErrorOr<int> serenity_main(Main::Arguments arguments)
 {
     auto app = TRY(GUI::Application::create(arguments));
+
+    // A session logout or SIGTERM ends like File -> Quit: save the session before leaving instead of disappearing
+    // without writing geometry and the final task state.
+    for (auto signal_number : { SIGINT, SIGTERM }) {
+        Core::EventLoop::register_signal(signal_number, [](int) {
+            GUI::Application::the()->quit(0);
+        });
+    }
 
     Vector<String> urls;
     bool private_window = false;

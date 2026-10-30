@@ -17,6 +17,7 @@
 #include <LibCore/File.h>
 #include <LibCore/StandardPaths.h>
 #include <LibCore/System.h>
+#include <AK/StringBuilder.h>
 #include <LibCore/Timer.h>
 #include <LibGUI/Application.h>
 
@@ -191,6 +192,7 @@ void BrowserSession::handle_session_plan(JsonObject const& event)
                 InitialTab tab;
                 tab.url = String::from_byte_string(tab_object.get_byte_string("url"sv).value_or({})).release_value();
                 tab.session_tab_id = tab_object.get_u64("session_tab"sv).value_or(0);
+                tab.pinned = tab_object.get_bool("pinned"sv).value_or(false);
                 tabs.append(move(tab));
             }
         }
@@ -352,6 +354,48 @@ void BrowserSession::open_devtools_client()
 JsonArray BrowserSession::clipboard_items_for_paste()
 {
     return m_clipboard->items_for_paste();
+}
+
+static String permission_key(String const& origin)
+{
+    auto view = origin.bytes_as_string_view();
+    if (auto scheme = view.find("://"sv); scheme.has_value())
+        view = view.substring_view(*scheme + 3);
+    if (auto slash = view.find('/'); slash.has_value())
+        view = view.substring_view(0, *slash);
+    return String::from_utf8(view).release_value();
+}
+
+void BrowserSession::note_permission(String const& origin, String const& name, bool granted)
+{
+    if (origin.is_empty())
+        return;
+    auto& entries = m_permissions.ensure(permission_key(origin));
+    auto description = String::formatted("{} ({})", name, granted ? "allowed" : "blocked").release_value();
+    for (auto const& entry : entries) {
+        if (entry.bytes_as_string_view().starts_with(name.bytes_as_string_view()))
+            return;
+    }
+    entries.append(move(description));
+}
+
+String BrowserSession::permission_summary(String const& origin) const
+{
+    auto it = m_permissions.find(permission_key(origin));
+    if (it == m_permissions.end())
+        return {};
+    StringBuilder builder;
+    for (size_t i = 0; i < it->value.size(); ++i) {
+        if (i)
+            builder.append(", "sv);
+        builder.append(it->value[i]);
+    }
+    return builder.to_string().release_value();
+}
+
+void BrowserSession::forget_permissions(String const& origin)
+{
+    m_permissions.remove(permission_key(origin));
 }
 
 void BrowserSession::on_engine_event(JsonObject const& event)

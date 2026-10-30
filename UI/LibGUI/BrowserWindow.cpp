@@ -24,6 +24,7 @@
 #include <LibGUI/Clipboard.h>
 #include <LibGUI/Dialog.h>
 #include <LibGUI/Icon.h>
+#include <LibGUI/InputBox.h>
 #include <LibGUI/JsonArrayModel.h>
 #include <LibGUI/Menu.h>
 #include <LibGUI/MessageBox.h>
@@ -45,6 +46,7 @@ static RefPtr<Gfx::Bitmap const> load_icon(StringView path)
 static BookmarkEntry bookmark_entry_from_json(JsonObject const& object)
 {
     BookmarkEntry entry;
+    entry.id = String::from_byte_string(object.get_byte_string("id"sv).value_or({})).release_value();
     entry.title = String::from_byte_string(object.get_byte_string("title"sv).value_or({})).release_value();
     entry.url = String::from_byte_string(object.get_byte_string("url"sv).value_or({})).release_value();
     entry.is_folder = object.get_byte_string("type"sv).value_or({}) == "folder"sv;
@@ -57,6 +59,19 @@ static BookmarkEntry bookmark_entry_from_json(JsonObject const& object)
     }
 
     return entry;
+}
+
+static BookmarkEntry const* find_bookmark(Vector<BookmarkEntry> const& items, StringView url)
+{
+    for (auto const& item : items) {
+        if (item.is_folder) {
+            if (auto const* found = find_bookmark(item.children, url))
+                return found;
+        } else if (item.url == url) {
+            return &item;
+        }
+    }
+    return nullptr;
 }
 
 static DownloadEntry download_entry_from_json(JsonObject const& object)
@@ -133,6 +148,11 @@ ErrorOr<void> BrowserWindow::initialize(Vector<InitialTab> initial_tabs, Optiona
 
     create_actions();
     create_menus();
+
+    m_history_refresh_timer = Core::Timer::create_single_shot(400, [this] {
+        if (m_engine && m_engine->is_connected())
+            m_engine->request_history(10);
+    });
 
     m_tab_widget->on_tab_close_click = [this](GUI::Widget& widget) {
         if (auto* tab = tab_for_widget(widget))
@@ -237,7 +257,7 @@ void BrowserWindow::create_actions()
     }, m_window.ptr());
     m_reopen_closed_tab_action->set_status_tip("Reopen the most recently closed tab"_string);
 
-    m_next_tab_action = GUI::Action::create("&Next Tab"sv, GUI::Shortcut(Mod_Ctrl, Key_PageDown), [this](auto&) {
+    m_next_tab_action = GUI::Action::create("&Next Tab"sv, GUI::Shortcut(Mod_Ctrl, Key_PageDown), GUI::Shortcut(Mod_Ctrl, Key_Tab), [this](auto&) {
         m_tab_widget->activate_next_tab();
     }, m_window.ptr());
     m_previous_tab_action = GUI::Action::create("&Previous Tab"sv, GUI::Shortcut(static_cast<u8>(Mod_Ctrl | Mod_Shift), Key_PageUp), [this](auto&) {
@@ -394,16 +414,33 @@ void BrowserWindow::create_menus()
     auto& bookmarks_menu = *m_window->add_menu("&Bookmarks"_string);
     bookmarks_menu.add_action(*m_bookmark_action);
     bookmarks_menu.add_separator();
+    bookmarks_menu.add_action(GUI::Action::create("Add Bookmark…"sv, [this](auto&) {
+        show_bookmark_dialog(false);
+    }, m_window.ptr()));
+    bookmarks_menu.add_action(GUI::Action::create("Edit Bookmark…"sv, [this](auto&) {
+        show_bookmark_dialog(true);
+    }, m_window.ptr()));
+    bookmarks_menu.add_action(GUI::Action::create("Remove Bookmark"sv, [this](auto&) {
+        auto* tab = active_tab();
+        if (!tab)
+            return;
+        auto id = bookmark_id_for_url(tab->current_url());
+        if (id.is_empty())
+            return;
+        m_engine->remove_bookmark(tab->tab_id(), id);
+    }, m_window.ptr()));
+    bookmarks_menu.add_separator();
     bookmarks_menu.add_action(GUI::Action::create("Show &Bookmarks"sv, [this](auto&) {
         navigate_active("about:bookmarks"_string);
     }, m_window.ptr()));
     bookmarks_menu.add_separator();
     m_bookmarks_menu = bookmarks_menu.add_submenu("All &Bookmarks"_string);
 
-    auto& history_menu = *m_window->add_menu("&History"_string);
-    history_menu.add_action(GUI::Action::create("Show &History"sv, [this](auto&) {
-        navigate_active("about:history"_string);
-    }, m_window.ptr()));
+    m_tabs_menu = m_window->add_menu("&Tabs"_string);
+    rebuild_tabs_menu();
+
+    m_history_menu = m_window->add_menu("&History"_string);
+    rebuild_history_menu();
 
     auto& tools_menu = *m_window->add_menu("&Tools"_string);
     tools_menu.add_action(GUI::Action::create("&Settings"sv, [this](auto&) {
@@ -434,7 +471,8 @@ void BrowserWindow::create_initial_tabs(Vector<InitialTab> const& initial_tabs, 
 
     for (size_t i = 0; i < initial_tabs.size(); ++i) {
         auto is_active = i == active_index;
-        add_tab(initial_tabs[i].url, is_active, is_active || !lazy_load, lazy_load && !is_active, initial_tabs[i].session_tab_id);
+        auto& tab = add_tab(initial_tabs[i].url, is_active, is_active || !lazy_load, lazy_load && !is_active, initial_tabs[i].session_tab_id);
+        tab.set_pinned(initial_tabs[i].pinned);
     }
 }
 
@@ -517,6 +555,7 @@ BrowserTab& BrowserWindow::add_tab(String const& url, bool activate, bool reques
         if (!tab_is_live(tab_pointer))
             return;
         m_tab_widget->set_tab_title(*tab_pointer->root(), title);
+        rebuild_tabs_menu();
         if (active_tab() == tab_pointer)
             update_window_title();
     };
@@ -547,6 +586,15 @@ BrowserTab& BrowserWindow::add_tab(String const& url, bool activate, bool reques
         if (tab_is_live(tab_pointer))
             hard_reload_tab(*tab_pointer);
     };
+    tab->set_permission_summary_provider([this](String const& origin) {
+        return m_session.permission_summary(origin);
+    });
+    tab->set_forget_permissions_handler([this](String const& origin) {
+        m_session.forget_permissions(origin);
+    });
+    tab->on_permission_decision = [this](String const& origin, String const& name, bool granted) {
+        m_session.note_permission(origin, name, granted);
+    };
 
     m_tabs.append(move(tab));
     tab_pointer->set_bookmarks(m_bookmarks);
@@ -571,6 +619,7 @@ BrowserTab& BrowserWindow::add_tab(String const& url, bool activate, bool reques
 
     update_action_state();
     update_window_title();
+    rebuild_tabs_menu();
     return *tab_pointer;
 }
 
@@ -604,6 +653,7 @@ void BrowserWindow::remove_tab(BrowserTab& tab)
 
     update_action_state();
     update_window_title();
+    rebuild_tabs_menu();
 }
 
 BrowserTab* BrowserWindow::active_tab() const
@@ -666,6 +716,8 @@ bool BrowserWindow::tab_is_live(BrowserTab const* tab) const
 
 void BrowserWindow::activate_tab(BrowserTab& tab)
 {
+    if (m_reordering_tabs)
+        return;
     ensure_tab_loaded(tab);
     if (tab.is_attached())
         m_engine->activate_tab(tab.tab_id(), m_id);
@@ -724,6 +776,8 @@ void BrowserWindow::navigate_active(String const& url)
 
 void BrowserWindow::handle_engine_connected()
 {
+    if (m_engine)
+        m_engine->request_history(10);
     for (auto& tab : m_tabs) {
         if (!tab->is_attached() && !tab->is_lazy()) {
             tab->create_engine_tab(m_session.next_request_id(), tab->initial_url(), m_private);
@@ -792,6 +846,24 @@ void BrowserWindow::handle_engine_global_event(JsonObject const& event)
         return;
     }
 
+    if (type == "history_recent"sv) {
+        m_recent_history.clear();
+        if (auto items = event.get_array("items"sv); items.has_value()) {
+            for (auto const& value : items->values()) {
+                if (!value.is_object())
+                    continue;
+                auto const& object = value.as_object();
+                RecentHistoryEntry entry;
+                entry.url = String::from_byte_string(object.get_byte_string("url"sv).value_or({})).release_value();
+                entry.title = String::from_byte_string(object.get_byte_string("title"sv).value_or({})).release_value();
+                if (!entry.url.is_empty())
+                    m_recent_history.append(move(entry));
+            }
+        }
+        rebuild_history_menu();
+        return;
+    }
+
     if (type == "bookmarks"sv) {
         Vector<BookmarkEntry> bookmarks;
         if (auto items = event.get_array("items"sv); items.has_value()) {
@@ -815,11 +887,15 @@ void BrowserWindow::handle_engine_tab_event(JsonObject const& event, u64 tab_id)
 
     auto type = string_for_key(event, "type"sv);
 
-    if (type == "title"sv) {
+    if (type == "audio"sv) {
+        tab->set_audio_state(event.get_bool("playing"sv).value_or(false), event.get_bool("muted"sv).value_or(false));
+    } else if (type == "title"sv) {
         tab->set_title(String::from_byte_string(string_for_key(event, "title"sv)).release_value());
     } else if (type == "url"sv) {
         tab->set_url(String::from_byte_string(string_for_key(event, "url"sv)).release_value());
         tab->set_bookmarked(event.get_bool("bookmarked"sv).value_or(false));
+        if (m_history_refresh_timer)
+            m_history_refresh_timer->start();
         if (active_tab() == tab)
             update_bookmark_action();
     } else if (type == "loading"sv) {
@@ -842,7 +918,9 @@ void BrowserWindow::handle_engine_tab_event(JsonObject const& event, u64 tab_id)
     } else if (type == "permission"sv) {
         tab->show_permission_prompt(string_for_key(event, "name"sv), string_for_key(event, "origin"sv), event.get_u64("request"sv).value_or(0));
     } else if (type == "file_picker"sv) {
-        tab->show_file_picker({});
+        auto multiple = event.get_bool("multiple"sv).value_or(false);
+        auto filters = event.get_array("filters"sv);
+        tab->show_file_picker(multiple, filters.has_value() ? *filters : JsonArray {});
     } else if (type == "select_dropdown"sv) {
         auto x = event.get_i64("x"sv).value_or(0);
         auto y = event.get_i64("y"sv).value_or(0);
@@ -986,6 +1064,7 @@ void BrowserWindow::show_downloads()
     if (!m_downloads_window)
         m_downloads_window = DownloadsWindow::create(*m_engine);
     m_downloads_window->set_downloads(m_downloads);
+    m_downloads_window->set_private_filter(m_private);
     m_downloads_window->show();
 }
 
@@ -1127,6 +1206,19 @@ void BrowserWindow::show_tab_context_menu(BrowserTab& tab, Gfx::IntPoint screen_
             duplicate_tab(*tab_pointer);
     }));
     menu->add_separator();
+    menu->add_action(GUI::Action::create(tab.is_pinned() ? "Unpin Tab"sv : "Pin Tab"sv, [this, tab_pointer](auto&) {
+        if (tab_is_live(tab_pointer))
+            toggle_pin_tab(*tab_pointer);
+    }));
+    menu->add_action(GUI::Action::create(tab.is_muted() ? "Unmute Tab"sv : "Mute Tab"sv, [this, tab_pointer](auto&) {
+        if (tab_is_live(tab_pointer) && tab_pointer->is_attached())
+            m_engine->toggle_mute(tab_pointer->tab_id());
+    }));
+    menu->add_action(GUI::Action::create("Move Tab to New Window"sv, [this, tab_pointer](auto&) {
+        if (tab_is_live(tab_pointer))
+            move_tab_to_new_window(*tab_pointer);
+    }));
+    menu->add_separator();
     menu->add_action(GUI::Action::create("Close Tab"sv, [this, tab_pointer](auto&) {
         if (tab_is_live(tab_pointer))
             close_tab(*tab_pointer);
@@ -1134,6 +1226,10 @@ void BrowserWindow::show_tab_context_menu(BrowserTab& tab, Gfx::IntPoint screen_
     menu->add_action(GUI::Action::create("Close Other Tabs"sv, [this, tab_pointer](auto&) {
         if (tab_is_live(tab_pointer))
             close_other_tabs(*tab_pointer);
+    }));
+    menu->add_action(GUI::Action::create("Close Tabs to the Right"sv, [this, tab_pointer](auto&) {
+        if (tab_is_live(tab_pointer))
+            close_tabs_to_the_right(*tab_pointer);
     }));
     menu->add_separator();
     menu->add_action(*m_reopen_closed_tab_action);
@@ -1145,6 +1241,191 @@ void BrowserWindow::show_tab_context_menu(BrowserTab& tab, Gfx::IntPoint screen_
 void BrowserWindow::duplicate_tab(BrowserTab& tab)
 {
     add_tab(tab.current_url(), true);
+}
+
+void BrowserWindow::close_tabs_to_the_right(BrowserTab& tab)
+{
+    auto index = m_tabs.find_first_index_if([&](auto const& candidate) {
+        return candidate.ptr() == &tab;
+    });
+    if (!index.has_value())
+        return;
+
+    Vector<BrowserTab*> to_close;
+    for (size_t i = *index + 1; i < m_tabs.size(); ++i)
+        to_close.append(m_tabs[i].ptr());
+    for (auto* candidate : to_close) {
+        if (tab_is_live(candidate))
+            close_tab(*candidate);
+    }
+}
+
+void BrowserWindow::toggle_pin_tab(BrowserTab& tab)
+{
+    tab.set_pinned(!tab.is_pinned());
+    if (tab.is_attached())
+        m_engine->pin_tab(tab.tab_id(), tab.is_pinned());
+    rebuild_tab_order();
+}
+
+void BrowserWindow::move_tab_to_new_window(BrowserTab& tab)
+{
+    auto url = tab.current_url();
+    if (url.is_empty())
+        url = tab.initial_url();
+    if (url.is_empty())
+        url = "about:newtab"_string;
+    m_session.create_window({ url }, m_private);
+    close_tab(tab);
+}
+
+void BrowserWindow::rebuild_tab_order()
+{
+    Vector<BrowserTab*> order;
+    for (auto& tab : m_tabs) {
+        if (tab->is_pinned())
+            order.append(tab.ptr());
+    }
+    for (auto& tab : m_tabs) {
+        if (!tab->is_pinned())
+            order.append(tab.ptr());
+    }
+
+    bool same_order = true;
+    for (size_t i = 0; i < order.size(); ++i) {
+        if (order[i] != m_tabs[i].ptr()) {
+            same_order = false;
+            break;
+        }
+    }
+    if (same_order)
+        return;
+
+    auto* active = active_tab();
+    m_reordering_tabs = true;
+
+    for (auto& tab : m_tabs)
+        m_tab_widget->remove_widget(*tab->root());
+
+    Vector<NonnullOwnPtr<BrowserTab>> reordered;
+    for (auto* wanted : order) {
+        auto index = m_tabs.find_first_index_if([wanted](auto const& candidate) {
+            return candidate.ptr() == wanted;
+        });
+        if (index.has_value())
+            reordered.append(m_tabs.take(*index));
+    }
+    m_tabs = move(reordered);
+
+    for (auto& tab : m_tabs) {
+        auto title = tab->display_title();
+        if (title.is_empty())
+            title = "New Tab"_string;
+        m_tab_widget->add_tab(tab->root(), title);
+        if (auto const* icon = tab->favicon())
+            m_tab_widget->set_tab_icon(*tab->root(), icon);
+    }
+
+    if (active && tab_is_live(active))
+        m_tab_widget->set_active_widget(active->root().ptr());
+    m_reordering_tabs = false;
+    rebuild_tabs_menu();
+}
+
+void BrowserWindow::rebuild_tabs_menu()
+{
+    if (!m_tabs_menu || m_tabs_menu->is_visible())
+        return;
+
+    m_tabs_menu->remove_all_actions();
+    for (size_t i = 0; i < m_tabs.size(); ++i) {
+        auto* tab = m_tabs[i].ptr();
+        auto title = tab->display_title();
+        if (title.is_empty())
+            title = tab->current_url();
+        if (title.is_empty())
+            title = "New Tab"_string;
+        auto label = String::formatted("{}  {}", i + 1, title).release_value();
+        m_tabs_menu->add_action(GUI::Action::create(label.bytes_as_string_view(), [this, tab](auto&) {
+            if (!tab_is_live(tab))
+                return;
+            m_tab_widget->set_active_widget(tab->root().ptr());
+            activate_tab(*tab);
+        }));
+    }
+    m_tabs_menu->add_separator();
+    m_tabs_menu->add_action(*m_new_tab_action);
+    m_tabs_menu->add_action(*m_close_tab_action);
+}
+
+void BrowserWindow::rebuild_history_menu()
+{
+    if (!m_history_menu || m_history_menu->is_visible())
+        return;
+
+    m_history_menu->remove_all_actions();
+    if (m_recent_history.is_empty()) {
+        auto action = GUI::Action::create("No History"sv, [](auto&) {});
+        action->set_enabled(false);
+        m_history_menu->add_action(action);
+    } else {
+        for (auto const& entry : m_recent_history) {
+            auto title = entry.title.is_empty() ? entry.url : entry.title;
+            m_history_menu->add_action(GUI::Action::create(title.bytes_as_string_view(), [this, url = entry.url](auto&) {
+                navigate_active(url);
+            }));
+        }
+    }
+    m_history_menu->add_separator();
+    m_history_menu->add_action(GUI::Action::create("Clear &History…"sv, [this](auto&) {
+        auto result = GUI::MessageBox::show(m_window, "Clear all browsing history?"sv, "Clear History"sv, GUI::MessageBox::Type::Question, GUI::MessageBox::InputType::YesNo);
+        if (result == GUI::Dialog::ExecResult::Yes)
+            m_engine->clear_history();
+    }));
+    m_history_menu->add_action(GUI::Action::create("Show &History"sv, [this](auto&) {
+        navigate_active("about:history"_string);
+    }));
+}
+
+String BrowserWindow::bookmark_id_for_url(StringView url) const
+{
+    if (auto const* bookmark = find_bookmark(m_bookmarks, url))
+        return bookmark->id;
+    return {};
+}
+
+void BrowserWindow::show_bookmark_dialog(bool edit_current)
+{
+    auto* tab = active_tab();
+    if (!tab)
+        return;
+    auto url = tab->current_url();
+    if (url.is_empty())
+        return;
+
+    String id;
+    String title = tab->display_title();
+    if (edit_current) {
+        if (auto const* bookmark = find_bookmark(m_bookmarks, url)) {
+            id = bookmark->id;
+            title = bookmark->title;
+        }
+        if (id.is_empty())
+            return;
+    }
+    if (title.is_empty())
+        title = url;
+
+    auto result = GUI::InputBox::show(m_window, title, edit_current ? "Edit bookmark title"sv : "Bookmark title"sv, edit_current ? "Edit Bookmark"sv : "Add Bookmark"sv, GUI::InputType::Text);
+    if (result != GUI::Dialog::ExecResult::OK)
+        return;
+    if (title.is_empty())
+        title = url;
+
+    if (edit_current)
+        m_engine->edit_bookmark(tab->tab_id(), id, url, title);
+    else
+        m_engine->add_bookmark(tab->tab_id(), url, title);
 }
 
 void BrowserWindow::close_other_tabs(BrowserTab& keep)

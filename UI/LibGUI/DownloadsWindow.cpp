@@ -88,7 +88,7 @@ DownloadsWindow::DownloadsWindow(EngineClient& engine)
     auto& clear_button = footer.add<GUI::Button>("Clear Completed"_string);
     clear_button.set_fixed_width(120);
     clear_button.on_click = [this](auto) {
-        m_engine.download_action("clear"sv, 0);
+        m_engine.download_action("clear"sv, 0, m_private_only);
     };
 
     m_summary = footer.add<GUI::Label>(String {});
@@ -119,25 +119,43 @@ void DownloadsWindow::set_downloads(Vector<DownloadEntry> const& downloads)
     refresh();
 }
 
+void DownloadsWindow::set_private_filter(bool private_only)
+{
+    m_private_only = private_only;
+    refresh();
+}
+
+Vector<DownloadEntry const*> DownloadsWindow::visible_downloads() const
+{
+    Vector<DownloadEntry const*> visible;
+    for (auto const& download : m_downloads) {
+        if (download.is_private == m_private_only)
+            visible.append(&download);
+    }
+    return visible;
+}
+
 void DownloadsWindow::refresh()
 {
     if (m_model)
         m_model->update();
 
     if (m_summary) {
+        auto visible = visible_downloads();
         auto active = 0;
-        for (auto const& download : m_downloads) {
-            if (download.status == "in_progress"sv || download.status == "paused"sv)
+        for (auto const* download : visible) {
+            if (download->status == "in_progress"sv || download->status == "paused"sv)
                 ++active;
         }
-        m_summary->set_text(String::formatted("{} download{}, {} active", m_downloads.size(), m_downloads.size() == 1 ? "" : "s", active).release_value());
+        m_summary->set_text(String::formatted("{} download{}, {} active", visible.size(), visible.size() == 1 ? "" : "s", active).release_value());
     }
 }
 
 JsonArray DownloadsWindow::rows() const
 {
     JsonArray rows;
-    for (auto const& download : m_downloads) {
+    for (auto const* download_pointer : visible_downloads()) {
+        auto const& download = *download_pointer;
         LexicalPath destination { download.destination.bytes_as_string_view() };
         auto basename = destination.basename();
         auto name = basename.is_empty() ? download.url : String::from_utf8(basename).release_value();
@@ -182,10 +200,11 @@ DownloadEntry const* DownloadsWindow::selected_download() const
     if (selection.is_empty())
         return nullptr;
 
+    auto visible = visible_downloads();
     auto row = selection.first().row();
-    if (row < 0 || row >= static_cast<int>(m_downloads.size()))
+    if (row < 0 || row >= static_cast<int>(visible.size()))
         return nullptr;
-    return &m_downloads[row];
+    return visible[row];
 }
 
 void DownloadsWindow::perform_action_on_selection(StringView action)

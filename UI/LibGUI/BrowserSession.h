@@ -51,6 +51,12 @@ public:
 
     JsonArray clipboard_items_for_paste();
 
+    // In-memory permission decisions for the site information popover. The engine prompts each time; these record
+    // what the user chose so the popover can summarize it and forget it.
+    void note_permission(String const& origin, String const& name, bool granted);
+    String permission_summary(String const& origin) const;
+    void forget_permissions(String const& origin);
+
     // Called by a BrowserWindow when its native window is closing.
     void window_will_close(BrowserWindow&);
 
@@ -95,6 +101,7 @@ private:
     bool m_session_plan_received { false };
     Vector<String> m_pending_initial_urls;
     Optional<u16> m_devtools_port;
+    HashMap<String, Vector<String>> m_permissions;
 };
 
 }

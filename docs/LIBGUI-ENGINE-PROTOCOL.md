@@ -23,9 +23,16 @@ Version: 9. `Shared/EngineProtocol.h` is authoritative.
 | `mouse` | `tab`, `event`, `x`, `y`, `button`, `buttons`, `ctrl`, `shift`, `alt`, `super`, `click_count` | Pointer event. |
 | `wheel` | `tab`, `x`, `y`, `delta_x`, `delta_y`, `ctrl`, `shift`, `alt`, `super` | Wheel/touchpad scroll in pixels. |
 | `key` | `tab`, `event`, `key`, `codepoint`, `ctrl`, `shift`, `alt`, `super`, `repeat` | Keyboard event; `key` is the Serenity key name. |
-| `find` | `tab`, `query` | Start/replace find-in-page; empty ends it. |
+| `find` | `tab`, `query`, `match_case` | Start/replace find-in-page; empty ends it. |
 | `find_next` / `find_previous` | `tab` | Move between matches. |
 | `toggle_bookmark` | `tab` | Toggle the current URL in the bookmark store. |
+| `add_bookmark` | `tab`, `url`, `title` | Add a bookmark; the engine re-sends `bookmarks` and the tab's `url` state. |
+| `edit_bookmark` | `tab`, `id`, `url`, `title` | Edit a bookmark by ID. |
+| `remove_bookmark` | `tab`, `id` | Remove a bookmark by ID. |
+| `pin_tab` | `tab`, `pinned` | Persist a tab's pinned state in the native session store. |
+| `toggle_mute` | `tab` | Toggle the page mute state; the engine answers with `audio`. |
+| `history_recent` | `limit` | Ask for the most recent history entries; the engine answers with `history_recent`. |
+| `history_clear` | | Remove all history entries. |
 | `copy` / `cut` | `tab` | Put the page selection on the clipboard as plain text. In-page Ctrl+C/Ctrl+X use WebContent's rich copy path instead. |
 | `paste` | `tab`, `items` | Paste clipboard representations into the page. `items` has the same shape as `clipboard_write`. The legacy `text` field is still accepted. |
 | `select_all`, `undo`, `redo` | `tab` | Editing commands. |
@@ -33,10 +40,10 @@ Version: 9. `Shared/EngineProtocol.h` is authoritative.
 | `dialog_response` | `tab`, `kind`, `accept`, `text` | Answer an alert/confirm/prompt. |
 | `context_menu_action` | `tab`, `action` | Invoke a menu item from the last `context_menu` event. |
 | `permission_response` | `tab`, `request`, `granted` | Answer a page permission request. |
-| `file_picker_response` | `tab`, `path` | Answer a file picker request; empty cancels. |
+| `file_picker_response` | `tab`, `path` or `paths` | Answer a file picker request; `paths` carries multiple selections, an empty list cancels. |
 | `select_dropdown_closed` | `tab`, `selected` | Answer a `<select>` popup; omit `selected` when canceled. |
 | `frame_ack` | `tab`, `sequence` | The frontend has replaced the frame it was displaying. The engine may reuse that shared-memory slot. |
-| `download_action` | `action`, `id` | `open`, `show_in_folder`, `pause`, `resume`, `cancel`, or `clear`. |
+| `download_action` | `action`, `id`, `private` | `open`, `show_in_folder`, `pause`, `resume`, `cancel`, or `clear`. For `clear`, `private` selects which session's completed downloads are pruned. |
 | `clipboard_changed` | `items` | The desktop clipboard changed. Representations are `{name, data}`; binary data adds `{"encoding": "base64"}`. The engine caches them for page-initiated reads and pastes. An empty list clears the cache. |
 | `toggle_devtools` | | Enable or disable the DevTools server in the engine host. |
 | `open_devtools_client` | | Ask the engine host to launch the Firefox DevTools client for the active tab. |
@@ -74,6 +81,8 @@ Version: 9. `Shared/EngineProtocol.h` is authoritative.
 | `devtools_enabled` | `port` | The DevTools server is listening. Sent at connection time too when the engine was started with `--devtools`. |
 | `devtools_disabled` | | The DevTools server stopped. |
 | `devtools_error` | `message` | Enabling DevTools or launching the client failed. |
+| `history_recent` | `items` | Recent history entries, each with `url` and `title`. Sent after `history_recent` and `history_clear`. |
+| `audio` | `tab`, `playing`, `muted` | The page started/stopped playing audio, or its mute state changed. |
 | `fullscreen` | `tab`, `fullscreen` | Page requested/left fullscreen. |
 | `bookmarks` | `items` | The bookmark tree for the bookmarks bar. Each item has `id`, `type` (`bookmark` or `folder`), `title`, and either `url` or nested `items`. |
 | `context_menu` | `tab`, `kind`, `x`, `y`, `items` | Page/link/image/media menu. Items have `text`, `action`, `enabled`, `checkable`, `checked`, or `separator`; `items` on a submenu entry nests. |

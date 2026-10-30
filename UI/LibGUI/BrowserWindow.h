@@ -95,7 +95,15 @@ private:
     void add_bookmark_menu_items(GUI::Menu&, Vector<BookmarkEntry> const&);
     void rebuild_bookmarks_menu();
     void close_other_tabs(BrowserTab&);
+    void close_tabs_to_the_right(BrowserTab&);
     void duplicate_tab(BrowserTab&);
+    void toggle_pin_tab(BrowserTab&);
+    void move_tab_to_new_window(BrowserTab&);
+    void rebuild_tab_order();
+    void rebuild_tabs_menu();
+    void rebuild_history_menu();
+    void show_bookmark_dialog(bool edit_current);
+    String bookmark_id_for_url(StringView) const;
     static ByteString string_for_key(JsonObject const&, StringView key);
 
     BrowserSession& m_session;
@@ -147,6 +155,15 @@ private:
     RefPtr<DownloadsWindow> m_downloads_window;
     RefPtr<GUI::Menu> m_tab_context_menu;
     RefPtr<GUI::Menu> m_bookmarks_menu;
+    RefPtr<GUI::Menu> m_tabs_menu;
+    RefPtr<GUI::Menu> m_history_menu;
+    RefPtr<Core::Timer> m_history_refresh_timer;
+    struct RecentHistoryEntry {
+        String title;
+        String url;
+    };
+    Vector<RecentHistoryEntry> m_recent_history;
+    bool m_reordering_tabs { false };
     HashMap<u64, BrowserTab*> m_pending_session_tab_requests;
     bool m_show_bookmarks_bar { true };
     RefPtr<Gfx::Bitmap const> m_bookmark_icon;

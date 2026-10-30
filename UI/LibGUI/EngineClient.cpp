@@ -585,12 +585,13 @@ void EngineClient::set_zoom(u64 tab_id, StringView direction)
     send(event);
 }
 
-void EngineClient::find_in_page(u64 tab_id, String const& query)
+void EngineClient::find_in_page(u64 tab_id, String const& query, bool match_case)
 {
     JsonObject event;
     event.set("type"sv, "find"sv);
     event.set("tab"sv, tab_id);
     event.set("query"sv, query.bytes_as_string_view());
+    event.set("match_case"sv, match_case);
     send(event);
 }
 
@@ -646,6 +647,62 @@ void EngineClient::open_devtools_client()
 }
 
 void EngineClient::select_all(u64 tab_id) { send_simple("select_all"sv, tab_id); }
+
+void EngineClient::add_bookmark(u64 tab_id, String const& url, String const& title)
+{
+    JsonObject event;
+    event.set("type"sv, "add_bookmark"sv);
+    event.set("tab"sv, tab_id);
+    event.set("url"sv, url.bytes_as_string_view());
+    event.set("title"sv, title.bytes_as_string_view());
+    send(event);
+}
+
+void EngineClient::edit_bookmark(u64 tab_id, String const& id, String const& url, String const& title)
+{
+    JsonObject event;
+    event.set("type"sv, "edit_bookmark"sv);
+    event.set("tab"sv, tab_id);
+    event.set("id"sv, id.bytes_as_string_view());
+    event.set("url"sv, url.bytes_as_string_view());
+    event.set("title"sv, title.bytes_as_string_view());
+    send(event);
+}
+
+void EngineClient::remove_bookmark(u64 tab_id, String const& id)
+{
+    JsonObject event;
+    event.set("type"sv, "remove_bookmark"sv);
+    event.set("tab"sv, tab_id);
+    event.set("id"sv, id.bytes_as_string_view());
+    send(event);
+}
+
+void EngineClient::pin_tab(u64 tab_id, bool pinned)
+{
+    JsonObject event;
+    event.set("type"sv, "pin_tab"sv);
+    event.set("tab"sv, tab_id);
+    event.set("pinned"sv, pinned);
+    send(event);
+}
+
+void EngineClient::toggle_mute(u64 tab_id) { send_simple("toggle_mute"sv, tab_id); }
+
+void EngineClient::request_history(u64 limit)
+{
+    JsonObject event;
+    event.set("type"sv, "history_recent"sv);
+    event.set("limit"sv, limit);
+    send(event);
+}
+
+void EngineClient::clear_history()
+{
+    JsonObject event;
+    event.set("type"sv, "history_clear"sv);
+    send(event);
+}
 void EngineClient::undo(u64 tab_id) { send_simple("undo"sv, tab_id); }
 void EngineClient::redo(u64 tab_id) { send_simple("redo"sv, tab_id); }
 
@@ -668,6 +725,18 @@ void EngineClient::permission_response(u64 tab_id, u64 request_id, bool granted)
     send(event);
 }
 
+void EngineClient::file_picker_response(u64 tab_id, Vector<String> const& paths)
+{
+    JsonObject event;
+    event.set("type"sv, "file_picker_response"sv);
+    event.set("tab"sv, tab_id);
+    JsonArray items;
+    for (auto const& path : paths)
+        items.must_append(path.bytes_as_string_view());
+    event.set("paths"sv, move(items));
+    send(event);
+}
+
 void EngineClient::file_picker_response(u64 tab_id, String const& path)
 {
     JsonObject event;
@@ -687,12 +756,13 @@ void EngineClient::select_dropdown_closed(u64 tab_id, Optional<u32> selected)
     send(event);
 }
 
-void EngineClient::download_action(StringView action, u64 id)
+void EngineClient::download_action(StringView action, u64 id, bool private_session)
 {
     JsonObject event;
     event.set("type"sv, "download_action"sv);
     event.set("action"sv, action);
     event.set("id"sv, id);
+    event.set("private"sv, private_session);
     send(event);
 }
 

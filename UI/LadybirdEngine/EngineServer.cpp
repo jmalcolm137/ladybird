@@ -29,6 +29,7 @@
 #include <LibWebCommon/Clipboard/SystemClipboard.h>
 #include <LibWebCommon/HTML/VisibilityState.h>
 #include <LibWebCommon/HTML/ActivateTab.h>
+#include <LibWebCommon/HTML/AudioPlayState.h>
 #include <LibWebCommon/HTML/WebViewHints.h>
 #include <LibWebCommon/Page/InputEvent.h>
 #include <LibWebCommon/PixelUnits.h>
@@ -38,6 +39,7 @@
 #include <LibWebView/Utilities.h>
 #include <LibWebView/BookmarkStore.h>
 #include <LibWebView/HeadlessWebView.h>
+#include <LibWebView/HistoryStore.h>
 #include <LibWebView/Menu.h>
 #include <LibWebView/RequestServerManager.h>
 #include <LibWebView/ViewImplementation.h>
@@ -298,6 +300,16 @@ void EngineServer::dispatch_command(JsonObject const& command)
         quit();
     } else if (*type == "download_action"sv) {
         handle_download_action(command);
+    } else if (*type == "history_recent"sv) {
+        handle_history_recent(command);
+    } else if (*type == "history_clear"sv) {
+        handle_history_clear();
+    } else if (*type == "add_bookmark"sv) {
+        handle_add_bookmark(command);
+    } else if (*type == "edit_bookmark"sv) {
+        handle_edit_bookmark(command);
+    } else if (*type == "remove_bookmark"sv) {
+        handle_remove_bookmark(command);
     } else if (*type == "clipboard_changed"sv) {
         handle_clipboard_changed(command);
     } else if (*type == "toggle_devtools"sv) {
@@ -359,6 +371,10 @@ void EngineServer::dispatch_command(JsonObject const& command)
             handle_find_next(*tab_id, false);
         } else if (*type == "toggle_bookmark"sv) {
             handle_toggle_bookmark(*tab_id);
+        } else if (*type == "pin_tab"sv) {
+            handle_pin_tab(*tab_id, command);
+        } else if (*type == "toggle_mute"sv) {
+            handle_toggle_mute(*tab_id);
         } else if (*type == "copy"sv) {
             handle_clipboard_copy(*tab_id, false);
         } else if (*type == "cut"sv) {
@@ -434,6 +450,7 @@ EngineServer::Tab& EngineServer::create_child_tab(Tab& parent, WebView::Canonica
     send_url(tab_ref);
     send_title(tab_ref);
     send_loading_state(tab_ref, tab_ref.view->is_loading());
+    send_audio_state(tab_ref);
     return tab_ref;
 }
 
@@ -488,6 +505,11 @@ void EngineServer::wire_tab(Tab& tab)
     tab.view->on_loading_state_change = [this, tab_id](bool loading) {
         if (auto* tab = tab_for_id(tab_id))
             send_loading_state(*tab, loading);
+    };
+
+    tab.view->on_audio_play_state_changed = [this, tab_id](Web::HTML::AudioPlayState) {
+        if (auto* tab = tab_for_id(tab_id))
+            send_audio_state(*tab);
     };
 
     tab.view->on_cursor_change = [this, tab_id](Gfx::Cursor const& cursor) {
@@ -1183,7 +1205,10 @@ void EngineServer::handle_find(u64 tab_id, JsonObject const& command)
         return;
     }
 
-    tab->view->find_in_page(Utf16String::from_utf8_with_replacement_character(query->bytes_as_string_view()));
+    auto case_sensitivity = command.get_bool("match_case"sv).value_or(false)
+        ? CaseSensitivity::CaseSensitive
+        : CaseSensitivity::CaseInsensitive;
+    tab->view->find_in_page(Utf16String::from_utf8_with_replacement_character(query->bytes_as_string_view()), case_sensitivity);
 }
 
 void EngineServer::destroy_frame_buffer(Tab& tab)
@@ -1368,6 +1393,122 @@ static Optional<Web::Clipboard::SystemClipboardItem> clipboard_item_from_json(Js
     if (representations.is_empty())
         return {};
     return Web::Clipboard::SystemClipboardItem { move(representations) };
+}
+
+void EngineServer::handle_history_recent(JsonObject const& command)
+{
+    auto limit = static_cast<size_t>(min<u64>(command.get_u64("limit"sv).value_or(10), 50));
+
+    JsonArray items;
+    if (auto* store = WebView::Application::default_session().history_store.ptr()) {
+        for (auto const& entry : store->list_entries({}, 0, limit)) {
+            JsonObject item;
+            item.set("url"sv, entry.url);
+            item.set("title"sv, entry.title.value_or(entry.url));
+            items.must_append(move(item));
+        }
+    }
+
+    JsonObject event;
+    event.set("type"sv, "history_recent"sv);
+    event.set("items"sv, move(items));
+    send_event(move(event));
+}
+
+void EngineServer::handle_history_clear()
+{
+    if (auto* store = WebView::Application::default_session().history_store.ptr())
+        store->remove_entries_accessed_since(UnixDateTime::earliest());
+
+    JsonObject event;
+    event.set("type"sv, "history_recent"sv);
+    event.set("items"sv, JsonArray {});
+    send_event(move(event));
+}
+
+void EngineServer::handle_add_bookmark(JsonObject const& command)
+{
+    auto url_text = command.get_string("url"sv);
+    if (!url_text.has_value())
+        return;
+    auto url = URL::Parser::basic_parse(url_text->bytes_as_string_view());
+    if (!url.has_value())
+        return;
+
+    Optional<String> title;
+    if (auto text = command.get_string("title"sv); text.has_value())
+        title = *text;
+    WebView::Application::bookmark_store().add_bookmark(url.release_value(), move(title), {});
+    send_bookmarks();
+    if (auto tab_id = command.get_u64("tab"sv); tab_id.has_value()) {
+        if (auto* tab = tab_for_id(*tab_id))
+            send_url(*tab);
+    }
+}
+
+void EngineServer::handle_edit_bookmark(JsonObject const& command)
+{
+    auto id = command.get_string("id"sv);
+    auto url_text = command.get_string("url"sv);
+    if (!id.has_value() || !url_text.has_value())
+        return;
+    auto url = URL::Parser::basic_parse(url_text->bytes_as_string_view());
+    if (!url.has_value())
+        return;
+
+    Optional<String> title;
+    if (auto text = command.get_string("title"sv); text.has_value())
+        title = *text;
+    WebView::Application::bookmark_store().edit_bookmark(*id, url.release_value(), move(title));
+    send_bookmarks();
+    if (auto tab_id = command.get_u64("tab"sv); tab_id.has_value()) {
+        if (auto* tab = tab_for_id(*tab_id))
+            send_url(*tab);
+    }
+}
+
+void EngineServer::handle_remove_bookmark(JsonObject const& command)
+{
+    auto id = command.get_string("id"sv);
+    if (!id.has_value())
+        return;
+
+    WebView::Application::bookmark_store().remove_item(*id);
+    send_bookmarks();
+    if (auto tab_id = command.get_u64("tab"sv); tab_id.has_value()) {
+        if (auto* tab = tab_for_id(*tab_id))
+            send_url(*tab);
+    }
+}
+
+void EngineServer::handle_pin_tab(u64 tab_id, JsonObject const& command)
+{
+    auto* tab = tab_for_id(tab_id);
+    if (!tab || !tab->session_tab_id.has_value())
+        return;
+
+    if (auto* store = WebView::Application::session_store(WebView::IsPrivate::No))
+        (void)store->tab_pinned_changed(*tab->session_tab_id, command.get_bool("pinned"sv).value_or(false));
+}
+
+void EngineServer::handle_toggle_mute(u64 tab_id)
+{
+    auto* tab = tab_for_id(tab_id);
+    if (!tab)
+        return;
+
+    tab->view->toggle_page_mute_state();
+    send_audio_state(*tab);
+}
+
+void EngineServer::send_audio_state(Tab& tab)
+{
+    JsonObject event;
+    event.set("type"sv, "audio"sv);
+    event.set("tab"sv, tab.id);
+    event.set("playing"sv, tab.view->audio_play_state() == Web::HTML::AudioPlayState::Playing);
+    event.set("muted"sv, tab.view->page_mute_state() == Web::HTML::MuteState::Muted);
+    send_event(move(event));
 }
 
 void EngineServer::handle_clipboard_copy(u64 tab_id, bool cut)
@@ -2220,11 +2361,23 @@ void EngineServer::handle_file_picker_response(u64 tab_id, JsonObject const& com
         return;
 
     Vector<Web::HTML::SelectedFile> selected_files;
-    if (auto path = command.get_string("path"sv); path.has_value() && !path->is_empty()) {
-        if (auto file = WebView::create_selected_file(path->to_byte_string()); file.is_error())
-            warnln("LadybirdEngine: could not open selected file '{}': {}", path->bytes_as_string_view(), file.error());
+
+    auto append_path = [&](String const& path) {
+        if (path.is_empty())
+            return;
+        if (auto file = WebView::create_selected_file(path.to_byte_string()); file.is_error())
+            warnln("LadybirdEngine: could not open selected file '{}': {}", path.bytes_as_string_view(), file.error());
         else
             selected_files.append(file.release_value());
+    };
+
+    if (auto paths = command.get_array("paths"sv); paths.has_value()) {
+        for (auto const& value : paths->values()) {
+            if (value.is_string())
+                append_path(value.as_string());
+        }
+    } else if (auto path = command.get_string("path"sv); path.has_value()) {
+        append_path(*path);
     }
 
     tab->view->file_picker_closed(move(selected_files));
@@ -2373,8 +2526,10 @@ void EngineServer::handle_download_action(JsonObject const& command)
     auto& downloader = WebView::Application::the().file_downloader();
     auto action_name = action->bytes_as_string_view();
     if (action_name == "clear"sv) {
-        (void)downloader.prune_inactive_downloads(WebView::IsPrivate::No);
-        (void)downloader.prune_inactive_downloads(WebView::IsPrivate::Yes);
+        if (command.get_bool("private"sv).value_or(false))
+            (void)downloader.prune_inactive_downloads(WebView::IsPrivate::Yes);
+        else
+            (void)downloader.prune_inactive_downloads(WebView::IsPrivate::No);
         return;
     }
 

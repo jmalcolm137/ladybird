@@ -158,6 +158,13 @@ private:
     void handle_file_picker_response(u64 tab_id, JsonObject const&);
     void handle_select_dropdown_closed(u64 tab_id, JsonObject const&);
     void handle_download_action(JsonObject const&);
+    void handle_history_recent(JsonObject const&);
+    void handle_history_clear();
+    void handle_add_bookmark(JsonObject const&);
+    void handle_edit_bookmark(JsonObject const&);
+    void handle_remove_bookmark(JsonObject const&);
+    void handle_pin_tab(u64 tab_id, JsonObject const&);
+    void handle_toggle_mute(u64 tab_id);
     void handle_frame_ack(u64 tab_id, JsonObject const&);
     void note_user_input(Tab&);
     void note_frame_presented(Tab&, u64 sequence);
@@ -197,6 +204,7 @@ private:
     void send_loading_state(Tab&, bool loading);
     void send_history_state(Tab&);
     void send_zoom_changed(Tab&);
+    void send_audio_state(Tab&);
     void send_autocomplete_results(u64 tab_id, u64 query_id, Vector<WebView::AutocompleteSuggestion>, WebView::AutocompleteResultKind);
     void send_dialog(Tab&, StringView kind, StringView message, StringView default_text = {});
     void send_cursor(Tab&, Gfx::Cursor const&);

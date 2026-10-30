@@ -18,6 +18,7 @@
 #include <LibCore/Forward.h>
 #include <LibGUI/Action.h>
 #include <LibGUI/Button.h>
+#include <LibGUI/CheckBox.h>
 #include <LibGUI/Forward.h>
 #include <LibGUI/Label.h>
 #include <LibGUI/Statusbar.h>
@@ -32,9 +33,11 @@ namespace LadybirdSDE {
 struct InitialTab {
     String url;
     u64 session_tab_id { 0 };
+    bool pinned { false };
 };
 
 struct BookmarkEntry {
+    String id;
     String title;
     String url;
     bool is_folder { false };
@@ -65,6 +68,11 @@ public:
     bool can_go_back() const { return m_can_go_back; }
     bool can_go_forward() const { return m_can_go_forward; }
     bool is_bookmarked() const { return m_bookmarked; }
+    bool is_pinned() const { return m_pinned; }
+    void set_pinned(bool pinned) { m_pinned = pinned; }
+    bool is_muted() const { return m_muted; }
+    void set_audio_state(bool playing, bool muted);
+    Gfx::Bitmap const* favicon() const { return m_favicon.ptr(); }
 
     void set_window_id(u64 window_id) { m_window_id = window_id; }
     void create_engine_tab(u64 request_id, String const& url, bool private_tab = false);
@@ -100,7 +108,9 @@ public:
     void show_dialog(StringView kind, StringView message, StringView default_text = {});
     void show_context_menu(JsonArray const& items, Gfx::IntPoint screen_position);
     void show_permission_prompt(StringView name, StringView origin, u64 request_id);
-    void show_file_picker(StringView filters);
+    void show_file_picker(bool multiple, JsonArray const& filters);
+    void set_permission_summary_provider(Function<String(String const&)> provider) { m_permission_summary_provider = move(provider); }
+    void set_forget_permissions_handler(Function<void(String const&)> handler) { m_forget_permissions_handler = move(handler); }
     void show_select_dropdown(Gfx::IntPoint position, i32 minimum_width, JsonArray const& items);
 
     String const& display_title() const { return m_title; }
@@ -114,6 +124,7 @@ public:
     Function<void(Gfx::Bitmap const*)> on_favicon_change;
     Function<void(bool)> on_bookmark_change;
     Function<void()> on_hard_reload;
+    Function<void(String const&, String const&, bool)> on_permission_decision;
 
 private:
     static StringView button_name(GUI::MouseButton);
@@ -122,6 +133,7 @@ private:
     void add_bookmark_menu_items(GUI::Menu&, Vector<BookmarkEntry> const&);
     void update_site_button();
     void request_autocomplete();
+    void request_find();
     void hide_autocomplete();
     void accept_autocomplete();
     void move_autocomplete_selection(int delta);
@@ -141,6 +153,14 @@ private:
     RefPtr<GUI::Menu> m_context_menu;
     RefPtr<GUI::Menu> m_select_dropdown;
     RefPtr<GUI::Menu> m_site_menu;
+    RefPtr<GUI::CheckBox> m_match_case;
+    RefPtr<GUI::Button> m_mute_button;
+    RefPtr<Gfx::Bitmap> m_favicon;
+    bool m_pinned { false };
+    bool m_audio_playing { false };
+    bool m_muted { false };
+    Function<String(String const&)> m_permission_summary_provider;
+    Function<void(String const&)> m_forget_permissions_handler;
     RefPtr<GUI::Menu> m_zoom_menu;
     RefPtr<GUI::Widget> m_autocomplete_overlay;
     RefPtr<GUI::TableView> m_autocomplete_table;

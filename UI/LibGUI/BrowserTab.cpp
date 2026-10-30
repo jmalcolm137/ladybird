@@ -6,7 +6,9 @@
 
 #include "BrowserTab.h"
 
+#include <LibCore/StandardPaths.h>
 #include <LibGUI/BoxLayout.h>
+#include <LibGUI/CheckBox.h>
 #include <LibGUI/FilePicker.h>
 #include <LibGUI/InputBox.h>
 #include <LibGUI/JsonArrayModel.h>
@@ -219,33 +221,51 @@ BrowserTab::BrowserTab(EngineClient& engine, GUI::Window& window, GUI::Action& b
             m_engine.set_zoom(m_tab_id, "reset"sv);
     }));
 
-    m_web_view = m_root->add<WebContentView>();
-    m_web_view->set_preferred_size(GUI::SpecialDimension::Grow, GUI::SpecialDimension::Grow);
+    auto& mute_button = m_toolbar->add<GUI::Button>("Mute"_string);
+    mute_button.set_fixed_height(22);
+    mute_button.set_fixed_width(56);
+    mute_button.set_visible(false);
+    mute_button.on_click = [this](auto) {
+        if (is_attached())
+            m_engine.toggle_mute(m_tab_id);
+    };
+    m_mute_button = mute_button;
 
     m_find_bar = m_root->add<GUI::Widget>();
     m_find_bar->set_fixed_height(30);
+    m_find_bar->set_preferred_width(GUI::SpecialDimension::Grow);
     m_find_bar->set_layout<GUI::HorizontalBoxLayout>(GUI::Margins { 4 }, 4);
     m_find_bar->set_visible(false);
 
-    m_find_bar->add<GUI::Label>("Find:"_string);
+    auto& find_label = m_find_bar->add<GUI::Label>("Find:"_string);
+    find_label.set_fixed_width(40);
     m_find_box = m_find_bar->add<GUI::TextBox>();
-    m_find_box->set_preferred_width(GUI::SpecialDimension::Grow);
+    m_find_box->set_fixed_width(280);
     m_find_box->on_change = [this] {
-        if (is_attached())
-            m_engine.find_in_page(m_tab_id, String::from_byte_string(m_find_box->text()).release_value());
+        request_find();
     };
     m_find_box->on_return_pressed = [this] {
         if (is_attached())
             m_engine.find_next(m_tab_id);
     };
 
+    m_match_case = m_find_bar->add<GUI::CheckBox>("Match case"_string);
+    m_match_case->set_fixed_width(110);
+    m_match_case->on_checked = [this](bool) {
+        request_find();
+    };
+
     auto& previous_button = m_find_bar->add<GUI::Button>("Previous"_string);
+    previous_button.set_fixed_width(70);
+    previous_button.set_fixed_height(22);
     previous_button.on_click = [this](auto) {
         if (is_attached())
             m_engine.find_previous(m_tab_id);
     };
 
     auto& next_button = m_find_bar->add<GUI::Button>("Next"_string);
+    next_button.set_fixed_width(50);
+    next_button.set_fixed_height(22);
     next_button.on_click = [this](auto) {
         if (is_attached())
             m_engine.find_next(m_tab_id);
@@ -256,9 +276,15 @@ BrowserTab::BrowserTab(EngineClient& engine, GUI::Window& window, GUI::Action& b
     m_find_status->set_text_alignment(Gfx::TextAlignment::CenterRight);
 
     auto& close_button = m_find_bar->add<GUI::Button>("Close"_string);
+    close_button.set_fixed_width(55);
+    close_button.set_fixed_height(22);
     close_button.on_click = [this](auto) {
         hide_find_bar();
     };
+
+
+    m_web_view = m_root->add<WebContentView>();
+    m_web_view->set_preferred_size(GUI::SpecialDimension::Grow, GUI::SpecialDimension::Grow);
 
     m_statusbar = m_root->add<GUI::Statusbar>();
     m_statusbar->set_fixed_height(22);
@@ -402,12 +428,22 @@ void BrowserTab::focus_location()
 void BrowserTab::show_find_bar()
 {
     m_find_bar->set_visible(true);
+    if (auto* parent = m_find_bar->parent_widget())
+        parent->invalidate_layout();
+    m_root->do_layout();
+    if (auto* window = m_root->window())
+        window->update();
     m_find_box->set_focus(true);
     m_find_box->select_all();
 }
 
 void BrowserTab::hide_find_bar()
 {
+    if (auto* parent = m_find_bar->parent_widget())
+        parent->invalidate_layout();
+    m_root->do_layout();
+    if (auto* window = m_root->window())
+        window->update();
     m_find_bar->set_visible(false);
     if (is_attached())
         m_engine.find_in_page(m_tab_id, String {});
@@ -592,6 +628,22 @@ void BrowserTab::update_site_button()
         if (is_attached())
             m_engine.set_zoom(m_tab_id, "reset"sv);
     }));
+    if (m_permission_summary_provider) {
+        auto summary = m_permission_summary_provider(identity.host);
+        if (!summary.is_empty()) {
+            menu->add_separator();
+            add_information(String::formatted("Permissions: {}", summary).release_value());
+            menu->add_action(GUI::Action::create("Forget Site Permissions"sv, [this, host = identity.host](auto&) {
+                if (m_forget_permissions_handler)
+                    m_forget_permissions_handler(host);
+                // Rebuilding the menu while it is being activated destroys the popup out of order.
+                Core::deferred_invoke([this] {
+                    update_site_button();
+                });
+            }));
+        }
+    }
+
     menu->add_separator();
     menu->add_action(GUI::Action::create("Site &Settings"sv, [this](auto&) {
         navigate("about:settings"_string);
@@ -609,6 +661,11 @@ void BrowserTab::show_site_info_dialog()
     auto percent = static_cast<int>(m_zoom_level * 100.0 + 0.5);
     auto subject = identity.host.is_empty() ? url : identity.host;
     auto text = String::formatted("{}: {}\nZoom: {}%", identity.security, subject, percent).release_value();
+    if (m_permission_summary_provider) {
+        auto summary = m_permission_summary_provider(identity.host);
+        if (!summary.is_empty())
+            text = String::formatted("{}\nPermissions: {}", text, summary).release_value();
+    }
     GUI::MessageBox::show(m_root->window(), text, "Site Information"sv, GUI::MessageBox::Type::Information, GUI::MessageBox::InputType::OK);
 }
 
@@ -747,6 +804,7 @@ void BrowserTab::set_title(String const& title)
 void BrowserTab::set_favicon(StringView path)
 {
     if (path.is_empty()) {
+        m_favicon.clear();
         if (on_favicon_change)
             on_favicon_change(nullptr);
         return;
@@ -755,6 +813,7 @@ void BrowserTab::set_favicon(StringView path)
     auto bitmap = Gfx::Bitmap::load_from_file(path, 1, Gfx::IntSize { 16, 16 });
     if (bitmap.is_error())
         return;
+    m_favicon = bitmap.value();
     if (on_favicon_change)
         on_favicon_change(bitmap.value().ptr());
 }
@@ -861,13 +920,43 @@ void BrowserTab::show_permission_prompt(StringView name, StringView origin, u64 
     auto message = String::formatted("Allow {} for {}?", name, origin).release_value();
     auto result = GUI::MessageBox::show(m_root->window(), message, "Permission Request"sv,
         GUI::MessageBox::Type::Question, GUI::MessageBox::InputType::YesNo);
+    auto granted = result == GUI::Dialog::ExecResult::Yes;
+    if (on_permission_decision)
+        on_permission_decision(String::from_utf8(origin).release_value(), String::from_utf8(name).release_value(), granted);
     if (is_attached())
-        m_engine.permission_response(m_tab_id, request_id, result == GUI::Dialog::ExecResult::Yes);
+        m_engine.permission_response(m_tab_id, request_id, granted);
 }
 
-void BrowserTab::show_file_picker(StringView)
+void BrowserTab::show_file_picker(bool, JsonArray const& filters)
 {
-    auto path = GUI::FilePicker::get_open_filepath(m_root->window(), "Select File"sv);
+    // LibGUI's file picker exposes one path at a time, so a multiple-file
+    // request still opens a single selection. The engine accepts a list, so the
+    // dialog can become multi-select without changing the protocol.
+    Optional<Vector<GUI::FileTypeFilter>> allowed_filters;
+    Vector<GUI::FileTypeFilter> parsed_filters;
+
+    for (auto const& value : filters.values()) {
+        if (!value.is_string())
+            continue;
+        auto filter = String::from_byte_string(value.as_string()).release_value();
+        auto view = filter.bytes_as_string_view();
+        if (view == "Image files"sv)
+            parsed_filters.append(GUI::FileTypeFilter::image_files());
+        else if (view == "Audio files"sv)
+            parsed_filters.append(GUI::FileTypeFilter::audio_files());
+        else if (view == "Video files"sv || view.starts_with("video/"sv))
+            parsed_filters.append(GUI::FileTypeFilter::video_files());
+        else if (view.starts_with("audio/"sv))
+            parsed_filters.append(GUI::FileTypeFilter::audio_files());
+        else if (view.starts_with("image/"sv))
+            parsed_filters.append(GUI::FileTypeFilter::image_files());
+        else if (view.starts_with("*."sv))
+            parsed_filters.append({ "Files"sv, Vector<ByteString> { filter.bytes_as_string_view().substring_view(2) } });
+    }
+    if (!parsed_filters.is_empty())
+        allowed_filters = move(parsed_filters);
+
+    auto path = GUI::FilePicker::get_open_filepath(m_root->window(), "Select File"sv, Core::StandardPaths::home_directory(), false, GUI::Dialog::ScreenPosition::CenterWithinParent, allowed_filters);
     if (!is_attached())
         return;
 
@@ -875,6 +964,27 @@ void BrowserTab::show_file_picker(StringView)
         m_engine.file_picker_response(m_tab_id, String::from_byte_string(path.release_value()).release_value());
     else
         m_engine.file_picker_response(m_tab_id, String {});
+}
+
+void BrowserTab::request_find()
+{
+    if (!is_attached())
+        return;
+    if (!m_find_box || m_find_box->text().is_empty()) {
+        m_engine.find_in_page(m_tab_id, String {});
+        return;
+    }
+    m_engine.find_in_page(m_tab_id, String::from_byte_string(m_find_box->text()).release_value(), m_match_case && m_match_case->is_checked());
+}
+
+void BrowserTab::set_audio_state(bool playing, bool muted)
+{
+    m_audio_playing = playing;
+    m_muted = muted;
+    if (m_mute_button) {
+        m_mute_button->set_text(muted ? "Unmute"_string : "Mute"_string);
+        m_mute_button->set_visible(playing || muted);
+    }
 }
 
 void BrowserTab::add_select_dropdown_items(GUI::Menu& menu, JsonArray const& items, bool in_group)

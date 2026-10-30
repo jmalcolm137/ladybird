@@ -136,12 +136,14 @@ navigating the real engine.
 * A real SDE LibGUI window with Serenity window decorations, menus, toolbar,
   tab bar, URL bar, status bar, and app icon.
 * Tabbed browsing: new/close/activate tabs, titles, favicons, per-tab history
-  state, and drag reordering (LibGUI `TabWidget`).
+  state, drag reordering (LibGUI `TabWidget`), pinning, mute/audio state, move to
+  a new window, close-tabs-to-the-right, and a Tabs menu listing every tab.
 * Navigation: load/search from the URL bar, back, forward, reload (with cache
   bypass support in the protocol), stop, zoom in/out/reset.
 * Find in page: Ctrl+F, incremental search, next/previous, and close.
 * Bookmarks: Ctrl+D toggle, filled/contour star, a bookmarks bar fed by
-  Ladybird's real `BookmarkStore`, and a show/hide action.
+  Ladybird's real `BookmarkStore`, add/edit/remove dialogs for the current page,
+  and a show/hide action.
 * Page dialogs: alert, confirm, and prompt are shown as LibGUI dialogs and
   answered back to the engine.
 * Page-initiated fullscreen and F11 window fullscreen.
@@ -171,13 +173,18 @@ navigating the real engine.
   renders it as a native LibGUI menu.
 * Tab context menu: new, reload, duplicate, close, and close other tabs.
 * Native downloads window with live progress, open/show-in-folder, pause,
-  resume, cancel, and clear-completed actions.
+  resume, cancel, and clear-completed actions. The window filters to the active
+  window's session (normal or private), and clearing only prunes that session.
 * Permission prompts for page requests such as the microphone.
 * File picker for `<input type=file>` and native `<select>` dropdowns.
-* Find-in-page match count in the find bar.
+* Find-in-page match count and a match-case toggle in the find bar.
 * A click-to-reload crash overlay for a crashed WebContent process, and an
   unresponsive-page banner that hard-reloads a renderer spinning without
   presenting frames.
+* History menu with the most recent entries, clear-history confirmation, and the
+  full history page.
+* Site information includes the permission decisions made for the current site
+  and a Forget action; certificate details are not exposed by the engine yet.
 * Session restore uses the engine host's native `SessionStore` and
   `SessionHistorySnapshot` data, not a URL-only frontend list. Every normal
   window reopens with its tabs, full session history, size, position,
