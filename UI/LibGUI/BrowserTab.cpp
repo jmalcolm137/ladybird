@@ -240,7 +240,7 @@ BrowserTab::BrowserTab(EngineClient& engine, GUI::Window& window, GUI::Action& b
     auto& find_label = m_find_bar->add<GUI::Label>("Find:"_string);
     find_label.set_fixed_width(40);
     m_find_box = m_find_bar->add<GUI::TextBox>();
-    m_find_box->set_fixed_width(280);
+    m_find_box->set_fixed_width(160);
     m_find_box->on_change = [this] {
         request_find();
     };
@@ -250,13 +250,13 @@ BrowserTab::BrowserTab(EngineClient& engine, GUI::Window& window, GUI::Action& b
     };
 
     m_match_case = m_find_bar->add<GUI::CheckBox>("Match case"_string);
-    m_match_case->set_fixed_width(110);
+    m_match_case->set_fixed_width(90);
     m_match_case->on_checked = [this](bool) {
         request_find();
     };
 
     auto& previous_button = m_find_bar->add<GUI::Button>("Previous"_string);
-    previous_button.set_fixed_width(70);
+    previous_button.set_fixed_width(60);
     previous_button.set_fixed_height(22);
     previous_button.on_click = [this](auto) {
         if (is_attached())
@@ -264,7 +264,7 @@ BrowserTab::BrowserTab(EngineClient& engine, GUI::Window& window, GUI::Action& b
     };
 
     auto& next_button = m_find_bar->add<GUI::Button>("Next"_string);
-    next_button.set_fixed_width(50);
+    next_button.set_fixed_width(40);
     next_button.set_fixed_height(22);
     next_button.on_click = [this](auto) {
         if (is_attached())
@@ -272,11 +272,11 @@ BrowserTab::BrowserTab(EngineClient& engine, GUI::Window& window, GUI::Action& b
     };
 
     m_find_status = m_find_bar->add<GUI::Label>(String {});
-    m_find_status->set_fixed_width(80);
+    m_find_status->set_fixed_width(50);
     m_find_status->set_text_alignment(Gfx::TextAlignment::CenterRight);
 
     auto& close_button = m_find_bar->add<GUI::Button>("Close"_string);
-    close_button.set_fixed_width(55);
+    close_button.set_fixed_width(45);
     close_button.set_fixed_height(22);
     close_button.on_click = [this](auto) {
         hide_find_bar();
