@@ -1429,13 +1429,13 @@ void BrowserWindow::rebuild_tabs_menu()
                 activate_tab(*tab);
             }));
         }
-        menu.add_separator();
         menu.add_action(*m_new_tab_action);
         menu.add_action(*m_close_tab_action);
     };
     populate(*m_tabs_menu);
     if (m_tabs_popup_menu)
         populate(*m_tabs_popup_menu);
+
 }
 
 void BrowserWindow::rebuild_history_menu()
@@ -1456,7 +1456,6 @@ void BrowserWindow::rebuild_history_menu()
             }));
         }
     }
-    m_history_menu->add_separator();
     m_history_menu->add_action(GUI::Action::create("&Search History…"sv, [this](auto&) {
         show_history_search();
     }));
@@ -1468,6 +1467,7 @@ void BrowserWindow::rebuild_history_menu()
     m_history_menu->add_action(GUI::Action::create("Show &History"sv, [this](auto&) {
         navigate_active("about:history"_string);
     }));
+
 }
 
 void BrowserWindow::show_history_search()
