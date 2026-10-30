@@ -301,8 +301,7 @@ new_profile session-regression-b
 start_frontend session-regression-b "$URL/a.html" || exit 1
 wait_for_log /a.html 10
 check "second test loads page A" $?
-click 500 500
-sleep 0.3
+# The window has focus after launch; no click is needed here (and a click could land on the test page's link).
 MAPS_BEFORE="$(grep -c 'toplevel mapped' "$WORK/compositor.log" 2>/dev/null || echo 0)"
 chord 29 49   # Ctrl+N opens another window
 MAPS_NOW="$MAPS_BEFORE"

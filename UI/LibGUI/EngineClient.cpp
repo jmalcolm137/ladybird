@@ -559,6 +559,27 @@ void EngineClient::wheel_event(u64 tab_id, Gfx::IntPoint position, double delta_
     send(event);
 }
 
+void EngineClient::drag_event(u64 tab_id, StringView type, Gfx::IntPoint position, unsigned modifiers, String const& text, Vector<String> const& urls)
+{
+    JsonObject event;
+    event.set("type"sv, "drag"sv);
+    event.set("tab"sv, tab_id);
+    event.set("drag_type"sv, type);
+    event.set("x"sv, position.x());
+    event.set("y"sv, position.y());
+    event.set("ctrl"sv, (modifiers & Mod_Ctrl) != 0);
+    event.set("shift"sv, (modifiers & Mod_Shift) != 0);
+    event.set("alt"sv, (modifiers & Mod_Alt) != 0);
+    event.set("super"sv, (modifiers & Mod_Super) != 0);
+    if (!text.is_empty())
+        event.set("text"sv, text.bytes_as_string_view());
+    JsonArray url_values;
+    for (auto const& url : urls)
+        url_values.must_append(url.bytes_as_string_view());
+    event.set("urls"sv, move(url_values));
+    send(event);
+}
+
 void EngineClient::key_event(u64 tab_id, StringView type, StringView key_name, u32 code_point, unsigned modifiers, bool repeat)
 {
     JsonObject event;

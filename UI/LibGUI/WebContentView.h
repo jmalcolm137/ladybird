@@ -38,6 +38,7 @@ public:
     Function<void(Gfx::IntSize)> on_resize;
     Function<void()> on_reload;
     Function<void(StringView type, Gfx::IntPoint position, GUI::MouseButton button, unsigned buttons, unsigned modifiers, int click_count)> on_mouse;
+    Function<void(StringView type, Gfx::IntPoint position, unsigned modifiers, String const& text, Vector<String> const& urls)> on_drag;
     Function<void(Gfx::IntPoint position, int delta_x, int delta_y, unsigned modifiers)> on_wheel;
     Function<void(StringView type, StringView key_name, u32 code_point, unsigned modifiers)> on_key;
     Function<void(bool focused)> on_focus_change;
@@ -49,6 +50,10 @@ public:
 protected:
     virtual void paint_event(GUI::PaintEvent&) override;
     virtual void resize_event(GUI::ResizeEvent&) override;
+    virtual void drag_enter_event(GUI::DragEvent&) override;
+    virtual void drag_move_event(GUI::DragEvent&) override;
+    virtual void drag_leave_event(GUI::Event&) override;
+    virtual void drop_event(GUI::DropEvent&) override;
     virtual void mousedown_event(GUI::MouseEvent&) override;
     virtual void mouseup_event(GUI::MouseEvent&) override;
     virtual void mousemove_event(GUI::MouseEvent&) override;
@@ -67,6 +72,8 @@ private:
     Gfx::Bitmap const* m_frame { nullptr };
     u64 m_frame_sequence { 0 };
     bool m_frame_was_painted { false };
+    bool m_dragging { false };
+    Gfx::IntPoint m_drag_position;
     int m_click_count { 1 };
     bool m_crashed { false };
     bool m_unresponsive { false };

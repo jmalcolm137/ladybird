@@ -6,7 +6,9 @@
 
 #pragma once
 
+#include <AK/Optional.h>
 #include <AK/OwnPtr.h>
+#include <AK/String.h>
 #include <AK/Vector.h>
 #include <LibIPC/Forward.h>
 #include <LibWebCommon/Export.h>
@@ -34,6 +36,8 @@ struct WEBCOMMON_API DragEvent {
     UIEvents::MouseButton buttons { UIEvents::MouseButton::None };
     UIEvents::KeyModifier modifiers { UIEvents::KeyModifier::Mod_None };
     Vector<HTML::SelectedFile> files;
+    Optional<String> text;
+    Vector<String> urls;
 
     OwnPtr<Web::BrowserInputData> browser_data;
     u64 id { 0 };

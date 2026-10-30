@@ -394,6 +394,8 @@ void EngineServer::dispatch_command(JsonObject const& command)
             handle_ime_commit_text(*tab_id, command);
         } else if (*type == "ime_unmark_text"sv) {
             handle_ime_unmark_text(*tab_id);
+        } else if (*type == "drag"sv) {
+            handle_drag(*tab_id, command);
         } else if (*type == "copy"sv) {
             handle_clipboard_copy(*tab_id, false);
         } else if (*type == "cut"sv) {
@@ -1653,6 +1655,75 @@ void EngineServer::handle_ime_unmark_text(u64 tab_id)
 {
     if (auto* tab = tab_for_id(tab_id))
         tab->view->unmark_text_from_input_method();
+}
+
+void EngineServer::handle_drag(u64 tab_id, JsonObject const& command)
+{
+    auto* tab = tab_for_id(tab_id);
+    if (!tab)
+        return;
+
+    auto type_name = command.get_string("drag_type"sv);
+    if (!type_name.has_value())
+        return;
+
+    Web::DragEvent::Type type;
+    if (*type_name == "start"sv)
+        type = Web::DragEvent::Type::DragStart;
+    else if (*type_name == "move"sv)
+        type = Web::DragEvent::Type::DragMove;
+    else if (*type_name == "end"sv)
+        type = Web::DragEvent::Type::DragEnd;
+    else if (*type_name == "drop"sv)
+        type = Web::DragEvent::Type::Drop;
+    else
+        return;
+
+    auto scale = max(tab->device_pixel_ratio, 1);
+    Web::DragEvent event {
+        .type = type,
+        .position = Web::DevicePixelPoint { static_cast<int>(command.get_i64("x"sv).value_or(0)) * scale, static_cast<int>(command.get_i64("y"sv).value_or(0)) * scale },
+        .screen_position = {},
+        .button = Web::UIEvents::MouseButton::Primary,
+        .buttons = Web::UIEvents::MouseButton::Primary,
+        .modifiers = modifiers_from_command(command),
+        .files = {},
+        .text = {},
+        .urls = {},
+        .browser_data = {},
+    };
+    event.screen_position = event.position;
+
+    if (auto text = command.get_string("text"sv); text.has_value() && !text->is_empty())
+        event.text = *text;
+
+    if (auto urls = command.get_array("urls"sv); urls.has_value()) {
+        for (auto const& value : urls->values()) {
+            if (!value.is_string())
+                continue;
+            String url_string = value.as_string();
+            auto parsed = URL::Parser::basic_parse(url_string.bytes_as_string_view());
+            if (!parsed.has_value())
+                continue;
+            if (parsed->scheme() == "file"sv) {
+                auto path = parsed->file_path();
+                if (path.is_empty())
+                    continue;
+                auto file = Core::File::open(path, Core::File::OpenMode::Read);
+                if (file.is_error())
+                    continue;
+                auto contents = file.value()->read_until_eof();
+                if (contents.is_error())
+                    continue;
+                auto name = Utf16String::from_utf8(LexicalPath::basename(path));
+                event.files.append(Web::HTML::SelectedFile { move(name), contents.release_value() });
+            } else {
+                event.urls.append(move(url_string));
+            }
+        }
+    }
+
+    tab->view->enqueue_input_event(move(event));
 }
 
 void EngineServer::handle_certificate_info(u64 tab_id, JsonObject const&)

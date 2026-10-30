@@ -60,7 +60,10 @@ information" on local or browser pages).
   enables it only while an editable field is focused, and the engine forwards
   marked and committed text to WebContent. LibGUI text fields receive committed
   text; their preedit is shown by the input method's own candidate window.
-- **Drag and drop**: links, files, tabs, and text.
+- **Drag and drop**: **Mostly done.** External text, URL, and file drags are
+  forwarded to WebContent as real `DragEvent`s and reach page drop targets.
+  Dragging a link, selection, file, or tab *out* of the page/window still needs
+  a LibGUI drag-source API; tab reordering inside a window is already supported.
 - **Rich clipboard**: **Done:** WebContent's rich copy path, text/HTML and
   image representations, and page-initiated clipboard reads. The LibWM
   clipboard portal now carries a list of representations per item, so

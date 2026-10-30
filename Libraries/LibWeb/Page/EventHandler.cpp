@@ -2385,7 +2385,7 @@ EventResult EventHandler::handle_keyup(UIEvents::KeyCode key, u32 modifiers, u32
     return fire_keyboard_event(UIEvents::EventNames::keyup, m_navigable, key, modifiers, code_point, false);
 }
 
-EventResult EventHandler::handle_drag_and_drop_event(DragEvent::Type type, CSSPixelPoint visual_viewport_position, CSSPixelPoint screen_position, u32 button, u32 buttons, u32 modifiers, Vector<HTML::SelectedFile> files)
+EventResult EventHandler::handle_drag_and_drop_event(DragEvent::Type type, CSSPixelPoint visual_viewport_position, CSSPixelPoint screen_position, u32 button, u32 buttons, u32 modifiers, Vector<HTML::SelectedFile> files, Optional<String> text, Vector<String> urls)
 {
     if (!m_navigable->active_document())
         return EventResult::Dropped;
@@ -2418,7 +2418,7 @@ EventResult EventHandler::handle_drag_and_drop_event(DragEvent::Type type, CSSPi
         return EventResult::Dropped;
 
     auto dispath_result = dispatch_event_to_nested_navigable(*this, *target_layout_node, node, visual_viewport_position, nullptr, [&](EventHandler& event_handler, CSSPixelPoint position) {
-        return event_handler.handle_drag_and_drop_event(type, position, screen_position, button, buttons, modifiers, move(files));
+        return event_handler.handle_drag_and_drop_event(type, position, screen_position, button, buttons, modifiers, move(files), move(text), move(urls));
     });
     if (dispath_result.has_value())
         return *dispath_result;
@@ -2434,7 +2434,7 @@ EventResult EventHandler::handle_drag_and_drop_event(DragEvent::Type type, CSSPi
     };
     switch (type) {
     case DragEvent::Type::DragStart:
-        return m_drag_and_drop_event_handler->handle_drag_start(HTML::relevant_global_object(document), m_mousedown_target.ptr(), screen_position, page_offset, viewport_position, offset, button, buttons, modifiers, move(files));
+        return m_drag_and_drop_event_handler->handle_drag_start(HTML::relevant_global_object(document), m_mousedown_target.ptr(), screen_position, page_offset, viewport_position, offset, button, buttons, modifiers, move(files), move(text), move(urls));
     case DragEvent::Type::DragMove:
         return m_drag_and_drop_event_handler->handle_drag_move(HTML::relevant_global_object(document), *node, screen_position, page_offset, viewport_position, offset, button, buttons, modifiers);
     case DragEvent::Type::DragEnd:

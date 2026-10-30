@@ -42,6 +42,7 @@ LDLIBS += \
 	-llagom-ipc \
 	-llagom-main \
 	-llagom-ak \
+	-llagom-url \
 	-llagom-filesystem \
 	-lwindowserver \
 	-lpthread

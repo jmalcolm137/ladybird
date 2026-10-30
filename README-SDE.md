@@ -224,8 +224,9 @@ The remaining UI work is tracked in
 autocomplete and search suggestions, reopen-closed-tab, tab search, bookmark
 folders and overflow, a site indicator/popover, a visible zoom percentage,
 certificate details, persisted permissions, HiDPI web content, and IME
-composition through the desktop's text-input-v3 input method. Drag and drop and
-accessibility follow. GPU/zero-copy frame sharing is deliberately shelved because it
+composition through the desktop's text-input-v3 input method, and drops of
+text, URLs, and files into page drop targets. Dragging page content back out to
+other applications and accessibility follow. GPU/zero-copy frame sharing is deliberately shelved because it
 destabilized scrolling and resizing; the stable rendering path is the
 acknowledged shared-memory ring with damage-only copies.
 

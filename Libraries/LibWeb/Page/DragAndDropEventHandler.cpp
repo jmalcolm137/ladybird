@@ -44,7 +44,9 @@ EventResult DragAndDropEventHandler::handle_drag_start(
     unsigned button,
     unsigned buttons,
     unsigned modifiers,
-    Vector<HTML::SelectedFile> files)
+    Vector<HTML::SelectedFile> files,
+    Optional<String> text,
+    Vector<String> urls)
 {
     auto fire_a_drag_and_drop_event = [&](GC::Ptr<DOM::EventTarget> target, Utf16FlyString const& name, GC::Ptr<DOM::EventTarget> related_target = nullptr) {
         return this->fire_a_drag_and_drop_event(relevant_global_object, target, name, screen_position, page_offset, client_offset, offset, button, buttons, modifiers, related_target);
@@ -122,6 +124,25 @@ EventResult DragAndDropEventHandler::handle_drag_start(
     //        File
     //    The actual data
     //        The file's contents and name.
+    if (text.has_value()) {
+        m_drag_data_store->add_item({
+            .kind = HTML::DragDataStoreItem::Kind::Text,
+            .type_string = "text/plain"_utf16,
+            .data = Utf16String::from_utf8(*text),
+            .file_data = {},
+            .file_name = {},
+        });
+    }
+    for (auto const& url : urls) {
+        m_drag_data_store->add_item({
+            .kind = HTML::DragDataStoreItem::Kind::Text,
+            .type_string = "text/uri-list"_utf16,
+            .data = Utf16String::formatted("{}\r\n", url),
+            .file_data = {},
+            .file_name = {},
+        });
+    }
+
     for (auto& file : files) {
         auto contents = file.take_contents();
         auto mime_type = MimeSniff::Resource::sniff(contents);

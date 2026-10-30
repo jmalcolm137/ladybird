@@ -542,14 +542,14 @@ EventResult Page::handle_mousewheel(DevicePixelPoint position, DevicePixelPoint 
     return handle_mousewheel(local_traversable(), position, screen_position, button, buttons, modifiers, wheel_delta_x, wheel_delta_y, wheel_tick_120ths_x, wheel_tick_120ths_y, wheel_delta_precision, scroll_gesture_phase, async_scroll_performed_default_action, async_scroll_operation, nullptr, {});
 }
 
-EventResult Page::handle_drag_and_drop_event(HTML::LocalNavigable& root, DragEvent::Type type, DevicePixelPoint position, DevicePixelPoint screen_position, unsigned button, unsigned buttons, unsigned modifiers, Vector<HTML::SelectedFile> files)
+EventResult Page::handle_drag_and_drop_event(HTML::LocalNavigable& root, DragEvent::Type type, DevicePixelPoint position, DevicePixelPoint screen_position, unsigned button, unsigned buttons, unsigned modifiers, Vector<HTML::SelectedFile> files, Optional<String> text, Vector<String> urls)
 {
-    return root.event_handler().handle_drag_and_drop_event(type, device_to_css_point(position), device_to_css_point(screen_position), button, buttons, modifiers, move(files));
+    return root.event_handler().handle_drag_and_drop_event(type, device_to_css_point(position), device_to_css_point(screen_position), button, buttons, modifiers, move(files), move(text), move(urls));
 }
 
-EventResult Page::handle_drag_and_drop_event(DragEvent::Type type, DevicePixelPoint position, DevicePixelPoint screen_position, unsigned button, unsigned buttons, unsigned modifiers, Vector<HTML::SelectedFile> files)
+EventResult Page::handle_drag_and_drop_event(DragEvent::Type type, DevicePixelPoint position, DevicePixelPoint screen_position, unsigned button, unsigned buttons, unsigned modifiers, Vector<HTML::SelectedFile> files, Optional<String> text, Vector<String> urls)
 {
-    return handle_drag_and_drop_event(local_traversable(), type, position, screen_position, button, buttons, modifiers, move(files));
+    return handle_drag_and_drop_event(local_traversable(), type, position, screen_position, button, buttons, modifiers, move(files), move(text), move(urls));
 }
 
 EventResult Page::handle_pinch_event(HTML::LocalNavigable& root, DevicePixelPoint position, unsigned modifiers, double scale, bool async_zoom_performed_default_action)

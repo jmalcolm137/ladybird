@@ -6,6 +6,7 @@
 
 #include "WebContentView.h"
 
+#include <LibCore/MimeData.h>
 #include <LibGUI/Event.h>
 #include <LibGUI/Painter.h>
 #include <LibGUI/Shortcut.h>
@@ -88,6 +89,57 @@ void WebContentView::paint_event(GUI::PaintEvent& event)
     }
 
     m_frame_was_painted = m_frame != nullptr;
+}
+
+void WebContentView::drag_enter_event(GUI::DragEvent& event)
+{
+    m_dragging = true;
+    m_drag_position = event.position();
+    event.accept();
+    if (!on_drag)
+        return;
+    auto text_data = event.mime_data().data("text/plain;charset=utf-8"sv);
+    if (text_data.is_empty())
+        text_data = event.mime_data().data("text/plain"sv);
+    auto text = String::from_utf8_with_replacement_character(StringView { text_data.bytes() });
+    Vector<String> urls;
+    for (auto const& url : event.mime_data().urls())
+        urls.append(String::from_byte_string(url.serialize()).release_value());
+    on_drag("start"sv, event.position(), event.modifiers(), text, urls);
+}
+
+void WebContentView::drag_move_event(GUI::DragEvent& event)
+{
+    if (!m_dragging) {
+        drag_enter_event(event);
+        return;
+    }
+    m_drag_position = event.position();
+    if (on_drag)
+        on_drag("move"sv, event.position(), event.modifiers(), {}, {});
+}
+
+void WebContentView::drag_leave_event(GUI::Event&)
+{
+    if (m_dragging && on_drag)
+        on_drag("end"sv, m_drag_position, 0, {}, {});
+    m_dragging = false;
+}
+
+void WebContentView::drop_event(GUI::DropEvent& event)
+{
+    m_dragging = false;
+    event.accept();
+    if (!on_drag)
+        return;
+    auto text_data = event.mime_data().data("text/plain;charset=utf-8"sv);
+    if (text_data.is_empty())
+        text_data = event.mime_data().data("text/plain"sv);
+    auto text = String::from_utf8_with_replacement_character(StringView { text_data.bytes() });
+    Vector<String> urls;
+    for (auto const& url : event.mime_data().urls())
+        urls.append(String::from_byte_string(url.serialize()).release_value());
+    on_drag("drop"sv, event.position(), event.modifiers(), text, urls);
 }
 
 void WebContentView::resize_event(GUI::ResizeEvent& event)

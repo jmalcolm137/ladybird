@@ -196,7 +196,7 @@ public:
     EventResult handle_mouseleave(HTML::LocalNavigable& root);
     EventResult handle_mousecancel(HTML::LocalNavigable& root);
     EventResult handle_mousewheel(HTML::LocalNavigable& root, DevicePixelPoint, DevicePixelPoint screen_position, unsigned button, unsigned buttons, unsigned modifiers, double wheel_delta_x, double wheel_delta_y, double wheel_tick_120ths_x, double wheel_tick_120ths_y, Web::WheelDeltaPrecision, Web::ScrollGesturePhase, bool async_scroll_performed_default_action, Optional<AsyncScrollOperation>* async_scroll_operation, Optional<RemoteInputEventTarget>* remote_target, Optional<Web::WheelGestureMark>);
-    EventResult handle_drag_and_drop_event(HTML::LocalNavigable& root, DragEvent::Type, DevicePixelPoint, DevicePixelPoint screen_position, unsigned button, unsigned buttons, unsigned modifiers, Vector<HTML::SelectedFile> files);
+    EventResult handle_drag_and_drop_event(HTML::LocalNavigable& root, DragEvent::Type, DevicePixelPoint, DevicePixelPoint screen_position, unsigned button, unsigned buttons, unsigned modifiers, Vector<HTML::SelectedFile> files, Optional<String> text = {}, Vector<String> urls = {});
     EventResult handle_pinch_event(HTML::LocalNavigable& root, DevicePixelPoint point, unsigned modifiers, double scale, bool async_zoom_performed_default_action);
 
     EventResult handle_mouseup(DevicePixelPoint, DevicePixelPoint screen_position, unsigned button, unsigned buttons, unsigned modifiers);
@@ -211,7 +211,7 @@ public:
     UniqueNodeID node_id_at_position(DevicePixelPoint);
     EventResult handle_mousewheel(DevicePixelPoint, DevicePixelPoint screen_position, unsigned button, unsigned buttons, unsigned modifiers, double wheel_delta_x, double wheel_delta_y, double wheel_tick_120ths_x, double wheel_tick_120ths_y, Web::WheelDeltaPrecision = Web::WheelDeltaPrecision::Discrete, Web::ScrollGesturePhase = Web::ScrollGesturePhase::None, bool async_scroll_performed_default_action = false, Optional<AsyncScrollOperation>* async_scroll_operation = nullptr);
 
-    EventResult handle_drag_and_drop_event(DragEvent::Type, DevicePixelPoint, DevicePixelPoint screen_position, unsigned button, unsigned buttons, unsigned modifiers, Vector<HTML::SelectedFile> files);
+    EventResult handle_drag_and_drop_event(DragEvent::Type, DevicePixelPoint, DevicePixelPoint screen_position, unsigned button, unsigned buttons, unsigned modifiers, Vector<HTML::SelectedFile> files, Optional<String> text = {}, Vector<String> urls = {});
     EventResult handle_pinch_event(DevicePixelPoint point, unsigned modifiers, double scale);
 
     EventResult handle_keydown(UIEvents::KeyCode, unsigned modifiers, u32 code_point, bool repeat, bool should_insert_text, bool async_scroll_performed_default_action = false, ReadonlySpan<TextEditingCommand> editing_commands = {}, bool native_editing_binding_resolved = false);

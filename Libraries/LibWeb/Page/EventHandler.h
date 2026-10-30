@@ -110,7 +110,7 @@ public:
     KeyboardScrollSnapshot keyboard_scroll_snapshot() const;
     EventResult handle_keyup(UIEvents::KeyCode, unsigned modifiers, u32 code_point, bool repeat);
 
-    EventResult handle_drag_and_drop_event(DragEvent::Type, CSSPixelPoint, CSSPixelPoint screen_position, unsigned button, unsigned buttons, unsigned modifiers, Vector<HTML::SelectedFile> files);
+    EventResult handle_drag_and_drop_event(DragEvent::Type, CSSPixelPoint, CSSPixelPoint screen_position, unsigned button, unsigned buttons, unsigned modifiers, Vector<HTML::SelectedFile> files, Optional<String> text = {}, Vector<String> urls = {});
     EventResult handle_pinch_event(CSSPixelPoint, unsigned modifiers, double scale_delta, bool async_zoom_performed_default_action);
     [[nodiscard]] EventResult perform_paste_action();
     EventResult perform_paste_action(NonnullRefPtr<HTML::DragDataStore> const&);

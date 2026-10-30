@@ -437,6 +437,10 @@ BrowserTab::BrowserTab(EngineClient& engine, GUI::Window& window, GUI::Action& b
         if (is_attached())
             m_engine.wheel_event(m_tab_id, position, delta_x, delta_y, modifiers);
     };
+    m_web_view->on_drag = [this](StringView type, Gfx::IntPoint position, unsigned modifiers, String const& text, Vector<String> const& urls) {
+        if (is_attached())
+            m_engine.drag_event(m_tab_id, type, position, modifiers, text, urls);
+    };
     m_web_view->on_key = [this](StringView type, StringView key_name, u32 code_point, unsigned modifiers) {
         if (is_attached())
             m_engine.key_event(m_tab_id, type, key_name, code_point, modifiers);

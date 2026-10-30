@@ -12,7 +12,7 @@ namespace Web {
 
 DragEvent DragEvent::clone_without_browser_data() const
 {
-    return { type, position, screen_position, button, buttons, modifiers, {}, nullptr, id };
+    return { type, position, screen_position, button, buttons, modifiers, {}, text, urls, nullptr, id };
 }
 
 }
@@ -27,6 +27,8 @@ ErrorOr<void> IPC::encode(Encoder& encoder, Web::DragEvent const& event)
     TRY(encoder.encode(event.buttons));
     TRY(encoder.encode(event.modifiers));
     TRY(encoder.encode(event.files));
+    TRY(encoder.encode(event.text));
+    TRY(encoder.encode(event.urls));
     TRY(encoder.encode(event.id));
     return {};
 }
@@ -41,7 +43,9 @@ ErrorOr<Web::DragEvent> IPC::decode(Decoder& decoder)
     auto buttons = TRY(decoder.decode<Web::UIEvents::MouseButton>());
     auto modifiers = TRY(decoder.decode<Web::UIEvents::KeyModifier>());
     auto files = TRY(decoder.decode<Vector<Web::HTML::SelectedFile>>());
+    auto text = TRY(decoder.decode<Optional<String>>());
+    auto urls = TRY(decoder.decode<Vector<String>>());
     auto id = TRY(decoder.decode<u64>());
 
-    return Web::DragEvent { type, position, screen_position, button, buttons, modifiers, move(files), nullptr, id };
+    return Web::DragEvent { type, position, screen_position, button, buttons, modifiers, move(files), move(text), move(urls), nullptr, id };
 }

@@ -5,7 +5,7 @@ line-oriented JSON protocol over a Unix socket. Frame pixels never travel over
 the socket: the engine publishes a POSIX shared-memory ring per tab and the
 frontend maps it.
 
-Version: 12. `Shared/EngineProtocol.h` is authoritative.
+Version: 13. `Shared/EngineProtocol.h` is authoritative.
 
 ## Frontend → engine
 
@@ -37,6 +37,7 @@ Version: 12. `Shared/EngineProtocol.h` is authoritative.
 | `ime_marked_text` | `tab`, `text` | Set the input method's marked (preedit) text in the focused page field. |
 | `ime_commit_text` | `tab`, `text`, `replacement_start`, `replacement_length` | Commit input method text, replacing the marked range when supplied. |
 | `ime_unmark_text` | `tab` | Clear the marked text without committing. |
+| `drag` | `tab`, `drag_type`, `x`, `y`, `ctrl`, `shift`, `alt`, `super`, `text`, `urls` | Forward a desktop drag to the page. `drag_type` is `start`, `move`, `end`, or `drop`; coordinates are logical. `urls` carries `text/uri-list` entries; `file://` entries become drag-and-drop files. |
 | `certificate_info` | `tab` | Ask for the TLS certificate of the tab's current HTTPS page; the engine answers with `certificate_info`. |
 | `history_recent` | `limit` | Ask for the most recent history entries; the engine answers with `history_recent`. |
 | `history_search` | `query`, `limit` | Search titles and URLs; the engine answers with `history_search_results`. |

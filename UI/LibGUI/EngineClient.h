@@ -50,6 +50,7 @@ public:
     void set_focus(u64 tab_id, bool focused);
     void mouse_event(u64 tab_id, StringView type, Gfx::IntPoint position, StringView button, unsigned buttons, unsigned modifiers, int click_count = 0);
     void wheel_event(u64 tab_id, Gfx::IntPoint position, double delta_x, double delta_y, unsigned modifiers);
+    void drag_event(u64 tab_id, StringView type, Gfx::IntPoint position, unsigned modifiers, String const& text, Vector<String> const& urls);
     void key_event(u64 tab_id, StringView type, StringView key_name, u32 code_point, unsigned modifiers, bool repeat = false);
     void dialog_response(u64 tab_id, StringView kind, bool accept, String const& text = {});
     void set_zoom(u64 tab_id, StringView direction);
