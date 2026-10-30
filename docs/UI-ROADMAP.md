@@ -21,8 +21,7 @@ reference for behaviour and options.
   prompts, file picker, native `<select>` dropdowns, JavaScript dialogs.
 - Reopen-closed-tab and tab search actions; a site indicator/popover with the
   connection state, host, zoom controls, and settings shortcut.
-- Session restore with window geometry, active tab, autosave, and a manual
-  restore action.
+- Session restore with window geometry, active tab, and autosave.
 - Crash overlay and unresponsive-page watchdog with click-to-reload.
 - Internal `about:settings`, `about:history`, `about:bookmarks`, and
   `about:downloads` pages.
@@ -34,7 +33,7 @@ reference for behaviour and options.
 | Address bar | **Done:** autocomplete and search suggestions are exposed over the control socket and shown in a keyboard-navigable popup. Inline completion is still future work. |
 | Tabs | **Partially done:** reopen closed tab (`Ctrl+Shift+T`) and tab search are wired. Still missing: pin tab, mute/audio indicator, move tab to a new window, close tabs to the right, and a visible all-tabs overflow strip. |
 | Bookmarks | **Partially done:** the bar renders folders and nested menus and has a leading overflow menu. Still missing: chrome-level add/edit/delete/reorder dialogs. `about:bookmarks` already provides management. |
-| History | The History menu only has “Show History” and “Restore Previous Session”. Add recent entries, search, and clear actions in the chrome. `about:history` handles deletion. |
+| History | The History menu only has “Show History”. Add recent entries, search, and clear actions in the chrome. `about:history` handles deletion. |
 | Downloads | The native Downloads window shows private-session downloads and lacks per-session pruning. Filter by the active session and use the engine's pruning action. `about:downloads` already behaves correctly. |
 | Site info | **Done (basic):** the address bar shows a Secure/Not secure/Local/Page indicator with a menu for host, zoom, and settings. Certificate details, permission summaries, and per-site settings are still future work. |
 | Find | Add a match-case toggle (the engine already supports case sensitivity). |

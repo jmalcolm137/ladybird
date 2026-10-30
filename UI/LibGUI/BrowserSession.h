@@ -35,7 +35,6 @@ public:
     void quit();
 
     BrowserWindow* create_window(Vector<String> urls = {}, bool private_window = false);
-    void restore_previous_session();
 
     // Tabs closed by the user, newest last. Private tabs are not retained.
     void note_closed_tab(String const& url, String const& title, bool private_tab);

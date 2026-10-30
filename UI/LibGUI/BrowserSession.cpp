@@ -501,12 +501,6 @@ void BrowserSession::window_will_close(BrowserWindow& window)
     });
 }
 
-void BrowserSession::restore_previous_session()
-{
-    if (load_session())
-        show();
-}
-
 ByteString BrowserSession::session_path() const
 {
     auto profile = Core::Environment::get("LADYBIRD_SDE_PROFILE"sv);
