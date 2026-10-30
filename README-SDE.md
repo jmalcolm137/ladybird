@@ -192,8 +192,12 @@ navigating the real engine.
   presenting frames.
 * History menu with the most recent entries, search results in a native window,
   clear-history confirmation, and the full history page.
-* Site information includes the permission decisions made for the current site
-  and a Forget action; certificate details are not exposed by the engine yet.
+* Site information includes the permission decisions made for the current site,
+  a Forget action, and certificate details for HTTPS pages (subject, issuer,
+  validity, serial, SHA-256 fingerprint, TLS version and cipher). Decisions can
+  be remembered per origin; remembered permissions are stored in the profile,
+  applied without prompting on later requests, and can be forgotten from the
+  site menu.
 * Session restore uses the engine host's native `SessionStore` and
   `SessionHistorySnapshot` data, not a URL-only frontend list. Every normal
   window reopens with its tabs, full session history, size, position,

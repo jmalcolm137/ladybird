@@ -23,6 +23,7 @@
 #include <LibGUI/Label.h>
 #include <LibGUI/Statusbar.h>
 #include <LibGUI/TextBox.h>
+#include <LibGUI/TextEditor.h>
 #include <LibGUI/Toolbar.h>
 #include <LibGUI/Widget.h>
 #include <LibGUI/Window.h>
@@ -125,8 +126,12 @@ public:
     Function<void(Gfx::Bitmap const*)> on_favicon_change;
     Function<void(bool)> on_bookmark_change;
     Function<void()> on_hard_reload;
-    Function<void(String const&, String const&, bool)> on_permission_decision;
+    Function<void(String const&, String const&, bool, bool)> on_permission_decision;
     Function<void(GUI::Widget&)> on_tabs_menu_request;
+    Function<void()> on_certificate_request;
+
+    void show_certificate_info(JsonObject const&);
+    bool is_private() const { return m_private; }
 
 private:
     static StringView button_name(GUI::MouseButton);
@@ -166,6 +171,8 @@ private:
     Function<String(String const&)> m_permission_summary_provider;
     Function<void(String const&)> m_forget_permissions_handler;
     RefPtr<GUI::Menu> m_zoom_menu;
+    RefPtr<GUI::Window> m_certificate_window;
+    RefPtr<GUI::TextEditor> m_certificate_text;
     RefPtr<GUI::Widget> m_autocomplete_overlay;
     RefPtr<GUI::TableView> m_autocomplete_table;
     RefPtr<GUI::JsonArrayModel> m_autocomplete_model;

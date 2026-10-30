@@ -601,8 +601,12 @@ BrowserTab& BrowserWindow::add_tab(String const& url, bool activate, bool reques
     tab->set_forget_permissions_handler([this](String const& origin) {
         m_session.forget_permissions(origin);
     });
-    tab->on_permission_decision = [this](String const& origin, String const& name, bool granted) {
-        m_session.note_permission(origin, name, granted);
+    tab->on_permission_decision = [this](String const& origin, String const& name, bool granted, bool remember) {
+        m_session.note_permission(origin, name, granted, remember && !m_private);
+    };
+    tab->on_certificate_request = [this, tab_pointer] {
+        if (tab_is_live(tab_pointer) && tab_pointer->is_attached())
+            m_engine->request_certificate_info(tab_pointer->tab_id());
     };
     tab->on_tabs_menu_request = [this](GUI::Widget& anchor) {
         rebuild_tabs_menu();
@@ -942,7 +946,18 @@ void BrowserWindow::handle_engine_tab_event(JsonObject const& event, u64 tab_id)
         if (auto items = event.get_array("items"sv); items.has_value())
             tab->show_context_menu(*items, Gfx::IntPoint { static_cast<int>(x), static_cast<int>(y) });
     } else if (type == "permission"sv) {
-        tab->show_permission_prompt(string_for_key(event, "name"sv), string_for_key(event, "origin"sv), event.get_u64("request"sv).value_or(0));
+        auto name = String::from_byte_string(string_for_key(event, "name"sv)).release_value();
+        auto origin = String::from_byte_string(string_for_key(event, "origin"sv)).release_value();
+        auto request_id = event.get_u64("request"sv).value_or(0);
+        bool remembered_decision = false;
+        if (!m_private && m_session.remembered_permission(origin, name, remembered_decision)) {
+            if (tab->is_attached())
+                m_engine->permission_response(tab->tab_id(), request_id, remembered_decision);
+        } else {
+            tab->show_permission_prompt(name, origin, request_id);
+        }
+    } else if (type == "certificate_info"sv) {
+        tab->show_certificate_info(event);
     } else if (type == "file_picker"sv) {
         auto multiple = event.get_bool("multiple"sv).value_or(false);
         auto filters = event.get_array("filters"sv);

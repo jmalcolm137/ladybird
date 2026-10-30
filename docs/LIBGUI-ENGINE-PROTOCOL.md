@@ -5,7 +5,7 @@ line-oriented JSON protocol over a Unix socket. Frame pixels never travel over
 the socket: the engine publishes a POSIX shared-memory ring per tab and the
 frontend maps it.
 
-Version: 9. `Shared/EngineProtocol.h` is authoritative.
+Version: 10. `Shared/EngineProtocol.h` is authoritative.
 
 ## Frontend → engine
 
@@ -34,6 +34,7 @@ Version: 9. `Shared/EngineProtocol.h` is authoritative.
 | `move_bookmark` | `id`, `parent`, `index` | Move an item to `index` within a folder (or the root). |
 | `pin_tab` | `tab`, `pinned` | Persist a tab's pinned state in the native session store. |
 | `toggle_mute` | `tab` | Toggle the page mute state; the engine answers with `audio`. |
+| `certificate_info` | `tab` | Ask for the TLS certificate of the tab's current HTTPS page; the engine answers with `certificate_info`. |
 | `history_recent` | `limit` | Ask for the most recent history entries; the engine answers with `history_recent`. |
 | `history_search` | `query`, `limit` | Search titles and URLs; the engine answers with `history_search_results`. |
 | `history_clear` | | Remove all history entries. |
@@ -91,7 +92,8 @@ Version: 9. `Shared/EngineProtocol.h` is authoritative.
 | `fullscreen` | `tab`, `fullscreen` | Page requested/left fullscreen. |
 | `bookmarks` | `items` | The bookmark tree for the bookmarks bar. Each item has `id`, `type` (`bookmark` or `folder`), `title`, and either `url` or nested `items`. |
 | `context_menu` | `tab`, `kind`, `x`, `y`, `items` | Page/link/image/media menu. Items have `text`, `action`, `enabled`, `checkable`, `checked`, or `separator`; `items` on a submenu entry nests. |
-| `permission` | `tab`, `request`, `name`, `origin` | Page permission prompt. |
+| `permission` | `tab`, `request`, `name`, `origin` | Page permission prompt. The frontend answers with `permission_response`; remembered decisions are answered without showing a prompt. |
+| `certificate_info` | `tab`, `ok`, `subject`, `issuer`, `valid_from`, `valid_until`, `serial_number`, `sha256_fingerprint`, `protocol`, `cipher` | Certificate details for a secure page. On failure `ok` is false and `error` explains why. |
 | `file_picker` | `tab`, `multiple`, `filters` | Page opened a file picker. |
 | `select_dropdown` | `tab`, `x`, `y`, `min_width`, `items` | Page opened a `<select>` popup. |
 | `downloads` | `items` | Initial download list. |

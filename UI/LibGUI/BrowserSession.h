@@ -51,11 +51,13 @@ public:
 
     JsonArray clipboard_items_for_paste();
 
-    // In-memory permission decisions for the site information popover. The engine prompts each time; these record
-    // what the user chose so the popover can summarize it and forget it.
-    void note_permission(String const& origin, String const& name, bool granted);
+    // Permission decisions for the site information popover. Decisions marked "remember" are written to the profile
+    // and applied automatically on later requests; the rest last for this session.
+    void note_permission(String const& origin, String const& name, bool granted, bool remember);
+    bool remembered_permission(String const& origin, String const& name, bool& granted) const;
     String permission_summary(String const& origin) const;
     void forget_permissions(String const& origin);
+    void load_permissions();
 
     // Called by a BrowserWindow when its native window is closing.
     void window_will_close(BrowserWindow&);
@@ -79,6 +81,8 @@ private:
     void handle_open_window(JsonObject const&);
 
     ByteString session_path() const;
+    ByteString permissions_path() const;
+    void save_permissions() const;
     bool should_restore_session() const;
     void save_session();
     bool load_session();
@@ -87,6 +91,12 @@ private:
     struct ClosedTab {
         String url;
         String title;
+    };
+
+    struct PermissionEntry {
+        String name;
+        bool granted { false };
+        bool persisted { false };
     };
 
     OwnPtr<EngineClient> m_engine;
@@ -101,7 +111,7 @@ private:
     bool m_session_plan_received { false };
     Vector<String> m_pending_initial_urls;
     Optional<u16> m_devtools_port;
-    HashMap<String, Vector<String>> m_permissions;
+    HashMap<String, Vector<PermissionEntry>> m_permissions;
 };
 
 }

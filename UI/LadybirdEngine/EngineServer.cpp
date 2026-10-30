@@ -24,6 +24,9 @@
 #include <LibGfx/Bitmap.h>
 #include <LibGfx/ImageFormats/PNGWriter.h>
 #include <LibGfx/SystemTheme.h>
+#include <LibHTTP/Cache/CacheMode.h>
+#include <LibHTTP/Cookie/IncludeCredentials.h>
+#include <LibRequests/RequestClient.h>
 #include <LibURL/Parser.h>
 #include <LibURL/URL.h>
 #include <LibWebCommon/Clipboard/SystemClipboard.h>
@@ -383,6 +386,8 @@ void EngineServer::dispatch_command(JsonObject const& command)
             handle_pin_tab(*tab_id, command);
         } else if (*type == "toggle_mute"sv) {
             handle_toggle_mute(*tab_id);
+        } else if (*type == "certificate_info"sv) {
+            handle_certificate_info(*tab_id, command);
         } else if (*type == "copy"sv) {
             handle_clipboard_copy(*tab_id, false);
         } else if (*type == "cut"sv) {
@@ -1586,6 +1591,118 @@ void EngineServer::handle_toggle_mute(u64 tab_id)
 
     tab->view->toggle_page_mute_state();
     send_audio_state(*tab);
+}
+
+void EngineServer::handle_certificate_info(u64 tab_id, JsonObject const&)
+{
+    auto* tab = tab_for_id(tab_id);
+    if (!tab)
+        return;
+
+    auto url = tab->view->url();
+    if (url.scheme() != "https"sv) {
+        send_certificate_error(tab_id, "Certificate details are only available for secure pages."_string);
+        return;
+    }
+
+    // A fresh HEAD request runs through the same RequestServer and TLS stack as the page, so the certificate we report
+    // is the one this profile would actually negotiate. Any previous lookup for the tab is cancelled first.
+    if (auto previous = m_certificate_requests.take(tab_id); previous.has_value())
+        (*previous)->stop();
+
+    auto client = WebView::Application::request_server_client();
+    if (client.is_error()) {
+        send_certificate_error(tab_id, "Could not connect to RequestServer."_string);
+        return;
+    }
+
+    auto request = client.value()->start_request(
+        "HEAD"sv,
+        url,
+        {},
+        {},
+        HTTP::CacheMode::NoStore,
+        HTTP::Cookie::IncludeCredentials::No,
+        Requests::RequestClient::TransferLease::No,
+        0u,
+        Requests::RequestClient::CacheMissNotification::No,
+        0u,
+        {},
+        true);
+    if (!request) {
+        send_certificate_error(tab_id, "Could not start the certificate request."_string);
+        return;
+    }
+
+    WeakPtr<Requests::Request> weak_request = request->make_weak_ptr();
+    m_certificate_requests.set(tab_id, *request);
+
+    request->set_unbuffered_request_callbacks(
+        [this, tab_id, weak_request](auto&&, auto&&, auto&&, auto&&, auto&&, auto&&) {
+            auto request = weak_request.strong_ref();
+            if (!request)
+                return;
+
+            // A reused TLS connection may only expose the certificate after the transfer completes; the finish
+            // callback below retries in that case.
+            auto info = request->certificate_info();
+            if (!info.has_value())
+                return;
+
+            send_certificate_info(tab_id, *info);
+            m_certificate_requests.remove(tab_id);
+            Core::deferred_invoke([request = request.release_nonnull()]() mutable {
+                request->stop();
+            });
+        },
+        [](Requests::ResponseData) {},
+        [](Core::ImmutableBytes) {},
+        [this, tab_id, weak_request](u64, Requests::RequestTimingInfo const&, Optional<Requests::NetworkError> const& network_error) {
+            if (!m_certificate_requests.contains(tab_id))
+                return;
+            auto request = weak_request.strong_ref();
+
+            if (request) {
+                if (auto info = request->certificate_info(); info.has_value()) {
+                    send_certificate_info(tab_id, *info);
+                    m_certificate_requests.remove(tab_id);
+                    return;
+                }
+            }
+
+            if (network_error.has_value())
+                send_certificate_error(tab_id, String::formatted("Could not reach the site ({}).", Requests::network_error_to_string(*network_error)).release_value());
+            else
+                send_certificate_error(tab_id, "The server did not present a certificate."_string);
+            m_certificate_requests.remove(tab_id);
+        });
+}
+
+void EngineServer::send_certificate_info(u64 tab_id, Requests::CertificateInfo const& info)
+{
+    JsonObject event;
+    event.set("type"sv, "certificate_info"sv);
+    event.set("tab"sv, tab_id);
+    event.set("ok"sv, true);
+    event.set("subject"sv, info.subject);
+    event.set("issuer"sv, info.issuer);
+    event.set("valid_from"sv, info.valid_from);
+    event.set("valid_until"sv, info.valid_until);
+    event.set("serial_number"sv, info.serial_number);
+    event.set("sha256_fingerprint"sv, info.sha256_fingerprint);
+    event.set("protocol"sv, info.protocol);
+    event.set("cipher"sv, info.cipher);
+    send_event(move(event));
+}
+
+void EngineServer::send_certificate_error(u64 tab_id, String const& error)
+{
+    JsonObject event;
+    event.set("type"sv, "certificate_info"sv);
+    event.set("tab"sv, tab_id);
+    event.set("ok"sv, false);
+    event.set("error"sv, error);
+    send_event(move(event));
 }
 
 void EngineServer::send_audio_state(Tab& tab)

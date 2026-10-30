@@ -721,6 +721,8 @@ void EngineClient::pin_tab(u64 tab_id, bool pinned)
 
 void EngineClient::toggle_mute(u64 tab_id) { send_simple("toggle_mute"sv, tab_id); }
 
+void EngineClient::request_certificate_info(u64 tab_id) { send_simple("certificate_info"sv, tab_id); }
+
 void EngineClient::request_history(u64 limit)
 {
     JsonObject event;

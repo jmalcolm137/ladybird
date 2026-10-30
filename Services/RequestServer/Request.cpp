@@ -464,11 +464,13 @@ NonnullOwnPtr<Request> Request::fetch(
     HTTP::Cookie::IncludeCredentials include_credentials,
     Optional<Requests::RequestTransferLeaseKey> transfer_lease,
     Optional<u32> address_selection_hint,
-    bool notify_on_cache_miss)
+    bool notify_on_cache_miss,
+    bool force_fresh_connection)
 {
     auto request = adopt_own(*new Request { request_id, RequestType::Fetch, disk_cache, move(network_isolation_key), cache_mode, client, curl_multi, resolver, move(url), move(method), move(request_headers), move(request_body), include_credentials, move(transfer_lease) });
     request->m_address_selection_hint = address_selection_hint;
     request->m_notify_on_cache_miss = notify_on_cache_miss;
+    request->m_force_fresh_connection = force_fresh_connection;
     request->process();
 
     return request;
@@ -1498,6 +1500,11 @@ void Request::handle_fetch_state()
     // Without explicitly using the OS Native CA cert store on Windows, https requests timeout with CURLE_PEER_FAILED_VERIFICATION
     set_option(CURLOPT_SSL_OPTIONS, CURLSSLOPT_NATIVE_CA);
 #endif
+    if (m_force_fresh_connection) {
+        set_option(CURLOPT_CERTINFO, 1L);
+        set_option(CURLOPT_FRESH_CONNECT, 1L);
+        set_option(CURLOPT_FORBID_REUSE, 1L);
+    }
 
     curl_slist* curl_headers = nullptr;
 
@@ -2256,11 +2263,128 @@ void Request::transfer_headers_to_client_if_needed()
     send_headers_to_client(move(javascript_bytecode), javascript_bytecode_size, javascript_bytecode_cache_vary_key);
 }
 
+static String x509_name_to_string(X509_NAME* name)
+{
+    if (!name)
+        return {};
+    char buffer[1024] {};
+    if (!X509_NAME_oneline(name, buffer, sizeof(buffer)))
+        return {};
+    return String::from_utf8_with_replacement_character(StringView { buffer, strlen(buffer) });
+}
+
+static String asn1_time_to_string(ASN1_TIME const* time)
+{
+    if (!time)
+        return {};
+    auto* bio = BIO_new(BIO_s_mem());
+    if (!bio)
+        return {};
+    String result;
+    if (ASN1_TIME_print(bio, time) == 1) {
+        char* data = nullptr;
+        auto length = BIO_get_mem_data(bio, &data);
+        if (length > 0)
+            result = String::from_utf8_with_replacement_character(StringView { data, static_cast<size_t>(length) });
+    }
+    BIO_free(bio);
+    return result;
+}
+
+static String asn1_integer_to_hex(ASN1_INTEGER const* integer)
+{
+    if (!integer)
+        return {};
+    auto* bio = BIO_new(BIO_s_mem());
+    if (!bio)
+        return {};
+    String result;
+    if (i2a_ASN1_INTEGER(bio, integer) > 0) {
+        char* data = nullptr;
+        auto length = BIO_get_mem_data(bio, &data);
+        if (length > 0)
+            result = String::from_utf8_with_replacement_character(StringView { data, static_cast<size_t>(length) });
+    }
+    BIO_free(bio);
+    return result;
+}
+
+static String x509_fingerprint(X509* certificate)
+{
+    unsigned char digest[EVP_MAX_MD_SIZE] {};
+    unsigned int digest_length = 0;
+    if (X509_digest(certificate, EVP_sha256(), digest, &digest_length) != 1)
+        return {};
+    StringBuilder builder;
+    for (unsigned int i = 0; i < digest_length; ++i) {
+        if (i)
+            builder.append(':');
+        builder.appendff("{:02X}", digest[i]);
+    }
+    return builder.to_string().release_value();
+}
+
+Optional<Requests::CertificateInfo> Request::certificate_info()
+{
+    if (m_certificate_info.has_value())
+        return m_certificate_info;
+
+    if (!m_curl_easy_handle)
+        return {};
+
+    curl_tlssessioninfo* session_info = nullptr;
+    auto tls_result = curl_easy_getinfo(m_curl_easy_handle, CURLINFO_TLS_SSL_PTR, &session_info);
+    if (tls_result == CURLE_OK && session_info && session_info->internals && session_info->backend == CURLSSLBACKEND_OPENSSL) {
+        auto* ssl = static_cast<SSL*>(session_info->internals);
+        if (auto* certificate = SSL_get0_peer_certificate(ssl)) {
+            m_certificate_info = Requests::CertificateInfo {
+                .subject = x509_name_to_string(X509_get_subject_name(certificate)),
+                .issuer = x509_name_to_string(X509_get_issuer_name(certificate)),
+                .valid_from = asn1_time_to_string(X509_get0_notBefore(certificate)),
+                .valid_until = asn1_time_to_string(X509_get0_notAfter(certificate)),
+                .serial_number = asn1_integer_to_hex(X509_get_serialNumber(certificate)),
+                .sha256_fingerprint = x509_fingerprint(certificate),
+                .protocol = String::from_utf8_with_replacement_character(StringView { SSL_get_version(ssl), strlen(SSL_get_version(ssl)) }),
+                .cipher = String::from_utf8_with_replacement_character(StringView { SSL_get_cipher_name(ssl), strlen(SSL_get_cipher_name(ssl)) }),
+            };
+            return m_certificate_info;
+        }
+    }
+
+    // A reused connection does not expose its SSL handle on this easy handle, but libcurl still has the parsed
+    // certificate chain for it. Fill in what it can tell us and leave the TLS version/cipher blank.
+    curl_certinfo* certinfo = nullptr;
+    if (curl_easy_getinfo(m_curl_easy_handle, CURLINFO_CERTINFO, &certinfo) != CURLE_OK || !certinfo || certinfo->num_of_certs == 0)
+        return {};
+
+    Requests::CertificateInfo info;
+    for (auto* slist = certinfo->certinfo[0]; slist; slist = slist->next) {
+        StringView line { slist->data, strlen(slist->data) };
+        auto assign = [&](StringView prefix, String& target) {
+            if (line.starts_with(prefix))
+                target = String::from_utf8_with_replacement_character(line.substring_view(prefix.length()));
+        };
+        assign("Subject:"sv, info.subject);
+        assign("Issuer:"sv, info.issuer);
+        assign("Start date:"sv, info.valid_from);
+        assign("Expire date:"sv, info.valid_until);
+        assign("Serial Number:"sv, info.serial_number);
+    }
+    if (info.subject.is_empty() && info.issuer.is_empty())
+        return {};
+    m_certificate_info = move(info);
+    return m_certificate_info;
+}
+
 void Request::send_headers_to_client(Optional<IPC::File> javascript_bytecode, u64 javascript_bytecode_size, Optional<u64> javascript_bytecode_cache_vary_key)
 {
     auto cache_state = Requests::CacheState::NotCached;
     if (m_cache_status == CacheStatus::ReadFromCache)
         cache_state = m_cache_entry_was_revalidated ? Requests::CacheState::Validated : Requests::CacheState::Local;
+    if (m_cache_status != CacheStatus::ReadFromCache) {
+        if (auto info = certificate_info(); info.has_value())
+            m_client->async_certificate_info_available(m_request_id, *info);
+    }
     m_client->async_headers_became_available(m_request_id, m_response_headers->headers(), m_status_code, m_reason_phrase, move(javascript_bytecode), javascript_bytecode_size, javascript_bytecode_cache_vary_key, cache_state, m_http_version);
 }
 

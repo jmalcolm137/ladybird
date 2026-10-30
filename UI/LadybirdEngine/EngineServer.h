@@ -21,6 +21,8 @@
 #include <LibGfx/Forward.h>
 #include <LibGfx/Rect.h>
 #include <LibGfx/Size.h>
+#include <LibRequests/CertificateInfo.h>
+#include <LibRequests/Forward.h>
 #include <LibURL/Origin.h>
 #include <LibURL/URL.h>
 #include <LibWebCommon/HTML/FileFilter.h>
@@ -169,6 +171,9 @@ private:
     void handle_move_bookmark(JsonObject const&);
     void handle_pin_tab(u64 tab_id, JsonObject const&);
     void handle_toggle_mute(u64 tab_id);
+    void handle_certificate_info(u64 tab_id, JsonObject const&);
+    void send_certificate_info(u64 tab_id, Requests::CertificateInfo const&);
+    void send_certificate_error(u64 tab_id, String const&);
     void handle_frame_ack(u64 tab_id, JsonObject const&);
     void note_user_input(Tab&);
     void note_frame_presented(Tab&, u64 sequence);
@@ -241,6 +246,7 @@ private:
     u64 m_focused_tab_id { 0 };
     HashMap<u64, u64> m_window_active_tabs;
     HashMap<u64, WebView::SessionWindowId> m_session_windows;
+    HashMap<u64, RefPtr<Requests::Request>> m_certificate_requests;
     u64 m_next_frame_buffer_id { 1 };
     u64 m_next_permission_id { 1 };
     bool m_quitting { false };

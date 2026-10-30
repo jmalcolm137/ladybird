@@ -98,14 +98,66 @@ static RefPtr<Gfx::Bitmap const> make_chrome_glyph(ChromeGlyph glyph, Gfx::Color
     return surface;
 }
 
+// A permission request offers the usual allow/block choice plus the chance to make the answer stick for this site.
+// Dialog::ExecResult has no slot for the check box, so the caller receives the decision and the box state together.
+class PermissionPrompt final : public GUI::Dialog {
+public:
+    static Optional<bool> run(GUI::Window* parent, String const& message, bool& remember)
+    {
+        auto dialog = adopt_ref(*new PermissionPrompt(parent, message));
+        auto result = dialog->exec();
+        remember = dialog->m_remember->is_checked();
+        if (result == GUI::Dialog::ExecResult::Yes)
+            return true;
+        if (result == GUI::Dialog::ExecResult::No)
+            return false;
+        return {};
+    }
+
+private:
+    PermissionPrompt(GUI::Window* parent, String const& message)
+        : Dialog(parent)
+    {
+        set_title("Permission Request"sv);
+        set_resizable(false);
+        set_auto_shrink(true);
+
+        auto main_widget = set_main_widget<GUI::Widget>();
+        main_widget->set_fill_with_background_color(true);
+        main_widget->set_layout<GUI::VerticalBoxLayout>(GUI::Margins { 12 }, 8);
+
+        auto& label = main_widget->add<GUI::Label>(message);
+        label.set_text_wrapping(Gfx::TextWrapping::DontWrap);
+        label.set_autosize(true);
+
+        m_remember = main_widget->add<GUI::CheckBox>("Remember this decision for this site"_string);
+
+        auto& buttons = main_widget->add<GUI::Widget>();
+        buttons.set_layout<GUI::HorizontalBoxLayout>(GUI::Margins { 0 }, 8);
+        buttons.set_fixed_height(24);
+        buttons.add_spacer();
+
+        auto& block = buttons.add<GUI::Button>("Block"_string);
+        block.set_fixed_width(70);
+        block.on_click = [this](auto) { done(GUI::Dialog::ExecResult::No); };
+
+        auto& allow = buttons.add<GUI::Button>("Allow"_string);
+        allow.set_fixed_width(70);
+        allow.on_click = [this](auto) { done(GUI::Dialog::ExecResult::Yes); };
+    }
+
+    RefPtr<GUI::CheckBox> m_remember;
+};
+
 struct SiteIdentity {
     String security;
     String host;
+    String origin;
 };
 
 static SiteIdentity site_identity_for_url(String const& url)
 {
-    SiteIdentity identity { "Site information"_string, {} };
+    SiteIdentity identity { "Site information"_string, {}, {} };
 
     auto url_view = url.bytes_as_string_view();
     if (url_view.starts_with("https:"sv))
@@ -126,8 +178,12 @@ static SiteIdentity site_identity_for_url(String const& url)
         size_t end = 0;
         while (end < rest.length() && rest[end] != '/' && rest[end] != '?' && rest[end] != '#')
             ++end;
-        if (end > 0)
+        if (end > 0) {
             identity.host = String::from_utf8(rest.substring_view(0, end)).release_value();
+            if (url_view.starts_with("https:"sv) || url_view.starts_with("http:"sv)) {
+                identity.origin = String::formatted("{}{}", url_view.substring_view(0, *scheme_separator + 3), identity.host).release_value();
+            }
+        }
     }
 
     return identity;
@@ -657,7 +713,7 @@ void BrowserTab::update_site_button()
 
     auto url = current_url();
     auto identity = url.is_empty()
-        ? SiteIdentity { "No page loaded"_string, {} }
+        ? SiteIdentity { "No page loaded"_string, {}, {} }
         : site_identity_for_url(url);
 
     if (identity.security == "Secure connection"sv) {
@@ -695,6 +751,13 @@ void BrowserTab::update_site_button()
     if (!identity.host.is_empty())
         add_information(identity.host);
 
+    if (identity.security == "Secure connection"sv && on_certificate_request) {
+        menu->add_action(GUI::Action::create("View &Certificate…"sv, [this](auto&) {
+            if (on_certificate_request)
+                on_certificate_request();
+        }));
+    }
+
     menu->add_separator();
     menu->add_action(GUI::Action::create("Zoom &In"sv, [this](auto&) {
         if (is_attached())
@@ -709,13 +772,13 @@ void BrowserTab::update_site_button()
             m_engine.set_zoom(m_tab_id, "reset"sv);
     }));
     if (m_permission_summary_provider) {
-        auto summary = m_permission_summary_provider(identity.host);
+        auto summary = m_permission_summary_provider(identity.origin);
         if (!summary.is_empty()) {
             menu->add_separator();
             add_information(String::formatted("Permissions: {}", summary).release_value());
-            menu->add_action(GUI::Action::create("Forget Site Permissions"sv, [this, host = identity.host](auto&) {
+            menu->add_action(GUI::Action::create("Forget Site Permissions"sv, [this, origin = identity.origin](auto&) {
                 if (m_forget_permissions_handler)
-                    m_forget_permissions_handler(host);
+                    m_forget_permissions_handler(origin);
                 // Rebuilding the menu while it is being activated destroys the popup out of order.
                 Core::deferred_invoke([this] {
                     update_site_button();
@@ -736,17 +799,72 @@ void BrowserTab::show_site_info_dialog()
 {
     auto url = current_url();
     auto identity = url.is_empty()
-        ? SiteIdentity { "No page loaded"_string, {} }
+        ? SiteIdentity { "No page loaded"_string, {}, {} }
         : site_identity_for_url(url);
     auto percent = static_cast<int>(m_zoom_level * 100.0 + 0.5);
     auto subject = identity.host.is_empty() ? url : identity.host;
     auto text = String::formatted("{}: {}\nZoom: {}%", identity.security, subject, percent).release_value();
     if (m_permission_summary_provider) {
-        auto summary = m_permission_summary_provider(identity.host);
+        auto summary = m_permission_summary_provider(identity.origin);
         if (!summary.is_empty())
             text = String::formatted("{}\nPermissions: {}", text, summary).release_value();
     }
     GUI::MessageBox::show(m_root->window(), text, "Site Information"sv, GUI::MessageBox::Type::Information, GUI::MessageBox::InputType::OK);
+}
+
+void BrowserTab::show_certificate_info(JsonObject const& event)
+{
+    auto get_string = [&](StringView key) -> String {
+        auto value = event.get_byte_string(key);
+        if (!value.has_value())
+            return {};
+        return String::from_byte_string(*value).release_value();
+    };
+
+    if (!event.get_bool("ok"sv).value_or(false)) {
+        auto error = get_string("error"sv);
+        if (error.is_empty())
+            error = "Certificate details are unavailable."_string;
+        GUI::MessageBox::show(m_root->window(), error, "Certificate"sv, GUI::MessageBox::Type::Error, GUI::MessageBox::InputType::OK);
+        return;
+    }
+
+    auto identity = site_identity_for_url(current_url());
+    StringBuilder builder;
+    builder.appendff("Certificate for {}\n\n", identity.host.is_empty() ? "this site"sv : identity.host.bytes_as_string_view());
+    auto append_field = [&](StringView name, String const& value) {
+        builder.appendff("{}\n    {}\n\n", name, value.is_empty() ? "Unknown"sv : value.bytes_as_string_view());
+    };
+    append_field("Subject"sv, get_string("subject"sv));
+    append_field("Issuer"sv, get_string("issuer"sv));
+    append_field("Valid from"sv, get_string("valid_from"sv));
+    append_field("Valid until"sv, get_string("valid_until"sv));
+    append_field("Serial number"sv, get_string("serial_number"sv));
+    append_field("SHA-256 fingerprint"sv, get_string("sha256_fingerprint"sv));
+    append_field("Protocol"sv, get_string("protocol"sv));
+    append_field("Cipher"sv, get_string("cipher"sv));
+
+    if (!m_certificate_window) {
+        m_certificate_window = GUI::Window::construct();
+        m_certificate_window->set_title("Certificate"sv);
+        m_certificate_window->resize(640, 420);
+        m_certificate_window->on_close = [this] {
+            m_certificate_window->hide();
+        };
+
+        auto main_widget = m_certificate_window->set_main_widget<GUI::Widget>();
+        main_widget->set_fill_with_background_color(true);
+        main_widget->set_layout<GUI::VerticalBoxLayout>(GUI::Margins { 8 }, 6);
+
+        m_certificate_text = main_widget->add<GUI::TextEditor>();
+        m_certificate_text->set_mode(GUI::TextEditor::ReadOnly);
+        m_certificate_text->set_wrapping_mode(GUI::TextEditor::WrapAtWords);
+    }
+
+    m_certificate_text->set_text(builder.string_view());
+    m_certificate_window->set_title(ByteString::formatted("Certificate - {}", identity.host.bytes_as_string_view()));
+    m_certificate_window->show();
+    m_certificate_window->center_on_screen();
 }
 
 void BrowserTab::set_autocomplete_results(u64 request_id, JsonArray const& items, bool)
@@ -998,13 +1116,18 @@ void BrowserTab::show_context_menu(JsonArray const& items, Gfx::IntPoint view_po
 void BrowserTab::show_permission_prompt(StringView name, StringView origin, u64 request_id)
 {
     auto message = String::formatted("Allow {} for {}?", name, origin).release_value();
-    auto result = GUI::MessageBox::show(m_root->window(), message, "Permission Request"sv,
-        GUI::MessageBox::Type::Question, GUI::MessageBox::InputType::YesNo);
-    auto granted = result == GUI::Dialog::ExecResult::Yes;
+    bool remember = false;
+    auto decision = PermissionPrompt::run(m_root->window(), message, remember);
+    if (!decision.has_value()) {
+        if (is_attached())
+            m_engine.permission_response(m_tab_id, request_id, false);
+        return;
+    }
+
     if (on_permission_decision)
-        on_permission_decision(String::from_utf8(origin).release_value(), String::from_utf8(name).release_value(), granted);
+        on_permission_decision(String::from_utf8(origin).release_value(), String::from_utf8(name).release_value(), *decision, remember);
     if (is_attached())
-        m_engine.permission_response(m_tab_id, request_id, granted);
+        m_engine.permission_response(m_tab_id, request_id, *decision);
 }
 
 void BrowserTab::show_file_picker(bool, JsonArray const& filters)

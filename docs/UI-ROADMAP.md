@@ -43,7 +43,7 @@ information" on local or browser pages).
 | Bookmarks | **Done:** the bar renders folders and nested menus; the chrome can add, edit, remove, and move bookmarks, and create and rename folders in a manager window. |
 | History | **Done:** the History menu lists recent entries, searches titles and URLs into a native results window, clears history after confirmation, and links to `about:history`. |
 | Downloads | **Done:** the window filters to the active window's session and Clear Completed prunes only that session. |
-| Site info | **Mostly done:** the indicator shows host, security state, zoom, site settings, the permission decisions made this session, and a Forget action. Certificate details need a new engine API; permission memory is in-memory. |
+| Site info | **Done:** the indicator shows host, security state, zoom, site settings, the permission decisions made for the site, and a Forget action. HTTPS pages can open a certificate view with subject, issuer, validity, serial, SHA-256 fingerprint, TLS version, and cipher. Remembered permission decisions are persisted per origin in the profile and applied without prompting; private windows neither use nor store them. |
 | Find | **Done:** the find bar has a match-case toggle, highlights all matches, and closes on Escape. |
 | Zoom | **Done:** the engine emits `zoom_changed` and the toolbar shows the current percentage with zoom controls. |
 | File picker | **Partially done:** the page's filters reach the picker. Multiple selection needs a multi-select LibGUI file picker; the engine and protocol already accept a list. |
@@ -72,7 +72,7 @@ information" on local or browser pages).
 - Crash report submission UI
 - Process manager / performance monitor
 - Picture-in-picture controls
-- Per-site permission memory and management
+- Per-site permission management UI beyond the site menu's Forget action
 - Native settings dialogs for the few settings that need them
 
 ## Shelved

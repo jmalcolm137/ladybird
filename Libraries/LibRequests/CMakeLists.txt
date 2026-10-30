@@ -1,5 +1,6 @@
 set(SOURCES
     CacheSizes.cpp
+    CertificateInfo.cpp
     NetworkError.h
     NetworkUsage.cpp
     Request.cpp

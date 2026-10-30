@@ -128,6 +128,9 @@ BrowserSession::~BrowserSession()
 
 ErrorOr<void> BrowserSession::initialize(Vector<String> initial_urls, bool private_window)
 {
+    if (!private_window)
+        load_permissions();
+
     if (!private_window && should_restore_session() && !Core::Environment::has("LADYBIRD_SDE_DISABLE_SESSION_RESTORE"sv)) {
         // The engine host owns the native session store and sends its launch plan once connected. Wait for it so
         // restored tabs and their history are registered under the same session IDs. URLs passed on the command
@@ -359,24 +362,42 @@ JsonArray BrowserSession::clipboard_items_for_paste()
 static String permission_key(String const& origin)
 {
     auto view = origin.bytes_as_string_view();
-    if (auto scheme = view.find("://"sv); scheme.has_value())
-        view = view.substring_view(*scheme + 3);
-    if (auto slash = view.find('/'); slash.has_value())
-        view = view.substring_view(0, *slash);
+    if (view.ends_with('/'))
+        view = view.substring_view(0, view.length() - 1);
     return String::from_utf8(view).release_value();
 }
 
-void BrowserSession::note_permission(String const& origin, String const& name, bool granted)
+void BrowserSession::note_permission(String const& origin, String const& name, bool granted, bool remember)
 {
     if (origin.is_empty())
         return;
     auto& entries = m_permissions.ensure(permission_key(origin));
-    auto description = String::formatted("{} ({})", name, granted ? "allowed" : "blocked").release_value();
-    for (auto const& entry : entries) {
-        if (entry.bytes_as_string_view().starts_with(name.bytes_as_string_view()))
+    for (auto& entry : entries) {
+        if (entry.name == name) {
+            entry.granted = granted;
+            entry.persisted |= remember;
+            if (remember)
+                save_permissions();
             return;
+        }
     }
-    entries.append(move(description));
+    entries.append({ name, granted, remember });
+    if (remember)
+        save_permissions();
+}
+
+bool BrowserSession::remembered_permission(String const& origin, String const& name, bool& granted) const
+{
+    auto it = m_permissions.find(permission_key(origin));
+    if (it == m_permissions.end())
+        return false;
+    for (auto const& entry : it->value) {
+        if (entry.name == name && entry.persisted) {
+            granted = entry.granted;
+            return true;
+        }
+    }
+    return false;
 }
 
 String BrowserSession::permission_summary(String const& origin) const
@@ -388,14 +409,94 @@ String BrowserSession::permission_summary(String const& origin) const
     for (size_t i = 0; i < it->value.size(); ++i) {
         if (i)
             builder.append(", "sv);
-        builder.append(it->value[i]);
+        builder.appendff("{} ({})", it->value[i].name, it->value[i].granted ? "allowed" : "blocked");
     }
     return builder.to_string().release_value();
 }
 
 void BrowserSession::forget_permissions(String const& origin)
 {
-    m_permissions.remove(permission_key(origin));
+    if (m_permissions.remove(permission_key(origin)))
+        save_permissions();
+}
+
+ByteString BrowserSession::permissions_path() const
+{
+    auto profile = Core::Environment::get("LADYBIRD_SDE_PROFILE"sv);
+    auto profile_name = profile.has_value() ? profile->to_byte_string() : ByteString { "libgui" };
+    return LexicalPath::join(Core::StandardPaths::config_directory(), "ladybird-sde"sv, ByteString::formatted("permissions-{}.json", profile_name)).string();
+}
+
+void BrowserSession::load_permissions()
+{
+    auto file = Core::File::open(permissions_path(), Core::File::OpenMode::Read);
+    if (file.is_error())
+        return;
+
+    auto contents = file.value()->read_until_eof();
+    if (contents.is_error())
+        return;
+    auto buffer = contents.release_value();
+    StringView json { reinterpret_cast<char const*>(buffer.data()), buffer.size() };
+    auto parsed = JsonParser { json }.parse();
+    if (parsed.is_error() || !parsed.value().is_object())
+        return;
+
+    auto origins_value = parsed.value().as_object().get_object("origins"sv);
+    if (!origins_value.has_value())
+        return;
+
+    origins_value->for_each_member([&](auto const& origin, auto const& entries_value) {
+        if (!entries_value.is_array())
+            return;
+        auto& entries = m_permissions.ensure(String::from_byte_string(origin).release_value());
+        for (auto const& entry_value : entries_value.as_array().values()) {
+            if (!entry_value.is_object())
+                continue;
+            auto const& object = entry_value.as_object();
+            auto name = String::from_byte_string(object.get_byte_string("name"sv).value_or({})).release_value();
+            if (name.is_empty())
+                continue;
+            entries.append({ name, object.get_bool("granted"sv).value_or(false), true });
+        }
+    });
+}
+
+void BrowserSession::save_permissions() const
+{
+    JsonObject origins;
+    for (auto const& [origin, entries] : m_permissions) {
+        JsonArray persisted_entries;
+        for (auto const& entry : entries) {
+            if (!entry.persisted)
+                continue;
+            JsonObject object;
+            object.set("name"sv, entry.name.bytes_as_string_view());
+            object.set("granted"sv, entry.granted);
+            persisted_entries.must_append(move(object));
+        }
+        if (!persisted_entries.is_empty())
+            origins.set(origin.bytes_as_string_view(), move(persisted_entries));
+    }
+
+    auto path = permissions_path();
+    if (auto result = Core::Directory::create(LexicalPath::dirname(path), Core::Directory::CreateDirectories::Yes); result.is_error())
+        return;
+
+    JsonObject root;
+    root.set("version"sv, 1);
+    root.set("origins"sv, move(origins));
+
+    auto temporary_path = ByteString::formatted("{}.tmp", path);
+    auto file = Core::File::open(temporary_path, Core::File::OpenMode::Write | Core::File::OpenMode::Truncate);
+    if (file.is_error())
+        return;
+    auto serialized = root.to_byte_string();
+    if (file.value()->write_until_depleted(serialized.bytes()).is_error())
+        return;
+    file.value()->close();
+    if (Core::System::rename(temporary_path, path).is_error())
+        (void)Core::System::unlink(temporary_path);
 }
 
 void BrowserSession::on_engine_event(JsonObject const& event)
