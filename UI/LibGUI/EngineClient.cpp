@@ -275,6 +275,7 @@ void EngineClient::handle_frame_buffer(JsonObject const& event)
     auto slot_size = event.get_u64("slot_size"sv);
     auto width = event.get_i64("width"sv);
     auto height = event.get_i64("height"sv);
+    auto scale = max(static_cast<int>(event.get_i64("scale"sv).value_or(1)), 1);
 
     if (!tab_id.has_value() || !name.has_value() || !slots.has_value() || !slot_size.has_value() || !width.has_value() || !height.has_value())
         return;
@@ -303,6 +304,7 @@ void EngineClient::handle_frame_buffer(JsonObject const& event)
     buffer->slot_size = *slot_size;
     buffer->name = *name;
     buffer->slot_dimensions = { static_cast<int>(*width), static_cast<int>(*height) };
+    buffer->scale = scale;
     buffer->bitmaps.ensure_capacity(buffer->slots);
     for (int i = 0; i < buffer->slots; ++i)
         buffer->bitmaps.append(RefPtr<Gfx::Bitmap> {});
@@ -328,12 +330,14 @@ void EngineClient::handle_frame(JsonObject const& event)
     if (static_cast<size_t>(*width) * 4 > *stride || static_cast<size_t>(*height) * *stride > buffer->slot_size)
         return;
 
-    auto size = Gfx::IntSize { static_cast<int>(*width), static_cast<int>(*height) };
+    auto scale = buffer->scale;
+    auto physical_size = Gfx::IntSize { static_cast<int>(*width), static_cast<int>(*height) };
+    auto size = Gfx::IntSize { physical_size.width() / scale, physical_size.height() / scale };
     auto& bitmap = buffer->bitmaps[*slot];
 
-    if (!bitmap || bitmap->size() != size || bitmap->pitch() != *stride) {
+    if (!bitmap || bitmap->size() != size || bitmap->scale() != scale || bitmap->pitch() != *stride) {
         auto* pixels = static_cast<u8*>(buffer->data) + (static_cast<size_t>(*slot) * buffer->slot_size);
-        auto created = Gfx::Bitmap::create_wrapper(Gfx::BitmapFormat::BGRA8888, size, 1, *stride, pixels);
+        auto created = Gfx::Bitmap::create_wrapper(Gfx::BitmapFormat::BGRA8888, size, scale, *stride, pixels);
         if (created.is_error()) {
             warnln("Ladybird: could not wrap frame: {}", created.error());
             return;
@@ -349,7 +353,12 @@ void EngineClient::handle_frame(JsonObject const& event)
         auto damage_y = event.get_i64("damage_y"sv).value_or(0);
         auto damage_width = event.get_i64("damage_width"sv).value_or(size.width());
         auto damage_height = event.get_i64("damage_height"sv).value_or(size.height());
-        damage = Gfx::IntRect { static_cast<int>(damage_x), static_cast<int>(damage_y), static_cast<int>(damage_width), static_cast<int>(damage_height) }.intersected({ 0, 0, size.width(), size.height() });
+        auto physical_damage = Gfx::IntRect { static_cast<int>(damage_x), static_cast<int>(damage_y), static_cast<int>(damage_width), static_cast<int>(damage_height) }.intersected({ 0, 0, physical_size.width(), physical_size.height() });
+        auto left = physical_damage.x() / scale;
+        auto top = physical_damage.y() / scale;
+        auto right = (physical_damage.right() + scale - 1) / scale;
+        auto bottom = (physical_damage.bottom() + scale - 1) / scale;
+        damage = Gfx::IntRect { left, top, max(right - left, 0), max(bottom - top, 0) }.intersected({ 0, 0, size.width(), size.height() });
     }
 
     if (on_frame)
@@ -428,13 +437,14 @@ void EngineClient::send_simple(StringView type, u64 tab_id)
     send(event);
 }
 
-void EngineClient::create_tab(Gfx::IntSize viewport_size, String const& url, u64 request_id, bool private_tab, u64 window_id, u64 session_tab_id, u64 session_window_id)
+void EngineClient::create_tab(Gfx::IntSize viewport_size, String const& url, u64 request_id, bool private_tab, u64 window_id, u64 session_tab_id, u64 session_window_id, int device_pixel_ratio)
 {
     JsonObject event;
     event.set("type"sv, "create_tab"sv);
     event.set("request"sv, request_id);
     event.set("width"sv, viewport_size.width());
     event.set("height"sv, viewport_size.height());
+    event.set("scale"sv, device_pixel_ratio);
     event.set("url"sv, url.bytes_as_string_view());
     event.set("private"sv, private_tab);
     if (window_id != 0)

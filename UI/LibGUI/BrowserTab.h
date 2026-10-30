@@ -119,6 +119,8 @@ public:
     String current_url() const;
     bool is_loading() const { return m_loading; }
     Gfx::IntSize content_size() const;
+    Gfx::IntSize device_pixel_content_size() const;
+    int device_pixel_ratio() const;
 
     Function<void(String const&)> on_title_change;
     Function<void(String const&)> on_url_change;

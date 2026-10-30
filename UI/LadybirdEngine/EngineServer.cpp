@@ -424,7 +424,7 @@ EngineServer::Tab* EngineServer::tab_for_id(u64 tab_id)
     return it->value.ptr();
 }
 
-EngineServer::Tab& EngineServer::create_tab(Gfx::IntSize viewport_size, bool is_private, u64 request_id, u64 parent, u64 window_id)
+EngineServer::Tab& EngineServer::create_tab(Gfx::IntSize viewport_size, bool is_private, u64 request_id, u64 parent, u64 window_id, int device_pixel_ratio)
 {
     auto id = m_next_tab_id++;
     auto view = EngineHeadlessWebView::create(m_theme, viewport_size.to_type<Web::DevicePixels>(), is_private ? WebView::IsPrivate::Yes : WebView::IsPrivate::No);
@@ -433,6 +433,9 @@ EngineServer::Tab& EngineServer::create_tab(Gfx::IntSize viewport_size, bool is_
     auto& tab_ref = *m_tabs.find(id)->value;
     tab_ref.parent = parent;
     tab_ref.window_id = window_id;
+    tab_ref.device_pixel_ratio = device_pixel_ratio > 0 ? device_pixel_ratio : 1;
+    tab_ref.view->set_device_pixel_ratio_for_testing(tab_ref.view->page(), tab_ref.device_pixel_ratio);
+    tab_ref.view->reset_viewport_size(viewport_size.to_type<Web::DevicePixels>());
     wire_autocomplete(tab_ref);
     wire_tab(tab_ref);
 
@@ -454,6 +457,7 @@ EngineServer::Tab& EngineServer::create_child_tab(Tab& parent, WebView::Canonica
     auto& tab_ref = *m_tabs.find(id)->value;
     tab_ref.parent = parent.id;
     tab_ref.window_id = parent.window_id;
+    tab_ref.device_pixel_ratio = parent.device_pixel_ratio;
     wire_autocomplete(tab_ref);
     wire_tab(tab_ref);
 
@@ -742,13 +746,14 @@ void EngineServer::handle_create_tab(JsonObject const& command)
     auto width = command.get_i64("width"sv).value_or(1024);
     auto height = command.get_i64("height"sv).value_or(768);
     auto is_private = command.get_bool("private"sv).value_or(false);
+    auto device_pixel_ratio = clamp(static_cast<int>(command.get_i64("scale"sv).value_or(1)), 1, 4);
 
     auto request_id = command.get_u64("request"sv).value_or(0);
     auto window_id = command.get_u64("window"sv).value_or(0);
     auto session_tab = command.get_u64("session_tab"sv);
     auto session_window = command.get_u64("session_window"sv);
 
-    auto& tab = create_tab({ max(static_cast<int>(width), 1), max(static_cast<int>(height), 1) }, is_private, request_id, 0, window_id);
+    auto& tab = create_tab({ max(static_cast<int>(width), 1), max(static_cast<int>(height), 1) }, is_private, request_id, 0, window_id, device_pixel_ratio);
 
     auto* store = WebView::Application::session_store(WebView::IsPrivate::No);
 
@@ -1045,8 +1050,9 @@ void EngineServer::handle_mouse(u64 tab_id, JsonObject const& command)
     if (!kind.has_value())
         return;
 
+    auto scale = max(tab->device_pixel_ratio, 1);
     Web::MouseEvent event;
-    event.position = Web::DevicePixelPoint { static_cast<int>(command.get_i64("x"sv).value_or(0)), static_cast<int>(command.get_i64("y"sv).value_or(0)) };
+    event.position = Web::DevicePixelPoint { static_cast<int>(command.get_i64("x"sv).value_or(0)) * scale, static_cast<int>(command.get_i64("y"sv).value_or(0)) * scale };
     event.screen_position = event.position;
     event.modifiers = modifiers_from_command(command);
 
@@ -1088,9 +1094,10 @@ void EngineServer::handle_wheel(u64 tab_id, JsonObject const& command)
     if (!tab)
         return;
 
+    auto scale = max(tab->device_pixel_ratio, 1);
     Web::MouseEvent event;
     event.type = Web::MouseEvent::Type::MouseWheel;
-    event.position = Web::DevicePixelPoint { static_cast<int>(command.get_i64("x"sv).value_or(0)), static_cast<int>(command.get_i64("y"sv).value_or(0)) };
+    event.position = Web::DevicePixelPoint { static_cast<int>(command.get_i64("x"sv).value_or(0)) * scale, static_cast<int>(command.get_i64("y"sv).value_or(0)) * scale };
     event.screen_position = event.position;
     event.modifiers = modifiers_from_command(command);
     event.button = Web::UIEvents::MouseButton::None;
@@ -1304,6 +1311,7 @@ bool EngineServer::ensure_frame_buffer(Tab& tab, Gfx::IntSize dimensions)
     event.set("slot_size"sv, static_cast<u64>(tab.frame_slot_size));
     event.set("width"sv, width);
     event.set("height"sv, height);
+    event.set("scale"sv, tab.device_pixel_ratio);
     send_event(move(event));
     return true;
 }
@@ -1977,6 +1985,7 @@ void EngineServer::try_send_frame(Tab& tab)
     event.set("width"sv, size.width());
     event.set("height"sv, size.height());
     event.set("stride"sv, static_cast<u64>(stride));
+    event.set("scale"sv, tab.device_pixel_ratio);
     event.set("sequence"sv, tab.presented_sequence);
     event.set("full"sv, full_copy);
     event.set("damage_x"sv, damage.x());
@@ -2427,6 +2436,8 @@ static StringView download_status_to_string(WebView::FileDownloader::DownloadSta
 
 void EngineServer::send_context_menu(Tab& tab, StringView kind, Gfx::IntPoint position, WebView::Menu& menu)
 {
+    auto scale = max(tab.device_pixel_ratio, 1);
+    position = { position.x() / scale, position.y() / scale };
     tab.context_menu_actions.clear();
 
     JsonArray items;
@@ -2619,12 +2630,13 @@ void EngineServer::send_select_dropdown(Tab& tab, Gfx::IntPoint position, i32 mi
         }
     }
 
+    auto scale = max(tab.device_pixel_ratio, 1);
     JsonObject event;
     event.set("type"sv, "select_dropdown"sv);
     event.set("tab"sv, tab.id);
-    event.set("x"sv, position.x());
-    event.set("y"sv, position.y());
-    event.set("min_width"sv, minimum_width);
+    event.set("x"sv, position.x() / scale);
+    event.set("y"sv, position.y() / scale);
+    event.set("min_width"sv, minimum_width / scale);
     event.set("items"sv, move(serialized_items));
     send_event(move(event));
 }

@@ -51,8 +51,11 @@ information" on local or browser pages).
 
 ## P2: Platform integration
 
-- **HiDPI**: the engine host paints at logical scale. Add device-pixel-ratio
-  information to the frame protocol and scale in the frontend.
+- **HiDPI**: **Done.** The frontend sends the LibGUI backing-store scale with
+  each tab, the engine paints at that device-pixel ratio, and frames travel as
+  physical pixels with their intrinsic scale so the frontend presents them at
+  logical size. Mouse, context-menu, and `<select>` positions convert between
+  logical and device pixels at the boundary.
 - **IME composition**: forward composition events, not only key events.
 - **Drag and drop**: links, files, tabs, and text.
 - **Rich clipboard**: **Done:** WebContent's rich copy path, text/HTML and

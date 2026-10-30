@@ -415,8 +415,10 @@ BrowserTab::BrowserTab(EngineClient& engine, GUI::Window& window, GUI::Action& b
 
     m_web_view->on_resize = [this](Gfx::IntSize size) {
         hide_autocomplete();
-        if (is_attached())
-            m_engine.resize(m_tab_id, size);
+        if (is_attached()) {
+            auto scale = device_pixel_ratio();
+            m_engine.resize(m_tab_id, { size.width() * scale, size.height() * scale });
+        }
     };
     m_web_view->on_mouse = [this](StringView type, Gfx::IntPoint position, GUI::MouseButton button, unsigned buttons, unsigned modifiers, int click_count) {
         if (!is_attached())
@@ -486,13 +488,27 @@ Gfx::IntSize BrowserTab::content_size() const
     return size;
 }
 
+int BrowserTab::device_pixel_ratio() const
+{
+    if (auto* window = m_root->window())
+        return window->backing_store_scale();
+    return 1;
+}
+
+Gfx::IntSize BrowserTab::device_pixel_content_size() const
+{
+    auto size = content_size();
+    auto scale = device_pixel_ratio();
+    return { size.width() * scale, size.height() * scale };
+}
+
 void BrowserTab::create_engine_tab(u64 request_id, String const& url, bool private_tab)
 {
     m_request_id = request_id;
     m_initial_url = url;
     m_private = private_tab;
     m_engine_tab_requested = true;
-    m_engine.create_tab(content_size(), url, request_id, private_tab, m_window_id, m_session_tab_id, m_session_window_id);
+    m_engine.create_tab(device_pixel_content_size(), url, request_id, private_tab, m_window_id, m_session_tab_id, m_session_window_id, device_pixel_ratio());
 }
 
 void BrowserTab::attach_tab_id(u64 tab_id)
@@ -501,7 +517,7 @@ void BrowserTab::attach_tab_id(u64 tab_id)
     m_engine_tab_requested = true;
     m_lazy = false;
     m_engine.activate_tab(tab_id, m_window_id);
-    m_engine.resize(tab_id, content_size());
+    m_engine.resize(tab_id, device_pixel_content_size());
     m_engine.set_focus(tab_id, m_web_view->is_focused());
 }
 

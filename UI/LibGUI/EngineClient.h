@@ -37,7 +37,7 @@ public:
 
     bool is_connected() const { return m_socket != nullptr; }
 
-    void create_tab(Gfx::IntSize viewport_size, String const& url, u64 request_id, bool private_tab = false, u64 window_id = 0, u64 session_tab_id = 0, u64 session_window_id = 0);
+    void create_tab(Gfx::IntSize viewport_size, String const& url, u64 request_id, bool private_tab = false, u64 window_id = 0, u64 session_tab_id = 0, u64 session_window_id = 0, int device_pixel_ratio = 1);
     void close_tab(u64 tab_id);
     void activate_tab(u64 tab_id, u64 window_id = 0);
     void navigate(u64 tab_id, String const& url, bool user_input = true);
@@ -103,6 +103,7 @@ private:
         size_t slot_size { 0 };
         ByteString name;
         Gfx::IntSize slot_dimensions;
+        int scale { 1 };
         Vector<RefPtr<Gfx::Bitmap>> bitmaps;
     };
 

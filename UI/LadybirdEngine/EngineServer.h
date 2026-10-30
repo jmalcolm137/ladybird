@@ -71,6 +71,7 @@ private:
         u64 id { 0 };
         u64 request_id { 0 };
         u64 parent { 0 };
+        int device_pixel_ratio { 1 };
         u64 window_id { 0 };
         Optional<WebView::SessionTabId> session_tab_id;
         NonnullOwnPtr<WebView::HeadlessWebView> view;
@@ -193,7 +194,7 @@ private:
     void check_resolver_files();
 
     Tab* tab_for_id(u64 tab_id);
-    Tab& create_tab(Gfx::IntSize viewport_size, bool is_private, u64 request_id = 0, u64 parent = 0, u64 window_id = 0);
+    Tab& create_tab(Gfx::IntSize viewport_size, bool is_private, u64 request_id = 0, u64 parent = 0, u64 window_id = 0, int device_pixel_ratio = 1);
     Tab& create_child_tab(Tab& parent, WebView::CanonicalTraversable&);
     void wire_autocomplete(Tab&);
     void wire_tab(Tab&);

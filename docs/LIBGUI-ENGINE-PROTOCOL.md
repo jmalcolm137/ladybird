@@ -5,23 +5,23 @@ line-oriented JSON protocol over a Unix socket. Frame pixels never travel over
 the socket: the engine publishes a POSIX shared-memory ring per tab and the
 frontend maps it.
 
-Version: 10. `Shared/EngineProtocol.h` is authoritative.
+Version: 11. `Shared/EngineProtocol.h` is authoritative.
 
 ## Frontend → engine
 
 | `type` | Fields | Meaning |
 |---|---|---|
-| `create_tab` | `request`, `width`, `height`, `url`, `private`, `window`, `session_tab`, `session_window` | Create a view and a tab. `request` is echoed in `tab_created`; `window` associates the tab with a frontend window. `session_tab`/`session_window` identify a natively restored tab/window so its session history can be restored from the engine's `SessionStore`. |
+| `create_tab` | `request`, `width`, `height`, `scale`, `url`, `private`, `window`, `session_tab`, `session_window` | Create a view and a tab. `width`/`height` are device pixels; `scale` is the client backing-store scale (1-4) used for input and frames. `request` is echoed in `tab_created`; `window` associates the tab with a frontend window. `session_tab`/`session_window` identify a natively restored tab/window so its session history can be restored from the engine's `SessionStore`. |
 | `activate` | `tab`, `window` | Make this tab the active tab of `window`; the active tab of every other window stays visible. |
 | `navigate` | `tab`, `url`, `user_input` | Load a URL, or run the URL/search-input path. |
 | `autocomplete` | `tab`, `request`, `query` | Query history/bookmarks/search suggestions. `request` is echoed in `autocomplete_results`; an empty query cancels. |
 | `back` / `forward` | `tab` | Traverse session history. |
 | `reload` | `tab`, `bypass_cache` | Reload. |
 | `stop` | `tab` | Stop loading. |
-| `resize` | `tab`, `width`, `height` | Set the page viewport. |
+| `resize` | `tab`, `width`, `height` | Set the page viewport in device pixels. |
 | `focus` | `tab`, `focused` | Tell the page whether it has system focus. |
-| `mouse` | `tab`, `event`, `x`, `y`, `button`, `buttons`, `ctrl`, `shift`, `alt`, `super`, `click_count` | Pointer event. |
-| `wheel` | `tab`, `x`, `y`, `delta_x`, `delta_y`, `ctrl`, `shift`, `alt`, `super` | Wheel/touchpad scroll in pixels. |
+| `mouse` | `tab`, `event`, `x`, `y`, `button`, `buttons`, `ctrl`, `shift`, `alt`, `super`, `click_count` | Pointer event; `x`/`y` are logical client coordinates and the engine scales them by the tab's `scale`. |
+| `wheel` | `tab`, `x`, `y`, `delta_x`, `delta_y`, `ctrl`, `shift`, `alt`, `super` | Wheel/touchpad scroll in pixels; `x`/`y` are logical and the engine scales them. |
 | `key` | `tab`, `event`, `key`, `codepoint`, `ctrl`, `shift`, `alt`, `super`, `repeat` | Keyboard event; `key` is the Serenity key name. |
 | `find` | `tab`, `query`, `match_case` | Start/replace find-in-page; empty ends it. |
 | `find_next` / `find_previous` | `tab` | Move between matches. |
@@ -99,8 +99,8 @@ Version: 10. `Shared/EngineProtocol.h` is authoritative.
 | `downloads` | `items` | Initial download list. |
 | `download_added` / `download_updated` | `download` | A download was added or changed (`id`, `url`, `destination`, `status`, `downloaded`, `total`, `progress`, `can_resume`, `private`, `error`). |
 | `download_removed` | `id`, `private` | A download left the list. |
-| `frame_buffer` | `tab`, `name`, `slots`, `slot_size`, `width`, `height` | Map this shared-memory object. |
-| `frame` | `tab`, `slot`, `width`, `height`, `stride`, `sequence`, `full`, `damage_x`, `damage_y`, `damage_width`, `damage_height` | The slot holds a new frame. `full` means the whole slot was rewritten; otherwise only the damage rectangle changed. |
+| `frame_buffer` | `tab`, `name`, `slots`, `slot_size`, `width`, `height`, `scale` | Map this shared-memory object. `width`/`height` and `slot_size` are physical pixels; `scale` is the bitmap's intrinsic scale so the frontend can wrap it at logical size. |
+| `frame` | `tab`, `slot`, `width`, `height`, `stride`, `scale`, `sequence`, `full`, `damage_x`, `damage_y`, `damage_width`, `damage_height` | The slot holds a new frame. `width`/`height`/`stride`/damage are physical pixels; the frontend divides damage by `scale` before repainting the logical widget. `full` means the whole slot was rewritten; otherwise only the damage rectangle changed. |
 
 The engine writes into a free slot in the ring. The frontend wraps the slot in a
 `Gfx::Bitmap` and paints it; no pixel data is serialized. A slot stays in flight
