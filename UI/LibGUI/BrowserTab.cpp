@@ -100,6 +100,17 @@ BrowserTab::BrowserTab(EngineClient& engine, GUI::Window& window, GUI::Action& b
     m_toolbar->add_action(downloads_action);
     m_toolbar->add_separator();
 
+    // Toolbar rule: the site indicator is always immediately left of the
+    // address bar; window-level controls (the tab list) sit to its left.
+    auto& tabs_button = m_toolbar->add<MenuButton>("Tabs"_string);
+    tabs_button.set_button_style(Gfx::ButtonStyle::Coolbar);
+    tabs_button.set_fixed_height(22);
+    tabs_button.set_fixed_width(44);
+    tabs_button.on_menu_request = [this, &tabs_button] {
+        if (on_tabs_menu_request)
+            on_tabs_menu_request(tabs_button);
+    };
+
     auto& site_button = m_toolbar->add<MenuButton>("Site"_string);
     site_button.set_button_style(Gfx::ButtonStyle::Coolbar);
     site_button.set_fixed_height(22);
@@ -114,15 +125,6 @@ BrowserTab::BrowserTab(EngineClient& engine, GUI::Window& window, GUI::Action& b
     m_bookmarks_bar->set_fixed_height(28);
     m_bookmarks_bar->set_layout<GUI::HorizontalBoxLayout>(GUI::Margins { 4 }, 4);
     m_bookmarks_bar->set_visible(false);
-
-    auto& tabs_button = m_toolbar->add<MenuButton>("Tabs"_string);
-    tabs_button.set_button_style(Gfx::ButtonStyle::Coolbar);
-    tabs_button.set_fixed_height(22);
-    tabs_button.set_fixed_width(44);
-    tabs_button.on_menu_request = [this, &tabs_button] {
-        if (on_tabs_menu_request)
-            on_tabs_menu_request(tabs_button);
-    };
 
     m_location_box = m_toolbar->add<GUI::TextBox>();
     m_location_box->set_placeholder("Search or enter address"sv);

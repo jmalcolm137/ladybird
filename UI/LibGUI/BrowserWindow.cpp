@@ -443,6 +443,9 @@ void BrowserWindow::create_menus()
     m_bookmarks_menu = bookmarks_menu.add_submenu("All &Bookmarks"_string);
 
     m_tabs_menu = m_window->add_menu("&Tabs"_string);
+    // The toolbar button gets its own menu object: reusing the menubar menu
+    // makes the popup render the menubar's button strip as extra rows.
+    m_tabs_popup_menu = GUI::Menu::construct("Tabs"_string);
     rebuild_tabs_menu();
 
     m_history_menu = m_window->add_menu("&History"_string);
@@ -603,7 +606,8 @@ BrowserTab& BrowserWindow::add_tab(String const& url, bool activate, bool reques
     };
     tab->on_tabs_menu_request = [this](GUI::Widget& anchor) {
         rebuild_tabs_menu();
-        m_tabs_menu->popup(anchor.screen_relative_rect().bottom_left(), {}, anchor.rect());
+        if (m_tabs_popup_menu)
+            m_tabs_popup_menu->popup(anchor.screen_relative_rect().bottom_left(), {}, anchor.rect());
     };
 
     m_tabs.append(move(tab));
@@ -1373,28 +1377,34 @@ void BrowserWindow::update_tab_icon(BrowserTab& tab)
 
 void BrowserWindow::rebuild_tabs_menu()
 {
-    if (!m_tabs_menu || m_tabs_menu->is_visible())
+    if (!m_tabs_menu || m_tabs_menu->is_visible()
+        || (m_tabs_popup_menu && m_tabs_popup_menu->is_visible()))
         return;
 
-    m_tabs_menu->remove_all_actions();
-    for (size_t i = 0; i < m_tabs.size(); ++i) {
-        auto* tab = m_tabs[i].ptr();
-        auto title = tab->display_title();
-        if (title.is_empty())
-            title = tab->current_url();
-        if (title.is_empty())
-            title = "New Tab"_string;
-        auto label = String::formatted("{}  {}", i + 1, title).release_value();
-        m_tabs_menu->add_action(GUI::Action::create(label.bytes_as_string_view(), [this, tab](auto&) {
-            if (!tab_is_live(tab))
-                return;
-            m_tab_widget->set_active_widget(tab->root().ptr());
-            activate_tab(*tab);
-        }));
-    }
-    m_tabs_menu->add_separator();
-    m_tabs_menu->add_action(*m_new_tab_action);
-    m_tabs_menu->add_action(*m_close_tab_action);
+    auto populate = [this](GUI::Menu& menu) {
+        menu.remove_all_actions();
+        for (size_t i = 0; i < m_tabs.size(); ++i) {
+            auto* tab = m_tabs[i].ptr();
+            auto title = tab->display_title();
+            if (title.is_empty())
+                title = tab->current_url();
+            if (title.is_empty())
+                title = "New Tab"_string;
+            auto label = String::formatted("{}  {}", i + 1, title).release_value();
+            menu.add_action(GUI::Action::create(label.bytes_as_string_view(), [this, tab](auto&) {
+                if (!tab_is_live(tab))
+                    return;
+                m_tab_widget->set_active_widget(tab->root().ptr());
+                activate_tab(*tab);
+            }));
+        }
+        menu.add_separator();
+        menu.add_action(*m_new_tab_action);
+        menu.add_action(*m_close_tab_action);
+    };
+    populate(*m_tabs_menu);
+    if (m_tabs_popup_menu)
+        populate(*m_tabs_popup_menu);
 }
 
 void BrowserWindow::rebuild_history_menu()

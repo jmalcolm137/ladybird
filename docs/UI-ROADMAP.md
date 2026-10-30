@@ -11,6 +11,10 @@ reference for behaviour and options.
 
 ## Current baseline
 
+Toolbar layout rule: the site indicator is always immediately to the left of
+the address bar; window-level controls (the tab list) sit to its left. Menus
+opened from toolbar buttons are separate menu objects from the menubar menus.
+
 - Window and tab chrome, tab close buttons, tab drag-reorder, middle-click
   close, duplicate tab, close other tabs.
 - Back/forward/reload/stop, home, new tab/window/private window.

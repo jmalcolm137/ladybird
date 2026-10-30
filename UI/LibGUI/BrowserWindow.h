@@ -176,6 +176,7 @@ private:
     RefPtr<GUI::Menu> m_tab_context_menu;
     RefPtr<GUI::Menu> m_bookmarks_menu;
     RefPtr<GUI::Menu> m_tabs_menu;
+    RefPtr<GUI::Menu> m_tabs_popup_menu;
     RefPtr<GUI::Menu> m_history_menu;
     RefPtr<GUI::Window> m_history_results_window;
     RefPtr<GUI::JsonArrayModel> m_history_results_model;

@@ -138,7 +138,9 @@ navigating the real engine.
 * Tabbed browsing: new/close/activate tabs, titles, favicons, per-tab history
   state, drag reordering (LibGUI `TabWidget`), pinning, mute/audio state, move to
   a new window, close-tabs-to-the-right, tab pin/mute/audio icons, a Tabs menu
-  listing every tab, and a Tabs button in the toolbar. The chrome can also move
+  listing every tab, and a Tabs button in the toolbar. Toolbar rule: the site
+  indicator is always immediately left of the address bar, and window-level
+  controls such as the tab list sit to its left. The chrome can also move
   a tab to a new window and close tabs to the right.
 * Navigation: load/search from the URL bar, back, forward, reload (with cache
   bypass support in the protocol), stop, zoom in/out/reset.
