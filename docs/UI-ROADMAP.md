@@ -94,9 +94,12 @@ scroll, resize, multi-window, and session-restore tests.
 
 ## Deployment gaps
 
-- `/usr/lib/sde-next` still contains the older `libgui-wayland` framework, so
-  normal launches do not get the latest menu-anchor, modifier-state, and scroll
-  fixes. Rebuild/reinstall it.
+- ~~`/usr/lib/sde-next` still contains the older `libgui-wayland` framework~~
+  **Done:** the framework and SDE binaries were rebuilt and reinstalled into
+  `/usr/lib/sde-next` (runtime, headers, and source). Installed TextEditor and
+  Terminal were verified with the multi-format clipboard, menu anchoring,
+  modifier state, and wheel scrolling. Note that running apps keep the
+  libraries they mapped; new launches pick up the new framework.
 - The Ladybird `.af` file and Taskbar entry are still manual; `scripts/install-sde.sh`
   should install them.
 - **Done:** the engine host watches the resolver configuration files and
