@@ -7,6 +7,7 @@
 #include "BrowserTab.h"
 
 #include <LibCore/StandardPaths.h>
+#include <LibGUI/Application.h>
 #include <LibGUI/BoxLayout.h>
 #include <LibGUI/CheckBox.h>
 #include <LibGUI/FilePicker.h>
@@ -17,7 +18,9 @@
 #include <LibGUI/TableView.h>
 #include <LibGUI/ToolbarContainer.h>
 #include <LibCore/Timer.h>
+#include <LibGfx/AntiAliasingPainter.h>
 #include <LibGfx/Bitmap.h>
+#include <LibGfx/Painter.h>
 
 namespace LadybirdSDE {
 
@@ -36,6 +39,8 @@ private:
     virtual void mousedown_event(GUI::MouseEvent& event) override
     {
         if (on_menu_request) {
+            // The tooltip for the button would otherwise stay up over the popup.
+            GUI::Application::the()->hide_tooltip();
             on_menu_request();
             event.accept();
             return;
@@ -43,6 +48,55 @@ private:
         Button::mousedown_event(event);
     }
 };
+
+// The chrome icons follow the drawings the Qt frontend uses for its tab list and
+// site indicator, scaled onto the same 16 px canvas.
+enum class ChromeGlyph {
+    ChevronDown,
+    SiteSettings,
+    Warning,
+};
+
+static RefPtr<Gfx::Bitmap const> make_chrome_glyph(ChromeGlyph glyph, Gfx::Color color)
+{
+    auto bitmap = Gfx::Bitmap::create(Gfx::BitmapFormat::BGRA8888, { 16, 16 });
+    if (bitmap.is_error())
+        return nullptr;
+
+    auto surface = bitmap.release_value();
+    surface->fill(Gfx::Color::Transparent);
+
+    Gfx::Painter painter(*surface);
+    Gfx::AntiAliasingPainter aa(painter);
+    auto line = [&](float x1, float y1, float x2, float y2) {
+        aa.draw_line(Gfx::FloatPoint { x1, y1 }, Gfx::FloatPoint { x2, y2 }, color, 1.4f);
+    };
+
+    switch (glyph) {
+    case ChromeGlyph::ChevronDown:
+        line(4.5f, 6.5f, 8.0f, 10.0f);
+        line(8.0f, 10.0f, 11.5f, 6.5f);
+        break;
+    case ChromeGlyph::SiteSettings:
+        // Two horizontal sliders, their knobs offset from each other.
+        line(2.5f, 5.0f, 8.5f, 5.0f);
+        line(12.5f, 5.0f, 13.5f, 5.0f);
+        aa.fill_circle({ 10, 5 }, 2, color);
+        line(2.5f, 11.0f, 3.5f, 11.0f);
+        line(7.5f, 11.0f, 13.5f, 11.0f);
+        aa.fill_circle({ 5, 11 }, 2, color);
+        break;
+    case ChromeGlyph::Warning:
+        line(8.0f, 2.5f, 14.0f, 13.5f);
+        line(14.0f, 13.5f, 2.0f, 13.5f);
+        line(2.0f, 13.5f, 8.0f, 2.5f);
+        line(8.0f, 6.8f, 8.0f, 9.8f);
+        aa.fill_circle({ 8, 12 }, 1, color);
+        break;
+    }
+
+    return surface;
+}
 
 struct SiteIdentity {
     String security;
@@ -102,19 +156,28 @@ BrowserTab::BrowserTab(EngineClient& engine, GUI::Window& window, GUI::Action& b
 
     // Toolbar rule: the site indicator is always immediately left of the
     // address bar; window-level controls (the tab list) sit to its left.
-    auto& tabs_button = m_toolbar->add<MenuButton>("Tabs"_string);
+    auto icon_color = m_toolbar->palette().button_text();
+    m_tabs_icon = make_chrome_glyph(ChromeGlyph::ChevronDown, icon_color);
+    m_site_settings_icon = make_chrome_glyph(ChromeGlyph::SiteSettings, icon_color);
+    m_warning_icon = make_chrome_glyph(ChromeGlyph::Warning, icon_color);
+
+    auto& tabs_button = m_toolbar->add<MenuButton>(String {});
     tabs_button.set_button_style(Gfx::ButtonStyle::Coolbar);
     tabs_button.set_fixed_height(22);
-    tabs_button.set_fixed_width(44);
+    tabs_button.set_fixed_width(28);
+    tabs_button.set_icon(m_tabs_icon);
+    tabs_button.set_tooltip("Show All Tabs"_string);
     tabs_button.on_menu_request = [this, &tabs_button] {
         if (on_tabs_menu_request)
             on_tabs_menu_request(tabs_button);
     };
 
-    auto& site_button = m_toolbar->add<MenuButton>("Site"_string);
+    auto& site_button = m_toolbar->add<MenuButton>(String {});
     site_button.set_button_style(Gfx::ButtonStyle::Coolbar);
     site_button.set_fixed_height(22);
-    site_button.set_fixed_width(76);
+    site_button.set_fixed_width(26);
+    site_button.set_icon(m_site_settings_icon);
+    site_button.set_tooltip("Site settings"_string);
     site_button.on_menu_request = [this, &site_button] {
         if (m_site_menu)
             m_site_menu->popup(site_button.screen_relative_rect().bottom_left(), {}, site_button.rect());
@@ -597,16 +660,29 @@ void BrowserTab::update_site_button()
         ? SiteIdentity { "No page loaded"_string, {} }
         : site_identity_for_url(url);
 
-    auto label = "Site"_string;
-    if (identity.security == "Secure connection"sv)
-        label = "Secure"_string;
-    else if (identity.security == "Not secure"sv)
-        label = "Not secure"_string;
-    else if (identity.security == "Local file"sv)
-        label = "Local"_string;
-    else if (identity.security == "Browser page"sv)
-        label = "Page"_string;
-    m_site_button->set_text(label);
+    if (identity.security == "Secure connection"sv) {
+        m_site_button->set_text({});
+        m_site_button->set_icon(m_site_settings_icon);
+        m_site_button->set_tooltip("Site settings"_string);
+        m_site_button->set_fixed_width(26);
+        m_site_button->set_visible(true);
+    } else if (identity.security == "Not secure"sv) {
+        m_site_button->set_icon(m_warning_icon);
+        m_site_button->set_text("Not secure"_string);
+        m_site_button->set_tooltip("The connection to this site is not secure"_string);
+        auto text_width = m_site_button->font().width_rounded_up("Not secure"sv);
+        m_site_button->set_fixed_width(8 + 16 + 4 + text_width + 8);
+        m_site_button->set_visible(true);
+    } else {
+        // Qt hides the indicator outside http(s); keep the sliders visible here so
+        // the site menu (zoom, permissions) stays reachable and the toolbar rule
+        // that the indicator sits immediately before the address bar always holds.
+        m_site_button->set_text({});
+        m_site_button->set_icon(m_site_settings_icon);
+        m_site_button->set_tooltip("Site information"_string);
+        m_site_button->set_fixed_width(26);
+        m_site_button->set_visible(true);
+    }
 
     auto menu = GUI::Menu::construct("Site"_string);
     auto add_information = [&](String const& text) {

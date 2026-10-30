@@ -144,6 +144,9 @@ private:
     NonnullRefPtr<GUI::Widget> m_root;
     RefPtr<GUI::Toolbar> m_toolbar;
     RefPtr<GUI::Button> m_site_button;
+    RefPtr<Gfx::Bitmap const> m_tabs_icon;
+    RefPtr<Gfx::Bitmap const> m_site_settings_icon;
+    RefPtr<Gfx::Bitmap const> m_warning_icon;
     RefPtr<GUI::TextBox> m_location_box;
     RefPtr<GUI::Button> m_zoom_button;
     RefPtr<WebContentView> m_web_view;

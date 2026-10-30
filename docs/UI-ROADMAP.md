@@ -14,6 +14,10 @@ reference for behaviour and options.
 Toolbar layout rule: the site indicator is always immediately to the left of
 the address bar; window-level controls (the tab list) sit to its left. Menus
 opened from toolbar buttons are separate menu objects from the menubar menus.
+The tab-list and site indicators are icon-only with tooltips, using the same
+glyphs as Qt: a chevron ("Show All Tabs") and the site-settings sliders
+("Site settings", a warning triangle and "Not secure" on HTTP, and "Site
+information" on local or browser pages).
 
 - Window and tab chrome, tab close buttons, tab drag-reorder, middle-click
   close, duplicate tab, close other tabs.
