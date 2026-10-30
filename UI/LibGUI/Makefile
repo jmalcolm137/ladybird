@@ -26,6 +26,7 @@ CPPFLAGS += \
 	-I$(LAGOM)/Userland/Libraries \
 	-I$(LAGOM)/Userland/Services \
 	-I$(LIBGUI_WAYLAND_ROOT)/compat \
+	-I$(LIBGUI_WAYLAND_ROOT)/src \
 	-I$(ROOT)
 
 # libwindowserver.so is the in-process WindowServer implementation that turns a

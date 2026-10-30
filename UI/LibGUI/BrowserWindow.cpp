@@ -674,6 +674,11 @@ void BrowserWindow::remove_tab(BrowserTab& tab)
     rebuild_tabs_menu();
 }
 
+GUI::Widget* BrowserWindow::focused_widget() const
+{
+    return m_window ? m_window->focused_widget() : nullptr;
+}
+
 BrowserTab* BrowserWindow::active_tab() const
 {
     auto* widget = m_tab_widget->active_widget();
@@ -958,6 +963,17 @@ void BrowserWindow::handle_engine_tab_event(JsonObject const& event, u64 tab_id)
         }
     } else if (type == "certificate_info"sv) {
         tab->show_certificate_info(event);
+    } else if (type == "input_method_state"sv) {
+        Optional<Gfx::IntRect> caret_rect;
+        if (auto x = event.get_i64("x"sv); x.has_value()) {
+            caret_rect = Gfx::IntRect {
+                static_cast<int>(*x),
+                static_cast<int>(event.get_i64("y"sv).value_or(0)),
+                static_cast<int>(event.get_i64("width"sv).value_or(0)),
+                static_cast<int>(event.get_i64("height"sv).value_or(0)),
+            };
+        }
+        tab->update_input_method_state(event.get_bool("enabled"sv).value_or(false), caret_rect);
     } else if (type == "file_picker"sv) {
         auto multiple = event.get_bool("multiple"sv).value_or(false);
         auto filters = event.get_array("filters"sv);

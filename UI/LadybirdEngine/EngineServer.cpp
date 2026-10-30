@@ -388,6 +388,12 @@ void EngineServer::dispatch_command(JsonObject const& command)
             handle_toggle_mute(*tab_id);
         } else if (*type == "certificate_info"sv) {
             handle_certificate_info(*tab_id, command);
+        } else if (*type == "ime_marked_text"sv) {
+            handle_ime_marked_text(*tab_id, command);
+        } else if (*type == "ime_commit_text"sv) {
+            handle_ime_commit_text(*tab_id, command);
+        } else if (*type == "ime_unmark_text"sv) {
+            handle_ime_unmark_text(*tab_id);
         } else if (*type == "copy"sv) {
             handle_clipboard_copy(*tab_id, false);
         } else if (*type == "cut"sv) {
@@ -674,6 +680,24 @@ void EngineServer::wire_tab(Tab& tab)
     wire_context_menu(tab.view->selected_text_link_context_menu(), "link"sv);
     wire_context_menu(tab.view->image_context_menu(), "image"sv);
     wire_context_menu(tab.view->media_context_menu(), "media"sv);
+
+    tab.view->on_input_method_state_change = [this, tab_id] {
+        auto* tab = tab_for_id(tab_id);
+        if (!tab)
+            return;
+        auto const& state = tab->view->input_method_state();
+        JsonObject event;
+        event.set("type"sv, "input_method_state"sv);
+        event.set("tab"sv, tab_id);
+        event.set("enabled"sv, state.is_enabled);
+        if (state.caret_rect.has_value()) {
+            event.set("x"sv, state.caret_rect->x().value());
+            event.set("y"sv, state.caret_rect->y().value());
+            event.set("width"sv, state.caret_rect->width().value());
+            event.set("height"sv, state.caret_rect->height().value());
+        }
+        send_event(move(event));
+    };
 
     tab.view->on_find_in_page = [this, tab_id](size_t current_match_index, Optional<size_t> const& total_match_count) {
         if (!tab_for_id(tab_id))
@@ -1599,6 +1623,36 @@ void EngineServer::handle_toggle_mute(u64 tab_id)
 
     tab->view->toggle_page_mute_state();
     send_audio_state(*tab);
+}
+
+void EngineServer::handle_ime_marked_text(u64 tab_id, JsonObject const& command)
+{
+    auto* tab = tab_for_id(tab_id);
+    if (!tab)
+        return;
+    String text;
+    if (auto value = command.get_string("text"sv); value.has_value())
+        text = *value;
+    tab->view->set_marked_text_from_input_method(Utf16String::from_utf8_with_replacement_character(text));
+}
+
+void EngineServer::handle_ime_commit_text(u64 tab_id, JsonObject const& command)
+{
+    auto* tab = tab_for_id(tab_id);
+    if (!tab)
+        return;
+    String text;
+    if (auto value = command.get_string("text"sv); value.has_value())
+        text = *value;
+    auto replacement_start = static_cast<i32>(command.get_i64("replacement_start"sv).value_or(0));
+    auto replacement_length = static_cast<i32>(command.get_i64("replacement_length"sv).value_or(0));
+    tab->view->commit_text_from_input_method(Utf16String::from_utf8_with_replacement_character(text), replacement_start, replacement_length);
+}
+
+void EngineServer::handle_ime_unmark_text(u64 tab_id)
+{
+    if (auto* tab = tab_for_id(tab_id))
+        tab->view->unmark_text_from_input_method();
 }
 
 void EngineServer::handle_certificate_info(u64 tab_id, JsonObject const&)

@@ -87,6 +87,7 @@ private:
     void close_tab(BrowserTab&);
     void remove_tab(BrowserTab&);
     BrowserTab* active_tab() const;
+    GUI::Widget* focused_widget() const;
     BrowserTab* tab_for_widget(GUI::Widget&) const;
     BrowserTab* tab_for_id(u64) const;
     void hard_reload_tab(BrowserTab&);

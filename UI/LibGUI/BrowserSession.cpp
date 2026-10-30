@@ -16,6 +16,7 @@
 #include <LibCore/Environment.h>
 #include <LibCore/File.h>
 #include <LibCore/StandardPaths.h>
+#include <WaylandClient.h>
 #include <LibCore/System.h>
 #include <AK/StringBuilder.h>
 #include <LibCore/Timer.h>
@@ -128,6 +129,29 @@ BrowserSession::~BrowserSession()
 
 ErrorOr<void> BrowserSession::initialize(Vector<String> initial_urls, bool private_window)
 {
+    // The desktop's input method talks to the focused LibGUI window over text-input-v3. Committed text belongs to the
+    // active tab's web view.
+    LibWM::WaylandClient::the().set_text_input_callbacks(
+        [this](String const& text) {
+            if (auto* window = active_window()) {
+                if (auto* focused = window->focused_widget(); focused && is<GUI::TextEditor>(*focused)) {
+                    static_cast<GUI::TextEditor&>(*focused).insert_at_cursor_or_replace_selection(text.bytes_as_string_view());
+                    return;
+                }
+                if (auto* tab = window->active_tab(); tab && tab->is_attached())
+                    m_engine->ime_commit_text(tab->tab_id(), text);
+            }
+        },
+        [this](String const& text, i32, i32) {
+            if (auto* window = active_window()) {
+                if (auto* focused = window->focused_widget(); focused && is<GUI::TextEditor>(*focused))
+                    return;
+                if (auto* tab = window->active_tab(); tab && tab->is_attached())
+                    m_engine->ime_marked_text(tab->tab_id(), text);
+            }
+        },
+        [](i32, i32) {});
+
     if (!private_window)
         load_permissions();
 

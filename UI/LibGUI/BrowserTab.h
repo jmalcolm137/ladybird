@@ -28,6 +28,7 @@
 #include <LibGUI/Widget.h>
 #include <LibGUI/Window.h>
 #include <LibGfx/Forward.h>
+#include <LibGfx/Rect.h>
 
 namespace LadybirdSDE {
 
@@ -133,6 +134,8 @@ public:
     Function<void()> on_certificate_request;
 
     void show_certificate_info(JsonObject const&);
+    void update_input_method_state(bool enabled, Optional<Gfx::IntRect> caret_rect);
+    void refresh_text_input_state();
     bool is_private() const { return m_private; }
 
 private:
@@ -187,6 +190,9 @@ private:
     Optional<u32> m_selected_select_item;
     double m_zoom_level { 1.0 };
     bool m_select_dropdown_visible { false };
+    bool m_input_method_enabled { false };
+    bool m_page_input_method_enabled { false };
+    Optional<Gfx::IntRect> m_page_caret_rect;
 
     u64 m_tab_id { 0 };
     u64 m_window_id { 0 };

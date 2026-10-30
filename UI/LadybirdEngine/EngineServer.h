@@ -173,6 +173,9 @@ private:
     void handle_pin_tab(u64 tab_id, JsonObject const&);
     void handle_toggle_mute(u64 tab_id);
     void handle_certificate_info(u64 tab_id, JsonObject const&);
+    void handle_ime_marked_text(u64 tab_id, JsonObject const&);
+    void handle_ime_commit_text(u64 tab_id, JsonObject const&);
+    void handle_ime_unmark_text(u64 tab_id);
     void send_certificate_info(u64 tab_id, Requests::CertificateInfo const&);
     void send_certificate_error(u64 tab_id, String const&);
     void handle_frame_ack(u64 tab_id, JsonObject const&);

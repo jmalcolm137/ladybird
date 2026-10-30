@@ -6,6 +6,8 @@
 
 #include "BrowserTab.h"
 
+#include <WaylandClient.h>
+
 #include <LibCore/StandardPaths.h>
 #include <LibGUI/Application.h>
 #include <LibGUI/BoxLayout.h>
@@ -278,6 +280,9 @@ BrowserTab::BrowserTab(EngineClient& engine, GUI::Window& window, GUI::Action& b
     m_location_box->on_down_pressed = [this] {
         move_autocomplete_selection(1);
     };
+    m_location_box->on_focus_change = [this](bool, auto) {
+        refresh_text_input_state();
+    };
     m_location_box->on_escape_pressed = [this] {
         hide_autocomplete();
     };
@@ -371,6 +376,9 @@ BrowserTab::BrowserTab(EngineClient& engine, GUI::Window& window, GUI::Action& b
     m_find_box->on_escape_pressed = [this] {
         hide_find_bar();
     };
+    m_find_box->on_focus_change = [this](bool, auto) {
+        refresh_text_input_state();
+    };
 
     m_match_case = m_find_bar->add<GUI::CheckBox>("Match case"_string);
     m_match_case->set_fixed_width(90);
@@ -436,6 +444,7 @@ BrowserTab::BrowserTab(EngineClient& engine, GUI::Window& window, GUI::Action& b
     m_web_view->on_focus_change = [this](bool focused) {
         if (is_attached())
             m_engine.set_focus(m_tab_id, focused);
+        refresh_text_input_state();
     };
     m_web_view->on_go_back = [this] { go_back(); };
     m_web_view->on_go_forward = [this] { go_forward(); };
@@ -826,6 +835,56 @@ void BrowserTab::show_site_info_dialog()
             text = String::formatted("{}\nPermissions: {}", text, summary).release_value();
     }
     GUI::MessageBox::show(m_root->window(), text, "Site Information"sv, GUI::MessageBox::Type::Information, GUI::MessageBox::InputType::OK);
+}
+
+void BrowserTab::update_input_method_state(bool enabled, Optional<Gfx::IntRect> caret_rect)
+{
+    m_page_input_method_enabled = enabled;
+    m_page_caret_rect = caret_rect;
+    refresh_text_input_state();
+}
+
+void BrowserTab::refresh_text_input_state()
+{
+    auto& wayland = LibWM::WaylandClient::the();
+    auto* window = m_root->window();
+    auto* focused = window ? window->focused_widget() : nullptr;
+
+    if (focused && is<GUI::TextEditor>(*focused)) {
+        // LibGUI text fields take committed text directly. They do not display a marked preedit, so the input method's
+        // own candidate window is the composition UI.
+        auto& editor = static_cast<GUI::TextEditor&>(*focused);
+        auto origin = editor.window_relative_rect().location();
+        auto caret = editor.cursor_content_rect();
+        wayland.set_text_input_cursor_rect({
+            origin.x() + caret.x(),
+            origin.y() + caret.y(),
+            max(caret.width(), 1),
+            max(caret.height(), 1),
+        });
+        wayland.set_text_input_enabled(true);
+        m_input_method_enabled = true;
+        return;
+    }
+
+    if (focused == m_web_view.ptr() && m_page_input_method_enabled) {
+        if (m_page_caret_rect.has_value()) {
+            auto scale = device_pixel_ratio();
+            auto origin = m_web_view->window_relative_rect().location();
+            wayland.set_text_input_cursor_rect({
+                origin.x() + m_page_caret_rect->x() / scale,
+                origin.y() + m_page_caret_rect->y() / scale,
+                max(m_page_caret_rect->width() / scale, 1),
+                max(m_page_caret_rect->height() / scale, 1),
+            });
+        }
+        wayland.set_text_input_enabled(true);
+        m_input_method_enabled = true;
+        return;
+    }
+
+    wayland.set_text_input_enabled(false);
+    m_input_method_enabled = false;
 }
 
 void BrowserTab::show_certificate_info(JsonObject const& event)

@@ -17,7 +17,7 @@ namespace LadybirdSDE {
 // Bumped whenever a command or event changes shape incompatibly. The chrome
 // refuses to talk to an engine host with a different version rather than fail
 // mysteriously at the first unknown message.
-constexpr uint32_t protocol_version = 11;
+constexpr uint32_t protocol_version = 12;
 
 // Frame pixels live in a POSIX shared-memory ring owned by the engine host and
 // mapped read-only by the chrome. The ring has a small number of fixed-size

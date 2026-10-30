@@ -56,7 +56,10 @@ information" on local or browser pages).
   physical pixels with their intrinsic scale so the frontend presents them at
   logical size. Mouse, context-menu, and `<select>` positions convert between
   logical and device pixels at the boundary.
-- **IME composition**: forward composition events, not only key events.
+- **IME composition**: **Done.** LibWM implements text-input-v3, the frontend
+  enables it only while an editable field is focused, and the engine forwards
+  marked and committed text to WebContent. LibGUI text fields receive committed
+  text; their preedit is shown by the input method's own candidate window.
 - **Drag and drop**: links, files, tabs, and text.
 - **Rich clipboard**: **Done:** WebContent's rich copy path, text/HTML and
   image representations, and page-initiated clipboard reads. The LibWM

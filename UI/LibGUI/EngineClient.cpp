@@ -733,6 +733,28 @@ void EngineClient::toggle_mute(u64 tab_id) { send_simple("toggle_mute"sv, tab_id
 
 void EngineClient::request_certificate_info(u64 tab_id) { send_simple("certificate_info"sv, tab_id); }
 
+void EngineClient::ime_marked_text(u64 tab_id, String const& text)
+{
+    JsonObject event;
+    event.set("type"sv, "ime_marked_text"sv);
+    event.set("tab"sv, tab_id);
+    event.set("text"sv, text.bytes_as_string_view());
+    send(event);
+}
+
+void EngineClient::ime_commit_text(u64 tab_id, String const& text, i32 replacement_start, i32 replacement_length)
+{
+    JsonObject event;
+    event.set("type"sv, "ime_commit_text"sv);
+    event.set("tab"sv, tab_id);
+    event.set("text"sv, text.bytes_as_string_view());
+    event.set("replacement_start"sv, replacement_start);
+    event.set("replacement_length"sv, replacement_length);
+    send(event);
+}
+
+void EngineClient::ime_unmark_text(u64 tab_id) { send_simple("ime_unmark_text"sv, tab_id); }
+
 void EngineClient::request_history(u64 limit)
 {
     JsonObject event;
