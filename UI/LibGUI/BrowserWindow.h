@@ -65,6 +65,17 @@ public:
 private:
     friend class BrowserSession;
 
+    struct FlatBookmark {
+        String id;
+        String title;
+        String url;
+        String parent;
+        bool is_folder { false };
+        size_t index { 0 };
+        size_t depth { 0 };
+    };
+
+
     ErrorOr<void> initialize(Vector<String> initial_urls, Optional<size_t> active_tab = {}, bool lazy_load = false);
     ErrorOr<void> initialize(Vector<InitialTab> initial_tabs, Optional<size_t> active_tab, bool lazy_load);
     void create_actions();
@@ -104,6 +115,15 @@ private:
     void rebuild_history_menu();
     void show_bookmark_dialog(bool edit_current);
     String bookmark_id_for_url(StringView) const;
+    void show_bookmarks_manager();
+    void rebuild_bookmarks_manager();
+    FlatBookmark const* selected_bookmark() const;
+    String selected_folder_id() const;
+    size_t sibling_count(String const& parent) const;
+    void show_history_search();
+    void show_history_results(JsonArray const& items, String const& query);
+    void update_tab_icon(BrowserTab&);
+    Gfx::Bitmap const* tab_icon_for(BrowserTab const&) const;
     static ByteString string_for_key(JsonObject const&, StringView key);
 
     BrowserSession& m_session;
@@ -157,6 +177,16 @@ private:
     RefPtr<GUI::Menu> m_bookmarks_menu;
     RefPtr<GUI::Menu> m_tabs_menu;
     RefPtr<GUI::Menu> m_history_menu;
+    RefPtr<GUI::Window> m_history_results_window;
+    RefPtr<GUI::JsonArrayModel> m_history_results_model;
+    RefPtr<GUI::TableView> m_history_results_table;
+    JsonArray m_history_results_rows;
+    Vector<String> m_history_result_urls;
+    RefPtr<GUI::Window> m_bookmarks_window;
+    RefPtr<GUI::JsonArrayModel> m_bookmarks_model;
+    RefPtr<GUI::TableView> m_bookmarks_table;
+    JsonArray m_bookmark_rows;
+    Vector<FlatBookmark> m_flat_bookmarks;
     RefPtr<Core::Timer> m_history_refresh_timer;
     struct RecentHistoryEntry {
         String title;
@@ -168,6 +198,9 @@ private:
     bool m_show_bookmarks_bar { true };
     RefPtr<Gfx::Bitmap const> m_bookmark_icon;
     RefPtr<Gfx::Bitmap const> m_bookmark_filled_icon;
+    RefPtr<Gfx::Bitmap const> m_pinned_tab_icon;
+    RefPtr<Gfx::Bitmap const> m_muted_tab_icon;
+    RefPtr<Gfx::Bitmap const> m_playing_tab_icon;
 
     bool m_private { false };
 };

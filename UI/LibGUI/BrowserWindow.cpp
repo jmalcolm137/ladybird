@@ -192,6 +192,9 @@ void BrowserWindow::create_actions()
     auto close_tab_icon = load_icon("/res/icons/16x16/close-tab.png"sv);
     m_bookmark_icon = load_icon("/res/icons/16x16/bookmark-contour.png"sv);
     m_bookmark_filled_icon = load_icon("/res/icons/16x16/bookmark-filled.png"sv);
+    m_pinned_tab_icon = load_icon("/res/icons/16x16/window-pin.png"sv);
+    m_muted_tab_icon = load_icon("/res/icons/16x16/audio-volume-muted.png"sv);
+    m_playing_tab_icon = load_icon("/res/icons/16x16/audio-volume-high.png"sv);
 
     m_back_action = GUI::Action::create("Back"sv, { Mod_Alt, Key_Left }, back_icon, [this](auto&) {
         if (auto* tab = active_tab())
@@ -430,6 +433,9 @@ void BrowserWindow::create_menus()
         m_engine->remove_bookmark(tab->tab_id(), id);
     }, m_window.ptr()));
     bookmarks_menu.add_separator();
+    bookmarks_menu.add_action(GUI::Action::create("&Manage Bookmarks…"sv, [this](auto&) {
+        show_bookmarks_manager();
+    }, m_window.ptr()));
     bookmarks_menu.add_action(GUI::Action::create("Show &Bookmarks"sv, [this](auto&) {
         navigate_active("about:bookmarks"_string);
     }, m_window.ptr()));
@@ -571,10 +577,10 @@ BrowserTab& BrowserWindow::add_tab(String const& url, bool activate, bool reques
         if (active_tab() == tab_pointer)
             update_bookmark_action();
     };
-    tab->on_favicon_change = [this, tab_pointer](Gfx::Bitmap const* icon) {
+    tab->on_favicon_change = [this, tab_pointer](Gfx::Bitmap const*) {
         if (!tab_is_live(tab_pointer))
             return;
-        m_tab_widget->set_tab_icon(*tab_pointer->root(), icon);
+        update_tab_icon(*tab_pointer);
     };
     tab->on_loading_change = [this, tab_pointer](bool) {
         if (!tab_is_live(tab_pointer))
@@ -594,6 +600,10 @@ BrowserTab& BrowserWindow::add_tab(String const& url, bool activate, bool reques
     });
     tab->on_permission_decision = [this](String const& origin, String const& name, bool granted) {
         m_session.note_permission(origin, name, granted);
+    };
+    tab->on_tabs_menu_request = [this](GUI::Widget& anchor) {
+        rebuild_tabs_menu();
+        m_tabs_menu->popup(anchor.screen_relative_rect().bottom_left(), {}, anchor.rect());
     };
 
     m_tabs.append(move(tab));
@@ -864,6 +874,15 @@ void BrowserWindow::handle_engine_global_event(JsonObject const& event)
         return;
     }
 
+    if (type == "history_search_results"sv) {
+        auto query = String::from_byte_string(event.get_byte_string("query"sv).value_or({})).release_value();
+        JsonArray items;
+        if (auto values = event.get_array("items"sv); values.has_value())
+            items = *values;
+        show_history_results(items, query);
+        return;
+    }
+
     if (type == "bookmarks"sv) {
         Vector<BookmarkEntry> bookmarks;
         if (auto items = event.get_array("items"sv); items.has_value()) {
@@ -874,6 +893,8 @@ void BrowserWindow::handle_engine_global_event(JsonObject const& event)
         }
         m_bookmarks = move(bookmarks);
         rebuild_bookmarks_menu();
+        if (m_bookmarks_window)
+            rebuild_bookmarks_manager();
         for (auto& tab : m_tabs)
             tab->set_bookmarks(m_bookmarks);
     }
@@ -889,6 +910,7 @@ void BrowserWindow::handle_engine_tab_event(JsonObject const& event, u64 tab_id)
 
     if (type == "audio"sv) {
         tab->set_audio_state(event.get_bool("playing"sv).value_or(false), event.get_bool("muted"sv).value_or(false));
+        update_tab_icon(*tab);
     } else if (type == "title"sv) {
         tab->set_title(String::from_byte_string(string_for_key(event, "title"sv)).release_value());
     } else if (type == "url"sv) {
@@ -1263,6 +1285,7 @@ void BrowserWindow::close_tabs_to_the_right(BrowserTab& tab)
 void BrowserWindow::toggle_pin_tab(BrowserTab& tab)
 {
     tab.set_pinned(!tab.is_pinned());
+    update_tab_icon(tab);
     if (tab.is_attached())
         m_engine->pin_tab(tab.tab_id(), tab.is_pinned());
     rebuild_tab_order();
@@ -1322,14 +1345,30 @@ void BrowserWindow::rebuild_tab_order()
         if (title.is_empty())
             title = "New Tab"_string;
         m_tab_widget->add_tab(tab->root(), title);
-        if (auto const* icon = tab->favicon())
-            m_tab_widget->set_tab_icon(*tab->root(), icon);
+        m_tab_widget->set_tab_icon(*tab->root(), tab_icon_for(*tab));
     }
 
     if (active && tab_is_live(active))
         m_tab_widget->set_active_widget(active->root().ptr());
     m_reordering_tabs = false;
     rebuild_tabs_menu();
+}
+
+Gfx::Bitmap const* BrowserWindow::tab_icon_for(BrowserTab const& tab) const
+{
+    if (tab.is_muted())
+        return m_muted_tab_icon.ptr();
+    if (tab.is_audio_playing())
+        return m_playing_tab_icon.ptr();
+    if (tab.is_pinned())
+        return m_pinned_tab_icon.ptr();
+    return tab.favicon();
+}
+
+void BrowserWindow::update_tab_icon(BrowserTab& tab)
+{
+    if (m_tab_widget)
+        m_tab_widget->set_tab_icon(*tab.root(), tab_icon_for(tab));
 }
 
 void BrowserWindow::rebuild_tabs_menu()
@@ -1377,6 +1416,9 @@ void BrowserWindow::rebuild_history_menu()
         }
     }
     m_history_menu->add_separator();
+    m_history_menu->add_action(GUI::Action::create("&Search History…"sv, [this](auto&) {
+        show_history_search();
+    }));
     m_history_menu->add_action(GUI::Action::create("Clear &History…"sv, [this](auto&) {
         auto result = GUI::MessageBox::show(m_window, "Clear all browsing history?"sv, "Clear History"sv, GUI::MessageBox::Type::Question, GUI::MessageBox::InputType::YesNo);
         if (result == GUI::Dialog::ExecResult::Yes)
@@ -1385,6 +1427,273 @@ void BrowserWindow::rebuild_history_menu()
     m_history_menu->add_action(GUI::Action::create("Show &History"sv, [this](auto&) {
         navigate_active("about:history"_string);
     }));
+}
+
+void BrowserWindow::show_history_search()
+{
+    if (!m_engine)
+        return;
+
+    String query;
+    if (GUI::InputBox::show(m_window, query, "Search history"sv, "Search History"sv, GUI::InputType::Text) != GUI::Dialog::ExecResult::OK)
+        return;
+    if (query.is_empty())
+        return;
+    m_engine->search_history(query, 50);
+}
+
+void BrowserWindow::show_history_results(JsonArray const& items, String const& query)
+{
+    m_history_results_rows.clear();
+    m_history_result_urls.clear();
+
+    for (auto const& value : items.values()) {
+        if (!value.is_object())
+            continue;
+        auto const& object = value.as_object();
+        auto title = String::from_byte_string(object.get_byte_string("title"sv).value_or({})).release_value();
+        auto url = String::from_byte_string(object.get_byte_string("url"sv).value_or({})).release_value();
+        if (url.is_empty())
+            continue;
+
+        JsonObject row;
+        row.set("title"sv, (title.is_empty() ? url : title).bytes_as_string_view());
+        row.set("url"sv, url.bytes_as_string_view());
+        m_history_results_rows.must_append(move(row));
+        m_history_result_urls.append(url);
+    }
+
+    if (!m_history_results_window) {
+        m_history_results_window = GUI::Window::construct();
+        m_history_results_window->set_title("History Search"sv);
+        m_history_results_window->resize(760, 420);
+
+        auto main_widget = m_history_results_window->set_main_widget<GUI::Widget>();
+        main_widget->set_fill_with_background_color(true);
+        main_widget->set_layout<GUI::VerticalBoxLayout>(GUI::Margins { 6 }, 6);
+
+        Vector<GUI::JsonArrayModel::FieldSpec> fields;
+        fields.append({ "title"sv, "Title"_string, Gfx::TextAlignment::CenterLeft });
+        fields.append({ "url"sv, "Address"_string, Gfx::TextAlignment::CenterLeft });
+        m_history_results_model = GUI::JsonArrayModel::create_from_source([this]() -> ErrorOr<JsonArray> {
+            return m_history_results_rows;
+        },
+            move(fields));
+
+        m_history_results_table = main_widget->add<GUI::TableView>();
+        m_history_results_table->set_model(m_history_results_model);
+        m_history_results_table->set_column_headers_visible(true);
+        m_history_results_table->set_column_width(0, 320);
+        m_history_results_table->set_column_width(1, 380);
+        m_history_results_table->on_activation = [this](auto const& index) {
+            auto row = index.row();
+            if (row >= 0 && row < static_cast<int>(m_history_result_urls.size()))
+                navigate_active(m_history_result_urls[row]);
+        };
+
+        m_history_results_window->on_close = [this] {
+            m_history_results_window->hide();
+        };
+    }
+
+    m_history_results_window->set_title(ByteString::formatted("History: {}", query.bytes_as_string_view()));
+    if (m_history_results_model)
+        m_history_results_model->update();
+    m_history_results_window->show();
+    m_history_results_window->center_on_screen();
+}
+
+void BrowserWindow::show_bookmarks_manager()
+{
+    if (!m_engine)
+        return;
+
+    if (!m_bookmarks_window) {
+        m_bookmarks_window = GUI::Window::construct();
+        m_bookmarks_window->set_title("Bookmarks"sv);
+        m_bookmarks_window->resize(780, 360);
+
+        auto main_widget = m_bookmarks_window->set_main_widget<GUI::Widget>();
+        main_widget->set_fill_with_background_color(true);
+        main_widget->set_layout<GUI::VerticalBoxLayout>(GUI::Margins { 6 }, 6);
+
+        Vector<GUI::JsonArrayModel::FieldSpec> fields;
+        fields.append({ "title"sv, "Title"_string, Gfx::TextAlignment::CenterLeft });
+        fields.append({ "type"sv, "Type"_string, Gfx::TextAlignment::CenterLeft });
+        fields.append({ "url"sv, "Address"_string, Gfx::TextAlignment::CenterLeft });
+        m_bookmarks_model = GUI::JsonArrayModel::create_from_source([this]() -> ErrorOr<JsonArray> {
+            return m_bookmark_rows;
+        },
+            move(fields));
+
+        auto& footer = main_widget->add<GUI::Widget>();
+        footer.set_fill_with_background_color(true);
+        footer.set_fixed_height(28);
+        footer.set_layout<GUI::HorizontalBoxLayout>(GUI::Margins { 0 }, 4);
+
+        auto& add_bookmark_button = footer.add<GUI::Button>("Add Bookmark"_string);
+        add_bookmark_button.set_fixed_width(110);
+        add_bookmark_button.on_click = [this](auto) {
+            auto* tab = active_tab();
+            String title = tab ? tab->display_title() : String {};
+            String url = tab ? tab->current_url() : String {};
+            if (GUI::InputBox::show(m_bookmarks_window, title, "Bookmark title"sv, "Add Bookmark"sv, GUI::InputType::Text) != GUI::Dialog::ExecResult::OK)
+                return;
+            if (GUI::InputBox::show(m_bookmarks_window, url, "Bookmark URL"sv, "Add Bookmark"sv, GUI::InputType::Text) != GUI::Dialog::ExecResult::OK)
+                return;
+            if (url.is_empty())
+                return;
+            m_engine->add_bookmark(tab && tab->is_attached() ? tab->tab_id() : 0, url, title, selected_folder_id());
+        };
+
+        auto& add_folder_button = footer.add<GUI::Button>("New Folder"_string);
+        add_folder_button.set_fixed_width(90);
+        add_folder_button.on_click = [this](auto) {
+            String title;
+            if (GUI::InputBox::show(m_bookmarks_window, title, "Folder name"sv, "New Folder"sv, GUI::InputType::Text) != GUI::Dialog::ExecResult::OK)
+                return;
+            if (title.is_empty())
+                return;
+            m_engine->add_folder(title, selected_folder_id());
+        };
+
+        auto& edit_button = footer.add<GUI::Button>("Edit"_string);
+        edit_button.set_fixed_width(60);
+        edit_button.on_click = [this](auto) {
+            auto const* item = selected_bookmark();
+            if (!item)
+                return;
+            String title = item->title;
+            if (GUI::InputBox::show(m_bookmarks_window, title, "Bookmark title"sv, "Edit"sv, GUI::InputType::Text) != GUI::Dialog::ExecResult::OK)
+                return;
+            if (item->is_folder) {
+                m_engine->edit_folder(item->id, title);
+                return;
+            }
+            String url = item->url;
+            if (GUI::InputBox::show(m_bookmarks_window, url, "Bookmark URL"sv, "Edit"sv, GUI::InputType::Text) != GUI::Dialog::ExecResult::OK)
+                return;
+            if (!url.is_empty())
+                m_engine->edit_bookmark(0, item->id, url, title);
+        };
+
+        auto& delete_button = footer.add<GUI::Button>("Delete"_string);
+        delete_button.set_fixed_width(60);
+        delete_button.on_click = [this](auto) {
+            if (auto const* item = selected_bookmark())
+                m_engine->remove_bookmark(0, item->id);
+        };
+
+        auto& up_button = footer.add<GUI::Button>("Move Up"_string);
+        up_button.set_fixed_width(70);
+        up_button.on_click = [this](auto) {
+            auto const* item = selected_bookmark();
+            if (!item || item->index == 0)
+                return;
+            m_engine->move_bookmark(item->id, item->parent, item->index - 1);
+        };
+
+        auto& down_button = footer.add<GUI::Button>("Move Down"_string);
+        down_button.set_fixed_width(80);
+        down_button.on_click = [this](auto) {
+            auto const* item = selected_bookmark();
+            if (!item || item->index + 1 >= sibling_count(item->parent))
+                return;
+            m_engine->move_bookmark(item->id, item->parent, item->index + 1);
+        };
+
+        auto& close_button = footer.add<GUI::Button>("Close"_string);
+        close_button.set_fixed_width(60);
+        close_button.on_click = [this](auto) {
+            m_bookmarks_window->hide();
+        };
+
+
+        m_bookmarks_table = main_widget->add<GUI::TableView>();
+        m_bookmarks_table->set_model(m_bookmarks_model);
+        m_bookmarks_table->set_column_headers_visible(true);
+        m_bookmarks_table->set_column_width(0, 320);
+        m_bookmarks_table->set_column_width(1, 80);
+        m_bookmarks_table->set_column_width(2, 360);
+        m_bookmarks_table->on_activation = [this](auto const& index) {
+            auto row = index.row();
+            if (row < 0 || row >= static_cast<int>(m_flat_bookmarks.size()))
+                return;
+            auto const& item = m_flat_bookmarks[row];
+            if (!item.is_folder && !item.url.is_empty())
+                navigate_active(item.url);
+        };
+
+        m_bookmarks_window->on_close = [this] {
+            m_bookmarks_window->hide();
+        };
+    }
+
+    rebuild_bookmarks_manager();
+    m_bookmarks_window->show();
+    m_bookmarks_window->center_on_screen();
+}
+
+void BrowserWindow::rebuild_bookmarks_manager()
+{
+    m_flat_bookmarks.clear();
+    m_bookmark_rows.clear();
+
+    Function<void(Vector<BookmarkEntry> const&, String const&, size_t)> flatten = [&](Vector<BookmarkEntry> const& items, String const& parent, size_t depth) {
+        for (size_t i = 0; i < items.size(); ++i) {
+            auto const& item = items[i];
+            m_flat_bookmarks.append({ item.id, item.title, item.url, parent, item.is_folder, i, depth });
+
+            StringBuilder indent;
+            for (size_t level = 0; level < depth; ++level)
+                indent.append("  "sv);
+            auto title = item.title.is_empty() ? item.url : item.title;
+            auto label = String::formatted("{}{}", indent.string_view(), title).release_value();
+
+            JsonObject row;
+            row.set("title"sv, label.bytes_as_string_view());
+            row.set("type"sv, item.is_folder ? "Folder"sv : "Bookmark"sv);
+            row.set("url"sv, item.url.bytes_as_string_view());
+            m_bookmark_rows.must_append(move(row));
+
+            if (item.is_folder)
+                flatten(item.children, item.id, depth + 1);
+        }
+    };
+    flatten(m_bookmarks, {}, 0);
+
+    if (m_bookmarks_model)
+        m_bookmarks_model->update();
+}
+
+BrowserWindow::FlatBookmark const* BrowserWindow::selected_bookmark() const
+{
+    if (!m_bookmarks_table)
+        return nullptr;
+    auto const& selection = m_bookmarks_table->selection();
+    if (selection.is_empty())
+        return nullptr;
+    auto row = selection.first().row();
+    if (row < 0 || row >= static_cast<int>(m_flat_bookmarks.size()))
+        return nullptr;
+    return &m_flat_bookmarks[row];
+}
+
+String BrowserWindow::selected_folder_id() const
+{
+    if (auto const* item = selected_bookmark(); item && item->is_folder)
+        return item->id;
+    return {};
+}
+
+size_t BrowserWindow::sibling_count(String const& parent) const
+{
+    size_t count = 0;
+    for (auto const& item : m_flat_bookmarks) {
+        if (item.parent == parent)
+            ++count;
+    }
+    return count;
 }
 
 String BrowserWindow::bookmark_id_for_url(StringView url) const

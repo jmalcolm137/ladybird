@@ -26,12 +26,16 @@ Version: 9. `Shared/EngineProtocol.h` is authoritative.
 | `find` | `tab`, `query`, `match_case` | Start/replace find-in-page; empty ends it. |
 | `find_next` / `find_previous` | `tab` | Move between matches. |
 | `toggle_bookmark` | `tab` | Toggle the current URL in the bookmark store. |
-| `add_bookmark` | `tab`, `url`, `title` | Add a bookmark; the engine re-sends `bookmarks` and the tab's `url` state. |
+| `add_bookmark` | `tab`, `url`, `title`, `parent` | Add a bookmark, optionally inside a folder; the engine re-sends `bookmarks` and the tab's `url` state. |
 | `edit_bookmark` | `tab`, `id`, `url`, `title` | Edit a bookmark by ID. |
-| `remove_bookmark` | `tab`, `id` | Remove a bookmark by ID. |
+| `remove_bookmark` | `tab`, `id` | Remove a bookmark or folder by ID. |
+| `add_folder` | `title`, `parent` | Create a bookmark folder, optionally inside another folder. |
+| `edit_folder` | `id`, `title` | Rename a bookmark folder. |
+| `move_bookmark` | `id`, `parent`, `index` | Move an item to `index` within a folder (or the root). |
 | `pin_tab` | `tab`, `pinned` | Persist a tab's pinned state in the native session store. |
 | `toggle_mute` | `tab` | Toggle the page mute state; the engine answers with `audio`. |
 | `history_recent` | `limit` | Ask for the most recent history entries; the engine answers with `history_recent`. |
+| `history_search` | `query`, `limit` | Search titles and URLs; the engine answers with `history_search_results`. |
 | `history_clear` | | Remove all history entries. |
 | `copy` / `cut` | `tab` | Put the page selection on the clipboard as plain text. In-page Ctrl+C/Ctrl+X use WebContent's rich copy path instead. |
 | `paste` | `tab`, `items` | Paste clipboard representations into the page. `items` has the same shape as `clipboard_write`. The legacy `text` field is still accepted. |
@@ -82,6 +86,7 @@ Version: 9. `Shared/EngineProtocol.h` is authoritative.
 | `devtools_disabled` | | The DevTools server stopped. |
 | `devtools_error` | `message` | Enabling DevTools or launching the client failed. |
 | `history_recent` | `items` | Recent history entries, each with `url` and `title`. Sent after `history_recent` and `history_clear`. |
+| `history_search_results` | `query`, `items` | Matching history entries for a `history_search`; each item has `url` and `title`. |
 | `audio` | `tab`, `playing`, `muted` | The page started/stopped playing audio, or its mute state changed. |
 | `fullscreen` | `tab`, `fullscreen` | Page requested/left fullscreen. |
 | `bookmarks` | `items` | The bookmark tree for the bookmarks bar. Each item has `id`, `type` (`bookmark` or `folder`), `title`, and either `url` or nested `items`. |

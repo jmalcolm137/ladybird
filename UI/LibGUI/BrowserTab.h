@@ -71,6 +71,7 @@ public:
     bool is_pinned() const { return m_pinned; }
     void set_pinned(bool pinned) { m_pinned = pinned; }
     bool is_muted() const { return m_muted; }
+    bool is_audio_playing() const { return m_audio_playing; }
     void set_audio_state(bool playing, bool muted);
     Gfx::Bitmap const* favicon() const { return m_favicon.ptr(); }
 
@@ -125,6 +126,7 @@ public:
     Function<void(bool)> on_bookmark_change;
     Function<void()> on_hard_reload;
     Function<void(String const&, String const&, bool)> on_permission_decision;
+    Function<void(GUI::Widget&)> on_tabs_menu_request;
 
 private:
     static StringView button_name(GUI::MouseButton);
@@ -154,7 +156,6 @@ private:
     RefPtr<GUI::Menu> m_select_dropdown;
     RefPtr<GUI::Menu> m_site_menu;
     RefPtr<GUI::CheckBox> m_match_case;
-    RefPtr<GUI::Button> m_mute_button;
     RefPtr<Gfx::Bitmap> m_favicon;
     bool m_pinned { false };
     bool m_audio_playing { false };

@@ -137,13 +137,16 @@ navigating the real engine.
   tab bar, URL bar, status bar, and app icon.
 * Tabbed browsing: new/close/activate tabs, titles, favicons, per-tab history
   state, drag reordering (LibGUI `TabWidget`), pinning, mute/audio state, move to
-  a new window, close-tabs-to-the-right, and a Tabs menu listing every tab.
+  a new window, close-tabs-to-the-right, tab pin/mute/audio icons, a Tabs menu
+  listing every tab, and a Tabs button in the toolbar. The chrome can also move
+  a tab to a new window and close tabs to the right.
 * Navigation: load/search from the URL bar, back, forward, reload (with cache
   bypass support in the protocol), stop, zoom in/out/reset.
 * Find in page: Ctrl+F, incremental search, next/previous, and close.
 * Bookmarks: Ctrl+D toggle, filled/contour star, a bookmarks bar fed by
   Ladybird's real `BookmarkStore`, add/edit/remove dialogs for the current page,
-  and a show/hide action.
+  a manager window for adding bookmarks and folders, editing, deleting, and
+  moving items up or down, and a show/hide action.
 * Page dialogs: alert, confirm, and prompt are shown as LibGUI dialogs and
   answered back to the engine.
 * Page-initiated fullscreen and F11 window fullscreen.
@@ -177,12 +180,13 @@ navigating the real engine.
   window's session (normal or private), and clearing only prunes that session.
 * Permission prompts for page requests such as the microphone.
 * File picker for `<input type=file>` and native `<select>` dropdowns.
-* Find-in-page match count and a match-case toggle in the find bar.
+* Find-in-page match count, a match-case toggle, all-matches highlighting, and
+  Escape to close the find bar.
 * A click-to-reload crash overlay for a crashed WebContent process, and an
   unresponsive-page banner that hard-reloads a renderer spinning without
   presenting frames.
-* History menu with the most recent entries, clear-history confirmation, and the
-  full history page.
+* History menu with the most recent entries, search results in a native window,
+  clear-history confirmation, and the full history page.
 * Site information includes the permission decisions made for the current site
   and a Forget action; certificate details are not exposed by the engine yet.
 * Session restore uses the engine host's native `SessionStore` and

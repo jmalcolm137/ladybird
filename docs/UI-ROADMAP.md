@@ -31,12 +31,12 @@ reference for behaviour and options.
 | Area | Remaining work |
 |---|---|
 | Address bar | **Done:** autocomplete and search suggestions are exposed over the control socket and shown in a keyboard-navigable popup. Inline completion is still future work. |
-| Tabs | **Done:** reopen closed tab, tab search, pin tab, mute/audio indicator, move tab to a new window, close tabs to the right, and a Tabs menu listing every tab. An icon-based overflow strip is still a cosmetic alternative. |
-| Bookmarks | **Mostly done:** the bar renders folders and nested menus and has a leading overflow menu; the chrome can add, edit, and remove the current page's bookmark. Reordering and folder management still live in `about:bookmarks`. |
-| History | **Done:** the History menu lists recent entries, clears history after confirmation, and links to `about:history`. Search remains on the history page. |
+| Tabs | **Done:** reopen closed tab, tab search, pin tab, mute/audio indicators on the tab, move tab to a new window, close tabs to the right, and a Tabs menu plus toolbar button. |
+| Bookmarks | **Done:** the bar renders folders and nested menus; the chrome can add, edit, remove, and move bookmarks, and create and rename folders in a manager window. |
+| History | **Done:** the History menu lists recent entries, searches titles and URLs into a native results window, clears history after confirmation, and links to `about:history`. |
 | Downloads | **Done:** the window filters to the active window's session and Clear Completed prunes only that session. |
 | Site info | **Mostly done:** the indicator shows host, security state, zoom, site settings, the permission decisions made this session, and a Forget action. Certificate details need a new engine API; permission memory is in-memory. |
-| Find | **Done:** the find bar has a match-case toggle. |
+| Find | **Done:** the find bar has a match-case toggle, highlights all matches, and closes on Escape. |
 | Zoom | **Done:** the engine emits `zoom_changed` and the toolbar shows the current percentage with zoom controls. |
 | File picker | **Partially done:** the page's filters reach the picker. Multiple selection needs a multi-select LibGUI file picker; the engine and protocol already accept a list. |
 | Settings | Native dialogs only where `about:settings` cannot express the choice; this is low priority. |

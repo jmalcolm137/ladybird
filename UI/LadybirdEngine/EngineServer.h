@@ -159,10 +159,14 @@ private:
     void handle_select_dropdown_closed(u64 tab_id, JsonObject const&);
     void handle_download_action(JsonObject const&);
     void handle_history_recent(JsonObject const&);
+    void handle_history_search(JsonObject const&);
     void handle_history_clear();
     void handle_add_bookmark(JsonObject const&);
     void handle_edit_bookmark(JsonObject const&);
     void handle_remove_bookmark(JsonObject const&);
+    void handle_add_folder(JsonObject const&);
+    void handle_edit_folder(JsonObject const&);
+    void handle_move_bookmark(JsonObject const&);
     void handle_pin_tab(u64 tab_id, JsonObject const&);
     void handle_toggle_mute(u64 tab_id);
     void handle_frame_ack(u64 tab_id, JsonObject const&);

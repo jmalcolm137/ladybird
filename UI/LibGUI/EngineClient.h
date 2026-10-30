@@ -57,12 +57,16 @@ public:
     void find_next(u64 tab_id);
     void find_previous(u64 tab_id);
     void toggle_bookmark(u64 tab_id);
-    void add_bookmark(u64 tab_id, String const& url, String const& title);
+    void add_bookmark(u64 tab_id, String const& url, String const& title, String const& parent = {});
+    void add_folder(String const& title, String const& parent = {});
+    void edit_folder(String const& id, String const& title);
+    void move_bookmark(String const& id, String const& parent, size_t index);
     void edit_bookmark(u64 tab_id, String const& id, String const& url, String const& title);
     void remove_bookmark(u64 tab_id, String const& id);
     void pin_tab(u64 tab_id, bool pinned);
     void toggle_mute(u64 tab_id);
     void request_history(u64 limit = 10);
+    void search_history(String const& query, u64 limit = 50);
     void clear_history();
     void copy(u64 tab_id, bool cut = false);
     void paste(u64 tab_id, JsonArray items);

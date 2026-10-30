@@ -302,6 +302,8 @@ void EngineServer::dispatch_command(JsonObject const& command)
         handle_download_action(command);
     } else if (*type == "history_recent"sv) {
         handle_history_recent(command);
+    } else if (*type == "history_search"sv) {
+        handle_history_search(command);
     } else if (*type == "history_clear"sv) {
         handle_history_clear();
     } else if (*type == "add_bookmark"sv) {
@@ -310,6 +312,12 @@ void EngineServer::dispatch_command(JsonObject const& command)
         handle_edit_bookmark(command);
     } else if (*type == "remove_bookmark"sv) {
         handle_remove_bookmark(command);
+    } else if (*type == "add_folder"sv) {
+        handle_add_folder(command);
+    } else if (*type == "edit_folder"sv) {
+        handle_edit_folder(command);
+    } else if (*type == "move_bookmark"sv) {
+        handle_move_bookmark(command);
     } else if (*type == "clipboard_changed"sv) {
         handle_clipboard_changed(command);
     } else if (*type == "toggle_devtools"sv) {
@@ -1208,7 +1216,7 @@ void EngineServer::handle_find(u64 tab_id, JsonObject const& command)
     auto case_sensitivity = command.get_bool("match_case"sv).value_or(false)
         ? CaseSensitivity::CaseSensitive
         : CaseSensitivity::CaseInsensitive;
-    tab->view->find_in_page(Utf16String::from_utf8_with_replacement_character(query->bytes_as_string_view()), case_sensitivity);
+    tab->view->find_in_page(Utf16String::from_utf8_with_replacement_character(query->bytes_as_string_view()), case_sensitivity, true);
 }
 
 void EngineServer::destroy_frame_buffer(Tab& tab)
@@ -1438,7 +1446,15 @@ void EngineServer::handle_add_bookmark(JsonObject const& command)
     Optional<String> title;
     if (auto text = command.get_string("title"sv); text.has_value())
         title = *text;
-    WebView::Application::bookmark_store().add_bookmark(url.release_value(), move(title), {});
+
+    Optional<String> parent;
+    if (auto text = command.get_string("parent"sv); text.has_value() && !text->is_empty())
+        parent = *text;
+
+    if (parent.has_value())
+        WebView::Application::bookmark_store().add_bookmark(url.release_value(), move(title), {}, *parent);
+    else
+        WebView::Application::bookmark_store().add_bookmark(url.release_value(), move(title), {});
     send_bookmarks();
     if (auto tab_id = command.get_u64("tab"sv); tab_id.has_value()) {
         if (auto* tab = tab_for_id(*tab_id))
@@ -1479,6 +1495,77 @@ void EngineServer::handle_remove_bookmark(JsonObject const& command)
         if (auto* tab = tab_for_id(*tab_id))
             send_url(*tab);
     }
+}
+
+void EngineServer::handle_history_search(JsonObject const& command)
+{
+    String query;
+    if (auto text = command.get_string("query"sv); text.has_value())
+        query = *text;
+    auto limit = static_cast<size_t>(min<u64>(command.get_u64("limit"sv).value_or(50), 200));
+
+    JsonArray items;
+    if (auto* store = WebView::Application::default_session().history_store.ptr()) {
+        for (auto const& entry : store->list_entries(query.bytes_as_string_view(), 0, limit)) {
+            JsonObject item;
+            item.set("url"sv, entry.url);
+            item.set("title"sv, entry.title.value_or(entry.url));
+            items.must_append(move(item));
+        }
+    }
+
+    JsonObject event;
+    event.set("type"sv, "history_search_results"sv);
+    event.set("query"sv, query.bytes_as_string_view());
+    event.set("items"sv, move(items));
+    send_event(move(event));
+}
+
+void EngineServer::handle_add_folder(JsonObject const& command)
+{
+    Optional<String> title;
+    if (auto text = command.get_string("title"sv); text.has_value())
+        title = *text;
+
+    auto parent_text = command.get_string("parent"sv);
+    if (parent_text.has_value() && !parent_text->is_empty()) {
+        String parent = *parent_text;
+        WebView::Application::bookmark_store().add_folder(move(title), parent);
+    } else {
+        WebView::Application::bookmark_store().add_folder(move(title), {});
+    }
+    send_bookmarks();
+}
+
+void EngineServer::handle_edit_folder(JsonObject const& command)
+{
+    auto id = command.get_string("id"sv);
+    if (!id.has_value())
+        return;
+
+    Optional<String> title;
+    if (auto text = command.get_string("title"sv); text.has_value())
+        title = *text;
+
+    WebView::Application::bookmark_store().edit_folder(*id, move(title));
+    send_bookmarks();
+}
+
+void EngineServer::handle_move_bookmark(JsonObject const& command)
+{
+    auto id = command.get_string("id"sv);
+    if (!id.has_value())
+        return;
+
+    auto index = static_cast<size_t>(command.get_u64("index"sv).value_or(0));
+    auto parent_text = command.get_string("parent"sv);
+    if (parent_text.has_value() && !parent_text->is_empty()) {
+        String parent = *parent_text;
+        WebView::Application::bookmark_store().move_item(*id, parent, index);
+    } else {
+        WebView::Application::bookmark_store().move_item(*id, {}, index);
+    }
+    send_bookmarks();
 }
 
 void EngineServer::handle_pin_tab(u64 tab_id, JsonObject const& command)

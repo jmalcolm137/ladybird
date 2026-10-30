@@ -115,6 +115,15 @@ BrowserTab::BrowserTab(EngineClient& engine, GUI::Window& window, GUI::Action& b
     m_bookmarks_bar->set_layout<GUI::HorizontalBoxLayout>(GUI::Margins { 4 }, 4);
     m_bookmarks_bar->set_visible(false);
 
+    auto& tabs_button = m_toolbar->add<MenuButton>("Tabs"_string);
+    tabs_button.set_button_style(Gfx::ButtonStyle::Coolbar);
+    tabs_button.set_fixed_height(22);
+    tabs_button.set_fixed_width(44);
+    tabs_button.on_menu_request = [this, &tabs_button] {
+        if (on_tabs_menu_request)
+            on_tabs_menu_request(tabs_button);
+    };
+
     m_location_box = m_toolbar->add<GUI::TextBox>();
     m_location_box->set_placeholder("Search or enter address"sv);
     m_location_box->set_preferred_width(GUI::SpecialDimension::Grow);
@@ -221,16 +230,6 @@ BrowserTab::BrowserTab(EngineClient& engine, GUI::Window& window, GUI::Action& b
             m_engine.set_zoom(m_tab_id, "reset"sv);
     }));
 
-    auto& mute_button = m_toolbar->add<GUI::Button>("Mute"_string);
-    mute_button.set_fixed_height(22);
-    mute_button.set_fixed_width(56);
-    mute_button.set_visible(false);
-    mute_button.on_click = [this](auto) {
-        if (is_attached())
-            m_engine.toggle_mute(m_tab_id);
-    };
-    m_mute_button = mute_button;
-
     m_find_bar = m_root->add<GUI::Widget>();
     m_find_bar->set_fixed_height(30);
     m_find_bar->set_preferred_width(GUI::SpecialDimension::Grow);
@@ -247,6 +246,9 @@ BrowserTab::BrowserTab(EngineClient& engine, GUI::Window& window, GUI::Action& b
     m_find_box->on_return_pressed = [this] {
         if (is_attached())
             m_engine.find_next(m_tab_id);
+    };
+    m_find_box->on_escape_pressed = [this] {
+        hide_find_bar();
     };
 
     m_match_case = m_find_bar->add<GUI::CheckBox>("Match case"_string);
@@ -981,10 +983,6 @@ void BrowserTab::set_audio_state(bool playing, bool muted)
 {
     m_audio_playing = playing;
     m_muted = muted;
-    if (m_mute_button) {
-        m_mute_button->set_text(muted ? "Unmute"_string : "Mute"_string);
-        m_mute_button->set_visible(playing || muted);
-    }
 }
 
 void BrowserTab::add_select_dropdown_items(GUI::Menu& menu, JsonArray const& items, bool in_group)

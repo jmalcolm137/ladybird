@@ -486,7 +486,7 @@ void BrowserSession::on_engine_event(JsonObject const& event)
         return;
     }
 
-    if (type == "bookmarks"sv || type == "downloads"sv || type == "download_added"sv || type == "download_updated"sv || type == "download_removed"sv) {
+    if (type == "history_recent"sv || type == "history_search_results"sv || type == "bookmarks"sv || type == "downloads"sv || type == "download_added"sv || type == "download_updated"sv || type == "download_removed"sv) {
         for (auto& window : m_windows)
             window->handle_engine_global_event(event);
         return;

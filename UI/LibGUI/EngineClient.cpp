@@ -648,13 +648,45 @@ void EngineClient::open_devtools_client()
 
 void EngineClient::select_all(u64 tab_id) { send_simple("select_all"sv, tab_id); }
 
-void EngineClient::add_bookmark(u64 tab_id, String const& url, String const& title)
+void EngineClient::add_bookmark(u64 tab_id, String const& url, String const& title, String const& parent)
 {
     JsonObject event;
     event.set("type"sv, "add_bookmark"sv);
     event.set("tab"sv, tab_id);
     event.set("url"sv, url.bytes_as_string_view());
     event.set("title"sv, title.bytes_as_string_view());
+    if (!parent.is_empty())
+        event.set("parent"sv, parent.bytes_as_string_view());
+    send(event);
+}
+
+void EngineClient::add_folder(String const& title, String const& parent)
+{
+    JsonObject event;
+    event.set("type"sv, "add_folder"sv);
+    event.set("title"sv, title.bytes_as_string_view());
+    if (!parent.is_empty())
+        event.set("parent"sv, parent.bytes_as_string_view());
+    send(event);
+}
+
+void EngineClient::edit_folder(String const& id, String const& title)
+{
+    JsonObject event;
+    event.set("type"sv, "edit_folder"sv);
+    event.set("id"sv, id.bytes_as_string_view());
+    event.set("title"sv, title.bytes_as_string_view());
+    send(event);
+}
+
+void EngineClient::move_bookmark(String const& id, String const& parent, size_t index)
+{
+    JsonObject event;
+    event.set("type"sv, "move_bookmark"sv);
+    event.set("id"sv, id.bytes_as_string_view());
+    if (!parent.is_empty())
+        event.set("parent"sv, parent.bytes_as_string_view());
+    event.set("index"sv, index);
     send(event);
 }
 
@@ -693,6 +725,15 @@ void EngineClient::request_history(u64 limit)
 {
     JsonObject event;
     event.set("type"sv, "history_recent"sv);
+    event.set("limit"sv, limit);
+    send(event);
+}
+
+void EngineClient::search_history(String const& query, u64 limit)
+{
+    JsonObject event;
+    event.set("type"sv, "history_search"sv);
+    event.set("query"sv, query.bytes_as_string_view());
     event.set("limit"sv, limit);
     send(event);
 }
