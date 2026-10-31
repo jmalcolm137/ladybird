@@ -124,7 +124,11 @@ private:
         Optional<String> pending_navigation;
         bool pending_navigation_user_input { true };
         Vector<NonnullRefPtr<WebView::Action>> context_menu_actions;
-        HashMap<u64, Function<void(bool)>> pending_permissions;
+        struct PendingPermission {
+            WebView::PermissionPromptRequest request;
+            Function<void(Web::Permissions::PromptOutcome)> callback;
+        };
+        HashMap<u64, PendingPermission> pending_permissions;
         OwnPtr<WebView::WebCompatReport> compat_report;
         Optional<ByteBuffer> compat_report_screenshot;
         bool compat_report_has_page_dumps { false };
@@ -235,7 +239,7 @@ private:
     void send_cursor(Tab&, Gfx::Cursor const&);
     void send_bookmarks();
     void send_context_menu(Tab&, StringView kind, Gfx::IntPoint, WebView::Menu&);
-    void send_permission_request(Tab&, Utf16String const& name, URL::Origin const&, u64 request_id);
+    void send_permission_request(Tab&, WebView::PermissionPromptRequest const&, u64 request_id);
     void send_file_picker_request(Tab&, Web::HTML::FileFilter const&, Web::HTML::AllowMultipleFiles);
     void send_select_dropdown(Tab&, Gfx::IntPoint, i32 minimum_width, Vector<Web::HTML::SelectItem> const&);
     void send_downloads();

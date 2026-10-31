@@ -28,6 +28,7 @@
 #include <QLocale>
 #include <QMenu>
 #include <QMessageBox>
+#include <QMouseEvent>
 #include <QPainter>
 #include <QPushButton>
 #include <QScrollBar>
@@ -39,6 +40,7 @@
 #include <QTimer>
 #include <QTreeWidget>
 #include <QVBoxLayout>
+#include <QWindow>
 
 #include <errno.h>
 
@@ -49,6 +51,10 @@ QString task_manager_site_label(URL::URL const& url)
     if (url == URL::about_blank())
         return {};
     if (url.host().has_value()) {
+        // NB: Pages and request servers are isolated by site, so a site's hosts, such as www.example.com and
+        //     example.com, are listed together under its registrable domain.
+        if (auto registrable_domain = url.host()->registrable_domain(); registrable_domain.has_value())
+            return qstring_from_ak_string(*registrable_domain);
         auto host = qstring_from_ak_string(url.serialized_host());
         if (!host.isEmpty())
             return host;
@@ -290,6 +296,42 @@ bool sorts_before(QTreeWidgetItem const* a, QTreeWidgetItem const* b, int column
     return order == Qt::AscendingOrder ? less(a, b) : less(b, a);
 }
 
+// A window whose content fills its title bar gets no window moving from the platform there, so dragging the title
+// bar's empty parts moves the window, and double-clicking them zooms it, as in the browser window.
+class TitleBarMouseFilter final : public QObject {
+public:
+    TitleBarMouseFilter(QObject* parent, Function<bool()> start_window_move)
+        : QObject(parent)
+        , m_start_window_move(move(start_window_move))
+    {
+    }
+
+private:
+    virtual bool eventFilter(QObject* object, QEvent* event) override
+    {
+        if (event->type() != QEvent::MouseButtonPress && event->type() != QEvent::MouseButtonDblClick)
+            return false;
+        if (static_cast<QMouseEvent*>(event)->button() != Qt::LeftButton)
+            return false;
+        auto* window = static_cast<QWidget*>(object)->window();
+        if (window->isFullScreen())
+            return false;
+        if (event->type() == QEvent::MouseButtonDblClick) {
+            if (window->isMaximized())
+                window->showNormal();
+            else
+                window->showMaximized();
+            return true;
+        }
+        if (m_start_window_move())
+            return true;
+        auto* handle = window->windowHandle();
+        return handle && handle->startSystemMove();
+    }
+
+    Function<bool()> m_start_window_move;
+};
+
 }
 
 ProcessManagerWindow::ProcessManagerWindow(WebView::ProcessManager& process_manager)
@@ -334,6 +376,9 @@ ProcessManagerWindow::ProcessManagerWindow(WebView::ProcessManager& process_mana
     m_search->setFixedSize(220, 28);
     title_bar_layout->addWidget(m_search);
     layout->addWidget(m_title_bar);
+#if defined(AK_OS_MACOS)
+    m_title_bar->installEventFilter(new TitleBarMouseFilter(m_title_bar, [this] { return on_title_bar_drag && on_title_bar_drag(); }));
+#endif
 
     auto* list = new QWidget(content);
     auto* list_layout = new QVBoxLayout(list);
@@ -572,22 +617,27 @@ void ProcessManagerWindow::refresh()
         processes_by_child_id.set(process.child_id, &process);
 
     // Each process is listed with the browser's own processes, with a site, or with the spare processes. A process
-    // that works for another, such as a page's image decoder, is listed with it.
+    // that works for another, such as a page's image decoder or a worker's media server, is listed with it.
     auto is_spare = [](WebView::ProcessSnapshot const& process) {
         return process.type == WebView::ProcessType::WebContent && process.title.has_value() && *process.title == "(spare)"_utf16;
     };
-    // NB: A page's process, and a request server bound to a site, belong to that site.
+    // NB: A page's process, a worker's process, and a request server bound to a site, belong to that site.
     auto site_of = [](WebView::ProcessSnapshot const& process) -> QString {
-        if (!first_is_one_of(process.type, WebView::ProcessType::WebContent, WebView::ProcessType::RequestServer) || !process.site_url.has_value())
+        if (!first_is_one_of(process.type, WebView::ProcessType::WebContent, WebView::ProcessType::WebWorker, WebView::ProcessType::RequestServer) || !process.site_url.has_value())
             return {};
         return task_manager_site_label(*process.site_url);
     };
+    // NB: A process that works for another may itself work for a third, as a worker's image decoder works for the
+    //     worker. A worker with its own site stays with that site; an opaque-origin worker follows its owner.
     auto section_process = [&](WebView::ProcessSnapshot const& process) -> WebView::ProcessSnapshot const& {
-        if (process.owner_child_id.has_value()) {
-            if (auto owner = processes_by_child_id.get(*process.owner_child_id); owner.has_value())
-                return **owner;
+        auto const* section = &process;
+        for (size_t depth = 0; depth < processes.size() && section->owner_child_id.has_value() && site_of(*section).isEmpty(); ++depth) {
+            auto owner = processes_by_child_id.get(*section->owner_child_id);
+            if (!owner.has_value())
+                break;
+            section = *owner;
         }
-        return process;
+        return *section;
     };
 
     struct Site {

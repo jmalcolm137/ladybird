@@ -373,6 +373,7 @@ fn parse_calculated_numeric(
         values,
         CalcParserContext {
             percentages_resolve_as: None,
+            allow_percentages: accepted.contains(&NumericKind::Percentage),
             property,
             random_function_index: context.random_function_index,
             allowed_color_channels,
@@ -443,6 +444,15 @@ fn parse_numeric(
                 kind: NumericKind::Number,
             });
         }
+    }
+    if accepted.contains(&NumericKind::Number)
+        && let Some(value) = super::value_parser::parse_tree_counting_value(context, value, 0)
+    {
+        stream.discard_a_token();
+        return Some(ParsedNumeric {
+            value,
+            kind: NumericKind::Number,
+        });
     }
     let parsed = match &value.kind {
         ComponentKind::Token(ParserTokenKind::Number { value, .. }) if accepted.contains(&NumericKind::Number) => {

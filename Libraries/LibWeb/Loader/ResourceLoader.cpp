@@ -19,6 +19,7 @@
 #include <LibURL/Parser.h>
 #include <LibWeb/Bindings/MainThreadVM.h>
 #include <LibWeb/DOM/Document.h>
+#include <LibWeb/Fetch/Engine/NetworkTransportHandle.h>
 #include <LibWeb/Fetch/Infrastructure/HTTP/Requests.h>
 #include <LibWeb/Fetch/Infrastructure/NetworkPartitionKey.h>
 #include <LibWeb/Loader/ContentBlocker.h>
@@ -206,7 +207,7 @@ bool ResourceLoader::is_known_hsts_host(Page& page, String const& host)
     return page.client().page_did_is_known_hsts_host(host);
 }
 
-static NonnullRefPtr<HTTP::HeaderList> response_headers_for_file(StringView path, Optional<time_t> const& modified_time)
+static NonnullRefPtr<HTTP::HeaderList> response_headers_for_file(StringView path, size_t content_length, Optional<time_t> const& modified_time)
 {
     // For file:// and resource:// URLs, we have to guess the MIME type, since there's no HTTP header to tell us what
     // it is. We insert a fake Content-Type header here, so that clients can use it to learn the MIME type.
@@ -215,6 +216,7 @@ static NonnullRefPtr<HTTP::HeaderList> response_headers_for_file(StringView path
     auto response_headers = HTTP::HeaderList::create({
         { "Access-Control-Allow-Origin"sv, "null"sv },
         { "Content-Type"sv, mime_type },
+        { "Content-Length"sv, ByteString::number(content_length) },
     });
 
     if (modified_time.has_value()) {
@@ -247,12 +249,6 @@ static void log_failure(LoadRequest const& request, ErrorType const& error)
     auto load_time_ms = request.load_time().to_milliseconds();
 
     dbgln("ResourceLoader: Failed load of: \"{}\", \033[31;1mError: {}\033[0m, Duration: {}ms", url_for_logging, error, load_time_ms);
-}
-
-static void log_filtered_request(LoadRequest const& request)
-{
-    auto url_for_logging = sanitized_url_for_logging(*request.url());
-    dbgln("ResourceLoader: Filtered request to: \"{}\"", url_for_logging);
 }
 
 // What kind of resource a blocked request was for, as the browser names it to the user.
@@ -317,7 +313,6 @@ static bool should_block_request(LoadRequest const& request)
     if (auto page = request.page(); !page || page->content_blocking_enabled_for_url(request.top_level_creation_url())) {
         auto source_url = request.source_url().value_or(url);
         if (ContentBlocker::the().is_filtered(url, source_url, request.destination(), request.initiator_type(), request.request_mode())) {
-            log_filtered_request(request);
             if (page)
                 page->client().page_did_block_resource(url, blocked_resource_kind(request));
             return true;
@@ -386,7 +381,7 @@ void ResourceLoader::handle_file_load_request(LoadRequest& request, FileHandler 
 
         FileLoadResult load_result {
             .data = maybe_data.value().bytes(),
-            .response_headers = response_headers_for_file(request.url()->file_path(), st_or_error.value().st_mtime),
+            .response_headers = response_headers_for_file(request.url()->file_path(), maybe_data.value().size(), st_or_error.value().st_mtime),
         };
         on_file(load_result);
     });
@@ -466,13 +461,13 @@ void ResourceLoader::handle_resource_load_request(LoadRequest const& request, Re
 
     FileLoadResult load_result {
         .data = resource_value->data(),
-        .response_headers = response_headers_for_file(url.file_path(), resource_value->modified_time()),
+        .response_headers = response_headers_for_file(url.file_path(), resource_value->data().size(), resource_value->modified_time()),
         .timing_info = timing_info,
     };
     on_resource(load_result);
 }
 
-RefPtr<Requests::Request> ResourceLoader::load(LoadRequest& request, GC::Root<OnHeadersReceived> on_headers_received, GC::Root<OnDataReceived> on_data_received, GC::Root<OnCachedBodyAvailable> on_cached_body_available, GC::Root<OnComplete> on_complete, Requests::RequestClient::TransferLease transfer_lease)
+RefPtr<Fetch::Engine::NetworkTransportHandle> ResourceLoader::load(LoadRequest& request, GC::Root<OnHeadersReceived> on_headers_received, GC::Root<OnDataReceived> on_data_received, GC::Root<OnCachedBodyAvailable> on_cached_body_available, GC::Root<OnComplete> on_complete, Requests::RequestClient::TransferLease transfer_lease)
 {
     auto const& url = request.url().value();
 
@@ -555,11 +550,13 @@ RefPtr<Requests::Request> ResourceLoader::load(LoadRequest& request, GC::Root<On
         return nullptr;
     }
 
-    auto protocol_headers_received = [on_headers_received = move(on_headers_received), request, &protocol_request = *protocol_request](auto const& response_headers, auto status_code, auto const& reason_phrase, auto javascript_bytecode, auto javascript_bytecode_cache_vary_key, auto cache_state) {
+    auto network_transport = Fetch::Engine::NetworkTransportHandle::create(*protocol_request);
+
+    auto protocol_headers_received = [on_headers_received = move(on_headers_received), request, &protocol_request = *protocol_request, network_transport](auto const& response_headers, auto status_code, auto const& reason_phrase, auto javascript_bytecode, auto javascript_bytecode_cache_vary_key, auto cache_state) {
         if (auto page = request.page())
             page->client().page_did_receive_network_response_headers(protocol_request.id(), status_code.value_or(0), reason_phrase, response_headers->headers(), cache_state);
 
-        on_headers_received->function()(&protocol_request, response_headers, move(status_code), reason_phrase, move(javascript_bytecode), javascript_bytecode_cache_vary_key, cache_state);
+        on_headers_received->function()(network_transport.ptr(), response_headers, move(status_code), reason_phrase, move(javascript_bytecode), javascript_bytecode_cache_vary_key, cache_state);
     };
 
     auto protocol_data_received = [on_data_received = move(on_data_received), request, request_id = protocol_request->id()](auto data) {
@@ -594,7 +591,7 @@ RefPtr<Requests::Request> ResourceLoader::load(LoadRequest& request, GC::Root<On
     protocol_request->set_stop_callback([this, &protocol_request = *protocol_request] {
         finish_network_request(protocol_request);
     });
-    return protocol_request;
+    return network_transport;
 }
 
 static NonnullRefPtr<HTTP::HeaderList const> headers_with_normalized_values(HTTP::HeaderList const& headers)

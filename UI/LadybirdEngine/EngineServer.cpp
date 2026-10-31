@@ -17,6 +17,7 @@
 #include <LibCore/Environment.h>
 #include <LibCore/EventLoop.h>
 #include <LibCore/File.h>
+#include <LibAudio/Audibility.h>
 #include <LibCore/Notifier.h>
 #include <LibCore/Socket.h>
 #include <LibCore/System.h>
@@ -32,7 +33,6 @@
 #include <LibWebCommon/Clipboard/SystemClipboard.h>
 #include <LibWebCommon/HTML/VisibilityState.h>
 #include <LibWebCommon/HTML/ActivateTab.h>
-#include <LibWebCommon/HTML/AudioPlayState.h>
 #include <LibWebCommon/HTML/WebViewHints.h>
 #include <LibWebCommon/Page/InputEvent.h>
 #include <LibWebCommon/PixelUnits.h>
@@ -544,7 +544,7 @@ void EngineServer::wire_tab(Tab& tab)
             send_loading_state(*tab, loading);
     };
 
-    tab.view->on_audio_play_state_changed = [this, tab_id](Web::HTML::AudioPlayState) {
+    tab.view->on_audibility_changed = [this, tab_id](Audio::Audibility) {
         if (auto* tab = tab_for_id(tab_id))
             send_audio_state(*tab);
     };
@@ -726,16 +726,27 @@ void EngineServer::wire_tab(Tab& tab)
         send_event(move(event));
     };
 
-    tab.view->on_request_permission = [this, tab_id](Utf16String const& name, URL::Origin const& origin, Function<void(bool)> on_decided) {
+    tab.view->on_request_permission = [this, tab_id](WebView::PermissionPromptRequest const& request, WebView::PermissionPromptCallback on_decided) {
         auto* tab = tab_for_id(tab_id);
         if (!tab) {
-            on_decided(false);
+            on_decided(Web::Permissions::PromptOutcome::Cancelled);
             return;
         }
 
         auto request_id = m_next_permission_id++;
-        tab->pending_permissions.set(request_id, move(on_decided));
-        send_permission_request(*tab, name, origin, request_id);
+        tab->pending_permissions.set(request_id, Tab::PendingPermission { request, move(on_decided) });
+        send_permission_request(*tab, request, request_id);
+    };
+
+    // The engine withdraws unanswered prompts when the page goes away. Drop the matching callbacks; the engine
+    // settles them itself with PromptOutcome::Ignored.
+    tab.view->on_cancel_permission_prompt = [this, tab_id](WebView::PermissionPromptRequest const& request) {
+        auto* tab = tab_for_id(tab_id);
+        if (!tab)
+            return;
+        tab->pending_permissions.remove_all_matching([&](auto&, auto& value) {
+            return value.request.is_same_request_as(request);
+        });
     };
 
     tab.view->on_request_file_picker = [this, tab_id](Web::HTML::FileFilter const& filters, Web::HTML::AllowMultipleFiles multiple) {
@@ -2056,7 +2067,7 @@ void EngineServer::send_audio_state(Tab& tab)
     JsonObject event;
     event.set("type"sv, "audio"sv);
     event.set("tab"sv, tab.id);
-    event.set("playing"sv, tab.view->audio_play_state() == Web::HTML::AudioPlayState::Playing);
+    event.set("playing"sv, tab.view->audibility() == Audio::Audibility::Audible);
     event.set("muted"sv, tab.view->page_mute_state() == Web::HTML::MuteState::Muted);
     send_event(move(event));
 }
@@ -2847,14 +2858,15 @@ void EngineServer::handle_context_menu_action(u64 tab_id, JsonObject const& comm
     actions[*action_index]->activate();
 }
 
-void EngineServer::send_permission_request(Tab& tab, Utf16String const& name, URL::Origin const& origin, u64 request_id)
+void EngineServer::send_permission_request(Tab& tab, WebView::PermissionPromptRequest const& request, u64 request_id)
 {
     JsonObject event;
     event.set("type"sv, "permission"sv);
     event.set("tab"sv, tab.id);
     event.set("request"sv, request_id);
-    event.set("name"sv, name.to_utf8());
-    event.set("origin"sv, origin.serialize());
+    event.set("name"sv, Web::Permissions::to_string(request.name));
+    event.set("origin"sv, request.top_level_origin.serialize());
+    event.set("file"sv, request.is_file);
     send_event(move(event));
 }
 
@@ -2868,9 +2880,13 @@ void EngineServer::handle_permission_response(u64 tab_id, JsonObject const& comm
     if (!request_id.has_value())
         return;
 
-    auto callback = tab->pending_permissions.take(*request_id);
-    if (callback.has_value())
-        (*callback)(command.get_bool("granted"sv).value_or(false));
+    auto pending = tab->pending_permissions.take(*request_id);
+    if (pending.has_value()) {
+        auto outcome = command.get_bool("granted"sv).value_or(false)
+            ? Web::Permissions::PromptOutcome::AllowAlways
+            : Web::Permissions::PromptOutcome::Block;
+        pending->callback(outcome);
+    }
 }
 
 void EngineServer::send_file_picker_request(Tab& tab, Web::HTML::FileFilter const& accepted_file_types, Web::HTML::AllowMultipleFiles allow_multiple_files)

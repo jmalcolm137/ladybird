@@ -19,11 +19,11 @@
 #include <LibGfx/Font/Font.h>
 #include <LibGfx/YUVData.h>
 #include <LibMediaCodecs/VideoFrame.h>
-#include <LibMediaCodecs/VideoFrameHandle.h>
 #include <LibMediaCodecs/VideoSurface.h>
 
 #include <core/SkFont.h>
 #include <core/SkImage.h>
+#include <core/SkImageFilter.h>
 #include <core/SkPath.h>
 #include <core/SkTextBlob.h>
 #include <core/SkYUVAPixmaps.h>
@@ -33,6 +33,25 @@
 namespace Compositor {
 
 using namespace Compositing;
+
+struct DisplayListRasterCache::LayerImageFilterCache {
+    AK_ALLOC_WITH_KMALLOC;
+
+    struct Entry {
+        ByteBuffer filter_bytes;
+        sk_sp<SkImageFilter> image_filter;
+    };
+    struct BackdropEntry {
+        ByteBuffer filter_bytes;
+        Gfx::IntRect region;
+        Gfx::CornerRadii corner_radii;
+        bool limited_to_region { false };
+        sk_sp<SkImageFilter> image_filter;
+    };
+    HashMap<u64, HashMap<u32, Entry>> entries_by_tree_structural_epoch_and_effect;
+    HashMap<u64, HashMap<u32, BackdropEntry>> backdrop_entries_by_tree_structural_epoch_and_effect;
+    u64 tree_structural_epoch { 0 };
+};
 
 struct DisplayListRasterCache::ImageFrameImage {
     AK_ALLOC_WITH_KMALLOC;
@@ -53,9 +72,7 @@ struct DisplayListRasterCache::ImageFrameImage {
 struct DisplayListRasterCache::VideoSinkImage {
     AK_ALLOC_WITH_KMALLOC;
 
-    Media::VideoFramePoolID pool_id { 0 };
-    u32 slot_index { 0 };
-    u64 slot_acquisition_id { 0 };
+    u64 frame_id { 0 };
     // Drawing is recorded here but read by the GPU afterwards, so the frame stays held, and its surface's pixels
     // with it, until a different frame is drawn in its place.
     RefPtr<Media::VideoFrame const> drawn_frame;
@@ -147,6 +164,9 @@ DisplayListRasterCache::~DisplayListRasterCache() = default;
 
 void DisplayListRasterCache::evict(DisplayListResourceSet const& removed_resources)
 {
+    // Filters retain images resolved from this storage, including resources whose IDs were replaced.
+    if (!removed_resources.image_frames.is_empty())
+        m_layer_image_filter_cache = nullptr;
     for (auto id : removed_resources.image_frames)
         m_image_frame_images.remove(id.value());
     for (auto id : removed_resources.video_sinks)
@@ -161,6 +181,41 @@ void DisplayListRasterCache::evict(DisplayListResourceSet const& removed_resourc
             return true;
         });
     }
+}
+
+DisplayListRasterCache::LayerImageFilterCache& DisplayListRasterCache::ensure_layer_image_filter_cache(u64 tree_structural_epoch)
+{
+    if (!m_layer_image_filter_cache || m_layer_image_filter_cache->tree_structural_epoch != tree_structural_epoch) {
+        m_layer_image_filter_cache = make<LayerImageFilterCache>();
+        m_layer_image_filter_cache->tree_structural_epoch = tree_structural_epoch;
+    }
+    return *m_layer_image_filter_cache;
+}
+
+sk_sp<SkImageFilter> DisplayListRasterCache::layer_image_filter(u64 tree_structural_epoch, ReplayLayer const& layer, Function<sk_sp<SkImageFilter>()> const& create)
+{
+    ReadonlyBytes filter_bytes { layer.filter_bytes, layer.filter_bytes_size };
+    auto& entries = ensure_layer_image_filter_cache(tree_structural_epoch).entries_by_tree_structural_epoch_and_effect.ensure(tree_structural_epoch);
+    if (auto cached = entries.get(layer.effect.value()); cached.has_value() && cached->filter_bytes.bytes() == filter_bytes)
+        return cached->image_filter;
+    auto image_filter = create();
+    entries.set(layer.effect.value(), LayerImageFilterCache::Entry { MUST(ByteBuffer::copy(filter_bytes)), image_filter });
+    return image_filter;
+}
+
+sk_sp<SkImageFilter> DisplayListRasterCache::backdrop_image_filter(u64 tree_structural_epoch, ReplayLayer const& layer, bool limited_to_region, Function<sk_sp<SkImageFilter>()> const& create)
+{
+    ReadonlyBytes filter_bytes { layer.backdrop_filter_bytes, layer.backdrop_filter_bytes_size };
+    auto& entries = ensure_layer_image_filter_cache(tree_structural_epoch).backdrop_entries_by_tree_structural_epoch_and_effect.ensure(tree_structural_epoch);
+    if (auto cached = entries.get(layer.effect.value()); cached.has_value()
+        && cached->filter_bytes.bytes() == filter_bytes
+        && cached->region == layer.backdrop_region
+        && cached->corner_radii == layer.backdrop_corner_radii
+        && cached->limited_to_region == limited_to_region)
+        return cached->image_filter;
+    auto image_filter = create();
+    entries.set(layer.effect.value(), LayerImageFilterCache::BackdropEntry { MUST(ByteBuffer::copy(filter_bytes)), layer.backdrop_region, layer.backdrop_corner_radii, limited_to_region, image_filter });
+    return image_filter;
 }
 
 static sk_sp<SkImage> create_skia_image(Gfx::DecodedImageFrame const& frame, RefPtr<Gfx::SkiaBackendContext> const& skia_backend_context)
@@ -201,21 +256,13 @@ sk_sp<SkImage> DisplayListRasterCache::image_for_video_sink(DisplayListResourceS
     if (!frame)
         return nullptr;
 
-    auto handle = Media::VideoFrameHandle::for_frame(*frame);
-    auto surface = frame->surface();
     auto& cached_image = *m_video_sink_images.ensure(id.value(), [] { return make<VideoSinkImage>(); });
     auto cached_image_matches = [&] {
         if (!cached_image.image)
             return false;
         if (cached_image.skia_backend_context != skia_backend_context)
             return false;
-        if (cached_image.pool_id != handle.pool_id)
-            return false;
-        if (cached_image.slot_index != handle.slot_index)
-            return false;
-        if (cached_image.slot_acquisition_id != handle.slot_acquisition_id)
-            return false;
-        return true;
+        return cached_image.frame_id == frame->id();
     }();
     if (cached_image_matches) {
         cached_image.drawn_frame = frame;
@@ -224,16 +271,10 @@ sk_sp<SkImage> DisplayListRasterCache::image_for_video_sink(DisplayListResourceS
     }
 
     auto image = sk_image_from_video_frame(*frame, skia_backend_context);
-
-    if (!frame->revalidate_backing())
-        return nullptr;
-
     if (!image)
         return nullptr;
 
-    cached_image.pool_id = handle.pool_id;
-    cached_image.slot_index = handle.slot_index;
-    cached_image.slot_acquisition_id = handle.slot_acquisition_id;
+    cached_image.frame_id = frame->id();
     cached_image.drawn_frame = frame;
     cached_image.skia_backend_context = skia_backend_context;
     cached_image.image = image;

@@ -29,6 +29,10 @@
 #    include <UI/Qt/ScrollbarPreferencesMac.h>
 #endif
 
+#if defined(AK_OS_LINUX)
+#    include <UI/Qt/X11Window.h>
+#endif
+
 #include <QAction>
 #include <QClipboard>
 #include <QDesktopServices>
@@ -584,6 +588,9 @@ void Application::show_process_manager()
             hide_appkit_window_title(*window);
             offset_appkit_window_controls(*window, 3, 10);
         };
+        m_process_manager_window->on_title_bar_drag = [window = m_process_manager_window.ptr()] {
+            return start_appkit_window_drag(*window);
+        };
 #endif
     }
     m_process_manager_window->show();
@@ -626,6 +633,7 @@ Core::EventLoop& Application::create_platform_event_loop()
         m_application = make<LadybirdQApplication>(arguments());
 #if defined(AK_OS_LINUX)
         QGuiApplication::setDesktopFileName(QStringLiteral("org.ladybird.Ladybird"));
+        Ladybird::clip_translucent_windows_that_cannot_blend();
 #endif
 #if !defined(Q_OS_MACOS) && !defined(Q_OS_WIN)
         install_orca_scripts();
@@ -706,6 +714,24 @@ Vector<String> Application::platform_preferred_languages() const
     for (auto const& language : QLocale::system().uiLanguages())
         languages.append(ak_string_from_qstring(language));
     return languages;
+}
+
+Optional<Gfx::GpuDeviceIdentity> Application::platform_presentation_gpu_device() const
+{
+#ifdef LADYBIRD_QT_USE_VULKAN_WINDOW
+    return WebContentView::presentation_gpu_device();
+#else
+    return {};
+#endif
+}
+
+Vector<u64> Application::platform_presentation_drm_format_modifiers() const
+{
+#ifdef LADYBIRD_QT_USE_VULKAN_WINDOW
+    return WebContentView::presentation_drm_format_modifiers();
+#else
+    return {};
+#endif
 }
 
 #if !defined(AK_OS_MACOS)

@@ -427,12 +427,11 @@ fn parse_value_type(
             Some(value_list(parsed, 0, false))
         }
         DescriptorValueType::OptionalDeclarationValue => {
-            if !declaration_value_is_valid(values) {
+            if !values.is_empty() && !declaration_value_is_valid(values) {
                 return None;
             }
             Some(unresolved_value(
                 source,
-                &[],
                 values.to_vec(),
                 SubstitutionFunctionsPresence::default(),
             ))
@@ -447,6 +446,14 @@ fn parse_with_metadata(
     values: &[ComponentValue],
     source: &[u16],
 ) -> Option<StyleValueData> {
+    if !metadata.allow_css_wide_keywords
+        && single_non_whitespace(values)
+            .and_then(ComponentValue::ident)
+            .and_then(keyword_from_ascii_case_insensitive)
+            .is_some_and(|keyword| is_css_wide_keyword(&StyleValueData::Keyword { keyword }))
+    {
+        return None;
+    }
     for syntax in metadata.syntax {
         let parsed = match syntax {
             DescriptorSyntax::Keyword(keyword) => parse_keyword(values, keyword),
@@ -490,7 +497,7 @@ pub(crate) fn parse_descriptor(
         if !metadata.allow_arbitrary_substitution_functions {
             return None;
         }
-        unresolved_value(source, &[], values.to_vec(), presence)
+        unresolved_value(source, values.to_vec(), presence)
     } else {
         parse_with_metadata(&descriptor_context, &metadata, values, source)?
     };

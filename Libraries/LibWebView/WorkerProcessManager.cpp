@@ -8,10 +8,12 @@
 #include <LibCore/EventLoop.h>
 #include <LibCore/Timer.h>
 #include <LibIPC/File.h>
+#include <LibURL/Parser.h>
 #include <LibWebView/Application.h>
 #include <LibWebView/CanonicalEnvironmentSettingsObject.h>
 #include <LibWebView/CanonicalNavigable.h>
 #include <LibWebView/HelperProcess.h>
+#include <LibWebView/PermissionManager.h>
 #include <LibWebView/RequestServerManager.h>
 #include <LibWebView/Utilities.h>
 #include <LibWebView/ViewImplementation.h>
@@ -210,6 +212,7 @@ Web::HTML::WorkerAgentId WorkerProcessManager::start_worker_agent(Owner owner, O
         // The worker's requests go through the RequestServers of its owner's sites.
         TRY(client->request_server_site_bindings().connect(*session));
         client->async_set_site_compatibility_data(Application::the().site_compatibility_data());
+        client->async_set_permission_snapshot(session->permission_manager->snapshot_for({}));
         // The User-Agent string, the navigator compatibility mode, and the preferred languages live in this process.
         // Pages get them through their view; a worker gets the same values here, so its navigator never contradicts
         // the page's.
@@ -246,6 +249,21 @@ Web::HTML::WorkerAgentId WorkerProcessManager::start_worker_agent(Owner owner, O
     //     settings it is created for, too.
     auto inside_settings = make<CanonicalWorkerEnvironmentSettingsObject>(move(origin), outside_settings->top_level_origin(), has_cross_site_ancestor, Web::HTML::EnvironmentId::generate());
     auto environment_id = inside_settings->id();
+
+    // NB: The task manager lists the worker's process with the process that started it, and once that one is gone,
+    //     with the site of the worker's origin.
+    if (auto process = Application::process_manager().find_child(client->child_id()); process.has_value()) {
+        owner.client.visit(
+            [&](WebContentOwner const& web_content_owner) {
+                if (web_content_owner.client)
+                    process->set_owner_child_id(web_content_owner.client->child_id());
+            },
+            [&](WebWorkerOwner const& web_worker_owner) {
+                process->set_owner_child_id(web_worker_owner.client->child_id());
+            });
+        if (auto const& worker_origin = inside_settings->origin(); !worker_origin.is_opaque() && !worker_origin.is_file_origin())
+            process->set_site_url(URL::Parser::basic_parse(worker_origin.serialize()));
+    }
 
     // NB: A worker's process reads local files as its owner's does. A worker of a file origin that local file content
     //     starts is local file content too.
@@ -306,6 +324,23 @@ Web::HTML::WorkerAgentId WorkerProcessManager::start_worker_agent(Owner owner, O
     client->async_start_worker(request.url, request.type, request.credentials, request.name, move(request.outside_port), request.outside_settings, request.agent_type, move(inside_origin), move(environment_id));
 
     return agent_id;
+}
+
+void WorkerProcessManager::update_permission_snapshot(PermissionManager const& manager)
+{
+    for (auto const& agent : m_agents) {
+        auto session = agent.value.client->session();
+        if (session && session->permission_manager.ptr() == &manager)
+            agent.value.client->async_set_permission_snapshot(manager.snapshot_for(agent.value.client->permission_origins()));
+    }
+}
+
+Optional<URL::Origin> WorkerProcessManager::top_level_origin(Web::HTML::WorkerAgentId agent_id) const
+{
+    auto agent = m_agents.find(agent_id);
+    if (agent == m_agents.end())
+        return {};
+    return agent->value.top_level_origin;
 }
 
 void WorkerProcessManager::update_site_compatibility_data(JsonValue const& data)

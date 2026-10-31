@@ -369,6 +369,26 @@ fn is_ascii_alphanumeric(code_unit: u16) -> bool {
     u8::try_from(code_unit).is_ok_and(|byte| byte.is_ascii_alphanumeric())
 }
 
+// Accumulates the digits exactly in a u64 and rounds once at the end. Once the u64 is full, later digits only scale the
+// value, and any nonzero bits among them are folded into the lowest bit, which lies below the rounding position.
+fn power_of_two_radix_digits_to_f64(digits: impl Iterator<Item = u32>, bits_per_digit: u32) -> f64 {
+    let mut mantissa = 0u64;
+    let mut exponent = 0i32;
+    let mut sticky = false;
+    for digit in digits {
+        if mantissa >> (64 - bits_per_digit) == 0 {
+            mantissa = (mantissa << bits_per_digit) | u64::from(digit);
+        } else {
+            exponent = exponent.saturating_add(bits_per_digit as i32);
+            sticky |= digit != 0;
+        }
+    }
+    if sticky {
+        mantissa |= 1;
+    }
+    mantissa as f64 * 2f64.powi(exponent)
+}
+
 fn is_ascii_hex_digit(code_unit: u16) -> bool {
     u8::try_from(code_unit).is_ok_and(|byte| byte.is_ascii_hexdigit())
 }
@@ -476,6 +496,15 @@ impl GlobalObject {
     pub(crate) fn parse_int(vm: &Vm) -> ThrowCompletionOr<Value> {
         let string = vm.argument(0);
 
+        // OPTIMIZATION: The decimal digits of an int32 parse back to it, so we can skip the int32-to-string-to-number
+        //               round trip when the radix is 10 or the default one.
+        let radix_argument = vm.argument(1);
+        if string.is_int32()
+            && (radix_argument.is_undefined() || (radix_argument.is_int32() && radix_argument.as_i32() == 10))
+        {
+            return Ok(string);
+        }
+
         // 1. Let inputString be ? ToString(string).
         let input_string = string.to_utf16_string(vm)?;
         let input_string = Utf16View::of_string(&input_string);
@@ -559,22 +588,33 @@ impl GlobalObject {
             Some(digit)
         };
 
-        let mut had_digits = false;
-        let mut number = 0.0;
         // NB: Only ASCII code units are digits, so going through the code units stops where going through the code
         //     points does.
-        for code_unit in trimmed_view.code_units() {
-            let Some(digit) = parse_digit(code_unit) else {
-                break;
-            };
-            had_digits = true;
-            number *= f64::from(radix);
-            number += f64::from(digit);
-        }
-
-        if !had_digits {
+        let digit_count = trimmed_view
+            .code_units()
+            .take_while(|&code_unit| parse_digit(code_unit).is_some())
+            .count();
+        if digit_count == 0 {
             return Ok(js_nan());
         }
+        let digits = trimmed_view
+            .code_units()
+            .take(digit_count)
+            .map(|code_unit| parse_digit(code_unit).expect("the first digit_count code units are digits"));
+
+        let radix = radix as u32;
+        let number = if radix.is_power_of_two() {
+            power_of_two_radix_digits_to_f64(digits, radix.trailing_zeros())
+        } else if radix == 10 && digit_count > 15 {
+            // NB: Accumulating decimal digits in a double rounds at every step once the value no longer fits in 53
+            //     bits, so parse long digit runs as a whole to get the correctly rounded value.
+            let digits: String = digits
+                .map(|digit| char::from_digit(digit, 10).expect("a decimal digit"))
+                .collect();
+            digits.parse::<f64>().expect("a run of decimal digits parses as f64")
+        } else {
+            digits.fold(0.0, |number, digit| number * f64::from(radix) + f64::from(digit))
+        };
 
         // 15. If mathInt = 0, then
         // a. If sign = -1, return -0𝔽.
@@ -651,7 +691,7 @@ impl GlobalObject {
         let mut escaped = Vec::with_capacity(string.length_in_code_units());
 
         // 4. Let unescapedSet be the string-concatenation of the ASCII word characters and "@*+-./".
-        let unescaped_set = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789@*_+-./";
+        let unescaped_set = AsciiSet::new(b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789@*_+-./");
 
         // 2. Let length be the length of string.
         // 5. Let k be 0.
@@ -660,8 +700,7 @@ impl GlobalObject {
             // a. Let char be the code unit at index k within string.
 
             // b. If unescapedSet contains char, then
-            // NOTE: We know unescapedSet is ASCII-only, so ensure we have an ASCII codepoint before casting to char.
-            if code_unit < 0x80 && unescaped_set.contains(&(code_unit as u8)) {
+            if unescaped_set.contains(code_unit) {
                 // i. Let S be the String value containing the single code unit char.
                 escaped.push(code_unit);
             }
@@ -768,6 +807,24 @@ impl GlobalObject {
 }
 
 // 19.2.6.5 Encode ( string, extraUnescaped ), https://tc39.es/ecma262/#sec-encode
+/// OPTIMIZATION: A set of ASCII characters that tells whether it contains a code unit with one lookup, where searching
+///               the characters would compare it with each of them.
+struct AsciiSet([bool; 128]);
+
+impl AsciiSet {
+    fn new(characters: &[u8]) -> Self {
+        let mut set = [false; 128];
+        for &character in characters {
+            set[usize::from(character)] = true;
+        }
+        Self(set)
+    }
+
+    fn contains(&self, code_unit: u16) -> bool {
+        self.0.get(usize::from(code_unit)).copied().unwrap_or(false)
+    }
+}
+
 fn encode(vm: &Vm, string: Utf16View<'_>, unescaped_set: &str) -> ThrowCompletionOr<Utf16String> {
     // 1. Let strLen be the length of string.
     let string_length = string.length_in_code_units();
@@ -778,6 +835,7 @@ fn encode(vm: &Vm, string: Utf16View<'_>, unescaped_set: &str) -> ThrowCompletio
     // 3. Let alwaysUnescaped be the string-concatenation of the ASCII word characters and "-.!~*'()".
     // 4. Let unescapedSet be the string-concatenation of alwaysUnescaped and extraUnescaped.
     // OPTIMIZATION: We pass in the entire unescapedSet as a StringView to avoid an extra allocation.
+    let unescaped_set = AsciiSet::new(unescaped_set.as_bytes());
 
     // 5. Let k be 0.
     let mut k = 0;
@@ -790,8 +848,7 @@ fn encode(vm: &Vm, string: Utf16View<'_>, unescaped_set: &str) -> ThrowCompletio
         // b. Let C be the code unit at index k within string.
         let code_unit = string.code_unit_at(k);
         // c. If C is in unescapedSet, then
-        // NOTE: We assume the unescaped set only contains ascii characters as unescaped_set is a StringView.
-        if code_unit < 0x80 && unescaped_set.as_bytes().contains(&(code_unit as u8)) {
+        if unescaped_set.contains(code_unit) {
             // i. Set k to k + 1.
             k += 1;
 

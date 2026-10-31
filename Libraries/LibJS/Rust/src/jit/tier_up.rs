@@ -128,9 +128,18 @@ impl CompileTarget {
     }
 }
 
+/// Executables with more bytecode than this are never compiled. The compile of one takes time and memory in proportion
+/// to its size or worse (YouTube's top-level script code, 8.8 MiB of bytecode, took minutes and over 1 GiB), and code
+/// that large rarely runs hot as a whole. Compiled C code is the exception: hot functions of Emscripten output can have
+/// over 200 KiB of bytecode (Octane zlib has one with 209 KiB).
+const MAX_COMPILED_BYTECODE_SIZE: usize = 256 * 1024;
+
 /// What to compile the running frame's executable for, if it should be compiled at all.
 fn code_to_compile(vm: &Vm) -> Option<CompileTarget> {
     if vm.debugging_enabled() {
+        return None;
+    }
+    if vm.current_executable().bytecode().len() > MAX_COMPILED_BYTECODE_SIZE {
         return None;
     }
     let frame = vm.running_execution_context_ref();
@@ -373,7 +382,7 @@ fn install(
     //     past the loop the code has an on-stack replacement entry at.
     vm.for_each_live_execution_context(|frame| {
         if !frame.runs_jit_code.get() && frame.executable.get().is_some() && executable_of(frame) == executable {
-            code.note_interpreted_frame(NonNull::from(frame), FRUITLESS_LOOP_CHECKS_AFTER_INSTALL);
+            code.note_interpreted_frame(vm, frame, FRUITLESS_LOOP_CHECKS_AFTER_INSTALL);
         }
         ControlFlow::Continue(())
     });

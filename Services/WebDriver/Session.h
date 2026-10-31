@@ -96,6 +96,7 @@ public:
     NonnullRefPtr<WebDriverPromise> wait_for_navigation_completion();
     NonnullRefPtr<WebDriverPromise> traverse_history(i32 delta, HandleUserPrompts);
     NonnullRefPtr<WebDriverPromise> session_history();
+    NonnullRefPtr<WebDriverPromise> set_permission(JsonValue parameters);
     NonnullRefPtr<WebDriverPromise> load_url(URL::URL);
     NonnullRefPtr<WebDriverPromise> switch_to_parent_frame();
     NonnullRefPtr<WebDriverPromise> run_content_command(StringView name, JsonValue payload = {}, Vector<String> arguments = {});
@@ -113,7 +114,7 @@ public:
     NonnullRefPtr<WebDriverPromise> perform_bidi_browser_command(StringView method, JsonValue params);
     NonnullRefPtr<WebDriverPromise> get_bidi_top_level_traversables(Vector<String> navigable_ids);
     NonnullRefPtr<WebDriverPromise> run_bidi_subscribe_steps(String const& event_name, Vector<String> top_level_traversable_ids);
-    void set_bidi_enabled_events(Vector<String> event_names);
+    void set_bidi_enabled_events(Vector<String> event_names, HashMap<String, Optional<Vector<String>>> event_contexts);
 
 private:
     Session(NonnullRefPtr<Client> client, JsonObject const& capabilities, String session_id, Web::WebDriver::SessionFlags flags);
