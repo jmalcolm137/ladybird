@@ -2726,6 +2726,7 @@ void EngineServer::send_autocomplete_results(u64 tab_id, u64 query_id, Vector<We
             item.set("subtitle"sv, *suggestion.subtitle);
         item.set("source"sv, static_cast<int>(suggestion.source));
         item.set("search"sv, suggestion.source == WebView::AutocompleteSuggestionSource::Search);
+        item.set("inline"sv, suggestion.can_be_inline_completed);
         items.must_append(move(item));
     }
 

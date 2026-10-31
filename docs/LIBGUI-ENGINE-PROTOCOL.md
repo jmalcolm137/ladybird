@@ -90,7 +90,7 @@ Version: 15. `Shared/EngineProtocol.h` is authoritative.
 | `history` | `tab`, `can_go_back`, `can_go_forward` | History button state. |
 | `find_result` | `tab`, `current`, `total` | Current and total find-in-page matches. |
 | `zoom_changed` | `tab`, `zoom` | The page zoom level changed. |
-| `autocomplete_results` | `tab`, `request`, `final`, `items` | Suggestions for an `autocomplete` query. Items have `text` (the value to navigate to), `display` (the URL or query to show), optional `title` and `subtitle`, `source`, and `search`. `final` marks the last update for the query. |
+| `autocomplete_results` | `tab`, `request`, `final`, `items` | Suggestions for an `autocomplete` query. Items have `text` (the value to navigate to), `display` (the URL or query to show), optional `title` and `subtitle`, `source`, `search`, and `inline` (whether the suggestion may be shown as an inline completion). `final` marks the last update for the query. |
 | `link_hover` | `tab`, `url` or empty | Link under the pointer. |
 | `cursor` | `tab`, `cursor` | Page cursor name. |
 | `dialog` | `tab`, `kind`, `message`, `default` | Page opened a dialog. |

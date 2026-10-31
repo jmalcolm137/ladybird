@@ -9,6 +9,7 @@
 #include <WaylandClient.h>
 
 #include <AK/Base64.h>
+#include <AK/StringBuilder.h>
 #include <LibCore/EventLoop.h>
 #include <LibCore/MimeData.h>
 #include <LibCore/StandardPaths.h>
@@ -268,7 +269,26 @@ BrowserTab::BrowserTab(EngineClient& engine, GUI::Window& window, GUI::Action& b
         m_web_view->set_focus(true);
     };
     m_location_box->on_change = [this] {
-        if (m_location_box->text().is_empty()) {
+        if (m_applying_inline_completion)
+            return;
+
+        auto text = String::from_byte_string(m_location_box->text()).release_value();
+        if (m_inline_completion_active) {
+            // The user edited the selected completion suffix. Deleting it, or typing over it without growing past
+            // the typed query, must not immediately bring the same completion back.
+            if (text.bytes_as_string_view().length() <= m_inline_base_query.bytes_as_string_view().length())
+                m_inline_completion_suppressed = true;
+            m_inline_completion_active = false;
+        } else if (text.bytes_as_string_view().length() < m_last_location_text.bytes_as_string_view().length() && m_last_location_text.bytes_as_string_view().starts_with(text.bytes_as_string_view())) {
+            m_inline_completion_suppressed = true;
+        } else if (text != m_last_location_text) {
+            m_inline_completion_suppressed = false;
+        }
+
+        m_last_location_text = text;
+        m_inline_base_query = text;
+
+        if (text.is_empty()) {
             hide_autocomplete();
             return;
         }
@@ -278,6 +298,25 @@ BrowserTab::BrowserTab(EngineClient& engine, GUI::Window& window, GUI::Action& b
             m_autocomplete_timer->start();
         }
     };
+    m_location_box->on_cursor_change = [this] {
+        if (m_applying_inline_completion || !m_inline_completion_active)
+            return;
+
+        auto text_length = m_location_box->text().length();
+        auto selection = m_location_box->normalized_selection();
+        bool still_selects_completion = m_location_box->has_selection()
+            && selection.start().column() == m_inline_base_query.bytes_as_string_view().length()
+            && selection.end().column() == text_length;
+        if (still_selects_completion)
+            return;
+
+        // Moving the cursor out of the completion accepts the text on display. If the cursor only collapsed the
+        // selection, the next edit starts from the full completion rather than the old query.
+        m_inline_completion_active = false;
+        m_inline_base_query = String::from_byte_string(m_location_box->text()).release_value();
+        m_last_location_text = m_inline_base_query;
+    };
+
     m_location_box->on_up_pressed = [this] {
         move_autocomplete_selection(-1);
     };
@@ -291,6 +330,8 @@ BrowserTab::BrowserTab(EngineClient& engine, GUI::Window& window, GUI::Action& b
         hide_autocomplete();
     };
     m_location_box->on_focusin = [this] {
+        // A fresh editing session should offer a completion even if the last one was dismissed with Backspace.
+        m_inline_completion_suppressed = false;
         if (!m_location_box->text().is_empty() && m_autocomplete_timer) {
             m_autocomplete_timer->stop();
             m_autocomplete_timer->start();
@@ -1177,6 +1218,11 @@ void BrowserTab::set_autocomplete_results(u64 request_id, JsonArray const& items
 
     m_autocomplete_table->set_cursor(m_autocomplete_model->index(0), GUI::AbstractView::SelectionUpdate::Set);
 
+    if (!m_inline_completion_suppressed && autocomplete_row_can_inline(0))
+        apply_inline_completion_for_row(0);
+    else
+        clear_inline_completion();
+
     auto location_rect = m_location_box->screen_relative_rect();
     auto root_rect = m_root->screen_relative_rect();
     auto x = max(0, location_rect.x() - root_rect.x());
@@ -1196,23 +1242,121 @@ void BrowserTab::set_autocomplete_results(u64 request_id, JsonArray const& items
         m_autocomplete_hide_timer->stop();
 }
 
+bool BrowserTab::autocomplete_row_can_inline(size_t row) const
+{
+    if (row >= m_autocomplete_rows.size())
+        return false;
+    auto const& value = m_autocomplete_rows.at(row);
+    return value.is_object() && value.as_object().get_bool("inline"sv).value_or(false);
+}
+
+static String inline_completion_for_candidate(String const& query, StringView candidate)
+{
+    auto query_view = query.bytes_as_string_view();
+    if (query_view.is_empty() || candidate.length() <= query_view.length())
+        return {};
+    if (!candidate.starts_with(query_view, CaseSensitivity::CaseInsensitive))
+        return {};
+
+    StringBuilder builder;
+    builder.append(query_view);
+    builder.append(candidate.substring_view(query_view.length()));
+    return MUST(builder.to_string());
+}
+
+static String inline_completion_for_suggestion(String const& query, StringView suggestion)
+{
+    auto completion = inline_completion_for_candidate(query, suggestion);
+    if (!completion.is_empty())
+        return completion;
+
+    for (auto scheme : { "https://"sv, "http://"sv }) {
+        if (!suggestion.starts_with(scheme))
+            continue;
+
+        auto stripped = suggestion.substring_view(scheme.length());
+        completion = inline_completion_for_candidate(query, stripped);
+        if (!completion.is_empty())
+            return completion;
+
+        if (stripped.starts_with("www."sv)) {
+            completion = inline_completion_for_candidate(query, stripped.substring_view(4));
+            if (!completion.is_empty())
+                return completion;
+        }
+    }
+
+    return {};
+}
+
+void BrowserTab::apply_inline_completion(String const& completion)
+{
+    if (completion.bytes_as_string_view().length() <= m_inline_base_query.bytes_as_string_view().length())
+        return;
+
+    m_applying_inline_completion = true;
+    m_location_box->set_text(completion.bytes_as_string_view());
+    m_location_box->set_selection(GUI::TextRange {
+        GUI::TextPosition { 0, m_inline_base_query.bytes_as_string_view().length() },
+        GUI::TextPosition { 0, completion.bytes_as_string_view().length() },
+    });
+    m_inline_completion_active = true;
+    m_applying_inline_completion = false;
+}
+
+void BrowserTab::apply_inline_completion_for_row(size_t row)
+{
+    if (row >= m_autocomplete_rows.size() || !autocomplete_row_can_inline(row)) {
+        clear_inline_completion();
+        return;
+    }
+
+    auto const& value = m_autocomplete_rows.at(row);
+    auto text = String::from_byte_string(value.as_object().get_byte_string("text"sv).value_or({})).release_value();
+    auto completion = inline_completion_for_suggestion(m_inline_base_query, text.bytes_as_string_view());
+    if (completion.is_empty()) {
+        clear_inline_completion();
+        return;
+    }
+
+    apply_inline_completion(completion);
+}
+
+void BrowserTab::clear_inline_completion()
+{
+    if (!m_inline_completion_active)
+        return;
+
+    m_inline_completion_active = false;
+    m_applying_inline_completion = true;
+    m_location_box->set_text(m_inline_base_query.bytes_as_string_view());
+    m_location_box->set_cursor(GUI::TextPosition { 0, m_inline_base_query.bytes_as_string_view().length() });
+    m_applying_inline_completion = false;
+}
+
 void BrowserTab::request_autocomplete()
 {
     if (!is_attached())
         return;
 
-    auto query = String::from_byte_string(m_location_box->text()).release_value();
+    auto query = m_inline_completion_active
+        ? m_inline_base_query
+        : String::from_byte_string(m_location_box->text()).release_value();
     if (query.is_empty()) {
         hide_autocomplete();
         return;
     }
 
+    m_inline_base_query = query;
+    m_last_location_text = query;
     auto request_id = ++m_autocomplete_request_id;
     m_engine.autocomplete(m_tab_id, request_id, query);
 }
 
 void BrowserTab::hide_autocomplete()
 {
+    clear_inline_completion();
+
     if (m_autocomplete_hide_timer)
         m_autocomplete_hide_timer->stop();
     if (m_autocomplete_overlay)
@@ -1261,6 +1405,12 @@ void BrowserTab::move_autocomplete_selection(int delta)
         ? GUI::AbstractView::CursorMovement::Up
         : GUI::AbstractView::CursorMovement::Down;
     m_autocomplete_table->move_cursor(movement, GUI::AbstractView::SelectionUpdate::Set);
+
+    auto selection = m_autocomplete_table->selection().first();
+    if (selection.is_valid() && autocomplete_row_can_inline(selection.row()))
+        apply_inline_completion_for_row(selection.row());
+    else
+        clear_inline_completion();
 }
 
 void BrowserTab::set_title(String const& title)

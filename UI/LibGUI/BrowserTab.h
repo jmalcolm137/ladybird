@@ -154,6 +154,10 @@ private:
     void add_bookmark_menu_items(GUI::Menu&, Vector<BookmarkEntry> const&);
     void update_site_button();
     void request_autocomplete();
+    void apply_inline_completion_for_row(size_t row);
+    void apply_inline_completion(String const& completion);
+    void clear_inline_completion();
+    bool autocomplete_row_can_inline(size_t row) const;
     void request_find();
     void run_drag(JsonArray const& items);
     void hide_autocomplete();
@@ -207,6 +211,11 @@ private:
     RefPtr<Core::Timer> m_autocomplete_hide_timer;
     JsonArray m_autocomplete_rows;
     Vector<String> m_autocomplete_texts;
+    String m_inline_base_query;
+    String m_last_location_text;
+    bool m_inline_completion_active { false };
+    bool m_inline_completion_suppressed { false };
+    bool m_applying_inline_completion { false };
     u64 m_autocomplete_request_id { 0 };
     bool m_autocomplete_visible { false };
     Optional<u32> m_selected_select_item;
