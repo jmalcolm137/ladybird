@@ -12,6 +12,7 @@
 #include <AK/StringBuilder.h>
 #include <LibCore/Directory.h>
 #include <LibCore/Environment.h>
+#include <LibCore/EventLoop.h>
 #include <LibCore/LocalServer.h>
 #include <LibCore/Notifier.h>
 #include <LibCore/Process.h>
@@ -134,6 +135,7 @@ void EngineClient::accept_connection(NonnullOwnPtr<Core::LocalSocket> socket)
     }
 
     m_socket = move(socket);
+    m_disconnect_scheduled = false;
     m_socket->on_ready_to_read = [this] {
         read_available();
     };
@@ -161,17 +163,13 @@ void EngineClient::read_available()
         if (result.is_error()) {
             if (result.error().is_errno() && (result.error().code() == EAGAIN || result.error().code() == EWOULDBLOCK))
                 return;
-            close_socket();
-            if (on_disconnected)
-                on_disconnected();
+            schedule_disconnect();
             return;
         }
 
         auto bytes = result.release_value();
         if (bytes.is_empty()) {
-            close_socket();
-            if (on_disconnected)
-                on_disconnected();
+            schedule_disconnect();
             return;
         }
 
@@ -199,6 +197,25 @@ void EngineClient::read_available()
             dispatch_line(line.value().bytes_as_string_view());
         }
     }
+}
+
+void EngineClient::schedule_disconnect()
+{
+    if (m_disconnect_scheduled)
+        return;
+    m_disconnect_scheduled = true;
+    // close_socket() destroys the socket (and its notifier) whose callback is running. Defer it so the callback
+    // Function is not destroyed from inside itself. Hold a weak pointer: the session may tear the client down
+    // before the deferred callback runs.
+    auto weak_this = make_weak_ptr();
+    Core::deferred_invoke([weak_this] {
+        auto* client = weak_this.ptr();
+        if (!client)
+            return;
+        client->close_socket();
+        if (client->on_disconnected)
+            client->on_disconnected();
+    });
 }
 
 void EngineClient::dispatch_line(StringView line)

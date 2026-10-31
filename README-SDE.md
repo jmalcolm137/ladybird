@@ -62,8 +62,18 @@ Requirements are those of both projects:
 
 ```sh
 scripts/build.sh            # engine host, then LibGUI frontend
-scripts/run.sh              # run from the build trees
+scripts/install-live.sh     # snapshot the built browser/engine/helpers/libs
+scripts/run.sh              # run the stable live snapshot
 ```
+
+`scripts/install-live.sh` snapshots the browser, engine host, helper processes,
+the libraries they map, and the engine's `share/Lagom` resources into
+`build/live`, with `$ORIGIN`-relative library paths. `scripts/run.sh` prefers that snapshot. Rebuilding the build tree cannot
+then replace a helper or library underneath a running session: an engine host
+that is already running maps its old libraries, and a helper it restarts must
+come from the same set. To pick up a rebuild, rerun `install-live.sh` and
+restart the browser. Setting `LADYBIRD_BUILD` explicitly runs the build tree
+directly (useful for one-off debugging, but not while rebuilding).
 
 `scripts/build-engine.sh` drives `Meta/ladybird.py build --preset Release
 LadybirdEngine`. If the host cannot launch Ladybird's sandbox, set

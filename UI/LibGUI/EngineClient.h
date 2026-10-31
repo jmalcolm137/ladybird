@@ -17,6 +17,7 @@
 #include <AK/RefPtr.h>
 #include <AK/String.h>
 #include <AK/Vector.h>
+#include <AK/WeakPtr.h>
 #include <LibCore/Forward.h>
 #include <LibGfx/Forward.h>
 #include <LibGfx/Rect.h>
@@ -28,7 +29,7 @@ namespace LadybirdSDE {
 // the Ladybird engine host, and presents a small command/event API to the
 // frontend. Frame pixels are shared through POSIX shared memory; the socket only
 // carries control messages.
-class EngineClient {
+class EngineClient : public Weakable<EngineClient> {
     AK_MAKE_NONCOPYABLE(EngineClient);
 
 public:
@@ -122,6 +123,7 @@ private:
     ErrorOr<void> spawn_engine(ByteString const& engine_path);
     void accept_connection(NonnullOwnPtr<Core::LocalSocket>);
     void read_available();
+    void schedule_disconnect();
     void dispatch_line(StringView);
     void handle_frame_buffer(JsonObject const&);
     void handle_frame(JsonObject const&);
@@ -142,6 +144,7 @@ private:
     Vector<u8> m_write_buffer;
     RefPtr<Core::Notifier> m_write_notifier;
     HashMap<u64, NonnullOwnPtr<FrameBuffer>> m_frame_buffers;
+    bool m_disconnect_scheduled { false };
     bool m_quitting { false };
 };
 
