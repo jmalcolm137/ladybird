@@ -28,30 +28,38 @@ label {
     cursor: default;
 }
 
+/* Form controls use a fixed system font size instead of inheriting the page font. */
+input, textarea, select, button {
+    font: 13.333333px system-ui;
+}
+
 /* FIXME: This is a temporary hack until we can render a native-looking frame for these. */
+/* NB: The native appearance of a text field or button paints a thin border of its own over the border box. Once an
+ *     author style devolves the widget, its border is the inset or outset one below. */
 input:not([type=submit], input[type=button], input[type=image], input[type=reset], input[type=color], input[type=checkbox], input[type=file], input[type=radio], input[type=range]), textarea {
-    border: 1px solid ButtonBorder;
-    padding: 1px 2px;
-    min-height: 16px;
+    border: 2px inset ButtonBorder;
+    padding: 1px 3px;
     cursor: text;
 
     background-color: Field;
     color: FieldText;
+
+    &:disabled {
+        color: GrayText;
+    }
 }
 
 textarea {
+    border: 1px solid ButtonBorder;
     padding: 2px;
     display: inline-block;
     overflow: auto;
     font-family: monospace;
+    font-size: 13.333333px;
     resize: both;
     /* This matches the behavior of other engines.
      * Spec issue: https://github.com/whatwg/html/issues/953 */
     overflow-wrap: break-word;
-}
-
-input[type=color] {
-    border-color: ButtonBorder;
 }
 
 input::placeholder, textarea::placeholder {
@@ -59,10 +67,10 @@ input::placeholder, textarea::placeholder {
     line-height: initial;
 }
 
-button, input[type=submit], input[type=button], input[type=reset], select, ::file-selector-button {
-    padding: 1px 4px;
+button, input[type=submit], input[type=button], input[type=reset], input[type=color], select, ::file-selector-button {
+    padding: 1px 7px;
     background-color: ButtonFace;
-    border: 1px solid ButtonBorder;
+    border: 2px outset ButtonBorder;
     color: ButtonText;
     cursor: default;
 
@@ -70,10 +78,52 @@ button, input[type=submit], input[type=button], input[type=reset], select, ::fil
         background-color: -libweb-ButtonFaceHover;
     }
 
+    &:active:hover:not(:disabled) {
+        background-color: color-mix(in srgb, ButtonFace, ButtonText 25%);
+    }
+
     &:disabled {
         background-color: -libweb-ButtonFaceDisabled;
         color: GrayText;
     }
+}
+
+/* https://html.spec.whatwg.org/multipage/rendering.html#the-select-element-2
+ * NB: A select that renders as a list box looks like a text field holding its options, which have their own padding.
+ */
+select:is([multiple], [size]:not([size="0"], [size="1"])) {
+    padding: 1px 0;
+    vertical-align: text-bottom;
+    background-color: Field;
+    color: FieldText;
+
+    &:hover, &:active:hover {
+        background-color: Field;
+    }
+}
+
+input[type=file]:enabled::file-selector-button:hover {
+    background-color: -libweb-ButtonFaceHover;
+}
+
+input[type=file]:enabled::file-selector-button:active:hover {
+    background-color: color-mix(in srgb, ButtonFace, ButtonText 25%);
+}
+
+input[type=file]:disabled::file-selector-button {
+    background-color: -libweb-ButtonFaceDisabled;
+    color: GrayText;
+}
+
+input[type=color], select {
+    padding: 2px 8px;
+    border: 1px solid ButtonBorder;
+}
+
+input[type=color] {
+    width: 50px;
+    height: 27px;
+    padding: 1px 2px;
 }
 
 input[type=image] {
@@ -87,48 +137,55 @@ option {
 /* Custom <input type="range"> styles */
 input[type=range] {
     display: inline-block;
+    width: 129px;
     height: 16px;
+    margin: 2px;
 
     &::slider-track {
         display: block;
         position: relative;
-        height: 6px;
+        height: 4px;
         width: 100%;
-        box-sizing: border-box;
-        background-color: AccentColorText;
-        border: 1px solid rgba(0, 0, 0, 0.5);
+        background-color: color-mix(in srgb, CanvasText 20%, transparent);
     }
 
     &::slider-fill {
         display: block;
         position: absolute;
         height: 100%;
+        border-radius: inherit;
     }
 
+    /* NB: The thumb's position assumes this width, see HTMLInputElement::update_slider_shadow_tree_elements(). */
     &::slider-thumb {
         display: block;
+        position: relative;
         margin-top: -6px;
         width: 16px;
         height: 16px;
-        transform: translateX(-50%);
         border-radius: 50%;
-        outline: 1px solid rgba(0, 0, 0, 0.5);
-        z-index: 1;
         background-color: AccentColor;
+    }
+
+    &:disabled::slider-thumb {
+        background-color: GrayText;
     }
 }
 
 /* Custom <meter> styles */
 meter {
     display: inline-block;
-    width: 300px;
-    height: 12px;
+    width: 5em;
+    height: 1em;
+    vertical-align: -0.2em;
 
     &::slider-track {
         display: block;
-        height: 100%;
-        background-color: hsl(0, 0%, 96%);
-        border: 1px solid rgba(0, 0, 0, 0.5);
+        height: 0.5em;
+        margin-top: 0.25em;
+        border-radius: 0.25em;
+        overflow: hidden;
+        background-color: color-mix(in srgb, CanvasText 15%, transparent);
     }
 
     &::slider-fill {
@@ -137,35 +194,54 @@ meter {
     }
 
     &:optimal-value::slider-fill {
-        background-color: hsl(141, 53%, 53%);
+        background-color: #107c10;
     }
 
     &:suboptimal-value::slider-fill {
-        background-color: hsl(48, 100%, 67%);
+        background-color: #ffb900;
     }
 
     &:even-less-good-value::slider-fill {
-        background-color: hsl(348, 100%, 61%);
+        background-color: #d83b01;
     }
 }
 
 /* Custom <progress> styles */
 progress {
     display: inline-block;
-    width: 300px;
-    height: 12px;
+    width: 10em;
+    height: 1em;
+    vertical-align: -0.2em;
 
     &::slider-track {
         display: block;
-        height: 100%;
-        background-color: AccentColorText;
-        border: 1px solid rgba(0, 0, 0, 0.5);
+        height: 0.5em;
+        margin-top: 0.25em;
+        border-radius: 0.25em;
+        overflow: hidden;
+        background-color: color-mix(in srgb, CanvasText 15%, transparent);
     }
 
     &::slider-fill {
         display: block;
         height: 100%;
         background-color: AccentColor;
+    }
+
+    /* NB: An indeterminate progress bar slides a fifth of the track to the far end and back. */
+    &:indeterminate::slider-fill {
+        width: 20%;
+        border-radius: inherit;
+        animation: -ua-progress-indeterminate 1.25s linear infinite alternate;
+    }
+}
+
+@keyframes -ua-progress-indeterminate {
+    from {
+        transform: translateX(0);
+    }
+    to {
+        transform: translateX(400%);
     }
 }
 
@@ -653,6 +729,10 @@ input, select, button, textarea {
     appearance: auto;
 }
 
+::file-selector-button {
+    appearance: auto;
+}
+
 input:not([type=range i], [type=checkbox i], [type=radio i]) {
     overflow: clip !important;
     overflow-clip-margin: 0 !important;
@@ -699,6 +779,16 @@ input:is([type=radio i], [type=checkbox i], [type=reset i], [type=button i],
 }
 
 textarea { white-space: pre-wrap; }
+
+input[type=checkbox i] {
+    margin-block: 3px;
+    margin-inline: 4px 3px;
+}
+
+input[type=radio i] {
+    margin-block: 3px 0;
+    margin-inline: 5px 3px;
+}
 
 /* 15.3.11 The hr element
  * https://html.spec.whatwg.org/multipage/rendering.html#the-hr-element-2
@@ -2180,8 +2270,8 @@ iframe:fullscreen {
   suffix: " ";
   /* for symbols, see normative text below */
   /* FIXME: If the image is directional, it must respond to the writing mode of the element */
-  symbols: \25BE;
-    /* ▾ */
+  symbols: \25BC;
+  /* ▼ */
 }
 
 @counter-style disclosure-closed {
@@ -2189,8 +2279,8 @@ iframe:fullscreen {
   suffix: " ";
   /* for symbols, see normative text below */
   /* FIXME: If the image is directional, it must respond to the writing mode of the element */
-  symbols: \25B8;
-  /* ▸ */
+  symbols: \25BA;
+  /* ► */
 }
 
 /* https://drafts.csswg.org/css-pseudo-4/#highlight-ua-styles */

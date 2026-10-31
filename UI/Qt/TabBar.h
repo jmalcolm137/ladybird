@@ -311,9 +311,9 @@ public:
 
     int index_of(Tab* widget) const;
 
-    void set_tab_text(int index, QString const& text) { m_tab_bar->setTabText(index, text); }
+    void set_tab_text(int index, QString const& text);
     void set_tab_tooltip(int index, QString const& tip) { m_tab_bar->setTabToolTip(index, tip); }
-    void set_tab_icon(int index, QIcon const& icon) { m_tab_bar->setTabIcon(index, icon); }
+    void set_tab_icon(int index, QIcon const& icon);
 
     void set_tab_bar_visible(bool visible);
     void set_new_tab_action(QAction* action);
@@ -335,6 +335,8 @@ public:
     void place_horizontal_new_tab_button();
     int horizontal_tab_strip_drag_space() const;
     void show_all_tabs();
+    void update_all_tabs_entries();
+    void update_all_tabs_entries_soon();
 
 signals:
     void current_tab_changed(int index);
@@ -367,7 +369,7 @@ private:
     void float_sidebar_buttons_while_toggling();
     bool slides_page_with_toggling_sidebar() const;
     void slide_page_with_toggling_sidebar();
-    QLabel* m_floating_ladybird_button { nullptr };
+    QLabel* m_floating_ladybird_buttons { nullptr };
     QLabel* m_floating_sidebar_toggle { nullptr };
     // Where the toolbar's slot for the buttons ends when the sidebar starts to open, in the window. The slot keeps
     // ending there until the sidebar is open, so the toolbar's other buttons stay in place under the sidebar.
@@ -409,8 +411,11 @@ private:
     QToolButton* m_new_tab_button { nullptr };
     QToolButton* m_all_tabs_button { nullptr };
     AllTabsPopover* m_all_tabs_popover { nullptr };
+    bool m_all_tabs_entries_update_is_pending { false };
     Vector<WebView::SessionWindowId> m_recently_closed_unit_ids;
     LadybirdButton* m_ladybird_button { nullptr };
+    // The Ladybird button and the all-tabs button after it, which move together.
+    QWidget* m_ladybird_buttons { nullptr };
     QToolButton* m_vertical_tabs_toggle_button { nullptr };
     QToolButton* m_minimize_window_button { nullptr };
     QToolButton* m_maximize_window_button { nullptr };

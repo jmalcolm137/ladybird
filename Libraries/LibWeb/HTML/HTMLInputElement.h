@@ -23,6 +23,7 @@
 #include <LibWeb/WebIDL/DOMException.h>
 #include <LibWebCommon/HTML/ColorPickerUpdateState.h>
 #include <LibWebCommon/HTML/FileFilter.h>
+#include <LibWebCommon/UIEvents/KeyCode.h>
 #include <LibWebCommon/WebIDL/Types.h>
 
 namespace JS {
@@ -122,8 +123,30 @@ public:
     bool can_have_text_editing_cursor() const;
 
     GC::Ptr<HTMLDataListElement const> list() const;
+    void suggestions_source_element_did_change();
 
     void did_pick_color(Optional<Color> picked_color, ColorPickerUpdateState state);
+    void did_pick_date(Optional<Utf16String> picked_value);
+    bool has_date_picker() const;
+    bool handle_date_time_field_key(UIEvents::KeyCode, u32 modifiers, u32 code_point);
+    void activate_last_date_time_field();
+    void update_date_time_fields_for_step();
+
+    struct DateTimeField {
+        enum class Kind : u8 {
+            Year,
+            Month,
+            Day,
+            Week,
+            Hour,
+            Minute,
+            Second,
+            DayPeriod,
+        };
+        Kind kind;
+        Optional<i32> value;
+        GC::Ptr<DOM::Element> element;
+    };
 
     enum class MultipleHandling {
         Replace,
@@ -290,6 +313,7 @@ public:
 
     virtual bool is_mutable() const override;
     virtual bool uses_button_layout() const override;
+    virtual bool is_devolvable_widget() const override;
     bool is_allowed_to_be_readonly() const;
 
 private:
@@ -399,6 +423,29 @@ private:
     void update_button_input_shadow_tree();
 
     void update_text_input_shadow_tree();
+
+    void create_date_time_fields();
+    void update_date_time_fields();
+    void update_date_time_field_elements();
+    void set_active_date_time_field(size_t index);
+    void date_time_fields_did_change();
+    void commit_date_time_value(Utf16String new_value);
+    bool date_time_fields_want_seconds() const;
+    bool date_time_fields_use_12_hour_clock() const;
+    bool date_time_fields_describe_bad_input() const;
+    Optional<DateTimeField const&> date_time_field(DateTimeField::Kind) const;
+    Optional<i32> date_time_field_value(DateTimeField::Kind) const;
+    i32 date_time_field_minimum(DateTimeField::Kind) const;
+    i32 date_time_field_maximum(DateTimeField::Kind) const;
+
+    GC::Ptr<DOM::Element> m_date_time_fields_container;
+    Vector<DateTimeField> m_date_time_fields;
+    Vector<Utf16String> m_day_period_names;
+    Optional<Utf16String> m_date_time_fields_value;
+    size_t m_active_date_time_field { 0 };
+    u8 m_date_time_field_typed_digits { 0 };
+    bool m_date_time_fields_show_seconds { false };
+
     GC::Ptr<DOM::Element> m_inner_text_element;
     GC::Ptr<DOM::Text> m_text_node;
     GC::Ptr<DOM::Text> m_image_button_alt_text_node;
@@ -414,9 +461,12 @@ private:
     GC::Ptr<DOM::Element> m_file_label;
 
     void update_slider_shadow_tree_elements();
+    void update_slider_ticks();
     GC::Ptr<DOM::Element> m_slider_runnable_track;
     GC::Ptr<DOM::Element> m_slider_progress_element;
     GC::Ptr<DOM::Element> m_slider_thumb;
+    GC::Ptr<DOM::Element> m_slider_ticks_element;
+    Vector<double> m_slider_tick_positions;
 
     GC::Ptr<DecodedImageData> image_data() const;
     GC::Ptr<SharedResourceRequest> m_resource_request;

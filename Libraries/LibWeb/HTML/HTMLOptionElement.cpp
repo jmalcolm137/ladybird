@@ -48,6 +48,8 @@ void HTMLOptionElement::visit_edges(Cell::Visitor& visitor)
 
 void HTMLOptionElement::update_selection_label()
 {
+    if (m_cached_nearest_select_element)
+        m_cached_nearest_select_element->list_box_options_did_change();
     if (selected()) {
         if (auto* select_element = first_ancestor_of_type<HTMLSelectElement>()) {
             select_element->clone_selected_option_into_select_button();
@@ -99,6 +101,12 @@ void HTMLOptionElement::attribute_changed(Utf16FlyString const& name, Optional<U
     if (namespace_.has_value())
         return;
 
+    // NB: The inputs that show this option's datalist as ticks read its value and whether it is disabled.
+    if (name == HTML::AttributeNames::value || name == HTML::AttributeNames::disabled) {
+        if (auto* data_list = first_ancestor_of_type<HTMLDataListElement>())
+            data_list->notify_inputs_using_this_as_suggestions_source();
+    }
+
     if (name == HTML::AttributeNames::selected) {
         // https://html.spec.whatwg.org/multipage/form-elements.html#attr-option-selected
         // Whenever an option element option's selected attribute is added or removed:
@@ -134,6 +142,9 @@ void HTMLOptionElement::attribute_changed(Utf16FlyString const& name, Optional<U
 
         // 5. Reset a select's selectedness given select and hasChanged.
         select->reset_selectedness(has_changed);
+    } else if (name == HTML::AttributeNames::disabled || name == HTML::AttributeNames::hidden) {
+        if (m_cached_nearest_select_element)
+            m_cached_nearest_select_element->list_box_options_did_change();
     } else if (name == HTML::AttributeNames::label) {
         update_selection_label();
     }
@@ -161,7 +172,10 @@ void HTMLOptionElement::set_selected_internal(bool selected)
         }
     }
 
+    bool const changed = m_selected != selected;
     m_selected = selected;
+    if (changed && m_cached_nearest_select_element)
+        m_cached_nearest_select_element->list_box_option_selectedness_did_change(*this);
     if (selected)
         m_selectedness_update_index = m_next_selectedness_update_index++;
 }
@@ -323,6 +337,10 @@ void HTMLOptionElement::update_nearest_select_element()
         }
         m_cached_nearest_select_element = new_select;
         update_label_sizer_text();
+        if (old_select)
+            old_select->list_box_options_did_change();
+        if (new_select)
+            new_select->list_box_options_did_change();
 
         // 1. If oldSelect is not null, then run the selectedness setting algorithm given oldSelect.
         if (old_select)
@@ -424,6 +442,12 @@ void HTMLOptionElement::children_changed(ChildrenChangedMetadata const& metadata
     Base::children_changed(metadata);
 
     update_selection_label();
+
+    // NB: Without a value attribute, the text of the option is its value.
+    if (!has_attribute(AttributeNames::value)) {
+        if (auto* data_list = first_ancestor_of_type<HTMLDataListElement>())
+            data_list->notify_inputs_using_this_as_suggestions_source();
+    }
 }
 
 }

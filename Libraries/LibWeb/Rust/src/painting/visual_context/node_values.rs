@@ -371,6 +371,21 @@ fn border_radius_is_initial(handle: &ComputedStyleValueHandle) -> bool {
     is_zero_px(horizontal_radius.data()) && is_zero_px(vertical_radius.data())
 }
 
+const NATIVE_APPEARANCE_CORNER_RADIUS_PX: i64 = 4;
+
+/// Whether the node is a devolvable widget rendered with its native appearance: its appearance is not none, and no
+/// author declaration disables native appearance for it.
+/// https://drafts.csswg.org/css-ui/#appearance-disabling-properties
+pub(crate) fn has_native_appearance(
+    style: ComputedValuesView<'_>,
+    layout_arena: &impl PaintRead,
+    slot: NodeSlotId,
+) -> bool {
+    layout_arena.node_has_dom_paint_fact(slot, crate::layout::node_data::DomPaintFact::DevolvableWidget)
+        && style.appearance() != css_enums::appearance::NONE
+        && !style.native_appearance_disabled()
+}
+
 pub(crate) fn border_radii_data(
     style: ComputedValuesView<'_>,
     layout_arena: &impl PaintRead,
@@ -387,7 +402,8 @@ pub(crate) fn border_radii_data(
         || !border_radius_is_initial(&border.border_bottom_right_radius)
         || !border_radius_is_initial(&border.border_top_left_radius)
         || !border_radius_is_initial(&border.border_top_right_radius);
-    if !has_noninitial_radii {
+    let has_native_appearance = has_native_appearance(style, layout_arena, slot);
+    if !has_noninitial_radii && !has_native_appearance {
         return BorderRadii::default();
     }
     let border_box = paintable_geometry::absolute_border_box_rect(layout_arena, slot);
@@ -397,6 +413,16 @@ pub(crate) fn border_radii_data(
         border_box.width,
         border_box.height,
     );
+    if !has_noninitial_radii {
+        // NB: The native appearance of a devolvable widget has slightly rounded corners. Its computed border-radius
+        //     stays zero, and an author border-radius devolves the widget.
+        return crate::painting::border_radii::scale_radii_to_fit(
+            border_rect,
+            BorderRadii {
+                values: [CssPixels::from_integer(NATIVE_APPEARANCE_CORNER_RADIUS_PX); 8],
+            },
+        );
+    }
     crate::painting::border_radii::normalize_border_radii_data(
         border_rect,
         border_rect,
@@ -940,7 +966,10 @@ pub(crate) fn compute_clip_data(layout_arena: &impl PaintRead, slot: NodeSlotId,
     //   clipping region is not rounded.
     // FIXME: Adjust the border radii for the overflow-clip-margin case.
     //        (see https://drafts.csswg.org/css-overflow-4/#valdef-overflow-clip-margin-length-0 )
-    let radii = if overflow_x != overflow::VISIBLE && overflow_y != overflow::VISIBLE {
+    // INTEROP: A single-line text field clips its contents to its padding box without rounding the corners, so that
+    //         text selected at the edge of a short field with rounded corners keeps its square highlight.
+    let is_text_input = layout_arena.node_kind_if_live(slot) == Some(crate::layout::node_data::NodeKind::TextInputBox);
+    let radii = if overflow_x != overflow::VISIBLE && overflow_y != overflow::VISIBLE && !is_text_input {
         padding_edge_border_radii(style, layout_arena, slot)
     } else {
         BorderRadii::default()

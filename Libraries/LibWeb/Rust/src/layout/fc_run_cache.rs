@@ -27,6 +27,8 @@ pub(crate) struct RunInputsTheStoredRunNeverObserved {
     pub(super) percentage_inline_basis: bool,
     pub(super) own_block_size: formatting_context::OwnBlockSizeObservation,
     pub(super) inline_space_around_root: bool,
+    /// The block size an item's root adopts at the end of a run whose contents never read it.
+    pub(super) content_block_size_adopted_after_run: bool,
 }
 
 impl RunInputsTheStoredRunNeverObserved {
@@ -47,12 +49,14 @@ impl RunInputsTheStoredRunNeverObserved {
             percentage_inline_basis,
             own_block_size,
             inline_space_around_root,
+            content_block_size_adopted_after_run,
         } = self;
         percentage_block_basis_and_block_size_definiteness
             || definite_available_inline_sizes_at_or_above.is_some()
             || percentage_inline_basis
             || own_block_size != formatting_context::OwnBlockSizeObservation::Observed
             || inline_space_around_root
+            || content_block_size_adopted_after_run
     }
 
     fn available_block_size_definiteness(self) -> bool {
@@ -101,10 +105,6 @@ impl FcRunCacheKey {
         mut input: LayoutInput,
         root_cells: used_values::RootInputCells,
     ) -> Self {
-        if !formatting_context::run_reads_content_block_size_adopted_after_it(fc_type, &input) {
-            input.sizing.adopt_automatic_content_block_size = false;
-            input.sizing.content_block_size_after_inside_layout = None;
-        }
         // NB: The parent block formatting context sizes a float against its containing block position before the
         //     run and places it after. The run lays the float out from its own origin.
         if let ParticipationInParentFormattingContext::Float {
@@ -121,14 +121,6 @@ impl FcRunCacheKey {
             input,
             root_cells,
         }
-    }
-
-    pub(super) fn fc_type(&self) -> formatting_context::FormattingContextType {
-        self.fc_type
-    }
-
-    pub(super) fn has_no_table_cell_intrinsic_block_padding(&self) -> bool {
-        self.input.sizing.table_cell_intrinsic_block_padding.is_none()
     }
 
     /// The key with the intrinsic block padding a table hands its cell taken out of the root's block paddings.
@@ -215,6 +207,7 @@ fn layout_inputs_match_ignoring_unobserved(
             &b.sizing,
             unobserved.available_block_size_definiteness(),
             unobserved.inline_space_around_root,
+            unobserved.content_block_size_adopted_after_run,
         )
 }
 
@@ -223,6 +216,7 @@ fn sizing_directives_match_ignoring_unobserved(
     b: &RootSizingDirectives,
     block_size_definiteness_unobserved: bool,
     float_avoidance_inline_size_unobserved: bool,
+    content_block_size_adopted_after_run_unobserved: bool,
 ) -> bool {
     let RootSizingDirectives {
         forced_content_inline_size,
@@ -249,9 +243,10 @@ fn sizing_directives_match_ignoring_unobserved(
         && block_parent_resolved_content_inline_size == b.block_parent_resolved_content_inline_size
         && table_cell_intrinsic_block_padding == b.table_cell_intrinsic_block_padding
         && table_box_content_block_offset_in_wrapper == b.table_box_content_block_offset_in_wrapper
-        && adopt_automatic_content_block_size == b.adopt_automatic_content_block_size
+        && ((adopt_automatic_content_block_size == b.adopt_automatic_content_block_size
+            && content_block_size_after_inside_layout == b.content_block_size_after_inside_layout)
+            || content_block_size_adopted_after_run_unobserved)
         && finds_automatic_line_clamp_lines == b.finds_automatic_line_clamp_lines
-        && content_block_size_after_inside_layout == b.content_block_size_after_inside_layout
         && (float_avoidance_inline_size == b.float_avoidance_inline_size || float_avoidance_inline_size_unobserved)
         && outer_float_intrusion_before_list_item_children == b.outer_float_intrusion_before_list_item_children
         && treat_block_axis_percentage_insets_as_auto_beyond_root
@@ -296,13 +291,9 @@ pub(super) struct FcRunCacheEntry {
     /// Whether the run is a table cell's that did not observe the intrinsic block padding its table hands it (see
     /// run_observes_root_block_padding), so that it stands for runs with any such padding.
     table_cell_intrinsic_block_padding_unobserved: bool,
-    root_content_block_size_adopted_after_run: Option<CssPixels>,
-    /// How many layouts the arena had committed when the run was stored. The subtrees the run took from the cache as
-    /// they were committed are only known to be so while no layout was committed since.
-    layout_commits_when_stored: u64,
-    /// The committed subtree token of the box when its committed fragments were found to be the stored ones, after
-    /// which the entry keeps no descendant fragments: they stay the stored ones while the token does.
-    committed_subtree_token_when_descendants_dropped: Option<u32>,
+    /// The committed subtree token of the box when its committed fragments were found to be the stored ones, which
+    /// they stay while the token does.
+    committed_subtree_token_when_found_committed: Option<u32>,
     last_used_at_layout_commit: std::sync::atomic::AtomicU64,
     structural_epoch_bumps_when_stored: u32,
 }
@@ -322,7 +313,7 @@ impl FcRunCacheEntry {
         let Some(root) = self.outputs.root.as_ref() else {
             return false;
         };
-        if !root.propagated_pending_abspos.is_empty() {
+        if !root.payloads_past_run.pending_abspos.is_empty() {
             return false;
         }
         if !arena.paintable_row_is_populated(box_) {
@@ -341,9 +332,9 @@ impl FcRunCacheEntry {
             })
             .unwrap_or(false);
         root_fragment_is_the_stored_one
-            && match self.committed_subtree_token_when_descendants_dropped {
+            && match self.committed_subtree_token_when_found_committed {
                 Some(token) => arena.committed_subtree_token(box_) == token,
-                None => links_are_committed(arena, &root.scoped_descendants),
+                None => links_are_committed(arena, &root.fragment.children),
             }
     }
 
@@ -352,33 +343,31 @@ impl FcRunCacheEntry {
             Some(cells) => (cells.content_inline_size, cells.content_block_size),
             None => (
                 self.key.root_cells.content_inline_size,
-                self.root_content_block_size_adopted_after_run
-                    .unwrap_or(self.key.root_cells.content_block_size),
+                formatting_context::content_block_size_adopted_after_run(
+                    &self.key.input,
+                    self.outputs.result.automatic_content_block_size,
+                )
+                .map_or(self.key.root_cells.content_block_size, |block_size| {
+                    clamp_to_max_dimension_value(block_size.max(CssPixels::default()))
+                }),
             ),
         }
     }
 
-    /// Whether the stored fragments can be replayed. Those of the subtrees the stored run took from the cache are the
-    /// committed ones, so such a run is replayed only before anything else is committed.
-    fn can_be_replayed(&self, callbacks: &LayoutPass<'_>) -> bool {
-        self.committed_subtree_token_when_descendants_dropped.is_none()
-            && self.outputs.root.as_ref().is_none_or(|root| {
-                root.reused_subtree_roots.is_empty()
-                    || callbacks.arena().layout_commit_count() == self.layout_commits_when_stored
-            })
+    /// Whether a hit may replay the stored fragments. An entry found committed answers only while it describes the
+    /// committed subtree.
+    fn can_be_replayed(&self) -> bool {
+        self.committed_subtree_token_when_found_committed.is_none()
     }
 
-    /// This entry without its descendant fragments, which are the box's committed ones while its committed subtree
-    /// token is `token`.
-    fn without_descendant_fragments(&self, token: u32) -> Self {
+    /// This entry as the one whose fragments the box committed, while its committed subtree token is `token`.
+    fn found_committed(&self, token: u32) -> Self {
         Self {
             key: self.key,
             validity: self.validity,
-            outputs: outputs_without_descendant_fragments(&self.outputs),
+            outputs: self.outputs.clone(),
             table_cell_intrinsic_block_padding_unobserved: self.table_cell_intrinsic_block_padding_unobserved,
-            root_content_block_size_adopted_after_run: self.root_content_block_size_adopted_after_run,
-            layout_commits_when_stored: self.layout_commits_when_stored,
-            committed_subtree_token_when_descendants_dropped: Some(token),
+            committed_subtree_token_when_found_committed: Some(token),
             last_used_at_layout_commit: std::sync::atomic::AtomicU64::new(self.last_used_at_layout_commit()),
             structural_epoch_bumps_when_stored: self.structural_epoch_bumps_when_stored,
         }
@@ -391,6 +380,7 @@ impl FcRunCacheEntry {
             root_outcome: self.outputs.root_outcome.clone(),
             inputs_never_observed: self.outputs.inputs_never_observed,
             host_findings: self.outputs.host_findings.clone(),
+            laid_out_abspos_contained_by_root: self.outputs.laid_out_abspos_contained_by_root,
         }
     }
 
@@ -405,7 +395,7 @@ impl FcRunCacheEntry {
     }
 
     fn holds_uncommitted_fragments(&self) -> bool {
-        self.outputs.root.is_some() && self.committed_subtree_token_when_descendants_dropped.is_none()
+        self.outputs.root.is_some() && self.committed_subtree_token_when_found_committed.is_none()
     }
 
     fn may_have_been_committed_by_the_last_layout(&self, layout_commit_count: u64) -> bool {
@@ -428,14 +418,9 @@ impl FcRunCacheEntry {
                     .matches(&key.without_table_cell_intrinsic_block_padding(), unobserved))
     }
 
-    /// The outputs a hit absorbs: the stored ones, or only what escapes the stored run where the hit keeps the
-    /// committed subtree.
-    pub(super) fn outputs_to_replay(&self, reuses_committed_subtree: bool) -> formatting_context::RunOutputs {
-        if reuses_committed_subtree {
-            outputs_without_descendant_fragments(&self.outputs)
-        } else {
-            self.outputs.clone()
-        }
+    /// The outputs a hit absorbs.
+    pub(super) fn outputs_to_replay(&self) -> formatting_context::RunOutputs {
+        self.outputs.clone()
     }
 }
 
@@ -466,28 +451,6 @@ fn links_are_committed(arena: &LayoutNodeArena, links: &[fragment_tree::Fragment
                 .get(index - 1)
                 .is_some_and(|committed| link.places_same_fragment_identically_to(&committed.link))
     })
-}
-
-fn outputs_without_descendant_fragments(outputs: &formatting_context::RunOutputs) -> formatting_context::RunOutputs {
-    let root = outputs.root.as_ref().map(|root| fragment_tree::UnplacedRootFragment {
-        node: root.node,
-        // Commit stops at the reused root, so descendant fragments and nested reuse markers never
-        // enter its scopes. Only payloads that escape the run still have to reach the parent.
-        scoped_descendants: Vec::new(),
-        reused_subtree_roots: HashSet::default(),
-        propagated_pending_abspos: root.propagated_pending_abspos.clone(),
-        propagated_anchor_candidates: root.propagated_anchor_candidates.clone(),
-        propagated_inline_containing_block_rects: root.propagated_inline_containing_block_rects.clone(),
-        propagated_abspos_containing_block_info: root.propagated_abspos_containing_block_info.clone(),
-        root_payloads: root.root_payloads.clone(),
-    });
-    formatting_context::RunOutputs {
-        result: outputs.result,
-        root,
-        root_outcome: outputs.root_outcome.clone(),
-        inputs_never_observed: outputs.inputs_never_observed,
-        host_findings: outputs.host_findings.clone(),
-    }
 }
 
 #[derive(Clone, Copy, Default)]
@@ -666,7 +629,7 @@ impl FcRunCacheStore {
         let mut displaced = entries.committed.take_if(|committed| committed.key == entry.key);
         match entries.latest.take() {
             Some(latest) if latest.key == entry.key => displaced = Some(latest),
-            Some(latest) if latest.committed_subtree_token_when_descendants_dropped.is_some() => {
+            Some(latest) if latest.committed_subtree_token_when_found_committed.is_some() => {
                 displaced = entries.committed.replace(latest).or(displaced);
             }
             Some(latest) => {
@@ -689,10 +652,10 @@ impl FcRunCacheStore {
         self.enqueue_for_sweep(slot);
     }
 
-    /// Releases stale entries after their last chance to supply reusable inline line data. Drops the descendant
-    /// fragments of the entry whose fragments the box committed, for which `committed_subtree_token` gives the token,
-    /// and the entries holding fragments the box did not commit once they went unused for a while, except the latest
-    /// entry of a box that committed none.
+    /// Releases stale entries after their last chance to supply reusable inline line data. Marks the entry whose
+    /// fragments the box committed, for which `committed_subtree_token` gives the token, and drops the entries holding
+    /// fragments the box did not commit once they went unused for a while, except the latest entry of a box that
+    /// committed none.
     pub(super) fn sweep_pending_entries(
         &self,
         mut keep: impl FnMut(u32, FcRunCacheValidity) -> bool,
@@ -720,11 +683,11 @@ impl FcRunCacheStore {
                 && latest.may_have_been_committed_by_the_last_layout(layout_commit_count)
                 && let Some(token) = token_of(latest)
             {
-                *latest = std::sync::Arc::new(latest.without_descendant_fragments(token));
+                *latest = std::sync::Arc::new(latest.found_committed(token));
                 entries.committed = None;
             } else {
                 entries.latest.take_if(|latest| {
-                    latest.committed_subtree_token_when_descendants_dropped.is_some() && token_of(latest).is_none()
+                    latest.committed_subtree_token_when_found_committed.is_some() && token_of(latest).is_none()
                 });
                 if let Some((index, token)) = earlier.iter().enumerate().find_map(|(index, earlier)| {
                     earlier
@@ -733,9 +696,7 @@ impl FcRunCacheStore {
                         .flatten()
                         .map(|token| (index, token))
                 }) {
-                    entries.committed = Some(std::sync::Arc::new(
-                        earlier.remove(index).without_descendant_fragments(token),
-                    ));
+                    entries.committed = Some(std::sync::Arc::new(earlier.remove(index).found_committed(token)));
                 } else {
                     entries.committed.take_if(|committed| token_of(committed).is_none());
                 }
@@ -870,7 +831,7 @@ impl FcRunCacheAttempt {
                 return false;
             }
             reuses_committed_subtree = entry.describes_committed_subtree(callbacks.arena(), box_);
-            reuses_committed_subtree || entry.can_be_replayed(callbacks)
+            reuses_committed_subtree || entry.can_be_replayed()
         }) {
             if !reuses_committed_subtree {
                 // NB: Once the replayed fragments are committed, the entry can drop them.
@@ -905,14 +866,8 @@ impl FcRunCacheAttempt {
         callbacks: &LayoutPass<'_>,
         box_: Node,
         key: FcRunCacheKey,
-        input: &LayoutInput,
         outputs: &formatting_context::RunOutputs,
     ) {
-        let root_content_block_size_adopted_after_run = formatting_context::content_block_size_adopted_after_run(
-            input,
-            outputs.result.automatic_content_block_size,
-        )
-        .map(|block_size| clamp_to_max_dimension_value(block_size.max(CssPixels::default())));
         let store = callbacks.fc_run_cache_store();
         let (validity, structurally_damaged_entry) = match self {
             Self::Bypass => return,
@@ -925,9 +880,7 @@ impl FcRunCacheAttempt {
                         validity,
                         outputs: outputs.clone(),
                         table_cell_intrinsic_block_padding_unobserved: false,
-                        root_content_block_size_adopted_after_run,
-                        layout_commits_when_stored: callbacks.arena().layout_commit_count(),
-                        committed_subtree_token_when_descendants_dropped: None,
+                        committed_subtree_token_when_found_committed: None,
                         last_used_at_layout_commit: std::sync::atomic::AtomicU64::new(
                             callbacks.arena().layout_commit_count(),
                         ),
@@ -943,13 +896,7 @@ impl FcRunCacheAttempt {
         };
         // Release the probed entry so that store() can replace it in place.
         drop(structurally_damaged_entry);
-        let Some(root) = &outputs.root else {
-            return;
-        };
-        // A committed-subtree hit omits that subtree's descendant fragments. Do not embed such a
-        // skeletal result in an entry that exports an out-of-flow descendant: replaying the parent
-        // has to rebuild its paintable subtree so the freshly laid-out descendant can commit.
-        if !root.propagated_pending_abspos.is_empty() && !root.reused_subtree_roots.is_empty() {
+        if outputs.root.is_none() {
             return;
         }
         let entry = FcRunCacheEntry {
@@ -963,9 +910,7 @@ impl FcRunCacheAttempt {
                 .is_some()
                 && outputs.root_outcome.parent_owns_root_input_cells()
                 && !run_observes_root_block_padding(callbacks, box_, outputs),
-            root_content_block_size_adopted_after_run,
-            layout_commits_when_stored: callbacks.arena().layout_commit_count(),
-            committed_subtree_token_when_descendants_dropped: None,
+            committed_subtree_token_when_found_committed: None,
             last_used_at_layout_commit: std::sync::atomic::AtomicU64::new(callbacks.arena().layout_commit_count()),
             structural_epoch_bumps_when_stored: 0,
         };
@@ -1016,9 +961,10 @@ pub(super) fn can_describe_run(
 
 /// Whether a run's outputs may depend on its root's block paddings. They hold the content in content box coordinates,
 /// so they stand for the same run at other block paddings unless the root is a scroll container, whose scrollable
-/// overflow area is bounded by its padding box, places a rendered legend on its border box, or passes payloads on to
-/// its ancestors (out-of-flow descendants, their containing block rects, anchors), which are placed against its
-/// padding box. Outputs without a root fragment cannot show those payloads.
+/// overflow area is bounded by its padding box, places a rendered legend on its border box, lays out absolutely
+/// positioned boxes against its padding box, or passes payloads on to its ancestors (out-of-flow descendants, their
+/// containing block rects, anchors), which are placed against its padding box. Outputs without a root fragment cannot
+/// show those payloads.
 pub(super) fn run_observes_root_block_padding(
     callbacks: &LayoutPass<'_>,
     box_: Node,
@@ -1028,7 +974,11 @@ pub(super) fn run_observes_root_block_padding(
     let places_rendered_legend_on_its_border_box = facts.is_fieldset_box() && !facts.rendered_legend().is_invalid();
     facts.is_scroll_container()
         || places_rendered_legend_on_its_border_box
-        || outputs.root.as_ref().is_none_or(|root| !root.propagates_nothing())
+        || outputs.laid_out_abspos_contained_by_root
+        || outputs
+            .root
+            .as_ref()
+            .is_none_or(|root| !root.payloads_past_run.is_empty())
 }
 
 #[cfg(test)]
@@ -1069,23 +1019,18 @@ mod tests {
         key(AvailableSize::definite(px(inline_size)), Some(px(inline_size)))
     }
 
-    fn root_with_a_descendant() -> fragment_tree::UnplacedRootFragment {
-        fragment_tree::UnplacedRootFragment {
-            node: Node::new(0, 1),
-            scoped_descendants: vec![fragment_tree::FragmentLink::for_test(Node::new(1, 1))],
-            reused_subtree_roots: HashSet::default(),
-            propagated_pending_abspos: Vec::new(),
-            propagated_anchor_candidates: Vec::new(),
-            propagated_inline_containing_block_rects: Vec::new(),
-            propagated_abspos_containing_block_info: Vec::new(),
-            root_payloads: None,
-        }
+    fn root_with_a_descendant() -> fragment_tree::RunRootFragment {
+        let mut root = fragment_tree::FragmentLink::for_test(Node::new(0, 1)).fragment;
+        std::sync::Arc::get_mut(&mut root)
+            .expect("a fresh fragment is not shared")
+            .children = vec![fragment_tree::FragmentLink::for_test(Node::new(1, 1))];
+        fragment_tree::RunRootFragment::propagating_nothing(root)
     }
 
     fn entry(
         key: FcRunCacheKey,
         fragment_cache_epoch: u32,
-        root: Option<fragment_tree::UnplacedRootFragment>,
+        root: Option<fragment_tree::RunRootFragment>,
         layout_commit_count: u64,
     ) -> FcRunCacheEntry {
         FcRunCacheEntry {
@@ -1107,11 +1052,10 @@ mod tests {
                     ..RunInputsTheStoredRunNeverObserved::default()
                 },
                 host_findings: None,
+                laid_out_abspos_contained_by_root: false,
             },
             table_cell_intrinsic_block_padding_unobserved: false,
-            root_content_block_size_adopted_after_run: None,
-            layout_commits_when_stored: layout_commit_count,
-            committed_subtree_token_when_descendants_dropped: None,
+            committed_subtree_token_when_found_committed: None,
             last_used_at_layout_commit: std::sync::atomic::AtomicU64::new(layout_commit_count),
             structural_epoch_bumps_when_stored: 0,
         }
@@ -1201,7 +1145,7 @@ mod tests {
     }
 
     #[test]
-    fn the_sweep_marks_the_entry_whose_fragments_the_box_committed_and_drops_its_descendant_fragments() {
+    fn the_sweep_marks_the_entry_whose_fragments_the_box_committed_and_keeps_its_fragments() {
         let store = FcRunCacheStore::default();
         let box_ = Node::new(0, 1);
         store.store(box_, entry(at(300), 1, Some(root_with_a_descendant()), 0));
@@ -1215,8 +1159,8 @@ mod tests {
             committed.key.input.available_space.inline_size,
             AvailableSize::definite(px(300))
         );
-        assert_eq!(committed.committed_subtree_token_when_descendants_dropped, Some(7));
-        assert!(committed.outputs.root.as_ref().unwrap().scoped_descendants.is_empty());
+        assert_eq!(committed.committed_subtree_token_when_found_committed, Some(7));
+        assert_eq!(committed.outputs.root.as_ref().unwrap().fragment.children.len(), 1);
         assert_eq!(widths_of_entries(&store, 0), widths(&[300, 320]));
 
         let both_are_committed =
@@ -1386,7 +1330,7 @@ mod tests {
     }
 
     #[test]
-    fn item_keys_leave_out_the_block_size_adopted_after_the_run_unless_the_run_reads_it() {
+    fn an_item_run_that_never_read_the_block_size_its_root_adopts_matches_at_another() {
         let root_cells = used_values::RootInputCells::default();
         let item_input = LayoutInput::new(
             AvailableSpace {
@@ -1396,22 +1340,21 @@ mod tests {
             ContainingBlockConstraints::default(),
             ParticipationInParentFormattingContext::Item,
         );
-        let key_of = |fc_type, input| FcRunCacheKey::new(fc_type, input, root_cells);
-        let stored_block_key = key_of(formatting_context::FormattingContextType::Block, item_input);
-        let stored_flex_key = key_of(formatting_context::FormattingContextType::Flex, item_input);
+        let key_of = |input| FcRunCacheKey::new(formatting_context::FormattingContextType::Block, input, root_cells);
+        let stored = key_of(item_input);
 
         let mut adopting_input = item_input;
         adopting_input.sizing.adopt_automatic_content_block_size = true;
         adopting_input.sizing.content_block_size_after_inside_layout = Some(px(40));
+        let probe = key_of(adopting_input);
 
-        let exact = RunInputsTheStoredRunNeverObserved::default();
-        assert!(stored_block_key.matches(
-            &key_of(formatting_context::FormattingContextType::Block, adopting_input),
-            exact
-        ));
-        assert!(!stored_flex_key.matches(
-            &key_of(formatting_context::FormattingContextType::Flex, adopting_input),
-            exact
+        assert!(!stored.matches(&probe, RunInputsTheStoredRunNeverObserved::default()));
+        assert!(stored.matches(
+            &probe,
+            RunInputsTheStoredRunNeverObserved {
+                content_block_size_adopted_after_run: true,
+                ..RunInputsTheStoredRunNeverObserved::default()
+            }
         ));
     }
 

@@ -2014,6 +2014,18 @@ EventResult EventHandler::handle_keydown(UIEvents::KeyCode key, u32 modifiers, u
 
     GC::Ref<DOM::Document> document = *m_navigable->active_document();
 
+    // NB: A focused list box moves its selection with the arrow, Home and End keys instead of scrolling.
+    if (auto* select = as_if<HTML::HTMLSelectElement>(document->focused_area().ptr()); select && select->renders_as_list_box()) {
+        if (select->handle_list_box_key(key, modifiers & ~UIEvents::Mod_Keypad))
+            return EventResult::Handled;
+    }
+
+    // NB: A focused date or time input edits its fields with the keyboard.
+    if (auto* input = as_if<HTML::HTMLInputElement>(document->focused_area().ptr()); input && input->has_date_picker()) {
+        if (input->handle_date_time_field_key(key, modifiers & ~UIEvents::Mod_Keypad, code_point))
+            return EventResult::Handled;
+    }
+
     if (!(modifiers & UIEvents::KeyModifier::Mod_Ctrl)) {
         if (key == UIEvents::KeyCode::Key_Tab)
             return focus_sequentially(modifiers & UIEvents::KeyModifier::Mod_Shift ? HTML::SequentialFocusDirection::Backward : HTML::SequentialFocusDirection::Forward);
@@ -3293,9 +3305,17 @@ EventResult EventHandler::focus_sequentially(HTML::SequentialFocusDirection dire
     //    direction, and selection mechanism.
     auto candidate = HTML::sequential_navigation_search(starting_point, direction, selection_mechanism);
 
+    auto focus_candidate = [&](DOM::Element& candidate) {
+        HTML::run_focusing_steps(&candidate, nullptr, HTML::FocusTrigger::Key);
+        if (direction != HTML::SequentialFocusDirection::Backward)
+            return;
+        if (auto* input = as_if<HTML::HTMLInputElement>(candidate); input && document->focused_area().ptr() == input)
+            input->activate_last_date_time_field();
+    };
+
     // 6. If candidate is not null, then run the focusing steps for candidate and return.
     if (candidate) {
-        HTML::run_focusing_steps(candidate, nullptr, HTML::FocusTrigger::Key);
+        focus_candidate(*candidate);
         return EventResult::Handled;
     }
 
@@ -3314,7 +3334,7 @@ EventResult EventHandler::focus_sequentially(HTML::SequentialFocusDirection dire
     candidate = HTML::sequential_navigation_search(GC::Ref<HTML::LocalNavigable> { *m_navigable }, direction, HTML::SelectionMechanism::Sequential);
     if (!candidate)
         return EventResult::Dropped;
-    HTML::run_focusing_steps(candidate, nullptr, HTML::FocusTrigger::Key);
+    focus_candidate(*candidate);
     return EventResult::Handled;
 }
 
@@ -3473,6 +3493,15 @@ GC::Ptr<DOM::Node> EventHandler::focus_candidate_for_position(Layout::BegunRead 
 
 static bool selection_contains_position(DOM::Document&, Painting::CaretPosition const&);
 
+static bool is_inside_button(GC::Ptr<DOM::Node const> node)
+{
+    for (; node; node = node->parent_or_shadow_host_node()) {
+        if (auto const* element = as_if<HTML::HTMLElement>(*node); element && element->uses_button_layout())
+            return true;
+    }
+    return false;
+}
+
 void EventHandler::run_mousedown_default_actions(Layout::BegunRead const& read, DOM::Document& document, CSSPixelPoint visual_viewport_position, unsigned button, unsigned modifiers, int click_count)
 {
     if (m_middle_button_scroll_handler) {
@@ -3512,6 +3541,11 @@ void EventHandler::run_mousedown_default_actions(Layout::BegunRead const& read, 
 
     auto caret_position = prepare_mouse_selection(document, visual_viewport_position);
     if (!caret_position.has_value())
+        return;
+
+    // NB: Pressing a button activates it, so a drag that starts on one does not select its label or the page around
+    //     it.
+    if (auto hit = document.hit_test(read, visual_viewport_position); hit.has_value() && is_inside_button(hit->dom_node()))
         return;
 
     // https://drafts.csswg.org/css-ui/#valdef-user-select-none
@@ -3631,6 +3665,14 @@ bool EventHandler::select_word_for_dictionary_lookup(CSSPixelPoint visual_viewpo
         dispatch_result.has_value()) {
         return *dispatch_result == EventResult::Handled;
     }
+
+    // NB: A button or file upload control has no words to look up, only labels.
+    for (GC::Ptr<DOM::Node const> node = result->dom_node(); node; node = node->parent_or_shadow_host_node()) {
+        if (auto const* input = as_if<HTML::HTMLInputElement>(*node); input && input->type_state() == HTML::HTMLInputElement::TypeAttributeState::FileUpload)
+            return false;
+    }
+    if (is_inside_button(result->dom_node()))
+        return false;
 
     return select_word_at_position(read, *document, visual_viewport_position);
 }

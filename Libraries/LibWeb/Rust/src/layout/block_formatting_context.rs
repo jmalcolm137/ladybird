@@ -22,7 +22,7 @@ struct ColumnLayout {
     consumed_block_size: CssPixels,
     baselines: formatting_context::DerivedBaselines,
     root_line_data: Option<std::sync::Arc<inline_content::InlineContent>>,
-    root: Option<fragment_tree::UnplacedRootFragment>,
+    contents: Option<fragment_tree::RunContents>,
 }
 
 #[derive(Clone, Copy)]
@@ -66,7 +66,7 @@ struct BlockLevelBoxOutcome {
 struct DeferredLegend {
     flow_position: geometry::LogicalOffset,
     placed_child: formatting_context::PlacedChild,
-    fragment_arrival: Option<fragment_tree::ChildFragmentArrival>,
+    fragment_arrival: Option<fragment_tree::RunRootFragment>,
 }
 
 impl BlockLevelBoxOutcome {
@@ -201,7 +201,7 @@ pub(crate) struct FloatLaidOutAheadOfItsPosition {
     placed_float: formatting_context::PlacedChild,
     pub(crate) cells: used_values::RootInputCells,
     laid_out_float_handed_back_by_its_run: Option<run_state::LaidOutChildBox>,
-    fragment_arrival: Option<fragment_tree::ChildFragmentArrival>,
+    fragment_arrival: Option<fragment_tree::RunRootFragment>,
 }
 
 /// A box a block formatting context sizes, in cells the call laying the box out owns: the cells the context lays the
@@ -2255,7 +2255,7 @@ impl<'pass> BlockFormattingContext<'pass> {
         force_independent_context_run: bool,
     ) -> (
         Option<formatting_context::ChildLayoutResult>,
-        Option<fragment_tree::ChildFragmentArrival>,
+        Option<fragment_tree::RunRootFragment>,
         run_state::LaidOutChildBox,
     ) {
         let formatting_context::ChildLayout {
@@ -3289,15 +3289,12 @@ impl<'pass> BlockFormattingContext<'pass> {
             node,
             formatting_context::PlacedChild::new(fragment_tree::FragmentGeometry {
                 cells: self.metrics_of(sized_child),
-                line_data: None,
+                line_data: fragment.line_data.clone(),
             })
             .with_in_flow_box_insets(insets),
             content_offset,
             None,
-            Some(fragment_tree::ChildFragmentArrival::CommittedFragment {
-                fragment,
-                reuses_subtree: true,
-            }),
+            Some(fragment_tree::RunRootFragment::propagating_nothing(fragment)),
         );
         self.block_offset_of_current_block_container
             .set(Some(flow_position + entry.flow_position_advance));
@@ -3975,7 +3972,7 @@ impl<'pass> BlockFormattingContext<'pass> {
                     consumed_block_size,
                     baselines: column_baselines,
                     root_line_data,
-                    root,
+                    contents,
                 } = self.layout_column(
                     ColumnLayoutUse::ContainerContent,
                     column_input,
@@ -3987,8 +3984,8 @@ impl<'pass> BlockFormattingContext<'pass> {
                     incoming.take(),
                     column_index,
                 );
-                if let (Some(fragments), Some(root)) = (self.run.fragments.as_deref(), root) {
-                    fragments.adopt_fragmentainer_root(root, origin, root_line_count);
+                if let (Some(fragments), Some(contents)) = (self.run.fragments.as_deref(), contents) {
+                    fragments.adopt_fragmentainer_contents(contents, origin, root_line_count);
                 }
                 let filled_column = outcome
                     .outgoing
@@ -4349,7 +4346,7 @@ impl<'pass> BlockFormattingContext<'pass> {
                 consumed_block_size: outputs.result.automatic_content_block_size,
                 baselines: outputs.result.baselines,
                 root_line_data: outputs.root_outcome.line_data,
-                root: outputs.root,
+                contents: fragmentainer.take_contents(),
             };
         }
     }
