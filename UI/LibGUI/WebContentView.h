@@ -31,6 +31,7 @@ public:
     RefPtr<Gfx::Bitmap> snapshot() const;
 
     void set_page_cursor(StringView cursor_name);
+    Gfx::IntPoint last_mouse_position() const { return m_last_mouse_position; }
     void set_crashed(bool crashed) { m_crashed = crashed; update(); }
     bool is_crashed() const { return m_crashed; }
     void set_unresponsive(bool unresponsive) { m_unresponsive = unresponsive; update(); }
@@ -75,6 +76,7 @@ private:
     bool m_frame_was_painted { false };
     bool m_dragging { false };
     Gfx::IntPoint m_drag_position;
+    Gfx::IntPoint m_last_mouse_position;
     int m_click_count { 1 };
     bool m_crashed { false };
     bool m_unresponsive { false };

@@ -162,6 +162,7 @@ void WebContentView::resize_event(GUI::ResizeEvent& event)
 void WebContentView::mousedown_event(GUI::MouseEvent& event)
 {
     set_focus(true);
+    m_last_mouse_position = event.position();
 
     if (m_unresponsive && event.position().y() < 34) {
         if (on_force_reload)
@@ -193,6 +194,7 @@ void WebContentView::mousedown_event(GUI::MouseEvent& event)
 
 void WebContentView::mouseup_event(GUI::MouseEvent& event)
 {
+    m_last_mouse_position = event.position();
     if (on_mouse)
         on_mouse("up"sv, event.position(), event.button(), event.buttons(), event.modifiers(), m_click_count);
     event.accept();
@@ -200,6 +202,7 @@ void WebContentView::mouseup_event(GUI::MouseEvent& event)
 
 void WebContentView::mousemove_event(GUI::MouseEvent& event)
 {
+    m_last_mouse_position = event.position();
     if (on_mouse)
         on_mouse("move"sv, event.position(), event.button(), event.buttons(), event.modifiers(), 0);
     event.accept();
@@ -207,6 +210,7 @@ void WebContentView::mousemove_event(GUI::MouseEvent& event)
 
 void WebContentView::doubleclick_event(GUI::MouseEvent& event)
 {
+    m_last_mouse_position = event.position();
     if (on_mouse)
         on_mouse("down"sv, event.position(), event.button(), event.buttons(), event.modifiers(), 2);
     event.accept();

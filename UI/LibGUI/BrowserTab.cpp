@@ -8,10 +8,14 @@
 
 #include <WaylandClient.h>
 
+#include <AK/Base64.h>
+#include <LibCore/EventLoop.h>
+#include <LibCore/MimeData.h>
 #include <LibCore/StandardPaths.h>
 #include <LibGUI/Application.h>
 #include <LibGUI/BoxLayout.h>
 #include <LibGUI/CheckBox.h>
+#include <LibGUI/DragOperation.h>
 #include <LibGUI/FilePicker.h>
 #include <LibGUI/InputBox.h>
 #include <LibGUI/JsonArrayModel.h>
@@ -1395,6 +1399,75 @@ void BrowserTab::show_permission_prompt(StringView name, StringView origin, u64 
         on_permission_decision(String::from_utf8(origin).release_value(), String::from_utf8(name).release_value(), *decision, remember);
     if (is_attached())
         m_engine.permission_response(m_tab_id, request_id, *decision);
+}
+
+void BrowserTab::start_drag(JsonArray items)
+{
+    // This runs from the engine socket's read callback. Defer it so starting the platform drag, which runs its own
+    // event loop until the drag ends, cannot re-enter that callback while it is still on the stack.
+    auto weak_this = make_weak_ptr();
+    Core::deferred_invoke([weak_this, items = move(items)]() mutable {
+        if (auto* tab = weak_this.ptr())
+            tab->run_drag(items);
+    });
+}
+
+void BrowserTab::run_drag(JsonArray const& items)
+{
+    auto mime_data = Core::MimeData::construct();
+    bool has_data = false;
+
+    for (auto const& value : items.values()) {
+        if (!value.is_object())
+            continue;
+
+        auto const& object = value.as_object();
+        auto kind = object.get_byte_string("kind"sv).value_or({});
+        auto type = String::from_byte_string(object.get_byte_string("type"sv).value_or({})).release_value();
+        auto encoded_data = object.get_byte_string("data"sv).value_or({});
+
+        if (kind == "text"sv) {
+            if (type.is_empty())
+                type = "text/plain"_string;
+            mime_data->set_data(type, encoded_data.to_byte_buffer());
+            if (type == "text/plain"sv)
+                mime_data->set_text(encoded_data);
+            has_data = true;
+        } else if (kind == "file"sv) {
+            auto data = AK::decode_base64(encoded_data.view());
+            if (data.is_error())
+                continue;
+            if (type.is_empty())
+                type = "application/octet-stream"_string;
+            mime_data->set_data(type, data.release_value());
+            has_data = true;
+        }
+    }
+
+    // Many drop targets only understand text/plain. A link or image drag carries its URL as text/uri-list, so give it
+    // a plain-text form too, as the reference frontends do.
+    if (!mime_data->has_format("text/plain"sv) && mime_data->has_format("text/uri-list"sv)) {
+        auto urls = mime_data->data("text/uri-list"sv);
+        auto view = StringView { reinterpret_cast<char const*>(urls.data()), urls.size() }.trim_whitespace();
+        if (auto newline = view.find('\n'); newline.has_value())
+            view = view.substring_view(0, *newline).trim_whitespace();
+        if (!view.is_empty())
+            mime_data->set_text(ByteString::from_utf8(view).release_value());
+    }
+
+    auto position = m_web_view->last_mouse_position();
+    if (!has_data) {
+        m_engine.drag_event(m_tab_id, "end"sv, position, 0, String {}, Vector<String> {});
+        return;
+    }
+
+    auto operation = GUI::DragOperation::construct();
+    operation->set_mime_data(mime_data);
+    if (auto* bitmap = favicon())
+        operation->set_bitmap(bitmap);
+
+    operation->exec();
+    m_engine.drag_event(m_tab_id, "end"sv, position, 0, String {}, Vector<String> {});
 }
 
 void BrowserTab::show_file_picker(bool, JsonArray const& filters)

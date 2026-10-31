@@ -104,6 +104,7 @@ private:
     void handle_download_event(JsonObject const&);
     void show_tab_context_menu(BrowserTab&, Gfx::IntPoint);
     void show_tab_search();
+    void show_user_agent_dialog();
     void add_bookmark_menu_items(GUI::Menu&, Vector<BookmarkEntry> const&);
     void rebuild_bookmarks_menu();
     void close_other_tabs(BrowserTab&);
@@ -168,6 +169,7 @@ private:
     RefPtr<GUI::Action> m_report_website_issue_action;
     RefPtr<GUI::Action> m_toggle_devtools_action;
     RefPtr<GUI::Action> m_open_devtools_client_action;
+    RefPtr<GUI::Action> m_user_agent_action;
     RefPtr<GUI::Widget> m_devtools_bar;
     RefPtr<GUI::Label> m_devtools_label;
 

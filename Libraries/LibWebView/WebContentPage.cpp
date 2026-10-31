@@ -1880,6 +1880,20 @@ void WebContentPage::did_request_file_picker(Web::HTML::FileFilter accepted_file
     view().did_request_file_picker({}, *this, accepted_file_types, allow_multiple_files);
 }
 
+void WebContentPage::did_start_drag(Web::DragData drag_data)
+{
+    if (displays_tab()) {
+        view().did_start_drag({}, *this, move(drag_data));
+        return;
+    }
+
+    // The view displaying the tab hears the drag its nested frame started.
+    if (auto display_page = traversable().display_page(); display_page) {
+        if (display_page->is_open() && display_page.ptr() != this)
+            display_page->did_start_drag(move(drag_data));
+    }
+}
+
 void WebContentPage::did_finish_handling_input_event(u64 event_id, Web::EventResult event_result)
 {
     relay_finished_input_event(*this, event_id, event_result);

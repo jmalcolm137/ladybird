@@ -49,6 +49,15 @@ public:
     void open_devtools_client();
     Optional<u16> devtools_port() const { return m_devtools_port; }
 
+    // User-agent overrides come from the engine, which owns the preset list the reference frontend shows.
+    struct UserAgentPreset {
+        String name;
+        String value;
+    };
+    Vector<UserAgentPreset> const& user_agent_presets() const { return m_user_agent_presets; }
+    String const& current_user_agent() const { return m_current_user_agent; }
+    void set_user_agent(String const& user_agent) { m_engine->set_user_agent(user_agent); }
+
     JsonArray clipboard_items_for_paste();
 
     // Permission decisions for the site information popover. Decisions marked "remember" are written to the profile
@@ -112,6 +121,8 @@ private:
     Vector<String> m_pending_initial_urls;
     Optional<u16> m_devtools_port;
     HashMap<String, Vector<PermissionEntry>> m_permissions;
+    Vector<UserAgentPreset> m_user_agent_presets;
+    String m_current_user_agent;
 };
 
 }

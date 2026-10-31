@@ -5,7 +5,7 @@ line-oriented JSON protocol over a Unix socket. Frame pixels never travel over
 the socket: the engine publishes a POSIX shared-memory ring per tab and the
 frontend maps it.
 
-Version: 14. `Shared/EngineProtocol.h` is authoritative.
+Version: 15. `Shared/EngineProtocol.h` is authoritative.
 
 ## Frontend → engine
 
@@ -44,6 +44,7 @@ Version: 14. `Shared/EngineProtocol.h` is authoritative.
 | `compat_report_cancel` | `tab` | Cancel an in-flight submission. |
 | `compat_report_close` | `tab` | Drop the report object after the review window closes. |
 | `drag` | `tab`, `drag_type`, `x`, `y`, `ctrl`, `shift`, `alt`, `super`, `text`, `urls` | Forward a desktop drag to the page. `drag_type` is `start`, `move`, `end`, or `drop`; coordinates are logical. `urls` carries `text/uri-list` entries; `file://` entries become drag-and-drop files. |
+| `set_user_agent` | `value` | Replace the User-Agent that every page and worker reports. An empty value restores the default. The engine answers with `user_agent_changed`. |
 | `certificate_info` | `tab` | Ask for the TLS certificate of the tab's current HTTPS page; the engine answers with `certificate_info`. |
 | `history_recent` | `limit` | Ask for the most recent history entries; the engine answers with `history_recent`. |
 | `history_search` | `query`, `limit` | Search titles and URLs; the engine answers with `history_search_results`. |
@@ -72,6 +73,8 @@ Version: 14. `Shared/EngineProtocol.h` is authoritative.
 | `type` | Fields | Meaning |
 |---|---|---|
 | `hello` | `protocol` | Protocol handshake. |
+| `user_agents` | `current`, `agents` | The current User-Agent and the presets the reference frontend offers. Each agent is `{name, value}`. Sent after `hello`. |
+| `user_agent_changed` | `value` | The application User-Agent changed. |
 | `session_plan` | `windows` | Native startup-recovery plan. Each window has `window`, `active`, optional geometry, and `tabs`; each tab has `session_tab`, `url`, and `pinned`. Sent once after `hello`. An empty list means open the default window. |
 | `session_window` | `window`, `session_window` | The engine assigned a native session-window ID to a frontend window. The frontend stores it for geometry and close reporting. |
 | `session_tab_registered` | `request`, `window`, `session_tab` | The native session store assigned an ID to a lazily restored tab. |
@@ -110,6 +113,7 @@ Version: 14. `Shared/EngineProtocol.h` is authoritative.
 | `compat_report_retry` | `tab`, `reason`, `retry`, `maximum`, `delay` | A transient failure; the submission retries after `delay` seconds. |
 | `compat_report_sent` | `tab` | The report was accepted. |
 | `compat_report_failed` | `tab`, `failure`, `reason` | The report failed. `failure` is `validation`, `preparation`, or `sending`. |
+| `drag_start` | `tab`, `items` | The page started a drag. Each item is a text representation (`kind` `text`, `type`, `data`) or a file (`kind` `file`, `type`, `name`, base64 `data`). The frontend turns these into a native drag and sends `drag` with `drag_type` `end` when it finishes. |
 | `input_method_state` | `tab`, `enabled`, `x`, `y`, `width`, `height` | The page's focused editable field changed. `enabled` tells the frontend to enable the desktop input method; the rectangle is the caret in device pixels. |
 | `certificate_info` | `tab`, `ok`, `subject`, `issuer`, `valid_from`, `valid_until`, `serial_number`, `sha256_fingerprint`, `protocol`, `cipher` | Certificate details for a secure page. On failure `ok` is false and `error` explains why. |
 | `file_picker` | `tab`, `multiple`, `filters` | Page opened a file picker. |

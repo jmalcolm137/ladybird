@@ -543,9 +543,7 @@ EventResult EventHandler::handle_mousemove(CSSPixelPoint visual_viewport_positio
 
         if (delta.x().abs() >= DRAG_THRESHOLD || delta.y().abs() >= DRAG_THRESHOLD) {
             auto result = handle_drag_and_drop_event(DragEvent::Type::DragStart, visual_viewport_position, screen_position, UIEvents::MouseButton::Primary, buttons, modifiers, {});
-#if defined(AK_OS_MACOS)
             bool should_start_selection_from_preserved_mousedown = m_mousedown_preserved_selection && result != EventResult::Handled;
-#endif
 
             if (result == EventResult::Handled) {
                 m_navigable->page().cursor().request(Gfx::StandardCursor::Drag);
@@ -564,10 +562,8 @@ EventResult EventHandler::handle_mousemove(CSSPixelPoint visual_viewport_positio
             if (!has_committed_root_box())
                 return EventResult::Accepted;
 
-#if defined(AK_OS_MACOS)
             if (should_start_selection_from_preserved_mousedown)
                 start_selection_from_preserved_mousedown(read, *document);
-#endif
         }
     }
 
@@ -822,12 +818,10 @@ EventResult EventHandler::handle_mouseup(CSSPixelPoint visual_viewport_position,
     auto coordinates = compute_mouse_event_coordinates(visual_viewport_position, viewport_position, *layout_node);
     auto dispatched_pointer_up = dispatch_a_pointer_event_for_a_device_that_supports_hover(read, PointerEventType::PointerUp, *node, chrome_widget, coordinates, screen_position, {}, button, buttons, modifiers, click_count);
 
-#if defined(AK_OS_MACOS)
     // INTEROP: Blink, WebKit, and Gecko defer changing a selection clicked for a possible drag until an uncancelled
     //          mouseup. Blink and WebKit clear non-editable selections, while Gecko collapses them to a caret.
     if (m_mousedown_preserved_selection && dispatched_pointer_up.result == PointerEventDispatchResult::RunDefaultActions)
         finish_selection_from_preserved_mousedown(*document, visual_viewport_position);
-#endif
 
     // https://w3c.github.io/pointerevents/#the-click-auxclick-and-contextmenu-events
     // The target of click and auxclick events is the pointer capture target override of the pointerup event, if the
@@ -2458,8 +2452,12 @@ EventResult EventHandler::handle_drag_and_drop_event(DragEvent::Type type, CSSPi
             document.page().invalidate_compositor_keyboard_scroll_state_for_document(document);
     };
     switch (type) {
-    case DragEvent::Type::DragStart:
-        return m_drag_and_drop_event_handler->handle_drag_start(HTML::relevant_global_object(document), m_mousedown_target.ptr(), screen_position, page_offset, viewport_position, offset, button, buttons, modifiers, move(files), move(text), move(urls));
+    case DragEvent::Type::DragStart: {
+        auto result = m_drag_and_drop_event_handler->handle_drag_start(HTML::relevant_global_object(document), m_mousedown_target.ptr(), screen_position, page_offset, viewport_position, offset, button, buttons, modifiers, move(files), move(text), move(urls));
+        if (result == EventResult::Handled && m_drag_and_drop_event_handler->has_ongoing_drag_and_drop_operation())
+            m_navigable->page().client().page_did_start_drag(m_drag_and_drop_event_handler->drag_data());
+        return result;
+    }
     case DragEvent::Type::DragMove:
         return m_drag_and_drop_event_handler->handle_drag_move(HTML::relevant_global_object(document), *node, screen_position, page_offset, viewport_position, offset, button, buttons, modifiers);
     case DragEvent::Type::DragEnd:
@@ -3555,12 +3553,10 @@ void EventHandler::run_mousedown_default_actions(Layout::BegunRead const& read, 
     if (user_select == CSS::UserSelect::None)
         return;
 
-#if defined(AK_OS_MACOS)
     if (click_count == 1 && !(modifiers & UIEvents::KeyModifier::Mod_Shift) && selection_contains_position(document, *caret_position)) {
         m_mousedown_preserved_selection = true;
         return;
     }
-#endif
 
     auto selection_started = [&] {
         if (click_count == 3)
@@ -3742,6 +3738,7 @@ bool EventHandler::select_word_at_position(Layout::BegunRead const& read, DOM::D
     }
     return false;
 }
+#endif
 
 void EventHandler::start_selection_from_preserved_mousedown(Layout::BegunRead const& read, DOM::Document& document)
 {
@@ -3794,7 +3791,6 @@ void EventHandler::finish_selection_from_preserved_mousedown(DOM::Document& docu
         document.set_needs_repaint(Badge<EventHandler> {}, InvalidateDisplayList::PaintCommands);
     }
 }
-#endif
 
 void EventHandler::run_activation_behavior(GC::Ref<DOM::Node> node, unsigned button, unsigned modifiers)
 {
@@ -4551,9 +4547,7 @@ void EventHandler::clear_mousedown_tracking()
     m_mousedown_visual_viewport_position = {};
     m_mousedown_click_count = 0;
     m_mousedown_target_is_drag_candidate = false;
-#if defined(AK_OS_MACOS)
     m_mousedown_preserved_selection = false;
-#endif
 }
 
 void EventHandler::stop_updating_selection()

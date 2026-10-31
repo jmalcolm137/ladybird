@@ -680,6 +680,14 @@ void EngineClient::set_clipboard_items(JsonArray items)
     send(event);
 }
 
+void EngineClient::set_user_agent(String const& user_agent)
+{
+    JsonObject event;
+    event.set("type"sv, "set_user_agent"sv);
+    event.set("value"sv, user_agent.bytes_as_string_view());
+    send(event);
+}
+
 void EngineClient::toggle_devtools()
 {
     JsonObject event;

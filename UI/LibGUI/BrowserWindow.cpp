@@ -22,9 +22,11 @@
 #include <LibGUI/Button.h>
 #include <LibGUI/Label.h>
 #include <LibGUI/Clipboard.h>
+#include <LibGUI/ComboBox.h>
 #include <LibGUI/Dialog.h>
 #include <LibGUI/Icon.h>
 #include <LibGUI/InputBox.h>
+#include <LibGUI/ItemListModel.h>
 #include <LibGUI/JsonArrayModel.h>
 #include <LibGUI/Menu.h>
 #include <LibGUI/MessageBox.h>
@@ -367,6 +369,11 @@ void BrowserWindow::create_actions()
     m_open_devtools_client_action->set_status_tip("Open a Firefox DevTools client for the active tab"_string);
     m_open_devtools_client_action->set_enabled(false);
 
+    m_user_agent_action = GUI::Action::create("User &Agent…"sv, [this](auto&) {
+        show_user_agent_dialog();
+    }, m_window.ptr());
+    m_user_agent_action->set_status_tip("Choose the User-Agent sent to sites"_string);
+
     m_back_action->set_enabled(false);
     m_forward_action->set_enabled(false);
 }
@@ -462,6 +469,8 @@ void BrowserWindow::create_menus()
     // SDE compositor rejects.
     tools_menu.add_action(*m_toggle_devtools_action);
     tools_menu.add_action(*m_open_devtools_client_action);
+    tools_menu.add_separator();
+    tools_menu.add_action(*m_user_agent_action);
 
     m_report_website_issue_action = GUI::Action::create("Report Website &Issue…"sv, [this](auto&) {
         if (auto* tab = active_tab(); tab && tab->is_attached())
@@ -973,6 +982,9 @@ void BrowserWindow::handle_engine_tab_event(JsonObject const& event, u64 tab_id)
         } else {
             tab->show_permission_prompt(name, origin, request_id);
         }
+    } else if (type == "drag_start"sv) {
+        if (auto items = event.get_array("items"sv); items.has_value())
+            tab->start_drag(*items);
     } else if (type == "certificate_info"sv) {
         tab->show_certificate_info(event);
     } else if (type == "compat_report_ready"sv) {
@@ -1276,6 +1288,70 @@ void BrowserWindow::show_tab_search()
 
     if (*selected_index < m_tabs.size())
         activate_tab(*m_tabs[*selected_index]);
+}
+
+void BrowserWindow::show_user_agent_dialog()
+{
+    auto dialog = GUI::Dialog::construct(m_window.ptr());
+    dialog->set_title("User Agent"sv);
+    dialog->resize(640, 210);
+
+    auto main_widget = dialog->set_main_widget<GUI::Widget>();
+    main_widget->set_fill_with_background_color(true);
+    main_widget->set_layout<GUI::VerticalBoxLayout>(GUI::Margins { 10 }, 8);
+
+    auto& description = main_widget->add<GUI::Label>("Choose a preset or enter a custom User-Agent string."_string);
+    description.set_text_wrapping(Gfx::TextWrapping::Wrap);
+
+    Vector<String> names;
+    for (auto const& preset : m_session.user_agent_presets())
+        names.append(preset.name);
+    names.append("Custom…"_string);
+
+    auto& preset_combo = main_widget->add<GUI::ComboBox>();
+    preset_combo.set_model(GUI::ItemListModel<String>::create(names));
+    preset_combo.set_only_allow_values_from_model(true);
+
+    auto& user_agent_box = main_widget->add<GUI::TextBox>();
+    user_agent_box.set_fixed_height(26);
+    user_agent_box.set_text(m_session.current_user_agent().bytes_as_string_view());
+
+    size_t selected_index = names.size() - 1;
+    for (size_t index = 0; index < m_session.user_agent_presets().size(); ++index) {
+        if (m_session.user_agent_presets()[index].value == m_session.current_user_agent()) {
+            selected_index = index;
+            break;
+        }
+    }
+    preset_combo.set_selected_index(selected_index);
+
+    preset_combo.on_change = [&](ByteString const&, GUI::ModelIndex const& index) {
+        if (!index.is_valid() || index.row() >= static_cast<int>(m_session.user_agent_presets().size()))
+            return;
+        user_agent_box.set_text(m_session.user_agent_presets()[index.row()].value.bytes_as_string_view());
+    };
+
+    auto& buttons = main_widget->add<GUI::Widget>();
+    buttons.set_layout<GUI::HorizontalBoxLayout>();
+    buttons.set_fixed_height(26);
+    auto& spacer = buttons.add<GUI::Widget>();
+    spacer.set_preferred_width(GUI::SpecialDimension::Grow);
+
+    auto& cancel_button = buttons.add<GUI::Button>("Cancel"_string);
+    cancel_button.set_fixed_width(80);
+    cancel_button.on_click = [&](auto) {
+        dialog->done(GUI::Dialog::ExecResult::Cancel);
+    };
+
+    auto& apply_button = buttons.add<GUI::Button>("Apply"_string);
+    apply_button.set_fixed_width(80);
+    apply_button.on_click = [&](auto) {
+        auto value = String::from_byte_string(user_agent_box.text()).release_value().trim_ascii_whitespace().release_value();
+        m_session.set_user_agent(move(value));
+        dialog->done(GUI::Dialog::ExecResult::OK);
+    };
+
+    dialog->exec();
 }
 
 void BrowserWindow::show_tab_context_menu(BrowserTab& tab, Gfx::IntPoint screen_position)

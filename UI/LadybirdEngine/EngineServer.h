@@ -161,6 +161,7 @@ private:
     void handle_clipboard_copy(u64 tab_id, bool cut);
     void handle_paste(u64 tab_id, JsonObject const&);
     void handle_clipboard_changed(JsonObject const&);
+    void handle_set_user_agent(JsonObject const&);
     void handle_toggle_devtools();
     void handle_open_devtools_client();
     void handle_select_all(u64 tab_id);
@@ -240,6 +241,7 @@ private:
     void send_bookmarks();
     void send_context_menu(Tab&, StringView kind, Gfx::IntPoint, WebView::Menu&);
     void send_permission_request(Tab&, WebView::PermissionPromptRequest const&, u64 request_id);
+    void send_drag_start(u64 tab_id, Web::DragData);
     void send_file_picker_request(Tab&, Web::HTML::FileFilter const&, Web::HTML::AllowMultipleFiles);
     void send_select_dropdown(Tab&, Gfx::IntPoint, i32 minimum_width, Vector<Web::HTML::SelectItem> const&);
     void send_downloads();

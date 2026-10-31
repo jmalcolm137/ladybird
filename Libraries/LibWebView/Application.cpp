@@ -3060,6 +3060,24 @@ String Application::user_agent_string() const
     return MUST(String::from_utf8(m_user_agent_string));
 }
 
+void Application::set_user_agent(String user_agent)
+{
+    if (user_agent.is_empty())
+        user_agent = MUST(String::from_utf8(Web::default_user_agent));
+
+    m_user_agent_storage = move(user_agent);
+    m_user_agent_string = m_user_agent_storage.bytes_as_string_view();
+
+    WorkerProcessManager::the().update_user_agent(m_user_agent_storage);
+
+    ViewImplementation::for_each_view([&](ViewImplementation& view) {
+        view.debug_request("spoof-user-agent"sv, m_user_agent_storage.to_byte_string());
+        // Requests already served under the previous value must be re-fetched under the new one.
+        view.debug_request("clear-cache"sv);
+        return IterationDecision::Continue;
+    });
+}
+
 Web::NavigatorCompatibilityMode Application::navigator_compatibility_mode() const
 {
     return navigator_compatibility_mode_from_string(m_navigator_compatibility_mode).value_or(Web::default_navigator_compatibility_mode);

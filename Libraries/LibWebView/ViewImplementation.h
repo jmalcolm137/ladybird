@@ -52,6 +52,7 @@
 #include <LibWebCommon/HTML/PreparedNavigationDescriptor.h>
 #include <LibWebCommon/HTML/Scripting/ScriptRegistryTypes.h>
 #include <LibWebCommon/HTML/SelectItem.h>
+#include <LibWebCommon/Page/DragData.h>
 #include <LibWebCommon/Page/DragEvent.h>
 #include <LibWebCommon/Page/EventResult.h>
 #include <LibWebCommon/Page/InputEvent.h>
@@ -281,6 +282,7 @@ public:
     void enable_picture_in_picture_controls();
     void enqueue_input_event(Web::InputEvent);
     // The page reporting on an event must be the one handling it.
+    void did_start_drag(Badge<WebContentPage>, WebContentPage const& reporting_page, Web::DragData);
     void did_finish_handling_input_event(Badge<WebContentPage>, WebContentPage const& reporting_page, u64 event_id, Web::EventResult event_result);
     void did_forward_input_event(Badge<WebContentPage>, WebContentPage const& reporting_page, u64 event_id, WebContentPage& endpoint);
     void did_forward_pinch_event(Badge<WebContentPage>, WebContentPage const& reporting_page, Web::PinchEvent const&, WebContentPage& endpoint);
@@ -640,6 +642,7 @@ public:
     Function<void(Web::KeyEvent const&)> on_finish_handling_key_event;
     Function<void(Web::MouseEvent const&, Web::EventResult)> on_finish_handling_mouse_event;
     Function<void(Compositing::PictureInPictureControl)> on_picture_in_picture_control_activated;
+    Function<void(Web::DragData)> on_start_drag;
     Function<void(Web::DragEvent const&)> on_finish_handling_drag_event;
     Function<void(String const&)> on_test_finish;
     Function<void(double milliseconds)> on_set_test_timeout;

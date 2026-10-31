@@ -257,9 +257,9 @@ private:
     static GC::Ptr<DOM::Range> context_menu_url_token_range(DOM::Text&, size_t offset);
 #if defined(AK_OS_MACOS)
     bool select_word_at_position(Layout::BegunRead const& read, DOM::Document&, CSSPixelPoint visual_viewport_position);
+#endif
     void start_selection_from_preserved_mousedown(Layout::BegunRead const& read, DOM::Document&);
     void finish_selection_from_preserved_mousedown(DOM::Document&, CSSPixelPoint visual_viewport_position);
-#endif
 
     void update_mouse_selection(Layout::BegunRead const& read, CSSPixelPoint visual_viewport_position);
     void apply_mouse_selection(Layout::BegunRead const& read, CSSPixelPoint visual_viewport_position);
@@ -331,9 +331,7 @@ private:
     Optional<CSSPixelPoint> m_mousedown_visual_viewport_position;
     int m_mousedown_click_count { 0 };
     bool m_mousedown_target_is_drag_candidate { false };
-#if defined(AK_OS_MACOS)
     bool m_mousedown_preserved_selection { false };
-#endif
 
     Optional<CSSPixelPoint> m_mousemove_previous_screen_position;
     Optional<CSSPixelPoint> m_last_known_mouse_visual_viewport_position;

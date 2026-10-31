@@ -39,6 +39,7 @@ information" on local or browser pages).
 | Area | Remaining work |
 |---|---|
 | Address bar | **Done:** autocomplete and search suggestions are exposed over the control socket and shown in a keyboard-navigable popup. Inline completion is still future work. |
+| User agent | **Done:** Tools → User Agent… chooses one of the reference frontend's presets or a custom string; the engine applies it to every page and worker and clears the cache. Per-site `WebCompat` rules still apply on top. |
 | Tabs | **Done:** reopen closed tab, tab search, pin tab, mute/audio indicators on the tab, move tab to a new window, close tabs to the right, and a Tabs menu plus toolbar button. |
 | Bookmarks | **Done:** the bar renders folders and nested menus; the chrome can add, edit, remove, and move bookmarks, and create and rename folders in a manager window. |
 | History | **Done:** the History menu lists recent entries, searches titles and URLs into a native results window, clears history after confirmation, and links to `about:history`. |
@@ -60,10 +61,13 @@ information" on local or browser pages).
   enables it only while an editable field is focused, and the engine forwards
   marked and committed text to WebContent. LibGUI text fields receive committed
   text; their preedit is shown by the input method's own candidate window.
-- **Drag and drop**: **Mostly done.** External text, URL, and file drags are
-  forwarded to WebContent as real `DragEvent`s and reach page drop targets.
-  Dragging a link, selection, file, or tab *out* of the page/window still needs
-  a LibGUI drag-source API; tab reordering inside a window is already supported.
+- **Drag and drop**: **Done.** External text, URL, and file drags are forwarded
+  to WebContent as real `DragEvent`s and reach page drop targets. A drag that
+  starts in a page — a link, selected text, an image, or a file — carries its
+  `text/plain`, `text/html`, `text/uri-list`, and file representations to the
+  frontend, which starts a `LibGUI::DragOperation`
+  on the compositor's data-device source; the page receives `dragend` when it
+  ends. Tab reordering inside a window was already supported.
 - **Rich clipboard**: **Done:** WebContent's rich copy path, text/HTML and
   image representations, and page-initiated clipboard reads. The LibWM
   clipboard portal now carries a list of representations per item, so
@@ -138,5 +142,5 @@ scroll, resize, multi-window, and session-restore tests.
    management dialogs remain).
 4. ~~Zoom percentage and address-bar polish~~ (done).
 5. Downloads private filtering/pruning, find match case, file-picker filters.
-6. ~~HiDPI, IME, and drag and drop~~ (done, except dragging page content out).
+6. ~~HiDPI, IME, and drag and drop~~ (done).
 7. The remaining diagnostics (crash submission UI, process monitor) and accessibility.

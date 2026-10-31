@@ -1274,6 +1274,12 @@ static bool is_history_traversal_key_event(Web::KeyEvent const& event)
     return event.modifiers == modifier || event.modifiers == (modifier | Web::UIEvents::Mod_Keypad);
 }
 
+void ViewImplementation::did_start_drag(Badge<WebContentPage>, WebContentPage const&, Web::DragData drag_data)
+{
+    if (on_start_drag)
+        on_start_drag(move(drag_data));
+}
+
 void ViewImplementation::did_finish_handling_input_event(Badge<WebContentPage>, WebContentPage const& reporting_page, u64 event_id, Web::EventResult event_result)
 {
     // Adjacent events can be handled by different processes, which finish them in no particular order.

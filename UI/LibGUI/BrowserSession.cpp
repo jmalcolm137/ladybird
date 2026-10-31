@@ -532,6 +532,30 @@ void BrowserSession::on_engine_event(JsonObject const& event)
         return;
     }
 
+    if (type == "user_agents"sv) {
+        m_user_agent_presets.clear();
+        if (auto agents = event.get_array("agents"sv); agents.has_value()) {
+            for (auto const& value : agents->values()) {
+                if (!value.is_object())
+                    continue;
+                auto const& object = value.as_object();
+                auto name = String::from_byte_string(object.get_byte_string("name"sv).value_or({})).release_value();
+                auto user_agent = String::from_byte_string(object.get_byte_string("value"sv).value_or({})).release_value();
+                if (!name.is_empty() && !user_agent.is_empty())
+                    m_user_agent_presets.append({ move(name), move(user_agent) });
+            }
+        }
+        if (auto current = event.get_byte_string("current"sv); current.has_value())
+            m_current_user_agent = String::from_byte_string(*current).release_value();
+        return;
+    }
+
+    if (type == "user_agent_changed"sv) {
+        if (auto value = event.get_byte_string("value"sv); value.has_value())
+            m_current_user_agent = String::from_byte_string(*value).release_value();
+        return;
+    }
+
     if (type == "clipboard_write"sv) {
         m_clipboard->apply_engine_clipboard(event);
         return;

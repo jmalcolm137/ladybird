@@ -236,10 +236,10 @@ The remaining UI work is tracked in
 [`docs/UI-ROADMAP.md`](docs/UI-ROADMAP.md). Recent additions are address-bar
 autocomplete and search suggestions, reopen-closed-tab, tab search, bookmark
 folders and overflow, a site indicator/popover, a visible zoom percentage,
-certificate details, persisted permissions, HiDPI web content, and IME
-composition through the desktop's text-input-v3 input method, and drops of
-text, URLs, and files into page drop targets. Dragging page content back out to
-other applications and accessibility follow. GPU/zero-copy frame sharing is deliberately shelved because it
+certificate details, persisted permissions, HiDPI web content, IME
+composition through the desktop's text-input-v3 input method, drops of text,
+URLs, and files into page drop targets, dragging page content out to other
+applications, and a User-Agent override under Tools. Accessibility follows. GPU/zero-copy frame sharing is deliberately shelved because it
 destabilized scrolling and resizing; the stable rendering path is the
 acknowledged shared-memory ring with damage-only copies.
 

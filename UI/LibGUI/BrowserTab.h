@@ -15,6 +15,7 @@
 #include <AK/Optional.h>
 #include <AK/String.h>
 #include <AK/Vector.h>
+#include <AK/WeakPtr.h>
 #include <LibCore/Forward.h>
 #include <LibGUI/Action.h>
 #include <LibGUI/Button.h>
@@ -48,7 +49,7 @@ struct BookmarkEntry {
 
 // One browser tab: a Serenity-style toolbar, the page view, and a status bar.
 // The tab mirrors a view owned by the engine host.
-class BrowserTab {
+class BrowserTab : public Weakable<BrowserTab> {
     AK_MAKE_NONCOPYABLE(BrowserTab);
 
 public:
@@ -115,6 +116,7 @@ public:
     void set_permission_summary_provider(Function<String(String const&)> provider) { m_permission_summary_provider = move(provider); }
     void set_forget_permissions_handler(Function<void(String const&)> handler) { m_forget_permissions_handler = move(handler); }
     void show_select_dropdown(Gfx::IntPoint position, i32 minimum_width, JsonArray const& items);
+    void start_drag(JsonArray items);
 
     String const& display_title() const { return m_title; }
     String current_url() const;
@@ -153,6 +155,7 @@ private:
     void update_site_button();
     void request_autocomplete();
     void request_find();
+    void run_drag(JsonArray const& items);
     void hide_autocomplete();
     void accept_autocomplete();
     void move_autocomplete_selection(int delta);

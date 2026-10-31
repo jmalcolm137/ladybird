@@ -86,6 +86,7 @@
 #include <LibWebCommon/IndexedDB/TransactionChanges.h>
 #include <LibWebCommon/Page/ContextMenuForInputEventsTarget.h>
 #include <LibWebCommon/Page/EventResult.h>
+#include <LibWebCommon/Page/DragData.h>
 #include <LibWebCommon/Page/InputEvent.h>
 #include <LibWebCommon/Page/InputTrace.h>
 #include <LibWebCommon/Page/MediaContextMenu.h>
@@ -721,6 +722,8 @@ public:
     virtual Queue<QueuedInputEvent>& input_event_queue() = 0;
     virtual void did_handle_input_event([[maybe_unused]] Web::PageId page_id, [[maybe_unused]] InputEvent const&) { }
     virtual void report_finished_handling_input_event(Web::PageId page_id, u64 event_id, EventResult event_was_handled) = 0;
+    // The page started a drag from its content. The UI process turns the payload into a platform drag.
+    virtual void page_did_start_drag([[maybe_unused]] DragData drag_data) { }
     // The event lands on content another process hosts, which handles it and finishes it.
     virtual void forward_mouse_event_to_remote_navigable([[maybe_unused]] Web::PageId page_id, [[maybe_unused]] HTML::CrossProcessId navigable_id, [[maybe_unused]] Web::MouseEvent) { }
     virtual void forward_pinch_event_to_remote_navigable([[maybe_unused]] Web::PageId page_id, [[maybe_unused]] HTML::CrossProcessId navigable_id, [[maybe_unused]] Web::PinchEvent) { }

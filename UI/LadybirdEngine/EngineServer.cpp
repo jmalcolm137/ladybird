@@ -14,10 +14,10 @@
 #include <AK/LexicalPath.h>
 #include <AK/StringBuilder.h>
 #include <AK/Utf16String.h>
+#include <LibAudio/Audibility.h>
 #include <LibCore/Environment.h>
 #include <LibCore/EventLoop.h>
 #include <LibCore/File.h>
-#include <LibAudio/Audibility.h>
 #include <LibCore/Notifier.h>
 #include <LibCore/Socket.h>
 #include <LibCore/System.h>
@@ -34,6 +34,8 @@
 #include <LibWebCommon/HTML/VisibilityState.h>
 #include <LibWebCommon/HTML/ActivateTab.h>
 #include <LibWebCommon/HTML/WebViewHints.h>
+#include <LibWebCommon/Loader/UserAgent.h>
+#include <LibWebCommon/Page/DragData.h>
 #include <LibWebCommon/Page/InputEvent.h>
 #include <LibWebCommon/PixelUnits.h>
 #include <LibWebCommon/UIEvents/KeyCode.h>
@@ -45,6 +47,7 @@
 #include <LibWebView/HistoryStore.h>
 #include <LibWebView/Menu.h>
 #include <LibWebView/RequestServerManager.h>
+#include <LibWebView/UserAgent.h>
 #include <LibWebView/ViewImplementation.h>
 #include <Shared/EngineProtocol.h>
 #include <errno.h>
@@ -147,6 +150,25 @@ ErrorOr<void> EngineServer::start()
     hello.set("type"sv, "hello"sv);
     hello.set("protocol"sv, static_cast<unsigned>(protocol_version));
     send_event(move(hello));
+
+    // The chrome builds its user-agent picker from the same presets the reference frontend uses. The current value is
+    // the application's, so a custom override set earlier is reflected too.
+    JsonObject user_agents_event;
+    user_agents_event.set("type"sv, "user_agents"sv);
+    user_agents_event.set("current"sv, EngineApplication::the().user_agent_string());
+    JsonArray user_agent_presets;
+    JsonObject default_user_agent;
+    default_user_agent.set("name"sv, "Default"sv);
+    default_user_agent.set("value"sv, Web::default_user_agent);
+    user_agent_presets.must_append(move(default_user_agent));
+    for (auto const& [name, value] : WebView::user_agents) {
+        JsonObject preset;
+        preset.set("name"sv, name);
+        preset.set("value"sv, value);
+        user_agent_presets.must_append(move(preset));
+    }
+    user_agents_event.set("agents"sv, move(user_agent_presets));
+    send_event(move(user_agents_event));
 
     // DevTools may already be running: the frontend asked the engine to start it with --devtools, before the
     // control socket existed. Tell the chrome now so it can show the banner.
@@ -301,6 +323,8 @@ void EngineServer::dispatch_command(JsonObject const& command)
         handle_create_tab(command);
     } else if (*type == "quit"sv) {
         quit();
+    } else if (*type == "set_user_agent"sv) {
+        handle_set_user_agent(command);
     } else if (*type == "download_action"sv) {
         handle_download_action(command);
     } else if (*type == "history_recent"sv) {
@@ -724,6 +748,10 @@ void EngineServer::wire_tab(Tab& tab)
         if (total_match_count.has_value())
             event.set("total"sv, static_cast<u64>(*total_match_count));
         send_event(move(event));
+    };
+
+    tab.view->on_start_drag = [this, tab_id](Web::DragData drag_data) {
+        send_drag_start(tab_id, move(drag_data));
     };
 
     tab.view->on_request_permission = [this, tab_id](WebView::PermissionPromptRequest const& request, WebView::PermissionPromptCallback on_decided) {
@@ -2123,6 +2151,20 @@ void EngineServer::handle_clipboard_changed(JsonObject const& command)
         EngineApplication::the().cache_clipboard_item_from_frontend({});
 }
 
+void EngineServer::handle_set_user_agent(JsonObject const& command)
+{
+    auto value = command.get_string("value"sv);
+    if (!value.has_value())
+        return;
+
+    EngineApplication::the().set_user_agent(*value);
+
+    JsonObject event;
+    event.set("type"sv, "user_agent_changed"sv);
+    event.set("value"sv, EngineApplication::the().user_agent_string());
+    send_event(move(event));
+}
+
 void EngineServer::handle_toggle_devtools()
 {
     if (auto result = WebView::Application::the().toggle_devtools_enabled(); result.is_error()) {
@@ -2856,6 +2898,38 @@ void EngineServer::handle_context_menu_action(u64 tab_id, JsonObject const& comm
         return;
 
     actions[*action_index]->activate();
+}
+
+void EngineServer::send_drag_start(u64 tab_id, Web::DragData drag_data)
+{
+    static constexpr size_t maximum_file_bytes = 8 * MiB;
+
+    JsonArray items;
+    for (auto const& item : drag_data.items) {
+        JsonObject object;
+        if (item.kind == Web::DragDataItem::Kind::Text) {
+            object.set("kind"sv, "text"sv);
+            object.set("type"sv, item.type);
+            object.set("data"sv, item.text);
+        } else {
+            if (item.file_data.size() > maximum_file_bytes)
+                continue;
+            auto encoded = AK::encode_base64(item.file_data.bytes());
+            if (encoded.is_error())
+                continue;
+            object.set("kind"sv, "file"sv);
+            object.set("type"sv, item.type);
+            object.set("name"sv, item.file_name);
+            object.set("data"sv, encoded.release_value());
+        }
+        items.must_append(move(object));
+    }
+
+    JsonObject event;
+    event.set("type"sv, "drag_start"sv);
+    event.set("tab"sv, tab_id);
+    event.set("items"sv, move(items));
+    send_event(move(event));
 }
 
 void EngineServer::send_permission_request(Tab& tab, WebView::PermissionPromptRequest const& request, u64 request_id)

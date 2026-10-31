@@ -11,6 +11,7 @@
 #include <LibJS/Heap/Cell.h>
 #include <LibWeb/Forward.h>
 #include <LibWeb/HTML/DragDataStore.h>
+#include <LibWebCommon/Page/DragData.h>
 #include <LibWebCommon/Page/DragEvent.h>
 #include <LibWebCommon/Page/EventResult.h>
 #include <LibWebCommon/PixelUnits.h>
@@ -24,6 +25,9 @@ public:
     void visit_edges(JS::Cell::Visitor& visitor) const;
 
     bool has_ongoing_drag_and_drop_operation() const { return !m_drag_data_store.is_null(); }
+
+    // The payload the platform drag source should carry, once a drag has started.
+    Web::DragData drag_data() const;
 
     EventResult handle_drag_start(JS::Object const& relevant_global_object, GC::Ptr<DOM::Node> drag_target, CSSPixelPoint screen_position, CSSPixelPoint page_offset, CSSPixelPoint client_offset, CSSPixelPoint offset, unsigned button, unsigned buttons, unsigned modifiers, Vector<HTML::SelectedFile> files, Optional<String> text = {}, Vector<String> urls = {});
     EventResult handle_drag_move(JS::Object const& relevant_global_object, GC::Ref<DOM::Node>, CSSPixelPoint screen_position, CSSPixelPoint page_offset, CSSPixelPoint client_offset, CSSPixelPoint offset, unsigned button, unsigned buttons, unsigned modifiers);

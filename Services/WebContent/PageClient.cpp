@@ -533,6 +533,11 @@ Queue<Web::QueuedInputEvent>& PageClient::input_event_queue()
     return client().input_event_queue();
 }
 
+void PageClient::page_did_start_drag(Web::DragData drag_data)
+{
+    client().async_did_start_drag(m_id, move(drag_data));
+}
+
 void PageClient::did_handle_input_event(Web::PageId page_id, Web::InputEvent const& event)
 {
     auto should_update_input_method_state = event.visit(

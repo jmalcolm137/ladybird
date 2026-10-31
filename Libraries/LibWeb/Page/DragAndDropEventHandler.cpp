@@ -8,6 +8,7 @@
 #include <AK/Utf16StringBuilder.h>
 #include <LibWeb/DOM/Document.h>
 #include <LibWeb/DOM/Element.h>
+#include <LibWeb/DOM/Range.h>
 #include <LibWeb/HTML/AttributeNames.h>
 #include <LibWeb/HTML/DragEvent.h>
 #include <LibWeb/HTML/EventNames.h>
@@ -20,6 +21,7 @@
 #include <LibWeb/HTML/WindowProxy.h>
 #include <LibWeb/HighResolutionTime/TimeOrigin.h>
 #include <LibWeb/Page/DragAndDropEventHandler.h>
+#include <LibWeb/Selection/Selection.h>
 #include <LibWebCommon/HTML/SelectedFile.h>
 #include <LibWebCommon/MimeSniff/Resource.h>
 #include <LibWebCommon/UIEvents/KeyCode.h>
@@ -54,13 +56,24 @@ EventResult DragAndDropEventHandler::handle_drag_start(
 
     // 1. Determine what is being dragged, as follows:
     GC::Ptr<DOM::Node> dragged_node;
+    bool selection_is_being_dragged = false;
+    Optional<String> selection_text;
+    GC::Ptr<DOM::EventTarget> selection_source_node;
 
-    //    FIXME: If the drag operation was invoked on a selection, then it is the selection that is being dragged.
+    //    If the drag operation was invoked on a selection, then it is the selection that is being dragged.
+    if (drag_target) {
+        auto& document = drag_target->document();
+        if (auto selection = document.get_selection(); selection && !selection->is_collapsed() && selection->contains_node(*drag_target, true)) {
+            selection_is_being_dragged = true;
+            selection_text = selection->to_string().to_utf8();
+            selection_source_node = selection->anchor_node();
+        }
+    }
 
     //    Otherwise, if the drag operation was invoked on a Document, it is the first element, going up the ancestor chain,
     //    starting at the node that the user tried to drag, that has the IDL attribute draggable set to true. If there is
     //    no such element, then nothing is being dragged; return, the drag-and-drop operation is never started.
-    if (drag_target) {
+    if (drag_target && !selection_is_being_dragged) {
         drag_target->for_each_inclusive_ancestor_of_type<HTML::HTMLElement>([&](HTML::HTMLElement& node) {
             if (!node.draggable())
                 return IterationDecision::Continue;
@@ -72,6 +85,9 @@ EventResult DragAndDropEventHandler::handle_drag_start(
         if (!dragged_node)
             return EventResult::Cancelled;
     }
+
+    if (!dragged_node && !selection_is_being_dragged)
+        return EventResult::Cancelled;
 
     //    Otherwise, the drag operation was invoked outside the user agent's purview. What is being dragged is defined by
     //    the document or application where the drag was started.
@@ -90,6 +106,8 @@ EventResult DragAndDropEventHandler::handle_drag_start(
     //    Otherwise, if it is an element that is being dragged, then the source node is the element that is being dragged.
     if (dragged_node) {
         m_source_node = dragged_node;
+    } else if (selection_is_being_dragged) {
+        m_source_node = selection_source_node;
     }
     //    Otherwise, the source node is part of another document or application. When this specification requires that
     //    an event be dispatched at the source node in this case, the user agent must instead follow the platform-specific
@@ -124,6 +142,9 @@ EventResult DragAndDropEventHandler::handle_drag_start(
     //        File
     //    The actual data
     //        The file's contents and name.
+    if (!text.has_value() && selection_text.has_value())
+        text = move(selection_text);
+
     if (text.has_value()) {
         m_drag_data_store->add_item({
             .kind = HTML::DragDataStoreItem::Kind::Text,
@@ -247,6 +268,28 @@ EventResult DragAndDropEventHandler::handle_drag_start(
     //         2. The drag data store default feedback.
 
     return EventResult::Handled;
+}
+
+Web::DragData DragAndDropEventHandler::drag_data() const
+{
+    Web::DragData data;
+    if (!m_drag_data_store)
+        return data;
+
+    for (auto const& item : m_drag_data_store->item_list()) {
+        Web::DragDataItem result;
+        result.type = item.type_string.to_utf16_string().to_utf8();
+        if (item.kind == HTML::DragDataStoreItem::Kind::Text) {
+            result.kind = Web::DragDataItem::Kind::Text;
+            result.text = item.data.to_utf8();
+        } else {
+            result.kind = Web::DragDataItem::Kind::File;
+            result.file_data = item.file_data;
+            result.file_name = item.file_name.to_utf8();
+        }
+        data.items.append(move(result));
+    }
+    return data;
 }
 
 // https://html.spec.whatwg.org/multipage/dnd.html#drag-and-drop-processing-model:queue-a-task

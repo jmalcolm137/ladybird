@@ -162,6 +162,8 @@ public:
 
     // The spoofing choices in effect: what every page and worker reports from its navigator.
     String user_agent_string() const;
+    // Replaces the user agent every existing page and worker reports, and every page created later starts with.
+    void set_user_agent(String user_agent);
     Web::NavigatorCompatibilityMode navigator_compatibility_mode() const;
 
     static BookmarkStore& bookmark_store() { return *the().m_bookmark_store; }
@@ -752,6 +754,7 @@ private:
     RefPtr<Action> m_show_caret_hit_test_debug_overlay_action;
     RefPtr<Action> m_enable_scripting_action;
     RefPtr<Action> m_block_pop_ups_action;
+    String m_user_agent_storage;
     StringView m_user_agent_string;
     StringView m_navigator_compatibility_mode;
 

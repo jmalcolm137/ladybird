@@ -766,6 +766,12 @@ Messages::WebContentClient::DidStartDownloadResponse WebContentClient::did_start
     return Optional<u64> {};
 }
 
+void WebContentClient::did_start_drag(Web::PageId page_id, Web::DragData drag_data)
+{
+    if (auto* page = this->page(page_id))
+        page->did_start_drag(move(drag_data));
+}
+
 Messages::WebContentClient::DidRequestNewWebViewResponse WebContentClient::did_request_new_web_view(Web::PageId page_id, Web::HTML::ActivateTab activate_tab, Web::HTML::WebViewHints hints, Web::HTML::CrossProcessId current_navigable_id, Utf16String name, bool no_opener, Optional<URL::URL> current_document_base_url)
 {
     if (auto* page = this->page(page_id))
