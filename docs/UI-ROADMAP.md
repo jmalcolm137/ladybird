@@ -77,7 +77,12 @@ information" on local or browser pages).
 - **DevTools**: **Done:** the engine host runs the upstream DevTools server,
   the frontend exposes Tools → Enable/Open DevTools, `Ctrl+Shift+I`/`F12`, `--devtools[=port]`,
   and a port banner; the client is the upstream Firefox client.
-- Web compatibility report flow
+- **Web compatibility report flow: Done.** Help → Report Website Issue…
+  captures the page URL, user agent, viewport, DPR, zoom, build details, a
+  screenshot, and optional layout/stacking/display-list dumps into a native
+  review window. It validates the description, shows the diagnostics, streams
+  send progress, auto-retries transient failures, and offers a manual Retry
+  after a terminal failure.
 - Crash report submission UI
 - Process manager / performance monitor
 - Picture-in-picture controls
@@ -133,5 +138,5 @@ scroll, resize, multi-window, and session-restore tests.
    management dialogs remain).
 4. ~~Zoom percentage and address-bar polish~~ (done).
 5. Downloads private filtering/pruning, find match case, file-picker filters.
-6. HiDPI, IME, and drag and drop.
-7. The remaining diagnostics (compatibility report, crash submission UI, process monitor).
+6. ~~HiDPI, IME, and drag and drop~~ (done, except dragging page content out).
+7. The remaining diagnostics (crash submission UI, process monitor) and accessibility.

@@ -776,6 +776,32 @@ void EngineClient::ime_commit_text(u64 tab_id, String const& text, i32 replaceme
 
 void EngineClient::ime_unmark_text(u64 tab_id) { send_simple("ime_unmark_text"sv, tab_id); }
 
+void EngineClient::compat_report_begin(u64 tab_id) { send_simple("compat_report_begin"sv, tab_id); }
+
+void EngineClient::compat_report_diagnostics(u64 tab_id, bool include_page_dumps)
+{
+    JsonObject event;
+    event.set("type"sv, "compat_report_diagnostics"sv);
+    event.set("tab"sv, tab_id);
+    event.set("include_page_dumps"sv, include_page_dumps);
+    send(event);
+}
+
+void EngineClient::compat_report_send(u64 tab_id, String const& description, bool include_page_dumps, bool include_screenshot)
+{
+    JsonObject event;
+    event.set("type"sv, "compat_report_send"sv);
+    event.set("tab"sv, tab_id);
+    event.set("description"sv, description.bytes_as_string_view());
+    event.set("include_page_dumps"sv, include_page_dumps);
+    event.set("include_screenshot"sv, include_screenshot);
+    send(event);
+}
+
+void EngineClient::compat_report_retry(u64 tab_id) { send_simple("compat_report_retry"sv, tab_id); }
+void EngineClient::compat_report_cancel(u64 tab_id) { send_simple("compat_report_cancel"sv, tab_id); }
+void EngineClient::compat_report_close(u64 tab_id) { send_simple("compat_report_close"sv, tab_id); }
+
 void EngineClient::request_history(u64 limit)
 {
     JsonObject event;

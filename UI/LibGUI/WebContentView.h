@@ -28,6 +28,7 @@ public:
     u64 tab_id() const { return m_tab_id; }
 
     void set_frame(Gfx::Bitmap const* frame, u64 sequence, Gfx::IntRect damage, bool full);
+    RefPtr<Gfx::Bitmap> snapshot() const;
 
     void set_page_cursor(StringView cursor_name);
     void set_crashed(bool crashed) { m_crashed = crashed; update(); }

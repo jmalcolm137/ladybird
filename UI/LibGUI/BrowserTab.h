@@ -135,6 +135,13 @@ public:
 
     void show_certificate_info(JsonObject const&);
     void update_input_method_state(bool enabled, Optional<Gfx::IntRect> caret_rect);
+    void show_compat_report(JsonObject const&);
+    void set_compat_report_page_dumps_ready();
+    void set_compat_report_progress(String const& stage);
+    void set_compat_report_retry(String const& reason, u32 retry, u32 maximum, u32 delay);
+    void set_compat_report_sent();
+    void set_compat_report_failed(String const& failure, String const& reason);
+    void show_compat_report_diagnostics(String const& text);
     void refresh_text_input_state();
     bool is_private() const { return m_private; }
 
@@ -178,6 +185,18 @@ private:
     RefPtr<GUI::Menu> m_zoom_menu;
     RefPtr<GUI::Window> m_certificate_window;
     RefPtr<GUI::TextEditor> m_certificate_text;
+    RefPtr<GUI::Window> m_compat_report_window;
+    RefPtr<GUI::Label> m_compat_report_website;
+    RefPtr<GUI::TextEditor> m_compat_report_description;
+    RefPtr<GUI::CheckBox> m_compat_report_include_screenshot;
+    RefPtr<GUI::CheckBox> m_compat_report_include_dumps;
+    RefPtr<GUI::Label> m_compat_report_status;
+    RefPtr<GUI::Button> m_compat_report_send_button;
+    RefPtr<GUI::Button> m_compat_report_retry_button;
+    RefPtr<GUI::Window> m_compat_report_diagnostics_window;
+    RefPtr<GUI::TextEditor> m_compat_report_diagnostics_text;
+    bool m_compat_report_page_dumps_ready { false };
+    bool m_compat_report_has_screenshot { false };
     RefPtr<GUI::Widget> m_autocomplete_overlay;
     RefPtr<GUI::TableView> m_autocomplete_table;
     RefPtr<GUI::JsonArrayModel> m_autocomplete_model;

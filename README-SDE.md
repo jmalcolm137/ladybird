@@ -192,6 +192,9 @@ navigating the real engine.
   presenting frames.
 * History menu with the most recent entries, search results in a native window,
   clear-history confirmation, and the full history page.
+* Help → Report Website Issue… builds a web-compatibility report with the page
+  metadata, a screenshot, and optional layout/paint dumps, reviewed in a native
+  window before it is sent to the Ladybird report service.
 * Site information includes the permission decisions made for the current site,
   a Forget action, and certificate details for HTTPS pages (subject, issuer,
   validity, serial, SHA-256 fingerprint, TLS version and cipher). Decisions can

@@ -396,6 +396,18 @@ void EngineServer::dispatch_command(JsonObject const& command)
             handle_ime_unmark_text(*tab_id);
         } else if (*type == "drag"sv) {
             handle_drag(*tab_id, command);
+        } else if (*type == "compat_report_begin"sv) {
+            handle_compat_report_begin(*tab_id);
+        } else if (*type == "compat_report_diagnostics"sv) {
+            handle_compat_report_diagnostics(*tab_id, command);
+        } else if (*type == "compat_report_send"sv) {
+            handle_compat_report_send(*tab_id, command);
+        } else if (*type == "compat_report_retry"sv) {
+            handle_compat_report_retry(*tab_id);
+        } else if (*type == "compat_report_cancel"sv) {
+            handle_compat_report_cancel(*tab_id);
+        } else if (*type == "compat_report_close"sv) {
+            handle_compat_report_close(*tab_id);
         } else if (*type == "copy"sv) {
             handle_clipboard_copy(*tab_id, false);
         } else if (*type == "cut"sv) {
@@ -1724,6 +1736,207 @@ void EngineServer::handle_drag(u64 tab_id, JsonObject const& command)
     }
 
     tab->view->enqueue_input_event(move(event));
+}
+
+static StringView compat_report_stage_name(WebView::ReportSubmission::Stage stage)
+{
+    switch (stage) {
+    case WebView::ReportSubmission::Stage::Preparing:
+        return "Preparing"sv;
+    case WebView::ReportSubmission::Stage::RequestingChallenge:
+        return "Requesting challenge"sv;
+    case WebView::ReportSubmission::Stage::SolvingProof:
+        return "Solving proof"sv;
+    case WebView::ReportSubmission::Stage::Sending:
+        return "Sending"sv;
+    }
+    VERIFY_NOT_REACHED();
+}
+
+void EngineServer::handle_compat_report_begin(u64 tab_id)
+{
+    auto* tab = tab_for_id(tab_id);
+    if (!tab)
+        return;
+
+    auto send_failure = [this, tab_id](StringView failure, String const& reason) {
+        JsonObject event;
+        event.set("type"sv, "compat_report_failed"sv);
+        event.set("tab"sv, tab_id);
+        event.set("failure"sv, failure);
+        event.set("reason"sv, reason);
+        send_event(move(event));
+    };
+
+    if (!tab->view->can_report_website_issue()) {
+        send_failure("validation"sv, "This page cannot be reported."_string);
+        return;
+    }
+    if (tab->compat_report && tab->compat_report->is_sending()) {
+        send_failure("validation"sv, "A report for this page is already being sent."_string);
+        return;
+    }
+
+    auto page = WebView::WebCompatReport::describe_page(*tab->view);
+    tab->compat_report = make<WebView::WebCompatReport>(page);
+    tab->compat_report_has_page_dumps = false;
+    tab->compat_report_screenshot.clear();
+
+    if (auto bitmap = tab->view->displayed_bitmap()) {
+        auto png = Gfx::PNGWriter::encode(*bitmap);
+        if (!png.is_error() && png.value().size() <= WebView::WebCompatReport::maximum_screenshot_bytes)
+            tab->compat_report_screenshot = png.release_value();
+    }
+
+    auto* report = tab->compat_report.ptr();
+    auto dumps = WebView::WebCompatReport::request_page_dumps(*tab->view);
+    dumps->when_resolved([this, tab_id](String& text) {
+        auto* tab = tab_for_id(tab_id);
+        if (!tab || !tab->compat_report)
+            return;
+        tab->compat_report->set_page_dumps(text);
+        tab->compat_report_has_page_dumps = true;
+        JsonObject event;
+        event.set("type"sv, "compat_report_page_dumps_ready"sv);
+        event.set("tab"sv, tab_id);
+        send_event(move(event));
+    });
+
+    JsonObject event;
+    event.set("type"sv, "compat_report_ready"sv);
+    event.set("tab"sv, tab_id);
+    event.set("url"sv, page.url.serialize());
+    event.set("user_agent"sv, page.user_agent);
+    event.set("viewport_width"sv, page.viewport_size.width());
+    event.set("viewport_height"sv, page.viewport_size.height());
+    event.set("device_pixel_ratio"sv, page.device_pixel_ratio);
+    event.set("zoom"sv, page.zoom_level);
+    event.set("has_screenshot"sv, tab->compat_report_screenshot.has_value());
+    event.set("has_page_dumps"sv, tab->compat_report_has_page_dumps);
+
+    JsonArray details;
+    for (auto const& detail : report->details()) {
+        JsonObject entry;
+        entry.set("label"sv, detail.label);
+        entry.set("value"sv, detail.value);
+        entry.set("code"sv, detail.is_code);
+        details.must_append(move(entry));
+    }
+    event.set("details"sv, move(details));
+    send_event(move(event));
+}
+
+void EngineServer::handle_compat_report_diagnostics(u64 tab_id, JsonObject const& command)
+{
+    auto* tab = tab_for_id(tab_id);
+    if (!tab || !tab->compat_report)
+        return;
+
+    auto include_page_dumps = command.get_bool("include_page_dumps"sv).value_or(true)
+        ? WebView::WebCompatReport::IncludePageDumps::Yes
+        : WebView::WebCompatReport::IncludePageDumps::No;
+    auto text = tab->compat_report->diagnostics(include_page_dumps);
+
+    JsonObject event;
+    event.set("type"sv, "compat_report_diagnostics"sv);
+    event.set("tab"sv, tab_id);
+    event.set("text"sv, text.view());
+    send_event(move(event));
+}
+
+void EngineServer::handle_compat_report_send(u64 tab_id, JsonObject const& command)
+{
+    auto* tab = tab_for_id(tab_id);
+    if (!tab || !tab->compat_report)
+        return;
+
+    auto send_failure = [this, tab_id](StringView failure, String const& reason) {
+        JsonObject event;
+        event.set("type"sv, "compat_report_failed"sv);
+        event.set("tab"sv, tab_id);
+        event.set("failure"sv, failure);
+        event.set("reason"sv, reason);
+        send_event(move(event));
+    };
+
+    if (tab->compat_report->is_sending()) {
+        send_failure("validation"sv, "This report is already being sent."_string);
+        return;
+    }
+
+    String description;
+    if (auto text = command.get_string("description"sv); text.has_value())
+        description = *text;
+
+    auto include_page_dumps = command.get_bool("include_page_dumps"sv).value_or(true);
+    auto include_screenshot = command.get_bool("include_screenshot"sv).value_or(true);
+
+    Optional<ByteBuffer> screenshot;
+    if (include_screenshot && tab->compat_report_screenshot.has_value()) {
+        auto copied = ByteBuffer::copy(tab->compat_report_screenshot->bytes());
+        if (!copied.is_error())
+            screenshot = copied.release_value();
+    }
+
+    auto* report = tab->compat_report.ptr();
+    report->on_progress = [this, tab_id](WebView::ReportSubmission::Stage stage) {
+        JsonObject event;
+        event.set("type"sv, "compat_report_progress"sv);
+        event.set("tab"sv, tab_id);
+        event.set("stage"sv, compat_report_stage_name(stage));
+        send_event(move(event));
+    };
+    report->on_retry = [this, tab_id](String reason, u32 retry, u32 maximum, u32 delay) {
+        JsonObject event;
+        event.set("type"sv, "compat_report_retry"sv);
+        event.set("tab"sv, tab_id);
+        event.set("reason"sv, reason);
+        event.set("retry"sv, retry);
+        event.set("maximum"sv, maximum);
+        event.set("delay"sv, delay);
+        send_event(move(event));
+    };
+    report->on_sent = [this, tab_id] {
+        JsonObject event;
+        event.set("type"sv, "compat_report_sent"sv);
+        event.set("tab"sv, tab_id);
+        send_event(move(event));
+    };
+    report->on_failed = [this, tab_id](WebView::ReportSubmission::Failure failure, String reason) {
+        JsonObject event;
+        event.set("type"sv, "compat_report_failed"sv);
+        event.set("tab"sv, tab_id);
+        event.set("failure"sv, failure == WebView::ReportSubmission::Failure::Preparation ? "preparation"sv : "sending"sv);
+        event.set("reason"sv, reason);
+        send_event(move(event));
+    };
+
+    auto error = report->send(description, move(screenshot), include_page_dumps ? WebView::WebCompatReport::IncludePageDumps::Yes : WebView::WebCompatReport::IncludePageDumps::No);
+    if (error.has_value())
+        send_failure("validation"sv, *error);
+}
+
+void EngineServer::handle_compat_report_retry(u64 tab_id)
+{
+    auto* tab = tab_for_id(tab_id);
+    if (!tab || !tab->compat_report || tab->compat_report->is_sending())
+        return;
+    tab->compat_report->retry();
+}
+
+void EngineServer::handle_compat_report_cancel(u64 tab_id)
+{
+    if (auto* tab = tab_for_id(tab_id); tab && tab->compat_report)
+        tab->compat_report->cancel_sending();
+}
+
+void EngineServer::handle_compat_report_close(u64 tab_id)
+{
+    if (auto* tab = tab_for_id(tab_id)) {
+        tab->compat_report.clear();
+        tab->compat_report_screenshot.clear();
+        tab->compat_report_has_page_dumps = false;
+    }
 }
 
 void EngineServer::handle_certificate_info(u64 tab_id, JsonObject const&)

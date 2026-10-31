@@ -165,6 +165,7 @@ private:
     RefPtr<GUI::Action> m_view_source_action;
     RefPtr<GUI::Action> m_downloads_action;
     RefPtr<GUI::Action> m_site_info_action;
+    RefPtr<GUI::Action> m_report_website_issue_action;
     RefPtr<GUI::Action> m_toggle_devtools_action;
     RefPtr<GUI::Action> m_open_devtools_client_action;
     RefPtr<GUI::Widget> m_devtools_bar;

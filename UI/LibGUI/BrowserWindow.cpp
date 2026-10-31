@@ -463,7 +463,14 @@ void BrowserWindow::create_menus()
     tools_menu.add_action(*m_toggle_devtools_action);
     tools_menu.add_action(*m_open_devtools_client_action);
 
+    m_report_website_issue_action = GUI::Action::create("Report Website &Issue…"sv, [this](auto&) {
+        if (auto* tab = active_tab(); tab && tab->is_attached())
+            m_engine->compat_report_begin(tab->tab_id());
+    }, m_window.ptr());
+    m_report_website_issue_action->set_enabled(false);
+
     auto& help_menu = *m_window->add_menu("&Help"_string);
+    help_menu.add_action(*m_report_website_issue_action);
     help_menu.add_action(GUI::CommonActions::make_about_action("Ladybird"_string, GUI::Icon::default_icon("app-browser"sv), m_window.ptr()));
 }
 
@@ -776,6 +783,11 @@ void BrowserWindow::update_action_state()
     m_reopen_closed_tab_action->set_enabled(m_session.closed_tab_count() > 0);
     m_bookmark_action->set_enabled(tab != nullptr);
     m_site_info_action->set_enabled(tab != nullptr);
+    if (m_report_website_issue_action) {
+        auto url = tab ? tab->current_url() : String {};
+        auto reportable = url.bytes_as_string_view().starts_with("http:"sv) || url.bytes_as_string_view().starts_with("https:"sv);
+        m_report_website_issue_action->set_enabled(tab && tab->is_attached() && reportable);
+    }
     m_find_action->set_enabled(tab != nullptr);
     m_zoom_in_action->set_enabled(tab != nullptr);
     m_zoom_out_action->set_enabled(tab != nullptr);
@@ -963,6 +975,26 @@ void BrowserWindow::handle_engine_tab_event(JsonObject const& event, u64 tab_id)
         }
     } else if (type == "certificate_info"sv) {
         tab->show_certificate_info(event);
+    } else if (type == "compat_report_ready"sv) {
+        tab->show_compat_report(event);
+    } else if (type == "compat_report_page_dumps_ready"sv) {
+        tab->set_compat_report_page_dumps_ready();
+    } else if (type == "compat_report_progress"sv) {
+        tab->set_compat_report_progress(String::from_byte_string(string_for_key(event, "stage"sv)).release_value());
+    } else if (type == "compat_report_retry"sv) {
+        tab->set_compat_report_retry(
+            String::from_byte_string(string_for_key(event, "reason"sv)).release_value(),
+            static_cast<u32>(event.get_u64("retry"sv).value_or(0)),
+            static_cast<u32>(event.get_u64("maximum"sv).value_or(0)),
+            static_cast<u32>(event.get_u64("delay"sv).value_or(0)));
+    } else if (type == "compat_report_sent"sv) {
+        tab->set_compat_report_sent();
+    } else if (type == "compat_report_failed"sv) {
+        tab->set_compat_report_failed(
+            String::from_byte_string(string_for_key(event, "failure"sv)).release_value(),
+            String::from_byte_string(string_for_key(event, "reason"sv)).release_value());
+    } else if (type == "compat_report_diagnostics"sv) {
+        tab->show_compat_report_diagnostics(String::from_byte_string(string_for_key(event, "text"sv)).release_value());
     } else if (type == "input_method_state"sv) {
         Optional<Gfx::IntRect> caret_rect;
         if (auto x = event.get_i64("x"sv); x.has_value()) {

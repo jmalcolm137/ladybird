@@ -70,6 +70,12 @@ public:
     void ime_marked_text(u64 tab_id, String const& text);
     void ime_commit_text(u64 tab_id, String const& text, i32 replacement_start = 0, i32 replacement_length = 0);
     void ime_unmark_text(u64 tab_id);
+    void compat_report_begin(u64 tab_id);
+    void compat_report_diagnostics(u64 tab_id, bool include_page_dumps);
+    void compat_report_send(u64 tab_id, String const& description, bool include_page_dumps, bool include_screenshot);
+    void compat_report_retry(u64 tab_id);
+    void compat_report_cancel(u64 tab_id);
+    void compat_report_close(u64 tab_id);
     void request_history(u64 limit = 10);
     void search_history(String const& query, u64 limit = 50);
     void clear_history();

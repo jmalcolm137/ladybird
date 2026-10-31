@@ -5,7 +5,7 @@ line-oriented JSON protocol over a Unix socket. Frame pixels never travel over
 the socket: the engine publishes a POSIX shared-memory ring per tab and the
 frontend maps it.
 
-Version: 13. `Shared/EngineProtocol.h` is authoritative.
+Version: 14. `Shared/EngineProtocol.h` is authoritative.
 
 ## Frontend → engine
 
@@ -37,6 +37,12 @@ Version: 13. `Shared/EngineProtocol.h` is authoritative.
 | `ime_marked_text` | `tab`, `text` | Set the input method's marked (preedit) text in the focused page field. |
 | `ime_commit_text` | `tab`, `text`, `replacement_start`, `replacement_length` | Commit input method text, replacing the marked range when supplied. |
 | `ime_unmark_text` | `tab` | Clear the marked text without committing. |
+| `compat_report_begin` | `tab` | Start a website-issue report for the active page. The engine captures the page metadata, a screenshot, and the page dumps, then answers with `compat_report_ready`. |
+| `compat_report_diagnostics` | `tab`, `include_page_dumps` | Ask for the report's diagnostics text for preview. |
+| `compat_report_send` | `tab`, `description`, `include_page_dumps`, `include_screenshot` | Submit the report and stream progress/retry/sent/failed events. |
+| `compat_report_retry` | `tab` | Retry a report that failed after preparation. |
+| `compat_report_cancel` | `tab` | Cancel an in-flight submission. |
+| `compat_report_close` | `tab` | Drop the report object after the review window closes. |
 | `drag` | `tab`, `drag_type`, `x`, `y`, `ctrl`, `shift`, `alt`, `super`, `text`, `urls` | Forward a desktop drag to the page. `drag_type` is `start`, `move`, `end`, or `drop`; coordinates are logical. `urls` carries `text/uri-list` entries; `file://` entries become drag-and-drop files. |
 | `certificate_info` | `tab` | Ask for the TLS certificate of the tab's current HTTPS page; the engine answers with `certificate_info`. |
 | `history_recent` | `limit` | Ask for the most recent history entries; the engine answers with `history_recent`. |
@@ -97,6 +103,13 @@ Version: 13. `Shared/EngineProtocol.h` is authoritative.
 | `bookmarks` | `items` | The bookmark tree for the bookmarks bar. Each item has `id`, `type` (`bookmark` or `folder`), `title`, and either `url` or nested `items`. |
 | `context_menu` | `tab`, `kind`, `x`, `y`, `items` | Page/link/image/media menu. Items have `text`, `action`, `enabled`, `checkable`, `checked`, or `separator`; `items` on a submenu entry nests. |
 | `permission` | `tab`, `request`, `name`, `origin` | Page permission prompt. The frontend answers with `permission_response`; remembered decisions are answered without showing a prompt. |
+| `compat_report_ready` | `tab`, `url`, `user_agent`, `viewport_width`, `viewport_height`, `device_pixel_ratio`, `zoom`, `details`, `has_screenshot`, `has_page_dumps` | Report metadata and review details. `details` is an array of `{label, value, code}`. |
+| `compat_report_page_dumps_ready` | `tab` | The layout/stacking/display-list dumps are now part of the report. |
+| `compat_report_diagnostics` | `tab`, `text` | Diagnostics text for the preview window. |
+| `compat_report_progress` | `tab`, `stage` | Submission stage: `Preparing`, `Requesting challenge`, `Solving proof`, or `Sending`. |
+| `compat_report_retry` | `tab`, `reason`, `retry`, `maximum`, `delay` | A transient failure; the submission retries after `delay` seconds. |
+| `compat_report_sent` | `tab` | The report was accepted. |
+| `compat_report_failed` | `tab`, `failure`, `reason` | The report failed. `failure` is `validation`, `preparation`, or `sending`. |
 | `input_method_state` | `tab`, `enabled`, `x`, `y`, `width`, `height` | The page's focused editable field changed. `enabled` tells the frontend to enable the desktop input method; the rectangle is the caret in device pixels. |
 | `certificate_info` | `tab`, `ok`, `subject`, `issuer`, `valid_from`, `valid_until`, `serial_number`, `sha256_fingerprint`, `protocol`, `cipher` | Certificate details for a secure page. On failure `ok` is false and `error` explains why. |
 | `file_picker` | `tab`, `multiple`, `filters` | Page opened a file picker. |

@@ -6,6 +6,7 @@
 
 #pragma once
 
+#include <AK/ByteBuffer.h>
 #include <AK/ByteString.h>
 #include <AK/Function.h>
 #include <AK/HashMap.h>
@@ -34,6 +35,7 @@
 #include <LibWebView/HeadlessWebView.h>
 #include <LibWebView/Menu.h>
 #include <LibWebView/SessionStore.h>
+#include <LibWebView/WebCompatReport.h>
 
 namespace LadybirdSDE {
 
@@ -123,6 +125,9 @@ private:
         bool pending_navigation_user_input { true };
         Vector<NonnullRefPtr<WebView::Action>> context_menu_actions;
         HashMap<u64, Function<void(bool)>> pending_permissions;
+        OwnPtr<WebView::WebCompatReport> compat_report;
+        Optional<ByteBuffer> compat_report_screenshot;
+        bool compat_report_has_page_dumps { false };
     };
 
     void read_available();
@@ -177,6 +182,12 @@ private:
     void handle_ime_commit_text(u64 tab_id, JsonObject const&);
     void handle_ime_unmark_text(u64 tab_id);
     void handle_drag(u64 tab_id, JsonObject const&);
+    void handle_compat_report_begin(u64 tab_id);
+    void handle_compat_report_diagnostics(u64 tab_id, JsonObject const&);
+    void handle_compat_report_send(u64 tab_id, JsonObject const&);
+    void handle_compat_report_retry(u64 tab_id);
+    void handle_compat_report_cancel(u64 tab_id);
+    void handle_compat_report_close(u64 tab_id);
     void send_certificate_info(u64 tab_id, Requests::CertificateInfo const&);
     void send_certificate_error(u64 tab_id, String const&);
     void handle_frame_ack(u64 tab_id, JsonObject const&);

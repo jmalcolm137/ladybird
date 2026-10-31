@@ -51,6 +51,16 @@ void WebContentView::set_frame(Gfx::Bitmap const* frame, u64 sequence, Gfx::IntR
         update(damage.intersected(rect()));
 }
 
+RefPtr<Gfx::Bitmap> WebContentView::snapshot() const
+{
+    if (!m_frame)
+        return {};
+    auto cloned = m_frame->clone();
+    if (cloned.is_error())
+        return {};
+    return cloned.release_value();
+}
+
 void WebContentView::paint_event(GUI::PaintEvent& event)
 {
     GUI::Painter painter(*this);
