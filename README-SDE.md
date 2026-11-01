@@ -154,6 +154,9 @@ protocol tests, the native spoofing dialogs, the address-bar inline-completion
 behaviour, the native drag source, and an end-to-end compatibility-report
 submission against a local report service.
 
+`scripts/test-install.sh` installs into a disposable prefix with no `sudo` and
+asserts the frontend, engine, resources, app file, icon, and desktop entry.
+
 ## Implemented in this milestone
 
 * A real SDE LibGUI window with Serenity window decorations, menus, toolbar,
