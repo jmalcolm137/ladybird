@@ -374,6 +374,11 @@ void BrowserWindow::create_actions()
     }, m_window.ptr());
     m_user_agent_action->set_status_tip("Choose the User-Agent sent to sites"_string);
 
+    m_navigator_compatibility_action = GUI::Action::create("Navigator &Compatibility Mode…"sv, [this](auto&) {
+        show_navigator_compatibility_dialog();
+    }, m_window.ptr());
+    m_navigator_compatibility_action->set_status_tip("Choose what the navigator object reports"_string);
+
     m_back_action->set_enabled(false);
     m_forward_action->set_enabled(false);
 }
@@ -471,6 +476,7 @@ void BrowserWindow::create_menus()
     tools_menu.add_action(*m_open_devtools_client_action);
     tools_menu.add_separator();
     tools_menu.add_action(*m_user_agent_action);
+    tools_menu.add_action(*m_navigator_compatibility_action);
 
     m_report_website_issue_action = GUI::Action::create("Report Website &Issue…"sv, [this](auto&) {
         if (auto* tab = active_tab(); tab && tab->is_attached())
@@ -1350,6 +1356,62 @@ void BrowserWindow::show_user_agent_dialog()
         m_session.set_user_agent(move(value));
         dialog->done(GUI::Dialog::ExecResult::OK);
     };
+
+    dialog->exec();
+}
+
+void BrowserWindow::show_navigator_compatibility_dialog()
+{
+    auto dialog = GUI::Dialog::construct(m_window.ptr());
+    dialog->set_title("Navigator Compatibility Mode"sv);
+    dialog->resize(560, 170);
+
+    auto main_widget = dialog->set_main_widget<GUI::Widget>();
+    main_widget->set_fill_with_background_color(true);
+    main_widget->set_layout<GUI::VerticalBoxLayout>(GUI::Margins { 10 }, 8);
+
+    auto& description = main_widget->add<GUI::Label>("Choose how navigator.appVersion, platform, vendor, and productSub are reported."_string);
+    description.set_text_wrapping(Gfx::TextWrapping::Wrap);
+
+    Vector<String> names;
+    for (auto const& mode : m_session.navigator_compatibility_modes())
+        names.append(mode.name);
+
+    auto& mode_combo = main_widget->add<GUI::ComboBox>();
+    mode_combo.set_model(GUI::ItemListModel<String>::create(names));
+    mode_combo.set_only_allow_values_from_model(true);
+
+    size_t selected_index = 0;
+    for (size_t index = 0; index < m_session.navigator_compatibility_modes().size(); ++index) {
+        if (m_session.navigator_compatibility_modes()[index].value == m_session.current_navigator_compatibility_mode()) {
+            selected_index = index;
+            break;
+        }
+    }
+    if (!names.is_empty())
+        mode_combo.set_selected_index(selected_index);
+
+    auto& buttons = main_widget->add<GUI::Widget>();
+    buttons.set_layout<GUI::HorizontalBoxLayout>();
+    buttons.set_fixed_height(26);
+    auto& spacer = buttons.add<GUI::Widget>();
+    spacer.set_preferred_width(GUI::SpecialDimension::Grow);
+
+    auto& cancel_button = buttons.add<GUI::Button>("Cancel"_string);
+    cancel_button.set_fixed_width(80);
+    cancel_button.on_click = [&](auto) {
+        dialog->done(GUI::Dialog::ExecResult::Cancel);
+    };
+
+    auto& apply_button = buttons.add<GUI::Button>("Apply"_string);
+    apply_button.set_fixed_width(80);
+    apply_button.on_click = [&](auto) {
+        auto index = mode_combo.selected_index();
+        if (index < m_session.navigator_compatibility_modes().size())
+            m_session.set_navigator_compatibility_mode(m_session.navigator_compatibility_modes()[index].value);
+        dialog->done(GUI::Dialog::ExecResult::OK);
+    };
+    apply_button.set_enabled(!names.is_empty());
 
     dialog->exec();
 }

@@ -165,6 +165,8 @@ public:
     // Replaces the user agent every existing page and worker reports, and every page created later starts with.
     void set_user_agent(String user_agent);
     Web::NavigatorCompatibilityMode navigator_compatibility_mode() const;
+    // Replaces the navigator compatibility mode every existing page and worker reports.
+    void set_navigator_compatibility_mode(Web::NavigatorCompatibilityMode);
 
     static BookmarkStore& bookmark_store() { return *the().m_bookmark_store; }
     void update_bookmark_action_for_current_web_view();

@@ -40,6 +40,7 @@ information" on local or browser pages).
 |---|---|
 | Address bar | **Done:** autocomplete and search suggestions are exposed over the control socket and shown in a keyboard-navigable popup. An inline completion fills in the top suggestion's suffix, selects it so typing replaces it, follows the highlighted row, and is suppressed after Backspace. |
 | User agent | **Done:** Tools → User Agent… chooses one of the reference frontend's presets or a custom string; the engine applies it to every page and worker and clears the cache. Per-site `WebCompat` rules still apply on top. |
+| Navigator compatibility | **Done:** Tools → Navigator Compatibility Mode… selects Chrome, Gecko, or WebKit for `navigator.appVersion`, `platform`, `vendor`, and `productSub`; the engine applies it to every page and worker and clears the cache. |
 | Tabs | **Done:** reopen closed tab, tab search, pin tab, mute/audio indicators on the tab, move tab to a new window, close tabs to the right, and a Tabs menu plus toolbar button. |
 | Bookmarks | **Done:** the bar renders folders and nested menus; the chrome can add, edit, remove, and move bookmarks, and create and rename folders in a manager window. |
 | History | **Done:** the History menu lists recent entries, searches titles and URLs into a native results window, clears history after confirmation, and links to `about:history`. |

@@ -3083,6 +3083,19 @@ Web::NavigatorCompatibilityMode Application::navigator_compatibility_mode() cons
     return navigator_compatibility_mode_from_string(m_navigator_compatibility_mode).value_or(Web::default_navigator_compatibility_mode);
 }
 
+void Application::set_navigator_compatibility_mode(Web::NavigatorCompatibilityMode mode)
+{
+    m_navigator_compatibility_mode = navigator_compatibility_mode_to_string(mode);
+
+    WorkerProcessManager::the().update_navigator_compatibility_mode(mode);
+
+    ViewImplementation::for_each_view([&](ViewImplementation& view) {
+        view.debug_request("navigator-compatibility-mode"sv, m_navigator_compatibility_mode);
+        view.debug_request("clear-cache"sv);
+        return IterationDecision::Continue;
+    });
+}
+
 void Application::update_vertical_tabs_action()
 {
     auto const& settings = m_settings->tab_settings();

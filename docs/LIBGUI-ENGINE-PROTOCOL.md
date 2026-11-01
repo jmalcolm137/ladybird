@@ -5,7 +5,7 @@ line-oriented JSON protocol over a Unix socket. Frame pixels never travel over
 the socket: the engine publishes a POSIX shared-memory ring per tab and the
 frontend maps it.
 
-Version: 15. `Shared/EngineProtocol.h` is authoritative.
+Version: 16. `Shared/EngineProtocol.h` is authoritative.
 
 ## Frontend → engine
 
@@ -45,6 +45,7 @@ Version: 15. `Shared/EngineProtocol.h` is authoritative.
 | `compat_report_close` | `tab` | Drop the report object after the review window closes. |
 | `drag` | `tab`, `drag_type`, `x`, `y`, `ctrl`, `shift`, `alt`, `super`, `text`, `urls` | Forward a desktop drag to the page. `drag_type` is `start`, `move`, `end`, or `drop`; coordinates are logical. `urls` carries `text/uri-list` entries; `file://` entries become drag-and-drop files. |
 | `set_user_agent` | `value` | Replace the User-Agent that every page and worker reports. An empty value restores the default. The engine answers with `user_agent_changed`. |
+| `set_navigator_compatibility_mode` | `value` | Select `chrome`, `gecko`, or `webkit` for `navigator.appVersion`, `platform`, `vendor`, and `productSub` in every page and worker. The engine answers with `navigator_compatibility_mode_changed`. |
 | `certificate_info` | `tab` | Ask for the TLS certificate of the tab's current HTTPS page; the engine answers with `certificate_info`. |
 | `history_recent` | `limit` | Ask for the most recent history entries; the engine answers with `history_recent`. |
 | `history_search` | `query`, `limit` | Search titles and URLs; the engine answers with `history_search_results`. |
@@ -75,6 +76,8 @@ Version: 15. `Shared/EngineProtocol.h` is authoritative.
 | `hello` | `protocol` | Protocol handshake. |
 | `user_agents` | `current`, `agents` | The current User-Agent and the presets the reference frontend offers. Each agent is `{name, value}`. Sent after `hello`. |
 | `user_agent_changed` | `value` | The application User-Agent changed. |
+| `navigator_compatibility_modes` | `current`, `modes` | The current navigator compatibility mode and the available modes. Each mode is `{name, value}`. Sent after `user_agents`. |
+| `navigator_compatibility_mode_changed` | `value` | The navigator compatibility mode changed. |
 | `session_plan` | `windows` | Native startup-recovery plan. Each window has `window`, `active`, optional geometry, and `tabs`; each tab has `session_tab`, `url`, and `pinned`. Sent once after `hello`. An empty list means open the default window. |
 | `session_window` | `window`, `session_window` | The engine assigned a native session-window ID to a frontend window. The frontend stores it for geometry and close reporting. |
 | `session_tab_registered` | `request`, `window`, `session_tab` | The native session store assigned an ID to a lazily restored tab. |

@@ -58,6 +58,14 @@ public:
     String const& current_user_agent() const { return m_current_user_agent; }
     void set_user_agent(String const& user_agent) { m_engine->set_user_agent(user_agent); }
 
+    struct NavigatorCompatibilityModeOption {
+        String name;
+        String value;
+    };
+    Vector<NavigatorCompatibilityModeOption> const& navigator_compatibility_modes() const { return m_navigator_compatibility_modes; }
+    String const& current_navigator_compatibility_mode() const { return m_current_navigator_compatibility_mode; }
+    void set_navigator_compatibility_mode(String const& mode) { m_engine->set_navigator_compatibility_mode(mode); }
+
     JsonArray clipboard_items_for_paste();
 
     // Permission decisions for the site information popover. Decisions marked "remember" are written to the profile
@@ -123,6 +131,8 @@ private:
     HashMap<String, Vector<PermissionEntry>> m_permissions;
     Vector<UserAgentPreset> m_user_agent_presets;
     String m_current_user_agent;
+    Vector<NavigatorCompatibilityModeOption> m_navigator_compatibility_modes;
+    String m_current_navigator_compatibility_mode;
 };
 
 }

@@ -239,8 +239,8 @@ folders and overflow, a site indicator/popover, a visible zoom percentage,
 certificate details, persisted permissions, HiDPI web content, IME
 composition through the desktop's text-input-v3 input method, address-bar inline
 completion, drops of text, URLs, and files into page drop targets, dragging page
-content out to other applications, and a User-Agent override under Tools.
-Accessibility follows. GPU/zero-copy frame sharing is deliberately shelved because it
+content out to other applications, a User-Agent override, and a Navigator
+Compatibility Mode under Tools. Accessibility follows. GPU/zero-copy frame sharing is deliberately shelved because it
 destabilized scrolling and resizing; the stable rendering path is the
 acknowledged shared-memory ring with damage-only copies.
 

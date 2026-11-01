@@ -688,6 +688,14 @@ void EngineClient::set_user_agent(String const& user_agent)
     send(event);
 }
 
+void EngineClient::set_navigator_compatibility_mode(String const& mode)
+{
+    JsonObject event;
+    event.set("type"sv, "set_navigator_compatibility_mode"sv);
+    event.set("value"sv, mode.bytes_as_string_view());
+    send(event);
+}
+
 void EngineClient::toggle_devtools()
 {
     JsonObject event;

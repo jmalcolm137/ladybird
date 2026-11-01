@@ -84,6 +84,7 @@ public:
     void paste(u64 tab_id, JsonArray items);
     void set_clipboard_items(JsonArray items);
     void set_user_agent(String const& user_agent);
+    void set_navigator_compatibility_mode(String const& mode);
     void toggle_devtools();
     void open_devtools_client();
     void select_all(u64 tab_id);

@@ -170,6 +170,22 @@ ErrorOr<void> EngineServer::start()
     user_agents_event.set("agents"sv, move(user_agent_presets));
     send_event(move(user_agents_event));
 
+    JsonObject navigator_modes_event;
+    navigator_modes_event.set("type"sv, "navigator_compatibility_modes"sv);
+    navigator_modes_event.set("current"sv, WebView::navigator_compatibility_mode_to_string(EngineApplication::the().navigator_compatibility_mode()));
+    JsonArray navigator_modes;
+    auto add_navigator_mode = [&](StringView name, Web::NavigatorCompatibilityMode mode) {
+        JsonObject entry;
+        entry.set("name"sv, name);
+        entry.set("value"sv, WebView::navigator_compatibility_mode_to_string(mode));
+        navigator_modes.must_append(move(entry));
+    };
+    add_navigator_mode("Chrome"sv, Web::NavigatorCompatibilityMode::Chrome);
+    add_navigator_mode("Gecko"sv, Web::NavigatorCompatibilityMode::Gecko);
+    add_navigator_mode("WebKit"sv, Web::NavigatorCompatibilityMode::WebKit);
+    navigator_modes_event.set("modes"sv, move(navigator_modes));
+    send_event(move(navigator_modes_event));
+
     // DevTools may already be running: the frontend asked the engine to start it with --devtools, before the
     // control socket existed. Tell the chrome now so it can show the banner.
     if (auto port = EngineApplication::the().devtools_port_if_enabled(); port.has_value()) {
@@ -325,6 +341,8 @@ void EngineServer::dispatch_command(JsonObject const& command)
         quit();
     } else if (*type == "set_user_agent"sv) {
         handle_set_user_agent(command);
+    } else if (*type == "set_navigator_compatibility_mode"sv) {
+        handle_set_navigator_compatibility_mode(command);
     } else if (*type == "download_action"sv) {
         handle_download_action(command);
     } else if (*type == "history_recent"sv) {
@@ -2162,6 +2180,24 @@ void EngineServer::handle_set_user_agent(JsonObject const& command)
     JsonObject event;
     event.set("type"sv, "user_agent_changed"sv);
     event.set("value"sv, EngineApplication::the().user_agent_string());
+    send_event(move(event));
+}
+
+void EngineServer::handle_set_navigator_compatibility_mode(JsonObject const& command)
+{
+    auto value = command.get_string("value"sv);
+    if (!value.has_value())
+        return;
+
+    auto mode = WebView::navigator_compatibility_mode_from_string(*value);
+    if (!mode.has_value())
+        return;
+
+    EngineApplication::the().set_navigator_compatibility_mode(*mode);
+
+    JsonObject event;
+    event.set("type"sv, "navigator_compatibility_mode_changed"sv);
+    event.set("value"sv, WebView::navigator_compatibility_mode_to_string(*mode));
     send_event(move(event));
 }
 

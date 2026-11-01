@@ -162,6 +162,7 @@ private:
     void handle_paste(u64 tab_id, JsonObject const&);
     void handle_clipboard_changed(JsonObject const&);
     void handle_set_user_agent(JsonObject const&);
+    void handle_set_navigator_compatibility_mode(JsonObject const&);
     void handle_toggle_devtools();
     void handle_open_devtools_client();
     void handle_select_all(u64 tab_id);

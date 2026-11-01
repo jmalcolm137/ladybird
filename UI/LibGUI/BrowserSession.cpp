@@ -556,6 +556,30 @@ void BrowserSession::on_engine_event(JsonObject const& event)
         return;
     }
 
+    if (type == "navigator_compatibility_modes"sv) {
+        m_navigator_compatibility_modes.clear();
+        if (auto modes = event.get_array("modes"sv); modes.has_value()) {
+            for (auto const& value : modes->values()) {
+                if (!value.is_object())
+                    continue;
+                auto const& object = value.as_object();
+                auto name = String::from_byte_string(object.get_byte_string("name"sv).value_or({})).release_value();
+                auto mode = String::from_byte_string(object.get_byte_string("value"sv).value_or({})).release_value();
+                if (!name.is_empty() && !mode.is_empty())
+                    m_navigator_compatibility_modes.append({ move(name), move(mode) });
+            }
+        }
+        if (auto current = event.get_byte_string("current"sv); current.has_value())
+            m_current_navigator_compatibility_mode = String::from_byte_string(*current).release_value();
+        return;
+    }
+
+    if (type == "navigator_compatibility_mode_changed"sv) {
+        if (auto value = event.get_byte_string("value"sv); value.has_value())
+            m_current_navigator_compatibility_mode = String::from_byte_string(*value).release_value();
+        return;
+    }
+
     if (type == "clipboard_write"sv) {
         m_clipboard->apply_engine_clipboard(event);
         return;
