@@ -10,6 +10,7 @@
 
 #include <AK/Base64.h>
 #include <AK/StringBuilder.h>
+#include <LibCore/Environment.h>
 #include <LibCore/EventLoop.h>
 #include <LibCore/MimeData.h>
 #include <LibCore/StandardPaths.h>
@@ -1293,6 +1294,9 @@ void BrowserTab::apply_inline_completion(String const& completion)
 {
     if (completion.bytes_as_string_view().length() <= m_inline_base_query.bytes_as_string_view().length())
         return;
+
+    if (Core::Environment::has("LADYBIRD_SDE_TEST_LOG_INLINE_COMPLETION"sv))
+        warnln("inline completion: {}", completion);
 
     m_applying_inline_completion = true;
     m_location_box->set_text(completion.bytes_as_string_view());

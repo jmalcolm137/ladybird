@@ -682,6 +682,9 @@ void EngineClient::set_clipboard_items(JsonArray items)
 
 void EngineClient::set_user_agent(String const& user_agent)
 {
+    if (Core::Environment::has("LADYBIRD_SDE_TEST_LOG_SPOOFING"sv))
+        warnln("spoof user agent: {}", user_agent);
+
     JsonObject event;
     event.set("type"sv, "set_user_agent"sv);
     event.set("value"sv, user_agent.bytes_as_string_view());
@@ -690,6 +693,9 @@ void EngineClient::set_user_agent(String const& user_agent)
 
 void EngineClient::set_navigator_compatibility_mode(String const& mode)
 {
+    if (Core::Environment::has("LADYBIRD_SDE_TEST_LOG_SPOOFING"sv))
+        warnln("spoof navigator: {}", mode);
+
     JsonObject event;
     event.set("type"sv, "set_navigator_compatibility_mode"sv);
     event.set("value"sv, mode.bytes_as_string_view());

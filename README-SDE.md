@@ -113,6 +113,8 @@ The install places:
 * `lib/ladybird` — Ladybird's shared libraries
 * `share/Lagom` — Ladybird's fonts, themes, and internal pages
 * `share/applications/ladybird.desktop` — the Taskbar/menu entry
+* `share/res/apps/Ladybird.af` — the SDE app file the Taskbar menu and quick
+  launch resolve
 
 ## Testing without the engine
 
@@ -140,6 +142,17 @@ it the frontend opens `about:newtab`. `Tools/ui-test-page.html` additionally
 exercises the select dropdown, file picker, and download UI. This path is
 verified in this tree, including clicking a link in the rendered page and
 navigating the real engine.
+
+The browser-feature regression set covers the newer chrome work:
+
+```sh
+scripts/test-browser-features.sh
+```
+
+It runs the engine-side User-Agent/navigator-mode/inline-completion/drag
+protocol tests, the native spoofing dialogs, the address-bar inline-completion
+behaviour, the native drag source, and an end-to-end compatibility-report
+submission against a local report service.
 
 ## Implemented in this milestone
 

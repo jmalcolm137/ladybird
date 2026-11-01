@@ -10,6 +10,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 LADYBIRD_BUILD="${LADYBIRD_BUILD:-$ROOT/Build/release}"
 LIBGUI_WAYLAND_ROOT="${LIBGUI_WAYLAND_ROOT:-$ROOT/../libgui-wayland}"
+SERENITY="${SERENITY:-$LIBGUI_WAYLAND_ROOT/serenity}"
 LAGOM="${LAGOM:-$LIBGUI_WAYLAND_ROOT/build/lagom}"
 PREFIX="${SDE_PREFIX:-/usr/lib/sde-next}"
 SUDO="${SUDO:-sudo}"
@@ -29,7 +30,7 @@ install_file() {
 
 echo "==> installing Ladybird into $PREFIX"
 "$SUDO" install -d "$PREFIX/bin" "$PREFIX/libexec" "$PREFIX/lib/ladybird" \
-    "$PREFIX/share/Lagom" "$PREFIX/share/applications"
+    "$PREFIX/share/Lagom" "$PREFIX/share/applications" "$PREFIX/share/res/apps"
 
 echo "==> frontend"
 install_file "$ROOT/build/chrome/Ladybird" "$PREFIX/bin/Ladybird.real"
@@ -82,6 +83,27 @@ for library in "$LAGOM"/lib/liblagom-*.so* "$LAGOM"/lib/libwindowserver.so; do
     [[ -e "$library" ]] || continue
     "$SUDO" cp -a "$library" "$PREFIX/lib/"
 done
+
+echo "==> app file"
+# The Taskbar's application menu and quick launch resolve Serenity app files from the resource root. Install one
+# alongside the generated desktop entry so a prefix install does not need a hand-written .af.
+if [[ -f "$SERENITY/Base/res/icons/32x32/app-browser.png" ]]; then
+    "$SUDO" install -d "$PREFIX/share/res/icons/32x32"
+    "$SUDO" install -m 0644 "$SERENITY/Base/res/icons/32x32/app-browser.png" "$PREFIX/share/res/icons/32x32/app-browser.png"
+fi
+"$SUDO" tee "$PREFIX/share/res/apps/Ladybird.af" >/dev/null <<EOF
+[App]
+Name=&Ladybird
+Description=LibGUI Ladybird browser
+Executable=$PREFIX/bin/Ladybird
+WorkingDirectory=$PREFIX
+Category=&Internet
+IconPath=$PREFIX/share/res/icons/32x32/app-browser.png
+
+[Launcher]
+FileTypes=html,htm
+Protocols=http,https
+EOF
 
 echo "==> desktop entry"
 "$SUDO" tee "$PREFIX/share/applications/ladybird.desktop" >/dev/null <<EOF

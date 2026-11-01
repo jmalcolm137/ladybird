@@ -127,8 +127,10 @@ scroll, resize, multi-window, and session-restore tests.
   Terminal were verified with the multi-format clipboard, menu anchoring,
   modifier state, and wheel scrolling. Note that running apps keep the
   libraries they mapped; new launches pick up the new framework.
-- The Ladybird `.af` file and Taskbar entry are still manual; `scripts/install-sde.sh`
-  should install them.
+- The Ladybird `.af` file and Taskbar entry are installed by
+  `scripts/install-sde.sh`; the `.af` is written into `share/res/apps`, its icon
+  is copied into the prefix, and `share/applications/ladybird.desktop` points at
+  the installed launcher.
 - **Done:** the engine host watches the resolver configuration files and
   restarts the RequestServer processes when `/etc/resolv.conf` (or the other
   resolver files) is replaced. This is a local safeguard for the upstream
