@@ -1553,6 +1553,12 @@ void BrowserTab::show_permission_prompt(StringView name, StringView origin, u64 
 
 void BrowserTab::start_drag(JsonArray items)
 {
+    // A page drag that started while another native drag is still running would nest DragOperation::exec(), which is
+    // not supported. Ignore the extra start; the first drag's end resets the page's drag state.
+    if (m_drag_in_progress)
+        return;
+    m_drag_in_progress = true;
+
     // This runs from the engine socket's read callback. Defer it so starting the platform drag, which runs its own
     // event loop until the drag ends, cannot re-enter that callback while it is still on the stack.
     auto weak_this = make_weak_ptr();
@@ -1608,6 +1614,7 @@ void BrowserTab::run_drag(JsonArray const& items)
     auto position = m_web_view->last_mouse_position();
     if (!has_data) {
         m_engine.drag_event(m_tab_id, "end"sv, position, 0, String {}, Vector<String> {});
+        m_drag_in_progress = false;
         return;
     }
 
@@ -1618,6 +1625,7 @@ void BrowserTab::run_drag(JsonArray const& items)
 
     operation->exec();
     m_engine.drag_event(m_tab_id, "end"sv, position, 0, String {}, Vector<String> {});
+    m_drag_in_progress = false;
 }
 
 void BrowserTab::show_file_picker(bool, JsonArray const& filters)

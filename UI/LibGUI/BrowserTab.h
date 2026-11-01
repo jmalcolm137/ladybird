@@ -214,6 +214,7 @@ private:
     String m_inline_base_query;
     String m_last_location_text;
     bool m_inline_completion_active { false };
+    bool m_drag_in_progress { false };
     bool m_inline_completion_suppressed { false };
     bool m_applying_inline_completion { false };
     u64 m_autocomplete_request_id { 0 };
