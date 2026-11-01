@@ -106,6 +106,11 @@ private:
     void show_tab_search();
     void show_user_agent_dialog();
     void show_navigator_compatibility_dialog();
+    void show_crash_report_notification(String const& report_name);
+    void show_crash_report(JsonObject const&);
+    void show_crash_report_text(String const& text);
+    void show_process_manager();
+    void update_processes(JsonObject const&);
     void add_bookmark_menu_items(GUI::Menu&, Vector<BookmarkEntry> const&);
     void rebuild_bookmarks_menu();
     void close_other_tabs(BrowserTab&);
@@ -172,6 +177,8 @@ private:
     RefPtr<GUI::Action> m_open_devtools_client_action;
     RefPtr<GUI::Action> m_user_agent_action;
     RefPtr<GUI::Action> m_navigator_compatibility_action;
+    RefPtr<GUI::Action> m_crash_reports_action;
+    RefPtr<GUI::Action> m_process_manager_action;
     RefPtr<GUI::Widget> m_devtools_bar;
     RefPtr<GUI::Label> m_devtools_label;
 
@@ -193,6 +200,27 @@ private:
     RefPtr<GUI::JsonArrayModel> m_bookmarks_model;
     RefPtr<GUI::TableView> m_bookmarks_table;
     JsonArray m_bookmark_rows;
+    RefPtr<GUI::Window> m_crash_prompt_window;
+    RefPtr<GUI::Label> m_crash_prompt_label;
+    String m_crash_prompt_name;
+    RefPtr<GUI::Window> m_crash_report_window;
+    RefPtr<GUI::Widget> m_crash_report_fields;
+    RefPtr<GUI::Label> m_crash_report_title;
+    RefPtr<GUI::TextEditor> m_crash_report_description;
+    RefPtr<GUI::CheckBox> m_crash_report_include_website;
+    RefPtr<GUI::TextBox> m_crash_report_website;
+    RefPtr<GUI::Label> m_crash_report_status;
+    RefPtr<GUI::Button> m_crash_report_send_button;
+    RefPtr<GUI::Button> m_crash_report_next_button;
+    RefPtr<GUI::Window> m_crash_report_text_window;
+    RefPtr<GUI::TextEditor> m_crash_report_text;
+    String m_crash_report_name;
+    RefPtr<GUI::Window> m_process_window;
+    RefPtr<GUI::TableView> m_process_table;
+    RefPtr<GUI::JsonArrayModel> m_process_model;
+    JsonArray m_process_rows;
+    RefPtr<Core::Timer> m_process_timer;
+    RefPtr<GUI::Label> m_process_status;
     Vector<FlatBookmark> m_flat_bookmarks;
     RefPtr<Core::Timer> m_history_refresh_timer;
     struct RecentHistoryEntry {

@@ -43,13 +43,16 @@
 #include <LibWebView/Application.h>
 #include <LibWebView/Utilities.h>
 #include <LibWebView/BookmarkStore.h>
+#include <LibWebView/CrashReportStore.h>
 #include <LibWebView/HeadlessWebView.h>
 #include <LibWebView/HistoryStore.h>
 #include <LibWebView/Menu.h>
+#include <LibWebView/ProcessSnapshot.h>
 #include <LibWebView/RequestServerManager.h>
 #include <LibWebView/UserAgent.h>
 #include <LibWebView/ViewImplementation.h>
 #include <Shared/EngineProtocol.h>
+#include <LibCore/Process.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <string.h>
@@ -133,6 +136,7 @@ ErrorOr<void> EngineServer::start()
 
     m_unresponsive_timer = Core::Timer::create_repeating(AK::Duration::from_milliseconds(1000), [this] {
         check_unresponsive_tabs();
+        check_crash_reports();
     });
     m_unresponsive_timer->start();
 
@@ -185,6 +189,11 @@ ErrorOr<void> EngineServer::start()
     add_navigator_mode("WebKit"sv, Web::NavigatorCompatibilityMode::WebKit);
     navigator_modes_event.set("modes"sv, move(navigator_modes));
     send_event(move(navigator_modes_event));
+
+    EngineApplication::the().set_crash_report_handler([this](ByteString const& report_name) {
+        send_crash_report_available(report_name);
+    });
+    check_crash_reports();
 
     // DevTools may already be running: the frontend asked the engine to start it with --devtools, before the
     // control socket existed. Tell the chrome now so it can show the banner.
@@ -343,6 +352,24 @@ void EngineServer::dispatch_command(JsonObject const& command)
         handle_set_user_agent(command);
     } else if (*type == "set_navigator_compatibility_mode"sv) {
         handle_set_navigator_compatibility_mode(command);
+    } else if (*type == "request_processes"sv) {
+        send_processes();
+    } else if (*type == "end_process"sv) {
+        handle_end_process(command);
+    } else if (*type == "crash_report_open"sv) {
+        handle_crash_report_open(command);
+    } else if (*type == "crash_report_next"sv) {
+        handle_crash_report_next();
+    } else if (*type == "crash_report_text"sv) {
+        handle_crash_report_text();
+    } else if (*type == "crash_report_send"sv) {
+        handle_crash_report_send(command);
+    } else if (*type == "crash_report_cancel"sv) {
+        handle_crash_report_cancel();
+    } else if (*type == "crash_report_close"sv) {
+        handle_crash_report_close();
+    } else if (*type == "crash_report_dismiss"sv) {
+        handle_crash_report_dismiss();
     } else if (*type == "download_action"sv) {
         handle_download_action(command);
     } else if (*type == "history_recent"sv) {
@@ -2167,6 +2194,230 @@ void EngineServer::handle_clipboard_changed(JsonObject const& command)
         EngineApplication::the().cache_clipboard_item_from_frontend(item.release_value());
     else
         EngineApplication::the().cache_clipboard_item_from_frontend({});
+}
+
+void EngineServer::send_crash_report_available(ByteString const& report_name)
+{
+    if (report_name.is_empty())
+        return;
+    auto name = String::from_byte_string(report_name).release_value();
+    if (m_offered_crash_reports.contains(name))
+        return;
+    m_offered_crash_reports.set(move(name));
+
+    JsonObject event;
+    event.set("type"sv, "crash_report_available"sv);
+    event.set("name"sv, report_name.view());
+    send_event(move(event));
+}
+
+void EngineServer::check_crash_reports()
+{
+    auto names = WebView::CrashReportStore::the().pending_report_names();
+    if (names.is_error())
+        return;
+    for (auto const& name : names.value())
+        send_crash_report_available(name);
+}
+
+static void append_crash_report_fields(JsonArray& fields, Vector<WebView::ReportDetail> const& details)
+{
+    for (auto const& detail : details) {
+        JsonObject field;
+        field.set("label"sv, detail.label);
+        field.set("value"sv, detail.value);
+        field.set("code"sv, detail.is_code);
+        fields.must_append(move(field));
+    }
+}
+
+void EngineServer::send_crash_report_ready(WebView::CrashReportReview::Report const& report)
+{
+    JsonArray fields;
+    append_crash_report_fields(fields, report.fields);
+
+    JsonObject event;
+    event.set("type"sv, "crash_report_ready"sv);
+    event.set("name"sv, report.name.view());
+    event.set("fields"sv, move(fields));
+    event.set("has_next"sv, m_crash_report && m_crash_report->has_next_report());
+    send_event(move(event));
+}
+
+void EngineServer::send_crash_report_failure(StringView failure, String const& reason)
+{
+    JsonObject event;
+    event.set("type"sv, "crash_report_failed"sv);
+    event.set("failure"sv, failure);
+    event.set("reason"sv, reason);
+    send_event(move(event));
+}
+
+void EngineServer::handle_crash_report_open(JsonObject const& command)
+{
+    if (m_crash_report && m_crash_report->is_sending())
+        return;
+
+    if (!m_crash_report)
+        m_crash_report = make<WebView::CrashReportReview>();
+
+    m_crash_report->on_progress = [this](WebView::ReportSubmission::Stage stage) {
+        JsonObject event;
+        event.set("type"sv, "crash_report_progress"sv);
+        event.set("stage"sv, compat_report_stage_name(stage));
+        send_event(move(event));
+    };
+    m_crash_report->on_retry = [this](String reason, u32 retry, u32 maximum, u32 delay) {
+        JsonObject event;
+        event.set("type"sv, "crash_report_retry"sv);
+        event.set("reason"sv, reason);
+        event.set("retry"sv, retry);
+        event.set("maximum"sv, maximum);
+        event.set("delay"sv, delay);
+        send_event(move(event));
+    };
+    m_crash_report->on_sent = [this] {
+        JsonObject event;
+        event.set("type"sv, "crash_report_sent"sv);
+        send_event(move(event));
+    };
+    m_crash_report->on_failed = [this](WebView::ReportSubmission::Failure failure, String reason) {
+        send_crash_report_failure(failure == WebView::ReportSubmission::Failure::Preparation ? "preparation"sv : "sending"sv, reason);
+    };
+
+    Optional<ByteString> name;
+    if (auto requested = command.get_string("name"sv); requested.has_value() && !requested->is_empty())
+        name = requested->to_byte_string();
+
+    auto report = m_crash_report->open(name);
+    if (report.is_error()) {
+        send_crash_report_failure("open"sv, String::from_utf8(report.error().string_literal()).release_value());
+        return;
+    }
+    send_crash_report_ready(report.value());
+}
+
+void EngineServer::handle_crash_report_next()
+{
+    handle_crash_report_open({});
+}
+
+void EngineServer::handle_crash_report_text()
+{
+    if (!m_crash_report)
+        return;
+    auto text = m_crash_report->report_text();
+    if (text.is_error()) {
+        send_crash_report_failure("preparation"sv, String::from_utf8(text.error().string_literal()).release_value());
+        return;
+    }
+    JsonObject event;
+    event.set("type"sv, "crash_report_text"sv);
+    event.set("text"sv, text.value().view());
+    send_event(move(event));
+}
+
+void EngineServer::handle_crash_report_send(JsonObject const& command)
+{
+    if (!m_crash_report || m_crash_report->is_sending())
+        return;
+
+    auto description = command.get_string("description"sv).value_or({});
+    Optional<String> url;
+    if (command.get_bool("include_website"sv).value_or(false))
+        url = command.get_string("url"sv).value_or(String {});
+
+    auto error = m_crash_report->send(description, url);
+    if (error.has_value())
+        send_crash_report_failure("validation"sv, *error);
+}
+
+void EngineServer::handle_crash_report_cancel()
+{
+    if (m_crash_report)
+        m_crash_report->cancel_sending();
+    JsonObject event;
+    event.set("type"sv, "crash_report_cancelled"sv);
+    send_event(move(event));
+}
+
+void EngineServer::handle_crash_report_close()
+{
+    m_crash_report.clear();
+}
+
+void EngineServer::handle_crash_report_dismiss()
+{
+    if (auto result = WebView::CrashReportStore::the().mark_all_seen(); result.is_error())
+        warnln("Could not mark crash reports as seen: {}", result.error());
+    m_offered_crash_reports.clear();
+    m_crash_report.clear();
+    JsonObject event;
+    event.set("type"sv, "crash_report_dismissed"sv);
+    send_event(move(event));
+}
+
+void EngineServer::send_processes()
+{
+    auto processes = WebView::process_snapshots(WebView::Application::process_manager());
+
+    JsonArray items;
+    double total_cpu = 0;
+    u64 total_memory = 0;
+    for (auto const& process : processes) {
+        total_cpu += process.cpu_percent;
+        total_memory += process.memory_usage_bytes;
+
+        JsonObject item;
+        item.set("child"sv, process.child_id);
+        item.set("pid"sv, static_cast<i64>(process.pid));
+        item.set("type"sv, WebView::process_name_from_type(process.type));
+        if (process.title.has_value())
+            item.set("title"sv, process.title->to_utf8());
+        if (process.site_url.has_value())
+            item.set("site"sv, process.site_url->to_string());
+        item.set("cpu"sv, process.cpu_percent);
+        item.set("memory"sv, process.memory_usage_bytes);
+        if (process.owner_child_id.has_value())
+            item.set("owner"sv, *process.owner_child_id);
+
+        if (process.page.has_value())
+            item.set("page"sv, process.page->url.to_string());
+
+        JsonArray tabs;
+        for (auto const& tab : process.tabs) {
+            JsonObject entry;
+            entry.set("title"sv, tab.title.to_utf8());
+            entry.set("url"sv, tab.page.url.to_string());
+            tabs.must_append(move(entry));
+        }
+        item.set("tabs"sv, move(tabs));
+        item.set("frames"sv, static_cast<u64>(process.frame_count));
+        items.must_append(move(item));
+    }
+
+    JsonObject event;
+    event.set("type"sv, "processes"sv);
+    event.set("items"sv, move(items));
+    event.set("total_cpu"sv, total_cpu);
+    event.set("total_memory"sv, total_memory);
+    send_event(move(event));
+}
+
+void EngineServer::handle_end_process(JsonObject const& command)
+{
+    auto child_id = command.get_u64("child"sv);
+    if (!child_id.has_value())
+        return;
+
+    auto result = WebView::Application::process_manager().terminate_child(*child_id, Core::Process::TerminationMode::Forceful);
+    if (result.is_error()) {
+        JsonObject event;
+        event.set("type"sv, "process_error"sv);
+        event.set("message"sv, result.error().string_literal());
+        send_event(move(event));
+    }
+    send_processes();
 }
 
 void EngineServer::handle_set_user_agent(JsonObject const& command)

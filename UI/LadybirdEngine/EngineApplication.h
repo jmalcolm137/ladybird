@@ -45,6 +45,9 @@ public:
     void set_devtools_event_handler(DevToolsEventHandler handler) { m_devtools_event_handler = move(handler); }
     Optional<u16> devtools_port_if_enabled() const;
 
+    using CrashReportHandler = Function<void(ByteString const& report_name)>;
+    void set_crash_report_handler(CrashReportHandler handler) { m_crash_report_handler = move(handler); }
+
 protected:
     virtual Optional<WebView::ViewImplementation&> active_web_view() const override;
     virtual void insert_clipboard_item(Web::Clipboard::SystemClipboardItem) override;
@@ -56,6 +59,7 @@ protected:
     virtual bool should_coordinate_browser_process() const override { return false; }
     virtual void open_download(WebView::FileDownloader::Download const&) const override;
     virtual void show_download_in_folder(WebView::FileDownloader::Download const&) const override;
+    virtual void display_crash_report_notification(ByteString const& report_name) override;
     virtual Optional<WebView::ViewImplementation&> open_blank_new_tab(Web::HTML::ActivateTab) const override;
     virtual void open_url_in_new_window(URL::URL const&, WebView::IsPrivate) override;
     virtual void open_navigation_in_new_window(Web::HTML::PreparedNavigationDescriptor, WebView::IsPrivate) override;
@@ -68,6 +72,7 @@ private:
     ActiveWebViewProvider m_active_web_view_provider;
     ClipboardWriteHandler m_clipboard_write_handler;
     DevToolsEventHandler m_devtools_event_handler;
+    CrashReportHandler m_crash_report_handler;
     mutable bool m_devtools_enabled { false };
 };
 

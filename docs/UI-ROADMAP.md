@@ -88,8 +88,12 @@ information" on local or browser pages).
   review window. It validates the description, shows the diagnostics, streams
   send progress, auto-retries transient failures, and offers a manual Retry
   after a terminal failure.
-- Crash report submission UI
-- Process manager / performance monitor
+- **Crash report submission UI: Done.** A saved crash report is offered in a
+  native notification, reviewed with its fields and full text, and sent with
+  progress, retry, cancellation, and failure handling.
+- **Process manager / performance monitor: Done.** Tools → Process Manager
+  lists every Ladybird process with PID, CPU, memory, page, and tabs, refreshes
+  once a second, and can end a process.
 - Picture-in-picture controls
 - Per-site permission management UI beyond the site menu's Forget action
 - Native settings dialogs for the few settings that need them

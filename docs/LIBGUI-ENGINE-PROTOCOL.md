@@ -5,7 +5,7 @@ line-oriented JSON protocol over a Unix socket. Frame pixels never travel over
 the socket: the engine publishes a POSIX shared-memory ring per tab and the
 frontend maps it.
 
-Version: 16. `Shared/EngineProtocol.h` is authoritative.
+Version: 17. `Shared/EngineProtocol.h` is authoritative.
 
 ## Frontend → engine
 
@@ -46,6 +46,15 @@ Version: 16. `Shared/EngineProtocol.h` is authoritative.
 | `drag` | `tab`, `drag_type`, `x`, `y`, `ctrl`, `shift`, `alt`, `super`, `text`, `urls` | Forward a desktop drag to the page. `drag_type` is `start`, `move`, `end`, or `drop`; coordinates are logical. `urls` carries `text/uri-list` entries; `file://` entries become drag-and-drop files. |
 | `set_user_agent` | `value` | Replace the User-Agent that every page and worker reports. An empty value restores the default. The engine answers with `user_agent_changed`. |
 | `set_navigator_compatibility_mode` | `value` | Select `chrome`, `gecko`, or `webkit` for `navigator.appVersion`, `platform`, `vendor`, and `productSub` in every page and worker. The engine answers with `navigator_compatibility_mode_changed`. |
+| `request_processes` | | Ask for the process manager snapshot; the engine answers with `processes`. |
+| `end_process` | `child` | Ask the process manager to end a child process. The engine answers with `processes` or `process_error`. |
+| `crash_report_open` | optional `name` | Open a saved crash report for review. With no name, the newest pending report opens. The engine answers with `crash_report_ready` or `crash_report_failed`. |
+| `crash_report_next` | | Open the next pending crash report. |
+| `crash_report_text` | | Ask for the open crash report's text; the engine answers with `crash_report_text`. |
+| `crash_report_send` | `description`, `include_website`, `url` | Submit the open crash report and stream progress/retry/sent/failed events. |
+| `crash_report_cancel` | | Cancel an in-flight crash-report submission. |
+| `crash_report_close` | | Drop the open crash report. |
+| `crash_report_dismiss` | | Mark all pending crash reports seen and close the review. |
 | `certificate_info` | `tab` | Ask for the TLS certificate of the tab's current HTTPS page; the engine answers with `certificate_info`. |
 | `history_recent` | `limit` | Ask for the most recent history entries; the engine answers with `history_recent`. |
 | `history_search` | `query`, `limit` | Search titles and URLs; the engine answers with `history_search_results`. |
@@ -78,6 +87,17 @@ Version: 16. `Shared/EngineProtocol.h` is authoritative.
 | `user_agent_changed` | `value` | The application User-Agent changed. |
 | `navigator_compatibility_modes` | `current`, `modes` | The current navigator compatibility mode and the available modes. Each mode is `{name, value}`. Sent after `user_agents`. |
 | `navigator_compatibility_mode_changed` | `value` | The navigator compatibility mode changed. |
+| `crash_report_available` | `name` | A saved crash report is waiting for review. |
+| `crash_report_ready` | `name`, `fields`, `has_next` | The open crash report's summary. Each field is `{label, value, code}`. |
+| `crash_report_text` | `text` | The full text of the open crash report. |
+| `crash_report_progress` | `stage` | Crash-report submission stage. |
+| `crash_report_retry` | `reason`, `retry`, `maximum`, `delay` | A transient crash-report submission failure; the engine retries. |
+| `crash_report_sent` | | The crash report was accepted. |
+| `crash_report_failed` | `failure`, `reason` | The crash report could not be opened or sent. |
+| `crash_report_cancelled` | | The crash-report submission was cancelled. |
+| `crash_report_dismissed` | | All pending crash reports were marked seen. |
+| `processes` | `items`, `total_cpu`, `total_memory` | Process manager snapshot. Each item has `child`, `pid`, `type`, optional `title`/`site`/`page`, `cpu`, `memory`, `tabs`, and `frames`. |
+| `process_error` | `message` | Ending a process failed. |
 | `session_plan` | `windows` | Native startup-recovery plan. Each window has `window`, `active`, optional geometry, and `tabs`; each tab has `session_tab`, `url`, and `pinned`. Sent once after `hello`. An empty list means open the default window. |
 | `session_window` | `window`, `session_window` | The engine assigned a native session-window ID to a frontend window. The frontend stores it for geometry and close reporting. |
 | `session_tab_registered` | `request`, `window`, `session_tab` | The native session store assigned an ID to a lazily restored tab. |

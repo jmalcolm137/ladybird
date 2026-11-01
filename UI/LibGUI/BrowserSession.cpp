@@ -659,6 +659,21 @@ void BrowserSession::on_engine_event(JsonObject const& event)
         return;
     }
 
+    if (type == "crash_report_available"sv) {
+        if (auto* window = active_window())
+            window->handle_engine_global_event(event);
+        return;
+    }
+
+    if (type == "crash_report_ready"sv || type == "crash_report_text"sv || type == "crash_report_progress"sv
+        || type == "crash_report_retry"sv || type == "crash_report_sent"sv || type == "crash_report_failed"sv
+        || type == "crash_report_cancelled"sv || type == "crash_report_dismissed"sv
+        || type == "processes"sv || type == "process_error"sv) {
+        for (auto& window : m_windows)
+            window->handle_engine_global_event(event);
+        return;
+    }
+
     if (type == "history_recent"sv || type == "history_search_results"sv || type == "bookmarks"sv || type == "downloads"sv || type == "download_added"sv || type == "download_updated"sv || type == "download_removed"sv) {
         for (auto& window : m_windows)
             window->handle_engine_global_event(event);

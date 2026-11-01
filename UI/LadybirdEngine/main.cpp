@@ -12,10 +12,14 @@
 #include <LibCore/Socket.h>
 #include <LibGfx/SystemTheme.h>
 #include <LibWebCommon/WebView/Utilities.h>
+#include <LibWebView/CrashReportStore.h>
 #include <signal.h>
 
 ErrorOr<int> ladybird_main(Main::Arguments arguments)
 {
+    if (auto result = WebView::CrashReportStore::the().initialize_browser_crash_handler(); result.is_error())
+        warnln("Could not prepare Browser crash reporting: {}", result.error());
+
     auto app = TRY(LadybirdSDE::EngineApplication::create(arguments));
 
     if (app->engine_socket_path().is_empty()) {

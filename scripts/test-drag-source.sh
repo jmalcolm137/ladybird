@@ -36,7 +36,7 @@ EOF
 export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
 export SDE_STATE_DIR="$RUNTIME"
 export SDE_SESSION_DIR="$RUNTIME/session"
-mkdir -p "$SDE_SESSION_DIR/portal"
+mkdir -p "$SDE_SESSION_DIR/portal" "$RUNTIME/data" "$RUNTIME/config"
 SOCK="ladybird-drag-test-$$"
 
 cleanup() {
@@ -63,6 +63,8 @@ COMP_PID=$!
 for _ in $(seq 1 100); do [[ -e "$XDG_RUNTIME_DIR/$SOCK" ]] && break; sleep 0.1; done
 
 env -u LD_LIBRARY_PATH WAYLAND_DISPLAY="$SOCK" \
+    XDG_DATA_HOME="$RUNTIME/data" \
+    XDG_CONFIG_HOME="$RUNTIME/config" \
     SERENITY_RES_ROOT="$SERENITY/Base/res" \
     SDE_APP_BIN_DIR="$LAGOM/bin" \
     LADYBIRD_SOURCE_DIR="$ROOT" \

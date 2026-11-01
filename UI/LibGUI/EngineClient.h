@@ -85,6 +85,15 @@ public:
     void set_clipboard_items(JsonArray items);
     void set_user_agent(String const& user_agent);
     void set_navigator_compatibility_mode(String const& mode);
+    void request_processes();
+    void end_process(u64 child_id);
+    void crash_report_open(String const& name = {});
+    void crash_report_next();
+    void crash_report_text();
+    void crash_report_send(String const& description, bool include_website, String const& url);
+    void crash_report_cancel();
+    void crash_report_close();
+    void crash_report_dismiss();
     void toggle_devtools();
     void open_devtools_client();
     void select_all(u64 tab_id);

@@ -55,6 +55,12 @@ void EngineApplication::open_download(WebView::FileDownloader::Download const& d
     open_with_system(download.destination.string());
 }
 
+void EngineApplication::display_crash_report_notification(ByteString const& report_name)
+{
+    if (m_crash_report_handler)
+        m_crash_report_handler(report_name);
+}
+
 void EngineApplication::show_download_in_folder(WebView::FileDownloader::Download const& download) const
 {
     open_with_system(LexicalPath::dirname(download.destination.string()));

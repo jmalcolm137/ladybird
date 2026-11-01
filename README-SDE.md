@@ -151,8 +151,9 @@ scripts/test-browser-features.sh
 
 It runs the engine-side User-Agent/navigator-mode/inline-completion/drag
 protocol tests, the native spoofing dialogs, the address-bar inline-completion
-behaviour, the native drag source, and an end-to-end compatibility-report
-submission against a local report service.
+behaviour, the native drag source, an end-to-end compatibility-report
+submission against a local report service, the crash-report notification and
+review flow, and the Process Manager.
 
 `scripts/test-install.sh` installs into a disposable prefix with no `sudo` and
 asserts the frontend, engine, resources, app file, icon, and desktop entry.

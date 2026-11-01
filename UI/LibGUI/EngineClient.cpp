@@ -702,6 +702,76 @@ void EngineClient::set_navigator_compatibility_mode(String const& mode)
     send(event);
 }
 
+void EngineClient::request_processes()
+{
+    JsonObject event;
+    event.set("type"sv, "request_processes"sv);
+    send(event);
+}
+
+void EngineClient::end_process(u64 child_id)
+{
+    JsonObject event;
+    event.set("type"sv, "end_process"sv);
+    event.set("child"sv, child_id);
+    send(event);
+}
+
+void EngineClient::crash_report_open(String const& name)
+{
+    JsonObject event;
+    event.set("type"sv, "crash_report_open"sv);
+    if (!name.is_empty())
+        event.set("name"sv, name.bytes_as_string_view());
+    send(event);
+}
+
+void EngineClient::crash_report_next()
+{
+    JsonObject event;
+    event.set("type"sv, "crash_report_next"sv);
+    send(event);
+}
+
+void EngineClient::crash_report_text()
+{
+    JsonObject event;
+    event.set("type"sv, "crash_report_text"sv);
+    send(event);
+}
+
+void EngineClient::crash_report_send(String const& description, bool include_website, String const& url)
+{
+    JsonObject event;
+    event.set("type"sv, "crash_report_send"sv);
+    event.set("description"sv, description.bytes_as_string_view());
+    event.set("include_website"sv, include_website);
+    if (include_website)
+        event.set("url"sv, url.bytes_as_string_view());
+    send(event);
+}
+
+void EngineClient::crash_report_cancel()
+{
+    JsonObject event;
+    event.set("type"sv, "crash_report_cancel"sv);
+    send(event);
+}
+
+void EngineClient::crash_report_close()
+{
+    JsonObject event;
+    event.set("type"sv, "crash_report_close"sv);
+    send(event);
+}
+
+void EngineClient::crash_report_dismiss()
+{
+    JsonObject event;
+    event.set("type"sv, "crash_report_dismiss"sv);
+    send(event);
+}
+
 void EngineClient::toggle_devtools()
 {
     JsonObject event;

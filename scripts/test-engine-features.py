@@ -37,11 +37,24 @@ console.log("NAV vendor=" + navigator.vendor + " appVersion=" + navigator.appVer
 PAGE = b"""<!doctype html><html><body>engine feature test</body></html>"""
 
 requests = []
+submissions = []
 
 
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, *args):
         pass
+
+    def do_POST(self):
+        length = int(self.headers.get("Content-Length", 0))
+        self.rfile.read(length)
+        submissions.append(self.path)
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.end_headers()
+        if self.path == "/api/v1/challenges":
+            self.wfile.write(b'{"algorithm":"sha256-seed-nonce-le-v1","token":"test-token","expected_work":1}')
+        else:
+            self.wfile.write(b'{"receipt":"test-receipt"}')
 
     def do_GET(self):
         requests.append((self.path, dict(self.headers.items())))
@@ -125,8 +138,29 @@ def main():
     env["XDG_CONFIG_HOME"] = os.path.join(tmp, "config")
     env["XDG_CACHE_HOME"] = os.path.join(tmp, "cache")
     env["XDG_DATA_HOME"] = os.path.join(tmp, "data")
+    env["LADYBIRD_REPORTS_ENDPOINT"] = f"http://127.0.0.1:{port}"
     for key in ("LD_LIBRARY_PATH", "WAYLAND_DISPLAY", "DISPLAY"):
         env.pop(key, None)
+
+    crash_report_dir = os.path.join(tmp, "data", "Ladybird", "CrashReports")
+    os.makedirs(crash_report_dir)
+    crash_report_name = "2026-11-01T00-00-00Z-WebContent-abc123.txt"
+    crash_report_text = """Ladybird crash report, format 1
+Process: WebContent
+Crashed at: 2026-11-01T00:00:00Z
+Version: 1.0
+Platform: Linux
+Architecture: x86_64
+Git commit: 5ebbe272
+Verification failed: value != 0 at Services/WebContent/Foo.cpp:123
+Termination signal: SIGTRAP
+Termination signal number: 5
+
+Native stack (binary build ID, object address):
+#0 abcdef 0x1234 Web::Page::crash()
+"""
+    with open(os.path.join(crash_report_dir, crash_report_name), "w") as report:
+        report.write(crash_report_text)
 
     engine_log_path = os.path.join(tmp, "engine.log")
     engine_log = open(engine_log_path, "wb")
@@ -143,13 +177,28 @@ def main():
         client = Client(stream)
 
         hello = client.wait_for("hello")
-        assert hello.get("protocol") == 16, hello
+        assert hello.get("protocol") == 17, hello
         user_agents = client.wait_for("user_agents")
         default_user_agent = next(agent["value"] for agent in user_agents["agents"] if agent["name"] == "Default")
         modes = client.wait_for("navigator_compatibility_modes")
         assert modes.get("current") == "chrome", modes
         assert [m["value"] for m in modes.get("modes", [])] == ["chrome", "gecko", "webkit"], modes
-        print("ok: protocol 16 and spoofing choices")
+        print("ok: protocol 17 and spoofing choices")
+
+        crash = client.wait_for("crash_report_available")
+        assert crash.get("name") == crash_report_name, crash
+        client.send({"type": "crash_report_open", "name": crash_report_name})
+        ready = client.wait_for("crash_report_ready")
+        assert ready.get("name") == crash_report_name, ready
+        assert any(field.get("label") == "Verification failed" for field in ready.get("fields", [])), ready
+        client.send({"type": "crash_report_text"})
+        text = client.wait_for("crash_report_text")
+        assert "Verification failed" in text.get("text", ""), text
+        client.send({"type": "crash_report_send", "description": "engine feature test", "include_website": False})
+        sent = client.wait_for("crash_report_sent", timeout=30)
+        assert sent.get("type") == "crash_report_sent", sent
+        assert "/api/v1/challenges" in submissions and "/api/v1/reports" in submissions, submissions
+        print("ok: crash report review and submission")
 
         client.send({"type": "set_user_agent", "value": "EngineFeatureTest/1.0"})
         changed = client.wait_for("user_agent_changed")
@@ -158,6 +207,12 @@ def main():
         time.sleep(1)
         assert any(path == "/ua" and headers.get("User-Agent") == "EngineFeatureTest/1.0" for path, headers in requests)
         print("ok: User-Agent override")
+
+        client.send({"type": "request_processes"})
+        processes = client.wait_for("processes")
+        types = {item.get("type") for item in processes.get("items", [])}
+        assert "Browser" in types and "WebContent" in types, types
+        print("ok: process manager data")
 
         client.send({"type": "set_user_agent", "value": default_user_agent})
         client.wait_for("user_agent_changed")

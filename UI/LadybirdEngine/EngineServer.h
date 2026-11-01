@@ -9,6 +9,7 @@
 #include <AK/ByteBuffer.h>
 #include <AK/ByteString.h>
 #include <AK/Function.h>
+#include <AK/HashTable.h>
 #include <AK/HashMap.h>
 #include <AK/JsonObject.h>
 #include <AK/NonnullOwnPtr.h>
@@ -32,6 +33,7 @@
 #include <LibWebView/Autocomplete.h>
 #include <LibWebView/FileDownloader.h>
 #include <LibWebView/Forward.h>
+#include <LibWebView/CrashReportReview.h>
 #include <LibWebView/HeadlessWebView.h>
 #include <LibWebView/Menu.h>
 #include <LibWebView/SessionStore.h>
@@ -163,6 +165,14 @@ private:
     void handle_clipboard_changed(JsonObject const&);
     void handle_set_user_agent(JsonObject const&);
     void handle_set_navigator_compatibility_mode(JsonObject const&);
+    void handle_crash_report_open(JsonObject const&);
+    void handle_crash_report_next();
+    void handle_crash_report_text();
+    void handle_crash_report_send(JsonObject const&);
+    void handle_crash_report_cancel();
+    void handle_crash_report_close();
+    void handle_crash_report_dismiss();
+    void handle_end_process(JsonObject const&);
     void handle_toggle_devtools();
     void handle_open_devtools_client();
     void handle_select_all(u64 tab_id);
@@ -243,6 +253,11 @@ private:
     void send_context_menu(Tab&, StringView kind, Gfx::IntPoint, WebView::Menu&);
     void send_permission_request(Tab&, WebView::PermissionPromptRequest const&, u64 request_id);
     void send_drag_start(u64 tab_id, Web::DragData);
+    void send_crash_report_available(ByteString const& report_name);
+    void send_crash_report_ready(WebView::CrashReportReview::Report const&);
+    void send_crash_report_failure(StringView failure, String const& reason);
+    void check_crash_reports();
+    void send_processes();
     void send_file_picker_request(Tab&, Web::HTML::FileFilter const&, Web::HTML::AllowMultipleFiles);
     void send_select_dropdown(Tab&, Gfx::IntPoint, i32 minimum_width, Vector<Web::HTML::SelectItem> const&);
     void send_downloads();
@@ -264,6 +279,8 @@ private:
     RefPtr<Core::Timer> m_resolver_watch_timer;
     Vector<ResolverFileState> m_resolver_files;
     HashMap<u64, NonnullOwnPtr<Tab>> m_tabs;
+    OwnPtr<WebView::CrashReportReview> m_crash_report;
+    HashTable<String> m_offered_crash_reports;
     u64 m_next_tab_id { 1 };
     u64 m_active_tab_id { 0 };
     u64 m_focused_tab_id { 0 };

@@ -20,6 +20,7 @@
 #include <LibGUI/Application.h>
 #include <LibGUI/BoxLayout.h>
 #include <LibGUI/Button.h>
+#include <LibGUI/CheckBox.h>
 #include <LibGUI/Label.h>
 #include <LibGUI/Clipboard.h>
 #include <LibGUI/ComboBox.h>
@@ -31,6 +32,7 @@
 #include <LibGUI/Menu.h>
 #include <LibGUI/MessageBox.h>
 #include <LibGUI/TableView.h>
+#include <LibGUI/TextEditor.h>
 #include <LibGUI/TextBox.h>
 #include <LibGUI/Widget.h>
 #include <LibGfx/Bitmap.h>
@@ -43,6 +45,17 @@ static RefPtr<Gfx::Bitmap const> load_icon(StringView path)
     if (bitmap.is_error())
         return nullptr;
     return bitmap.release_value();
+}
+
+static String format_memory(u64 bytes)
+{
+    if (bytes >= 1ull << 30)
+        return String::formatted("{:.1f} GiB", static_cast<double>(bytes) / static_cast<double>(1ull << 30)).release_value();
+    if (bytes >= 1ull << 20)
+        return String::formatted("{:.1f} MiB", static_cast<double>(bytes) / static_cast<double>(1ull << 20)).release_value();
+    if (bytes >= 1ull << 10)
+        return String::formatted("{:.1f} KiB", static_cast<double>(bytes) / static_cast<double>(1ull << 10)).release_value();
+    return String::formatted("{} B", bytes).release_value();
 }
 
 static BookmarkEntry bookmark_entry_from_json(JsonObject const& object)
@@ -379,6 +392,16 @@ void BrowserWindow::create_actions()
     }, m_window.ptr());
     m_navigator_compatibility_action->set_status_tip("Choose what the navigator object reports"_string);
 
+    m_crash_reports_action = GUI::Action::create("Crash &Reports…"sv, [this](auto&) {
+        m_engine->crash_report_open();
+    }, m_window.ptr());
+    m_crash_reports_action->set_status_tip("Review crash reports from Ladybird's processes"_string);
+
+    m_process_manager_action = GUI::Action::create("&Process Manager"sv, [this](auto&) {
+        show_process_manager();
+    }, m_window.ptr());
+    m_process_manager_action->set_status_tip("Show Ladybird's processes and their CPU and memory use"_string);
+
     m_back_action->set_enabled(false);
     m_forward_action->set_enabled(false);
 }
@@ -477,6 +500,7 @@ void BrowserWindow::create_menus()
     tools_menu.add_separator();
     tools_menu.add_action(*m_user_agent_action);
     tools_menu.add_action(*m_navigator_compatibility_action);
+    tools_menu.add_action(*m_process_manager_action);
 
     m_report_website_issue_action = GUI::Action::create("Report Website &Issue…"sv, [this](auto&) {
         if (auto* tab = active_tab(); tab && tab->is_attached())
@@ -485,6 +509,7 @@ void BrowserWindow::create_menus()
     m_report_website_issue_action->set_enabled(false);
 
     auto& help_menu = *m_window->add_menu("&Help"_string);
+    help_menu.add_action(*m_crash_reports_action);
     help_menu.add_action(*m_report_website_issue_action);
     help_menu.add_action(GUI::CommonActions::make_about_action("Ladybird"_string, GUI::Icon::default_icon("app-browser"sv), m_window.ptr()));
 }
@@ -876,6 +901,84 @@ void BrowserWindow::adopt_engine_tab(u64 tab_id, u64 request_id)
 void BrowserWindow::handle_engine_global_event(JsonObject const& event)
 {
     auto type = string_for_key(event, "type"sv);
+
+    if (type == "crash_report_available"sv) {
+        auto name = String::from_byte_string(string_for_key(event, "name"sv)).release_value();
+        if (!name.is_empty())
+            show_crash_report_notification(name);
+        return;
+    }
+
+    if (type == "crash_report_ready"sv) {
+        show_crash_report(event);
+        return;
+    }
+
+    if (type == "crash_report_text"sv) {
+        show_crash_report_text(String::from_byte_string(string_for_key(event, "text"sv)).release_value());
+        return;
+    }
+
+    if (type == "crash_report_progress"sv) {
+        if (m_crash_report_status)
+            m_crash_report_status->set_text(String::formatted("{}…", string_for_key(event, "stage"sv)).release_value());
+        if (m_crash_report_send_button)
+            m_crash_report_send_button->set_enabled(false);
+        return;
+    }
+
+    if (type == "crash_report_retry"sv) {
+        if (m_crash_report_status) {
+            auto reason = String::from_byte_string(string_for_key(event, "reason"sv)).release_value();
+            m_crash_report_status->set_text(String::formatted("{} Retrying in {}s ({}/{}).", reason, event.get_u64("delay"sv).value_or(0), event.get_u64("retry"sv).value_or(0), event.get_u64("maximum"sv).value_or(0)).release_value());
+        }
+        return;
+    }
+
+    if (type == "crash_report_sent"sv) {
+        if (m_crash_report_status)
+            m_crash_report_status->set_text("Crash report sent. Thank you."_string);
+        if (m_crash_report_send_button)
+            m_crash_report_send_button->set_enabled(false);
+        return;
+    }
+
+    if (type == "crash_report_failed"sv) {
+        if (m_crash_report_status) {
+            auto reason = String::from_byte_string(string_for_key(event, "reason"sv)).release_value();
+            m_crash_report_status->set_text(String::formatted("Could not send the report: {}", reason).release_value());
+        }
+        if (m_crash_report_send_button)
+            m_crash_report_send_button->set_enabled(true);
+        return;
+    }
+
+    if (type == "crash_report_cancelled"sv) {
+        if (m_crash_report_status)
+            m_crash_report_status->set_text("Sending cancelled."_string);
+        if (m_crash_report_send_button)
+            m_crash_report_send_button->set_enabled(true);
+        return;
+    }
+
+    if (type == "crash_report_dismissed"sv) {
+        if (m_crash_prompt_window)
+            m_crash_prompt_window->hide();
+        if (m_crash_report_window)
+            m_crash_report_window->hide();
+        return;
+    }
+
+    if (type == "processes"sv) {
+        update_processes(event);
+        return;
+    }
+
+    if (type == "process_error"sv) {
+        if (m_process_status)
+            m_process_status->set_text(String::from_byte_string(string_for_key(event, "message"sv)).release_value());
+        return;
+    }
 
     if (type == "downloads"sv) {
         Vector<DownloadEntry> downloads;
@@ -1414,6 +1517,339 @@ void BrowserWindow::show_navigator_compatibility_dialog()
     apply_button.set_enabled(!names.is_empty());
 
     dialog->exec();
+}
+
+void BrowserWindow::show_crash_report_notification(String const& report_name)
+{
+    m_crash_prompt_name = report_name;
+
+    if (!m_crash_prompt_window) {
+        m_crash_prompt_window = GUI::Window::construct();
+        m_crash_prompt_window->set_title("Crash Report"sv);
+        m_crash_prompt_window->resize(480, 160);
+
+        auto main_widget = m_crash_prompt_window->set_main_widget<GUI::Widget>();
+        main_widget->set_fill_with_background_color(true);
+        main_widget->set_layout<GUI::VerticalBoxLayout>(GUI::Margins { 12 }, 8);
+
+        m_crash_prompt_label = main_widget->add<GUI::Label>("Part of Ladybird stopped unexpectedly. You can send us a crash report to help fix it."_string);
+        m_crash_prompt_label->set_text_wrapping(Gfx::TextWrapping::Wrap);
+
+        auto& buttons = main_widget->add<GUI::Widget>();
+        buttons.set_layout<GUI::HorizontalBoxLayout>();
+        buttons.set_fixed_height(26);
+        auto& spacer = buttons.add<GUI::Widget>();
+        spacer.set_preferred_width(GUI::SpecialDimension::Grow);
+
+        auto& dismiss_button = buttons.add<GUI::Button>("Dismiss"_string);
+        dismiss_button.set_fixed_width(80);
+        dismiss_button.on_click = [this](auto) {
+            if (m_crash_prompt_window)
+                m_crash_prompt_window->hide();
+            m_engine->crash_report_dismiss();
+        };
+
+        auto& review_button = buttons.add<GUI::Button>("Review Report"_string);
+        review_button.set_fixed_width(120);
+        review_button.on_click = [this](auto) {
+            if (m_crash_prompt_window)
+                m_crash_prompt_window->hide();
+            if (!m_crash_prompt_name.is_empty())
+                m_engine->crash_report_open(m_crash_prompt_name);
+        };
+
+        m_crash_prompt_window->on_close = [this] {
+            if (m_crash_prompt_window)
+                m_crash_prompt_window->hide();
+            m_engine->crash_report_dismiss();
+        };
+    }
+
+    m_crash_prompt_label->set_text(String::formatted("Part of Ladybird stopped unexpectedly (report {}). You can send us a crash report to help fix it.", report_name).release_value());
+    m_crash_prompt_window->show();
+    m_crash_prompt_window->move_to_front();
+}
+
+void BrowserWindow::show_crash_report(JsonObject const& event)
+{
+    if (!m_crash_report_window) {
+        m_crash_report_window = GUI::Window::construct();
+        m_crash_report_window->set_title("Crash Report"sv);
+        m_crash_report_window->resize(760, 540);
+        m_crash_report_window->on_close = [this] {
+            if (m_crash_report_window)
+                m_crash_report_window->hide();
+            m_engine->crash_report_close();
+        };
+
+        auto main_widget = m_crash_report_window->set_main_widget<GUI::Widget>();
+        main_widget->set_fill_with_background_color(true);
+        main_widget->set_layout<GUI::VerticalBoxLayout>(GUI::Margins { 10 }, 6);
+
+        m_crash_report_title = main_widget->add<GUI::Label>("Part of Ladybird stopped unexpectedly"_string);
+        m_crash_report_title->set_text_wrapping(Gfx::TextWrapping::Wrap);
+
+        m_crash_report_fields = main_widget->add<GUI::Widget>();
+        m_crash_report_fields->set_layout<GUI::VerticalBoxLayout>(GUI::Margins { 0 }, 1);
+
+        auto& description_label = main_widget->add<GUI::Label>("What were you doing when it stopped?"_string);
+        description_label.set_text_wrapping(Gfx::TextWrapping::Wrap);
+
+        m_crash_report_description = main_widget->add<GUI::TextEditor>();
+        m_crash_report_description->set_mode(GUI::TextEditor::Editable);
+        m_crash_report_description->set_wrapping_mode(GUI::TextEditor::WrapAtWords);
+        m_crash_report_description->set_fixed_height(84);
+        m_crash_report_description->set_placeholder("Describe what happened, if you can."_string);
+
+        auto& website_row = main_widget->add<GUI::Widget>();
+        website_row.set_layout<GUI::HorizontalBoxLayout>();
+        website_row.set_fixed_height(26);
+        m_crash_report_include_website = website_row.add<GUI::CheckBox>("Include website"_string);
+        m_crash_report_include_website->set_fixed_width(140);
+        m_crash_report_website = website_row.add<GUI::TextBox>();
+        m_crash_report_website->set_preferred_width(GUI::SpecialDimension::Grow);
+        m_crash_report_website->set_enabled(false);
+        m_crash_report_include_website->on_checked = [this](bool checked) {
+            if (m_crash_report_website)
+                m_crash_report_website->set_enabled(checked);
+        };
+
+        m_crash_report_status = main_widget->add<GUI::Label>("Review the report, add a description, then send."_string);
+        m_crash_report_status->set_text_wrapping(Gfx::TextWrapping::Wrap);
+
+        auto& buttons = main_widget->add<GUI::Widget>();
+        buttons.set_layout<GUI::HorizontalBoxLayout>();
+        buttons.set_fixed_height(26);
+
+        auto& show_button = buttons.add<GUI::Button>("Show Report…"_string);
+        show_button.set_fixed_width(110);
+        show_button.on_click = [this](auto) {
+            m_engine->crash_report_text();
+        };
+
+        m_crash_report_next_button = buttons.add<GUI::Button>("Next Report"_string);
+        m_crash_report_next_button->set_fixed_width(100);
+        m_crash_report_next_button->on_click = [this](auto) {
+            m_engine->crash_report_next();
+        };
+        m_crash_report_next_button->set_visible(false);
+
+        auto& spacer = buttons.add<GUI::Widget>();
+        spacer.set_preferred_width(GUI::SpecialDimension::Grow);
+
+        auto& close_button = buttons.add<GUI::Button>("Close"_string);
+        close_button.set_fixed_width(80);
+        close_button.on_click = [this](auto) {
+            if (m_crash_report_window)
+                m_crash_report_window->hide();
+            m_engine->crash_report_close();
+        };
+
+        m_crash_report_send_button = buttons.add<GUI::Button>("Send Report"_string);
+        m_crash_report_send_button->set_fixed_width(110);
+        m_crash_report_send_button->on_click = [this](auto) {
+            auto description = String::from_byte_string(m_crash_report_description->text()).release_value();
+            auto url = String::from_byte_string(m_crash_report_website->text()).release_value();
+            m_engine->crash_report_send(description, m_crash_report_include_website->is_checked(), url);
+            if (m_crash_report_status)
+                m_crash_report_status->set_text("Sending crash report…"_string);
+            if (m_crash_report_send_button)
+                m_crash_report_send_button->set_enabled(false);
+        };
+    }
+
+    auto name = String::from_byte_string(string_for_key(event, "name"sv)).release_value();
+    m_crash_report_name = name;
+    if (m_crash_report_title)
+        m_crash_report_title->set_text(String::formatted("Part of Ladybird stopped unexpectedly (report {}).", name).release_value());
+
+    if (m_crash_report_fields) {
+        m_crash_report_fields->remove_all_children();
+        if (auto fields = event.get_array("fields"sv); fields.has_value()) {
+            for (auto const& value : fields->values()) {
+                if (!value.is_object())
+                    continue;
+                auto const& field = value.as_object();
+                auto label = String::from_byte_string(field.get_byte_string("label"sv).value_or({})).release_value();
+                auto detail = String::from_byte_string(field.get_byte_string("value"sv).value_or({})).release_value();
+                auto& text = m_crash_report_fields->add<GUI::Label>(String::formatted("{}: {}", label, detail).release_value());
+                text.set_text_wrapping(Gfx::TextWrapping::Wrap);
+                text.set_text_alignment(Gfx::TextAlignment::CenterLeft);
+                text.set_fixed_height(18);
+            }
+        }
+        m_crash_report_fields->invalidate_layout();
+    }
+
+    if (m_crash_report_description)
+        m_crash_report_description->set_text({});
+    if (m_crash_report_include_website)
+        m_crash_report_include_website->set_checked(false);
+    if (m_crash_report_website) {
+        auto url = active_tab() ? active_tab()->current_url() : String {};
+        m_crash_report_website->set_text(url.bytes_as_string_view());
+        m_crash_report_website->set_enabled(false);
+    }
+    if (m_crash_report_status)
+        m_crash_report_status->set_text("Review the report, add a description, then send."_string);
+    if (m_crash_report_send_button)
+        m_crash_report_send_button->set_enabled(true);
+    if (m_crash_report_next_button)
+        m_crash_report_next_button->set_visible(event.get_bool("has_next"sv).value_or(false));
+
+    m_crash_report_window->show();
+    m_crash_report_window->move_to_front();
+}
+
+void BrowserWindow::show_crash_report_text(String const& text)
+{
+    if (!m_crash_report_text_window) {
+        m_crash_report_text_window = GUI::Window::construct();
+        m_crash_report_text_window->set_title("Crash Report"sv);
+        m_crash_report_text_window->resize(780, 520);
+        m_crash_report_text_window->on_close = [this] {
+            if (m_crash_report_text_window)
+                m_crash_report_text_window->hide();
+        };
+
+        auto main_widget = m_crash_report_text_window->set_main_widget<GUI::Widget>();
+        main_widget->set_fill_with_background_color(true);
+        main_widget->set_layout<GUI::VerticalBoxLayout>(GUI::Margins { 6 }, 6);
+        m_crash_report_text = main_widget->add<GUI::TextEditor>();
+        m_crash_report_text->set_mode(GUI::TextEditor::ReadOnly);
+        m_crash_report_text->set_wrapping_mode(GUI::TextEditor::NoWrap);
+    }
+
+    m_crash_report_text->set_text(text.bytes_as_string_view());
+    m_crash_report_text_window->show();
+    m_crash_report_text_window->move_to_front();
+}
+
+void BrowserWindow::show_process_manager()
+{
+    if (!m_process_window) {
+        m_process_window = GUI::Window::construct();
+        m_process_window->set_title("Process Manager"sv);
+        m_process_window->resize(860, 480);
+        m_process_window->on_close = [this] {
+            if (m_process_timer)
+                m_process_timer->stop();
+            if (m_process_window)
+                m_process_window->hide();
+        };
+
+        auto main_widget = m_process_window->set_main_widget<GUI::Widget>();
+        main_widget->set_fill_with_background_color(true);
+        main_widget->set_layout<GUI::VerticalBoxLayout>(GUI::Margins { 8 }, 6);
+
+        Vector<GUI::JsonArrayModel::FieldSpec> fields;
+        fields.append({ "name"sv, "Process"_string, Gfx::TextAlignment::CenterLeft });
+        fields.append({ "pid"sv, "PID"_string, Gfx::TextAlignment::CenterRight });
+        fields.append({ "cpu"sv, "CPU"_string, Gfx::TextAlignment::CenterRight });
+        fields.append({ "memory"sv, "Memory"_string, Gfx::TextAlignment::CenterRight });
+        fields.append({ "page"sv, "Page"_string, Gfx::TextAlignment::CenterLeft });
+        m_process_model = GUI::JsonArrayModel::create_from_source([this]() -> ErrorOr<JsonArray> {
+            return m_process_rows;
+        },
+            move(fields));
+
+        m_process_table = main_widget->add<GUI::TableView>();
+        m_process_table->set_model(m_process_model);
+        m_process_table->set_column_width(0, 260);
+        m_process_table->set_column_width(1, 80);
+        m_process_table->set_column_width(2, 80);
+        m_process_table->set_column_width(3, 100);
+        m_process_table->set_column_width(4, 300);
+
+        auto& buttons = main_widget->add<GUI::Widget>();
+        buttons.set_layout<GUI::HorizontalBoxLayout>();
+        buttons.set_fixed_height(26);
+
+        auto& refresh_button = buttons.add<GUI::Button>("Refresh"_string);
+        refresh_button.set_fixed_width(80);
+        refresh_button.on_click = [this](auto) {
+            m_engine->request_processes();
+        };
+
+        auto& end_button = buttons.add<GUI::Button>("End Process"_string);
+        end_button.set_fixed_width(100);
+        end_button.on_click = [this](auto) {
+            auto selection = m_process_table->selection().first();
+            if (!selection.is_valid() || selection.row() < 0 || selection.row() >= static_cast<int>(m_process_rows.size()))
+                return;
+            auto const& row = m_process_rows.at(selection.row());
+            if (!row.is_object())
+                return;
+            if (row.as_object().get_byte_string("type"sv).value_or({}) == "Browser"sv) {
+                if (m_process_status)
+                    m_process_status->set_text("The browser process cannot be ended from here."_string);
+                return;
+            }
+            if (auto child = row.as_object().get_u64("child"sv); child.has_value())
+                m_engine->end_process(*child);
+        };
+
+        m_process_status = buttons.add<GUI::Label>(""_string);
+        m_process_status->set_preferred_width(GUI::SpecialDimension::Grow);
+
+        m_process_timer = Core::Timer::create_repeating(1000, [this] {
+            m_engine->request_processes();
+        });
+        m_process_timer->start();
+    }
+
+    if (m_process_timer)
+        m_process_timer->start();
+    m_engine->request_processes();
+    m_process_window->show();
+    m_process_window->move_to_front();
+}
+
+void BrowserWindow::update_processes(JsonObject const& event)
+{
+    JsonArray rows;
+    if (auto items = event.get_array("items"sv); items.has_value()) {
+        for (auto const& value : items->values()) {
+            if (!value.is_object())
+                continue;
+            auto const& object = value.as_object();
+            auto type = String::from_byte_string(object.get_byte_string("type"sv).value_or({})).release_value();
+            auto name = type;
+            if (auto title = object.get_byte_string("title"sv); title.has_value() && !title->is_empty()) {
+                if (type != "WebContent"sv)
+                    name = String::formatted("{} — {}", type, *title).release_value();
+            }
+
+            auto page = String::from_byte_string(object.get_byte_string("page"sv).value_or({})).release_value();
+            if (page.is_empty())
+                page = String::from_byte_string(object.get_byte_string("site"sv).value_or({})).release_value();
+
+            auto cpu = object.get_double_with_precision_loss("cpu"sv).value_or(0.0);
+            auto memory = object.get_u64("memory"sv).value_or(0);
+
+            auto cpu_text = String::formatted("{:.1f}%", cpu).release_value();
+            auto memory_text = format_memory(memory);
+            JsonObject row;
+            row.set("name"sv, name.bytes_as_string_view());
+            row.set("pid"sv, object.get_u64("pid"sv).value_or(0));
+            row.set("cpu"sv, cpu_text.bytes_as_string_view());
+            row.set("memory"sv, memory_text.bytes_as_string_view());
+            row.set("page"sv, page.bytes_as_string_view());
+            row.set("child"sv, object.get_u64("child"sv).value_or(0));
+            rows.must_append(move(row));
+        }
+    }
+
+    m_process_rows = move(rows);
+    if (m_process_model)
+        m_process_model->update();
+    if (Core::Environment::has("LADYBIRD_SDE_TEST_LOG_PROCESSES"sv))
+        warnln("process manager: {} processes", m_process_rows.size());
+    if (m_process_status) {
+        auto total_cpu = event.get_double_with_precision_loss("total_cpu"sv).value_or(0.0);
+        auto total_memory = event.get_u64("total_memory"sv).value_or(0);
+        m_process_status->set_text(String::formatted("{} processes · {:.1f}% CPU · {}", m_process_rows.size(), total_cpu, format_memory(total_memory)).release_value());
+    }
 }
 
 void BrowserWindow::show_tab_context_menu(BrowserTab& tab, Gfx::IntPoint screen_position)
