@@ -87,7 +87,9 @@ if [[ "$mapped" != 1 ]]; then
     tail -30 "$RUNTIME/chrome.log" >&2
     exit 1
 fi
-sleep 2
+# The title is set before layout finishes; the drag source needs the page's
+# hit-test, so leave the renderer time to lay out the document.
+sleep 3
 
 env WAYLAND_DISPLAY="$SOCK" "$VI" --extent 1280 720 \
     --move 400 320 --sleep 200 \

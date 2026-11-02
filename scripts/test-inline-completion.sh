@@ -64,7 +64,9 @@ for _ in $(seq 1 150); do
     grep -q 'toplevel mapped' "$RUNTIME/compositor.log" 2>/dev/null && break
     sleep 0.1
 done
-sleep 2
+# The window maps before the renderer has prepared the location bar and its
+# default bookmarks; give it the extra time so the clicks below are reliable.
+sleep 3
 
 # Click the location bar and clear its about:newtab text, then type "lady".
 env WAYLAND_DISPLAY="$SOCK" "$VI" --extent 1280 720 \

@@ -115,6 +115,16 @@ BrowserSession::~BrowserSession()
 {
     if (m_autosave_timer)
         m_autosave_timer->stop();
+
+    // Keep a durable reason for the process ending. Without this, a quit and a window that disappeared look the same
+    // in the session log; only a SIGKILL or a crash inside the crash handler leaves no line at all.
+    if (m_exit_reason.is_empty())
+        m_exit_reason = "unrecorded exit (the event loop ended)"sv;
+    size_t tab_count = 0;
+    for (auto const& window : m_windows)
+        tab_count += window->tab_urls().size();
+    warnln("Ladybird: exiting: {} ({} window(s), {} tab(s))", m_exit_reason, m_windows.size(), tab_count);
+
     save_session();
 
     // Destroying the engine client tears down the frame buffers, and that reports a cleared frame for every tab.
@@ -265,10 +275,17 @@ void BrowserSession::show()
 
 void BrowserSession::quit()
 {
+    note_exit_reason("quit action (File > Quit or Alt+F4)"sv);
     save_session();
     if (m_engine)
         m_engine->quit();
     GUI::Application::the()->quit(0);
+}
+
+void BrowserSession::note_exit_reason(ByteString reason)
+{
+    if (m_exit_reason.is_empty())
+        m_exit_reason = move(reason);
 }
 
 BrowserWindow* BrowserSession::create_window(Vector<String> urls, bool private_window)
@@ -726,6 +743,7 @@ void BrowserSession::window_will_close(BrowserWindow& window)
         save_session();
 
         if (m_windows.is_empty()) {
+            note_exit_reason("last window closed"sv);
             if (m_engine)
                 m_engine->quit();
             GUI::Application::the()->quit(0);

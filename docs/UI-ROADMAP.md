@@ -94,6 +94,13 @@ information" on local or browser pages).
 - **Process manager / performance monitor: Done.** Tools → Process Manager
   lists every Ladybird process with PID, CPU, memory, page, and tabs, refreshes
   once a second, and can end a process.
+- **Exit-reason log: Done.** Every orderly exit writes
+  `Ladybird: exiting: <reason> (N window(s), M tab(s))` to stderr — in the SDE
+  session that is `~/.local/state/sde/session.log`. The reason distinguishes
+  `received SIGTERM (15)`, `quit action (File > Quit or Alt+F4)`,
+  `last window closed`, and `event loop returned N`, so a window that disappears
+  is no longer indistinguishable from a crash. A missing line means the process
+  was killed with SIGKILL or died inside the crash handler.
 - Picture-in-picture controls
 - Per-site permission management UI beyond the site menu's Forget action
 - Native settings dialogs for the few settings that need them

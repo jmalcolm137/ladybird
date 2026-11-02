@@ -34,6 +34,10 @@ public:
     void show();
     void quit();
 
+    // Record why the process is ending. The first reason wins, and the destructor writes it to stderr, so a quit or
+    // signal leaves a trace in the session log instead of the window just disappearing. A SIGKILL cannot be logged.
+    void note_exit_reason(ByteString reason);
+
     BrowserWindow* create_window(Vector<String> urls = {}, bool private_window = false);
 
     // Tabs closed by the user, newest last. Private tabs are not retained.
@@ -133,6 +137,7 @@ private:
     String m_current_user_agent;
     Vector<NavigatorCompatibilityModeOption> m_navigator_compatibility_modes;
     String m_current_navigator_compatibility_mode;
+    ByteString m_exit_reason;
 };
 
 }

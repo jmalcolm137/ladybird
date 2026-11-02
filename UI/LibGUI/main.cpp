@@ -15,10 +15,16 @@ ErrorOr<int> serenity_main(Main::Arguments arguments)
 {
     auto app = TRY(GUI::Application::create(arguments));
 
+    LadybirdSDE::BrowserSession* session_pointer = nullptr;
+
     // A session logout or SIGTERM ends like File -> Quit: save the session before leaving instead of disappearing
-    // without writing geometry and the final task state.
+    // without writing geometry and the final task state. Record the signal so the session log says why it exited.
+    // The handler only runs once the event loop does, by which point the session exists.
     for (auto signal_number : { SIGINT, SIGTERM }) {
-        Core::EventLoop::register_signal(signal_number, [](int) {
+        Core::EventLoop::register_signal(signal_number, [&session_pointer](int signal_number) {
+            auto name = signal_number == SIGTERM ? "SIGTERM"sv : signal_number == SIGINT ? "SIGINT"sv : "signal"sv;
+            if (session_pointer)
+                session_pointer->note_exit_reason(ByteString::formatted("received {} ({})", name, signal_number));
             GUI::Application::the()->quit(0);
         });
     }
@@ -47,12 +53,17 @@ ErrorOr<int> serenity_main(Main::Arguments arguments)
         urls.append(String::from_utf8(argument).release_value());
     }
 
-    auto session = LadybirdSDE::BrowserSession::create(move(urls), private_window, devtools_port);
-    if (session.is_error()) {
-        warnln("Ladybird: {}", session.error());
+    auto created_session = LadybirdSDE::BrowserSession::create(move(urls), private_window, devtools_port);
+    if (created_session.is_error()) {
+        warnln("Ladybird: {}", created_session.error());
         return 1;
     }
 
-    session.value()->show();
-    return app->exec();
+    auto* session = created_session.value().ptr();
+    session_pointer = session;
+
+    session->show();
+    auto exit_status = app->exec();
+    session->note_exit_reason(ByteString::formatted("event loop returned {}", exit_status));
+    return exit_status;
 }
