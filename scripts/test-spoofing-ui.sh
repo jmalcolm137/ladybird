@@ -61,23 +61,57 @@ for _ in $(seq 1 150); do
     grep -q 'toplevel mapped' "$RUNTIME/compositor.log" 2>/dev/null && break
     sleep 0.1
 done
-sleep 2
+sleep 3
+
+WIN_X=100
+WIN_Y=100
+POSITION="$(grep -o "placed new window 'New Tab - Ladybird' at [0-9]*,[0-9]*" "$RUNTIME/compositor.log" | tail -1)"
+if [[ -n "$POSITION" ]]; then
+    X="${POSITION##* at }"
+    WIN_Y="${X##*,}"
+    WIN_X="${X%%,*}"
+fi
 
 click() {
-    WAYLAND_DISPLAY="$SOCK" "$VI" --move "$1" "$2" --sleep 200 --button 0x110 press --sleep 60 --button 0x110 release --sleep 500 >/dev/null 2>&1
+    local x=$(( $1 + WIN_X - 100 ))
+    local y=$(( $2 + WIN_Y - 100 ))
+    WAYLAND_DISPLAY="$SOCK" "$VI" --move "$x" "$y" --sleep 200 --button 0x110 press --sleep 60 --button 0x110 release --sleep 500 >/dev/null 2>&1
 }
 
 # Tools -> User Agent..., choose Chrome Linux Desktop, Apply.
 click 378 133
 click 500 282
-sleep 0.5
+for _ in $(seq 1 100); do
+    grep -q "title='User Agent'" "$RUNTIME/chrome.log" 2>/dev/null && break
+    sleep 0.1
+done
+sleep 1
 click 640 400
 click 640 428
 sleep 0.4
 click 912 466
 sleep 1
 
-if ! grep -q 'spoof user agent: Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/153.0.0.0 Safari/537.36' "$RUNTIME/chrome.log"; then
+UA_PRESET='spoof user agent: Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/153.0.0.0 Safari/537.36'
+if ! grep -q "$UA_PRESET" "$RUNTIME/chrome.log"; then
+    # A click can land before the modal dialog has laid out under load. Close any
+    # dialog and try the sequence once more.
+    WAYLAND_DISPLAY="$SOCK" "$VI" --key 1 press --sleep 60 --key 1 release --sleep 400 >/dev/null 2>&1 || true
+    click 378 133
+    click 500 282
+    for _ in $(seq 1 100); do
+        grep -q "title='User Agent'" "$RUNTIME/chrome.log" 2>/dev/null && break
+        sleep 0.1
+    done
+    sleep 1
+    click 640 400
+    click 640 428
+    sleep 0.4
+    click 912 466
+    sleep 1
+fi
+
+if ! grep -q "$UA_PRESET" "$RUNTIME/chrome.log"; then
     echo "  FAIL: the User-Agent dialog did not send its preset"
     tail -40 "$RUNTIME/chrome.log"
     exit 1
@@ -87,7 +121,11 @@ echo "  ok: User-Agent dialog"
 # Tools -> Navigator Compatibility Mode..., choose Gecko, Apply.
 click 378 133
 click 500 306
-sleep 0.5
+for _ in $(seq 1 100); do
+    grep -q "title='Navigator Compatibility Mode'" "$RUNTIME/chrome.log" 2>/dev/null && break
+    sleep 0.1
+done
+sleep 1
 click 640 413
 click 400 451
 sleep 0.4

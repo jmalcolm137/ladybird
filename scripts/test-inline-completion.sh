@@ -70,9 +70,18 @@ done
 # default bookmarks; give it the extra time so the clicks below are reliable.
 sleep 5
 
+WIN_X=100
+WIN_Y=100
+POSITION="$(grep -o "placed new window 'New Tab - Ladybird' at [0-9]*,[0-9]*" "$RUNTIME/compositor.log" | tail -1)"
+if [[ -n "$POSITION" ]]; then
+    X="${POSITION##* at }"
+    WIN_Y="${X##*,}"
+    WIN_X="${X%%,*}"
+fi
+
 # Click the location bar and clear its about:newtab text, then type "lady".
 env WAYLAND_DISPLAY="$SOCK" "$VI" --extent 1280 720 \
-    --move 700 181 --sleep 200 --button 0x110 press --sleep 60 --button 0x110 release --sleep 300 \
+    --move "$((WIN_X + 600))" "$((WIN_Y + 81))" --sleep 200 --button 0x110 press --sleep 60 --button 0x110 release --sleep 300 \
     --key 14 press --sleep 25 --key 14 release --sleep 25 \
     --key 14 press --sleep 25 --key 14 release --sleep 25 \
     --key 14 press --sleep 25 --key 14 release --sleep 25 \
