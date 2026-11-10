@@ -167,7 +167,6 @@ use crate::runtime::weak_set_constructor::WeakSetConstructor;
 use crate::runtime::weak_set_prototype::WeakSetPrototype;
 use crate::runtime::wrap_for_valid_iterator_prototype::WrapForValidIteratorPrototype;
 use crate::source_code::SourceCode;
-use crate::utf16::Utf16View;
 
 /// Declares the intrinsics' slots, which all start out empty.
 macro_rules! define_intrinsics {
@@ -207,8 +206,9 @@ define_intrinsics! {
     normal_function_prototype_constructor_offset: Cell<u32>,
 
     normal_function_shape: Cell<Option<Gc<Shape>>>,
-    normal_function_length_offset: Cell<u32>,
-    normal_function_name_offset: Cell<u32>,
+    normal_constructor_function_shape: Cell<Option<Gc<Shape>>>,
+    generator_function_length_offset: Cell<u32>,
+    generator_function_name_offset: Cell<u32>,
 
     async_function_shape: Cell<Option<Gc<Shape>>>,
     generator_function_shape: Cell<Option<Gc<Shape>>>,
@@ -268,7 +268,6 @@ define_intrinsics! {
     json_parse_function: Cell<Option<Gc<FunctionObject>>>,
     json_stringify_function: Cell<Option<Gc<FunctionObject>>>,
     object_prototype_to_string_function: Cell<Option<Gc<FunctionObject>>>,
-    throw_type_error_function: Cell<Option<Gc<FunctionObject>>>,
 
     // JS_ENUMERATE_BUILTIN_TYPES
     aggregate_error_constructor: Cell<Option<Gc<AggregateErrorConstructor>>>,
@@ -491,6 +490,7 @@ created_intrinsics! {
         iterator_result_object_shape: Shape => "iterator result object shape",
         normal_function_prototype_shape: Shape => "normal function prototype shape",
         normal_function_shape: Shape => "normal function shape",
+        normal_constructor_function_shape: Shape => "normal constructor function shape",
         async_function_shape: Shape => "async function shape",
         generator_function_shape: Shape => "generator function shape",
         async_generator_function_shape: Shape => "async generator function shape",
@@ -522,7 +522,6 @@ created_intrinsics! {
         json_parse_function: FunctionObject => "%JSON.parse%",
         json_stringify_function: FunctionObject => "%JSON.stringify%",
         object_prototype_to_string_function: FunctionObject => "%Object.prototype.toString%",
-        throw_type_error_function: FunctionObject => "%ThrowTypeError%",
         array_iterator_prototype: Object => "%ArrayIteratorPrototype%",
         async_iterator_prototype: Object => "%AsyncIteratorPrototype%",
         intl_segment_iterator_prototype: Object => "%IntlSegmentIteratorPrototype%",
@@ -536,8 +535,8 @@ created_intrinsics! {
         iterator_result_object_value_offset,
         iterator_result_object_done_offset,
         normal_function_prototype_constructor_offset,
-        normal_function_length_offset,
-        normal_function_name_offset,
+        generator_function_length_offset,
+        generator_function_name_offset,
         generator_function_prototype_property_offset,
         native_function_length_offset,
         native_function_name_offset,
@@ -857,9 +856,7 @@ pub(crate) fn parse_builtin_file<'vm>(
                     Utf16String::from_utf8("BuiltinFile"),
                     Utf16String::from_utf8(script_text),
                 );
-                let mut source = Vec::with_capacity(code.length_in_code_units());
-                Utf16View::of_string(code.code()).append_to(&mut source);
-                let parsed = crate::compile::parse_builtin_file(&source);
+                let parsed = crate::compile::parse_builtin_file(code.code());
                 Rc::new((code, parsed))
             })
             .clone()
@@ -868,7 +865,12 @@ pub(crate) fn parse_builtin_file<'vm>(
 
     let shared_data_list = MarkedVec::new(vm);
     for description in crate::compile::describe_builtin_file_functions(parsed) {
-        shared_data_list.push(SharedFunctionInstanceData::create(vm, description, Some(code)));
+        shared_data_list.push(SharedFunctionInstanceData::create(
+            vm,
+            &description,
+            description.strict,
+            Some(code),
+        ));
     }
     shared_data_list
 }
@@ -1106,7 +1108,8 @@ impl Intrinsics {
         intrinsics.initialize_intrinsics(vm, realm);
 
         // 3. Perform AddRestrictedFunctionProperties(realmRec.[[Intrinsics]].[[%Function.prototype%]], realmRec).
-        add_restricted_function_properties(vm, &realm.intrinsics().function_prototype(vm), realm);
+        // INTEROP: All major engines give %Function.prototype% accessors that work for sloppy functions instead, see
+        //          FunctionPrototype::initialize().
 
         realm_watchpoints::arm(vm, realm);
 
@@ -1171,13 +1174,12 @@ impl Intrinsics {
 
         let normal_function_shape = Shape::create(vm, realm);
         normal_function_shape.set_prototype_without_transition(vm, function_prototype);
-        normal_function_shape.add_property_without_transition(vm, &names.length, configurable);
-        normal_function_shape.add_property_without_transition(vm, &names.name, configurable);
-        self.normal_function_length_offset
-            .set(offset_of(normal_function_shape, &names.length));
-        self.normal_function_name_offset
-            .set(offset_of(normal_function_shape, &names.name));
         self.normal_function_shape.set(Some(normal_function_shape));
+
+        let normal_constructor_function_shape = Shape::create(vm, realm);
+        normal_constructor_function_shape.set_prototype_without_transition(vm, function_prototype);
+        self.normal_constructor_function_shape
+            .set(Some(normal_constructor_function_shape));
 
         let native_function_shape = Shape::create(vm, realm);
         native_function_shape.set_prototype_without_transition(vm, function_prototype);
@@ -1370,8 +1372,6 @@ impl Intrinsics {
             None,
             None,
         );
-        self.throw_type_error_function
-            .set(Some(throw_type_error_function.upcast()));
         throw_type_error_function.define_direct_property(vm, &names.length, Value::from_i32(0), attributes(0));
         throw_type_error_function.define_direct_property(
             vm,
@@ -1449,25 +1449,27 @@ impl Intrinsics {
             configurable,
         );
 
-        // OPTIMIZATION: Like normal functions, the other function kinds start from a premade shape with their own properties
-        //               already in spec order, so creating one only has to store the property values.
-        let create_function_shape = |prototype: Gc<Object>, has_prototype_property: bool| {
+        // NB: Like normal functions, async functions make their properties lazily.
+        let async_function_shape = Shape::create(vm, realm);
+        async_function_shape.set_prototype_without_transition(vm, self.async_function_prototype(vm));
+        self.async_function_shape.set(Some(async_function_shape));
+
+        // OPTIMIZATION: Generator functions start from a premade shape with their own properties already in spec order,
+        //               so creating one only has to store the property values.
+        let create_function_shape = |prototype: Gc<Object>| {
             let shape = Shape::create(vm, realm);
             shape.set_prototype_without_transition(vm, prototype);
             shape.add_property_without_transition(vm, &names.length, configurable);
             shape.add_property_without_transition(vm, &names.name, configurable);
-            if has_prototype_property {
-                shape.add_property_without_transition(vm, &names.prototype, attributes(Attribute::WRITABLE));
-            }
-            assert!(offset_of(shape, &names.length) == self.normal_function_length_offset.get());
-            assert!(offset_of(shape, &names.name) == self.normal_function_name_offset.get());
+            shape.add_property_without_transition(vm, &names.prototype, attributes(Attribute::WRITABLE));
+            self.generator_function_length_offset
+                .set(offset_of(shape, &names.length));
+            self.generator_function_name_offset.set(offset_of(shape, &names.name));
             shape
         };
-        self.async_function_shape
-            .set(Some(create_function_shape(self.async_function_prototype(vm), false)));
-        let generator_function_shape = create_function_shape(self.generator_function_prototype(vm), true);
+        let generator_function_shape = create_function_shape(self.generator_function_prototype(vm));
         self.generator_function_shape.set(Some(generator_function_shape));
-        let async_generator_function_shape = create_function_shape(self.async_generator_function_prototype(vm), true);
+        let async_generator_function_shape = create_function_shape(self.async_generator_function_prototype(vm));
         self.async_generator_function_shape
             .set(Some(async_generator_function_shape));
         self.generator_function_prototype_property_offset
@@ -1584,33 +1586,4 @@ impl Intrinsics {
     pub fn realm(&self) -> Gc<Realm> {
         self.realm
     }
-}
-
-// 10.2.4 AddRestrictedFunctionProperties ( F, realm ), https://tc39.es/ecma262/#sec-addrestrictedfunctionproperties
-pub fn add_restricted_function_properties(vm: &Vm, function: &Object, realm: Gc<Realm>) {
-    // 1. Assert: realm.[[Intrinsics]].[[%ThrowTypeError%]] exists and has been initialized.
-    // NOTE: This is ensured by dereferencing the GCPtr in the getter.
-
-    // 2. Let thrower be realm.[[Intrinsics]].[[%ThrowTypeError%]].
-    let thrower = realm.intrinsics().throw_type_error_function();
-
-    // 3. Perform ! DefinePropertyOrThrow(F, "caller", PropertyDescriptor { [[Get]]: thrower, [[Set]]: thrower, [[Enumerable]]: false, [[Configurable]]: true }).
-    function.define_direct_accessor(
-        vm,
-        &vm.names.caller,
-        Some(thrower),
-        Some(thrower),
-        PropertyAttributes::new(Attribute::CONFIGURABLE),
-    );
-
-    // 4. Perform ! DefinePropertyOrThrow(F, "arguments", PropertyDescriptor { [[Get]]: thrower, [[Set]]: thrower, [[Enumerable]]: false, [[Configurable]]: true }).
-    function.define_direct_accessor(
-        vm,
-        &vm.names.arguments,
-        Some(thrower),
-        Some(thrower),
-        PropertyAttributes::new(Attribute::CONFIGURABLE),
-    );
-
-    // 5. Return unused.
 }

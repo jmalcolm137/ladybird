@@ -9,6 +9,7 @@ use super::{
     IncludeVisualViewportTransform, SpatialData, SpatialNodeIndex, TransformDataRole, VISUAL_VIEWPORT_NODE_INDEX,
     VisualContextTree, device_offset_for_index,
 };
+use ak::math;
 use libgfx_rust::{
     CompositingAndBlendingOperator, FloatMatrix4x4, FloatPoint, FloatRect, IntPoint, IntRect, map_rect_through_matrix,
 };
@@ -68,6 +69,9 @@ struct SpatialChainWalk {
     needs_accumulated_matrices: bool,
     has_3d_transform: bool,
     culled: bool,
+    // The cull state of the plane the current 3D rendering context is flattened into. A root path runs through at
+    // most one context at a time, since a nested context only starts below an element that flattens.
+    culled_outside_sorting_context: bool,
     accumulated_matrices: Vec<FloatMatrix4x4>,
     point: FloatPoint,
     applied_steps: usize,
@@ -174,6 +178,7 @@ impl VisualContextTree {
             needs_accumulated_matrices,
             has_3d_transform,
             culled: false,
+            culled_outside_sorting_context: false,
             accumulated_matrices,
             point: screen_point,
             applied_steps: 0,
@@ -205,10 +210,17 @@ impl VisualContextTree {
             }
         }
 
-        if let SpatialData::Transform(transform) = &node.data
-            && (transform.sorting_context_root_index.is_some() || transform.establishes_sorting_context)
-        {
-            walk.culled = false;
+        // https://drafts.csswg.org/css-transforms-2/#3d-rendering-contexts
+        // A participant in a 3D rendering context is its own plane, culled only by its own hidden backface or by
+        // whatever culls the plane its context is flattened into. The spec doesn't yet say if a hidden backface culls
+        // the 3D rendering contexts nested in it:
+        // https://github.com/w3c/csswg-drafts/issues/918
+        if let SpatialData::Transform(transform) = &node.data {
+            if transform.establishes_sorting_context {
+                walk.culled_outside_sorting_context = walk.culled;
+            } else if transform.sorting_context_root_index.is_some() {
+                walk.culled = walk.culled_outside_sorting_context;
+            }
         }
 
         if walk.has_3d_transform && !matches!(node.data, SpatialData::BackfaceVisibility(_)) {
@@ -342,6 +354,30 @@ impl VisualContextTree {
                 clip_path.path.contains(point.x, point.y, clip_path.fill_rule)
             }
             ClipNodeData::Dead => true,
+        }
+    }
+
+    pub fn can_snap_composited_context_origin(&self, mut spatial_node_index: SpatialNodeIndex) -> bool {
+        loop {
+            let Some(node) = self.spatial_nodes.get(spatial_node_index.0 as usize) else {
+                return false;
+            };
+
+            if !node.data.is_live() {
+                return false;
+            }
+
+            if spatial_node_index == VISUAL_VIEWPORT_NODE_INDEX {
+                return true;
+            }
+
+            match &node.data {
+                SpatialData::Transform(transform) if transform.matrix != FloatMatrix4x4::identity() => return false,
+                SpatialData::Perspective(_) => return false,
+                _ => {}
+            }
+
+            spatial_node_index = node.parent;
         }
     }
 
@@ -519,35 +555,28 @@ impl VisualContextTree {
         rect
     }
 
-    pub fn cumulative_scroll_chain_offset(&self, index: SpatialNodeIndex, scroll_offsets: &[FloatPoint]) -> FloatPoint {
-        let nearest_scroll_like_ancestor = |from: SpatialNodeIndex| -> Option<SpatialNodeIndex> {
-            let mut current = from;
-            while current != VISUAL_VIEWPORT_NODE_INDEX {
-                current = self.spatial_nodes[current.0 as usize].parent;
-                if current == VISUAL_VIEWPORT_NODE_INDEX {
-                    return None;
-                }
-                if self.spatial_nodes[current.0 as usize].data.is_scroll_like() {
-                    return Some(current);
-                }
-            }
-            None
-        };
-
+    /// How far the nodes on the spatial chain from `index` up to the viewport move a box when its transforms are left
+    /// out, in device pixels.
+    pub fn offset_to_viewport_ignoring_transforms(
+        &self,
+        index: SpatialNodeIndex,
+        scroll_offsets: &[FloatPoint],
+    ) -> FloatPoint {
         let mut offset = FloatPoint::default();
-        let mut current = Some(index);
-        while let Some(node_index) = current
-            && node_index != VISUAL_VIEWPORT_NODE_INDEX
-        {
-            let entry = device_offset_for_index(scroll_offsets, node_index);
-            offset = FloatPoint {
-                x: offset.x + entry.x,
-                y: offset.y + entry.y,
+        let mut current = index;
+        while current != VISUAL_VIEWPORT_NODE_INDEX {
+            let node = &self.spatial_nodes[current.0 as usize];
+            let node_offset = match &node.data {
+                SpatialData::Scroll(_) | SpatialData::Sticky(_) => device_offset_for_index(scroll_offsets, current),
+                SpatialData::AnchorScrollShift(shift) => shift.masked_offset(scroll_offsets),
+                SpatialData::Transform(_)
+                | SpatialData::Perspective(_)
+                | SpatialData::BackfaceVisibility(_)
+                | SpatialData::Dead => FloatPoint::default(),
             };
-            current = match &self.spatial_nodes[node_index.0 as usize].data {
-                SpatialData::Sticky(sticky) => Some(sticky.parent_sticky.unwrap_or(sticky.scroller)),
-                _ => nearest_scroll_like_ancestor(node_index),
-            };
+            offset.x += node_offset.x;
+            offset.y += node_offset.y;
+            current = node.parent;
         }
         offset
     }
@@ -817,7 +846,7 @@ impl VisualContextTree {
                 let origin = transform.origin;
                 let dx = (rect.x - origin.x).abs().max((rect.right() - origin.x).abs());
                 let dy = (rect.y - origin.y).abs().max((rect.bottom() - origin.y).abs());
-                let radius = dx.hypot(dy);
+                let radius = math::hypot(dx, dy);
                 rect = FloatRect::new(origin.x - radius, origin.y - radius, 2.0 * radius, 2.0 * radius);
             } else {
                 let matrix = self.local_spatial_matrix(index, scroll_offsets).matrix;
@@ -875,6 +904,7 @@ mod tests {
             role: TransformDataRole::CssTransform,
             synthetic_plane: false,
             establishes_sorting_context: false,
+            bounds: FloatRect::default(),
         }
     }
 
@@ -886,7 +916,6 @@ mod tests {
         SpatialData::Scroll(ScrollData {
             state_slot: NO_SCROLL_STATE_SLOT,
             owner_paintable: NodeSlotId::INVALID,
-            registry_parent_node: VISUAL_VIEWPORT_NODE_INDEX,
         })
     }
 
@@ -1394,44 +1423,6 @@ mod tests {
     }
 
     #[test]
-    fn the_cumulative_scroll_chain_offset_sums_entries_up_the_scroll_parent_chain() {
-        let mut tree = identity_tree();
-        let outer_scroll = tree.append_spatial(scroll(), VISUAL_VIEWPORT_NODE_INDEX);
-        let transformed = tree.append_spatial(
-            SpatialData::Transform(transform_data(FloatMatrix4x4::identity(), FloatPoint::default())),
-            outer_scroll,
-        );
-        let inner_scroll = tree.append_spatial(scroll(), transformed);
-        let sticky = tree.append_spatial(
-            SpatialData::Sticky(StickyData::unconstrained(
-                inner_scroll,
-                None,
-                NO_SCROLL_STATE_SLOT,
-                NodeSlotId::INVALID,
-                inner_scroll,
-            )),
-            inner_scroll,
-        );
-        let mut scroll_offsets = vec![FloatPoint::default(); 5];
-        scroll_offsets[outer_scroll.0 as usize] = point(0.0, -100.0);
-        scroll_offsets[inner_scroll.0 as usize] = point(0.0, -30.0);
-        scroll_offsets[sticky.0 as usize] = point(0.0, 5.0);
-
-        assert_eq!(
-            tree.cumulative_scroll_chain_offset(sticky, &scroll_offsets),
-            point(0.0, -125.0)
-        );
-        assert_eq!(
-            tree.cumulative_scroll_chain_offset(inner_scroll, &scroll_offsets),
-            point(0.0, -130.0)
-        );
-        assert_eq!(
-            tree.cumulative_scroll_chain_offset(VISUAL_VIEWPORT_NODE_INDEX, &scroll_offsets),
-            FloatPoint::default()
-        );
-    }
-
-    #[test]
     fn sticky_offsets_resolve_from_the_scroller_entry_and_the_parent_sticky_chain() {
         let mut tree = identity_tree();
         let viewport_scroll_node = tree.append_spatial(scroll(), VISUAL_VIEWPORT_NODE_INDEX);
@@ -1458,7 +1449,6 @@ mod tests {
                 inset_left: None,
                 state_slot: NO_SCROLL_STATE_SLOT,
                 owner_paintable: NodeSlotId::INVALID,
-                registry_parent_node: viewport_scroll_node,
             }),
             viewport_scroll_node,
         );
@@ -1485,7 +1475,6 @@ mod tests {
                 inset_left: None,
                 state_slot: NO_SCROLL_STATE_SLOT,
                 owner_paintable: NodeSlotId::INVALID,
-                registry_parent_node: viewport_scroll_node,
             }),
             header_node,
         );
@@ -1535,7 +1524,6 @@ mod tests {
             inset_left: None,
             state_slot: NO_SCROLL_STATE_SLOT,
             owner_paintable: NodeSlotId::INVALID,
-            registry_parent_node: parent_sticky.unwrap_or(scroller),
         })
     }
 
@@ -1638,12 +1626,7 @@ mod tests {
             SpatialData::Sticky(sticky) => SpatialData::Sticky(StickyData {
                 scroller: map(sticky.scroller),
                 parent_sticky: sticky.parent_sticky.map(map),
-                registry_parent_node: map(sticky.registry_parent_node),
                 ..*sticky
-            }),
-            SpatialData::Scroll(scroll) => SpatialData::Scroll(ScrollData {
-                registry_parent_node: map(scroll.registry_parent_node),
-                ..*scroll
             }),
             other => other.clone(),
         }
@@ -1866,7 +1849,6 @@ mod tests {
                 None,
                 NO_SCROLL_STATE_SLOT,
                 NodeSlotId::INVALID,
-                VISUAL_VIEWPORT_NODE_INDEX,
             )),
             VISUAL_VIEWPORT_NODE_INDEX,
         );

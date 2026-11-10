@@ -10,6 +10,7 @@
 #include <LibWeb/Animations/DocumentTimeline.h>
 #include <LibWeb/Animations/KeyframeEffect.h>
 #include <LibWeb/Animations/ScrollTimeline.h>
+#include <LibWeb/Animations/ViewTimeline.h>
 #include <LibWeb/CSS/CSSTransition.h>
 #include <LibWeb/CSS/StyleComputer.h>
 #include <LibWeb/CSS/StyleEngineBridge.h>
@@ -18,12 +19,14 @@
 #include <LibWeb/DOM/Document.h>
 #include <LibWeb/DOM/Element.h>
 #include <LibWeb/HTML/EventLoop/ClockPlan.h>
+#include <LibWeb/HTML/LocalNavigable.h>
 #include <LibWeb/HTML/Navigable.h>
 #include <LibWeb/HTML/Window.h>
 #include <LibWeb/Layout/LayoutRustFFI.h>
 #include <LibWeb/Layout/Node.h>
 #include <LibWeb/Layout/RenderDocument.h>
 #include <LibWeb/Namespace.h>
+#include <LibWeb/Page/EventHandler.h>
 #include <LibWeb/Page/Page.h>
 #include <LibWeb/Painting/BoxViews.h>
 
@@ -36,8 +39,20 @@ static bool timing_is_in(Animations::KeyframeEffect const& effect, Animations::T
     return effect.start_delay().type == type && effect.iteration_duration().type == type && effect.active_duration().type == type;
 }
 
-// Adds the scroll timeline `timeline` that `effect` runs on, at `local_time`, to `scroll_timelines`. Answers whether a
-// tick may sample it.
+// How much of `edge` is a percentage of the scrollport's size, which a tick that resizes the scrollport resolves again.
+static double inset_percentage(Animations::ViewTimeline::InsetEdge const& edge)
+{
+    return edge.is_auto ? 0 : edge.percentage;
+}
+
+// Whether `edge` is a length plus a percentage, which is all a tick that resizes the scrollport can resolve again.
+static bool inset_is_linear(Animations::ViewTimeline::InsetEdge const& edge)
+{
+    return !edge.calculated || CSS::ComputedValuesFFI::rust_length_percentage_is_linear(edge.calculated.data());
+}
+
+// Adds the scroll timeline `timeline` that `effect` runs on, at `local_time`, to `scroll_timelines`, whose last entry
+// is the timeline's where an effect of it was planned before. Answers whether a tick may sample it.
 static bool plan_scroll_timeline(Vector<Layout::RustFFI::FfiPlannedScrollTimeline>& scroll_timelines, Animations::ScrollTimeline const& timeline, Animations::KeyframeEffect const& effect, Optional<Animations::TimeValue> local_time)
 {
     auto const& scroller = timeline.followed_scroller();
@@ -46,13 +61,33 @@ static bool plan_scroll_timeline(Vector<Layout::RustFFI::FfiPlannedScrollTimelin
         || !local_time.has_value() || local_time->type != Animations::TimeValue::Type::Percentage
         || !timing_is_in(effect, Animations::TimeValue::Type::Percentage))
         return false;
-    auto scroller_id = scroller->scroll_node.node_id.value();
-    if (!scroll_timelines.find_first_index_if([&](auto const& planned) { return planned.scroller == scroller_id && planned.vertical == scroller->vertical; }).has_value()) {
+    // A tick finds the subject of a view timeline by its box, which a pseudo-element does not name.
+    auto const* view_timeline = as_if<Animations::ViewTimeline>(timeline);
+    if (view_timeline && (view_timeline->subject_internal().pseudo_element().has_value() || !view_timeline->subject_internal().element().style_node_id() || !view_timeline->last_metrics().has_value()))
+        return false;
+    // A tick resolves the insets of a view timeline as a length plus a percentage, which not every calculation is.
+    if (view_timeline && (!inset_is_linear(view_timeline->inset().start) || !inset_is_linear(view_timeline->inset().end)))
+        return false;
+    if (scroll_timelines.is_empty() || scroll_timelines.last().timeline != timeline.clock_identity()) {
         scroll_timelines.append({
-            .scroller = scroller_id,
+            .timeline = timeline.clock_identity(),
+            .scroller = scroller->scroll_node.node_id.value(),
+            .scroller_element = scroller->scroller_style_node,
             .vertical = scroller->vertical,
+            .scroll_offset = scroller->scroll_offset,
             .max_scroll_offset = scroller->max_scroll_offset,
-            .progress = progress->value,
+            .view = view_timeline
+                ? Layout::RustFFI::FfiPlannedViewTimeline {
+                      .subject = view_timeline->subject_internal().element().style_node_id().value(),
+                      .scrollport_size = view_timeline->last_metrics()->scrollport_size,
+                      .inset_start = view_timeline->last_metrics()->inset_start,
+                      .inset_end = view_timeline->last_metrics()->inset_end,
+                      .inset_start_percentage = inset_percentage(view_timeline->inset().start),
+                      .inset_end_percentage = inset_percentage(view_timeline->inset().end),
+                      .subject_offset = view_timeline->last_metrics()->subject_offset,
+                      .subject_size = view_timeline->last_metrics()->subject_size,
+                  }
+                : Layout::RustFFI::FfiPlannedViewTimeline {},
         });
     }
     return true;
@@ -142,7 +177,7 @@ bool hover_lane_is_enabled()
     return enabled;
 }
 
-// The page's cursor, as a hover of the render clock asks it to show the cursor of what it hovers, on the StyleLayout
+// The page's cursor, as a hover of the render clock asks it to show the cursor of what it hovers, on the Render
 // thread.
 static Layout::RustFFI::FfiPageCursor ffi_page_cursor(PageCursor& cursor)
 {
@@ -153,6 +188,20 @@ static Layout::RustFFI::FfiPageCursor ffi_page_cursor(PageCursor& cursor)
         .request = [](void const* cursor, u8 css_cursor) {
             auto& page_cursor = const_cast<PageCursor&>(*static_cast<PageCursor const*>(cursor));
             page_cursor.request(css_to_gfx_cursor(static_cast<CSS::CursorPredefined>(css_cursor))); },
+    };
+}
+
+// What tells the document's page the link a hover of the render clock is over, on the Render thread.
+static Layout::RustFFI::FfiHoverLinkReporter ffi_hover_link_reporter(DOM::Document& document)
+{
+    document.update_hover_link_base();
+    return {
+        .reporter = &document.hover_link_reporter(),
+        .retain = [](void const* reporter) { static_cast<HoverLinkReporter const*>(reporter)->ref(); },
+        .release = [](void const* reporter) { static_cast<HoverLinkReporter const*>(reporter)->unref(); },
+        .is_link = [](void const* reporter, u32 element) { return static_cast<HoverLinkReporter const*>(reporter)->is_link(element); },
+        .report = [](void const* reporter, u32 element) { const_cast<HoverLinkReporter&>(*static_cast<HoverLinkReporter const*>(reporter)).report(element); },
+        .withdraw = [](void const* reporter) { const_cast<HoverLinkReporter&>(*static_cast<HoverLinkReporter const*>(reporter)).withdraw(); },
     };
 }
 
@@ -277,16 +326,30 @@ bool seal_clock_plan(DOM::Document& document, bool may_plan, u64 update_serial)
                 }
             }
             scroll_offsets = document.scroll_state_snapshot().device_offsets();
+            Optional<Web::EventHandler::SelectionDragForLanes> selection_drag;
+            if (auto navigable = document.navigable())
+                selection_drag = navigable->event_handler().selection_drag_for_lanes(read);
+            auto scrollport = selection_drag.has_value() ? selection_drag->scrollport.value_or(CSSPixelRect {}) : CSSPixelRect {};
             hover = Layout::RustFFI::FfiHoverPlanInputs {
                 .device_pixels_per_css_pixel = document.page().client().device_pixels_per_css_pixel(),
                 .scroll_offsets = scroll_offsets.data(),
                 .scroll_offset_count = scroll_offsets.size(),
                 .chrome_metrics = document.page().chrome_metrics(),
                 .page_cursor = ffi_page_cursor(document.page().cursor()),
+                .link_reporter = ffi_hover_link_reporter(document),
                 .effect_timing_nodes = effect_timing_nodes.data(),
                 .effect_timing_identities = effect_timing_identities.data(),
                 .effect_timings = effect_timings.data(),
                 .effect_timing_count = effect_timings.size(),
+                .selection_drag_anchor = selection_drag.has_value() ? selection_drag->anchor.value() : 0,
+                .selection_drag_anchor_offset = selection_drag.has_value() ? selection_drag->anchor_offset : 0,
+                .selection_drag_anchor_child = selection_drag.has_value() ? selection_drag->anchor_child.value() : 0,
+                .selection_drag_scrollport = {
+                    .x = scrollport.x().to_float(),
+                    .y = scrollport.y().to_float(),
+                    .width = scrollport.width().to_float(),
+                    .height = scrollport.height().to_float(),
+                },
             };
         }
         if (animates || hover.has_value()) {

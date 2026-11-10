@@ -4,7 +4,6 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-use core::cell::Cell;
 use core::ops::Deref;
 
 use ak::Utf16String;
@@ -15,6 +14,7 @@ use crate::gc::visitor::{Trace, Visitor};
 use crate::interpreter::vm::Vm;
 use crate::layout::cell::Gc;
 pub use crate::layout::function_object::FunctionObject;
+use crate::layout::function_object::ecmascript_function_flags;
 use crate::layout::object::Object;
 use crate::layout::value::Value;
 use crate::runtime::class_field_definition::ClassElementName;
@@ -50,31 +50,15 @@ impl Deref for FunctionObject {
 }
 
 impl FunctionObject {
-    pub fn new_with_realm_and_prototype(
+    pub fn new_with_prototype(
         vm: &Vm,
         class: &'static Class,
         realm: Gc<Realm>,
         prototype: Option<Gc<Object>>,
         may_interfere_with_indexed_property_access: MayInterfereWithIndexedPropertyAccess,
     ) -> FunctionObject {
-        let object = Object::new_with_realm_and_prototype(
-            vm,
-            class,
-            realm,
-            prototype,
-            may_interfere_with_indexed_property_access,
-        );
-        object.set_is_function();
-        Self::from_object(object)
-    }
-
-    pub fn new_with_prototype(
-        vm: &Vm,
-        class: &'static Class,
-        prototype: Gc<Object>,
-        may_interfere_with_indexed_property_access: MayInterfereWithIndexedPropertyAccess,
-    ) -> FunctionObject {
-        let object = Object::new_with_prototype(vm, class, prototype, may_interfere_with_indexed_property_access);
+        let object =
+            Object::new_with_prototype(vm, class, realm, prototype, may_interfere_with_indexed_property_access);
         object.set_is_function();
         Self::from_object(object)
     }
@@ -90,24 +74,19 @@ impl FunctionObject {
     }
 
     fn from_object(object: Object) -> FunctionObject {
-        FunctionObject {
-            base: object,
-            builtin: Cell::new(0),
-            has_builtin: Cell::new(false),
-            flags: Cell::new(0),
-        }
+        FunctionObject { base: object }
     }
 
     pub fn builtin(&self) -> Option<Builtin> {
-        if !self.has_builtin.get() {
+        let bits = self.class_bits.get();
+        if bits == 0 || bits & ecmascript_function_flags::IS_ECMASCRIPT_FUNCTION != 0 {
             return None;
         }
-        Some(Builtin::from_u8(self.builtin.get()).expect("a function's builtin is a Builtin"))
+        Some(Builtin::from_u8(bits - 1).expect("a function's builtin is a Builtin"))
     }
 
     pub fn set_builtin(&self, builtin: Option<Builtin>) {
-        self.builtin.set(builtin.map_or(0, |builtin| builtin as u8));
-        self.has_builtin.set(builtin.is_some());
+        self.class_bits.set(builtin.map_or(0, |builtin| builtin as u8 + 1));
     }
 
     pub fn is_array_prototype_next_builtin(&self) -> bool {

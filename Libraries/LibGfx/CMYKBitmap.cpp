@@ -17,14 +17,14 @@ ErrorOr<NonnullRefPtr<CMYKBitmap>> CMYKBitmap::create_with_size(IntSize const& s
     final_size.mul(sizeof(CMYK));
     if (final_size.has_overflow())
         return Error::from_string_literal("Image dimensions cause an integer overflow");
-    auto data = TRY(ByteBuffer::create_uninitialized(final_size.value()));
+    auto data = TRY(ByteBuffer::create_zeroed(final_size.value()));
     return adopt_ref(*new CMYKBitmap(size, move(data)));
 }
 
 ErrorOr<NonnullRefPtr<Bitmap>> CMYKBitmap::to_low_quality_rgb() const
 {
     if (!m_rgb_bitmap) {
-        m_rgb_bitmap = TRY(Bitmap::create(BitmapFormat::BGRx8888, m_size));
+        m_rgb_bitmap = TRY(Bitmap::create_shareable(BitmapFormat::BGRx8888, AlphaType::Premultiplied, m_size));
 
         for (int y = 0; y < m_size.height(); ++y) {
             for (int x = 0; x < m_size.width(); ++x) {

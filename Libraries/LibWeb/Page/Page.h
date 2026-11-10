@@ -15,7 +15,9 @@
 #include <AK/Queue.h>
 #include <AK/Utf16String.h>
 #include <AK/Variant.h>
+#include <LibAudio/Forward.h>
 #include <LibCompositing/Types.h>
+#include <LibCore/Forward.h>
 #include <LibGC/Root.h>
 #include <LibGC/Weak.h>
 #include <LibGfx/Cursor.h>
@@ -47,17 +49,20 @@
 #include <LibWeb/Geolocation/Geolocation.h>
 #include <LibWeb/Geolocation/GeolocationCoordinates.h>
 #include <LibWeb/Geolocation/GeolocationPositionError.h>
+#include <LibWeb/HTML/DedicatedWorkerThreadLink.h>
 #include <LibWeb/HTML/Focus.h>
 #include <LibWeb/HTML/NavigationSourceSnapshot.h>
 #include <LibWeb/HTML/PreparedNavigationDescriptor.h>
 #include <LibWeb/HTML/SameDocumentNavigationEntry.h>
 #include <LibWeb/HTML/Scripting/ScriptRegistry.h>
 #include <LibWeb/HTML/SessionHistoryEntry.h>
+#include <LibWeb/HTML/StructuredSerialize.h>
 #include <LibWeb/HTML/TokenizedFeatures.h>
 #include <LibWeb/HTML/UserNavigationInvolvement.h>
 #include <LibWeb/HTML/WebViewHints.h>
 #include <LibWeb/Loader/FileRequest.h>
 #include <LibWeb/Page/PageCursor.h>
+#include <LibWeb/Page/PageHoverLink.h>
 #include <LibWeb/Page/ScreenWakeLockHandle.h>
 #include <LibWeb/Painting/ChromeMetrics.h>
 #include <LibWebCommon/CSS/PreferredColorScheme.h>
@@ -96,6 +101,7 @@
 #include <LibWebCommon/Page/QueuedInputEvent.h>
 #include <LibWebCommon/Page/SpellingError.h>
 #include <LibWebCommon/Page/TextEditingCommand.h>
+#include <LibWebCommon/Page/Translation.h>
 #include <LibWebCommon/Page/ViewportIsFullscreen.h>
 #include <LibWebCommon/Page/WritingSuggestion.h>
 #include <LibWebCommon/Permissions/Permissions.h>
@@ -174,6 +180,7 @@ public:
     GC::Ptr<HTML::LocalNavigable> fullscreen_element_and_its_containers(GC::Ref<DOM::Element>, Fullscreen::RequestType, ElementIsRequestedElement);
 
     void discard();
+    bool has_been_discarded() const { return m_has_been_discarded; }
 
     HTML::HistoryExecutor& history_executor();
 
@@ -182,6 +189,7 @@ public:
     GC::Ptr<HTML::Navigable> focused_navigable() const;
     GC::Ptr<HTML::LocalNavigable> hosted_focused_navigable() const;
     void set_focused_navigable(HTML::Navigable&);
+    void system_focus_changed();
     void focused_navigable_changed_in_another_page(HTML::CrossProcessId);
     void navigable_document_destroyed(Badge<DOM::Document>, HTML::LocalNavigable&);
 
@@ -221,7 +229,7 @@ public:
     EventResult handle_drag_and_drop_event(DragEvent::Type, DevicePixelPoint, DevicePixelPoint screen_position, unsigned button, unsigned buttons, unsigned modifiers, Vector<HTML::SelectedFile> files, Optional<String> text = {}, Vector<String> urls = {});
     EventResult handle_pinch_event(DevicePixelPoint point, unsigned modifiers, double scale);
 
-    EventResult handle_keydown(UIEvents::KeyCode, unsigned modifiers, u32 code_point, bool repeat, bool should_insert_text, bool async_scroll_performed_default_action = false, ReadonlySpan<TextEditingCommand> editing_commands = {}, bool native_editing_binding_resolved = false);
+    EventResult handle_keydown(UIEvents::KeyCode, unsigned modifiers, u32 code_point, bool repeat, bool should_insert_text, bool async_scroll_performed_default_action = false, ReadonlySpan<TextEditingCommand> editing_commands = {}, bool native_editing_binding_resolved = false, Optional<u64> user_input_scroll_count_with_nothing_to_scroll = {});
     EventResult handle_keyup(UIEvents::KeyCode, unsigned modifiers, u32 code_point, bool repeat);
 
     void handle_gamepad_connected(Gamepad::GamepadDescription const&);
@@ -263,9 +271,6 @@ public:
     bool is_webdriver_active() const { return m_is_webdriver_active; }
     void set_is_webdriver_active(bool b) { m_is_webdriver_active = b; }
 
-    bool is_hovering_link() const { return m_is_hovering_link; }
-    void set_is_hovering_link(bool b) { m_is_hovering_link = b; }
-
     bool is_in_tooltip_area() const { return m_is_in_tooltip_area; }
     void set_is_in_tooltip_area(bool b) { m_is_in_tooltip_area = b; }
 
@@ -274,6 +279,7 @@ public:
 
     Gfx::Cursor current_cursor() const { return m_cursor->current(); }
     PageCursor& cursor() { return *m_cursor; }
+    PageHoverLink& hover_link() { return *m_hover_link; }
 
     DevicePixelPoint window_position() const { return m_window_position; }
     void set_window_position(DevicePixelPoint position) { m_window_position = position; }
@@ -304,6 +310,9 @@ public:
     void dismiss_dialog(GC::Ref<GC::Function<void()>> on_dialog_closed);
     void accept_dialog(GC::Ref<GC::Function<void()>> on_dialog_closed);
 
+    void add_unloading_canceled_check(Badge<HTML::CheckUnloadingCanceledState>, GC::Ref<HTML::CheckUnloadingCanceledState>);
+    void remove_unloading_canceled_check(Badge<HTML::CheckUnloadingCanceledState>, GC::Ref<HTML::CheckUnloadingCanceledState>);
+
     void did_request_color_picker(GC::Weak<HTML::HTMLInputElement> target, Color current_color);
     void color_picker_update(Optional<Color> picked_color, HTML::ColorPickerUpdateState state);
 
@@ -317,7 +326,8 @@ public:
     void select_dropdown_closed(Optional<u32> const& selected_item_id);
 
     using ClipboardRequest = GC::Ref<GC::Function<void(Vector<Clipboard::SystemClipboardItem>)>>;
-    void request_clipboard_entries(ClipboardRequest);
+    void request_clipboard_entries_for_paste(ClipboardRequest);
+    void request_clipboard_entries(ClipboardRequest, HTML::CrossProcessId reading_document_id);
     void retrieved_clipboard_entries(u64 request_id, Vector<Clipboard::SystemClipboardItem>);
 
     using SpellCheckRequest = GC::Ref<GC::Function<void(Vector<SpellingError>)>>;
@@ -330,6 +340,23 @@ public:
     // For tests: Calls the callback once no document of the page has spellchecking queued or in flight.
     void when_spell_checking_settled(GC::Ref<GC::Function<void()>>);
     void notify_spell_check_progress();
+
+    // Translating the page's documents: The UI process decides the languages, and translates each unit of text the
+    // documents send it.
+    TranslationLanguageSample translation_language_sample();
+    void start_translation(String source_language, String target_language);
+    void stop_translation();
+    bool is_translating() const { return m_translation_target_language.has_value(); }
+    void did_translate(TranslatedUnit);
+    void did_completely_load_document(DOM::Document&);
+    u64 allocate_translation_unit_id() { return m_next_translation_unit_id++; }
+    // Sends the most urgent units of the page's documents, as many as may be in flight at once.
+    void notify_translation_progress();
+
+    // For tests: Translates the page as its translation menu would, and calls the callback once no document of the
+    // page has text waiting to be translated or in flight.
+    void request_translation_for_testing(String const& target_language);
+    void when_translation_settled(GC::Ref<GC::Function<void()>>);
 
     using WritingSuggestionRequest = GC::Ref<GC::Function<void(Optional<WritingSuggestion>)>>;
     bool writing_suggestions_available() const { return m_writing_suggestions_available; }
@@ -359,6 +386,19 @@ public:
     using PermissionPromptCallback = GC::Ref<GC::Function<void(Web::Permissions::EffectiveState)>>;
     void request_permission(HTML::CrossProcessId requesting_document_id, Utf16String const& name, PermissionPromptCallback);
     void permission_request_completed(u64 request_id, Web::Permissions::EffectiveState);
+
+    // The list of notifications (https://notifications.spec.whatwg.org/#list-of-notifications) this page has asked
+    // the UI process to show, by the id that names each one across the bridge.
+    u64 allocate_notification_id() { return m_next_notification_id++; }
+    void register_showing_notification(u64 notification_id, GC::Ref<NotificationsAPI::Notification>);
+    void unregister_notification(u64 notification_id);
+    void notification_shown(u64 notification_id);
+    void notification_show_failed(u64 notification_id);
+    void notification_clicked(u64 notification_id);
+    void notification_closed(u64 notification_id, bool by_user);
+    // The document whose script created notifications is gone: Their objects can't get events any more, and the UI
+    // process hears that, so a later click opens the site instead.
+    void notifications_document_destroyed(DOM::Document const&);
 
     // https://w3c.github.io/geolocation/#dfn-emulated-position-data
     // NB: The top-level traversable's, which the UI process tells every page representing it.
@@ -404,6 +444,8 @@ public:
         GC::Ref<DOM::Node> target;
         CSSPixelPoint position;
         Optional<Web::MediaContextMenu> media {};
+        Optional<URL::URL> link_url {};
+        Optional<String> image_mime_type {};
     };
     void record_context_menu_request(Badge<EventHandler>, ContextMenuRequest);
     void clear_context_menu_request() { m_context_menu_request.clear(); }
@@ -505,6 +547,8 @@ private:
     void set_find_in_page_active_match(GC::Ptr<DOM::Range>);
 
     void on_pending_dialog_closed();
+    void close_pending_dialog_of_discarded_page();
+    void finish_discarding();
 
     GC::Ref<PageClient> m_client;
 
@@ -520,6 +564,8 @@ private:
     GC::Ptr<HTML::Navigable> m_top_level_traversable;
     OwnPtr<Compositor::CompositorContextHandle> m_retired_page_compositor_context;
     Vector<GC::Ref<HTML::Navigable>> m_navigables_being_destroyed;
+    bool m_has_been_discarded { false };
+    size_t m_local_roots_left_to_discard { 0 };
 
     HTML::VisibilityState m_system_visibility_state { HTML::VisibilityState::Hidden };
 
@@ -548,10 +594,10 @@ private:
     // The webdriver-active flag is set to true when the user agent is under remote control. It is initially false.
     bool m_is_webdriver_active { false };
 
-    bool m_is_hovering_link { false };
     bool m_is_in_tooltip_area { false };
 
     NonnullRefPtr<PageCursor> m_cursor { PageCursor::create() };
+    NonnullRefPtr<PageHoverLink> m_hover_link { PageHoverLink::create() };
 
     DevicePixelPoint m_window_position {};
     DevicePixelSize m_window_size {};
@@ -565,6 +611,10 @@ private:
     Optional<Optional<Utf16String>> m_pending_prompt_response;
     GC::Ptr<GC::Function<void()>> m_on_pending_dialog_closed;
 
+    // The checks if unloading is canceled that are still running. They wait on tasks and dialogs that may never come
+    // back, so this page keeps them alive until they finish, if need be by timing out.
+    HashTable<GC::Ref<HTML::CheckUnloadingCanceledState>> m_unloading_canceled_checks;
+
     PendingNonBlockingDialog m_pending_non_blocking_dialog { PendingNonBlockingDialog::None };
     GC::Weak<HTML::HTMLElement> m_pending_non_blocking_dialog_target;
     Utf16String m_pending_date_picker_input_type;
@@ -576,6 +626,12 @@ private:
     HashMap<u64, SpellCheckRequest> m_pending_spell_check_requests;
     u64 m_next_spell_check_request_id { 0 };
     Vector<GC::Ref<GC::Function<void()>>> m_spell_checking_settled_callbacks;
+
+    Optional<String> m_translation_source_language;
+    Optional<String> m_translation_target_language;
+    u64 m_next_translation_unit_id { 1 };
+    HashMap<u64, GC::Weak<DOM::Document>> m_translation_units_in_flight;
+    Vector<GC::Ref<GC::Function<void()>>> m_translation_settled_callbacks;
 
     bool m_writing_suggestions_available { false };
     HashMap<u64, WritingSuggestionRequest> m_pending_writing_suggestion_requests;
@@ -594,6 +650,9 @@ private:
 
     HashMap<u64, PermissionPromptCallback> m_pending_permission_requests;
     u64 m_next_permission_request_id { 0 };
+
+    HashMap<u64, GC::Ref<NotificationsAPI::Notification>> m_notifications_list;
+    u64 m_next_notification_id { 0 };
 
     // AD-HOC: Denied until the UI process sends the browser-wide setting, so a request cannot observe the test
     //         position in the short window before that arrives.
@@ -688,7 +747,8 @@ public:
     virtual void request_window_focus_of_remote_navigable(HTML::RemoteNavigable&) { VERIFY_NOT_REACHED(); }
     virtual void request_set_opener_of_remote_navigable(HTML::RemoteNavigable&, HTML::Navigable const&) { VERIFY_NOT_REACHED(); }
     virtual void navigation_params_creation_finished(HTML::LocalNavigable&, HTML::NavigationPopulationRequest, HTML::NavigationPopulationResult);
-    virtual void history_navigation_params_creation_finished(HTML::CrossProcessId operation_id, HTML::HistoryNavigationPopulation);
+    virtual void changing_navigable_history_job_reached_population(HTML::CrossProcessId operation_id, HTML::CrossProcessId navigable_id, HTML::NavigationSourceSnapshot);
+    virtual void history_navigation_params_creation_finished(HTML::CrossProcessId operation_id, HTML::CrossProcessId navigable_id, HTML::NavigationPopulationResult);
     virtual void navigation_population_failed(HTML::CrossProcessId, Utf16String const&) { }
     virtual void page_did_create_populated_document_with_an_origin_of_its_own(HTML::CrossProcessId, HTML::CrossProcessId, HTML::PopulatedDocumentOrigin, HTML::EnvironmentId const&) { }
     virtual void page_did_create_child_frame(HTML::CrossProcessId, DOM::Document const&, HTML::CrossProcessId, HTML::HostedNavigableState const&, HTML::PendingSessionHistoryEntryDescriptor const&, URL::Origin const&, HTML::EnvironmentId const&, HTML::CrossProcessId) { }
@@ -701,6 +761,7 @@ public:
     virtual void page_did_destroy_child_frame(HTML::CrossProcessId) { }
     virtual String dump_site_isolation_process_tree_for_testing() { return {}; }
     virtual void crash_remote_frame_processes_for_testing() { }
+    virtual void close_tab_for_testing() { }
     virtual void page_did_spoof_document_origin_for_testing(HTML::EnvironmentSettingsObject const&, URL::Origin const&) { }
     virtual void stop_loading_through_ui_process_for_testing() { }
     virtual void reload_through_ui_process_for_testing([[maybe_unused]] bool bypass_cache) { }
@@ -739,6 +800,8 @@ public:
     }
     virtual HTML::CrossProcessId allocate_navigable_id() { return allocate_cross_process_id(); }
     virtual void request_frame() = 0;
+    // A frame request on behalf of one document, for a client whose page shows many documents.
+    virtual void request_frame_for(DOM::Document const&) { request_frame(); }
     virtual double rendering_frame_interval_in_milliseconds() const { return 1000.0 / 60.0; }
     virtual void rendering_opportunity([[maybe_unused]] i64 frame_time_nanoseconds, [[maybe_unused]] double frame_interval_milliseconds) { }
     virtual void will_begin_rendering_update() { }
@@ -749,7 +812,6 @@ public:
     virtual void page_did_change_title(Utf16String const&) { }
     virtual void page_did_update_editing_history_state(bool, bool) { }
     virtual void page_did_set_text_fragment_indication_visibility(bool) { }
-    virtual void page_did_request_refresh() { }
     virtual void page_did_request_resize_window(Gfx::IntSize, u64) { }
     virtual void page_did_request_reposition_window(Gfx::IntPoint, u64) { }
     virtual void page_did_request_restore_window() { }
@@ -761,13 +823,15 @@ public:
     virtual void page_did_change_picture_in_picture_video_size(Gfx::IntSize) { }
     virtual void page_did_change_picture_in_picture_player_controls_visibility(bool) { }
     virtual void page_did_change_active_document_in_top_level_browsing_context(Web::DOM::Document&) { }
+    virtual void page_did_change_active_document_in_child_navigable(Web::DOM::Document&) { }
     virtual void page_did_finish_loading(HTML::CrossProcessId, HTML::CrossProcessId) { }
-    virtual Optional<u64> page_did_start_download(HTML::CrossProcessId navigable_id, Optional<Utf16String> const& navigation_id, URL::URL const&, ByteString const& suggested_filename, Optional<u64> total_size, int request_server_client_id, u64 request_server_request_id, ByteBuffer initial_data, JsonValue network_response)
+    virtual Optional<u64> page_did_start_download(HTML::CrossProcessId navigable_id, Optional<Utf16String> const& navigation_id, URL::URL const&, ByteString const& suggested_filename, Optional<u64> total_size, HTTP::Cookie::SameSiteContext same_site_context, int request_server_client_id, u64 request_server_request_id, ByteBuffer initial_data, JsonValue network_response)
     {
         (void)navigable_id;
         (void)navigation_id;
         (void)suggested_filename;
         (void)total_size;
+        (void)same_site_context;
         (void)request_server_client_id;
         (void)request_server_request_id;
         (void)initial_data;
@@ -792,17 +856,13 @@ public:
     virtual void page_did_change_accessibility_focus(Web::UniqueNodeID) { }
     virtual void page_did_request_context_menu([[maybe_unused]] HTML::CrossProcessId local_root_id, CSSPixelPoint, ContextMenuForInputEventsTarget, [[maybe_unused]] Optional<Utf16String> misspelled_word, [[maybe_unused]] GC::Ptr<DOM::Range> selected_text_range) { }
     virtual void page_did_request_link_context_menu([[maybe_unused]] HTML::CrossProcessId local_root_id, CSSPixelPoint, HTML::PreparedNavigationDescriptor, [[maybe_unused]] ByteString const& target, [[maybe_unused]] unsigned modifiers, [[maybe_unused]] GC::Ptr<DOM::Range> selected_text_range) { }
-    virtual void page_did_request_image_context_menu([[maybe_unused]] HTML::CrossProcessId local_root_id, CSSPixelPoint, HTML::PreparedNavigationDescriptor, [[maybe_unused]] ByteString const& target, [[maybe_unused]] unsigned modifiers, Optional<Gfx::Bitmap const*>) { }
+    virtual void page_did_request_image_context_menu([[maybe_unused]] HTML::CrossProcessId local_root_id, CSSPixelPoint, HTML::PreparedNavigationDescriptor, [[maybe_unused]] ByteString const& target, [[maybe_unused]] unsigned modifiers, Optional<Gfx::Bitmap const*>, [[maybe_unused]] Optional<HTML::PreparedNavigationDescriptor> link_navigation, [[maybe_unused]] Optional<String> image_mime_type) { }
     virtual void page_did_request_media_context_menu([[maybe_unused]] HTML::CrossProcessId local_root_id, CSSPixelPoint, [[maybe_unused]] ByteString const& target, [[maybe_unused]] unsigned modifiers, Page::MediaContextMenu const&, Optional<HTML::PreparedNavigationDescriptor>) { }
     virtual void page_did_click_link(HTML::PreparedNavigationDescriptor, [[maybe_unused]] ByteString const& target, [[maybe_unused]] unsigned modifiers) { }
     virtual void page_did_middle_click_link(HTML::PreparedNavigationDescriptor, [[maybe_unused]] ByteString const& target, [[maybe_unused]] unsigned modifiers) { }
     virtual void page_did_request_external_url([[maybe_unused]] URL::URL const& url, [[maybe_unused]] URL::Origin const& initiator_origin, [[maybe_unused]] bool has_transient_activation) { }
-    virtual void page_did_request_tooltip_override(CSSPixelPoint, ByteString const&) { }
-    virtual void page_did_stop_tooltip_override() { }
     virtual void page_did_enter_tooltip_area(ByteString const&) { }
     virtual void page_did_leave_tooltip_area() { }
-    virtual void page_did_hover_link(URL::URL const&) { }
-    virtual void page_did_unhover_link() { }
     virtual void page_did_change_favicon(Gfx::Bitmap const&) { }
     virtual void page_did_request_alert(Utf16String const&) { }
     virtual void page_did_request_before_unload(String const&) { }
@@ -862,11 +922,16 @@ public:
     virtual String page_did_request_ui_process_session_history_for_testing() { return "{}"_string; }
     virtual bool page_did_request_has_populated_document_for_testing([[maybe_unused]] HTML::CrossProcessId navigable_id) { return false; }
     virtual bool page_did_request_tab_is_playing_audio_for_testing() { return false; }
+    virtual bool page_did_request_tab_is_heard_playing_audio_for_testing() { return false; }
+    virtual bool page_did_request_tab_is_using_microphone_for_testing() { return false; }
+    virtual bool page_did_request_tab_is_capturing_audio_for_testing() { return false; }
+    virtual void page_did_report_audio_capture_for_testing([[maybe_unused]] Web::PageId labelled_page_id, [[maybe_unused]] bool capturing) { }
+    virtual void page_did_retire_picture_in_picture_window_for_testing() { }
     virtual u64 page_did_request_tab_audibility_change_count_for_testing() { return 0; }
     virtual bool page_did_request_capture_session_history_snapshot_for_testing() { return false; }
     virtual bool page_did_request_restore_session_history_snapshot_for_testing() { return false; }
-    virtual bool page_did_request_register_session_store_tab_for_testing() { return false; }
-    virtual String page_did_request_session_store_tab_state_for_testing() { return "{}"_string; }
+    virtual bool page_did_request_record_reported_session_history_for_testing() { return false; }
+    virtual String page_did_request_reported_session_history_for_testing() { return "{}"_string; }
     virtual void page_did_request_history_operation([[maybe_unused]] HTML::CrossProcessId operation_id, [[maybe_unused]] HistoryOperationParameters parameters) { }
     virtual void page_did_revoke_history_operation([[maybe_unused]] HTML::CrossProcessId operation_id) { }
     virtual void page_did_request_child_navigable_unload([[maybe_unused]] HTML::CrossProcessId navigable_id) { }
@@ -879,6 +944,7 @@ public:
     virtual void page_did_request_unload_check(HTML::CrossProcessId, GC::Ref<GC::Function<void(HTML::CheckIfUnloadingIsCanceledResult)>>) { VERIFY_NOT_REACHED(); }
     virtual void page_did_change_needs_beforeunload_check([[maybe_unused]] bool needs_beforeunload_check) { }
     virtual void page_did_consume_user_activation([[maybe_unused]] HTML::UserActivationConsumption consumption) { }
+    virtual void page_did_notify_about_user_activation([[maybe_unused]] HTML::CrossProcessId document_id) { }
 
     virtual void request_file(FileRequest) = 0;
 
@@ -895,8 +961,19 @@ public:
     virtual Optional<Web::Permissions::PermissionSnapshot> page_did_request_permission_snapshot([[maybe_unused]] URL::Origin const& top_level_origin) { return {}; }
     virtual Optional<Web::Permissions::PermissionSnapshot> page_did_set_permission_for_testing([[maybe_unused]] HTML::CrossProcessId document_id, [[maybe_unused]] String const& name, [[maybe_unused]] String const& state) { return {}; }
     virtual void page_did_set_next_permission_prompt_outcome_for_testing([[maybe_unused]] String const& name, [[maybe_unused]] String const& outcome, [[maybe_unused]] bool held) { }
+    virtual void page_did_set_system_microphone_authorization_for_testing([[maybe_unused]] String const& authorization, [[maybe_unused]] String const& answer, [[maybe_unused]] bool held) { }
+    virtual void page_did_release_system_microphone_answer_for_testing() { }
+    virtual String page_did_request_microphone_state_for_testing() { return "{}"_string; }
     virtual void page_did_release_held_permission_prompt_for_testing([[maybe_unused]] u32 waiters) { }
     virtual Optional<Web::Permissions::PermissionSnapshot> page_did_advance_permission_clock_for_testing([[maybe_unused]] u64 milliseconds) { return {}; }
+    virtual void page_did_request_show_notification([[maybe_unused]] u64 notification_id, [[maybe_unused]] HTML::CrossProcessId document_id, [[maybe_unused]] NotificationsAPI::NotificationData const&, [[maybe_unused]] RefPtr<Gfx::Bitmap const> icon) { }
+    virtual void page_did_request_close_notification([[maybe_unused]] u64 notification_id) { }
+    virtual void page_did_abandon_notification([[maybe_unused]] u64 notification_id) { }
+    virtual void page_did_handle_notification_click([[maybe_unused]] u64 notification_id, [[maybe_unused]] bool into_focus) { }
+    virtual String page_did_request_notifications_state_for_testing() { return "{}"_string; }
+    virtual void page_did_request_click_notification_for_testing([[maybe_unused]] u64 notification_id) { }
+    virtual void page_did_request_click_notification_by_id_for_testing([[maybe_unused]] u64 browser_notification_id) { }
+    virtual void page_did_request_dismiss_notification_for_testing([[maybe_unused]] u64 notification_id) { }
 
     virtual void page_did_finish_test([[maybe_unused]] Utf16String const& text) { }
     virtual void page_did_set_test_timeout([[maybe_unused]] double milliseconds) { }
@@ -908,9 +985,13 @@ public:
     virtual void page_did_change_theme_color(Gfx::Color) { }
     virtual void page_did_change_background_color(Gfx::Color) { }
 
-    virtual void page_did_insert_clipboard_item(Clipboard::SystemClipboardItem const&, [[maybe_unused]] StringView presentation_style) { }
-    virtual void page_did_request_clipboard_entries([[maybe_unused]] u64 request_id) { }
+    virtual void page_did_insert_clipboard_item(Clipboard::SystemClipboardItem const&, [[maybe_unused]] StringView presentation_style, [[maybe_unused]] Optional<HTML::CrossProcessId> writing_document_id) { }
+    virtual void page_did_request_clipboard_entries_for_paste([[maybe_unused]] u64 request_id) { }
+    virtual void page_did_request_clipboard_entries([[maybe_unused]] u64 request_id, [[maybe_unused]] HTML::CrossProcessId reading_document_id) { }
+    virtual void page_did_request_paste_from_clipboard_for_testing() { }
     virtual void page_did_request_spell_check([[maybe_unused]] u64 request_id, [[maybe_unused]] Utf16String const& text) { }
+    virtual void page_did_request_translation([[maybe_unused]] TranslationUnit const&) { }
+    virtual void page_did_request_page_translation_for_testing([[maybe_unused]] String const& target_language) { }
     virtual void page_did_request_writing_suggestion([[maybe_unused]] u64 request_id, [[maybe_unused]] Utf16String const& text, [[maybe_unused]] u32 caret_offset) { }
     virtual void page_did_request_primary_paste() { }
     virtual void page_did_complete_paste_action() { }
@@ -921,6 +1002,8 @@ public:
     virtual NonnullOwnPtr<MediaClient::RemotePlaybackManager> create_media_playback_manager();
     // A media element adopted from another page's document plays its sound for this page from then on.
     virtual void rebind_media_playback_manager(MediaClient::RemotePlaybackManager&);
+    // Every microphone track captures through its own, for this page.
+    virtual NonnullRefPtr<Core::Promise<NonnullRefPtr<Audio::RecordStream>>> create_audio_record_stream(StringView device_id, Function<void(ReadonlyBytes, Audio::SampleSpecification const&)>);
     virtual void page_did_change_screen_wake_lock_state(ScreenWakeLockState) { }
 
     virtual void page_did_start_using_gamepads() { }
@@ -947,8 +1030,14 @@ public:
     virtual void page_did_report_navigation_violation_of_remote_client([[maybe_unused]] HTML::RemoteClientNavigation const& navigation, [[maybe_unused]] u64 policy_index, [[maybe_unused]] ContentSecurityPolicy::RemoteViolationDirective directive, [[maybe_unused]] bool url_is_https) { }
     virtual void page_did_register_javascript_source([[maybe_unused]] DOM::Document&, [[maybe_unused]] HTML::ScriptRegistry::Description const&) { }
     virtual void page_did_post_broadcast_channel_message([[maybe_unused]] HTML::PostedBroadcastChannelMessage const& message) { }
+    virtual void page_did_close_shared_worker() { }
 
-    virtual HTML::WorkerAgentId start_worker_agent([[maybe_unused]] HTML::WorkerAgentStartRequest&& request) { return {}; }
+    struct StartedWorkerAgent {
+        HTML::WorkerAgentId agent_id { 0 };
+        bool is_hosted_in_this_process { false };
+    };
+    virtual StartedWorkerAgent start_worker_agent([[maybe_unused]] HTML::WorkerAgentStartRequest&& request) { return {}; }
+    virtual RefPtr<HTML::DedicatedWorkerThreadLink> start_dedicated_worker([[maybe_unused]] HTML::WorkerAgentStartRequest&& request) { return {}; }
     virtual void close_worker_agent([[maybe_unused]] HTML::WorkerAgentId agent_id, [[maybe_unused]] HTML::WorkerAgentOwnerToken owner_token) { }
 
     virtual void page_did_mutate_dom([[maybe_unused]] Utf16FlyString const& type, [[maybe_unused]] DOM::Node const& target, [[maybe_unused]] DOM::NodeList& added_nodes, [[maybe_unused]] DOM::NodeList& removed_nodes, [[maybe_unused]] GC::Ptr<DOM::Node> previous_sibling, [[maybe_unused]] GC::Ptr<DOM::Node> next_sibling, [[maybe_unused]] Optional<Utf16FlyString> const& attribute_name) { }

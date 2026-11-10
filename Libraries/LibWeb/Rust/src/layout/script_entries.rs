@@ -223,6 +223,91 @@ pub extern "C" fn layout_script_text_caret_rect_in_dom_range(
     });
 }
 
+/// Calls `push_source` with what the character geometry of the text node `primary` is computed from: for each of its
+/// layout nodes, a retained reference to its containing block's line content, and the raw document-absolute position
+/// of that block. The same references at the same positions mean the same geometry. The consumer owns every reference
+/// pushed, and releases each one with layout_release_inline_content(). Returns false when the geometry depends on more
+/// than this: when a block is fragmented, or holds no line content.
+///
+/// # Safety
+///
+/// The callback must be sound to call with `context`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn layout_script_text_geometry_sources(
+    host: &DocumentHost,
+    primary: NodeSlotId,
+    context: *mut c_void,
+    push_source: unsafe extern "C" fn(*mut c_void, *const c_void, i32, i32),
+) -> bool {
+    read_rows(host, |arena| {
+        let fragments = arena.text_fragments(primary);
+        let node_slots = fragments.as_slice();
+        if node_slots.is_empty() {
+            return false;
+        }
+        for &node in node_slots {
+            let Some(block) = crate::painting::text_fragment::containing_block_paintable_of_node(arena, node) else {
+                return false;
+            };
+            let side_data = arena.committed_side_data(block);
+            let Some(content) = side_data.inline_content.as_ref() else {
+                return false;
+            };
+            // Lines in different fragments of a block can each move on their own.
+            if side_data.box_fragments().len() > 1 {
+                return false;
+            }
+            let position = crate::painting::paintable_geometry::absolute_line_root_position(arena, block, 0);
+            let retained = std::sync::Arc::into_raw(content.clone()).cast::<c_void>();
+            // SAFETY: The consumer takes ownership of the reference, and copies the position synchronously.
+            unsafe { push_source(context, retained, position.x.raw_value(), position.y.raw_value()) };
+        }
+        true
+    })
+}
+
+/// Releases a reference to line content that layout_script_text_geometry_sources() handed out.
+///
+/// # Safety
+///
+/// `content` must be a reference layout_script_text_geometry_sources() pushed, released only once.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn layout_release_inline_content(content: *const c_void) {
+    if content.is_null() {
+        return;
+    }
+    // SAFETY: The caller passes a reference from Arc::into_raw() in layout_script_text_geometry_sources(), once.
+    drop(unsafe { std::sync::Arc::from_raw(content.cast::<crate::layout::inline_content::InlineContent>()) });
+}
+
+/// Calls `push_position` with each DOM offset (in UTF-16 code units) of the text node `primary` that one of its
+/// horizontal fragments renders, along with the document-absolute x coordinate where that offset's character starts,
+/// read from the fragment's shaped glyph run. `is_fragment_end` marks the offset one past a fragment's last character,
+/// whose x is where that fragment's text ends.
+///
+/// # Safety
+///
+/// The callback must be sound to call with `context`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn layout_script_text_character_x_positions(
+    host: &DocumentHost,
+    primary: NodeSlotId,
+    context: *mut c_void,
+    push_position: unsafe extern "C" fn(*mut c_void, usize, f32, bool),
+) {
+    read_rows(host, |arena| {
+        let fragments = arena.text_fragments(primary);
+        crate::painting::text_fragment::for_each_fragment_of_nodes(arena, fragments.as_slice(), |_, _, fragment| {
+            let end = fragment.dom_end_offset_in_node;
+            crate::painting::text_fragment::for_each_dom_offset_x(arena, fragment, |dom_offset, x| {
+                // SAFETY: The consumer copies the plain-data position synchronously.
+                unsafe { push_position(context, dom_offset, x, dom_offset == end) };
+            });
+            true
+        });
+    });
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn layout_script_text_caret_rect_for_position(
     host: &DocumentHost,
@@ -361,16 +446,17 @@ pub extern "C" fn layout_script_has_sticky_positioned_inclusive_ancestor(
     })
 }
 
-/// The offset by which sticky positioning moves the box, as the sum of the offsets of the sticky positioned box and
-/// its sticky positioned ancestors.
-#[unsafe(no_mangle)]
-pub extern "C" fn layout_script_accumulated_sticky_offset(
+fn spatial_chain_offset_in_css_pixels(
     host: &DocumentHost,
     slot: NodeSlotId,
     rect_to_viewport_transform: FfiRectToViewportTransform<'_>,
-    out: &mut crate::painting::ffi::FfiOptionalCssPixelPoint,
-) {
-    *out = read_rows(host, |arena| {
+    device_offset_of_spatial_chain: impl Fn(
+        &crate::painting::visual_context::VisualContextTree,
+        crate::painting::visual_context::SpatialNodeIndex,
+        &[libgfx_rust::FloatPoint],
+    ) -> libgfx_rust::FloatPoint,
+) -> crate::painting::ffi::FfiOptionalCssPixelPoint {
+    read_rows(host, |arena| {
         let mut result = crate::painting::ffi::FfiOptionalCssPixelPoint {
             has_value: false,
             x: CssPixels::from_raw(0),
@@ -383,15 +469,46 @@ pub extern "C" fn layout_script_accumulated_sticky_offset(
             return result;
         }
         let spatial = arena.paintable_data(slot).accumulated_visual_context.spatial;
-        let offset = transform
-            .visual_context_tree
-            .accumulated_sticky_offset(spatial, transform.scroll_offsets);
+        let offset = device_offset_of_spatial_chain(transform.visual_context_tree, spatial, transform.scroll_offsets);
         let inverse_pixel_ratio = 1.0 / transform.device_pixels_per_css_pixel;
         result.has_value = true;
         result.x = CssPixels::nearest_value_for_f32(offset.x * inverse_pixel_ratio);
         result.y = CssPixels::nearest_value_for_f32(offset.y * inverse_pixel_ratio);
         result
-    });
+    })
+}
+
+/// The offset by which sticky positioning moves the box, as the sum of the offsets of the sticky positioned box and
+/// its sticky positioned ancestors.
+#[unsafe(no_mangle)]
+pub extern "C" fn layout_script_accumulated_sticky_offset(
+    host: &DocumentHost,
+    slot: NodeSlotId,
+    rect_to_viewport_transform: FfiRectToViewportTransform<'_>,
+    out: &mut crate::painting::ffi::FfiOptionalCssPixelPoint,
+) {
+    *out = spatial_chain_offset_in_css_pixels(
+        host,
+        slot,
+        rect_to_viewport_transform,
+        crate::painting::visual_context::VisualContextTree::accumulated_sticky_offset,
+    );
+}
+
+/// The offset by which scrolling, sticky positioning and anchor scroll shifts move the box, without its transforms.
+#[unsafe(no_mangle)]
+pub extern "C" fn layout_script_offset_to_viewport_ignoring_transforms(
+    host: &DocumentHost,
+    slot: NodeSlotId,
+    rect_to_viewport_transform: FfiRectToViewportTransform<'_>,
+    out: &mut crate::painting::ffi::FfiOptionalCssPixelPoint,
+) {
+    *out = spatial_chain_offset_in_css_pixels(
+        host,
+        slot,
+        rect_to_viewport_transform,
+        crate::painting::visual_context::VisualContextTree::offset_to_viewport_ignoring_transforms,
+    );
 }
 
 #[unsafe(no_mangle)]
@@ -661,7 +778,6 @@ pub unsafe extern "C" fn layout_script_find_matching_text(
 /// A min or max sizing property, whose anchor-size() functions the abspos engine resolves.
 #[repr(u8)]
 #[derive(Clone, Copy)]
-#[expect(dead_code, reason = "C++ constructs the variants")]
 pub enum FfiAnchorSizedProperty {
     MinWidth,
     MinHeight,

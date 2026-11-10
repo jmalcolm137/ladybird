@@ -10,8 +10,11 @@
 //! boolean followed by the value, and a sequence as its size followed by its elements. File descriptors and port rights
 //! go beside the bytes, as attachments, in the order they are encoded.
 
+#[cfg(windows)]
+use crate::transport_windows::OwnedDescriptor;
 use std::collections::VecDeque;
-use std::os::fd::OwnedFd;
+#[cfg(unix)]
+use std::os::fd::OwnedFd as OwnedDescriptor;
 
 use crate::attachment::Attachment;
 
@@ -423,7 +426,7 @@ pub fn validate_utf8(mut bytes: &[u8]) -> Result<(), DecodeError> {
     Ok(())
 }
 
-/// `Utf16String`: whether its code units are stored as ASCII bytes, their count, then the code units.
+/// `Utf16String`: whether its code units are stored as Latin-1 bytes, their count, then the code units.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct Utf16String(pub Vec<u16>);
 
@@ -441,10 +444,10 @@ impl Utf16String {
 
 impl Encode for Utf16String {
     fn encode(&self, encoder: &mut Encoder) -> Result<(), EncodeError> {
-        let is_ascii = self.0.iter().all(|&code_unit| code_unit < 0x80);
-        is_ascii.encode(encoder)?;
+        let is_latin1 = self.0.iter().all(|&code_unit| code_unit <= 0xFF);
+        is_latin1.encode(encoder)?;
         encoder.encode_size(self.0.len())?;
-        if is_ascii {
+        if is_latin1 {
             encoder.bytes.reserve(self.0.len());
             encoder.bytes.extend(self.0.iter().map(|&code_unit| code_unit as u8));
         } else {
@@ -458,13 +461,10 @@ impl Decode for Utf16String {
     const MIN_ENCODED_SIZE: usize = 5;
 
     fn decode(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
-        let is_ascii = decoder.decode::<bool>()?;
+        let is_latin1 = decoder.decode::<bool>()?;
         let length = decoder.decode_size()?;
-        if is_ascii {
+        if is_latin1 {
             let bytes = decoder.read_bytes(length)?;
-            if !bytes.is_ascii() {
-                return Err(DecodeError::InvalidValue("Utf16String with ASCII storage"));
-            }
             return Ok(Self(bytes.iter().map(|&byte| u16::from(byte)).collect()));
         }
         let byte_count = length.checked_mul(2).ok_or(DecodeError::SizeTooLarge(length))?;
@@ -577,17 +577,23 @@ impl<T: Decode> Decode for Option<T> {
 
 /// `IPC::File`: a file descriptor, which goes as an attachment.
 #[derive(Debug)]
-pub struct File(pub OwnedFd);
+pub struct File(pub OwnedDescriptor);
 
 impl Encode for File {
     fn encode(&self, encoder: &mut Encoder) -> Result<(), EncodeError> {
         let fd = self.0.try_clone().map_err(EncodeError::Attachment)?;
+        #[cfg(unix)]
         encoder.append_attachment(Attachment::from_fd(fd).map_err(EncodeError::Attachment)?);
+        #[cfg(windows)]
+        encoder.append_attachment(Attachment::from_descriptor(fd));
         Ok(())
     }
 
     fn encode_owned(self, encoder: &mut Encoder) -> Result<(), EncodeError> {
+        #[cfg(unix)]
         encoder.append_attachment(Attachment::from_fd(self.0).map_err(EncodeError::Attachment)?);
+        #[cfg(windows)]
+        encoder.append_attachment(Attachment::from_descriptor(self.0));
         Ok(())
     }
 }
@@ -595,6 +601,9 @@ impl Encode for File {
 impl Decode for File {
     fn decode(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
         let attachment = decoder.take_attachment()?;
+        #[cfg(windows)]
+        return Ok(Self(attachment.into_descriptor()));
+        #[cfg(unix)]
         Ok(Self(
             attachment
                 .into_fd()
@@ -625,9 +634,10 @@ pub fn decode_message_header(decoder: &mut Decoder<'_>) -> Result<(u32, i32), De
     Ok((decoder.decode()?, decoder.decode()?))
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
+    use std::os::fd::OwnedFd;
 
     fn round_trip<T: Encode + Decode>(value: &T) -> (T, Vec<u8>) {
         let mut encoder = Encoder::new();
@@ -763,20 +773,20 @@ mod tests {
     }
 
     #[test]
-    fn utf16_strings_go_as_ascii_bytes_when_they_can() {
+    fn utf16_strings_go_as_latin1_bytes_when_they_can() {
         let (value, bytes) = round_trip(&Utf16String::from("ab"));
         assert_eq!(value.to_string_lossy(), "ab");
         assert_eq!(bytes, [1, 2, 0, 0, 0, b'a', b'b']);
 
-        for units in [vec![], vec![0x7f], vec![0x80, 0xd800, 0xffff]] {
+        for units in [vec![], vec![0x7f], vec![0x80, 0xe9, 0xff], vec![0x100, 0xd800, 0xffff]] {
             let value = Utf16String(units.clone());
             let (decoded, bytes) = round_trip(&value);
             assert_eq!(decoded, value);
-            let is_ascii = units.iter().all(|&unit| unit < 0x80);
-            let mut expected = vec![u8::from(is_ascii)];
+            let is_latin1 = units.iter().all(|&unit| unit <= 0xff);
+            let mut expected = vec![u8::from(is_latin1)];
             expected.extend_from_slice(&(units.len() as u32).to_ne_bytes());
             for unit in units {
-                if is_ascii {
+                if is_latin1 {
                     expected.push(unit as u8);
                 } else {
                     expected.extend_from_slice(&unit.to_ne_bytes());

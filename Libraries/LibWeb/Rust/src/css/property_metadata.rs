@@ -218,7 +218,7 @@ pub struct FfiPropertyNumericRange {
 }
 
 pub fn property_numeric_ranges(property_id: u16) -> &'static [FfiPropertyNumericRange] {
-    PROPERTY_NUMERIC_RANGES[longhand_index(property_id)]
+    PROPERTY_NUMERIC_RANGES[property_index(property_id)]
 }
 
 /// Returns the longhand property identifiers in computation order.
@@ -297,15 +297,13 @@ fn shorthand_leaf_longhands() -> &'static [(u16, Box<[u16]>)] {
     })
 }
 
-/// The shorthand whose longhands, through any shorthand nested in it, are exactly `longhands`: the one a value pending
-/// substitution in each of them was written for.
-pub(crate) fn shorthand_with_leaf_longhands(mut longhands: Vec<u16>) -> Option<u16> {
-    longhands.sort_unstable();
-    longhands.dedup();
-    shorthand_leaf_longhands()
-        .iter()
-        .find(|(_, leaves)| **leaves == *longhands)
-        .map(|(shorthand, _)| *shorthand)
+/// Whether `longhand` is one of the longhands of `shorthand`, through any shorthand nested in it.
+pub(crate) fn shorthand_has_leaf_longhand(shorthand: u16, longhand: u16) -> bool {
+    property_is_shorthand(shorthand)
+        && shorthand_leaf_longhands()[usize::from(shorthand - FIRST_SHORTHAND_PROPERTY_ID)]
+            .1
+            .binary_search(&longhand)
+            .is_ok()
 }
 
 /// The shorthands whose longhands, through any shorthand nested in it, include all of `longhands`, with the fewest
@@ -326,6 +324,23 @@ pub fn longhands_for_shorthand(property_id: u16) -> &'static [u16] {
         return &[];
     }
     SHORTHAND_EXPANSIONS[(property_id - FIRST_SHORTHAND_PROPERTY_ID) as usize]
+}
+
+/// The longhands of a shorthand, through any shorthand nested in it.
+pub(crate) fn expanded_longhands_for_shorthand(property_id: u16) -> &'static [u16] {
+    if !property_is_shorthand(property_id) {
+        return &[];
+    }
+    EXPANDED_LONGHANDS_FOR_SHORTHAND[(property_id - FIRST_SHORTHAND_PROPERTY_ID) as usize]
+}
+
+/// The shorthands a property maps to, in preferred order.
+pub(crate) fn shorthands_for_longhand(property_id: u16) -> &'static [u16] {
+    SHORTHANDS_FOR_LONGHAND[property_index(property_id)]
+}
+
+pub(crate) fn property_is_legacy_shorthand(property_id: u16) -> bool {
+    LEGACY_SHORTHANDS.binary_search(&property_id).is_ok()
 }
 
 pub(crate) fn property_is_positional_value_list_shorthand(property_id: u16) -> bool {

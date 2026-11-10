@@ -12,9 +12,11 @@
 #include <LibWeb/HTML/AnimationFrameCallbackDriver.h>
 #include <LibWeb/HTML/DedicatedWorkerGlobalScope.h>
 #include <LibWeb/HTML/EventHandler.h>
+#include <LibWeb/HTML/EventLoop/EventLoop.h>
 #include <LibWeb/HTML/EventNames.h>
 #include <LibWeb/HTML/MessageEvent.h>
 #include <LibWeb/HTML/MessagePort.h>
+#include <LibWeb/HTML/Scripting/Environments.h>
 #include <LibWeb/HTML/Scripting/ExceptionReporter.h>
 #include <LibWeb/HTML/StructuredSerialize.h>
 #include <LibWeb/Page/Page.h>
@@ -75,11 +77,11 @@ WebIDL::ExceptionOr<WebIDL::UnsignedLong> DedicatedWorkerGlobalScope::request_an
     // 3. Increment target's animation frame callback identifier by one, and let handle be the result.
     // 4. Let callbacks be target's map of animation frame callbacks.
     // 5. Set callbacks[handle] to callback.
-    auto handle = animation_frame_callback_driver().add(GC::create_function(heap(), [this, callback](double now) {
+    auto handle = animation_frame_callback_driver().add(GC::create_function(heap(), GC::captures(*this, callback), [](auto& self, auto& callback, double now) {
         // Invoke callback with « now » and "report".
         auto result = WebIDL::invoke_callback(*callback, {}, { { JS::Value(now) } });
         if (result.is_error())
-            report_exception(result, realm());
+            report_exception(result, self.realm());
     }));
     schedule_rendering_update();
 
@@ -125,8 +127,12 @@ bool DedicatedWorkerGlobalScope::has_animation_frame_callbacks() const
 void DedicatedWorkerGlobalScope::schedule_rendering_update()
 {
     if (!m_rendering_update_timer) {
-        m_rendering_update_timer = Platform::Timer::create_single_shot(heap(), AK::Duration::from_milliseconds(0), GC::create_function(heap(), [this] {
-            run_rendering_update();
+        m_rendering_update_timer = Platform::Timer::create_single_shot(heap(), AK::Duration::from_milliseconds(0), GC::create_function(heap(), GC::captures(*this), [](auto& self) {
+            if (relevant_settings_object(self).responsible_event_loop().execution_paused()) {
+                self.schedule_rendering_update();
+                return;
+            }
+            self.run_rendering_update();
         }));
     }
     if (m_rendering_update_timer->is_active())
@@ -180,7 +186,7 @@ WebIDL::ExceptionOr<void> DedicatedWorkerGlobalScope::post_message(JS::Realm& re
     // The postMessage(message, transfer) and postMessage(message, options) methods on DedicatedWorkerGlobalScope objects act as if,
     // when invoked, it immediately invoked the respective postMessage(message, transfer) and postMessage(message, options)
     // on the port, with the same arguments, and returned the same return value.
-    return m_internal_port->post_message(realm, message, options);
+    return m_internal_port->post_message(realm, message, options.transfer);
 }
 
 WebIDL::ExceptionOr<void> DedicatedWorkerGlobalScope::post_message(JS::Realm& realm, JS::Value message, Bindings::StructuredSerializeOptions const& options)
@@ -211,7 +217,7 @@ void DedicatedWorkerGlobalScope::set_onmessage(WebIDL::CallbackType* callback)
     // https://html.spec.whatwg.org/multipage/web-messaging.html#message-ports:handler-messageeventtarget-onmessage
     // The first time a MessagePort object's onmessage IDL attribute is set, the port's port message queue must be enabled,
     // as if the start() method had been called.
-    m_internal_port->start();
+    m_internal_port->enable();
 }
 
 void DedicatedWorkerGlobalScope::set_onmessageerror(WebIDL::CallbackType* callback)
@@ -222,6 +228,16 @@ void DedicatedWorkerGlobalScope::set_onmessageerror(WebIDL::CallbackType* callba
 WebIDL::CallbackType* DedicatedWorkerGlobalScope::onmessageerror()
 {
     return event_handler_attribute(EventNames::messageerror);
+}
+
+WebIDL::CallbackType* DedicatedWorkerGlobalScope::onrtctransform()
+{
+    return event_handler_attribute(EventNames::rtctransform);
+}
+
+void DedicatedWorkerGlobalScope::set_onrtctransform(WebIDL::CallbackType* callback)
+{
+    set_event_handler_attribute(EventNames::rtctransform, callback);
 }
 
 }

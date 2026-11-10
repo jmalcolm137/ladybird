@@ -22,7 +22,6 @@ static NEXT_SHEET_IDENTITY: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Copy)]
 #[repr(u8)]
-#[cfg_attr(not(test), expect(dead_code, reason = "Flags are selected by CSSOM through FFI"))]
 pub enum NativeStyleSheetFlag {
     Disabled = 1,
     Alternate = 2,
@@ -546,6 +545,51 @@ pub extern "C" fn rust_style_sheet_publish_conditions(
         conditions.push((identity, holds));
     });
     write_rule_conditions(host, conditions);
+}
+
+/// Queue the rules of a user agent sheet a document just attached whose conditions do not hold in it: those of the
+/// others hold in a document until it hears otherwise.
+#[unsafe(no_mangle)]
+pub extern "C" fn rust_style_sheet_publish_failing_conditions(
+    sheet: &NativeStyleSheet,
+    host: &crate::render_state::DocumentHost,
+    environment: FfiMediaEnvironment<'_>,
+) {
+    let mut conditions = Vec::new();
+    sheet.visit_conditions(environment.borrow(), true, &mut |identity, holds| {
+        if !holds {
+            conditions.push((identity, holds));
+        }
+    });
+    write_rule_conditions(host, conditions);
+}
+
+/// Have the process build the user agent index of the documents deciding with `sheet` alone, as `environment` says its
+/// conditions, off the thread of the document that would otherwise build it as it first needs it.
+#[unsafe(no_mangle)]
+pub extern "C" fn rust_user_agent_style_sheet_index_ahead(
+    sheet: &NativeStyleSheet,
+    environment: FfiMediaEnvironment<'_>,
+) {
+    let mut failing = Vec::new();
+    sheet.visit_conditions(environment.borrow(), true, &mut |identity, holds| {
+        if !holds {
+            failing.push(identity);
+        }
+    });
+    crate::render_state::process_style().index_user_agent_sheet_ahead(sheet.identity(), &failing);
+}
+
+/// Lets go of the parsed sheets and sheet segments only the process keeps and nothing asked for lately.
+#[unsafe(no_mangle)]
+pub extern "C" fn rust_style_prune_kept_data() {
+    crate::render_state::process_style().prune_kept_past_release();
+}
+
+/// Lets go of all the parsed sheets and sheet segments only the process keeps, for a process short of memory.
+#[unsafe(no_mangle)]
+pub extern "C" fn rust_style_release_kept_data() {
+    crate::render_state::process_style().release_kept_past_release();
 }
 
 /// Writes whether the conditions of each rule hold, for the rules the engine has.

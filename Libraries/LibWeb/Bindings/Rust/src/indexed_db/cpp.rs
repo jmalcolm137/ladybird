@@ -6,46 +6,28 @@
 
 //! What IndexedDB asks of LibWeb's C++ code, defined in Libraries/LibWeb/IndexedDB/RustIntegration.cpp.
 
-use std::rc::Rc;
-
 use core::ffi::c_void;
 use core::ptr::NonNull;
 
 use ak::Utf16String;
-use libjs_rust::api::{EmbedderCell, Gc, Object, RawNativeFunctionResult, Realm, Trace, Value, Vm};
-use liburl_rust::FfiOrigin;
-use liburl_rust::origin::Origin;
+use libjs_rust::api::{EmbedderCell, Gc, Object, Realm, Trace, Vm};
 
 use crate::bindings::conversions::CppInterface;
 use crate::bindings::cpp_cell::CppCell;
-use crate::bindings::{CallContext, Exception, WebIdlResult};
-use crate::indexed_db::idb_record::StorageSerializationRecord;
+use crate::bindings::{CallContext, Exception};
 use crate::indexed_db::internal::database::Database;
 use crate::indexed_db::internal::function::{Function, FunctionCell, call_function};
 use crate::indexed_db::internal::key::{Key, KeyValue};
 use crate::indexed_db::internal::mutation_log::{TransactionChange, TransactionChanges};
-use crate::indexed_db::internal::storage::StorageKey;
 
 unsafe extern "C" {
     fn web_indexed_db_create_dom_exception(name: ak::Span<'_, u8>, message: usize) -> *mut c_void;
     fn web_indexed_db_dom_exception_from_value(value: u64) -> *mut c_void;
     fn web_indexed_db_wrap_dom_exception(realm: *mut c_void, exception: *mut c_void) -> *mut c_void;
-    fn web_indexed_db_obtain_a_storage_key(
-        realm: *mut c_void,
-        ctx: *mut c_void,
-        on_origin: unsafe extern "C" fn(*mut c_void, *const FfiOrigin),
-    ) -> bool;
     fn web_indexed_db_create_dom_string_list(realm: *mut c_void, strings: *const usize, count: usize) -> *mut c_void;
-    fn web_indexed_db_structured_serialize_for_storage(
-        realm: *mut c_void,
-        value: u64,
-        bytes: *mut c_void,
-        append: unsafe extern "C" fn(*mut c_void, *const u8, usize),
-    ) -> RawNativeFunctionResult;
-    fn web_indexed_db_structured_deserialize(realm: *mut c_void, bytes: ak::Span<'_, u8>) -> RawNativeFunctionResult;
     fn web_indexed_db_queue_a_database_task(cell: *mut c_void, steps: unsafe extern "C" fn(*mut c_void, *mut c_void));
     fn web_indexed_db_run_in_parallel(cell: *mut c_void, steps: unsafe extern "C" fn(*mut c_void, *mut c_void));
-    fn web_indexed_db_main_thread_event_loop() -> *mut c_void;
+    fn web_indexed_db_current_event_loop() -> *mut c_void;
     fn web_indexed_db_enqueue_check_pending_connection_wait(database: *mut c_void);
     fn web_indexed_db_devtools_client_is_active(realm: *mut c_void) -> bool;
     fn web_indexed_db_create_transaction_changes() -> *mut c_void;
@@ -111,20 +93,6 @@ impl DomException {
     }
 }
 
-/// https://storage.spec.whatwg.org/#obtain-a-storage-key, given the relevant settings object of the realm's global
-/// object.
-pub(crate) fn obtain_a_storage_key(realm: Gc<Realm>) -> Option<StorageKey> {
-    unsafe extern "C" fn on_origin(ctx: *mut c_void, ffi_origin: *const FfiOrigin) {
-        // SAFETY: ctx is the origin below, and LibWeb lends the origin for the call.
-        unsafe { *ctx.cast::<Option<Origin>>() = Some((*ffi_origin).to_origin()) };
-    }
-
-    let mut origin: Option<Origin> = None;
-    // SAFETY: The realm is live, and the origin outlives the call.
-    unsafe { web_indexed_db_obtain_a_storage_key(realm.as_ptr().cast(), (&raw mut origin).cast(), on_origin) };
-    origin.map(|origin| StorageKey { origin })
-}
-
 pub(crate) fn create_dom_string_list(cx: &CallContext, strings: &[Utf16String]) -> CppInterface {
     let raw_strings: Vec<usize> = strings.iter().map(Utf16String::raw_identity).collect();
     // SAFETY: The realm is live, the strings are lent for the call, and LibWeb returns a live wrapper.
@@ -134,39 +102,6 @@ pub(crate) fn create_dom_string_list(cx: &CallContext, strings: &[Utf16String]) 
     let wrapper = NonNull::new(wrapper.cast::<Object>()).expect("LibWeb returns a wrapper");
     // SAFETY: The wrapper is a live wrapper of a DOMStringList.
     unsafe { CppInterface::from_wrapper(Gc::from_non_null(wrapper)) }
-}
-
-// https://html.spec.whatwg.org/multipage/structured-data.html#structuredserializeforstorage
-pub(crate) fn structured_serialize_for_storage(
-    cx: &CallContext,
-    value: Value,
-) -> WebIdlResult<StorageSerializationRecord> {
-    unsafe extern "C" fn append(bytes: *mut c_void, data: *const u8, length: usize) {
-        // SAFETY: The bytes are the Vec below, and LibWeb passes that many bytes.
-        unsafe { (*bytes.cast::<Vec<u8>>()).extend_from_slice(ak::slice_from_raw_parts(data, length)) };
-    }
-
-    let mut bytes: Vec<u8> = Vec::new();
-    // SAFETY: The realm and the value are live, and the bytes outlive the call.
-    unsafe {
-        web_indexed_db_structured_serialize_for_storage(
-            cx.realm().as_ptr().cast(),
-            value.to_raw(),
-            (&raw mut bytes).cast(),
-            append,
-        )
-    }
-    .into_completion()?;
-    Ok(Rc::from(bytes))
-}
-
-// https://html.spec.whatwg.org/multipage/structured-data.html#structureddeserialize
-pub(crate) fn structured_deserialize(cx: &CallContext, serialized: &StorageSerializationRecord) -> WebIdlResult<Value> {
-    // SAFETY: The realm is live, and the bytes are lent for the call.
-    Ok(
-        unsafe { web_indexed_db_structured_deserialize(cx.realm().as_ptr().cast(), ak::Span::new(serialized)) }
-            .into_completion()?,
-    )
 }
 
 unsafe extern "C" fn run_function(vm: *mut c_void, cell: *mut c_void) {
@@ -195,9 +130,9 @@ pub(crate) fn run_in_parallel(_: &Vm, steps: Function) {
 }
 
 /// https://html.spec.whatwg.org/multipage/webappapis.html#main-thread-event-loop
-pub(crate) fn main_thread_event_loop() -> CppCell {
+pub(crate) fn current_event_loop() -> CppCell {
     // SAFETY: LibWeb returns the live event loop.
-    unsafe { CppCell::from_raw(web_indexed_db_main_thread_event_loop()) }
+    unsafe { CppCell::from_raw(web_indexed_db_current_event_loop()) }
 }
 
 /// Checks the database's pending connection wait after the collection that runs a finalizer, if the database is still

@@ -4,12 +4,12 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-use crate::css::declaration_block::{DeclarationBlock, DeclarationBlockData};
+use crate::css::declaration_block::{DeclarationBlock, SharedDeclarationBlock};
 use std::sync::Arc;
 
 pub struct KeyframeData {
     pub(crate) keys: Box<[f64]>,
-    pub(crate) declarations: Arc<DeclarationBlockData>,
+    pub(crate) declarations: SharedDeclarationBlock,
 }
 
 pub struct FfiKeyframe {
@@ -26,7 +26,7 @@ impl FfiKeyframe {
         &self.data.keys
     }
 
-    pub(crate) fn declarations(&self) -> Arc<DeclarationBlockData> {
+    pub(crate) fn declarations(&self) -> SharedDeclarationBlock {
         self.declarations.data()
     }
 
@@ -35,20 +35,6 @@ impl FfiKeyframe {
             declarations: DeclarationBlock::new(data.declarations.clone()),
             data,
         }
-    }
-}
-
-#[repr(C)]
-pub struct FfiKeyframeKeys {
-    pub values: *const f64,
-    pub count: usize,
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn rust_keyframe_keys(frame: &FfiKeyframe) -> FfiKeyframeKeys {
-    FfiKeyframeKeys {
-        values: frame.keys().as_ptr(),
-        count: frame.keys().len(),
     }
 }
 

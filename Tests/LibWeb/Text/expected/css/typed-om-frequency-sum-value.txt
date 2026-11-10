@@ -1,0 +1,8 @@
+hz
+khz
+calc(1hz + 1khz)
+1000hz
+1001hz
+1.001khz
+2000hz
+false

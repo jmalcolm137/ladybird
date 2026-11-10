@@ -11,10 +11,11 @@ use core::ffi::c_void;
 
 pub use crate::gc::class::Class;
 pub use crate::gc::foreign::ForeignCellSlot;
-pub use crate::runtime::object::PrivateElements;
+pub use crate::runtime::descriptor_array::DescriptorArray;
 pub use crate::runtime::private_environment::PrivateEnvironmentStorage;
 pub use crate::runtime::realm::RealmStorage;
 pub use crate::runtime::shape::ShapeStorage;
+pub use crate::runtime::special_property_cache::SpecialPropertyCache;
 pub use crate::runtime::symbol::Symbol;
 pub use crate::runtime::watchpoint_set::WatchpointSetStorage;
 pub use ak::Utf16StringDataHeader;
@@ -74,3 +75,42 @@ pub use crate::runtime::ecmascript_function_object::EcmascriptFunctionObjectStor
 pub use crate::runtime::shared_function_instance_data::SharedFunctionInstanceDataStorage;
 
 pub use crate::runtime::typed_array::TypedArrayBaseStorage;
+
+/// A copy of LibGC's js_heap_region_base, which initialize_heap_region_base() fills in before this copy of the runtime
+/// creates its first heap, so before any cell that it could decode exists, and which never changes after that.
+struct HeapRegionBaseCopy(core::cell::UnsafeCell<usize>);
+
+// SAFETY: The copy is written once, before any cell that this runtime decodes exists, and every read of it is of a cell
+//         that some thread has made since, which it had to synchronize with to get at.
+unsafe impl Sync for HeapRegionBaseCopy {}
+
+// OPTIMIZATION: A copy of the base in this library, which a decode reads with one PC-relative load instead of a load of
+//               js_heap_region_base's address from the GOT first. It is a plain load, which the compiler can hoist out
+//               of loops, where an atomic one would have to stay in them.
+static HEAP_REGION_BASE: HeapRegionBaseCopy = HeapRegionBaseCopy(core::cell::UnsafeCell::new(0));
+
+/// The base of the heap region, which compressed cell pointers and cell values are offsets from. Zero until the runtime
+/// creates its first heap.
+#[inline(always)]
+pub fn heap_region_base() -> usize {
+    // SAFETY: Nothing writes the copy after the first cell exists, see HeapRegionBaseCopy.
+    unsafe { *HEAP_REGION_BASE.0.get() }
+}
+
+/// Fills in the copy of the heap region base, which reserves the region if LibGC has not yet. Every heap that the runtime
+/// reaches cells of is one that it creates, and it calls this before creating one.
+///
+/// NB: This is not left to a static initializer elsewhere, which a static link drops along with the rest of its object
+///     when nothing references that object.
+pub fn initialize_heap_region_base() {
+    static INITIALIZE: std::sync::Once = std::sync::Once::new();
+    INITIALIZE.call_once(|| {
+        let base = crate::gc::capi::gc_heap_region_base();
+        // SAFETY: No cell that this runtime could decode exists yet, so nothing reads the copy, and the Once keeps any
+        //         other thread that creates a heap waiting until the copy is written.
+        unsafe { *HEAP_REGION_BASE.0.get() = base };
+    });
+}
+
+const _: () =
+    assert!(crate::layout::member::COMPRESSED_POINTER_RANGE == crate::build_configuration::HEAP_REGION_OFFSET_MASK + 1);

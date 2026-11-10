@@ -1,0 +1,23 @@
+*: parses, supports true
+*|*: parses, supports true
+|*: parses, supports true
+*.a: parses, supports true
+*[id]: parses, supports true
+*:first-child: parses, supports true
+*::before: parses, supports true
+**: SyntaxError, supports false
+div*: SyntaxError, supports false
+*div: SyntaxError, supports false
+*|**: SyntaxError, supports false
+*|*|*: SyntaxError, supports false
+|*|*: SyntaxError, supports false
+*|div*: SyntaxError, supports false
+.a*: SyntaxError, supports false
+#target*: SyntaxError, supports false
+[id]*: SyntaxError, supports false
+:first-child*: SyntaxError, supports false
+*[id]*: SyntaxError, supports false
+::before*: SyntaxError, supports false
+div *: parses, supports true
+div > *: parses, supports true
+color rgb(0, 0, 0), background-color rgba(0, 0, 0, 0), margin-left 0px, margin-right 4px

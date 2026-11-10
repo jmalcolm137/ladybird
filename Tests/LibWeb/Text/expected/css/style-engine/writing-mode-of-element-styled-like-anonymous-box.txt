@@ -1,0 +1,3 @@
+html: vertical-rl
+head: vertical-rl
+span: vertical-rl

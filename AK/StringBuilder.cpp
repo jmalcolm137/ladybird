@@ -375,6 +375,9 @@ ErrorOr<void> StringBuilder::try_append_repeated(Utf16View const& string, size_t
 
     if (string.has_ascii_storage()) {
         TRY(will_append(string.length_in_code_units() * n));
+    } else if (string.has_latin1_storage()) {
+        auto utf8_length = simdutf::utf8_length_from_latin1(reinterpret_cast<char const*>(string.latin1_span().data()), string.length_in_code_units());
+        TRY(will_append(utf8_length * n));
     } else {
         auto utf8_length = simdutf::utf8_length_from_utf16(string.utf16_span().data(), string.length_in_code_units());
         TRY(will_append(utf8_length * n));
@@ -520,7 +523,12 @@ ErrorOr<void> StringBuilder::try_append(Utf16View const& utf16_view)
     if (utf16_view.is_empty())
         return {};
     if (utf16_view.has_ascii_storage())
-        return try_append_ascii_without_validation(utf16_view.bytes());
+        return try_append_ascii_without_validation(utf16_view.ascii_bytes());
+    if (utf16_view.has_latin1_storage()) {
+        for (auto code_point : utf16_view)
+            TRY(try_append_code_point(code_point));
+        return {};
+    }
 
     auto remaining_view = utf16_view.utf16_span();
     auto maximum_utf8_length = UnicodeUtils::maximum_utf8_length_from_utf16(remaining_view);

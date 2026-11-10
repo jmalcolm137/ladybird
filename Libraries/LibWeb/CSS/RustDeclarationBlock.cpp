@@ -31,7 +31,7 @@ static StyleProperty wrap_property(FfiDeclaredProperty const& property, HashMap<
     return { property.important ? Important::Yes : Important::No, static_cast<PropertyID>(property.property_id), move(value) };
 }
 
-RustDeclarationBlockSnapshot::RustDeclarationBlockSnapshot(DeclarationBlockData const* data)
+RustDeclarationBlockSnapshot::RustDeclarationBlockSnapshot(DeclarationBlockHeader const* data)
     : m_data(data)
 {
     VERIFY(m_data);
@@ -39,7 +39,9 @@ RustDeclarationBlockSnapshot::RustDeclarationBlockSnapshot(DeclarationBlockData 
 
 RustDeclarationBlockSnapshot::~RustDeclarationBlockSnapshot()
 {
-    rust_declaration_data_release(m_data);
+    // NB: A snapshot that was moved from holds no reference.
+    if (m_data)
+        rust_declaration_data_release(m_data);
 }
 
 RustDeclarationBlockSnapshot::RustDeclarationBlockSnapshot(RustDeclarationBlockSnapshot&& other)
@@ -200,16 +202,16 @@ size_t RustDeclarationBlock::external_memory_size() const
     return JS::saturating_add_external_memory_size(size, JS::hash_map_external_memory_size(m_views->custom_properties));
 }
 
-bool RustDeclarationBlock::set(PropertyID property_id, StyleValue const& value, Important important)
+bool RustDeclarationBlock::set_expanding_shorthands(PropertyID property_id, StyleValue const& value, Important important)
 {
     auto property = property_view(property_id, value, important);
-    return rust_declaration_block_set(m_block, &property);
+    return rust_declaration_block_set_expanding_shorthands(m_block, &property);
 }
 
-void RustDeclarationBlock::append(PropertyID property_id, StyleValue const& value, Important important)
+void RustDeclarationBlock::append_expanding_shorthands(PropertyID property_id, StyleValue const& value, Important important)
 {
     auto property = property_view(property_id, value, important);
-    rust_declaration_block_append(m_block, &property);
+    rust_declaration_block_append_expanding_shorthands(m_block, &property);
 }
 
 void RustDeclarationBlock::set_custom(Utf16FlyString const& name, StyleProperty const& property)
@@ -218,9 +220,9 @@ void RustDeclarationBlock::set_custom(Utf16FlyString const& name, StyleProperty 
     rust_declaration_block_set_custom(m_block, &view);
 }
 
-bool RustDeclarationBlock::remove(PropertyID property_id)
+bool RustDeclarationBlock::remove_expanding_shorthands(PropertyID property_id)
 {
-    return rust_declaration_block_remove(m_block, to_underlying(property_id));
+    return rust_declaration_block_remove_expanding_shorthands(m_block, to_underlying(property_id));
 }
 
 bool RustDeclarationBlock::remove_custom(Utf16FlyString const& name)

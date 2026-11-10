@@ -26,9 +26,9 @@
 #include <LibWebCommon/Page/PageId.h>
 #include <LibWebView/AccessibilityTreeManager.h>
 #include <LibWebView/BrowsingSession.h>
-#include <LibWebView/ViewImplementation.h>
 #include <LibWebView/WebCompatReport.h>
 #include <UI/Qt/BackingStoreRelease.h>
+#include <UI/Qt/RemoteView.h>
 #include <UI/Qt/ScreenshotSelectionOverlay.h>
 
 #include <LibWebCommon/Page/QueuedInputEvent.h>
@@ -63,7 +63,9 @@
 #endif
 
 class QKeyEvent;
+class QNativeGestureEvent;
 class QLabel;
+class QMenu;
 class QPushButton;
 class QScreen;
 class QShortcut;
@@ -110,12 +112,13 @@ struct WebContentViewInitialState {
     WebView::IsPrivate is_private { WebView::IsPrivate::No };
     double maximum_frames_per_second { 60.0 };
     Optional<u64> display_id;
-    WebView::ViewImplementation const* owner_view { nullptr };
+    Optional<u64> owner_view_id;
+    bool is_tab { true };
 };
 
 class WebContentView final
     : public WebContentViewBase
-    , public WebView::ViewImplementation
+    , public RemoteView
 #if !defined(Q_OS_WIN)
     , public QAccessible::ActivationObserver
 #endif
@@ -124,7 +127,7 @@ class WebContentView final
 public:
     AK_ALLOC_WITH_KMALLOC;
 
-    WebContentView(QWidget* window, Optional<WebView::CanonicalTraversable&> traversable = {}, WebContentViewInitialState initial_state = {});
+    WebContentView(QWidget* window, Optional<u64> hub_view_id = {}, WebContentViewInitialState initial_state = {});
     virtual ~WebContentView() override;
 
 #ifdef LADYBIRD_QT_USE_VULKAN_WINDOW
@@ -166,7 +169,6 @@ public:
     void set_viewport_rect(Gfx::IntRect);
     void push_viewport_size();
     void set_device_pixel_ratio(double);
-    void set_zoom_level(double);
     void set_vertical_tab_overlay_insets(int left, int right);
     void set_bookmarks_bar_overlay_height(int);
     // How much the page is dimmed under a page dialog, from 0 to 1, where the page is presented above anything Qt paints
@@ -175,11 +177,13 @@ public:
     // A card that floats over the page, such as the find bar. Qt paints it above the page, so whatever presents the
     // page above Qt's painting steps aside while it shows.
     void add_floating_surface(QWidget&);
+    // The address field's suggestions float over the page as such a card does, but outlive the view, as they belong to
+    // the window.
+    void set_suggestions_over_page(bool);
     void prepare_for_window_move();
     void finish_window_move();
     void close_select_dropdown_after_crash();
     void cancel_mouse_press();
-    void review_hidden_crash_report(ByteString const& report_name);
     void leave_report_review();
     void review_web_compat_report(WebCompatReportCapture);
     void select_web_compat_report_screenshot(Function<void(QImage)> on_selected, Function<void()> on_close = {});
@@ -214,15 +218,13 @@ signals:
     void urls_dropped(QList<QUrl> const&);
 
 private:
-    // ^WebView::ViewImplementation
-    virtual void prepare_page_for_navigable(WebView::WebContentPage&) override;
-    virtual Core::AnonymousBuffer system_theme() override;
+    // ^RemoteView
+    virtual void show_context_menu(Menu&, Gfx::IntPoint widget_position) override;
     virtual Optional<ScreenRects> screen_rects() const override;
     virtual void update_zoom() override;
-    virtual Web::DevicePixelSize viewport_size() const override;
-    virtual Gfx::IntPoint to_content_position(Gfx::IntPoint widget_position) const override;
-    virtual Gfx::IntPoint to_widget_position(Gfx::IntPoint content_position) const override;
     virtual void did_accept_presented_backing_store(i32, Gfx::IntRect) override;
+
+    Web::DevicePixelSize viewport_size() const;
 
 #ifdef LADYBIRD_QT_USE_RHI_WIDGET
     // ^QRhiWidget
@@ -249,7 +251,6 @@ private:
 
     void update_viewport_size();
     void update_cursor(Gfx::Cursor cursor);
-    void apply_web_content_cursor(QCursor const&);
     void schedule_repaint();
 #ifdef LADYBIRD_QT_USE_RHI_WIDGET
     void schedule_frame_damage_repaint();
@@ -269,7 +270,7 @@ private:
     void watch_screen_geometry(QScreen&);
 
     void set_crash_overlay_visible(bool);
-    void show_crash_report_review(Optional<ByteString> const& hidden_crash_report_name = {});
+    void show_crash_report_review();
 
     void start_web_compat_report();
     ScreenshotSelectionOverlay& select_screenshot(QImage const& frame, ScreenshotSelectionOverlay::Purpose, Function<void()> on_close = {});
@@ -300,10 +301,15 @@ private:
     friend class WebContentViewAccessible;
 #endif
 
+    // Takes the steps that follow each tree update: after a change, with the IDs of the nodes it removed.
+    void did_update_accessibility_tree(Optional<Vector<i64>> removed_ids);
+
     OwnPtr<WebView::AccessibilityTreeManager> m_accessibility_manager;
     bool m_posted_initial_accessibility_focus { false };
     // Set once this view has asked WebContent for the tree; from then on, WebContent pushes every change on its own.
     bool m_requested_accessibility_tree { false };
+    // Set while the whole tree is on its way, after a change this view couldn't apply.
+    bool m_accessibility_whole_tree_pending { false };
 #if !defined(Q_OS_WIN)
     // Set when an assistive technology turns up mid-page: The next tree to arrive reports the focus to it.
     bool m_report_accessibility_focus_with_next_tree { false };
@@ -311,7 +317,6 @@ private:
 
     bool m_follows_mouse_while_inactive { false };
 
-    bool m_tooltip_override { false };
     Optional<ByteString> m_tooltip_text;
     QTimer m_tooltip_hover_timer;
 
@@ -323,6 +328,7 @@ private:
     int m_click_count { 0 };
 
     QPointer<SelectDropdown> m_select_dropdown;
+    QPointer<QMenu> m_context_menu;
 
     PageOverlay* m_crash_overlay { nullptr };
     CrashOverlayUrlLabel* m_crash_overlay_url { nullptr };
@@ -335,7 +341,18 @@ private:
     QPointer<ScreenshotSelectionOverlay> m_screenshot_selection_overlay;
     QPointer<ScreenshotViewer> m_screenshot_viewer;
     Vector<QPointer<QWidget>> m_floating_surfaces;
+    bool m_suggestions_over_page { false };
     PageOverlay* m_web_compat_report_overlay { nullptr };
+
+    bool handle_native_gesture_event(QNativeGestureEvent const&);
+
+    // A pinch only tells where it began and ended apart from its steps.
+    enum class NativeGestureState : u8 {
+        None,
+        Began,
+        Zooming,
+    };
+    NativeGestureState m_native_gesture_state { NativeGestureState::None };
 
 #ifdef AK_OS_MACOS
     NativeTextEditingBindings m_native_text_editing_bindings;
@@ -361,6 +378,9 @@ private:
     void update_iosurface_layer_background_color();
     void detach_iosurface_layer_from_native_view();
     void destroy_iosurface_layer();
+    void update_whether_qt_paints_view();
+    virtual QPaintEngine* paintEngine() const override;
+    virtual void childEvent(QChildEvent*) override;
 
     void* m_iosurface_layer { nullptr };
     void* m_page_dim_layer { nullptr };
@@ -403,9 +423,6 @@ private:
     bool current_paintable_can_use_vulkan_window() const;
     void schedule_vulkan_window_update();
     void update_vulkan_window_geometry();
-    void set_vulkan_window_cursor(QCursor const&);
-    bool handle_vulkan_window_event(QEvent*);
-    bool vulkan_window_has_native_focus() const;
     void set_vulkan_window_container_visible(bool);
     void fall_back_to_bitmap_rendering();
     void vulkan_window_exposure_changed();
@@ -413,18 +430,21 @@ private:
     bool vulkan_window_update_would_only_resize() const;
     void remap_unexposed_vulkan_window();
 
-    virtual void release_backing_store(i32 bitmap_id) override;
+    virtual void release_backing_store(u64 page_id, i32 bitmap_id) override;
 
 #    ifdef LADYBIRD_HAS_WAYLAND_GPU_QUERY
     bool create_page_surface();
-    void update_page_surface();
+    enum class PageSurfaceContent {
+        Unchanged,
+        MayHaveChanged,
+    };
+    void update_page_surface(PageSurfaceContent);
     void hide_page_surface();
     bool page_surface_can_show_frames() const;
     void fall_back_from_page_surface();
     void destroy_page_surface();
     void release_retired_backing_stores_no_longer_painted();
     void release_all_retired_backing_stores();
-    Vector<Gfx::SharedImageBuffer const*> backing_stores() const;
     QRect rect_shown_in_window() const;
 
     // Shows the page's frames on Wayland by handing their dma-bufs to the compositor of the desktop. Without it, the
@@ -438,7 +458,7 @@ private:
     // The backing stores the view is done with that the compositor of the desktop may still read. The page they belong
     // to can stop displaying the tab before the compositor is done.
     struct BackingStoreWaitingForRelease {
-        NonnullRefPtr<WebView::WebContentPage> page;
+        u64 page_id { 0 };
         i32 bitmap_id { -1 };
     };
     Vector<BackingStoreWaitingForRelease> m_backing_stores_waiting_for_release;

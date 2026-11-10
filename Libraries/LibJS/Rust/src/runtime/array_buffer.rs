@@ -12,25 +12,23 @@ use core::ops::Deref;
 use core::ptr::NonNull;
 use core::sync::atomic::{AtomicU8, AtomicU16, AtomicU32, AtomicU64, Ordering};
 use core::time::Duration;
+use std::sync::Arc;
 
 use libjs_runtime_macros::Trace;
 use num_bigint::BigInt as NumBigInt;
 
-use crate::futex::{self, AtomicWaitResult, WaitWord};
 use crate::gc::capi::{GC_PRIMITIVE_STORAGE_NULL_HANDLE, GCPrimitiveStorageHandle, gc_cell_type_info};
 use crate::gc::class::{ExternalMemorySize, Finalize, GcCell, define_cell};
 use crate::gc::foreign::ForeignCellSlot;
 use crate::gc::gc_ref_cell::GcRefCell;
 use crate::gc::heap::Heap;
-use crate::gc::primitive_storage::{ForeignPrimitiveStorage, OwnedPrimitiveStorage, create_shared_memory};
-use crate::gc::shared_memory::{AsSharedMemory, BorrowedSharedMemory, OwnedSharedMemory, SharedMemoryViewOutsideCage};
+use crate::gc::primitive_storage::{ForeignPrimitiveStorage, OwnedPrimitiveStorage};
 use crate::gc::visitor::{Trace, Visitor};
 use crate::gc::weak::GcWeak;
 use crate::interpreter::vm::Vm;
 use crate::layout::cell::Gc;
 use crate::layout::object::Object;
 use crate::layout::value::Value;
-use crate::random::get_random_u64;
 use crate::runtime::abstract_operations::ordinary_create_from_constructor_of;
 use crate::runtime::big_int::BigInt;
 use crate::runtime::completion::{Must, ThrowCompletionOr};
@@ -41,10 +39,12 @@ use crate::runtime::intrinsics::Intrinsics;
 use crate::runtime::math_object::round_to_binary16;
 use crate::runtime::object::MayInterfereWithIndexedPropertyAccess;
 use crate::runtime::realm::Realm;
+use crate::runtime::shared_backing_store::SharedBackingStore;
 use crate::runtime::typed_array::TypedArrayBase;
 use crate::runtime::value::same_value;
 use crate::runtime::value_conversions;
 use crate::runtime::value_conversions::MAX_ARRAY_LIKE_INDEX;
+use ak::waiter_list::{self, AgentWaiter, AtomicWaitResult, WaitWord};
 
 pub use crate::gc::primitive_storage::cage_base as primitive_storage_cage_base;
 pub use crate::gc::primitive_storage::{OutOfMemory, ZeroFillNewBytes};
@@ -192,7 +192,7 @@ impl OwnedBackingStore {
     }
 
     #[inline]
-    fn data(&self) -> *mut u8 {
+    pub fn data(&self) -> *mut u8 {
         self.storage
             .as_ref()
             .map_or(core::ptr::null_mut(), OwnedPrimitiveStorage::data)
@@ -291,130 +291,6 @@ impl ExternalPrimitiveStorage {
     }
 }
 
-/// The id of a new shared memory object is drawn at random, as it has to stay unique across processes that never
-/// coordinate. Zero means that a block has no id.
-fn mint_shared_object_id() -> u64 {
-    loop {
-        let id = get_random_u64();
-        if id != 0 {
-            return id;
-        }
-    }
-}
-
-/// DataBlock::SharedBackingStore: the bytes of a fixed-length Shared Data Block in a shared memory object, which agents
-/// in other processes map too. The block keeps a descriptor of the object to hand it on, and the id that names the
-/// object in every agent, since one object that is mapped twice has two addresses.
-pub struct SharedBackingStore {
-    shared_memory: OwnedSharedMemory,
-    object_id: u64,
-    mapping: SharedMemoryMapping,
-}
-
-/// Like every other backing store, shared memory is mapped into the cage, so that an out-of-bounds access through the
-/// buffer is masked back into it. When the cage cannot take the mapping, as on Windows, which cannot place one inside
-/// it, the object is mapped outside of it instead, where the views of the buffer reach the bytes through the slow path.
-enum SharedMemoryMapping {
-    InCage(OwnedPrimitiveStorage),
-    OutsideCage(SharedMemoryViewOutsideCage),
-}
-
-impl SharedMemoryMapping {
-    fn map(shared_memory: BorrowedSharedMemory<'_>, size: usize) -> Result<Self, OutOfMemory> {
-        if let Ok(storage) = OwnedPrimitiveStorage::adopt_shared_memory(shared_memory, size) {
-            return Ok(Self::InCage(storage));
-        }
-        let view = SharedMemoryViewOutsideCage::map(shared_memory, size)?;
-        Ok(Self::OutsideCage(view))
-    }
-}
-
-/// Whether the shared memory object has at least `size` bytes, as accessing a mapping beyond the end of its object
-/// raises SIGBUS. A Windows section is not a file, so it has no size to ask for, but MapViewOfFile() refuses a view
-/// that extends past its end.
-fn shared_memory_object_has_at_least(shared_memory: &std::fs::File, size: usize) -> bool {
-    #[cfg(unix)]
-    {
-        shared_memory
-            .metadata()
-            .is_ok_and(|metadata| metadata.len() >= size as u64)
-    }
-    #[cfg(windows)]
-    {
-        let _ = (shared_memory, size);
-        true
-    }
-}
-
-impl SharedBackingStore {
-    /// A new zero-filled shared memory object of `size` bytes, named by a new id.
-    pub fn create(size: usize) -> Result<Self, OutOfMemory> {
-        let shared_memory = create_shared_memory(size)?;
-        let mapping = SharedMemoryMapping::map(shared_memory.as_shared_memory(), size)?;
-        Ok(Self {
-            shared_memory,
-            object_id: mint_shared_object_id(),
-            mapping,
-        })
-    }
-
-    /// The first `size` bytes of a shared memory object that another agent made and `object_id` names. The store keeps
-    /// a duplicate of the descriptor. Fails if `size` is 0 or the object is smaller than that.
-    pub fn adopt(shared_memory: BorrowedSharedMemory<'_>, size: usize, object_id: u64) -> Result<Self, OutOfMemory> {
-        let shared_memory = std::fs::File::from(shared_memory.try_clone_to_owned().map_err(|_| OutOfMemory)?);
-        if !shared_memory_object_has_at_least(&shared_memory, size) {
-            return Err(OutOfMemory);
-        }
-        let mapping = SharedMemoryMapping::map(shared_memory.as_shared_memory(), size)?;
-        Ok(Self {
-            shared_memory: shared_memory.into(),
-            object_id,
-            mapping,
-        })
-    }
-
-    pub fn shared_memory(&self) -> BorrowedSharedMemory<'_> {
-        self.shared_memory.as_shared_memory()
-    }
-
-    pub fn object_id(&self) -> u64 {
-        self.object_id
-    }
-
-    /// The handle of the storage in the cage, or the null handle for a mapping outside of it.
-    pub fn handle(&self) -> GCPrimitiveStorageHandle {
-        match &self.mapping {
-            SharedMemoryMapping::InCage(storage) => storage.handle(),
-            SharedMemoryMapping::OutsideCage(_) => GC_PRIMITIVE_STORAGE_NULL_HANDLE,
-        }
-    }
-
-    pub fn size(&self) -> usize {
-        match &self.mapping {
-            SharedMemoryMapping::InCage(storage) => storage.size(),
-            SharedMemoryMapping::OutsideCage(view) => view.size(),
-        }
-    }
-
-    fn data(&self) -> *mut u8 {
-        match &self.mapping {
-            SharedMemoryMapping::InCage(storage) => storage.data(),
-            SharedMemoryMapping::OutsideCage(view) => view.data(),
-        }
-    }
-
-    fn offset(&self) -> usize {
-        match &self.mapping {
-            SharedMemoryMapping::InCage(storage) => storage.offset(),
-            SharedMemoryMapping::OutsideCage(_) => INVALID_DATA_OFFSET,
-        }
-    }
-
-    fn is_caged(&self) -> bool {
-        matches!(self.mapping, SharedMemoryMapping::InCage(_))
-    }
-}
-
 /// Copies `count` bytes; the ranges may overlap.
 ///
 /// # Safety
@@ -434,7 +310,7 @@ pub enum DataBlockStorage {
     Empty,
     Owned(OwnedBackingStore),
     External(ExternalPrimitiveStorage),
-    Shared(SharedBackingStore),
+    Shared(Arc<SharedBackingStore>),
 }
 
 // 6.2.9 Data Blocks, https://tc39.es/ecma262/#sec-data-blocks
@@ -467,8 +343,8 @@ impl DataBlock {
         }
     }
 
-    /// A Shared Data Block in shared memory.
-    pub fn shared_memory(store: SharedBackingStore) -> Self {
+    /// A Shared Data Block in the store, which the agents of the process share.
+    pub fn shared(store: Arc<SharedBackingStore>) -> Self {
         Self {
             byte_buffer: DataBlockStorage::Shared(store),
             is_shared: Shared::Yes,
@@ -685,14 +561,12 @@ impl DataBlock {
         }
     }
 
-    /// Whether the bytes are in the cage. Owned storage always is, as the runtime fails to create a block rather than
-    /// fall back to memory outside of it, shared memory is unless the platform cannot map it there, and external
-    /// storage is while its handle names storage.
+    /// Whether the bytes are in the cage. Owned and shared storage always are, as the runtime fails to create a block
+    /// rather than fall back to memory outside of it, and external storage is while its handle names storage.
     pub fn is_caged(&self) -> bool {
         match &self.byte_buffer {
             DataBlockStorage::Empty => false,
-            DataBlockStorage::Owned(_) => true,
-            DataBlockStorage::Shared(store) => store.is_caged(),
+            DataBlockStorage::Owned(_) | DataBlockStorage::Shared(_) => true,
             DataBlockStorage::External(storage) => storage.storage.is_valid(),
         }
     }
@@ -710,31 +584,14 @@ impl DataBlock {
         matches!(self.byte_buffer, DataBlockStorage::External(_))
     }
 
-    /// Whether the bytes are in shared memory, which an agent in another process may write at any time, so that a
-    /// typed array must not cache their offset for the interpreter's plain loads and stores.
-    pub fn is_cross_process_shared(&self) -> bool {
+    /// Whether the bytes are in a shared store, which an agent on another thread may write at any time, so that a typed
+    /// array must not cache their offset for the interpreter's plain loads and stores.
+    pub fn is_in_shared_store(&self) -> bool {
         matches!(self.byte_buffer, DataBlockStorage::Shared(_))
-    }
-
-    /// The id of the shared memory object, or 0 for a block that is not in shared memory.
-    pub fn shared_object_id(&self) -> u64 {
-        match &self.byte_buffer {
-            DataBlockStorage::Shared(store) => store.object_id(),
-            _ => 0,
-        }
     }
 
     pub fn shares_storage_with(&self, other: &DataBlock) -> bool {
         if matches!(self.byte_buffer, DataBlockStorage::Empty) || matches!(other.byte_buffer, DataBlockStorage::Empty) {
-            return false;
-        }
-        // NB: One shared memory object can be mapped at several addresses, so blocks in shared memory are compared by
-        //     the id of the object, and one without an id matches nothing.
-        if let DataBlockStorage::Shared(store) = &self.byte_buffer {
-            return matches!(&other.byte_buffer, DataBlockStorage::Shared(other_store)
-                if store.object_id() != 0 && store.object_id() == other_store.object_id());
-        }
-        if matches!(other.byte_buffer, DataBlockStorage::Shared(_)) {
             return false;
         }
         // NB: Two blocks of zero bytes share the storage they do not have.
@@ -888,9 +745,21 @@ fn prototype_for_shared_state(vm: &Vm, realm: Gc<Realm>, is_shared: Shared) -> G
 }
 
 impl ArrayBuffer {
-    fn new_with_buffer(vm: &Vm, buffer: OwnedBackingStore, is_shared: Shared, prototype: Gc<Object>) -> Self {
+    fn new_with_buffer(
+        vm: &Vm,
+        realm: Gc<Realm>,
+        buffer: OwnedBackingStore,
+        is_shared: Shared,
+        prototype: Gc<Object>,
+    ) -> Self {
         Self {
-            base: Object::new_with_prototype(vm, Self::CLASS, prototype, MayInterfereWithIndexedPropertyAccess::No),
+            base: Object::new_with_prototype(
+                vm,
+                Self::CLASS,
+                realm,
+                Some(prototype),
+                MayInterfereWithIndexedPropertyAccess::No,
+            ),
             data_block: GcRefCell::new(DataBlock::new(buffer, is_shared)),
             max_byte_length: Cell::new(None),
             detach_key: Cell::new(Value::UNDEFINED),
@@ -898,9 +767,15 @@ impl ArrayBuffer {
         }
     }
 
-    pub fn new(vm: &Vm, is_shared: Shared, prototype: Gc<Object>) -> Self {
+    pub fn new(vm: &Vm, realm: Gc<Realm>, is_shared: Shared, prototype: Gc<Object>) -> Self {
         Self {
-            base: Object::new_with_prototype(vm, Self::CLASS, prototype, MayInterfereWithIndexedPropertyAccess::No),
+            base: Object::new_with_prototype(
+                vm,
+                Self::CLASS,
+                realm,
+                Some(prototype),
+                MayInterfereWithIndexedPropertyAccess::No,
+            ),
             data_block: GcRefCell::new(DataBlock::empty(is_shared)),
             max_byte_length: Cell::new(None),
             detach_key: Cell::new(Value::UNDEFINED),
@@ -914,6 +789,9 @@ impl ArrayBuffer {
         byte_length: usize,
         is_shared: Shared,
     ) -> ThrowCompletionOr<Gc<ArrayBuffer>> {
+        if exceeds_max_array_buffer_byte_length(byte_length, None) {
+            return vm.throw_completion(ErrorKind::RangeError, ErrorType::InvalidLength, &[&"array buffer"]);
+        }
         let Ok(buffer) = allocate_or_retry_after_gc(vm.heap(), || OwnedBackingStore::create_zeroed(byte_length)) else {
             return vm.throw_completion(
                 ErrorKind::RangeError,
@@ -923,7 +801,9 @@ impl ArrayBuffer {
         };
 
         let prototype = prototype_for_shared_state(vm, realm, is_shared);
-        Ok(realm.create_object(vm, |_| ArrayBuffer::new_with_buffer(vm, buffer, is_shared, prototype)))
+        Ok(realm.create_object(vm, |_| {
+            ArrayBuffer::new_with_buffer(vm, realm, buffer, is_shared, prototype)
+        }))
     }
 
     /// ArrayBuffer::create(Realm&, ByteBuffer, DataBlock::Shared)
@@ -932,7 +812,7 @@ impl ArrayBuffer {
             OwnedBackingStore::create_uninitialized(bytes.len()).expect("allocating the data block succeeds");
         let prototype = prototype_for_shared_state(vm, realm, is_shared);
         let array_buffer = realm.create_object(vm, |_| {
-            ArrayBuffer::new_with_buffer(vm, owned_buffer, is_shared, prototype)
+            ArrayBuffer::new_with_buffer(vm, realm, owned_buffer, is_shared, prototype)
         });
         array_buffer.overwrite(0, bytes);
         vm.heap()
@@ -951,6 +831,9 @@ impl ArrayBuffer {
         is_shared: Shared,
         write: impl FnOnce(&mut [MaybeUninit<u8>]) -> usize,
     ) -> ThrowCompletionOr<Gc<ArrayBuffer>> {
+        if exceeds_max_array_buffer_byte_length(byte_length, None) {
+            return vm.throw_completion(ErrorKind::RangeError, ErrorType::InvalidLength, &[&"array buffer"]);
+        }
         let Ok(buffer) = allocate_or_retry_after_gc(vm.heap(), || OwnedBackingStore::create_uninitialized(byte_length))
         else {
             return vm.throw_completion(
@@ -960,7 +843,9 @@ impl ArrayBuffer {
             );
         };
         let prototype = prototype_for_shared_state(vm, realm, is_shared);
-        let array_buffer = realm.create_object(vm, |_| ArrayBuffer::new_with_buffer(vm, buffer, is_shared, prototype));
+        let array_buffer = realm.create_object(vm, |_| {
+            ArrayBuffer::new_with_buffer(vm, realm, buffer, is_shared, prototype)
+        });
         array_buffer.with_data_block(|data_block| {
             let written = if byte_length == 0 {
                 write(&mut [])
@@ -984,22 +869,15 @@ impl ArrayBuffer {
     pub fn create_from_data_block(vm: &Vm, realm: Gc<Realm>, block: DataBlock) -> Gc<ArrayBuffer> {
         let is_shared = block.is_shared;
         let prototype = prototype_for_shared_state(vm, realm, is_shared);
-        let array_buffer = realm.create_object(vm, |_| ArrayBuffer::new(vm, is_shared, prototype));
+        let array_buffer = realm.create_object(vm, |_| ArrayBuffer::new(vm, realm, is_shared, prototype));
         array_buffer.set_data_block(vm, block);
         array_buffer
     }
 
-    /// ArrayBuffer::create(Realm&, Core::AnonymousBuffer, u64 shared_object_id): a fixed-length SharedArrayBuffer over
-    /// `size` bytes of a shared memory object that another agent made, as structured deserialization creates it.
-    pub fn create_from_shared_memory(
-        vm: &Vm,
-        realm: Gc<Realm>,
-        shared_memory: BorrowedSharedMemory<'_>,
-        size: usize,
-        object_id: u64,
-    ) -> Result<Gc<ArrayBuffer>, OutOfMemory> {
-        let store = SharedBackingStore::adopt(shared_memory, size, object_id)?;
-        Ok(Self::create_from_data_block(vm, realm, DataBlock::shared_memory(store)))
+    /// A fixed-length SharedArrayBuffer over a store that another agent of this process made, as structured
+    /// deserialization creates it.
+    pub fn create_from_shared_store(vm: &Vm, realm: Gc<Realm>, store: Arc<SharedBackingStore>) -> Gc<ArrayBuffer> {
+        Self::create_from_data_block(vm, realm, DataBlock::shared(store))
     }
 
     pub fn byte_length(&self) -> usize {
@@ -1303,16 +1181,15 @@ impl ArrayBuffer {
 
     pub fn can_cache_typed_array_view_data_offset(&self) -> bool {
         let data_block = self.data_block.borrow();
-        // NB: The views of a fixed-length Shared Data Block backed by shared memory stay on the atomic slow path.
-        //     Unless the VM was asked for shared memory, the runtime owns such a block instead, and its views take the
-        //     same path.
-        let stands_in_for_shared_memory =
+        // NB: The views of a fixed-length Shared Data Block in a shared store stay on the atomic slow path, and so do
+        //     those of such a block that the runtime owns instead, as a clone of one that lost its store does.
+        let stands_in_for_shared_store =
             matches!(data_block.byte_buffer, DataBlockStorage::Owned(_)) && data_block.is_shared == Shared::Yes;
         !matches!(data_block.byte_buffer, DataBlockStorage::Empty)
             && self.is_fixed_length()
             && data_block.is_caged()
-            && !data_block.is_cross_process_shared()
-            && !stands_in_for_shared_memory
+            && !data_block.is_in_shared_store()
+            && !stands_in_for_shared_store
     }
 
     // 25.2.2.2 IsSharedArrayBuffer ( obj ), https://tc39.es/ecma262/#sec-issharedarraybuffer
@@ -1525,13 +1402,14 @@ impl ArrayBuffer {
             .to_le_bytes()
     }
 
-    /// Core::atomic_wait() on the word at `byte_index`.
+    /// waiter_list::atomic_wait() on the word at `byte_index`.
     pub fn atomic_wait(
         &self,
         byte_index: usize,
         expected: u64,
         size: usize,
         timeout: Option<Duration>,
+        waiter: &Arc<AgentWaiter>,
     ) -> AtomicWaitResult {
         // NB: The data block stays borrowed while the agent waits, since the agent is the only one that could change it.
         let data_block = self.data_block.borrow();
@@ -1540,14 +1418,22 @@ impl ArrayBuffer {
             8 => WaitWord::Word64(data_block.atomic_at(byte_index)),
             _ => unreachable!("Atomics.wait waits on 4-byte or 8-byte elements"),
         };
-        futex::atomic_wait(word, expected, timeout)
+        waiter_list::atomic_wait(word, expected, timeout, waiter)
     }
 
-    /// Core::atomic_notify() on the word at `byte_index`.
+    /// waiter_list::atomic_notify() on the word at `byte_index`.
     pub fn atomic_notify(&self, byte_index: usize, max_count: usize) -> usize {
-        // NB: Waiters of both sizes key on the low 32-bit half of their word.
-        futex::atomic_notify(self.data_block.borrow().atomic_at::<AtomicU32>(byte_index), max_count)
+        // NB: Waiters of both sizes are on the list of the address of their word.
+        waiter_list::atomic_notify(self.data_block.borrow().atomic_at::<AtomicU32>(byte_index), max_count)
     }
+}
+
+/// The largest byte length of a buffer. Every byte of a buffer this long can be indexed by a Uint8Array, whose element
+/// indices are u32s.
+pub const MAX_ARRAY_BUFFER_BYTE_LENGTH: usize = 1 << 32;
+
+fn exceeds_max_array_buffer_byte_length(size: usize, capacity: Option<usize>) -> bool {
+    capacity.unwrap_or(size).max(size) > MAX_ARRAY_BUFFER_BYTE_LENGTH
 }
 
 // 6.2.9.1 CreateByteDataBlock ( size ), https://tc39.es/ecma262/#sec-createbytedatablock
@@ -1559,6 +1445,11 @@ pub fn create_byte_data_block(vm: &Vm, size: usize, capacity: Option<usize>) -> 
     if let Some(capacity) = capacity
         && capacity as f64 > MAX_ARRAY_LIKE_INDEX
     {
+        return vm.throw_completion(ErrorKind::RangeError, ErrorType::InvalidLength, &[&"array buffer"]);
+    }
+
+    // AD-HOC: See MAX_ARRAY_BUFFER_BYTE_LENGTH.
+    if exceeds_max_array_buffer_byte_length(size, capacity) {
         return vm.throw_completion(ErrorKind::RangeError, ErrorType::InvalidLength, &[&"array buffer"]);
     }
 
@@ -1583,18 +1474,23 @@ pub fn create_byte_data_block(vm: &Vm, size: usize, capacity: Option<usize>) -> 
 // FIXME: The returned DataBlock is not shared in the sense that the standard specifies it.
 // 6.2.9.2 CreateSharedByteDataBlock ( size ), https://tc39.es/ecma262/#sec-createsharedbytedatablock
 fn create_shared_byte_data_block(vm: &Vm, size: usize, capacity: Option<usize>) -> ThrowCompletionOr<DataBlock> {
+    // AD-HOC: See MAX_ARRAY_BUFFER_BYTE_LENGTH.
+    if exceeds_max_array_buffer_byte_length(size, capacity) {
+        return vm.throw_completion(
+            ErrorKind::RangeError,
+            ErrorType::InvalidLength,
+            &[&"shared array buffer"],
+        );
+    }
+
     let capacity = capacity.unwrap_or(size);
 
-    // AD-HOC: A fixed-length shared Data Block is backed by cross-process shared memory (Core::AnonymousBuffer) — so
-    //         that the SharedArrayBuffer is genuinely shared across agents in different processes, rather than copied.
-    //         Fresh anonymous shared memory is zero-filled by the OS. A growable shared Data Block (capacity > size)
-    //         uses process-local storage, so a growable SharedArrayBuffer crosses a process boundary as a copy.
-    // NB: Only a VM whose embedder has agents in other processes asks for shared memory. Otherwise, the fixed-length
-    //     block is owned by the runtime, like a growable one.
+    // AD-HOC: A fixed-length shared Data Block is a store that the agents of the process share, so that the
+    //         SharedArrayBuffer is genuinely shared with agents on other threads, rather than copied. A growable shared
+    //         Data Block (capacity > size) is owned by its heap, so a growable SharedArrayBuffer reaches another thread
+    //         as a copy.
     if capacity == size && size > 0 {
-        // AD-HOC: Cap the shared allocation — so one SharedArrayBuffer can't reserve an absurd amount of address space
-        //         in every agent that maps it. Chromium caps its shared-memory regions at INT_MAX; match that (the fd
-        //         transport also carries the size as a u32).
+        // AD-HOC: Cap the shared allocation, as Chromium caps its shared regions at INT_MAX.
         if size > i32::MAX as usize {
             return vm.throw_completion(
                 ErrorKind::RangeError,
@@ -1603,14 +1499,7 @@ fn create_shared_byte_data_block(vm: &Vm, size: usize, capacity: Option<usize>) 
             );
         }
 
-        let block = allocate_or_retry_after_gc(vm.heap(), || {
-            if vm.options().shared_memory_shared_array_buffers {
-                // Mint the id that will name this object for as long as it exists — in this agent and every agent it
-                // reaches.
-                return Ok(DataBlock::shared_memory(SharedBackingStore::create(size)?));
-            }
-            Ok(DataBlock::new(OwnedBackingStore::create_zeroed(size)?, Shared::Yes))
-        });
+        let block = allocate_or_retry_after_gc(vm.heap(), || Ok(DataBlock::shared(SharedBackingStore::create(size)?)));
         let Ok(block) = block else {
             return vm.throw_completion(ErrorKind::RangeError, ErrorType::NotEnoughMemoryToAllocate, &[&size]);
         };
@@ -1673,7 +1562,7 @@ pub fn allocate_array_buffer(
         realm,
         constructor,
         Intrinsics::array_buffer_prototype,
-        |_, prototype| ArrayBuffer::new(vm, Shared::No, prototype),
+        |_, prototype| ArrayBuffer::new(vm, realm, Shared::No, prototype),
     )?;
 
     // 5. Let block be ? CreateByteDataBlock(byteLength).
@@ -1878,7 +1767,7 @@ pub fn allocate_shared_array_buffer(
         realm,
         constructor,
         Intrinsics::shared_array_buffer_prototype,
-        |_, prototype| ArrayBuffer::new(vm, Shared::Yes, prototype),
+        |_, prototype| ArrayBuffer::new(vm, realm, Shared::Yes, prototype),
     )?;
 
     // 6. If allocatingGrowableBuffer is true, let allocLength be maxByteLength; otherwise let allocLength be byteLength.

@@ -15,6 +15,7 @@ set(SOURCES
     Gamepad/GamepadSnapshot.cpp
     Gamepad/GamepadStateBuffer.cpp
     HTML/AutoplayPolicy.cpp
+    NotificationsAPI/NotificationData.cpp
     HTML/BroadcastChannelMessage.cpp
     HTML/BrowsingContext.cpp
     HTML/CrossOrigin/OpenerPolicy.cpp
@@ -57,6 +58,7 @@ set(SOURCES
     Page/InputTrace.cpp
     Page/MediaContextMenu.cpp
     Page/SpellingError.cpp
+    Page/Translation.cpp
     Page/WritingSuggestion.cpp
     Permissions/Permissions.cpp
     PermissionsPolicy/PermissionsPolicy.cpp
@@ -79,6 +81,7 @@ set(SOURCES
     WebView/Attribute.cpp
     WebView/BrowsingBehavior.cpp
     WebView/ConsoleOutput.cpp
+    WebView/ConsoleOutputBuffer.cpp
     WebView/Debugger.cpp
     WebView/DOMNodeProperties.cpp
     WebView/Geolocation.cpp
@@ -128,7 +131,6 @@ compile_ipc(WebDriver/BiDi.ipc WebDriver/BiDiCodecs.h)
 #     both sides generate their endpoints from here.
 file(MAKE_DIRECTORY ${CMAKE_BINARY_DIR}/Services/WebContent)
 file(MAKE_DIRECTORY ${CMAKE_BINARY_DIR}/Services/WebDriver)
-file(MAKE_DIRECTORY ${CMAKE_BINARY_DIR}/Services/WebWorker)
 compile_ipc(${LADYBIRD_SOURCE_DIR}/Services/WebContent/WebContentClient.ipc ${CMAKE_BINARY_DIR}/Services/WebContent/WebContentClientEndpoint.h)
 compile_ipc(${LADYBIRD_SOURCE_DIR}/Services/WebContent/WebContentServer.ipc ${CMAKE_BINARY_DIR}/Services/WebContent/WebContentServerEndpoint.h)
 compile_ipc(${LADYBIRD_SOURCE_DIR}/Services/WebContent/WebContentTestClient.ipc ${CMAKE_BINARY_DIR}/Services/WebContent/WebContentTestClientEndpoint.h)
@@ -137,8 +139,8 @@ compile_ipc(${LADYBIRD_SOURCE_DIR}/Services/WebDriver/WebDriverBrowserClient.ipc
 compile_ipc(${LADYBIRD_SOURCE_DIR}/Services/WebDriver/WebDriverBrowserServer.ipc ${CMAKE_BINARY_DIR}/Services/WebDriver/WebDriverBrowserServerEndpoint.h)
 compile_ipc(${LADYBIRD_SOURCE_DIR}/Services/WebContent/WebUIClient.ipc ${CMAKE_BINARY_DIR}/Services/WebContent/WebUIClientEndpoint.h)
 compile_ipc(${LADYBIRD_SOURCE_DIR}/Services/WebContent/WebUIServer.ipc ${CMAKE_BINARY_DIR}/Services/WebContent/WebUIServerEndpoint.h)
-compile_ipc(${LADYBIRD_SOURCE_DIR}/Services/WebWorker/WebWorkerClient.ipc ${CMAKE_BINARY_DIR}/Services/WebWorker/WebWorkerClientEndpoint.h)
-compile_ipc(${LADYBIRD_SOURCE_DIR}/Services/WebWorker/WebWorkerServer.ipc ${CMAKE_BINARY_DIR}/Services/WebWorker/WebWorkerServerEndpoint.h)
+compile_ipc(${LADYBIRD_SOURCE_DIR}/Services/WebContent/WebWorkerClient.ipc ${CMAKE_BINARY_DIR}/Services/WebContent/WebWorkerClientEndpoint.h)
+compile_ipc(${LADYBIRD_SOURCE_DIR}/Services/WebContent/WebWorkerServer.ipc ${CMAKE_BINARY_DIR}/Services/WebContent/WebWorkerServerEndpoint.h)
 
 set(GENERATED_SOURCES
     CSS/PropertyList.cpp
@@ -149,8 +151,8 @@ set(GENERATED_SOURCES
     ../../Services/WebContent/WebContentTestServerEndpoint.h
     ../../Services/WebDriver/WebDriverBrowserClientEndpoint.h
     ../../Services/WebDriver/WebDriverBrowserServerEndpoint.h
-    ../../Services/WebWorker/WebWorkerClientEndpoint.h
-    ../../Services/WebWorker/WebWorkerServerEndpoint.h
+    ../../Services/WebContent/WebWorkerClientEndpoint.h
+    ../../Services/WebContent/WebWorkerServerEndpoint.h
     ../../Services/WebContent/WebUIClientEndpoint.h
     ../../Services/WebContent/WebUIServerEndpoint.h
 )

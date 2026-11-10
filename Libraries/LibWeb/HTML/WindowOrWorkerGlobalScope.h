@@ -87,8 +87,8 @@ public:
     void unregister_event_source(Badge<EventSource>, GC::Ref<EventSource>);
     void forcibly_close_all_event_sources();
 
-    void add_strong_reference_to_broadcast_channel(Badge<BroadcastChannel>, GC::Ref<BroadcastChannel>);
-    void remove_strong_reference_to_broadcast_channel(Badge<BroadcastChannel>, GC::Ref<BroadcastChannel>);
+    void add_strong_reference_to_broadcast_channel(GC::Ref<DOM::EventTarget>);
+    void remove_strong_reference_to_broadcast_channel(GC::Ref<DOM::EventTarget>);
 
     void close_all_idb_connections();
 
@@ -101,7 +101,11 @@ public:
     };
     AffectedAnyWebSockets make_disappear_all_web_sockets();
 
-    i32 run_steps_after_a_timeout(i32 timeout, Function<void()> completion_step);
+    void set_has_pending_activity(DOM::EventTarget&, bool);
+    bool has_pending_activity(DOM::EventTarget const&) const;
+    void clear_objects_with_pending_activity() { m_objects_with_pending_activity.clear(); }
+
+    i32 run_steps_after_a_timeout(i32 timeout, GC::Ref<GC::Function<void()>> completion_step);
 
     void document_visibility_state_changed(Badge<DOM::Document>);
     void document_audio_play_state_changed(Badge<DOM::Document>);
@@ -158,7 +162,8 @@ private:
         No,
     };
     WebIDL::ExceptionOr<i32> run_timer_initialization_steps(TimerHandler handler, i32 timeout, GC::RootVector<JS::Value> arguments, Repeat repeat, Optional<i32> previous_id = {});
-    void run_steps_after_a_timeout_impl(i32 timeout, TimerThrottlingClass, Function<void()> completion_step, Optional<i32> timer_key, Repeat repeat = Repeat::No);
+    bool has_expired_timer_yet_to_fire(double now);
+    void run_steps_after_a_timeout_impl(i32 timeout, TimerThrottlingClass, GC::Ref<GC::Function<void()>> completion_step, Optional<i32> timer_key, Repeat repeat = Repeat::No);
     bool document_is_hidden() const;
     bool timers_are_throttled() const;
     Optional<i32> throttled_timer_delay(TimerThrottlingClass, double deadline) const;
@@ -173,6 +178,7 @@ private:
 
     IDAllocator m_timer_id_allocator;
     HashMap<int, GC::Ref<Timer>> m_timers;
+    double m_earliest_timer_deadline { NumericLimits<double>::max() };
 
     // The interval between the wake-ups a hidden document holds its delayed timers back to; a test can shorten it.
     double m_hidden_document_timer_wake_up_interval { 1000 };
@@ -205,7 +211,7 @@ private:
     // https://html.spec.whatwg.org/multipage/web-messaging.html#broadcasting-to-other-browsing-contexts
     // The open BroadcastChannel objects with a message or messageerror listener, which this global keeps alive. They're
     // held here rather than rooted — so a channel that's never closed can't keep its global alive.
-    HashTable<GC::Ref<BroadcastChannel>> m_strongly_referenced_broadcast_channels;
+    HashTable<GC::Ref<DOM::EventTarget>> m_strongly_referenced_broadcast_channels;
     Vector<GC::Weak<PermissionsAPI::PermissionStatus>> m_permission_statuses;
 
     GC::Ptr<HighResolutionTime::Performance> m_performance;
@@ -221,6 +227,10 @@ private:
     bool m_in_error_reporting_mode { false };
 
     WebSockets::WebSocket::List m_registered_web_sockets;
+
+    // Objects with pending activity, such as a WebSocket with a listener for events still to come, which this global
+    // keeps alive. They're held here rather than rooted, so they can't keep their global alive.
+    HashTable<GC::Ref<DOM::EventTarget>> m_objects_with_pending_activity;
 
     // https://w3c.github.io/resource-timing/#sec-extensions-performance-interface
     // Each ECMAScript global environment has:

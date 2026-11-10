@@ -42,6 +42,7 @@ class WEBVIEW_API CanonicalDocumentState final : public RefCounted<CanonicalDocu
 public:
     static NonnullRefPtr<CanonicalDocumentState> create(Web::HTML::CrossProcessId);
     static NonnullRefPtr<CanonicalDocumentState> create(Web::HTML::CrossProcessId, NonnullRefPtr<CanonicalDocument>);
+    static NonnullRefPtr<CanonicalDocumentState> create_from_descriptor(Web::HTML::SessionHistoryDocumentStateDescriptor const&);
 
     ~CanonicalDocumentState();
 
@@ -66,6 +67,7 @@ public:
     Optional<URL::Origin> origin;
     Optional<URL::URL> about_base_url;
     Web::HTML::DocumentResource resource;
+    HTTP::Cookie::SameSiteStatus navigation_same_site_status { HTTP::Cookie::SameSiteStatus::CrossSite };
     bool reload_pending { false };
     bool reload_bypasses_cache { false };
     bool ever_populated { false };

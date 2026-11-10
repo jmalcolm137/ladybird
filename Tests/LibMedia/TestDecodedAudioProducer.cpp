@@ -228,17 +228,21 @@ TEST_CASE(blocks_held_by_the_decoder_are_delivered_when_data_becomes_permanently
     Vector<BlockFrameRange> ranges;
     auto quiet_period = AK::Duration::from_milliseconds(300);
     auto deadline = MonotonicTime::now_coarse() + time_limit;
-    auto quiet_until = MonotonicTime::now_coarse() + quiet_period;
+    auto quiet_until = deadline;
     while (MonotonicTime::now_coarse() < quiet_until && MonotonicTime::now_coarse() < deadline) {
         auto output = producer->peek();
-        EXPECT_NE(output.status, Media::PipelineStatus::EndOfStream);
         if (output.status == Media::PipelineStatus::HaveData) {
             ranges.append({ output.block->first_frame_index(), output.block->end_frame_index() });
             producer->consume();
-            quiet_until = MonotonicTime::now_coarse() + quiet_period;
+            if (ranges.size() >= ended_ranges->size())
+                quiet_until = MonotonicTime::now_coarse() + quiet_period;
             continue;
         }
         loop.pump(Core::EventLoop::WaitMode::PollForEvents);
+        if (output.status != Media::PipelineStatus::Pending) {
+            FAIL(ByteString::formatted("Unexpected status {}", output.status));
+            break;
+        }
     }
 
     EXPECT_EQ(ranges.size(), ended_ranges->size());
@@ -272,6 +276,10 @@ TEST_CASE(a_seek_resolves_on_held_blocks_when_data_becomes_permanently_unavailab
             return;
         }
         loop.pump(Core::EventLoop::WaitMode::PollForEvents);
+        if (output.status != Media::PipelineStatus::Pending) {
+            FAIL(ByteString::formatted("Unexpected status {}", output.status));
+            return;
+        }
         output = producer->peek();
     }
     EXPECT(output.block->contains_media_time(target));

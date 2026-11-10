@@ -9,8 +9,12 @@
 use core::ffi::c_void;
 use core::ptr::NonNull;
 
-use crate::embedding::abi_types::{JSRealm, cell_from_abi, completion_into_abi, optional_cell_from_abi, vm_from_abi};
-use crate::embedding::debugger::{JSDebuggerStackFrame, stack_frame_into_abi};
+use crate::embedding::abi_types::{
+    JSRealm, cell_from_abi, completion_into_abi, optional_cell_from_abi, value_from_abi, vm_from_abi,
+};
+use crate::embedding::debugger::{
+    JSDebuggerSourceRange, JSDebuggerStackFrame, source_range_into_abi, stack_frame_into_abi,
+};
 use crate::embedding::hooks::{
     Embedder, EmbedderAgent, JSAgent, JSImportedModulePayload, JSImportedModuleReferrer, JSModuleRequest, JSPromiseJob,
     JSVmHostHooks, imported_module_payload_from_abi, imported_module_referrer_from_abi, install_embedder,
@@ -43,17 +47,15 @@ const _: () = assert!(
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 pub struct JSVmOptions {
-    /// Makes the VM's heap the one GC::Heap::the() returns, so that C++ cells of the embedder are allocated from it.
-    pub become_process_default_heap: bool,
-    /// Backs SharedArrayBuffers with shared memory, which other processes can map.
-    pub shared_memory_shared_array_buffers: bool,
+    /// Makes the VM's heap the one GC::Heap::the() returns on this thread, so that C++ cells of the embedder are
+    /// allocated from it.
+    pub become_thread_default_heap: bool,
 }
 
 impl From<JSVmOptions> for VmOptions {
     fn from(options: JSVmOptions) -> Self {
         Self {
-            become_process_default_heap: options.become_process_default_heap,
-            shared_memory_shared_array_buffers: options.shared_memory_shared_array_buffers,
+            become_thread_default_heap: options.become_thread_default_heap,
         }
     }
 }
@@ -133,6 +135,31 @@ pub unsafe extern "C" fn js_vm_did_reach_stack_space_limit(vm: *mut JSVM) -> boo
     unsafe { vm_from_abi(vm) }.did_reach_stack_space_limit()
 }
 
+/// VM::take_throw_site_of(): where `value` was thrown, or no source code if it is not the last exception thrown. The VM
+/// keeps the source code alive until it forgets the throw. Only the VM's thread may call this.
+///
+/// # Safety
+///
+/// `vm` must be a live VM.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn js_vm_throw_site_of(vm: *mut JSVM, value: JSValue) -> JSDebuggerSourceRange {
+    // SAFETY: The caller passes a live VM.
+    let vm = unsafe { vm_from_abi(vm) };
+    source_range_into_abi(vm.throw_site_of(value_from_abi(value)).as_ref())
+}
+
+/// VM::take_throw_site_of(): forgets where `value` was thrown, if it is the last exception thrown. Only the VM's thread
+/// may call this.
+///
+/// # Safety
+///
+/// `vm` must be a live VM.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn js_vm_forget_throw_site_of(vm: *mut JSVM, value: JSValue) {
+    // SAFETY: The caller passes a live VM.
+    unsafe { vm_from_abi(vm) }.forget_throw_site_of(value_from_abi(value));
+}
+
 /// Receives each StackTraceElement of a stack trace, which lives for the call.
 #[repr(C)]
 pub struct JSStackTraceSink {
@@ -185,21 +212,51 @@ pub unsafe extern "C" fn js_vm_set_embedder(vm: *mut JSVM, hooks: *const JSVmHos
     install_embedder(vm, hooks.map(|hooks| Embedder { hooks, data }));
 }
 
-/// Chooses how the VM writes the two strings scripts read to tell engines apart: Error.prototype.stack's frames
-/// (0: indented "    at f (url:line:col)", 1: "f@url:line:col") and Function.prototype.toString of a built-in function
-/// (0: on one line, 1: with "[native code]" on a line of its own). Only the VM's thread may call this.
-///
-/// # Safety
-///
-/// `vm` must be a live VM.
+/// Chooses how every VM of the process writes the two strings scripts read to tell engines apart:
+/// Error.prototype.stack's frames (0: indented "    at f (url:line:col)", 1: "f@url:line:col") and
+/// Function.prototype.toString of a built-in function (0: on one line, 1: with "[native code]" on a line of its own).
+/// Any thread may call this.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn js_vm_set_source_text_syntaxes(vm: *mut JSVM, stack_frames: u8, native_functions: u8) {
-    // SAFETY: The caller passes a live VM.
-    let vm = unsafe { vm_from_abi(vm) };
-    vm.set_source_text_syntaxes(
+pub extern "C" fn js_vm_set_source_text_syntaxes(stack_frames: u8, native_functions: u8) {
+    Vm::set_source_text_syntaxes(
         StackFrameSyntax::from_abi(stack_frames),
         NativeFunctionSourceSyntax::from_abi(native_functions),
     );
+}
+
+/// Stops script on the VM for good: it unwinds past every handler, and nothing runs on the VM from then on. Any thread
+/// may call this.
+///
+/// # Safety
+///
+/// `vm` must stay alive until this returns.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn js_vm_request_interrupt(vm: *mut JSVM) {
+    // SAFETY: The caller keeps the VM alive, and the call only touches its atomics.
+    unsafe { vm_from_abi(vm) }.request_interrupt();
+}
+
+/// Whether js_vm_request_interrupt() was called on the VM. Any thread may call this.
+///
+/// # Safety
+///
+/// `vm` must stay alive until this returns.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn js_vm_interrupt_requested(vm: *mut JSVM) -> bool {
+    // SAFETY: The caller keeps the VM alive, and the call only touches its atomics.
+    unsafe { vm_from_abi(vm) }.interrupt_requested()
+}
+
+/// Whether the thread of the VM waits on a word of shared memory, on the list that a notify takes it off. Any thread may
+/// call this.
+///
+/// # Safety
+///
+/// `vm` must stay alive until this returns.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn js_vm_is_waiting_on_shared_memory(vm: *mut JSVM) -> bool {
+    // SAFETY: The caller keeps the VM alive, and the call only touches its agent waiter.
+    unsafe { vm_from_abi(vm) }.agent_waiter().is_waiting()
 }
 
 /// Makes `agent` the surrounding agent of the VM: its [[CanBlock]] says whether Atomics.wait() may block, and await in

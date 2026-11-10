@@ -22,10 +22,31 @@ namespace ImageDecoder {
 static HashMap<int, RefPtr<ConnectionFromClient>> s_connections;
 static IDAllocator s_client_ids;
 
-ConnectionFromClient::ConnectionFromClient(NonnullOwnPtr<IPC::Transport> transport)
+static i64 s_next_session_id { 1 };
+static auto s_is_held_open_by_browser = ConnectionFromClient::IsHeldOpenByBrowser::No;
+static size_t s_client_count { 0 };
+
+static void exit_if_no_longer_needed()
+{
+    if (s_client_count == 0 && s_is_held_open_by_browser == ConnectionFromClient::IsHeldOpenByBrowser::No)
+        Core::Process::terminate_immediately(0);
+}
+
+void ConnectionFromClient::set_is_held_open_by_browser(IsHeldOpenByBrowser is_held_open)
+{
+    s_is_held_open_by_browser = is_held_open;
+    exit_if_no_longer_needed();
+}
+
+ConnectionFromClient::ConnectionFromClient(NonnullOwnPtr<IPC::Transport> transport, RefPtr<ClientGroup> group)
     : IPC::ConnectionFromClient<ImageDecoderClientEndpoint, ImageDecoderServerEndpoint>(*this, move(transport), s_client_ids.allocate())
+    , m_is_frame_client(group ? IsFrameClient::Yes : IsFrameClient::No)
+    , m_group(group ? group.release_nonnull() : make_ref_counted<ClientGroup>())
 {
     s_connections.set(client_id(), *this);
+    m_group->clients.set(this);
+    if (m_is_frame_client == IsFrameClient::No)
+        ++s_client_count;
 }
 
 void ConnectionFromClient::die()
@@ -37,15 +58,18 @@ void ConnectionFromClient::die()
     for (auto& [_, job] : m_pending_frame_jobs)
         job->cancel();
     m_pending_frame_jobs.clear();
-    m_animation_sessions.clear();
+
+    m_group->clients.remove(this);
+    if (m_group->clients.is_empty())
+        m_group->animation_sessions.clear();
 
     auto client_id = this->client_id();
     s_connections.remove(client_id);
     s_client_ids.deallocate(client_id);
 
-    if (s_connections.is_empty()) {
-        Core::Process::terminate_immediately(0);
-    }
+    if (m_is_frame_client == IsFrameClient::No)
+        --s_client_count;
+    exit_if_no_longer_needed();
 }
 
 static void decode_image_to_bitmaps_and_durations_with_decoder(Gfx::ImageDecoder const& decoder, Optional<Gfx::IntSize> ideal_size, Vector<RefPtr<Gfx::Bitmap>>& bitmaps, Vector<u32>& durations)
@@ -65,8 +89,6 @@ static void decode_image_to_bitmaps_and_durations_with_decoder(Gfx::ImageDecoder
         }
     }
 }
-
-static constexpr u32 STREAMING_BATCH_SIZE = 4;
 
 static ErrorOr<ConnectionFromClient::DecodeResult> decode_image_to_details(Core::AnonymousBuffer encoded_buffer, Optional<Gfx::IntSize> ideal_size, Optional<ByteString> const& known_mime_type)
 {
@@ -105,25 +127,15 @@ static ErrorOr<ConnectionFromClient::DecodeResult> decode_image_to_details(Core:
     bool const use_streaming = result.is_animated && result.frame_count > 1;
 
     if (use_streaming) {
-        // Collect all durations cheaply (via frame_duration(), no pixel decode for GIF).
+        // Clients take the first frame from here and ask for the others when they need them.
+        auto first_frame = TRY(decoder->frame(0, ideal_size));
+        first_frame.image->set_alpha_type_destructive(Gfx::AlphaType::Premultiplied);
+        bitmaps.append(first_frame.image);
+
+        // NB: Some decoders only know their durations once they have decoded, so this must come after the first frame.
         result.durations.ensure_capacity(result.frame_count);
         for (u32 i = 0; i < result.frame_count; ++i)
             result.durations.unchecked_append(decoder->frame_duration(i));
-
-        // Decode only the first batch of frames.
-        u32 const batch_size = min(STREAMING_BATCH_SIZE, result.frame_count);
-        bitmaps.ensure_capacity(batch_size);
-        for (u32 i = 0; i < batch_size; ++i) {
-            auto frame_or_error = decoder->frame(i, ideal_size);
-            if (frame_or_error.is_error())
-                break;
-            auto frame = frame_or_error.release_value();
-            frame.image->set_alpha_type_destructive(Gfx::AlphaType::Premultiplied);
-            bitmaps.unchecked_append(frame.image);
-            // If frame_duration() returned 0, use the actual decoded duration.
-            if (result.durations[i] == 0)
-                result.durations[i] = frame.duration;
-        }
 
         // Keep decoder alive for future frame requests.
         result.decoder = decoder;
@@ -170,12 +182,12 @@ NonnullRefPtr<ConnectionFromClient::PendingJob> ConnectionFromClient::start_deco
 
                 if (result_value.decoder) {
                     // This is a streaming animated decode. Create a session.
-                    session_id = strong_this->m_next_session_id++;
+                    session_id = s_next_session_id++;
                     auto session = make_ref_counted<AnimationSession>();
                     session->encoded_data = move(result_value.encoded_data);
                     session->decoder = move(result_value.decoder);
                     session->frame_count = result_value.frame_count;
-                    strong_this->m_animation_sessions.set(session_id, move(session));
+                    strong_this->m_group->animation_sessions.set(session_id, move(session));
                 }
 
                 strong_this->async_did_decode_image(request_id, result_value.is_animated, result_value.loop_count, move(result_value.bitmaps), move(result_value.durations), result_value.scale, move(result_value.color_profile), session_id);
@@ -239,8 +251,8 @@ void ConnectionFromClient::cancel_decoding(i64 request_id)
 
 void ConnectionFromClient::request_animation_frames(i64 session_id, u32 start_frame_index, u32 count)
 {
-    auto it = m_animation_sessions.find(session_id);
-    if (it == m_animation_sessions.end())
+    auto it = m_group->animation_sessions.find(session_id);
+    if (it == m_group->animation_sessions.end())
         return;
 
     auto session = it->value;
@@ -322,9 +334,23 @@ NonnullRefPtr<ConnectionFromClient::PendingJob> ConnectionFromClient::start_fram
 
 void ConnectionFromClient::stop_animation_decode(i64 session_id)
 {
-    if (auto job = m_pending_frame_jobs.take(session_id); job.has_value())
-        job.value()->cancel();
-    m_animation_sessions.remove(session_id);
+    // NB: The job belongs to whichever of the clients sharing the session asked for the frames.
+    for (auto* client : m_group->clients) {
+        if (auto job = client->m_pending_frame_jobs.take(session_id); job.has_value())
+            job.value()->cancel();
+    }
+    m_group->animation_sessions.remove(session_id);
+}
+
+void ConnectionFromClient::connect_frame_client(IPC::TransportHandle handle)
+{
+    auto transport_or_error = handle.create_transport();
+    if (transport_or_error.is_error()) {
+        dbgln("ImageDecoder: Could not take up a frame client: {}", transport_or_error.error());
+        return;
+    }
+    // NB: The new connection keeps itself alive in s_connections until it dies.
+    (void)ConnectionFromClient::construct(transport_or_error.release_value(), m_group);
 }
 
 }

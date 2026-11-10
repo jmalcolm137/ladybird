@@ -61,26 +61,27 @@ struct ShapedSvgText {
 ///        this layout shapes.
 fn append_svg_text_character_cells(
     cells: &mut Vec<FfiSvgTextCharacterCell>,
-    glyphs: &[libgfx_rust::text_layout::DrawGlyph],
+    glyphs: &libgfx_rust::text_layout::GlyphBuffer,
     length_in_code_units: usize,
     run_end_x: f32,
     top: f32,
     height: f32,
 ) {
+    let placed: Vec<_> = glyphs.placed().collect();
     let mut covered = 0usize;
     let mut index = 0usize;
-    while index < glyphs.len() && covered < length_in_code_units {
-        let first = glyphs[index];
+    while index < placed.len() && covered < length_in_code_units {
+        let first = placed[index];
         // A glyph that maps to no code unit of its own (a combining mark's, e.g.) belongs to the
         // typographic character before it, so it extends that character's cell. One at the start
         // of the run has no character before it, so it joins the character after it instead.
         let mut next = index + 1;
-        let mut code_units = first.length_in_code_units;
-        while next < glyphs.len() && (glyphs[next].length_in_code_units == 0 || code_units == 0) {
-            code_units += glyphs[next].length_in_code_units;
+        let mut code_units = first.glyph.length_in_code_units();
+        while next < placed.len() && (placed[next].glyph.length_in_code_units() == 0 || code_units == 0) {
+            code_units += placed[next].glyph.length_in_code_units();
             next += 1;
         }
-        let end_x = glyphs.get(next).map_or(run_end_x, |glyph| glyph.x);
+        let end_x = placed.get(next).map_or(run_end_x, |glyph| glyph.x);
         let code_units = code_units.max(1).min(length_in_code_units - covered);
         let cell = FfiSvgTextCharacterCell {
             x: first.x,
@@ -220,6 +221,10 @@ pub struct FfiSvgAttributeFacts {
     pub line_y1: FfiSvgNumberPercentage,
     pub line_x2: FfiSvgNumberPercentage,
     pub line_y2: FfiSvgNumberPercentage,
+    /// The `pathLength` a geometry element parses, where it parses one: the length its stroke's dashes measure the
+    /// path in.
+    pub has_path_length: bool,
+    pub path_length: f32,
     /// The text positioning attributes of a `<text>` or `<tspan>`.
     /// FIXME: These only carry a single value each, not a list.
     pub text_x: FfiSvgLengthValue,
@@ -279,7 +284,8 @@ impl FfiSvgNumberPercentage {
 }
 
 pub(crate) const PRESERVE_ASPECT_RATIO_NONE: u8 = 0;
-const PRESERVE_ASPECT_RATIO_X_MIN_Y_MIN: u8 = 1;
+pub(crate) const PRESERVE_ASPECT_RATIO_X_MIN_Y_MIN: u8 = 1;
+pub(crate) const PRESERVE_ASPECT_RATIO_X_MID_Y_MID: u8 = 5;
 pub(crate) const PRESERVE_ASPECT_RATIO_X_MAX_Y_MAX: u8 = 9;
 pub(crate) const MEET_OR_SLICE_MEET: u8 = 0;
 pub(crate) const MEET_OR_SLICE_SLICE: u8 = 1;
@@ -628,19 +634,19 @@ impl<'pass> SvgFormattingContext<'pass> {
     }
 
     fn first_child(&self, node: Node) -> Node {
-        self.run.callbacks.node_data(node).first_child.get()
+        self.run.pass.node_data(node).first_child.get()
     }
 
     fn next_sibling(&self, node: Node) -> Node {
-        self.run.callbacks.node_data(node).next_sibling.get()
+        self.run.pass.node_data(node).next_sibling.get()
     }
 
     fn parent(&self, node: Node) -> Node {
-        self.run.callbacks.node_data(node).parent.get()
+        self.run.pass.node_data(node).parent.get()
     }
 
     fn node_kind(&self, node: Node) -> NodeKind {
-        self.run.callbacks.node_data(node).kind.get()
+        self.run.pass.node_data(node).kind.get()
     }
 }
 
@@ -1031,8 +1037,7 @@ impl SvgShapeGeometry {
 #[repr(C)]
 pub struct FfiSvgGeometryElementShape {
     pub geometry: FfiSvgAttributeFacts,
-    pub payloads: *const *const c_void,
-    pub payload_count: usize,
+    pub style: *const c_void,
     pub points: *const FfiFloatPoint,
     pub point_count: usize,
     pub viewport_size: FfiCssPixelSize,
@@ -1043,21 +1048,19 @@ impl FfiSvgGeometryElementShape {
     /// shape builders layout uses, and of the element's style.
     ///
     /// # Safety
-    /// `payloads` must point to `payload_count` live style group payloads, and `points` to `point_count` points.
+    /// `style` must point at the groups of a live style record, and `points` to `point_count` points.
     unsafe fn measure<R>(&self, measure: impl FnOnce(&libgfx_rust::path::Path, StyleValues<'_>) -> R) -> R {
-        assert!(!self.payloads.is_null(), "style group payload array is null");
-        let mut style_payloads = FfiStylePayloads::default();
         // SAFETY: Guaranteed by the caller.
-        style_payloads
-            .groups
-            .copy_from_slice(unsafe { ak::slice_from_raw_parts(self.payloads, self.payload_count) });
+        let style = unsafe { crate::layout::node_data::LayoutStyleRef::from_raw(self.style) }
+            .expect("an SVG geometry element's style record is not null");
         // SAFETY: Guaranteed by the caller.
         let points = unsafe { ak::slice_from_raw_parts(self.points, self.point_count) };
         let shape_geometry = SvgShapeGeometry {
             viewport_width: self.viewport_size.width,
             viewport_height: self.viewport_size.height,
         };
-        let style = StyleValues::new(&style_payloads);
+        // SAFETY: Guaranteed by the caller.
+        let style = StyleValues::new(unsafe { style.view() });
         measure(&shape_geometry.path(self.geometry, style, Some(points)), style)
     }
 }
@@ -1216,12 +1219,21 @@ pub unsafe extern "C" fn svg_geometry_element_stroke_contains(
                 cap_style: stroke.cap_style,
                 join_style: stroke.join_style,
                 miter_limit: stroke.miter_limit,
-                dash_array: stroke
-                    .dash_array
-                    .iter()
-                    .map(|dash| dash * dash_scale * stroke_scale)
-                    .collect(),
-                dash_offset: stroke.dash_offset * dash_scale * stroke_scale,
+                // An infinite dash scale makes every dash infinitely long, so the stroke draws solid.
+                dash_array: if dash_scale.is_finite() {
+                    stroke
+                        .dash_array
+                        .iter()
+                        .map(|dash| dash * dash_scale * stroke_scale)
+                        .collect()
+                } else {
+                    Vec::new()
+                },
+                dash_offset: if dash_scale.is_finite() {
+                    stroke.dash_offset * dash_scale * stroke_scale
+                } else {
+                    0.0
+                },
             };
             if stroke_style.thickness <= 0.0 {
                 return false;
@@ -1242,7 +1254,7 @@ impl<'pass> SvgFormattingContext<'pass> {
 
     /// The geometry a shape element draws, in the user units of the viewport it sits in.
     fn svg_geometry_path(&self, node: Node) -> libgfx_rust::path::Path {
-        let points = self.run.callbacks.arena().svg_points(node);
+        let points = self.run.pass.arena().svg_points(node);
         self.shape_geometry()
             .path(self.svg_attributes(node), self.style(node), points.as_deref())
     }
@@ -1255,7 +1267,7 @@ impl<'pass> SvgFormattingContext<'pass> {
             SVG_LENGTH_KIND_PERCENTAGE => {
                 CssPixels::truncated_value_for(reference.to_double() * value.value / 100.0).to_float()
             }
-            SVG_LENGTH_KIND_LENGTH => resolve_svg_length(&self.run.callbacks, node, value).to_float(),
+            SVG_LENGTH_KIND_LENGTH => resolve_svg_length(&self.run.pass, node, value).to_float(),
             _ => 0.0,
         }
     }
@@ -1266,7 +1278,7 @@ impl<'pass> SvgFormattingContext<'pass> {
     /// text the row kept beside its rendering.
     fn svg_text_contents(&self, node: Node) -> Vec<u16> {
         let mut text: Vec<u16> = Vec::new();
-        for child in self.run.callbacks.children(node) {
+        for child in self.run.pass.children(node) {
             if node_facts::kind_is_text(self.node_kind(child)) {
                 self.append_svg_source_text(child, &mut text);
             }
@@ -1311,7 +1323,7 @@ impl<'pass> SvgFormattingContext<'pass> {
     }
 
     fn append_svg_source_text(&self, text_node: Node, out: &mut Vec<u16>) {
-        let content = self.run.callbacks.arena().text_content(text_node);
+        let content = self.run.pass.arena().text_content(text_node);
         debug_assert!(content.is_some(), "SVG text child was not synced before layout");
         if let Some(source) = content.and_then(|content| content.svg_source_text.as_deref()) {
             out.extend_from_slice(source);
@@ -1363,16 +1375,16 @@ impl<'pass> SvgFormattingContext<'pass> {
         // NB: The dominant-baseline offset is resolved against the metrics of the first available
         //     font - while each glyph is rendered with the first font in the cascade that contains
         //     its code point.
-        let font = style.font();
+        let font = style.font().first_available_font_metrics();
         match metric {
-            baseline_metric::CENTRAL => (font.font_ascent - font.font_descent) / 2.0,
-            baseline_metric::MIDDLE => font.font_x_height / 2.0,
+            baseline_metric::CENTRAL => (font.ascent - font.descent) / 2.0,
+            baseline_metric::MIDDLE => font.x_height / 2.0,
             // FIXME: Read the hanging baseline from the font's BASE table.
-            baseline_metric::HANGING => font.font_ascent * 0.8,
+            baseline_metric::HANGING => font.ascent * 0.8,
             // FIXME: Read the ideographic baseline from the font's BASE table.
-            baseline_metric::IDEOGRAPHIC => -font.font_descent,
+            baseline_metric::IDEOGRAPHIC => -font.descent,
             // FIXME: Read the math baseline from the font's BASE table.
-            baseline_metric::MATHEMATICAL => font.font_ascent * 0.5,
+            baseline_metric::MATHEMATICAL => font.ascent * 0.5,
             // FIXME: Support text-top and text-bottom.
             _ => 0.0,
         }
@@ -1458,16 +1470,13 @@ impl<'pass> SvgFormattingContext<'pass> {
                 cell_height,
             );
             shaped_text.advance += shaped.width();
-            let mut glyph_buffer = shaped.into_glyphs();
-            let glyphs = glyph_buffer.to_mut();
+            let mut glyphs = shaped.into_glyphs();
             if baseline_start.y != 0.0 {
-                for glyph in glyphs.iter_mut() {
-                    glyph.y += baseline_start.y;
-                }
+                glyphs.shift_baseline(baseline_start.y);
             }
             shaped_text.runs.push(libgfx_rust::path::GlyphRun {
                 font: font.clone(),
-                glyphs: std::mem::take(glyphs),
+                glyphs,
             });
         });
         shaped_text
@@ -1657,7 +1666,7 @@ impl<'pass> SvgFormattingContext<'pass> {
     /// published rather than from a box: a `<textPath>`'s target is normally a `<path>` inside a
     /// `<defs>`, and a `<defs>` builds no box at all.
     fn svg_referenced_shape_path(&self, referring_box: Node) -> Option<libgfx_rust::path::Path> {
-        let arena = self.run.callbacks.arena();
+        let arena = self.run.pass.arena();
         let referrer = arena.node_style_node(referring_box)?;
         let atom = self.svg_attributes(referring_box).reference_fragment_atom;
         let shape = arena.element_by_svg_reference(referrer, atom)?;
@@ -1666,23 +1675,24 @@ impl<'pass> SvgFormattingContext<'pass> {
         if attributes.geometry_kind == SVG_GEOMETRY_KIND_NONE {
             return None;
         }
-        let payloads = arena.style_node_style_payloads(shape)?;
+        let style = arena.style_node_style(shape)?;
         let points = arena.style_node_svg_points(shape);
         Some(
             self.shape_geometry()
-                .path(attributes, StyleValues::new(&payloads), points.as_deref()),
+                // SAFETY: The record the element published is retained for the pass.
+                .path(attributes, StyleValues::new(unsafe { style.view() }), points.as_deref()),
         )
     }
 
     fn svg_attributes(&self, node: Node) -> FfiSvgAttributeFacts {
-        self.run.callbacks.arena().svg_attribute_facts(node)
+        self.run.pass.arena().svg_attribute_facts(node)
     }
 
     fn svg_facts(&self, node: Node) -> SvgElementFacts {
-        let data = self.run.callbacks.node_data(node);
+        let data = self.run.pass.node_data(node);
         let mut facts = SvgElementFacts {
             is_document_element: node_facts::has_flag(data, NodeFlag::IsDocumentElement),
-            document_is_decoded_svg: self.run.callbacks.arena().document_is_decoded_svg(),
+            document_is_decoded_svg: self.run.pass.arena().document_is_decoded_svg(),
             ..Default::default()
         };
         // Everything below is a graphics element's business; a <mask> or <clipPath> box answers
@@ -1713,7 +1723,7 @@ impl<'pass> SvgFormattingContext<'pass> {
         node: Node,
         matches: impl Fn(FfiSvgAttributeFacts) -> bool,
     ) -> Option<StyleNodeID> {
-        let arena = self.run.callbacks.arena();
+        let arena = self.run.pass.arena();
         let mut style_node = arena
             .node_style_node(node)
             .and_then(|style_node| arena.flat_tree_parent(style_node));
@@ -1731,7 +1741,7 @@ impl<'pass> SvgFormattingContext<'pass> {
     /// Percentages resolve against nothing here, since layout has not sized the element yet when a
     /// descendant asks.
     fn svg_viewport_element_size(&self, element: StyleNodeID) -> FfiCssPixelSize {
-        let arena = self.run.callbacks.arena();
+        let arena = self.run.pass.arena();
         let attributes = arena.style_node_svg_attribute_facts(element);
         if attributes.has_active_view_box {
             return FfiCssPixelSize {
@@ -1810,7 +1820,8 @@ impl<'pass> SvgFormattingContext<'pass> {
         let style = self.style(node);
         let svg = style.inherited_svg();
         let stroke_is_visible =
-            crate::painting::record::paint::svg::svg_paint_color(&svg.stroke).is_some_and(|color| color >> 24 != 0);
+            crate::painting::record::paint::svg::svg_paint_color(&svg.stroke, style.current_color())
+                .is_some_and(|color| color >> 24 != 0);
         if !stroke_is_visible {
             return 0.0;
         }
@@ -1821,7 +1832,7 @@ impl<'pass> SvgFormattingContext<'pass> {
 
     #[inline]
     fn style(&self, node: Node) -> StyleValues<'_> {
-        StyleValues::for_node(&self.run.callbacks, node)
+        StyleValues::for_node(&self.run.pass, node)
     }
 
     /// Cells for `node`, a box this context lays out in them.
@@ -1830,7 +1841,7 @@ impl<'pass> SvgFormattingContext<'pass> {
         // SVG layout resolves percentages against the SVG viewport, not a CSS containing
         // block, so boxes inside the SVG subtree carry no percentage basis.
         Cell::new(used_values::cells_before_sizing(
-            &self.run.callbacks,
+            &self.run.pass,
             node,
             ContainingBlockConstraints::default(),
         ))
@@ -1864,6 +1875,7 @@ impl<'pass> SvgFormattingContext<'pass> {
             svg.viewport_percentage_basis = facts.viewport_percentage_basis;
             svg.resource_content_units_are_object_bounding_box =
                 attributes.content_units == SVG_UNITS_OBJECT_BOUNDING_BOX;
+            svg.author_path_length = attributes.has_path_length.then_some(attributes.path_length);
         });
     }
 
@@ -1921,7 +1933,7 @@ impl<'pass> SvgFormattingContext<'pass> {
 
     fn first_child_of_kind(&self, node: Node, kind: NodeKind) -> Option<Node> {
         self.run
-            .callbacks
+            .pass
             .children(node)
             .find(|&child| self.node_kind(child) == kind)
     }
@@ -1952,23 +1964,6 @@ impl<'pass> SvgFormattingContext<'pass> {
         let facts = self.svg_facts(self.run.box_);
         let attributes = self.svg_attributes(self.run.box_);
         self.commit_svg_element_facts(self.run.box_, facts, attributes);
-
-        if facts.is_document_element
-            && !facts.document_is_decoded_svg
-            && !input.sizing.root_keeps_its_committed_geometry
-        {
-            // Overwrite the content width/height with the styled node width/height (from <svg width height ...>)
-            //
-            // NOTE: If a height had not been provided by the svg element, it was set to the height of the container
-            let style = self.style(self.run.box_);
-            if style.width().is_length() {
-                cells.set_content_inline_size(style.width().to_px(CssPixels::default()));
-            }
-            if style.height().is_length() {
-                cells.set_content_block_size(style.height().to_px(CssPixels::default()));
-            }
-            // FIXME: In SVG 2, length can also be a percentage. We'll need to support that.
-        }
 
         // NOTE: We consider all SVG root elements to have definite size in both axes.
         //       I'm not sure if this is good or bad, but our viewport transform logic depends on it.
@@ -2045,7 +2040,7 @@ impl<'pass> SvgFormattingContext<'pass> {
         self.viewport_is_committed_viewport = kind == NodeKind::SVGSVGBox
             && self.run.fragments.is_some()
             && crate::painting::paint_read::GeometryRead::with_committed_fragment_link(
-                self.run.callbacks.arena(),
+                self.run.pass.arena(),
                 self.run.box_,
                 |link| {
                     link.is_some_and(|link| {
@@ -2064,8 +2059,8 @@ impl<'pass> SvgFormattingContext<'pass> {
             .containing_block_constraints
             .quirks_mode_percentage_basis_block_size;
 
-        for child in self.run.callbacks.children(self.run.box_) {
-            if NodeFacts::new(&self.run.callbacks, child).is_box() {
+        for child in self.run.pass.children(self.run.box_) {
+            if NodeFacts::new(&self.run.pass, child).is_box() {
                 self.layout_svg_element(run, child);
             }
         }
@@ -2079,7 +2074,7 @@ impl<'pass> SvgFormattingContext<'pass> {
         } else if kind == NodeKind::SVGForeignObjectBox {
             // SVG descendants carry no percentage basis, as `cells_of_svg_box` explains.
             let mut child_cells =
-                used_values::cells_before_sizing(&self.run.callbacks, child, ContainingBlockConstraints::default());
+                used_values::cells_before_sizing(&self.run.pass, child, ContainingBlockConstraints::default());
             let style = self.style(child);
             let rect = SvgCssPixelRect {
                 x: style.x().to_px(self.viewport_width),
@@ -2209,7 +2204,7 @@ impl<'pass> SvgFormattingContext<'pass> {
         if let Some(clip) = self.first_child_of_kind(graphics_box, NodeKind::SVGClipBox) {
             self.layout_mask_or_clip(run, clip, &laid_out.cells);
         }
-        for child in self.run.callbacks.children(graphics_box) {
+        for child in self.run.pass.children(graphics_box) {
             if self.node_kind(child) == NodeKind::SVGPatternBox {
                 self.layout_mask_or_clip(run, child, &laid_out.cells);
             }
@@ -2242,7 +2237,7 @@ impl<'pass> SvgFormattingContext<'pass> {
         // A committed fragment stops being current when something marks its box for layout.
         let link = self
             .run
-            .callbacks
+            .pass
             .arena()
             .with_current_committed_fragment_link(shape, |link| link.clone())?;
         let fragment = link.fragment.clone();
@@ -2319,7 +2314,7 @@ impl<'pass> SvgFormattingContext<'pass> {
 
         if kind == NodeKind::SVGTextBox {
             // <text> and <tspan> elements can contain more text elements, whose glyph cells count toward this box too.
-            for child in self.run.callbacks.children(graphics_box) {
+            for child in self.run.pass.children(graphics_box) {
                 if matches!(self.node_kind(child), NodeKind::SVGTextBox | NodeKind::SVGTextPathBox) {
                     let laid_out_child = self.layout_graphics_element(run, child);
                     let offset = laid_out_child.content_offset;
@@ -2359,7 +2354,7 @@ impl<'pass> SvgFormattingContext<'pass> {
 
         let facts = self
             .run
-            .callbacks
+            .pass
             .arena()
             .replaced_content_facts(image_box)
             .unwrap_or_default();
@@ -2462,9 +2457,9 @@ impl<'pass> SvgFormattingContext<'pass> {
         let mut min_y = CssPixels::default();
         let mut max_x = CssPixels::default();
         let mut max_y = CssPixels::default();
-        for child in self.run.callbacks.children(container) {
+        for child in self.run.pass.children(container) {
             // Masks/clips/patterns do not change the bounding box of their parents.
-            if NodeFacts::new(&self.run.callbacks, child).is_box()
+            if NodeFacts::new(&self.run.pass, child).is_box()
                 && !node_facts::kind_is_svg_resource_box(self.node_kind(child))
             {
                 let laid_out_child = self
@@ -2513,13 +2508,13 @@ impl<'pass> SvgFormattingContext<'pass> {
 }
 
 fn font_metrics_for_length_resolution(style: StyleValues<'_>) -> crate::css::style_compute::FfiFontMetrics {
-    let font = style.font();
+    let font = style.font().first_available_font_metrics();
     crate::css::style_compute::FfiFontMetrics {
         font_size: style.font_size().to_double(),
-        x_height: CssPixels::nearest_value_for_f32(font.font_x_height).to_double(),
+        x_height: CssPixels::nearest_value_for_f32(font.x_height).to_double(),
         // FIXME: This is only approximately the cap height, exactly as Length::FontMetrics has it.
-        cap_height: CssPixels::nearest_value_for_f32(font.font_ascent).to_double(),
-        zero_advance: CssPixels::nearest_value_for_f32(font.font_zero_advance).to_double(),
+        cap_height: CssPixels::nearest_value_for_f32(font.ascent).to_double(),
+        zero_advance: CssPixels::nearest_value_for_f32(font.zero_advance).to_double(),
         line_height: style.line_height().to_double(),
     }
 }
@@ -2527,26 +2522,26 @@ fn font_metrics_for_length_resolution(style: StyleValues<'_>) -> crate::css::sty
 /// What a length one of an SVG element's attributes gives resolves against: the element's own style,
 /// the document element's, and the viewport.
 fn length_resolution_context(
-    callbacks: &LayoutPass<'_>,
+    pass: &LayoutPass<'_>,
     node: Node,
     unit: u8,
 ) -> crate::css::style_compute::FfiLengthResolutionContext {
-    let style = StyleValues::for_node(callbacks, node);
-    let root_style = document_element_style(callbacks, node).unwrap_or(style);
-    let viewport_width = callbacks.initial_containing_block_inline_size.to_double();
-    let viewport_height = callbacks.initial_containing_block_block_size.to_double();
+    let style = StyleValues::for_node(pass, node);
+    let root_style = document_element_style(pass, node).unwrap_or(style);
+    let viewport_width = pass.initial_containing_block_inline_size.to_double();
+    let viewport_height = pass.initial_containing_block_block_size.to_double();
     // A container unit resolves against the committed content box of the nearest size query container on its axis, or
     // the viewport without one. Finding that container is style's business, so it is asked only for a length that
     // needs it, and the host hears which containers the lengths depend on once the layout is committed.
     let container_bases = crate::css::style_compute::length_unit_is_container_relative(unit).then(|| {
-        let element = callbacks
+        let element = pass
             .arena()
             .dom_node_style_node(node)
             .expect("an SVG element's attribute length is resolved for the element's own box");
-        let bases = callbacks
+        let bases = pass
             .arena()
             .with_style_store(|engine| engine.container_unit_bases(element, false));
-        callbacks.note_host_findings(|findings| findings.note_container_length_dependencies(element, &bases));
+        pass.note_host_findings(|findings| findings.note_container_length_dependencies(node, element, &bases));
         bases
     });
     let mut context = crate::css::style_compute::FfiLengthResolutionContext {
@@ -2574,12 +2569,12 @@ fn length_resolution_context(
 }
 
 /// The style of the document element, which a root-relative length resolves against.
-fn document_element_style<'pass>(callbacks: &LayoutPass<'pass>, node: Node) -> Option<StyleValues<'pass>> {
+fn document_element_style<'pass>(pass: &LayoutPass<'pass>, node: Node) -> Option<StyleValues<'pass>> {
     let mut ancestor = node;
     while !ancestor.is_invalid() {
-        let data = callbacks.node_data(ancestor);
+        let data = pass.node_data(ancestor);
         if node_facts::has_flag(data, NodeFlag::IsDocumentElement) {
-            return callbacks.arena().style_payloads(ancestor).map(StyleValues::new);
+            return pass.arena().style_view(ancestor).map(StyleValues::new);
         }
         ancestor = data.parent.get();
     }
@@ -2587,8 +2582,8 @@ fn document_element_style<'pass>(callbacks: &LayoutPass<'pass>, node: Node) -> O
 }
 
 /// The pixels an absolute or relative `<length>` an SVG element's attribute gives resolves to.
-fn resolve_svg_length(callbacks: &LayoutPass<'_>, node: Node, length: FfiSvgLengthValue) -> CssPixels {
-    let context = length_resolution_context(callbacks, node, length.unit);
+fn resolve_svg_length(pass: &LayoutPass<'_>, node: Node, length: FfiSvgLengthValue) -> CssPixels {
+    let context = length_resolution_context(pass, node, length.unit);
     let absolutized =
         crate::css::style_compute::absolutize_length_for_calc(length.value, length.unit as usize, &context);
     CssPixels::nearest_value_for(absolutized.px)
@@ -2597,15 +2592,15 @@ fn resolve_svg_length(callbacks: &LayoutPass<'_>, node: Node, length: FfiSvgLeng
 // https://www.w3.org/TR/SVG2/coords.html#SizingSVGInCSS
 /// The natural size of an `<svg>` root's box, negotiated from what its element published.
 pub(crate) fn svg_root_natural_size(
-    callbacks: &LayoutPass<'_>,
+    pass: &LayoutPass<'_>,
     node: Node,
 ) -> (Option<CssPixels>, Option<CssPixels>, Option<(CssPixels, CssPixels)>) {
-    let attributes = callbacks.arena().svg_attribute_facts(node);
+    let attributes = pass.arena().svg_attribute_facts(node);
     // The intrinsic dimensions must also be determined from the width and height sizing properties. If either width or
     // height are not specified, the used value is the initial value 'auto'. 'auto' and percentage lengths must not be
     // used to determine an intrinsic width or intrinsic height.
     let resolve = |length: FfiSvgLengthValue| {
-        (length.kind == SVG_LENGTH_KIND_LENGTH).then(|| resolve_svg_length(callbacks, node, length))
+        (length.kind == SVG_LENGTH_KIND_LENGTH).then(|| resolve_svg_length(pass, node, length))
     };
     let width = resolve(attributes.natural_width);
     let height = resolve(attributes.natural_height);
@@ -2618,6 +2613,29 @@ pub(crate) fn svg_root_natural_size(
         height,
         svg_root_natural_aspect_ratio(width, height, view_box_aspect_ratio),
     )
+}
+
+/// Overwrites the content size of the document element's `<svg>`, which the layout entry sized as the viewport in
+/// `cells`, with its styled width and height (from <svg width height ...>) where they are lengths. A decoded SVG image
+/// keeps the size of the viewport it is drawn into.
+pub(crate) fn size_document_element_svg_from_its_width_and_height(
+    pass: &LayoutPass<'_>,
+    svg: Node,
+    cells: &mut used_values::RootInputCells,
+) {
+    if !node_facts::has_flag(pass.node_data(svg), NodeFlag::IsDocumentElement) || pass.arena().document_is_decoded_svg()
+    {
+        return;
+    }
+    // NOTE: If a height had not been provided by the svg element, it was set to the height of the container
+    let style = StyleValues::for_node(pass, svg);
+    if style.width().is_length() {
+        cells.set_content_inline_size(style.width().to_px(CssPixels::default()));
+    }
+    if style.height().is_length() {
+        cells.set_content_block_size(style.height().to_px(CssPixels::default()));
+    }
+    // FIXME: In SVG 2, length can also be a percentage. We'll need to support that.
 }
 
 /// The intrinsic aspect ratio must be calculated using the following algorithm. If the algorithm returns null, then

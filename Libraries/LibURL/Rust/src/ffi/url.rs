@@ -21,19 +21,22 @@ use crate::url::{UrlInput, parse_host_into};
 #[derive(Clone, Copy)]
 pub struct RustUrlInput {
     pub utf8: *const u8,
+    pub latin1: *const u8,
     pub utf16: *const u16,
     pub length: usize,
 }
 
 impl RustUrlInput {
     /// # Safety
-    /// The selected pointer must borrow length storage units. Byte input must be valid UTF-8.
+    /// The selected pointer must borrow length storage units. UTF-8 input must be valid UTF-8.
     pub(crate) unsafe fn borrow<'a>(self) -> UrlInput<'a> {
         if self.length == 0 {
             return UrlInput::Utf8("");
         }
         if !self.utf16.is_null() {
             UrlInput::Utf16(unsafe { ak::slice_from_raw_parts(self.utf16, self.length) })
+        } else if !self.latin1.is_null() {
+            UrlInput::Latin1(unsafe { ak::slice_from_raw_parts(self.latin1, self.length) })
         } else {
             UrlInput::Utf8(unsafe { std::str::from_utf8_unchecked(ak::slice_from_raw_parts(self.utf8, self.length)) })
         }
@@ -89,6 +92,12 @@ impl RustUrl {
             serialization: unsafe { self.serialization.borrow() }.unwrap_or(""),
             components: self.components,
         }
+    }
+
+    /// # Safety
+    /// The serialization must be valid UTF-8 for the duration of this call, and the components must describe it.
+    pub unsafe fn to_url(&self) -> Url {
+        Url::from(unsafe { self.borrow() })
     }
 }
 
@@ -241,10 +250,13 @@ pub unsafe extern "C" fn rust_url_set_password(
 pub unsafe extern "C" fn rust_url_set_port(
     url: *const RustUrl,
     has_port: bool,
-    port: u16,
+    port: u32,
     ctx: *mut c_void,
     on_complete: FfiUrlResultFn,
 ) {
+    // NB: A port travels in 32 bits. rustc takes the upper bits of a narrower parameter to be zero, which GCC 16 does not
+    //     hold to: it sign-extends a u16 of 32768 or above.
+    let port = port as u16;
     abort_on_panic(|| unsafe {
         modify_url(url, ctx, on_complete, |url| url.set_port(has_port.then_some(port)));
     })

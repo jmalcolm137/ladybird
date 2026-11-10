@@ -4,7 +4,6 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-use crate::css::style::fast_hash::FastMap;
 use crate::layout::node_data::NodeSlotId;
 use libgfx_rust::path::Path;
 use libgfx_rust::{FloatPoint, WindingRule};
@@ -72,7 +71,7 @@ pub struct PublishedImageMapArea {
 
 // https://html.spec.whatwg.org/multipage/image-maps.html#image-map-processing-model
 /// The shape to layer onto the image, built with the same operations the DOM side built it with,
-/// so that the containment test is the one `Gfx::Path` already answered.
+/// so that the containment test gives the same answer.
 fn shape_path(shape: AreaShape, coords: &[f64]) -> Option<Path> {
     // Each area element in areas must be processed as follows to obtain a shape to layer onto the image:
 
@@ -185,10 +184,11 @@ fn rectangle_path(left: f32, top: f32, right: f32, bottom: f32) -> Path {
 pub struct ImageMapAreaColumn {
     /// Shared with the rows published for the host, so a write copies the maps only while those hold them.
     maps: Arc<ImageMaps>,
+    writes: u64,
 }
 
 /// The `<area>` elements of the image map of every image that has one, by the image's paintable row.
-pub type ImageMaps = FastMap<NodeSlotId, Arc<[PublishedImageMapArea]>>;
+pub type ImageMaps = crate::cow_map::CowMap<NodeSlotId, Arc<[PublishedImageMapArea]>>;
 
 impl ImageMapAreaColumn {
     /// Publishes the `<area>` elements of the image map an image is associated with, in tree order.
@@ -197,16 +197,16 @@ impl ImageMapAreaColumn {
             return;
         }
         if areas.is_empty() {
-            if self.maps.contains_key(&slot) {
-                Arc::make_mut(&mut self.maps).remove(&slot);
-            }
+            self.forget(slot);
         } else {
+            self.writes += 1;
             Arc::make_mut(&mut self.maps).insert(slot, areas.into());
         }
     }
 
     pub fn forget(&mut self, slot: NodeSlotId) {
         if self.maps.contains_key(&slot) {
+            self.writes += 1;
             Arc::make_mut(&mut self.maps).remove(&slot);
         }
     }
@@ -221,9 +221,9 @@ impl ImageMapAreaColumn {
         self.maps.clone()
     }
 
-    /// Where the maps are, which moves when a write copies the ones a snapshot shares.
-    pub(crate) fn address(&self) -> usize {
-        Arc::as_ptr(&self.maps).addr()
+    /// How many writes the maps took.
+    pub(crate) fn writes(&self) -> u64 {
+        self.writes
     }
 }
 

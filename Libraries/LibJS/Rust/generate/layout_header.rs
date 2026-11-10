@@ -243,13 +243,6 @@ macro_rules! check_host_object_abi_constants {
     };
 }
 
-/// The C layout that #[repr(C, u8)] gives ScriptOrModule: the tag, then the payload of the variant.
-#[repr(C)]
-struct ScriptOrModuleRepresentation {
-    tag: u8,
-    payload: usize,
-}
-
 /// Spells a class name such as RawJSONObject the way C spells constants, RAW_JSON_OBJECT.
 fn screaming_snake_case(name: &str) -> String {
     let characters: Vec<char> = name.chars().collect();
@@ -286,7 +279,6 @@ pub fn generate() -> LayoutHeader {
     let mut w = HeaderWriter::new();
 
     w.section("Cell header, at the start of every cell");
-    offset!(w, "CELL_CLASS", CellHeader, class);
     offset!(w, "CELL_MARK", CellHeader, mark);
     offset!(w, "CELL_STATE", CellHeader, state);
     offset!(w, "CELL_KIND", CellHeader, kind);
@@ -294,7 +286,8 @@ pub fn generate() -> LayoutHeader {
         w.define(&format!("CELL_KIND_{}", cell_kind_name(kind)), kind as u8);
     }
 
-    w.section("Class, which the first word of a cell points to: its id and the class it extends");
+    w.section("Class, which the block of a cell holds: its id and the class it extends");
+    w.define("BLOCK_CLASS_TAIL_TAG", BLOCK_CLASS_TAIL_TAG);
     offset!(w, "CLASS_ID", ClassLayout, id);
     offset!(w, "CLASS_PARENT", ClassLayout, parent);
 
@@ -359,15 +352,9 @@ pub fn generate() -> LayoutHeader {
     size!(w, "EXECUTION_CONTEXT", ExecutionContext);
     w.define("EXECUTION_CONTEXT_ALIGN", align_of::<ExecutionContext>());
 
-    w.section("ScriptOrModule, a tag and the script or module cell it names");
-    assert_eq!(size_of::<ScriptOrModuleRepresentation>(), size_of::<ScriptOrModule>());
-    assert_eq!(align_of::<ScriptOrModuleRepresentation>(), align_of::<ScriptOrModule>());
-    w.define("SCRIPT_OR_MODULE_TAG_OFFSET", offset_of!(ScriptOrModuleRepresentation, tag));
-    w.define("SCRIPT_OR_MODULE_PAYLOAD_OFFSET", offset_of!(ScriptOrModuleRepresentation, payload));
-    size!(w, "SCRIPT_OR_MODULE", ScriptOrModule);
-    w.define("SCRIPT_OR_MODULE_TAG_EMPTY", SCRIPT_OR_MODULE_TAG_EMPTY);
-    w.define("SCRIPT_OR_MODULE_TAG_SCRIPT", SCRIPT_OR_MODULE_TAG_SCRIPT);
-    w.define("SCRIPT_OR_MODULE_TAG_MODULE", SCRIPT_OR_MODULE_TAG_MODULE);
+    w.section("ScriptOrModule, the script or module cell it names in one word");
+    size!(w, "SCRIPT_OR_MODULE", ScriptOrModuleSlot);
+    w.define("SCRIPT_OR_MODULE_MODULE_BIT", SCRIPT_OR_MODULE_SLOT_MODULE_BIT);
 
     w.section("VM, whose head is at its start");
     offset!(w, "VM_RUNNING_EXECUTION_CONTEXT", VmHead, running_execution_context);
@@ -397,7 +384,7 @@ pub fn generate() -> LayoutHeader {
     offset!(w, "TYPED_ARRAY_ELEMENT_SIZE", TypedArrayBase, element_size);
     offset!(w, "TYPED_ARRAY_ARRAY_LENGTH", TypedArrayBase, array_length.length);
     offset!(w, "TYPED_ARRAY_ARRAY_LENGTH_ALTERNATIVE_INDEX", TypedArrayBase, array_length.alternative_index);
-    w.define("TYPED_ARRAY_ARRAY_LENGTH_U32_ALTERNATIVE_INDEX", BYTE_LENGTH_U32_INDEX);
+    w.define("TYPED_ARRAY_ARRAY_LENGTH_LENGTH_ALTERNATIVE_INDEX", BYTE_LENGTH_LENGTH_INDEX);
     offset!(w, "TYPED_ARRAY_BYTE_OFFSET", TypedArrayBase, byte_offset);
 
     w.section("TypedArrayBase kinds");
@@ -495,6 +482,7 @@ pub fn generate() -> LayoutHeader {
         JS_HOST_CLASS_HAS_CONSTRUCTOR,
         JS_HOST_CLASS_SHARES_ALLOCATOR_WITH_PARENT,
         JS_HOST_CLASS_NOT_CACHEABLE_FOR_INDEXED_PROPERTY_ABSENCE,
+        JS_HOST_CLASS_NOT_CACHEABLE_ACROSS_REALMS,
         JS_RESOLVED_BINDING_BINDING_NAME,
         JS_RESOLVED_BINDING_NAMESPACE,
         JS_RESOLVED_BINDING_AMBIGUOUS,

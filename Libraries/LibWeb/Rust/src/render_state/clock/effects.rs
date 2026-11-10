@@ -18,9 +18,7 @@ use crate::css::style::layout_style::DerivedStyleRecord;
 use crate::css::style::tree::StyleNodeID;
 use crate::css::style::{SampleBounds, StyleEngine};
 use crate::css::transition::{HoverTransitions, LaneTransitions};
-use crate::layout::node_data::{
-    GENERATED_FOR_AFTER, GENERATED_FOR_BEFORE, GENERATED_FOR_MARKER, NodeSlotId, pseudo_kind_of,
-};
+use crate::layout::node_data::{GENERATED_FOR_AFTER, GENERATED_FOR_BEFORE, GENERATED_FOR_MARKER, NodeSlotId};
 use crate::layout::{LayoutNodeArena, SampleKind, StyleRelayout};
 use crate::painting::host::FfiVisualAnimationTargetKind;
 use crate::painting::record::damage::PaintDamage;
@@ -198,12 +196,15 @@ impl Lane {
             .map(ElementEffects::node)
             .collect();
         if !unplanned.is_empty()
-            && let super::LaneState::Forked(mut fork) = std::mem::take(&mut self.state)
+            && let super::LaneState::Forked {
+                mut fork,
+                state_moved_on,
+            } = std::mem::take(&mut self.state)
         {
             for &node in &unplanned {
                 self.show_host_styles_of_started(&mut fork, node);
             }
-            self.state = super::LaneState::Forked(fork);
+            self.state = super::LaneState::Forked { fork, state_moved_on };
         }
         self.effects
             .retain(|effects| !unplanned.contains(&effects.node()) || !effects.is_host());
@@ -503,7 +504,10 @@ impl Lane {
             if row.is_invalid() {
                 continue;
             }
-            let host_record = self.host_record(state, row);
+            let Some(host_record) = state.engine_ref().host_record(self.host_record(state, row)).cloned() else {
+                composed = Err(NeedsHost);
+                break;
+            };
             let mut inherited = AnimatedOverlay::default();
             for &property in properties {
                 if let Some(entry) = overlay.get(property) {
@@ -512,7 +516,7 @@ impl Lane {
             }
             match state
                 .engine_mut()
-                .compose_overlay_over_record(*descendant, host_record, &inherited, bounds)
+                .compose_overlay_over_record(*descendant, &host_record, &inherited, bounds)
             {
                 Ok(sample) => samples.push((row, *descendant, sample, &properties[..])),
                 Err(needs_host) => {
@@ -616,13 +620,10 @@ impl Lane {
                         inherited.set_owned(property, entry.clone_value(), true, false);
                     }
                 }
-                let sample = state.engine_mut().compose_overlay_over_pseudo_element_record(
-                    *node,
-                    pseudo_kind_of(generated_for),
-                    host_record,
-                    &inherited,
-                    bounds,
-                )?;
+                let host_record = state.engine_ref().host_record(host_record).ok_or(NeedsHost)?.clone();
+                let sample = state
+                    .engine_mut()
+                    .compose_overlay_over_record(*node, &host_record, &inherited, bounds)?;
                 composed.push((row, sample, inherited_properties));
             }
         }

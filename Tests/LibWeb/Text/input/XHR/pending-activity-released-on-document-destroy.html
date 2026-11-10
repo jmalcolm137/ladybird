@@ -1,0 +1,37 @@
+<!DOCTYPE html>
+<script src="../include.js"></script>
+<script>
+    promiseTest(async () => {
+        const server = httpTestServer();
+        const url = await server.createEcho("GET", "/xhr-pending-activity-release", {
+            status: 200,
+            headers: { "Content-Type": "text/plain" },
+            body: "done",
+            delay_ms: 500,
+        });
+
+        const frame = document.createElement("iframe");
+        document.body.append(frame);
+
+        const xhr = new frame.contentWindow.XMLHttpRequest();
+        xhr.open("GET", url);
+        xhr.send();
+        println(`listenerless: ${internals.hasPendingActivity(xhr)}`);
+
+        const listener = () => {};
+        xhr.addEventListener("progress", listener);
+        println(`with listener: ${internals.hasPendingActivity(xhr)}`);
+
+        xhr.removeEventListener("progress", listener);
+        println(`after removing listener: ${internals.hasPendingActivity(xhr)}`);
+
+        xhr.addEventListener("loadend", listener);
+        await new Promise(resolve => {
+            frame.contentWindow.addEventListener("unload", resolve, { once: true });
+            frame.remove();
+        });
+        // Collect after the unload task has finished destroying the document.
+        await internals.gcAsync();
+        println(`after destroy: ${internals.hasPendingActivity(xhr)}`);
+    });
+</script>

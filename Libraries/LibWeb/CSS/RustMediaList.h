@@ -81,7 +81,6 @@ public:
     }
 
     RustMediaList retain() const { return RustMediaList { Parser::ValueParserFFI::rust_media_list_retain(m_list) }; }
-    RustMediaList share() const { return RustMediaList { Parser::ValueParserFFI::rust_media_list_share(m_list) }; }
     size_t length() const { return Parser::ValueParserFFI::rust_media_list_length(m_list); }
     bool matches() const { return Parser::ValueParserFFI::rust_media_list_matches(m_list); }
     bool evaluate(DOM::Document const& document) const
@@ -90,8 +89,6 @@ public:
         return Parser::ValueParserFFI::rust_media_list_evaluate(m_list, environment.ffi_environment());
     }
     void set_text(Utf16View text) const { Parser::ValueParserFFI::rust_media_list_set_text(m_list, view(text)); }
-    bool append(Utf16View text) const { return Parser::ValueParserFFI::rust_media_list_append(m_list, view(text)); }
-    Parser::ValueParserFFI::MediaListDeleteResult remove(Utf16View text) const { return Parser::ValueParserFFI::rust_media_list_delete(m_list, view(text)); }
     Utf16String media_text() const
     {
         Utf16String result;
@@ -111,8 +108,8 @@ public:
 private:
     static Parser::ValueParserFFI::FfiUtf16View view(Utf16View text)
     {
-        return { text.has_ascii_storage() ? reinterpret_cast<u8 const*>(text.ascii_span().data()) : nullptr,
-            text.has_ascii_storage() ? nullptr : reinterpret_cast<u16 const*>(text.utf16_span().data()), text.length_in_code_units() };
+        return { text.has_latin1_storage() ? text.latin1_span().data() : nullptr,
+            text.has_latin1_storage() ? nullptr : reinterpret_cast<u16 const*>(text.utf16_span().data()), text.length_in_code_units() };
     }
     static void copy_text(void* context, u16 const* data, size_t length)
     {

@@ -13,6 +13,7 @@
 #include <LibMedia/Containers/Matroska/MatroskaDemuxer.h>
 #include <LibMedia/IncrementallyPopulatedStream.h>
 #include <LibMedia/ReadonlyBytesCursor.h>
+#include <LibMediaCodecs/Limits.h>
 #include <LibTest/TestCase.h>
 
 #include <LibMedia/Containers/Matroska/Reader.h>
@@ -324,6 +325,27 @@ ByteBuffer make_matroska_without_cues(SegmentSize segment_size, ClusterSize clus
     }
 
     return data;
+}
+
+ByteBuffer make_track_entry_with_element_of_size(u32 id, size_t payload_size)
+{
+    ByteBuffer data;
+    auto track_entry = begin_ebml_master(data, Media::Matroska::TRACK_ENTRY_ID);
+    append_ebml_uint(data, Media::Matroska::TRACK_NUMBER_ID, 1);
+    append_ebml_id(data, id);
+    append_ebml_size(data, payload_size, 4);
+    auto payload_offset = data.size();
+    MUST(data.try_resize(payload_offset + payload_size));
+    data.bytes().slice(payload_offset).fill('a');
+    finish_ebml_master(data, track_entry);
+    return data;
+}
+
+Media::DecoderErrorOr<NonnullRefPtr<Media::Matroska::TrackEntry>> parse_track_entry(ByteBuffer const& data)
+{
+    // Parsing starts after the element ID.
+    auto streamer = streamer_from_bytes(data.bytes().slice(1));
+    return Media::Matroska::Reader::parse_track_entry(streamer);
 }
 
 }
@@ -941,6 +963,35 @@ TEST_CASE(buffered_time_ranges_incremental_thirds)
     EXPECT_EQ(ranges_3[0].end, AK::Duration::from_microseconds(1021500));
 }
 
+TEST_CASE(buffered_time_ranges_scan_only_the_given_byte_ranges)
+{
+    auto file_data = load_test_file_data("./vp9_in_webm.webm"sv);
+    size_t one_third = file_data.size() / 3;
+    size_t two_thirds = one_third * 2;
+
+    // Bytes can arrive after a scan takes its snapshot of the stream's byte ranges.
+    NonnullRefPtr<Media::IncrementallyPopulatedStream> stream = Media::IncrementallyPopulatedStream::create_empty();
+    stream->add_chunk_at(0, file_data.bytes().slice(0, two_thirds));
+    stream->add_chunk_at(CUES_START, file_data.bytes().slice(CUES_START));
+    auto reader = MUST(Media::Matroska::Reader::from_stream(stream->create_cursor()));
+    auto scan_cursor = stream->create_cursor();
+    scan_cursor->set_is_blocking(false);
+
+    auto scan = [&](size_t end) {
+        Vector<Media::MediaStream::ByteRange> byte_ranges { { 0, end }, { CUES_START, file_data.size() } };
+        auto scans = reader.buffered_time_ranges_by_track(scan_cursor, byte_ranges);
+        return Media::DemuxerScanState::create_from_track_scans(move(scans), reader.duration().value_or(AK::Duration::zero()), false).buffered_ranges();
+    };
+
+    auto ranges_1 = scan(one_third);
+    EXPECT_EQ(ranges_1.size(), 1u);
+    EXPECT_EQ(ranges_1[0].end, AK::Duration::from_milliseconds(51));
+
+    auto ranges_2 = scan(two_thirds);
+    EXPECT_EQ(ranges_2.size(), 1u);
+    EXPECT_EQ(ranges_2[0].end, AK::Duration::from_milliseconds(531));
+}
+
 // big_buck_bunny_5s.webm cluster layout:
 //   Cluster 0 (0ms):    byte 482
 //   Cluster 1 (500ms):  byte 6128
@@ -1170,4 +1221,22 @@ TEST_CASE(unknown_track_type_values_are_invalid)
     // Every value the element can carry maps to a track type without trapping.
     EXPECT_EQ(Media::Matroska::track_type_from_matroska_track_type(Media::Matroska::TrackEntry::TrackType::Metadata), Media::TrackType::Subtitles);
     EXPECT_EQ(Media::Matroska::track_type_from_matroska_track_type(Media::Matroska::TrackEntry::TrackType::Control), Media::TrackType::Unknown);
+}
+
+TEST_CASE(strings_past_the_metadata_string_limit_are_corrupted)
+{
+    auto track_entry = MUST(parse_track_entry(make_track_entry_with_element_of_size(Media::Matroska::TRACK_NAME_ID, Media::MAX_METADATA_STRING_SIZE)));
+    auto name = track_entry->name();
+    EXPECT_EQ(name.bytes().size(), Media::MAX_METADATA_STRING_SIZE);
+
+    auto result = parse_track_entry(make_track_entry_with_element_of_size(Media::Matroska::TRACK_NAME_ID, Media::MAX_METADATA_STRING_SIZE + 1));
+    EXPECT(result.is_error());
+    EXPECT_EQ(result.error().category(), Media::DecoderErrorCategory::Corrupted);
+}
+
+TEST_CASE(codec_private_data_past_the_codec_configuration_limit_is_corrupted)
+{
+    auto result = parse_track_entry(make_track_entry_with_element_of_size(Media::Matroska::TRACK_CODEC_PRIVATE_ID, Media::MAX_CODEC_CONFIGURATION_SIZE + 1));
+    EXPECT(result.is_error());
+    EXPECT_EQ(result.error().category(), Media::DecoderErrorCategory::Corrupted);
 }

@@ -3,16 +3,12 @@ set(SOURCES
     CAPI.cpp
     Cell.cpp
     CellAllocator.cpp
-    ConservativeHashMap.cpp
-    ConservativeHashTable.cpp
-    ConservativeRangeProvider.cpp
-    ConservativeVector.cpp
     CrossHeapMember.cpp
-    ExternalEntityTable.cpp
     Root.cpp
     RootHashMap.cpp
     RootHashTable.cpp
     RootVector.cpp
+    Rootable.cpp
     Heap.cpp
     HeapGroup.cpp
     HeapBlock.cpp

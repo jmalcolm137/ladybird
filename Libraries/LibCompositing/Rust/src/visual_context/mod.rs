@@ -41,6 +41,9 @@ pub struct TransformData {
     pub role: TransformDataRole,
     pub synthetic_plane: bool,
     pub establishes_sorting_context: bool,
+    /// The box the node transforms, with what overflows it, in the node's space: what a transform animation of the
+    /// node moves. Empty where the node transforms no box.
+    pub bounds: FloatRect,
 }
 
 impl TransformData {
@@ -149,7 +152,6 @@ pub struct MaskData {
 pub struct ScrollData {
     pub state_slot: ScrollStateSlot,
     pub owner_paintable: NodeSlotId,
-    pub registry_parent_node: SpatialNodeIndex,
 }
 
 // A sticky box's shift is derived when the scroll state snapshot is resolved, from the scroller's
@@ -165,8 +167,9 @@ pub struct StickyData {
     pub scrollport_size: FloatSize,
     pub containing_block_region: FloatRect,
     pub needs_parent_offset_adjustment: bool,
-    // The nearest scroll container of the box when it has no scrollable overflow, and so no scroll node. Its
-    // scrollport never moves, and the geometry above is relative to it rather than to the scroller.
+    // The nearest scroll container of the box when it has no scroll node, because it has no scrollable overflow and
+    // passes its scrolls on. Its scrollport never moves, and the geometry above is relative to it rather than to the
+    // scroller.
     pub non_scrolling_scroll_container: NodeSlotId,
     pub inset_top: Option<f32>,
     pub inset_right: Option<f32>,
@@ -174,7 +177,6 @@ pub struct StickyData {
     pub inset_left: Option<f32>,
     pub state_slot: ScrollStateSlot,
     pub owner_paintable: NodeSlotId,
-    pub registry_parent_node: SpatialNodeIndex,
 }
 
 impl StickyData {
@@ -183,7 +185,6 @@ impl StickyData {
         parent_sticky: Option<SpatialNodeIndex>,
         state_slot: ScrollStateSlot,
         owner_paintable: NodeSlotId,
-        registry_parent_node: SpatialNodeIndex,
     ) -> Self {
         Self {
             scroller,
@@ -200,8 +201,11 @@ impl StickyData {
             inset_left: None,
             state_slot,
             owner_paintable,
-            registry_parent_node,
         }
+    }
+
+    pub fn parent_sticky_or_scroller(&self) -> SpatialNodeIndex {
+        self.parent_sticky.unwrap_or(self.scroller)
     }
 }
 
@@ -656,8 +660,32 @@ pub fn resolve_leaf_to_context_matrices(
     matrices
 }
 
+/// A number no other copy of a tree has had: what a holder of no reference to a tree can tell it by, where another tree
+/// can take the address of one that is gone. Every copy takes a number of its own, so a write to a tree someone shares,
+/// which copies it, moves the number.
+#[derive(Debug, PartialEq, Eq)]
+pub struct VisualContextTreeCopy(u64);
+
+impl VisualContextTreeCopy {
+    fn new() -> Self {
+        // NB: The process's counter numbers nothing but what its numbers are told apart from.
+        Self(allocate_structural_epoch())
+    }
+
+    pub fn number(&self) -> u64 {
+        self.0
+    }
+}
+
+impl Clone for VisualContextTreeCopy {
+    fn clone(&self) -> Self {
+        Self::new()
+    }
+}
+
 #[derive(Clone)]
 pub struct VisualContextTree {
+    pub copy: VisualContextTreeCopy,
     pub spatial_nodes: Vec<SpatialNode>,
     pub clip_nodes: Vec<ClipNode>,
     pub effect_nodes: Vec<EffectNode>,
@@ -696,13 +724,11 @@ fn for_each_spatial_node_reference(
         visit(node.parent);
     }
     match &node.data {
-        SpatialData::Scroll(scroll) => visit(scroll.registry_parent_node),
         SpatialData::Sticky(sticky) => {
             visit(sticky.scroller);
             if let Some(parent_sticky) = sticky.parent_sticky {
                 visit(parent_sticky);
             }
-            visit(sticky.registry_parent_node);
         }
         SpatialData::Transform(transform) => {
             if let Some(root) = transform.sorting_context_root_index {
@@ -711,7 +737,7 @@ fn for_each_spatial_node_reference(
         }
         SpatialData::BackfaceVisibility(backface) => visit(backface.plane_root_index),
         SpatialData::AnchorScrollShift(shift) => visit(shift.scroll_node_index),
-        SpatialData::Perspective(_) | SpatialData::Dead => {}
+        SpatialData::Scroll(_) | SpatialData::Perspective(_) | SpatialData::Dead => {}
     }
 }
 
@@ -820,6 +846,7 @@ impl VisualContextTree {
             clip_nodes: Vec::new(),
             effect_nodes: Vec::new(),
             root_isolation_effect: None,
+            copy: VisualContextTreeCopy::new(),
             structural_epoch: allocate_structural_epoch(),
             spatial_slots: SlotAccounting {
                 live_count: 1,
@@ -854,6 +881,7 @@ impl VisualContextTree {
             clip_nodes,
             effect_nodes,
             root_isolation_effect,
+            copy: VisualContextTreeCopy::new(),
             structural_epoch,
             sampled_background_colors: HashMap::new(),
             visual_animations: std::sync::Arc::from(Vec::new()),
@@ -1453,6 +1481,7 @@ mod tests {
             role: TransformDataRole::CssTransform,
             synthetic_plane: false,
             establishes_sorting_context: false,
+            bounds: FloatRect::default(),
         }
     }
 
@@ -1499,7 +1528,6 @@ mod tests {
             SpatialData::Scroll(ScrollData {
                 state_slot: NO_SCROLL_STATE_SLOT,
                 owner_paintable: NodeSlotId::INVALID,
-                registry_parent_node: VISUAL_VIEWPORT_NODE_INDEX,
             }),
             VISUAL_VIEWPORT_NODE_INDEX,
         );
@@ -1559,7 +1587,6 @@ mod tests {
         SpatialData::Scroll(ScrollData {
             state_slot: NO_SCROLL_STATE_SLOT,
             owner_paintable: NodeSlotId::INVALID,
-            registry_parent_node: VISUAL_VIEWPORT_NODE_INDEX,
         })
     }
 
@@ -1576,7 +1603,6 @@ mod tests {
                 None,
                 NO_SCROLL_STATE_SLOT,
                 NodeSlotId::INVALID,
-                scroll,
             )),
             VISUAL_VIEWPORT_NODE_INDEX,
         );

@@ -10,15 +10,43 @@
 #include <AK/DistinctNumeric.h>
 #include <AK/Variant.h>
 #include <LibCompositing/Forward.h>
+#include <LibCore/Forward.h>
 #include <LibGC/Forward.h>
 #include <LibGfx/Forward.h>
+#include <LibHTTP/Forward.h>
 #include <LibIPC/Forward.h>
 #include <LibJS/Forward.h>
+#include <LibURL/Forward.h>
 #include <LibWeb/Bindings/Forward.h>
 #include <LibWeb/CSS/StyleEngineIdentifiers.h>
 #include <LibWeb/CSS/StyleRecordID.h>
 #include <LibWeb/Export.h>
 #include <LibWebCommon/Forward.h>
+
+namespace Gfx {
+
+class Typeface;
+
+}
+
+namespace Web::Fetch::Engine {
+
+class FetchBodyDeliveryGate;
+class FetchByteChannel;
+class WholeBodyTransport;
+
+}
+
+// NB: The fetch engine can't include LibGC, so these are declared here. A whole-body transport keeps the callbacks
+//     that fetch gives it, which hold the cells they use in roots.
+GC_UNTRACED_CAPTURE(Web::Fetch::Engine::FetchBodyDeliveryGate);
+GC_UNTRACED_CAPTURE(Web::Fetch::Engine::FetchByteChannel);
+GC_UNTRACED_CAPTURE_WITH_ROOTED_CALLBACKS(Web::Fetch::Engine::WholeBodyTransport);
+GC_UNTRACED_CAPTURE(Gfx::Typeface);
+GC_UNTRACED_CAPTURE(HTTP::HeaderList);
+GC_UNTRACED_CAPTURE(HTTP::MemoryCache);
+GC_UNTRACED_CAPTURE(URL::URL);
+GC_UNTRACED_CAPTURE(URL::Origin);
 
 namespace Web {
 
@@ -148,6 +176,42 @@ class MediaStreamTrack;
 
 }
 
+namespace Web::WebRTC {
+
+class KeyFrameRequestEvent;
+class RTCCertificate;
+class RTCDataChannel;
+class RTCDataChannelEvent;
+class RTCDTMFSender;
+class RTCDTMFToneChangeEvent;
+class RTCDtlsTransport;
+class RTCEncodedAudioFrame;
+class RTCEncodedVideoFrame;
+class RTCError;
+class RTCErrorEvent;
+class RTCIceCandidate;
+class RTCIceTransport;
+class RTCPeerConnection;
+class RTCPeerConnectionIceErrorEvent;
+class RTCPeerConnectionIceEvent;
+class RTCRtpReceiver;
+class RTCRtpScriptTransform;
+class RTCRtpScriptTransformer;
+class RTCRtpSender;
+class RTCRtpTransceiver;
+class RTCSctpTransport;
+class RTCSessionDescription;
+class RTCSFrameReceiverTransform;
+class RTCSFrameSenderTransform;
+class RTCStatsReport;
+class RTCTrackEvent;
+class RTCTransformEvent;
+class SFrameDecrypterStream;
+class SFrameEncrypterStream;
+class SFrameTransformErrorEvent;
+
+}
+
 namespace Web::Clipboard {
 
 class Clipboard;
@@ -207,6 +271,7 @@ class BackgroundSizeStyleValue;
 class BlurFilterStyleValue;
 class CalculatedStyleValue;
 class CustomPropertyData;
+enum class IsAnimationOverlay : bool;
 class ColorFilterStyleValue;
 class ColorFunctionStyleValue;
 class ColorSchemeStyleValue;
@@ -219,66 +284,26 @@ class ContentStyleValue;
 class CounterDefinitionsStyleValue;
 class CounterStyleStyleValue;
 class CSSAnimation;
-class CSSConditionRule;
-class CSSContainerRule;
-class CSSCounterStyleRule;
 class CSSDescriptors;
-class CSSFontFaceDescriptors;
 class CSSFontFaceRule;
-class CSSFontFeatureValuesMap;
 class CSSFontFeatureValuesRule;
-class CSSFunctionDescriptors;
 class CSSFunctionRule;
 class CSSGroupingRule;
-class CSSImageValue;
 class CSSImportRule;
-class CSSKeyframeRule;
 class CSSKeyframesRule;
 class CSSKeywordValue;
-class CSSLayerBlockRule;
-class CSSLayerStatementRule;
-class CSSMarginRule;
-class CSSMathClamp;
-class CSSMathInvert;
-class CSSMathMax;
-class CSSMathMin;
-class CSSMathNegate;
-class CSSMathProduct;
-class CSSMathSum;
-class CSSMathValue;
-class CSSMatrixComponent;
-class CSSMediaRule;
-class CSSNamespaceRule;
 class CSSNestedDeclarations;
-class CSSNumericArray;
 class CSSNumericValue;
-class CSSPageRule;
-class CSSPageDescriptors;
-class CSSPerspective;
 class CSSPositionTryDescriptors;
-class CSSPositionTryRule;
-class CSSPropertyRule;
-class CSSRotate;
 class CSSRule;
 class CSSRuleList;
-class CSSScale;
-class CSSScopeRule;
-class CSSSkew;
-class CSSSkewX;
-class CSSSkewY;
 class CSSStyleDeclaration;
 class CSSStyleProperties;
 class CSSStyleRule;
 class CSSStyleSheet;
 class StyleSheetState;
 class CSSStyleValue;
-class CSSSupportsRule;
-class CSSTransformComponent;
-class CSSTransformValue;
-class CSSTranslate;
 class CSSUnitValue;
-class CSSUnparsedValue;
-class CSSVariableReferenceValue;
 class CursorStyleValue;
 class CustomIdentStyleValue;
 class DimensionStyleValue;
@@ -298,7 +323,6 @@ class Frequency;
 class FrequencyPercentage;
 class FrequencyStyleValue;
 class FunctionStyleValue;
-class Highlight;
 class HighlightRegistry;
 class HueRotateFilterStyleValue;
 class ImageSetStyleValue;
@@ -312,7 +336,6 @@ class LengthPercentageOrAuto;
 class LengthStyleValue;
 class MediaList;
 class MediaQueryList;
-class MediaQueryListEvent;
 class Number;
 class NumberStyleValue;
 class NumericType;
@@ -326,7 +349,6 @@ class RatioStyleValue;
 class Resolution;
 class ResolutionStyleValue;
 class Screen;
-class ScreenOrientation;
 class Selector;
 class ShadowStyleValue;
 class ShorthandStyleValue;
@@ -335,7 +357,6 @@ class StyleComputer;
 class StylePropertyMap;
 class StylePropertyMapReadOnly;
 class StyleScope;
-class StyleSheet;
 class StyleSheetImport;
 class StyleSheetList;
 class StyleValue;
@@ -356,7 +377,6 @@ enum class LayoutTreeRebuildRoot : u8;
 enum class MediaFeatureID : u8;
 enum class PropertyID : u16;
 enum class ValueType : u8;
-enum class AnimatedPropertyResultOfTransition : u8;
 
 enum class AbsoluteSize : u8;
 enum class AnchorSize : u8;
@@ -417,7 +437,6 @@ struct ColorResolutionStyle;
 struct ComputationContext;
 struct CustomPropertyRegistration;
 struct LogicalAliasMappingContext;
-struct NormalGap;
 struct RequiredInvalidationAfterStyleChange;
 
 // https://drafts.css-houdini.org/css-typed-om-1/#typedefdef-cssnumberish
@@ -449,6 +468,7 @@ class AbortController;
 class AbortSignal;
 class AbstractElement;
 class AbstractRange;
+class AccessibilityChangeTracker;
 class AccessibilityTreeNode;
 class AnchorNameMap;
 class Attr;
@@ -510,6 +530,12 @@ enum class UpdateLayoutReason;
 using HTMLSerializationOptions = Bindings::GetHTMLOptions;
 using ShadowRootMode = Bindings::ShadowRootMode;
 using SlotAssignmentMode = Bindings::SlotAssignmentMode;
+
+}
+
+namespace Web::Translation {
+
+class DocumentTranslator;
 
 }
 
@@ -633,6 +659,7 @@ class DOMRectReadOnly;
 namespace Web::HTML {
 
 enum class CheckIfUnloadingIsCanceledResult;
+enum class HoverUpdatePoint : u8;
 
 class AnimationFrameCallbackDriver;
 class AudioTrack;
@@ -640,11 +667,11 @@ class AudioTrackList;
 class AutoplaySettings;
 class BarProp;
 class BeforeUnloadEvent;
-class BroadcastChannel;
 class BrowsingContext;
 class Canvas2DContextBase;
 class CanvasHost;
 class CanvasRenderingContext2D;
+class CheckUnloadingCanceledState;
 class RemoteCanvas2DTransport;
 class ClassicScript;
 class CloseEvent;
@@ -657,6 +684,7 @@ class DataTransfer;
 class DataTransferItem;
 class DataTransferItemList;
 class DecodedImageData;
+class DedicatedWorkerThreadLink;
 class DocumentState;
 class DOMParser;
 class DOMStringList;
@@ -722,6 +750,7 @@ class HTMLOListElement;
 class HTMLOptGroupElement;
 class HTMLOptionElement;
 class HTMLOptionsCollection;
+class HTMLOrSVGScriptElement;
 class HTMLOutputElement;
 class HTMLParagraphElement;
 class HTMLParamElement;
@@ -762,7 +791,7 @@ class LocalNavigable;
 class LocalTraversableNavigable;
 class Location;
 class MediaError;
-class MessageChannel;
+class MediaStreamPlayback;
 class MessageEvent;
 class MessagePort;
 class MimeType;
@@ -801,8 +830,6 @@ class SharedResourceRequest;
 class SharedWorker;
 class SharedWorkerGlobalScope;
 class Storage;
-class StructuredSerializeReader;
-class StructuredSerializeWriter;
 class SubmitEvent;
 class TextTrack;
 class TextTrackCue;
@@ -813,13 +840,13 @@ class Timer;
 class TimeRanges;
 class ToggleEvent;
 class TrackEvent;
-class TransferDataDecoder;
 class UserActivation;
 class UserScrollGestureHold;
 class ValidityState;
 class VideoPlaybackQuality;
 class VideoTrack;
 class VideoTrackList;
+class VisibilityStateEntry;
 class Window;
 class WindowEnvironmentSettingsObject;
 class WindowProxy;
@@ -848,6 +875,7 @@ enum class RequireWellFormed;
 enum class SelectionDirection : u8;
 
 struct Agent;
+class ScriptAbortHandle;
 struct DeserializedTransferRecord;
 struct Environment;
 struct EnvironmentSettingsObject;
@@ -876,11 +904,9 @@ class IDBFactory;
 
 namespace Web::Internals {
 
-class FakeXRDevice;
 class Internals;
 class InternalGamepad;
 class WebUI;
-class XRTest;
 
 }
 
@@ -954,6 +980,7 @@ class PerformanceTiming;
 namespace Web::NotificationsAPI {
 
 class Notification;
+struct NotificationData;
 
 }
 
@@ -1035,13 +1062,6 @@ class Selection;
 
 }
 
-namespace Web::Serial {
-
-class Serial;
-class SerialPort;
-
-}
-
 namespace Web::ServiceWorker {
 
 class Cache;
@@ -1084,10 +1104,7 @@ class WritableStream;
 namespace Web::StorageAPI {
 
 class NavigatorStorage;
-class StorageBottle;
-class StorageBucket;
 class StorageManager;
-class StorageShelf;
 
 }
 
@@ -1155,6 +1172,7 @@ class SVGSwitchElement;
 class SVGSymbolElement;
 class SVGTitleElement;
 class SVGTransformList;
+class SVGUseElement;
 class SVGViewElement;
 class TimeEvent;
 
@@ -1229,7 +1247,6 @@ namespace Web::WebGL {
 
 class RemoteWebGLTransport;
 class WebGL2RenderingContext;
-class WebGLContextEvent;
 class WebGLRenderingContext;
 class WebGLRenderingContextBase;
 
@@ -1260,9 +1277,7 @@ struct InputState;
 namespace Web::WebLocks {
 
 class Lock;
-class LockData;
 class LockManager;
-class LockRequest;
 class NavigatorLocks;
 
 }
@@ -1280,21 +1295,9 @@ class VTTRegion;
 
 }
 
-namespace Web::WebXR {
-
-class XRLayer;
-class XRRenderState;
-class XRSession;
-class XRSessionEvent;
-class XRSystem;
-class XRWebGLLayer;
-
-}
-
 namespace Web::XHR {
 
 class FormData;
-class FormDataIterator;
 class ProgressEvent;
 class XMLHttpRequest;
 class XMLHttpRequestEventTarget;

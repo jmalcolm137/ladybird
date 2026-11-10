@@ -29,6 +29,8 @@ public:
     // The payload the platform drag source should carry, once a drag has started.
     Web::DragData drag_data() const;
 
+    static GC::Ptr<HTML::HTMLElement> first_draggable_inclusive_ancestor(DOM::Node&);
+
     EventResult handle_drag_start(JS::Object const& relevant_global_object, GC::Ptr<DOM::Node> drag_target, CSSPixelPoint screen_position, CSSPixelPoint page_offset, CSSPixelPoint client_offset, CSSPixelPoint offset, unsigned button, unsigned buttons, unsigned modifiers, Vector<HTML::SelectedFile> files, Optional<String> text = {}, Vector<String> urls = {});
     EventResult handle_drag_move(JS::Object const& relevant_global_object, GC::Ref<DOM::Node>, CSSPixelPoint screen_position, CSSPixelPoint page_offset, CSSPixelPoint client_offset, CSSPixelPoint offset, unsigned button, unsigned buttons, unsigned modifiers);
     EventResult handle_drag_leave(JS::Object const& relevant_global_object, CSSPixelPoint screen_position, CSSPixelPoint page_offset, CSSPixelPoint client_offset, CSSPixelPoint offset, unsigned button, unsigned buttons, unsigned modifiers);

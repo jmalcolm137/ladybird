@@ -4,52 +4,39 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-#include <LibGC/Heap.h>
 #include <LibJS/Runtime/Realm.h>
-#include <LibJS/Runtime/VM.h>
 #include <LibWeb/HTML/MessagePort.h>
 #include <LibWeb/WebAudio/AudioWorkletGlobalScope.h>
-#include <LibWeb/WebAudio/AudioWorkletProcessor.h>
+#include <LibWeb/WebAudio/AudioWorkletNode.h>
 
 namespace Web::WebAudio {
 
-GC_DEFINE_ALLOCATOR(AudioWorkletProcessor);
-
-// https://webaudio.github.io/web-audio-api/#dom-audioworkletprocessor-audioworkletprocessor
-WebIDL::ExceptionOr<GC::Ref<AudioWorkletProcessor>> AudioWorkletProcessor::construct_impl(JS::Realm& realm)
-{
-    // 1. Let nodeName be the value of the current pending processor construction data's node name... (steps
-    //    collapsed): When the constructor is invoked outside of AudioWorkletNode instantiation, there is no
-    //    pending processor construction data, and a TypeError must be thrown.
-    auto* global_scope = Bindings::impl_from<AudioWorkletGlobalScope>(&realm.global_object());
-    if (!global_scope)
-        return realm.vm().throw_completion<JS::TypeError>("AudioWorkletProcessor can only be constructed in an AudioWorkletGlobalScope"sv);
-
-    auto pending_data = global_scope->take_pending_processor_construction_data();
-    if (!pending_data.has_value())
-        return realm.vm().throw_completion<JS::TypeError>("AudioWorkletProcessor cannot be constructed directly; it is instantiated by AudioWorkletNode"sv);
-
-    // 2. Set this's port to the pending construction data's transferred port.
-    return GC::Heap::the().allocate<AudioWorkletProcessor>(pending_data->port);
+extern "C" {
+AudioWorkletGlobalScope* web_audio_processor_global_scope(JS::Realm*);
+AudioWorkletNode* web_audio_processor_pending_node_reference(AudioWorkletGlobalScope*);
+HTML::MessagePort* web_audio_processor_pending_transferred_port(AudioWorkletGlobalScope*);
+JS::Realm* web_audio_processor_scope_realm(AudioWorkletGlobalScope*);
 }
 
-AudioWorkletProcessor::AudioWorkletProcessor(GC::Ref<HTML::MessagePort> port)
-    : m_port(port)
+AudioWorkletGlobalScope* web_audio_processor_global_scope(JS::Realm* realm)
 {
+    return Bindings::impl_from<AudioWorkletGlobalScope>(&realm->global_object());
 }
 
-AudioWorkletProcessor::~AudioWorkletProcessor() = default;
-
-GC::Ptr<Bindings::Wrappable> AudioWorkletProcessor::relevant_global_impl() const
+AudioWorkletNode* web_audio_processor_pending_node_reference(AudioWorkletGlobalScope* scope)
 {
-    // Pin wrapper creation to the worklet realm: the processor's port lives on the worklet global.
-    return m_port->relevant_global_impl();
+    auto const& pending_data = scope->pending_processor_construction_data();
+    return pending_data.has_value() ? pending_data->node_reference.ptr() : nullptr;
 }
 
-void AudioWorkletProcessor::visit_edges(Cell::Visitor& visitor)
+HTML::MessagePort* web_audio_processor_pending_transferred_port(AudioWorkletGlobalScope* scope)
 {
-    Base::visit_edges(visitor);
-    visitor.visit(m_port);
+    return scope->pending_processor_construction_data()->transferred_port.ptr();
+}
+
+JS::Realm* web_audio_processor_scope_realm(AudioWorkletGlobalScope* scope)
+{
+    return &scope->realm();
 }
 
 }

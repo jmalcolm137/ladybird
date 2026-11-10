@@ -72,6 +72,39 @@ test("reassignment to const should run valueOf", () => {
     expect(valueOfExecuted).toBeTrue();
 });
 
+test("update expression on const keeps its value", () => {
+    function localConstant() {
+        const value = 1;
+        try {
+            ++value;
+        } catch {}
+        try {
+            value--;
+        } catch {}
+        return value;
+    }
+    expect(localConstant()).toBe(1);
+});
+
+test("a single update expression on const keeps its value", () => {
+    function prefix() {
+        const value = 1;
+        try {
+            ++value;
+        } catch {}
+        return value;
+    }
+    function postfix() {
+        const value = "1";
+        try {
+            value--;
+        } catch {}
+        return value;
+    }
+    expect(prefix()).toBe(1);
+    expect(postfix()).toBe("1");
+});
+
 test("const creation in inner scope", () => {
     const constantValue = 1;
     do {
@@ -95,4 +128,37 @@ test("reassignment to destructured const in function", () => {
             [value] = [2];
         })();
     }).toThrowWithMessage(TypeError, "Invalid assignment to const variable");
+});
+
+test("updates of a const run valueOf and leave the value as it is", () => {
+    let valueOfCount = 0;
+    const object = {
+        valueOf() {
+            ++valueOfCount;
+            return 1;
+        },
+    };
+    function postfix(value) {
+        const constant = value;
+        constant++;
+    }
+    function prefix(value) {
+        const constant = value;
+        --constant;
+    }
+    expect(() => postfix(object)).toThrowWithMessage(TypeError, "Invalid assignment to const variable");
+    expect(() => prefix(object)).toThrowWithMessage(TypeError, "Invalid assignment to const variable");
+    expect(valueOfCount).toBe(2);
+
+    function keepsValue() {
+        const constant = Math.abs(1);
+        try {
+            constant++;
+        } catch {}
+        try {
+            --constant;
+        } catch {}
+        return constant;
+    }
+    expect(keepsValue()).toBe(1);
 });

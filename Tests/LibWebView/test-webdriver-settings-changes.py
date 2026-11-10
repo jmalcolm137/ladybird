@@ -37,13 +37,9 @@ def run_test(webdriver_binary):
         config = Path(directory) / "config"
         config.mkdir()
         (config / "Settings.json").write_text(json.dumps({"contentBlockers": {"enabled": True}}))
-        port = helpers["unused_port"]()
-        process = subprocess.Popen(
-            [webdriver_binary, "--headless", "-l", "127.0.0.1", "-p", str(port), "--profile-path", directory]
-        )
+        process, port = helpers["launch_webdriver"](webdriver_binary, "--headless", "--profile-path", directory)
         session = None
         try:
-            helpers["wait_for_port"](port)
             session = helpers["create_session"](port)
 
             def command(path, body):
@@ -96,9 +92,9 @@ def run_test(webdriver_binary):
                 document.querySelector('#dns-server').value = 'unfinished.example';
             """)
 
-            changes = change("setAppearance", {"showBookmarksBar": "never"})
+            changes = change("setAppearance", {"showBookmarksBar": "always"})
             assert set(changes) == {"appearance"}, changes
-            assert changes["appearance"]["showBookmarksBar"] == "never"
+            assert changes["appearance"]["showBookmarksBar"] == "always"
             assert script("""
                 return draftInput === document.getElementById(draftInput.id)
                     && draftInput === document.activeElement && draftInput.value === '999'
@@ -120,9 +116,8 @@ def run_test(webdriver_binary):
             ), "An update with no eligible lists left the button waiting for a notification"
 
             variable = script("""
-                const input = [...document.querySelectorAll('#config-list input[type=number]')]
-                    .find(input => input !== draftInput);
-                return {name: input.id, value: Number(input.value) + 1};
+                const input = document.querySelector('#config-list input[type=checkbox]');
+                return {name: input.id, value: !input.checked};
             """)
             changes = change("setConfigVariable", variable)
             assert set(changes) == {"configVariables", "configVariableDefinitions"}, changes

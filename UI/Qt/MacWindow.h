@@ -6,16 +6,18 @@
 
 #pragma once
 
+#include <AK/Noncopyable.h>
 #include <AK/Optional.h>
 #include <AK/Platform.h>
 #include <AK/Types.h>
 #include <LibGfx/Forward.h>
 #include <LibWebView/Forward.h>
 
+#include <QColor>
 #include <Qt>
 
-class QColor;
 class QDrag;
+class QMargins;
 class QWheelEvent;
 class QWidget;
 
@@ -46,12 +48,40 @@ Optional<AppKitScrollMomentumTransition> take_appkit_scroll_momentum_transition_
 void make_appkit_window_first_responder(QWidget&);
 // Rounds the corners of a native child widget's view, which shows what is below it through them, and outlines it.
 void round_appkit_view_corners(QWidget&, qreal radius, QColor const& border_color);
-// Puts the native view of the first widget right below the second one's, among the views of the second one's superview.
-void stack_appkit_view_below(QWidget&, QWidget& sibling);
 // The opacity of a native view embedded in another window, which has no window opacity of its own.
 void set_appkit_view_opacity(QWidget&, qreal opacity);
 // Clips a native view to rounded bottom corners, for a sheet that hangs from what is above it.
 void round_appkit_view_bottom_corners(QWidget&, qreal radius);
+// Casts a shadow around a native view. Being outside of the view, the shadow takes no mouse input.
+void cast_appkit_view_shadow(QWidget&, qreal corner_radius, qreal blur_radius, qreal y_offset, QColor const&);
+// The focus ring around a focused surface: a line right outside its edge, inside a wider, softer ring.
+struct AppKitViewFocusRing {
+    QColor edge_color;
+    QColor ring_color;
+    qreal ring_width { 0 };
+};
+// A shadow right below a native view, in a plain view of its own. It is no Qt window, as Qt on macOS takes a child
+// window to be under the mouse even when it is transparent for input, and keeps the mouse from what is below it.
+class AppKitViewShadow {
+    AK_MAKE_NONCOPYABLE(AppKitViewShadow);
+    AK_MAKE_NONMOVABLE(AppKitViewShadow);
+
+public:
+    AppKitViewShadow();
+    ~AppKitViewShadow();
+
+    // The shadow is clipped to the given room around the view.
+    // The shadow view also draws the focus ring, if any, as it lies outside the view too.
+    void follow(QWidget&, QMargins const& room, qreal corner_radius, qreal blur_radius, qreal y_offset, QColor const& shadow_color, QColor const& fill_color, Optional<AppKitViewFocusRing> const& = {});
+    void hide();
+    void set_opacity(qreal);
+
+private:
+    void* m_view { nullptr };
+    void* m_caster { nullptr };
+    void* m_focus_edge { nullptr };
+    void* m_focus_ring { nullptr };
+};
 bool start_appkit_window_drag(QWidget&);
 Qt::DropAction execute_appkit_tab_drag(QWidget&, QDrag&);
 void show_appkit_dictionary_lookup(QWidget&, WebView::DictionaryLookup const&, Gfx::IntPoint);

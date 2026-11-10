@@ -1,0 +1,43 @@
+a box below every float moves: reused [below-beside below-last], laid out again [], matches a fresh layout
+a box beside an unchanged float stays: reused [beside-first], laid out again [beside-second], matches a fresh layout
+boxes move with their float: reused [together-last], laid out again [together-first], matches a fresh layout
+a later box in a nested flow: reused [nested-last], laid out again [nested-first], matches a fresh layout
+a box that places a float: reused [places-float-box places-float-beside], laid out again [], matches a fresh layout
+a float grows: reused [], laid out again [grow-beside grow-below], matches a fresh layout
+a float is removed: reused [], laid out again [removed-beside], matches a fresh layout
+a box moves into the reach of a float: reused [], laid out again [into-reach-box], matches a fresh layout
+only the intrusion of a float changes: reused [], laid out again [intrusion-beside], matches a fresh layout
+contents above their box read a float: reused [], laid out again [above-box-box], matches a fresh layout
+clearance after a negative flow offset: reused [], laid out again [negative-flow-box], matches a fresh layout
+clearance past a float without inline size: reused [], laid out again [zero-width-box], matches a fresh layout
+a margin before a box whose contents clear: reused [], laid out again [margin-clear-box], matches a fresh layout
+a margin before a list item: reused [], laid out again [margin-marker-box], matches a fresh layout
+floats move above the root: reused [negative-root-box], laid out again [], matches a fresh layout
+a box not stored still reads for its parent: reused [], laid out again [not-stored-box], matches a fresh layout
+a reused box inside a box laid out again: reused [replay-reused], laid out again [replay-box], matches a fresh layout
+then a float grows into the reused box: reused [], laid out again [replay-box replay-reused], matches a fresh layout
+a float widens beside a formatting context: reused [], laid out again [own-context-box], matches a fresh layout
+clearance in root inline content: reused [], laid out again [], matches a fresh layout
+a clearing float in root inline content: reused [], laid out again [], matches a fresh layout
+the root widens around a fixed box: reused [root-width-wrapped-last], laid out again [], matches a fresh layout
+the root widens around a float in it: reused [], laid out again [root-width-beside], matches a fresh layout
+a box stored without floats, below a new float: reused [new-float-below], laid out again [], matches a fresh layout
+a box reused without floats: reused [read-through-first], laid out again [read-through-box], matches a fresh layout
+then a new float reaches it: reused [], laid out again [read-through-box read-through-first], matches a fresh layout
+a margin before a box that reads where it settled: reused [settled-box], laid out again [], matches a fresh layout
+a box carries the float it placed: reused [carries-box carries-beside carries-clear], laid out again [], matches a fresh layout
+a box read the float a reused box placed: reused [reader-box], laid out again [reader-beside], matches a fresh layout
+a reused box's float sizes its root: reused [grows-root-box], laid out again [], matches a fresh layout
+the root widens around a reused box with a float: reused [right-of-root-box], laid out again [], matches a fresh layout
+a float reaches a box that placed one: reused [], laid out again [in-reach-box], matches a fresh layout
+floats placed through a reused child: reused [nested-floats-inner], laid out again [nested-floats-outer], matches a fresh layout
+then the box holding them moves: reused [nested-floats-outer], laid out again [nested-floats-inner], matches a fresh layout
+a float in a top margin group: reused [in-margin-group-box], laid out again [in-margin-group-outer], matches a fresh layout
+clearance moves a box: reused [clear-past-box], laid out again [], matches a fresh layout
+a box clears one side, beside a float: reused [clear-side-box], laid out again [], matches a fresh layout
+then clearance moves it beside that float: reused [], laid out again [clear-side-box], matches a fresh layout
+clearance moves contents with a top margin: reused [clear-group-box], laid out again [], matches a fresh layout
+clearance goes from contents with a top margin: reused [], laid out again [clear-gone-box], matches a fresh layout
+clearance comes to a box without top margins below: reused [], laid out again [clear-comes-box], matches a fresh layout
+a margin before a box that stays clear of floats: reused [], laid out again [clear-margin-box], matches a fresh layout
+clearance moves a box with padding: reused [clear-padded-box], laid out again [], matches a fresh layout

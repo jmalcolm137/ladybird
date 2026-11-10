@@ -12,6 +12,7 @@
 #include <LibMedia/DecoderRegistrations.h>
 #include <LibMedia/IncrementallyPopulatedStream.h>
 #include <LibMediaCodecs/CodedFrame.h>
+#include <LibMediaCodecs/Limits.h>
 #include <LibTest/TestCase.h>
 #include <LibThreading/Thread.h>
 
@@ -349,6 +350,27 @@ TEST_CASE(demuxer_declines_what_it_cannot_read)
     EXPECT(demuxer_for(marker_only).is_error());
 }
 
+TEST_CASE(demuxer_refuses_sample_rates_outside_the_supported_range)
+{
+    auto with_sample_rate = [](u32 sample_rate) {
+        // The sample rate is the first 20 bits after STREAMINFO's block and frame sizes.
+        static constexpr size_t sample_rate_offset = 8 + 10;
+        auto data = read_fixture("buffered-ranges/tone.flac"sv);
+        data[sample_rate_offset] = static_cast<u8>(sample_rate >> 12);
+        data[sample_rate_offset + 1] = static_cast<u8>(sample_rate >> 4);
+        data[sample_rate_offset + 2] = static_cast<u8>(((sample_rate & 0xF) << 4) | (data[sample_rate_offset + 2] & 0xF));
+        return data;
+    };
+
+    EXPECT(!demuxer_for(with_sample_rate(Media::MIN_AUDIO_SAMPLE_RATE)).is_error());
+    EXPECT(!demuxer_for(with_sample_rate(Media::MAX_AUDIO_SAMPLE_RATE)).is_error());
+
+    auto too_slow = demuxer_for(with_sample_rate(Media::MIN_AUDIO_SAMPLE_RATE - 1));
+    EXPECT_EQ(too_slow.error().category(), Media::DecoderErrorCategory::NotImplemented);
+    auto too_fast = demuxer_for(with_sample_rate(Media::MAX_AUDIO_SAMPLE_RATE + 1));
+    EXPECT_EQ(too_fast.error().category(), Media::DecoderErrorCategory::NotImplemented);
+}
+
 TEST_CASE(demuxer_grows_the_duration_of_a_stream_that_does_not_state_its_length)
 {
     auto file_data = read_fixture("buffered-ranges/tone.flac"sv);
@@ -387,23 +409,15 @@ TEST_CASE(demuxer_seeks_into_unbuffered_data_with_few_requests)
     stream->set_expected_size(file_data.size());
     stream->add_chunk_at(0, file_data.bytes().trim(head_size));
 
-    // Serve the way a server does once asked: each request starts delivery at its offset, delivery goes on from
-    // there a slice at a time, and a stopped request ends it.
+    // Answer each request with everything from its offset to the end, so that only the seek's reads decide which
+    // requests are made.
     Vector<u64> requested_offsets;
-    Optional<size_t> serving_position;
     stream->set_data_request_callback([&](Optional<u64> offset) {
-        serving_position = offset.map([](u64 value) { return static_cast<size_t>(value); });
-        if (offset.has_value())
-            requested_offsets.append(*offset);
-    });
-    auto server = Core::Timer::create_repeating(AK::Duration::from_milliseconds(1), [&] {
-        if (!serving_position.has_value() || *serving_position >= file_data.size())
+        if (!offset.has_value())
             return;
-        auto slice_size = min<size_t>(2 * KiB, file_data.size() - *serving_position);
-        stream->add_chunk_at(*serving_position, file_data.bytes().slice(*serving_position, slice_size));
-        *serving_position += slice_size;
+        requested_offsets.append(offset.value());
+        stream->add_chunk_at(offset.value(), file_data.bytes().slice(offset.value()));
     });
-    server->start();
 
     IGNORE_USE_IN_ESCAPING_LAMBDA auto demuxer = MUST(Media::FLAC::FLACDemuxer::from_stream(stream));
     IGNORE_USE_IN_ESCAPING_LAMBDA auto track = audio_track(*demuxer);
@@ -417,10 +431,13 @@ TEST_CASE(demuxer_seeks_into_unbuffered_data_with_few_requests)
     IGNORE_USE_IN_ESCAPING_LAMBDA auto target = AK::Duration::from_milliseconds(2'500);
     IGNORE_USE_IN_ESCAPING_LAMBDA AK::Duration landed_timestamp;
     IGNORE_USE_IN_ESCAPING_LAMBDA Atomic<bool> seek_finished { false };
+    IGNORE_USE_IN_ESCAPING_LAMBDA auto main_thread_event_loop = Core::EventLoop::current_weak();
     auto seeker_thread = Threading::Thread::construct("TestSeeker"sv, [&]() -> intptr_t {
         MUST(demuxer->seek_to_most_recent_keyframe(track, target));
         landed_timestamp = MUST(demuxer->get_next_sample_for_track(track)).presentation_timestamp();
         seek_finished = true;
+        if (auto event_loop = main_thread_event_loop->take())
+            event_loop->wake();
         return 0;
     });
     seeker_thread->start();
@@ -430,15 +447,14 @@ TEST_CASE(demuxer_seeks_into_unbuffered_data_with_few_requests)
     deadline_timer->start();
     loop.spin_until([&] { return seek_finished.load() || deadline_expired; });
     if (deadline_expired)
-        FAIL(ByteString::formatted("The seek did not finish: {} requests, serving at {}", requested_offsets.size(), serving_position));
-    server->stop();
+        FAIL(ByteString::formatted("The seek did not finish after requests at {}", requested_offsets));
     stream->set_data_request_callback(nullptr);
     if (!deadline_expired)
         MUST(seeker_thread->join());
 
     EXPECT_EQ(landed_timestamp, time_of_sample(4 * SEEKPOINTS_BLOCK_SIZE, SEEKPOINTS_SAMPLE_RATE));
     // One probe overshoots into the noise, and one step back by the noise's byte rate lands at the head.
-    EXPECT(requested_offsets.size() <= 2);
+    EXPECT_EQ(requested_offsets.size(), 2u);
 }
 
 // A header that nothing follows within a frame's reach was not a header, so the stream ends rather than delivering

@@ -30,14 +30,6 @@ namespace Compositing {
 
 using AsyncScrollOperationID = u64;
 
-// Stable identifier for a scroll node in a document; the node index alone is not unique across nested documents.
-struct AsyncScrollNodeID {
-    Web::UniqueNodeID document_id;
-    Compositing::SpatialNodeIndex scroll_node_index;
-
-    bool operator==(AsyncScrollNodeID const&) const = default;
-};
-
 COMPOSITING_API Web::AsyncScrollNodeKind async_scroll_node_kind_for(Compositing::CompositorScrollNodeKind);
 
 struct AsyncScrollOffset {
@@ -53,12 +45,16 @@ struct AsyncScrollOffset {
     u64 applied_scroll_request_id { 0 };
     // How many times the compositor had scrolled the box for user input of its own when it reported this.
     u64 user_input_scroll_count { 0 };
+    // How many times the compositor had scrolled any box of the context for user input of its own when it reported
+    // this. Not every such scroll is reported, as one the next input turns back moves no box.
+    u64 context_user_input_scroll_count { 0 };
 
     void merge_later_scroll(AsyncScrollOffset const& later)
     {
         compositor_scroll_offset = later.compositor_scroll_offset;
         applied_scroll_request_id = later.applied_scroll_request_id;
         user_input_scroll_count = later.user_input_scroll_count;
+        context_user_input_scroll_count = later.context_user_input_scroll_count;
         if (later.visual_viewport_scale.has_value())
             visual_viewport_scale = later.visual_viewport_scale;
         unadopted_scroll_delta.translate_by(later.unadopted_scroll_delta);
@@ -69,11 +65,11 @@ struct AsyncScrollOffset {
     }
 };
 
-// One scrollable area from the paint snapshot.
+// One scrollable area from the paint snapshot, or a scroll container with nothing to scroll that keeps its scrolls.
 struct AsyncScrollNode {
-    AsyncScrollNodeID node_id;
+    Compositing::SpatialNodeIndex scroll_node_index;
     Web::AsyncScrollNodeStableID stable_node_id;
-    Optional<AsyncScrollNodeID> parent_node_id;
+    Optional<Compositing::SpatialNodeIndex> parent_scroll_node_index;
     Gfx::IntRect scrollport_rect;
     Gfx::FloatPoint min_scroll_offset;
     Gfx::FloatPoint max_scroll_offset;
@@ -98,7 +94,7 @@ struct WheelHitTestTarget {
     Compositing::ContextRef context;
     Gfx::FloatRect rect;
     Gfx::CornerRadii corner_radii;
-    Optional<AsyncScrollNodeID> target_node_id;
+    Optional<Compositing::SpatialNodeIndex> target_scroll_node_index;
     // Position among the wheel hit test targets and scrollbars of the display list, which are recorded in paint order.
     u32 paint_order_index { 0 };
 };
@@ -119,18 +115,7 @@ struct NestedContextWheelRegion {
     u32 paint_order_index { 0 };
 };
 
-// A scroll container without a scroll node of its own that keeps the scrolls along an axis to itself. A wheel inside
-// its rect is not passed on along that axis to the scroll node above it.
-struct ScrollChainingBarrier {
-    Compositing::ContextRef context;
-    Gfx::FloatRect rect;
-    AsyncScrollNodeID scroll_node_id_above_barrier;
-    bool keeps_horizontal_scrolls { false };
-    bool keeps_vertical_scrolls { false };
-};
-
 struct AsyncScrollbar {
-    AsyncScrollNodeID scroll_node_id;
     Optional<Web::AsyncScrollNodeStableID> scroller_stable_node_id;
     Compositing::SpatialNodeIndex scroll_node_index;
     // The rects of a scrollbar the display list paints are in the space of this context.
@@ -146,6 +131,7 @@ struct AsyncScrollbar {
     float min_scroll_offset { 0 };
     float max_scroll_offset { 0 };
     Color thumb_color;
+    Color thumb_outline_color;
     Color track_color;
     bool vertical { false };
     // The compositor paints the viewport's scrollbars itself. The display list paints every other scrollbar thin, which
@@ -155,7 +141,7 @@ struct AsyncScrollbar {
 
 // A scroll node that is a snap container, with the geometry snap positions are selected from.
 struct AsyncSnapContainer {
-    AsyncScrollNodeID node_id;
+    Compositing::SpatialNodeIndex scroll_node_index;
     SnapContainerGeometry geometry;
     Vector<SnapAreaGeometry> areas;
 };
@@ -167,7 +153,6 @@ struct AsyncScrollingState {
     Vector<WheelHitTestTarget> wheel_hit_test_targets;
     Vector<MainThreadWheelEventRegion> main_thread_wheel_event_regions;
     Vector<NestedContextWheelRegion> nested_context_wheel_regions;
-    Vector<ScrollChainingBarrier> scroll_chaining_barriers;
     Vector<AsyncScrollbar> scrollbars;
 
     // Non-passive wheel listeners can cancel scrolling, so async scrolling must treat them as hard barriers.
@@ -202,7 +187,8 @@ COMPOSITING_API WheelRoutingAdmission wheel_routing_admission_for(AsyncScrolling
 // The admission of a scrolling state recorded before the newest change to the page's blocking wheel event listeners is
 // stale, as the state may not have the regions that change made.
 COMPOSITING_API WheelRoutingAdmission wheel_routing_admission_for(AsyncScrollingState const&, u64 newest_wheel_event_listener_state_generation);
-// Why a wheel step that the admission does not let the compositor scroll is left to the main thread.
+// Why a wheel step that the admission does not let the compositor scroll before the page dispatches it is left to the
+// page.
 COMPOSITING_API Web::InputRoutingDecision input_routing_decision_for_wheel_step_not_admitted_by(WheelRoutingAdmission);
 
 }

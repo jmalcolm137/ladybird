@@ -48,9 +48,9 @@ static GC::Ref<JS::ArrayBuffer> make_shared_array_buffer(JS::Realm& realm, Reado
     return buffer;
 }
 
-// The SharedArrayBuffer constructor's path: A fixed-length shared Data Block is backed by cross-process shared memory,
-// unlike the process-local storage that ArrayBuffer::create(Realm&, size_t, Shared) allocates above.
-static GC::Ref<JS::ArrayBuffer> make_shared_memory_backed_array_buffer(JS::Realm& realm, ReadonlyBytes contents)
+// The SharedArrayBuffer constructor's path: A fixed-length shared Data Block is a store that agents on other threads can
+// share, unlike the storage of one buffer that ArrayBuffer::create(Realm&, size_t, Shared) allocates above.
+static GC::Ref<JS::ArrayBuffer> make_array_buffer_in_shared_store(JS::Realm& realm, ReadonlyBytes contents)
 {
     Web::HTML::TemporaryExecutionContext execution_context { realm };
     auto& buffer = as<JS::ArrayBuffer>(*MUST(JS::construct(realm.vm(), *realm.intrinsics().shared_array_buffer_constructor(), JS::Value(contents.size()))));
@@ -94,13 +94,13 @@ static Web::HTML::IPCSerializationRecord ipc_round_trip(Web::HTML::IPCSerializat
     return MUST(decoder.decode<Web::HTML::IPCSerializationRecord>());
 }
 
-TEST_CASE(same_process_clone_aliases_the_backing_store)
+TEST_CASE(same_agent_clone_aliases_the_backing_store)
 {
     auto source = make_shared_array_buffer(source_realm(), "shared array buffer"sv.bytes());
 
     auto record = serialize_same_agent(JS::Value { source.ptr() });
-    EXPECT_EQ(Web::HTML::same_process_shared_array_buffers(record).size(), 1uz);
-    EXPECT_EQ(Web::HTML::same_process_shared_array_buffers(record)[0].ptr(), source.ptr());
+    EXPECT_EQ(Web::HTML::same_agent_shared_array_buffers(record).size(), 1uz);
+    EXPECT_EQ(Web::HTML::same_agent_shared_array_buffers(record)[0].ptr(), source.ptr());
 
     auto& clone = as_array_buffer(deserialize(record, target_realm()));
     EXPECT(clone.is_shared_array_buffer());
@@ -121,22 +121,20 @@ TEST_CASE(same_process_clone_aliases_the_backing_store)
     EXPECT_EQ(source_contents[1], static_cast<u8>('C'));
 }
 
-TEST_CASE(shared_memory_backed_clone_references_the_same_shared_object)
+TEST_CASE(clone_in_a_shared_store_references_the_same_store)
 {
-    auto source = make_shared_memory_backed_array_buffer(source_realm(), "shared memory"sv.bytes());
-    EXPECT(source->shared_buffer().has_value());
+    auto source = make_array_buffer_in_shared_store(source_realm(), "shared store"sv.bytes());
+    EXPECT(source->data_block().is_in_shared_store());
 
     auto& clone = as_array_buffer(deserialize(serialize_same_agent(JS::Value { source.ptr() }), target_realm()));
     EXPECT(clone.is_shared_array_buffer());
     EXPECT_EQ(clone.byte_length(), source->byte_length());
     EXPECT(&clone != source.ptr());
 
-    // The clone references the source's shared object, rather than a process-local alias of it — so it can itself
-    // be shared with an agent in another process.
-    auto clone_shared_memory = clone.shared_buffer();
-    EXPECT(clone_shared_memory.has_value());
-    clone_shared_memory->data<u8>()[2] = static_cast<u8>('M');
-    EXPECT_EQ(contents_of(*source)[2], static_cast<u8>('M'));
+    // The clone references the source's store, rather than a local alias of the buffer, so it can itself be shared with
+    // an agent on another thread.
+    EXPECT(clone.data_block().is_in_shared_store());
+    EXPECT_EQ(clone.data_at(0), source->data_at(0));
 
     source->overwrite(0, "S", 1);
     auto clone_contents = contents_of(clone);
@@ -186,7 +184,7 @@ TEST_CASE(ipc_round_trip_degrades_to_a_copy)
     auto source = make_shared_array_buffer(source_realm(), "copied across processes"sv.bytes());
 
     auto record = ipc_round_trip(serialize_same_agent(JS::Value { source.ptr() }));
-    EXPECT(Web::HTML::same_process_shared_array_buffers(record).is_empty());
+    EXPECT(Web::HTML::same_agent_shared_array_buffers(record).is_empty());
 
     auto& clone = as_array_buffer(deserialize(record, target_realm()));
     EXPECT(clone.is_shared_array_buffer());
@@ -206,8 +204,8 @@ TEST_CASE(growable_shared_array_buffer_aliases_the_backing_store)
     source->set_max_byte_length(128);
 
     auto record = serialize_same_agent(JS::Value { source.ptr() });
-    EXPECT_EQ(Web::HTML::same_process_shared_array_buffers(record).size(), 1uz);
-    EXPECT_EQ(Web::HTML::same_process_shared_array_buffers(record)[0].ptr(), source.ptr());
+    EXPECT_EQ(Web::HTML::same_agent_shared_array_buffers(record).size(), 1uz);
+    EXPECT_EQ(Web::HTML::same_agent_shared_array_buffers(record)[0].ptr(), source.ptr());
 
     auto& clone = as_array_buffer(deserialize(record, target_realm()));
     EXPECT(clone.is_shared_array_buffer());
@@ -237,24 +235,11 @@ TEST_CASE(cross_origin_isolation_gate_still_applies_by_default)
     EXPECT(result.is_error());
 }
 
-TEST_CASE(storage_serialization_rejects_shared_array_buffers_even_when_same_agent)
+TEST_CASE(storage_serialization_rejects_shared_array_buffers)
 {
     auto& vm = Web::Bindings::main_thread_vm();
     auto source = make_shared_array_buffer(source_realm(), "not for storage"sv.bytes());
 
-    auto writer = Web::HTML::StructuredSerializeWriter::create_storage();
-    Web::HTML::SerializationMemory memory;
-    auto result = Web::HTML::structured_serialize_internal(vm, writer, JS::Value { source.ptr() }, true, memory, Web::HTML::AllowSharedArrayBuffers::SameAgentAlways);
+    auto result = Web::HTML::structured_serialize_for_storage(vm, JS::Value { source.ptr() });
     EXPECT(result.is_error());
-}
-
-TEST_CASE(appending_an_ipc_record_rejects_a_shared_array_buffer_side_table)
-{
-    auto record = serialize_same_agent(JS::Value { make_shared_array_buffer(source_realm(), "side table"sv.bytes()).ptr() });
-    EXPECT(!Web::HTML::same_process_shared_array_buffers(record).is_empty());
-
-    auto writer = Web::HTML::StructuredSerializeWriter::create_ipc();
-    EXPECT_DEATH("Appending an IPC record with a SharedArrayBuffer side table", [&] {
-        writer.append(move(record));
-    }());
 }

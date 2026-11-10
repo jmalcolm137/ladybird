@@ -12,7 +12,6 @@
 #include <AK/Utf16View.h>
 #include <LibGC/Weak.h>
 #include <LibWeb/CSS/CSSStyleDeclaration.h>
-#include <LibWeb/CSS/GeneratedCSSStyleProperties.h>
 #include <LibWeb/CSS/RustDeclarationBlock.h>
 #include <LibWeb/Export.h>
 
@@ -21,7 +20,7 @@ namespace Web::CSS {
 // https://drafts.csswg.org/cssom/#cssstyleproperties
 class WEB_API CSSStyleProperties
     : public CSSStyleDeclaration {
-    WEB_WRAPPABLE(CSSStyleProperties, CSSStyleDeclaration);
+    WEB_NON_IDL_WRAPPABLE(CSSStyleProperties, CSSStyleDeclaration);
     GC_DECLARE_ALLOCATOR(CSSStyleProperties);
 
 public:
@@ -57,6 +56,8 @@ public:
     u64 identity() const { return m_declarations.identity(); }
     u64 revision() const { return m_declarations.revision(); }
 
+    virtual Utf16FlyString owner_highlight_name() const override { return m_owner_highlight_name; }
+
     virtual bool has_property(PropertyNameAndID const&) const override;
     bool has_property(PropertyID) const;
 
@@ -64,12 +65,7 @@ public:
     RefPtr<StyleValue const> get_property_style_value(PropertyID) const;
     virtual WebIDL::ExceptionOr<void> set_property_style_value(PropertyNameAndID const&, NonnullRefPtr<StyleValue const>) override;
 
-    Utf16String css_float() const;
-    WebIDL::ExceptionOr<void> set_css_float(Utf16View);
-
     virtual Utf16String serialized() const final override;
-    Utf16String serialize_a_css_value_to_utf16(StyleProperty const&) const;
-    Utf16String serialize_a_css_value_to_utf16(Vector<StyleProperty>) const;
     virtual WebIDL::ExceptionOr<void> set_css_text(Utf16View) override;
 
     void set_declarations_from_text(Utf16View);
@@ -78,6 +74,8 @@ public:
 
 protected:
     CSSStyleProperties(Computed, Readonly, RustDeclarationBlock, Optional<DOM::AbstractElement>);
+
+    virtual void create_owner() override;
 
 private:
     virtual size_t external_memory_size() const override;
@@ -88,19 +86,17 @@ private:
     Optional<StyleProperty> get_direct_property(PropertyNameAndID const&) const;
     WebIDL::ExceptionOr<void> set_property_internal(PropertyNameAndID const&, Utf16View css_text, Utf16View priority);
     WebIDL::ExceptionOr<Utf16String> remove_property_internal(Optional<PropertyNameAndID> const&);
-    bool set_a_css_declaration(PropertyID, NonnullRefPtr<StyleValue const>, Important);
 
     void invalidate_owners();
 
     Vector<Utf16FlyString> const& computed_custom_property_names() const;
 
     RustDeclarationBlock m_declarations;
+    Utf16FlyString m_owner_highlight_name;
     mutable Vector<Utf16FlyString> m_cached_computed_custom_property_names;
     mutable GC::Weak<DOM::Document> m_cached_computed_custom_property_document;
     mutable RefPtr<CustomPropertyData const> m_cached_computed_custom_property_data;
     mutable u64 m_cached_custom_property_registration_generation { 0 };
 };
-
-#undef ENUMERATE_GENERATED_CSS_STYLE_PROPERTIES
 
 }

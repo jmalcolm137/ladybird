@@ -6,30 +6,15 @@
 
 import argparse
 import http.client
+import importlib
 import json
-import socket
 import subprocess
-import time
 
-EVENT_TIMEOUT_SECONDS = 30
+from urllib.parse import quote
+
 WEBDRIVER_REQUEST_TIMEOUT_SECONDS = 30
 
-
-def unused_port():
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.bind(("127.0.0.1", 0))
-        return sock.getsockname()[1]
-
-
-def wait_for_port(port):
-    deadline = time.monotonic() + EVENT_TIMEOUT_SECONDS
-    while time.monotonic() < deadline:
-        try:
-            with socket.create_connection(("127.0.0.1", port), timeout=0.1):
-                return
-        except OSError:
-            time.sleep(0.05)
-    raise RuntimeError(f"Timed out waiting for port {port}")
+webdriver_helpers = importlib.import_module("test-webdriver-delete-session")
 
 
 def request(connection, method, path, body=None):
@@ -45,13 +30,38 @@ def request(connection, method, path, body=None):
     return response.status, payload, response_body
 
 
+def check_screenshot_error_preserves_element(connection, session_id, left):
+    session_path = f"/session/{session_id}"
+    document = (
+        '<!doctype html><body style="margin:0">'
+        f'<div style="position:fixed;left:{left};top:0;width:1px;height:1px"></div>'
+    )
+    status, _, body = request(connection, "POST", f"{session_path}/url", {"url": f"data:text/html,{quote(document)}"})
+    assert status == 200, body
+
+    status, payload, body = request(
+        connection, "POST", f"{session_path}/element", {"using": "css selector", "value": "div"}
+    )
+    assert status == 200, body
+    element_id = payload["value"]["element-6066-11e4-a52e-4f735466cecf"]
+    element_path = f"{session_path}/element/{element_id}"
+
+    status, payload, body = request(connection, "GET", f"{element_path}/screenshot")
+    assert status == 500 and payload["value"]["error"] == "unable to capture screen", body
+
+    status, payload, body = request(connection, "GET", f"{element_path}/name")
+    assert status == 200 and payload["value"] == "div", body
+
+    status, _, body = request(connection, "GET", f"{session_path}/screenshot")
+    assert status == 200, body
+
+
 def run_test(webdriver_binary):
-    webdriver_port = unused_port()
-    webdriver = subprocess.Popen([webdriver_binary, "--headless", "-l", "127.0.0.1", "-p", str(webdriver_port)])
+    webdriver, webdriver_port = webdriver_helpers.launch_webdriver(
+        webdriver_binary, "--headless", "--force-cpu-painting"
+    )
     connection = None
     try:
-        wait_for_port(webdriver_port)
-
         # Every request in this test is sent over the same keep-alive connection, matching how the
         # WPT wdspec harness drives WebDriver. An error response must leave the connection usable.
         connection = http.client.HTTPConnection("127.0.0.1", webdriver_port, timeout=WEBDRIVER_REQUEST_TIMEOUT_SECONDS)
@@ -84,6 +94,10 @@ def run_test(webdriver_binary):
         status, payload, response_body = request(connection, "GET", f"/session/{session_id}/title")
         if status != 200:
             raise AssertionError(f"Get Title after unknown command failed with HTTP {status}: {response_body}")
+
+        check_screenshot_error_preserves_element(connection, session_id, "-100000px")
+        # At the right edge of the viewport, the calculated screenshot width is zero.
+        check_screenshot_error_preserves_element(connection, session_id, "100vw")
 
         status, payload, response_body = request(connection, "DELETE", f"/session/{session_id}")
         if status != 200:

@@ -58,6 +58,8 @@ pub(crate) struct HostTables {
     pub(crate) shows_search_text: Cell<bool>,
     /// Whether the host gave the rows spelling-error highlights that it has not cleared since.
     pub(crate) shows_spelling_errors: Cell<bool>,
+    /// Whether the host gave the rows custom highlights that it has not cleared since.
+    pub(crate) shows_custom_highlights: Cell<bool>,
     /// The rows the host gave layer image paint facts, which the arena drops with the row.
     pub(crate) rows_with_layer_image_paint_facts: RefCell<HashSet<NodeSlotId>>,
     /// The image resources the tree builds of the rounds the host was paid for owe the rows they stamped, which the
@@ -85,7 +87,7 @@ impl HostTables {
             return std::ptr::null_mut();
         };
         assert!(
-            !crate::stage_thread::style_layout_thread().is_current(),
+            !crate::stage_thread::render_thread().is_current(),
             "a layout node is made on the main thread, whose heap it is allocated from"
         );
         // SAFETY: Registration and unregistration keep the factory context live. The factory's
@@ -178,9 +180,11 @@ impl ArenaHandle {
         &mut self.arena
     }
 
-    /// The arena to write, beside the layout stage's scratch, which the stage reads as it prepares and ends a pass.
-    pub(crate) fn arena_mut_and_layout_scratch(&mut self) -> (&mut LayoutNodeArena, &super::run_state::LayoutScratch) {
-        (&mut self.arena, &self.layout_scratch)
+    /// The arena to write, beside the layout stage's scratch, which the stage maintains as it prepares and ends a pass.
+    pub(crate) fn arena_mut_and_layout_scratch(
+        &mut self,
+    ) -> (&mut LayoutNodeArena, &mut super::run_state::LayoutScratch) {
+        (&mut self.arena, &mut self.layout_scratch)
     }
 }
 

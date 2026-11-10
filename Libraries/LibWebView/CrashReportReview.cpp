@@ -4,17 +4,14 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-#include <AK/AnyOf.h>
-#include <AK/Array.h>
 #include <AK/Hex.h>
 #include <AK/WeakPtr.h>
 #include <LibCrypto/Hash/SHA2.h>
+#include <LibURL/URL.h>
 #include <LibWebView/CrashReportDiagnostics.h>
 #include <LibWebView/CrashReportReview.h>
 
 namespace WebView {
-
-static constexpr auto failure_headers = Array { "Verification failed"sv, "Assertion failed"sv, "Rust panic"sv, "Exit code"sv };
 
 static String to_string(StringView text)
 {
@@ -33,7 +30,7 @@ CrashReportReview::CrashReportReview(CrashReportStore& store)
 
 CrashReportReview::~CrashReportReview() = default;
 
-ErrorOr<CrashReportReview::Report> CrashReportReview::open(Optional<ByteString> const& name)
+ErrorOr<CrashReportReview::Report> CrashReportReview::open(ByteString const& report_name)
 {
     VERIFY(!m_submission);
 
@@ -43,19 +40,7 @@ ErrorOr<CrashReportReview::Report> CrashReportReview::open(Optional<ByteString> 
     m_prepared_description = {};
     m_prepared_url = {};
 
-    auto report_name = name.value_or({});
-    if (report_name.is_empty()) {
-        auto pending = TRY(m_store.pending_report_names());
-        if (pending.is_empty())
-            return Error::from_string_literal("There is no crash report to review");
-        report_name = pending.first();
-    }
-
     auto saved_report = TRY(m_store.saved_report(report_name));
-
-    // Without this, a report closed rather than answered would come back on every launch.
-    if (auto result = m_store.mark_seen(report_name); result.is_error())
-        warnln("Could not mark crash report as seen: {}", result.error());
 
     m_report_name = report_name;
     m_text_digest = sha256_hex(saved_report.text.bytes());
@@ -86,7 +71,7 @@ ErrorOr<CrashReportReview::Report> CrashReportReview::open(Optional<ByteString> 
         if (auto crashed_at = diagnostics.crashed_at->to_string("%Y-%m-%d %H:%M:%S"sv, UnixDateTime::LocalTime::Yes); !crashed_at.is_error())
             add_field("Crash date"sv, crashed_at.value().bytes_as_string_view());
     }
-    for (auto header : failure_headers) {
+    for (auto header : CrashReportDiagnostics::failure_headers) {
         if (auto value = diagnostics.header(header); !value.is_empty()) {
             add_field(header, value, true);
             break;
@@ -102,18 +87,24 @@ ErrorOr<CrashReportReview::Report> CrashReportReview::open(Optional<ByteString> 
     return report;
 }
 
-bool CrashReportReview::has_next_report() const
-{
-    auto pending = m_store.pending_report_names();
-    if (pending.is_error())
-        return false;
-    return any_of(pending.value(), [&](auto const& name) { return name != m_report_name; });
-}
-
 ErrorOr<ByteString> CrashReportReview::report_text() const
 {
     VERIFY(!m_report_name.is_empty());
     return TRY(m_store.saved_report(m_report_name)).text;
+}
+
+Optional<String> CrashReportReview::website_from_url(URL::URL const& url)
+{
+    if (url.scheme() != "http"sv && url.scheme() != "https"sv)
+        return {};
+
+    auto website = url;
+    website.set_username(""sv);
+    website.set_password(""sv);
+    auto serialized_website = website.serialize(URL::ExcludeFragment::Yes);
+    if (serialized_website.bytes().size() > maximum_url_bytes)
+        return {};
+    return serialized_website;
 }
 
 Optional<String> CrashReportReview::validate(StringView description, Optional<StringView> url)
@@ -190,6 +181,19 @@ Optional<String> CrashReportReview::send(String const& description, Optional<Str
     m_submission = submission;
     submission->start();
     return {};
+}
+
+void CrashReportReview::set_prepared_submission(PreparedSubmission submission)
+{
+    m_prepared_manifest = move(submission.manifest);
+    m_prepared_description = move(submission.description);
+    m_prepared_url = move(submission.url);
+}
+
+ErrorOr<void> CrashReportReview::decline()
+{
+    VERIFY(!m_report_name.is_empty());
+    return m_store.mark_seen(m_report_name);
 }
 
 // The report stays on the device, and sending it again sends the same submission, which the server recognizes if the

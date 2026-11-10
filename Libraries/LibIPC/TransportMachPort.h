@@ -49,12 +49,22 @@ public:
     ~TransportMachPort();
 
     void set_up_read_hook(Function<void()>);
+
+    // Sets what the IO thread shows every message that arrives, before the transport's owner gets to see it, and empty
+    // bytes once the peer is gone. This is for a thread that does not get back to its event loop on its own, like one
+    // stuck in script. It runs while the IO thread holds a lock, so it should only have a look.
+    void set_incoming_message_observer(Function<void(ReadonlyBytes)>);
+
     bool is_open() const;
 
     void close();
     void close_after_sending_all_pending_messages();
 
     void wait_until_readable();
+
+    // Makes wait_until_readable() return, even with nothing to read, now or if none is under way, the next time. Any
+    // thread may call this.
+    void interrupt_wait_until_readable();
 
     // Wait until everything posted so far has been handed to the kernel.
     void flush();
@@ -102,6 +112,7 @@ private:
     bool schedule_read_notification_if_needed_locked();
     void write_read_notification_byte();
     void mark_peer_eof();
+    void notify_incoming_message_observer(ReadonlyBytes);
     void release_send_waiters();
     enum class SendOutcome {
         Sent,
@@ -137,7 +148,11 @@ private:
 
     Mutex m_incoming_mutex;
     ConditionVariable m_incoming_cv { m_incoming_mutex };
+    bool m_wait_until_readable_interrupted { false };
     Vector<NonnullOwnPtr<Message>> m_incoming_messages;
+    // NB: This has a lock of its own, as the observer may interrupt a wait, which takes m_incoming_mutex.
+    Mutex m_incoming_message_observer_mutex;
+    Function<void(ReadonlyBytes)> m_incoming_message_observer;
     u64 m_receive_barriers_sent { 0 };
     u64 m_receive_barriers_received { 0 };
     bool m_read_notification_pending { false };

@@ -7,7 +7,7 @@
 //! Snapshots of executables for compile jobs, captured on the main thread straight from the runtime's structures.
 //! A snapshot refers to cells only by address; the cells it captured are kept alive by whoever owns the job.
 
-use core::mem::offset_of;
+use core::num::NonZeroU64;
 use libjs_abi::Builtin;
 use std::collections::HashMap;
 
@@ -37,9 +37,8 @@ use crate::gc::defer_gc::{DeferGc, Deferred};
 use crate::interpreter::vm::Vm;
 use crate::layout::cell::{CellHeader, Gc};
 use crate::layout::environment::DeclarativeEnvironment;
-use crate::layout::execution_context::ExecutionContext;
 use crate::layout::function_object::{
-    DirectGetterFunction, EcmascriptFunctionObject, FunctionObject, RawNativeFunction,
+    DirectGetterFunction, EcmascriptFunctionObject, FunctionObject, NativeFunction, RawNativeFunction,
 };
 use crate::layout::object::{Object, TYPED_ARRAY_CACHED_DATA_OFFSET_INVALID, TypedArrayBase};
 use crate::layout::property_lookup_cache::{GlobalVariableCache, PropertyLookupCache, PropertyLookupCacheEntryType};
@@ -343,41 +342,41 @@ fn direct_call_target(feedback: &CallFeedback) -> Option<(Gc<EcmascriptFunctionO
     function.can_inline_call().then_some((function, closures))
 }
 
-/// The target of a call site if it is a raw native function that JIT code can call directly, in the frame the
-/// interpreter's call fast path builds for it. Function.prototype.call and apply forward their calls, which the runtime
-/// does for JIT code.
-fn native_call_target(vm: &Vm, feedback: &CallFeedback) -> Option<Gc<RawNativeFunction>> {
-    if !RAW_NATIVE_FUNCTIONS_RETURN_IN_REGISTERS || feedback.flags.get() & call_feedback_flags::POLYMORPHIC != 0 {
+/// The target of a call site if it is a native function, which JIT code can call directly in the frame the
+/// interpreter's call fast path builds for it, or replace with an intrinsic, and the entry it calls it at, if it can:
+/// none where native functions do not return their completion in two registers, and JIT code leaves calls of them to
+/// the runtime. Function.prototype.call and apply forward their calls, which the runtime does for JIT code.
+fn native_call_target(vm: &Vm, feedback: &CallFeedback) -> Option<(Gc<NativeFunction>, Option<NonZeroU64>)> {
+    if feedback.flags.get() & call_feedback_flags::POLYMORPHIC != 0 {
         return None;
     }
-    let function = feedback.target()?.downcast::<RawNativeFunction>()?;
-    (!FunctionPrototype::is_call_function(vm, &function) && !FunctionPrototype::is_apply_function(vm, &function))
-        .then_some(function)
+    let function = feedback.target()?.downcast::<NativeFunction>()?;
+    let entry = if let Some(raw) = function.downcast::<RawNativeFunction>() {
+        if FunctionPrototype::is_call_function(vm, &raw) || FunctionPrototype::is_apply_function(vm, &raw) {
+            return None;
+        }
+        raw.native_function(vm)
+    } else {
+        function.capturing_call_entry()
+    };
+    let entry = entry
+        .filter(|_| RAW_NATIVE_FUNCTIONS_RETURN_IN_REGISTERS)
+        .and_then(|pointer| NonZeroU64::new(pointer as usize as u64));
+    Some((function, entry))
 }
 
 /// The words of an ECMAScript function its frames start with, which stay the same for its lifetime.
 fn function_frame_fields(function: Gc<EcmascriptFunctionObject>) -> FunctionFrameFields {
+    let shared_data = function.shared_data();
     FunctionFrameFields {
-        script_or_module: [
-            word_of(function, offset_of!(EcmascriptFunctionObject, script_or_module)),
-            word_of(function, offset_of!(EcmascriptFunctionObject, script_or_module) + 8),
-        ],
-        environment: word_of(function, offset_of!(EcmascriptFunctionObject, environment)),
-        private_environment: word_of(function, offset_of!(EcmascriptFunctionObject, private_environment)),
+        script_or_module: shared_data.script_or_module.word(),
+        environment: function
+            .environment()
+            .map_or(0, |environment| environment.as_ptr() as u64),
+        private_environment: function
+            .private_environment()
+            .map_or(0, |environment| environment.as_ptr() as u64),
     }
-}
-
-/// The words of the `[[ScriptOrModule]]` of a frame, like `function_frame_fields()` has them of a function.
-fn script_or_module_words(frame: &ExecutionContext) -> [u64; 2] {
-    let address = core::ptr::from_ref(&frame.script_or_module).cast::<u64>();
-    // SAFETY: The field is two words.
-    unsafe { [address.read_unaligned(), address.add(1).read_unaligned()] }
-}
-
-/// The words at `offset` of a cell.
-fn word_of<T>(cell: Gc<T>, offset: usize) -> u64 {
-    // SAFETY: The callers read fields of the cell that are words.
-    unsafe { cell.as_ptr().cast::<u8>().add(offset).cast::<u64>().read_unaligned() }
 }
 
 impl SnapshotBuilder<'_> {
@@ -612,7 +611,8 @@ impl SnapshotBuilder<'_> {
                     Some(TypedArraySnapshot {
                         element,
                         fixed_length: (array.cached_data_offset() != TYPED_ARRAY_CACHED_DATA_OFFSET_INVALID)
-                            .then(|| array.array_length.length.get()),
+                            .then(|| array.array_length.length.get())
+                            .and_then(|length| u32::try_from(length).ok()),
                     })
                 }),
         }
@@ -922,10 +922,7 @@ impl SnapshotBuilder<'_> {
             && !(closures && environment.is_some())
         {
             snapshot.direct_call = Some(self.direct_call_target_snapshot(function, environment, closures));
-        } else if let Some(function) = native_call_target(self.vm, call) {
-            let entry = function
-                .native_function(self.vm)
-                .map_or(0, |pointer| pointer as usize as u64);
+        } else if let Some((function, entry)) = native_call_target(self.vm, call) {
             snapshot.native_call = Some(NativeCallTarget {
                 function: self.cell(function),
                 realm: self.cell(function.realm()),
@@ -949,7 +946,7 @@ impl SnapshotBuilder<'_> {
             return None;
         }
         let native_function = function.downcast::<RawNativeFunction>()?;
-        let entry = native_function.native_function(self.vm)? as usize as u64;
+        let entry = NonZeroU64::new(native_function.native_function(self.vm)? as usize as u64)?;
         let direct_getter = function
             .downcast::<DirectGetterFunction>()
             .filter(|_| direct_getter_validated)
@@ -957,7 +954,8 @@ impl SnapshotBuilder<'_> {
                 let bytes = |word_offset: u32| word_offset * size_of::<u64>() as u32;
                 DirectGetterFields {
                     wrapper_implementation: bytes(getter.wrapper_implementation_word_offset.get()),
-                    implementation_value: bytes(getter.implementation_value_word_offset.get()),
+                    implementation_value: getter.implementation_value_offset.get(),
+                    implementation_value_is_compressed: getter.implementation_value_is_compressed.get() != 0,
                     main_world_wrapper: bytes(getter.main_world_wrapper_word_offset.get()),
                     weak_impl_value: bytes(getter.weak_impl_value_word_offset.get()),
                 }
@@ -965,7 +963,7 @@ impl SnapshotBuilder<'_> {
         Some(NativeCallTarget {
             function: function_cell,
             realm: self.cell(native_function.realm()),
-            entry,
+            entry: Some(entry),
             direct_getter,
         })
     }
@@ -1040,7 +1038,7 @@ impl SnapshotBuilder<'_> {
             },
             constants: executable.constants().iter().map(|constant| constant.0).collect(),
             exception_handlers: executable
-                .exception_handlers
+                .exception_handlers()
                 .iter()
                 .map(|handler| ExceptionHandler {
                     start_offset: handler.start_offset,
@@ -1111,7 +1109,7 @@ impl SnapshotBuilder<'_> {
             // NB: Only the compiled function's own code creates bindings by name.
             identifiers: if entry.function.is_none() {
                 executable
-                    .identifier_table
+                    .identifier_table()
                     .iter()
                     .map(|identifier| identifier.raw_identity() as u64)
                     .collect()
@@ -1163,7 +1161,7 @@ impl SnapshotBuilder<'_> {
             let Some(environment) = environment.as_declarative_environment() else {
                 continue;
             };
-            if coordinate.index as usize >= environment.binding_values.size() {
+            if coordinate.index as usize >= environment.binding_count.get() as usize {
                 continue;
             }
             let value = environment.get_initialized_binding_value_direct(coordinate.index as usize);
@@ -1264,7 +1262,7 @@ pub fn capture_snapshot<'d>(
     let compiled_function_fields = match function {
         Some(function) => function_frame_fields(function),
         None => FunctionFrameFields {
-            script_or_module: script_or_module_words(vm.running_execution_context_ref()),
+            script_or_module: vm.running_execution_context_ref().script_or_module.word(),
             ..FunctionFrameFields::default()
         },
     };

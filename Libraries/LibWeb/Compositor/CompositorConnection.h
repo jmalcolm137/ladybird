@@ -51,6 +51,11 @@ public:
     void destroy_context(Web::CompositorContextId);
     // Has the Paint thread present frames through this connection from now on.
     void hand_frame_sink_to_paint_thread();
+    void add_animated_image(u64 frame_id, AnimatedImageRegistration const&);
+    void remove_animated_image(u64 frame_id);
+    void start_animated_image(u64 frame_id);
+    void stop_animated_image(u64 frame_id);
+    AnimatedImageState animated_image_state_for_testing(u64 frame_id);
     void add_video_sink(Media::VideoSinkHandle, NonnullRefPtr<Compositing::VideoFramePresentationPage>);
     void remove_video_sink(Media::VideoSinkHandle);
     void release_video_frame_hold(Media::VideoSinkHandle, u64 generation);
@@ -66,7 +71,9 @@ public:
     bool rasterize_display_list(Compositing::DisplayList const&, Compositing::AccumulatedVisualContextTree const&, Compositing::DisplayListResourceTransaction, NonnullRefPtr<Gfx::Bitmap> target);
     void invalidate_wheel_event_listener_state(Web::CompositorContextId, u64 generation);
     void invalidate_keyboard_scroll_state(Web::CompositorContextId, u64 generation);
-    Compositing::AsyncScrollEnqueueResult async_scroll_by(Web::CompositorContextId, Web::UniqueNodeID document_id, Gfx::FloatPoint position, Gfx::FloatPoint delta, Gfx::IntRect viewport_rect, Web::WheelDeltaPrecision, Web::ScrollGesturePhase, u32 modifiers, Compositing::AsyncScrollOperationTracking, Compositing::WheelStepDispatch, u64 input_event_id);
+    Compositing::WheelEventAnswer take_wheel_event_from_main_thread(Web::CompositorContextId, Web::MouseEvent const&, Compositing::AsyncScrollOperationTracking, Compositing::WheelEventRouting);
+    Compositing::WheelEventAnswer wheel_event_let_through(Web::CompositorContextId, Compositing::WheelStepLetThrough const&, Compositing::AsyncScrollOperationTracking);
+    void wheel_event_canceled(Web::CompositorContextId, u64 wheel_gesture_id);
     String scroll_state_for_testing(Web::CompositorContextId, Web::AsyncScrollNodeStableID stretched_scroller);
     void synchronize_for_testing();
     Optional<Compositing::FirstWheelStepRouteForTesting> route_first_wheel_step_for_testing(Web::CompositorContextId, Gfx::FloatPoint position, Gfx::FloatPoint delta_in_css_pixels);
@@ -77,7 +84,7 @@ public:
     void viewport_size_updated(Web::CompositorContextId, Gfx::IntSize, double device_pixel_ratio, Compositing::WindowResizingInProgress);
     bool request_rendering_opportunity(Web::CompositorContextId, double maximum_frames_per_second);
     void hurry_rendering_opportunity(Web::CompositorContextId);
-    void request_screenshot(Web::CompositorContextId, NonnullRefPtr<Gfx::Bitmap>, Function<void()>&&);
+    void request_screenshot(Web::CompositorContextId, NonnullRefPtr<Gfx::Bitmap>, Function<void(ScreenshotResult)>&&);
 
     Optional<Compositing::CanvasId> create_webgl_context(Compositing::WebGL::WebGLVersion, Gfx::IntSize, bool depth, bool stencil, bool antialias, Vector<String>& out_supported_extensions);
     void set_webgl_command_buffer(Compositing::CanvasId, Core::AnonymousBuffer const&);
@@ -91,6 +98,7 @@ public:
     bool read_webgl_buffer_sub_data(Compositing::CanvasId, Compositing::WebGL::GLenum target, Compositing::WebGL::GLintptr offset, Compositing::WebGL::GLintptr size, Core::AnonymousBuffer const& data);
 
     void ensure_video_presentation_channel();
+    void ensure_image_decoder_channel();
     // Takes up the render clock channel the Browser made between this process and the Compositor, which delivers
     // display ticks over it from then on.
     void attach_render_clock(IPC::TransportHandle);
@@ -105,7 +113,7 @@ private:
     struct PendingScreenshot {
         NonnullRefPtr<Gfx::Bitmap> target_bitmap;
 
-        Function<void()> callback;
+        Function<void(ScreenshotResult)> callback;
     };
 
     virtual void die() override;
@@ -116,6 +124,7 @@ private:
     virtual void request_rendering_update() override;
     virtual void rendering_opportunity(Web::CompositorContextId, i64 frame_time_nanoseconds, double frame_interval_milliseconds) override;
     virtual void async_scroll_updates(Web::CompositorContextId, Compositing::PendingAsyncScrollUpdates) override;
+    virtual void animated_content_moved_under_pointer(Web::CompositorContextId, i64 frame_time_nanoseconds) override;
     virtual void did_complete_screenshot(Compositing::ScreenshotRequestId) override;
     virtual void did_fail_screenshot(Compositing::ScreenshotRequestId) override;
     virtual void did_lose_compositor() override;
@@ -139,6 +148,7 @@ private:
     bool m_has_lost_compositor { false };
     // The media server whose presentation channel the Compositor holds; a replacement server needs a new channel.
     Optional<u64> m_video_presentation_channel_media_client_generation;
+    Optional<u64> m_image_decoder_channel_client_generation;
 };
 
 }

@@ -135,18 +135,15 @@ impl AnchorResolvedValues {
     pub(crate) fn new(resolved: &ResolvedAnchorSizes, frame: geometry::Frame) -> Self {
         let size = |value: Option<ResolvedSizeOverride>| {
             value.map(|value| match value {
-                ResolvedSizeOverride::Length(px) => ComputedSize {
-                    kind: ComputedSizeKind::Length,
-                    value: ComputedStyleValueHandle::length(px.to_double()),
-                },
+                ResolvedSizeOverride::Length(px) => ComputedSize::new(
+                    ComputedSizeKind::Length,
+                    ComputedStyleValueHandle::length(px.to_double()),
+                ),
                 ResolvedSizeOverride::Keyword(kind) => ComputedSize::keyword(kind),
             })
         };
         let margin = |value: Option<CssPixels>| {
-            value.map(|px| ComputedLengthPercentageOrAuto {
-                is_auto: false,
-                value: ComputedStyleValueHandle::length(px.to_double()),
-            })
+            value.map(|px| ComputedLengthPercentageOrAuto::new(false, ComputedStyleValueHandle::length(px.to_double())))
         };
         Self {
             width: size(resolved.width),
@@ -212,9 +209,9 @@ impl<'a> std::ops::Deref for StyleValues<'a> {
 
 impl<'a> StyleValues<'a> {
     #[inline]
-    pub(crate) fn new(payloads: &'a FfiStylePayloads) -> Self {
+    pub(crate) fn new(payloads: ComputedValuesView<'a>) -> Self {
         Self {
-            style: ComputedValuesView::new(&payloads.groups),
+            style: payloads,
             resolved_anchor_insets: None,
             anchor_resolved_values: None,
             vertical_align_override: None,
@@ -224,10 +221,11 @@ impl<'a> StyleValues<'a> {
     }
 
     #[inline]
-    pub(crate) fn for_node(callbacks: &LayoutPass<'a>, node: Node) -> Self {
-        StyleValues::new(callbacks.style_payloads(node))
-            .for_kind(callbacks.node_data(node).kind.get())
-            .in_frame(callbacks.frame)
+    pub(crate) fn for_node(pass: &LayoutPass<'a>, node: Node) -> Self {
+        let (data, style) = pass.row_and_style(node);
+        StyleValues::new(style.expect("styled node must publish its style container before layout"))
+            .for_kind(data.kind.get())
+            .in_frame(pass.frame)
     }
 
     /// The view as seen from `frame`, whose sides and axes the box's sizes and box model properties are read in.
@@ -683,7 +681,7 @@ impl<'a> StyleValues<'a> {
 /// If no fallback value is specified, it makes the declaration referencing it invalid at computed-value time.
 /// NB: Outside of the resolutions the abspos engine installs, an anchor function is unresolvable.
 fn unresolvable_anchor_size_or<'a>(size: &'a ComputedSize, initial: &'static ComputedSize) -> &'a ComputedSize {
-    if !size.is_length_percentage() || !size.length_percentage().contains_anchor_function() {
+    if !size.contains_anchor_function() {
         return size;
     }
     let mut percentage_basis = CssPixels::default();
@@ -701,7 +699,7 @@ fn unresolvable_anchor_size_or<'a>(size: &'a ComputedSize, initial: &'static Com
 
 /// A px calc node, holding one reference for the external-resolution snapshot that releases it.
 pub(crate) fn calc_node_create_px_dimension(value: f64) -> *const c_void {
-    crate::css::calc::rust_calc_node_create_numeric_dimension(
+    crate::css::calc::calc_node_create_numeric_dimension(
         formatting_context::CALC_NUMERIC_KIND_LENGTH,
         value,
         crate::css::style_compute::px_length_unit(),
@@ -767,8 +765,8 @@ unsafe extern "C" fn resolve_unresolvable_anchor_function(context: *mut c_void, 
     // SAFETY: The context is the percentage basis resolve_calc_with_unresolvable_anchor_functions passes.
     let percentage_basis = unsafe { *context.cast::<CssPixels>() };
     // SAFETY: `shell` is the live style value the calc core's non-math-function node retains.
-    match unsafe { &*shell.cast::<StyleValueData>() } {
-        StyleValueData::Anchor { fallback_value, .. } | StyleValueData::AnchorSize { fallback_value, .. } => unsafe {
+    match unsafe { &*shell.cast::<StyleValueData>() }.anchor_name_and_fallback() {
+        Some((_, _, fallback_value)) => unsafe {
             anchor_function_fallback_node(
                 fallback_value,
                 percentage_basis,
@@ -776,7 +774,7 @@ unsafe extern "C" fn resolve_unresolvable_anchor_function(context: *mut c_void, 
                 resolve_unresolvable_anchor_function,
             )
         },
-        _ => std::ptr::null(),
+        None => std::ptr::null(),
     }
 }
 

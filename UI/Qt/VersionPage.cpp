@@ -1,0 +1,51 @@
+/*
+ * Copyright (c) 2026, Tim Flynn <trflynn89@ladybird.org>
+ *
+ * SPDX-License-Identifier: BSD-2-Clause
+ */
+
+#include <AK/JsonObject.h>
+#include <AK/NeverDestroyed.h>
+#include <AK/String.h>
+#include <LibCore/BrowserVersion.h>
+#include <LibCore/System.h>
+#include <LibWebCommon/Loader/UserAgent.h>
+#include <LibWebView/BuildInformation.h>
+#include <UI/Qt/Application.h>
+#include <UI/Qt/VersionPage.h>
+
+namespace Ladybird {
+
+void VersionPage::received_message(String const& name, JsonValue const&)
+{
+    if (name == "loadVersionInfo"sv)
+        load_version_info();
+}
+
+void VersionPage::load_version_info()
+{
+    static NeverDestroyed<String> browser_name = String::from_utf8_without_validation({ BROWSER_NAME, __builtin_strlen(BROWSER_NAME) });
+    static NeverDestroyed<String> browser_version = String::from_utf8_without_validation({ BROWSER_VERSION, __builtin_strlen(BROWSER_VERSION) });
+    static NeverDestroyed<String> release_stage = String::from_utf8_without_validation({ BROWSER_RELEASE_STAGE, __builtin_strlen(BROWSER_RELEASE_STAGE) });
+    static NeverDestroyed<String> product_name = String::from_utf8_without_validation({ BROWSER_PRODUCT_NAME, __builtin_strlen(BROWSER_PRODUCT_NAME) });
+    static NeverDestroyed<String> browser_commit = String::from_utf8_without_validation(WebView::LADYBIRD_COMMIT.bytes());
+    static NeverDestroyed<String> arch = String::from_utf8_without_validation({ CPU_STRING, __builtin_strlen(CPU_STRING) });
+    static NeverDestroyed<String> platform_name = String::from_utf8_without_validation({ OS_STRING, __builtin_strlen(OS_STRING) });
+    static NeverDestroyed<String> command_line = Application::the().command_line();
+    static NeverDestroyed<String> executable_path = MUST(String::from_byte_string(MUST(Core::System::current_executable_path())));
+
+    JsonObject version_info;
+    version_info.set("browserName"_string, *browser_name);
+    version_info.set("browserVersion"_string, *browser_version);
+    version_info.set("releaseStage"_string, *release_stage);
+    version_info.set("productName"_string, *product_name);
+    version_info.set("browserCommit"_string, *browser_commit);
+    version_info.set("arch"_string, *arch);
+    version_info.set("platformName"_string, *platform_name);
+    version_info.set("commandLine"_string, *command_line);
+    version_info.set("executablePath"_string, *executable_path);
+
+    send_message("renderVersionInfo"_string, move(version_info));
+}
+
+}

@@ -18,6 +18,7 @@
 #include <LibCompositing/Scrolling/AsyncScrollingState.h>
 #include <LibIPC/Forward.h>
 #include <LibWebCommon/Page/CompositorContextId.h>
+#include <LibWebCommon/Page/InputEvent.h>
 #include <LibWebCommon/Page/InputRoutingDecision.h>
 #include <LibWebCommon/Page/PageId.h>
 #include <LibWebCommon/PixelUnits.h>
@@ -109,9 +110,45 @@ struct AsyncScrollEnqueueResult {
     Optional<Web::AsyncScrollNodeStableID> routed_scroller {};
 };
 
+// What the compositor did with a wheel event that WebContent's main thread passed on to it, as the compositor does with
+// the UI's wheel events before the main thread gets them.
+struct WheelEventAnswer {
+    bool performed_default_action { false };
+    Optional<Web::WheelGestureMark> wheel_gesture_mark {};
+    // The operation the event started, whose end the scroll updates of the context report.
+    Optional<AsyncScrollOperationID> operation_id {};
+    Optional<Web::CompositorContextId> operation_context_id {};
+    // Why the compositor took or turned away the event, and the scroller it routed the event to.
+    Optional<Web::InputRoutingDecision> routing_decision {};
+    Optional<Web::AsyncScrollNodeStableID> routed_scroller {};
+};
+
 enum class AsyncScrollOperationTracking {
     No,
     Yes,
+};
+
+// When the compositor routes a wheel event that WebContent's main thread passes on to it, which it names the gesture of
+// either way: before the page dispatches the event, as it routes the UI's wheel events, or only once the page lets the
+// event through with the scrollers around its target. The main thread asks for the latter while the compositor's
+// display list misses changes to the scrollers.
+enum class WheelEventRouting : u8 {
+    BeforeDispatch,
+    AfterDispatch,
+};
+
+// A step of a wheel gesture that WebContent's page dispatched and did not cancel, which the compositor scrolls by.
+struct WheelStepLetThrough {
+    Web::UniqueNodeID document_id;
+    Web::WheelGestureMark wheel_gesture_mark;
+    // In the device pixels of the viewport of the context the step is let through in.
+    Gfx::FloatPoint position;
+    // In CSS pixels, with the axes already swapped for Shift.
+    Gfx::FloatPoint delta_in_css_pixels;
+    Web::WheelDeltaPrecision wheel_delta_precision { Web::WheelDeltaPrecision::Discrete };
+    Web::ScrollGesturePhase scroll_gesture_phase { Web::ScrollGesturePhase::None };
+    // The scroll containers around the target of the step, innermost first, ending at the viewport.
+    Vector<Web::AsyncScrollNodeStableID> scroll_chain;
 };
 
 // Blocking wheel event listeners hold a wheel step back from the compositor until the page has dispatched it. A step
@@ -167,6 +204,10 @@ struct RequestedSmoothScroll {
     // Where the scroll goes, or how far it goes from wherever the box is.
     Gfx::FloatPoint destination_offset;
     bool destination_is_relative { false };
+    // What a relative scroll clamps the box to, as each scroll folded into it clamps the box to the scroll range it
+    // had.
+    Gfx::FloatPoint relative_lower_bound { -AK::Infinity<float>, -AK::Infinity<float> };
+    Gfx::FloatPoint relative_upper_bound { AK::Infinity<float>, AK::Infinity<float> };
     ScrollAnimationKind animation_kind { ScrollAnimationKind::SmoothScroll };
     SmoothScrollInitiator initiator { SmoothScrollInitiator::Programmatic };
     // User input that heads the user input scroll of the same operation somewhere else, rather than starting another.
@@ -175,19 +216,31 @@ struct RequestedSmoothScroll {
     // that the main thread had heard of. User input the compositor took since carries the gesture on instead.
     Optional<u64> settled_user_input_scroll_count;
 
+    RequestedRelativeScroll relative_scroll() const
+    {
+        VERIFY(destination_is_relative);
+        return { destination_offset, relative_lower_bound, relative_upper_bound };
+    }
+
     // A later scroll of the same operation goes on from where this one was headed.
     void fold_later(RequestedSmoothScroll const& later)
     {
         VERIFY(later.operation_id == operation_id);
-        auto earlier_destination_offset = destination_offset;
-        auto earlier_destination_is_relative = destination_is_relative;
-        auto earlier_retargets_operation = retargets_operation;
+        auto earlier = *this;
         *this = later;
-        retargets_operation |= earlier_retargets_operation;
-        if (later.destination_is_relative) {
-            destination_offset.translate_by(earlier_destination_offset);
-            destination_is_relative = earlier_destination_is_relative;
+        retargets_operation |= earlier.retargets_operation;
+        if (!later.destination_is_relative)
+            return;
+        if (!earlier.destination_is_relative) {
+            destination_offset = later.relative_scroll().applied_to(earlier.destination_offset);
+            destination_is_relative = false;
+            return;
         }
+        auto folded = earlier.relative_scroll();
+        folded.then(later.relative_scroll());
+        destination_offset = folded.delta;
+        relative_lower_bound = folded.lower_bound;
+        relative_upper_bound = folded.upper_bound;
     }
 };
 
@@ -219,7 +272,8 @@ struct ScrollRequest {
             instant_scroll_is_for_user_input = later.instant_scroll_is_for_user_input;
         if (later.jump_offset.has_value()) {
             jump_offset = later.jump_offset;
-            visual_viewport_scale = later.visual_viewport_scale;
+            if (later.visual_viewport_scale.has_value())
+                visual_viewport_scale = later.visual_viewport_scale;
             relative_scroll = later.relative_scroll;
             relative_scroll_moves_visual_viewport_first = later.relative_scroll_moves_visual_viewport_first;
         } else if (later.relative_scroll.has_value()) {
@@ -300,8 +354,13 @@ template<>
 COMPOSITING_API ErrorOr<Compositing::ScrollRequest> decode(Decoder&);
 
 template<>
-COMPOSITING_API ErrorOr<void> encode(Encoder&, Compositing::AsyncScrollEnqueueResult const&);
+COMPOSITING_API ErrorOr<void> encode(Encoder&, Compositing::WheelEventAnswer const&);
 template<>
-COMPOSITING_API ErrorOr<Compositing::AsyncScrollEnqueueResult> decode(Decoder&);
+COMPOSITING_API ErrorOr<Compositing::WheelEventAnswer> decode(Decoder&);
+
+template<>
+COMPOSITING_API ErrorOr<void> encode(Encoder&, Compositing::WheelStepLetThrough const&);
+template<>
+COMPOSITING_API ErrorOr<Compositing::WheelStepLetThrough> decode(Decoder&);
 
 }

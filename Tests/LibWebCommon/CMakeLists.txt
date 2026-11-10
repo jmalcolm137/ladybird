@@ -2,6 +2,7 @@ ladybird_test_suite(LibWebCommon)
 
 set(TEST_SOURCES
     TestCSSPixels.cpp
+    TestConsoleOutputBuffer.cpp
     TestGamepadSharedState.cpp
     TestGamepadStateBuffer.cpp
     TestInsecureRequestsPolicy.cpp
@@ -18,4 +19,4 @@ set(TEST_SOURCES
 )
 
 target_sources(TestLibWebCommon PRIVATE ${TEST_SOURCES})
-target_link_libraries(TestLibWebCommon PRIVATE LibHTTP LibIPC LibURL LibWebCommon)
+target_link_libraries(TestLibWebCommon PRIVATE LibHTTP LibIPC LibThreading LibURL LibWebCommon)

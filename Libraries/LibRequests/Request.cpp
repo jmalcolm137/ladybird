@@ -270,12 +270,10 @@ void Request::set_buffered_request_finished_callback(BufferedRequestFinished on_
 
     m_internal_buffered_data = make<InternalBufferedData>();
 
-    on_headers_received = [this](auto headers, auto response_code, auto const& reason_phrase, auto javascript_bytecode, auto javascript_bytecode_cache_vary_key, auto cache_state) {
+    on_headers_received = [this](auto headers, auto response_code, auto const& reason_phrase, auto cache_state) {
         m_internal_buffered_data->response_headers = move(headers);
         m_internal_buffered_data->response_code = move(response_code);
         m_internal_buffered_data->reason_phrase = reason_phrase;
-        m_internal_buffered_data->javascript_bytecode = move(javascript_bytecode);
-        m_internal_buffered_data->javascript_bytecode_cache_vary_key = javascript_bytecode_cache_vary_key;
         m_internal_buffered_data->cache_state = cache_state;
     };
 
@@ -296,8 +294,6 @@ void Request::set_buffered_request_finished_callback(BufferedRequestFinished on_
             m_internal_buffered_data->response_headers,
             m_internal_buffered_data->response_code,
             m_internal_buffered_data->reason_phrase,
-            move(m_internal_buffered_data->javascript_bytecode),
-            m_internal_buffered_data->javascript_bytecode_cache_vary_key,
             m_internal_buffered_data->cache_state,
             move(payload));
     };
@@ -341,11 +337,11 @@ void Request::did_receive_certificate_info(Badge<RequestClient>, CertificateInfo
         on_certificate_info(*m_certificate_info);
 }
 
-void Request::did_receive_headers(Badge<RequestClient>, NonnullRefPtr<HTTP::HeaderList> response_headers, Optional<u32> response_code, Optional<String> const& reason_phrase, Optional<Core::ImmutableBytes> javascript_bytecode, Optional<u64> javascript_bytecode_cache_vary_key, CacheState cache_state, ByteString http_version)
+void Request::did_receive_headers(Badge<RequestClient>, NonnullRefPtr<HTTP::HeaderList> response_headers, Optional<u32> response_code, Optional<String> const& reason_phrase, CacheState cache_state, ByteString http_version)
 {
     m_http_version = move(http_version);
     if (on_headers_received)
-        on_headers_received(move(response_headers), response_code, reason_phrase, move(javascript_bytecode), javascript_bytecode_cache_vary_key, cache_state);
+        on_headers_received(move(response_headers), response_code, reason_phrase, cache_state);
 }
 
 void Request::did_transfer(Badge<RequestClient>)
@@ -370,6 +366,7 @@ void Request::defer_teardown()
     Core::deferred_invoke([self = NonnullRefPtr(*this)] {
         self->on_headers_received = nullptr;
         self->on_finish = nullptr;
+        self->on_upload_progress = nullptr;
         self->m_internal_buffered_data = nullptr;
         self->m_internal_stream_data = nullptr;
     });

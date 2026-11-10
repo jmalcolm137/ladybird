@@ -37,7 +37,7 @@ unsafe extern "C" {
 /// A shaped run of glyphs in one font, as the path operations below take one.
 pub struct GlyphRun {
     pub font: crate::font::FontHandle,
-    pub glyphs: Vec<crate::text_layout::DrawGlyph>,
+    pub glyphs: crate::text_layout::GlyphBuffer,
 }
 
 struct GlyphOutlineSink<'a> {
@@ -95,7 +95,6 @@ pub struct StrokeStyle {
     pub dash_offset: f32,
 }
 
-/// A path, with the rules of `Gfx::Path` for each operation.
 pub struct Path {
     geometry: PathGeometry,
     // A process-unique, never-reused identity, so that consumers that hold a copied snapshot can
@@ -192,7 +191,7 @@ impl Path {
         self.geometry_mut().set_fill_rule(fill_rule);
     }
 
-    /// Whether the path has no current point, which Gfx::Path::is_empty() calls empty.
+    /// Whether the path has no current point.
     pub fn is_empty(&self) -> bool {
         self.geometry.is_empty()
     }
@@ -270,7 +269,7 @@ impl Path {
             let ascent = run.font.facts().ascent;
             let transforms: Vec<_> = run
                 .glyphs
-                .iter()
+                .placed()
                 .map(|glyph| AffineTransform {
                     values: [1.0, 0.0, 0.0, 1.0, glyph.x, glyph.y + ascent],
                 })
@@ -295,9 +294,9 @@ impl Path {
                 continue;
             }
             let mut transforms = Vec::with_capacity(run.glyphs.len());
-            for glyph in &run.glyphs {
+            for glyph in run.glyphs.placed() {
                 let glyph_distance = offset + glyph.x;
-                if glyph_distance + (glyph.glyph_width / 2.0) > path_length {
+                if glyph_distance + (glyph.glyph.advance / 2.0) > path_length {
                     break;
                 }
                 let (point, tangent) = contour.position_and_tangent(glyph_distance);
@@ -339,6 +338,7 @@ impl Eq for Path {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ak::math;
 
     fn point(x: f32, y: f32) -> FloatPoint {
         FloatPoint { x, y }
@@ -491,8 +491,8 @@ mod tests {
         let vertices = circle.vertices();
         assert!(vertices.len() > 40);
         for vertex in &vertices {
-            assert_approximately(vertex.point.x.hypot(vertex.point.y), 10.0, 0.001);
-            assert_approximately(vertex.direction.x.hypot(vertex.direction.y), 1.0, 0.001);
+            assert_approximately(math::hypot(vertex.point.x, vertex.point.y), 10.0, 0.001);
+            assert_approximately(math::hypot(vertex.direction.x, vertex.direction.y), 1.0, 0.001);
             assert_approximately(
                 vertex.direction.x * vertex.point.x + vertex.direction.y * vertex.point.y,
                 0.0,
@@ -504,7 +504,7 @@ mod tests {
                 (pair[0].point.x + pair[1].point.x) / 2.0,
                 (pair[0].point.y + pair[1].point.y) / 2.0,
             );
-            assert!(midpoint.x.hypot(midpoint.y) > 10.0 - 0.5 / 16.0);
+            assert!(math::hypot(midpoint.x, midpoint.y) > 10.0 - 0.5 / 16.0);
         }
         assert_approximately(vertices.first().unwrap().point.x, 10.0, 0.000_000_5);
         assert_approximately(vertices.last().unwrap().point.x, 10.0, 0.000_000_5);

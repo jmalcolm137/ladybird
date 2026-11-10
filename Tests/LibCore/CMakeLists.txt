@@ -18,12 +18,12 @@ set(TEST_SOURCES
 if (LINUX)
     list(APPEND TEST_SOURCES
         TestLibCoreFileWatcher.cpp
+        TestLibCoreProcessStatistics.cpp
     )
 endif()
 
 if (APPLE OR LINUX)
     list(APPEND TEST_SOURCES
-        TestLibCoreFutex.cpp
         TestLibCoreProcess.cpp
         TestLibCoreStandardPaths.cpp
     )

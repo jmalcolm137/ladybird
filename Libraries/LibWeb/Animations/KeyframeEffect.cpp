@@ -18,6 +18,7 @@
 #include <LibWeb/CSS/Parser/Parser.h>
 #include <LibWeb/CSS/PropertyID.h>
 #include <LibWeb/CSS/StyleComputer.h>
+#include <LibWeb/CSS/StyleEngineInput.h>
 #include <LibWeb/CSS/StyleValues/KeywordStyleValue.h>
 #include <LibWeb/ComputedValuesRustFFI.h>
 #include <LibWeb/DOM/AbstractElement.h>
@@ -32,6 +33,7 @@
 #include <LibWeb/Layout/Node.h>
 #include <LibWeb/SVG/SMILAnimation.h>
 #include <LibWeb/SVG/SVGAnimationElement.h>
+#include <LibWeb/SVG/SVGElement.h>
 #include <LibWeb/WebIDL/ExceptionOr.h>
 
 namespace Web::Animations {
@@ -79,7 +81,7 @@ static WebIDL::ExceptionOr<KeyframeType<AL>> process_a_keyframe_like_object(JS::
     auto& vm = realm.vm();
 
     Function<WebIDL::ExceptionOr<Optional<double>>(JS::Value)> to_offset = [&vm](JS::Value value) -> WebIDL::ExceptionOr<Optional<double>> {
-        if (value.is_undefined())
+        if (value.is_nullish())
             return Optional<double> {};
         auto double_value = TRY(value.to_double(vm));
         if (isnan(double_value) || isinf(double_value))
@@ -310,7 +312,7 @@ void compute_missing_keyframe_offsets(Vector<BaseKeyframe>& keyframes)
             auto index = static_cast<double>(keyframe_index - index_a);
 
             // 4. Set the computed keyframe offset of keyframe to offsetA + (offsetB − offsetA) × index / n.
-            keyframes[keyframe_index].computed_offset = (offset_a + (offset_b - offset_a)) * index / n;
+            keyframes[keyframe_index].computed_offset = offset_a + (offset_b - offset_a) * index / n;
         }
 
         index_a = index_b;
@@ -569,12 +571,8 @@ static WebIDL::ExceptionOr<Vector<BaseKeyframe>> process_a_keyframes_argument(JS
             if (!property.has_value())
                 continue;
 
-            if (auto style_value = parse_css_value(CSS::Parser::ParsingParams(), value_string, property->id())) {
-                // Handle 'initial' here so we don't have to get the default value of the property every frame in StyleComputer
-                if (style_value->is_initial() && !property->is_custom_property())
-                    style_value = CSS::property_initial_value(property->id());
+            if (auto style_value = parse_css_value(CSS::Parser::ParsingParams(), value_string, property->id()))
                 parsed_properties.set(*property, CSS::RustStyleValueHandle::retained(style_value->rust_style_value_data()));
-            }
         }
         keyframe.properties.set(move(parsed_properties));
 
@@ -856,6 +854,8 @@ void KeyframeEffect::set_target(GC::Ptr<DOM::Element> target)
     m_target_element = target;
 
     invalidate_animation_preparation();
+    if (m_target_element)
+        CSS::record_attr_names_read_by_keyframes(*m_target_element, *this);
     invalidate_effect();
     // FIXME: We don't remove the animated style from the old target element as part of normal animated style update and
     //        it will remain "stuck" until it's style is fully invalidated for some other reason.
@@ -898,6 +898,7 @@ void KeyframeEffect::set_target(DOM::AbstractElement abstract_element, Invalidat
     } else {
         VERIFY(!associated_animation());
         m_target_element = &abstract_element.element();
+        CSS::record_attr_names_read_by_keyframes(*m_target_element, *this);
     }
     m_target_pseudo_selector = abstract_element.pseudo_element().map([](auto it) { return CSS::Selector::PseudoElementSelector { it }; });
 }
@@ -929,6 +930,8 @@ void KeyframeEffect::set_key_frame_set(RefPtr<KeyFrameSet const> key_frame_set)
         }
     }
     m_key_frame_set = move(key_frame_set);
+    if (m_target_element)
+        CSS::record_attr_names_read_by_keyframes(*m_target_element, *this);
     invalidate_animation_preparation();
     invalidate_effect();
 }
@@ -1049,6 +1052,8 @@ void KeyframeEffect::set_keyframes(Vector<BaseKeyframe> keyframes)
 
     generate_initial_and_final_frames(keyframe_set, m_target_properties);
     m_key_frame_set = keyframe_set;
+    if (m_target_element)
+        CSS::record_attr_names_read_by_keyframes(*m_target_element, *this);
 
     invalidate_animation_preparation();
     invalidate_effect();
@@ -1084,6 +1089,30 @@ void KeyframeEffect::visit_edges(GC::Cell::Visitor& visitor)
     Base::visit_edges(visitor);
     visitor.visit(m_target_element);
     visitor.visit(m_keyframe_objects_cache);
+}
+
+// Whether nothing shows the target's style, as a display: none ancestor leaves the target without a box.
+// NB: SVG resources keep their style under display: none, where boxes elsewhere in the document can reference them.
+static bool target_is_unseen_in_display_none_subtree(DOM::Element const& target)
+{
+    if (target.has_layout_box() || !target.has_inclusive_ancestor_with_display_none_ignoring_animations())
+        return false;
+    bool has_referenceable_svg_element = false;
+    target.for_each_in_inclusive_subtree_of_type<SVG::SVGElement>([&](SVG::SVGElement const& element) {
+        if (!element.is_referenceable_in_display_none_subtree())
+            return TraversalDecision::Continue;
+        has_referenceable_svg_element = true;
+        return TraversalDecision::Break;
+    });
+    return !has_referenceable_svg_element;
+}
+
+// NB: A custom property can feed the display of the target through var().
+bool KeyframeEffect::may_animate_display() const
+{
+    return any_of(target_properties(), [](auto const& property) {
+        return property.id() == CSS::PropertyID::Display || property.is_custom_property();
+    });
 }
 
 bool KeyframeEffect::can_skip_per_frame_style_update() const
@@ -1146,6 +1175,8 @@ bool KeyframeEffect::can_skip_per_frame_style_update() const
         return cache_result(false);
 
     if (!target->is_connected())
+        return cache_result(true);
+    if (target->document().layout_is_up_to_date() && !may_animate_display() && target_is_unseen_in_display_none_subtree(*target))
         return cache_result(true);
     bool has_animated_property = false;
     auto const* key_frame_set = m_key_frame_set.ptr();
@@ -1215,6 +1246,11 @@ bool KeyframeEffect::can_skip_per_frame_animation_tick() const
         return true;
 
     if (!m_is_compositor_driven && !m_is_compositor_replaced && !can_skip_per_frame_style_update())
+        return false;
+
+    // NB: Playing backward, an effect with an infinite iteration count finishes at time zero, and with a zero iteration
+    //     duration it finishes at its end time. No timer wakes the main thread for either.
+    if (auto animation = associated_animation(); animation && isinf(iteration_count()) && (animation->playback_rate() < 0 || !isinf(end_time().value)))
         return false;
 
     // A compositor-handled one-iteration effect has a document timer that wakes the main thread at its active end.
@@ -1287,7 +1323,7 @@ bool KeyframeEffect::css_animation_events_are_heard(bool only_iteration_events) 
 
 static bool is_in_display_none_subtree_ignoring_animations(DOM::AbstractElement abstract_element)
 {
-    if (abstract_element.pseudo_element().has_value() && abstract_element.element().installed_style(abstract_element.pseudo_element()).display_is_none())
+    if (abstract_element.pseudo_element().has_value() && abstract_element.element().installed_style(abstract_element.pseudo_element()).display_is_none_ignoring_animations())
         return true;
     return abstract_element.element().has_inclusive_ancestor_with_display_none_ignoring_animations();
 }
@@ -1302,8 +1338,11 @@ void KeyframeEffect::update_computed_properties(AnimationUpdateContext& context)
     // the update being skipped is the one that applies or removes that override, so it must always run.
     // NB: A descendant's retained style can still describe a display-none subtree while ancestor visibility
     //     reactions are propagating, so inspect the current target and ancestor styles before skipping its update.
+    // NB: Only a pseudo-element can skip it. What an element animates reaches the SVG paint servers below it, which
+    //     keep their style under display: none.
     DOM::AbstractElement abstract_element { *target, pseudo_element_type() };
-    if (!target_properties().contains(CSS::PropertyNameAndID::from_id(CSS::PropertyID::Display))
+    if (abstract_element.pseudo_element().has_value()
+        && !target_properties().contains(CSS::PropertyNameAndID::from_id(CSS::PropertyID::Display))
         && is_in_display_none_subtree_ignoring_animations(abstract_element))
         return;
 
@@ -1312,14 +1351,13 @@ void KeyframeEffect::update_computed_properties(AnimationUpdateContext& context)
 
 void KeyframeEffect::update_computed_properties_for_style(AnimationUpdateContext& context, DOM::AbstractElement abstract_element)
 {
-    Layout::ForcedReadScope read { abstract_element.document() };
     auto& style_computer = abstract_element.element().document().style_computer();
-    auto& element_data = context.elements.ensure(abstract_element, [&abstract_element, &style_computer, &read] {
-        auto style_record = abstract_element.style_record_identity();
-        if (!style_record)
+    auto& element_data = context.elements.ensure(abstract_element, [&abstract_element, &style_computer] {
+        auto const& style = abstract_element.installed_style();
+        if (!style)
             return AnimationUpdateContext::ElementData {};
-        auto computed_properties = style_computer.reconstruct_computed_properties_for_animation(read, style_record);
-        return AnimationUpdateContext::ElementData { style_record, move(computed_properties) };
+        auto computed_properties = style_computer.reconstruct_computed_properties_for_animation(style);
+        return AnimationUpdateContext::ElementData { style, move(computed_properties) };
     });
 
     if (!element_data.target_style)

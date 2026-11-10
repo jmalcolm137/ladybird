@@ -31,13 +31,13 @@
 #include <LibWebCommon/HTML/SelectItem.h>
 #include <LibWebCommon/HTML/SelectedFile.h>
 #include <LibWebView/Autocomplete.h>
+#include <LibWebView/ContextMenuRequest.h>
 #include <LibWebView/FileDownloader.h>
 #include <LibWebView/Forward.h>
 #include <LibWebView/CrashReportReview.h>
 #include <LibWebView/HeadlessWebView.h>
-#include <LibWebView/Menu.h>
-#include <LibWebView/SessionStore.h>
 #include <LibWebView/WebCompatReport.h>
+#include <UI/Qt/SessionStore.h>
 
 namespace LadybirdSDE {
 
@@ -56,6 +56,14 @@ public:
     void quit(int status = 0);
 
 private:
+    struct ContextMenuAction {
+        String text;
+        bool enabled { true };
+        bool checkable { false };
+        bool checked { false };
+        Function<void()> on_activate;
+    };
+
     struct Tab {
         AK_ALLOC_WITH_KMALLOC;
 
@@ -77,7 +85,7 @@ private:
         u64 parent { 0 };
         int device_pixel_ratio { 1 };
         u64 window_id { 0 };
-        Optional<WebView::SessionTabId> session_tab_id;
+        Optional<Ladybird::SessionTabId> session_tab_id;
         NonnullOwnPtr<WebView::HeadlessWebView> view;
         WebView::Autocomplete* autocomplete { nullptr };
         Gfx::IntSize viewport_size;
@@ -125,7 +133,7 @@ private:
         bool closing { false };
         Optional<String> pending_navigation;
         bool pending_navigation_user_input { true };
-        Vector<NonnullRefPtr<WebView::Action>> context_menu_actions;
+        Vector<ContextMenuAction> context_menu_actions;
         struct PendingPermission {
             WebView::PermissionPromptRequest request;
             Function<void(Web::Permissions::PromptOutcome)> callback;
@@ -165,6 +173,9 @@ private:
     void handle_clipboard_changed(JsonObject const&);
     void handle_set_user_agent(JsonObject const&);
     void handle_set_navigator_compatibility_mode(JsonObject const&);
+    void handle_set_website_color_scheme(JsonObject const&);
+    void handle_set_preferred_contrast(JsonObject const&);
+    void handle_set_preferred_motion(JsonObject const&);
     void handle_crash_report_open(JsonObject const&);
     void handle_crash_report_next();
     void handle_crash_report_text();
@@ -178,6 +189,7 @@ private:
     void handle_select_all(u64 tab_id);
     void handle_undo_redo(u64 tab_id, bool redo);
     void handle_context_menu_action(u64 tab_id, JsonObject const&);
+    void handle_context_menu_request(u64 tab_id, WebView::ContextMenuRequest);
     void handle_permission_response(u64 tab_id, JsonObject const&);
     void handle_file_picker_response(u64 tab_id, JsonObject const&);
     void handle_select_dropdown_closed(u64 tab_id, JsonObject const&);
@@ -250,7 +262,7 @@ private:
     void send_dialog(Tab&, StringView kind, StringView message, StringView default_text = {});
     void send_cursor(Tab&, Gfx::Cursor const&);
     void send_bookmarks();
-    void send_context_menu(Tab&, StringView kind, Gfx::IntPoint, WebView::Menu&);
+    void send_context_menu(Tab&, WebView::ContextMenuRequest);
     void send_permission_request(Tab&, WebView::PermissionPromptRequest const&, u64 request_id);
     void send_drag_start(u64 tab_id, Web::DragData);
     void send_crash_report_available(ByteString const& report_name);
@@ -258,12 +270,13 @@ private:
     void send_crash_report_failure(StringView failure, String const& reason);
     void check_crash_reports();
     void send_processes();
+    void send_view_preferences();
     void send_file_picker_request(Tab&, Web::HTML::FileFilter const&, Web::HTML::AllowMultipleFiles);
     void send_select_dropdown(Tab&, Gfx::IntPoint, i32 minimum_width, Vector<Web::HTML::SelectItem> const&);
     void send_downloads();
     void send_download_event(StringView type, WebView::FileDownloader::Download const&);
     void send_session_plan();
-    WebView::SessionWindowId session_window_for(u64 frontend_window_id, bool create);
+    Ladybird::SessionWindowId session_window_for(u64 frontend_window_id, bool create);
     JsonObject download_to_json(WebView::FileDownloader::Download const&);
     virtual void download_added(WebView::FileDownloader::Download const&) override;
     virtual void download_updated(WebView::FileDownloader::Download const&) override;
@@ -285,7 +298,7 @@ private:
     u64 m_active_tab_id { 0 };
     u64 m_focused_tab_id { 0 };
     HashMap<u64, u64> m_window_active_tabs;
-    HashMap<u64, WebView::SessionWindowId> m_session_windows;
+    HashMap<u64, Ladybird::SessionWindowId> m_session_windows;
     HashMap<u64, RefPtr<Requests::Request>> m_certificate_requests;
     u64 m_next_frame_buffer_id { 1 };
     u64 m_next_permission_id { 1 };

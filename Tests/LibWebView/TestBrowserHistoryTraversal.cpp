@@ -52,7 +52,7 @@ public:
         web_content_options.file_scheme_urls_have_tuple_origins = WebView::FileSchemeUrlsHaveTupleOrigins::Yes;
     }
 
-    virtual Optional<WebView::ViewImplementation&> open_blank_new_tab(Web::HTML::ActivateTab) const override
+    virtual Optional<WebView::ViewImplementation&> open_blank_new_tab(Web::HTML::ActivateTab, WebView::ViewImplementation const*) const override
     {
         ++m_new_tab_requests;
         return {};
@@ -165,7 +165,7 @@ TEST_CASE(browser_history_traversal)
     view->load(url_d);
     wait_until_at(url_d);
 
-    auto back_menu_items = view->session_history_traversal_menu_items(-1);
+    auto back_menu_items = view->session_history_traversal_items(-1);
     VERIFY(back_menu_items.size() == 3);
     VERIFY(back_menu_items[0].step == 2);
     VERIFY(back_menu_items[1].step == 1);
@@ -306,7 +306,7 @@ TEST_CASE(browser_history_traversal)
     auto cookie_url = URL::Parser::basic_parse("https://example.com/"sv).release_value();
     HTTP::Cookie::ParsedCookie cookie { .name = "page-lifecycle"_string, .value = "preserved"_string };
     auto& cookie_jar = *client.session().cookie_jar;
-    cookie_jar.set_cookie(cookie_url, cookie, HTTP::Cookie::Source::Http, {});
+    cookie_jar.set_cookie(cookie_url, cookie, HTTP::Cookie::Source::Http, {}, HTTP::Cookie::SameSiteContext::same_site());
     VERIFY(cookie_jar.get_named_cookie(cookie_url, cookie.name).has_value());
     auto& stub = static_cast<WebContentClientStub&>(client);
     auto new_tab_requests = app->new_tab_requests();
@@ -315,7 +315,7 @@ TEST_CASE(browser_history_traversal)
     VERIFY(stub.did_request_cookie(popup_page_id, {}, cookie_url, HTTP::Cookie::Source::Http).cookie().cookie == "page-lifecycle=preserved"sv);
     stub.did_request_delete_all_cookies(popup_page_id, 0, cookie_url);
     VERIFY(!cookie_jar.get_named_cookie(cookie_url, cookie.name).has_value());
-    cookie_jar.set_cookie(cookie_url, cookie, HTTP::Cookie::Source::Http, {});
+    cookie_jar.set_cookie(cookie_url, cookie, HTTP::Cookie::Source::Http, {}, HTTP::Cookie::SameSiteContext::same_site());
     client.page(popup_page_id)->set_detached_close_pending(true);
     popup.clear();
     VERIFY(!client.page(popup_page_id));

@@ -171,7 +171,7 @@ ErrorOr<void> BrowserSession::initialize(Vector<String> initial_urls, bool priva
         // line open in the restored window, as in the reference frontend.
         m_pending_initial_urls = move(initial_urls);
         m_waiting_for_session_plan = true;
-        m_session_plan_timeout = Core::Timer::create_single_shot(2000, [this] {
+        m_session_plan_timeout = Core::Timer::create_single_shot(10000, [this] {
             if (m_session_plan_received)
                 return;
             m_session_plan_received = true;
@@ -286,6 +286,30 @@ void BrowserSession::note_exit_reason(ByteString reason)
 {
     if (m_exit_reason.is_empty())
         m_exit_reason = move(reason);
+}
+
+void BrowserSession::set_website_color_scheme(String const& color_scheme)
+{
+    m_website_color_scheme = color_scheme;
+    m_engine->set_website_color_scheme(m_website_color_scheme);
+    for (auto& window : m_windows)
+        window->update_view_preference_actions();
+}
+
+void BrowserSession::set_preferred_contrast(String const& contrast)
+{
+    m_preferred_contrast = contrast;
+    m_engine->set_preferred_contrast(m_preferred_contrast);
+    for (auto& window : m_windows)
+        window->update_view_preference_actions();
+}
+
+void BrowserSession::set_preferred_motion(String const& motion)
+{
+    m_preferred_motion = motion;
+    m_engine->set_preferred_motion(m_preferred_motion);
+    for (auto& window : m_windows)
+        window->update_view_preference_actions();
 }
 
 BrowserWindow* BrowserSession::create_window(Vector<String> urls, bool private_window)
@@ -594,6 +618,18 @@ void BrowserSession::on_engine_event(JsonObject const& event)
     if (type == "navigator_compatibility_mode_changed"sv) {
         if (auto value = event.get_byte_string("value"sv); value.has_value())
             m_current_navigator_compatibility_mode = String::from_byte_string(*value).release_value();
+        return;
+    }
+
+    if (type == "view_preferences"sv) {
+        if (auto value = event.get_byte_string("color_scheme"sv); value.has_value())
+            m_website_color_scheme = String::from_byte_string(*value).release_value();
+        if (auto value = event.get_byte_string("contrast"sv); value.has_value())
+            m_preferred_contrast = String::from_byte_string(*value).release_value();
+        if (auto value = event.get_byte_string("motion"sv); value.has_value())
+            m_preferred_motion = String::from_byte_string(*value).release_value();
+        for (auto& window : m_windows)
+            window->update_view_preference_actions();
         return;
     }
 

@@ -22,13 +22,13 @@ static Gfx::Orientation orientation_for_scrollbar(Compositing::AsyncScrollbar co
 // stable id of its scroller wherever both display lists name one.
 struct ScrollbarIdentity {
     Optional<Web::AsyncScrollNodeStableID> scroller_stable_node_id;
-    Compositing::AsyncScrollNodeID scroll_node_id;
+    Compositing::SpatialNodeIndex scroll_node_index;
     bool vertical { false };
 };
 
 static ScrollbarIdentity scrollbar_identity(Compositing::AsyncScrollbar const& scrollbar)
 {
-    return { scrollbar.scroller_stable_node_id, scrollbar.scroll_node_id, scrollbar.vertical };
+    return { scrollbar.scroller_stable_node_id, scrollbar.scroll_node_index, scrollbar.vertical };
 }
 
 static Optional<ScrollbarIdentity> scrollbar_identity_at(ReadonlySpan<Compositing::AsyncScrollbar> scrollbars, Optional<size_t> scrollbar_index)
@@ -44,7 +44,7 @@ static bool scrollbar_has_identity(Compositing::AsyncScrollbar const& scrollbar,
         return false;
     if (scrollbar.scroller_stable_node_id.has_value() && identity.scroller_stable_node_id.has_value())
         return *scrollbar.scroller_stable_node_id == *identity.scroller_stable_node_id;
-    return scrollbar.scroll_node_id == identity.scroll_node_id;
+    return scrollbar.scroll_node_index == identity.scroll_node_index;
 }
 
 static Optional<size_t> find_scrollbar_index(ReadonlySpan<Compositing::AsyncScrollbar> scrollbars, ScrollbarIdentity const& identity)
@@ -157,7 +157,7 @@ Optional<size_t> ScrollbarController::hit_test_scrollbar_painted_by_compositor(C
         auto const& scrollbar = m_scrollbars[i];
         if (!scrollbar.is_painted_by_compositor)
             continue;
-        auto scroll_offset = async_scroll_tree.scroll_offset_for_node(scrollbar.scroll_node_id, scroll_state_snapshot);
+        auto scroll_offset = async_scroll_tree.scroll_offset_for_node(scrollbar.scroll_node_index, scroll_state_snapshot);
         if (!scroll_offset.has_value())
             continue;
 
@@ -176,7 +176,7 @@ Optional<size_t> ScrollbarController::hit_test_scrollbar_painted_by_display_list
         auto const& scrollbar = m_scrollbars[i];
         if (scrollbar.is_painted_by_compositor || !scrollbar.scroller_stable_node_id.has_value() || !is_shown(i))
             continue;
-        if (!async_scroll_tree.scroll_offset_for_node(scrollbar.scroll_node_id, scroll_state_snapshot).has_value())
+        if (!async_scroll_tree.scroll_offset_for_node(scrollbar.scroll_node_index, scroll_state_snapshot).has_value())
             continue;
 
         auto position_in_scrollbar_space = position_in_space_of_scrollbar(scrollbar, visual_context_tree, scroll_state_snapshot, position, Compositing::AccumulatedVisualContextTree::ClipBehavior::Respect);
@@ -203,7 +203,7 @@ Optional<ScrollbarController::Drag> ScrollbarController::begin_drag(Compositing:
         return {};
 
     auto const& scrollbar = m_scrollbars[*scrollbar_index];
-    auto scroll_offset = async_scroll_tree.scroll_offset_for_node(scrollbar.scroll_node_id, scroll_state_snapshot);
+    auto scroll_offset = async_scroll_tree.scroll_offset_for_node(scrollbar.scroll_node_index, scroll_state_snapshot);
     VERIFY(scroll_offset.has_value());
     auto position_in_scrollbar_space = position_in_space_of_scrollbar(scrollbar, visual_context_tree, scroll_state_snapshot, position, Compositing::AccumulatedVisualContextTree::ClipBehavior::Respect);
     VERIFY(position_in_scrollbar_space.has_value());
@@ -287,7 +287,7 @@ Optional<ScrollbarController::ScrollOffset> ScrollbarController::scroll_offset_f
     if (scroll_size == 0)
         return {};
 
-    auto current_scroll_offset = async_scroll_tree.scroll_offset_for_node(scrollbar.scroll_node_id, scroll_state_snapshot);
+    auto current_scroll_offset = async_scroll_tree.scroll_offset_for_node(scrollbar.scroll_node_index, scroll_state_snapshot);
     if (!current_scroll_offset.has_value())
         return {};
 
@@ -306,7 +306,7 @@ Optional<ScrollbarController::ScrollOffset> ScrollbarController::scroll_offset_f
 
     auto scroll_offset = *current_scroll_offset;
     scroll_offset.set_primary_offset_for_orientation(orientation, target_scroll_offset);
-    return ScrollOffset { scrollbar.scroll_node_id, scroll_offset };
+    return ScrollOffset { scrollbar.scroll_node_index, scroll_offset };
 }
 
 int ScrollbarController::paging_direction(size_t scrollbar_index, float primary_position, Gfx::FloatPoint scroll_offset) const
@@ -446,7 +446,7 @@ static Gfx::FloatRect interpolated_rect(Gfx::IntRect const& from, Gfx::IntRect c
     };
 }
 
-ScrollbarController::PresentedScrollbar ScrollbarController::presented_scrollbar(size_t scrollbar_index, Compositing::ScrollStateSnapshot const& scroll_state_snapshot, Color thumb_color, Color track_color) const
+ScrollbarController::PresentedScrollbar ScrollbarController::presented_scrollbar(size_t scrollbar_index, Compositing::ScrollStateSnapshot const& scroll_state_snapshot, Color thumb_color, Color thumb_outline_color, Color track_color) const
 {
     auto const& scrollbar = m_scrollbars[scrollbar_index];
     auto progress = expansion(scrollbar_index);
@@ -465,17 +465,18 @@ ScrollbarController::PresentedScrollbar ScrollbarController::presented_scrollbar
         .gutter_rect = interpolated_rect(scrollbar.track_rect, scrollbar.expanded_gutter_rect, progress),
         .thumb_rect = interpolated_rect(thin_thumb_rect, expanded_thumb_rect, progress),
         .thumb_color = thumb_color,
+        .thumb_outline_color = thumb_outline_color,
         .track_color = track_color.with_alpha(static_cast<u8>(track_alpha)),
         .opacity = opacity(scrollbar_index),
     };
 }
 
-Optional<ScrollbarController::PresentedScrollbar> ScrollbarController::presented_scrollbar_painted_by_display_list(Compositing::SpatialNodeIndex scroll_node_index, bool vertical, Color thumb_color, Color track_color, Compositing::ScrollStateSnapshot const& scroll_state_snapshot) const
+Optional<ScrollbarController::PresentedScrollbar> ScrollbarController::presented_scrollbar_painted_by_display_list(Compositing::SpatialNodeIndex scroll_node_index, bool vertical, Color thumb_color, Color thumb_outline_color, Color track_color, Compositing::ScrollStateSnapshot const& scroll_state_snapshot) const
 {
     for (size_t i = 0; i < m_scrollbars.size(); ++i) {
         auto const& scrollbar = m_scrollbars[i];
         if (!scrollbar.is_painted_by_compositor && scrollbar.scroll_node_index == scroll_node_index && scrollbar.vertical == vertical)
-            return presented_scrollbar(i, scroll_state_snapshot, thumb_color, track_color);
+            return presented_scrollbar(i, scroll_state_snapshot, thumb_color, thumb_outline_color, track_color);
     }
     return {};
 }
@@ -489,7 +490,7 @@ bool ScrollbarController::paint(Gfx::PaintingSurface& surface, DisplayListPlayer
             continue;
         if (opacity(i) <= 0)
             continue;
-        display_list_player.paint_scrollbar(surface, presented_scrollbar(i, scroll_state_snapshot, scrollbar.thumb_color, scrollbar.track_color));
+        display_list_player.paint_scrollbar(surface, presented_scrollbar(i, scroll_state_snapshot, scrollbar.thumb_color, scrollbar.thumb_outline_color, scrollbar.track_color));
         painted_a_scrollbar = true;
     }
     return painted_a_scrollbar;

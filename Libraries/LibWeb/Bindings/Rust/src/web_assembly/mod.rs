@@ -45,16 +45,16 @@ use std::sync::Arc;
 
 use libjs_rust::api::{
     EmbedderCell, EmbedderClass, EmbedderValue, ErrorKind, ErrorType, Gc, GcWeak, Realm, Throw, ThrowCompletionOr,
-    Trace, Value, Visitor, Vm, is_host_instance_of,
+    Trace, Value, Visitor, Vm,
 };
 use libwasm_engine::Module as CoreModule;
 use libwasm_engine::runtime::entity::{Entity, Handle};
 use libwasm_engine::runtime::heap::{CellTypeInfo, GcInterface, GcLayout, PrimitiveStorageLayout};
 use libwasm_engine::runtime::{InstantiationError, Store, TagAddress, Trap, Value as WasmValue};
-use libwasm_engine::types::FuncType;
+use libwasm_engine::types::{FuncType, ValType};
 
 use crate::bindings::conversions::BufferSource;
-use crate::bindings::interface::{Interface, Ref, Wrapped, implementation_of};
+use crate::bindings::interface::{Interface, Ref, Wrapped, implementation_if_wrapper};
 use crate::web_assembly::errors::{WebAssemblyError, throw_webassembly_error};
 use crate::web_assembly::exception::Exception;
 use crate::web_assembly::memory::{Memory, refresh_the_memory_buffer};
@@ -66,7 +66,12 @@ pub(crate) const PAGE_SIZE: u64 = 65536;
 unsafe extern "C" {
     // The functions of Libraries/LibGC/CAPI.h that the engine uses, with the types of its GcInterface.
     fn gc_get_layout(layout: *mut GcLayout);
-    fn gc_allocator_create(type_info: *const CellTypeInfo, name: *const c_char, name_length: usize) -> *mut c_void;
+    fn gc_allocator_create(
+        type_info: *const CellTypeInfo,
+        name: *const c_char,
+        name_length: usize,
+        foreign_type: *const c_void,
+    ) -> *mut c_void;
     fn gc_heap_allocate_cell(heap: *mut c_void, allocator: *mut c_void, must_mark: *mut bool) -> *mut c_void;
     fn gc_heap_defer_gc(heap: *mut c_void);
     fn gc_heap_undefer_gc(heap: *mut c_void);
@@ -75,7 +80,6 @@ unsafe extern "C" {
     fn gc_root_create(cell: *mut c_void) -> *mut c_void;
     fn gc_root_destroy(root: *mut c_void);
     pub(crate) fn gc_visitor_visit_cell(visitor: *mut c_void, cell: *mut c_void);
-    fn gc_visitor_visit_possible_values(visitor: *mut c_void, data: *const u8, size: usize);
     fn gc_primitive_storage_reserve(
         size: usize,
         capacity: usize,
@@ -107,7 +111,6 @@ fn gc_interface(heap: *mut c_void) -> GcInterface {
         gc_root_create,
         gc_root_destroy,
         gc_visitor_visit_cell,
-        gc_visitor_visit_possible_values,
         gc_primitive_storage_reserve,
         gc_primitive_storage_resize,
         gc_primitive_storage_free,
@@ -147,10 +150,15 @@ unsafe impl Trace for CellReference {
     }
 }
 
-/// Values of the store, which may be references that keep cells alive where they are traced, as a conservative scan
-/// of the values would. They live in a cell of their own, which a Gc in a local keeps alive. As allocating the cell can
-/// collect garbage, it is allocated empty, before there are values for it to keep alive.
-pub(crate) struct WasmValues(pub(crate) RefCell<Vec<WasmValue>>);
+/// Values of the store, which may be references that keep cells alive where they are traced. Each is traced as the type
+/// it was made for says, which a function reference needs, as it points into its function's cell. They live in a cell of
+/// their own, which a Gc in a local keeps alive. As allocating the cell can collect garbage, it is allocated empty,
+/// before there are values for it to keep alive.
+pub(crate) struct WasmValues {
+    values: RefCell<Vec<WasmValue>>,
+    /// How the collector follows each value, as the store's trace_of() says.
+    traces: RefCell<Vec<u8>>,
+}
 
 static WASM_VALUES_CLASS: EmbedderClass<WasmValues> = EmbedderClass::new("WasmValues");
 
@@ -160,24 +168,50 @@ impl EmbedderValue for WasmValues {
 
 impl WasmValues {
     pub(crate) fn allocate(vm: &Vm) -> Gc<EmbedderCell<WasmValues>> {
-        WASM_VALUES_CLASS.allocate(vm, |_| WasmValues(RefCell::default()))
+        WASM_VALUES_CLASS.allocate(vm, |_| WasmValues {
+            values: RefCell::default(),
+            traces: RefCell::default(),
+        })
+    }
+
+    /// How the collector follows values of `types`, for push().
+    pub(crate) fn traces_of(vm: &Vm, types: &[ValType]) -> Vec<u8> {
+        let store = Agent::the(vm).store();
+        types.iter().map(|&ty| store.trace_of(ty)).collect()
+    }
+
+    /// Appends a value, which the collector follows as `trace` says.
+    pub(crate) fn push(&self, value: WasmValue, trace: u8) {
+        self.values.borrow_mut().push(value);
+        self.traces.borrow_mut().push(trace);
+    }
+
+    /// Replaces the values with ones of the types `types`.
+    pub(crate) fn set(&self, vm: &Vm, values: Vec<WasmValue>, types: &[ValType]) {
+        *self.traces.borrow_mut() = Self::traces_of(vm, types);
+        *self.values.borrow_mut() = values;
+    }
+
+    pub(crate) fn values(&self) -> core::cell::Ref<'_, Vec<WasmValue>> {
+        self.values.borrow()
+    }
+
+    pub(crate) fn take(&self) -> Vec<WasmValue> {
+        self.traces.take();
+        self.values.take()
     }
 }
 
-// SAFETY: Every cell the values refer to is at an address in their bits, which this visits as a possible value. Only
-//         the edges of a cell may be visited so, which is why the values live in one.
+// SAFETY: Every reference among the values is traced as the type it was made for says.
 unsafe impl Trace for WasmValues {
     fn trace(&self, visitor: &mut Visitor) {
-        for value in self.0.borrow().iter() {
-            let (slots, count) = value.to_slots();
-            // SAFETY: The visitor is live while it traces, and the slots are plain data.
-            unsafe {
-                gc_visitor_visit_possible_values(
-                    visitor.as_raw().cast(),
-                    slots.as_ptr().cast(),
-                    count * size_of::<u64>(),
-                );
-            };
+        let wasm_visitor = libwasm_engine::runtime::heap::Visitor::new(visitor.as_raw().cast());
+        let (values, traces) = (self.values.borrow(), self.traces.borrow());
+        debug_assert_eq!(values.len(), traces.len());
+        for (value, &trace) in values.iter().zip(traces.iter()) {
+            if let WasmValue::Ref(bits) = *value {
+                wasm_visitor.visit_value(bits, trace);
+            }
         }
     }
 }
@@ -205,7 +239,7 @@ thread_local! {
 
 impl Agent {
     /// The agent of the current thread, which the first use on it creates. Each thread is one agent with one VM and one
-    /// heap, which the agent outlives.
+    /// heap, which outlive it: shut_down() ends it before they go.
     pub(crate) fn the(vm: &Vm) -> &'static Agent {
         if let Some(agent) = AGENT.get() {
             return agent;
@@ -216,6 +250,11 @@ impl Agent {
         // SAFETY: Nothing else has the store yet.
         let store = unsafe { &mut *store_cell.get() };
         store.attach_to_heap();
+
+        // NB: An interrupt of the agent's VM has to stop the store's code too.
+        // SAFETY: The word is in the boxed store, which does not move, and shut_down() clears it before the store goes.
+        unsafe { vm.set_wasm_stack_limit_word(store.stack_limit_word()) };
+        store.agent_waiter = Some(vm.agent_waiter().clone());
 
         // NB: The store is the agent's, whose [[CanBlock]] decides whether memory.atomic.wait may block.
         store.can_block = libjs_rust::api::agent_can_suspend(vm);
@@ -248,6 +287,20 @@ impl Agent {
         }));
         AGENT.set(Some(agent));
         agent
+    }
+
+    /// Ends the agent of the current thread, if it has one, while its heap is alive. The store and the root of the
+    /// JavaScript exception tag point into the heap, and whatever cells of the store remain go with the heap.
+    pub(crate) fn shut_down() {
+        let Some(agent) = AGENT.take() else {
+            return;
+        };
+        // SAFETY: Null is always allowed.
+        unsafe { agent.vm().set_wasm_stack_limit_word(std::ptr::null()) };
+        // SAFETY: The root belongs to the agent, which is going away, and the heap it is in is alive.
+        unsafe { gc_root_destroy(agent._js_tag_root.as_ptr()) };
+        // SAFETY: the() leaked this box, and AGENT held the only way to reach the agent.
+        drop(unsafe { Box::from_raw(std::ptr::from_ref(agent).cast_mut()) });
     }
 
     /// The agent of the current thread, which must have one.
@@ -319,10 +372,10 @@ pub(crate) fn set_host_object<T>(cell: *mut u8, object: Gc<T>) {
 
 /// The object of the interface that the value is the wrapper of, if it is one.
 pub(crate) fn implementation_of_value<T: Interface>(value: Value) -> Option<Ref<T>> {
-    if !value.is_object() || !is_host_instance_of(&value.as_object(), T::wrapper_class()) {
+    if !value.is_object() {
         return None;
     }
-    Some(implementation_of::<T>(value.as_object()))
+    implementation_if_wrapper(value.as_object())
 }
 
 /// A copy of the bytes held by a buffer, which the algorithms compile: their stableBytes.

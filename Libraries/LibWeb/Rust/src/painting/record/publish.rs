@@ -356,18 +356,33 @@ pub(crate) fn take_in_presented_output(
         .as_ref()
         .zip(recorder.published_hit_test_items.as_ref())
         .is_some_and(|(list, source)| std::sync::Arc::ptr_eq(&list.items, &source.items));
-    let hit_test_list_changed = !(output.is_identical_to_published_recording && previous_list_is_the_source);
+    // A recording that paints otherwise may still place the same items in the same contexts: the list kept stands,
+    // with the indexes built on it.
+    let items_stand = hit_test_list.as_ref().is_some_and(|previous| {
+        (output.is_identical_to_published_recording && previous_list_is_the_source)
+            || (previous.recorded_structural_epoch == output.recorded_structural_epoch
+                && previous.items.len() == list.items.len()
+                && *previous.items == *list.items)
+    });
+    let hit_test_list_changed = !items_stand;
     if hit_test_list_changed {
-        if publishes_recording {
-            recorder.published_hit_test_items =
-                Some(std::sync::Arc::new(crate::painting::record::PublishedHitTestItems {
-                    items: list.items.clone(),
-                    structural_epoch: output.recorded_structural_epoch,
-                }));
-        }
         *hit_test_list = Some(list);
     }
     if publishes_recording {
+        // A later recording copies its clean output from the published recording, with the published items: those of
+        // the list that stands with it.
+        let kept = hit_test_list.as_ref().expect("a list stands or was taken");
+        let published_items_stand = recorder
+            .published_hit_test_items
+            .as_ref()
+            .is_some_and(|source| std::sync::Arc::ptr_eq(&source.items, &kept.items));
+        if !published_items_stand {
+            recorder.published_hit_test_items =
+                Some(std::sync::Arc::new(crate::painting::record::PublishedHitTestItems {
+                    items: kept.items.clone(),
+                    structural_epoch: output.recorded_structural_epoch,
+                }));
+        }
         recorder.published_recording = Some(output.clone());
     }
     take_in(output, hit_test_list_changed);
@@ -385,6 +400,8 @@ pub(crate) fn take_in_recording(
     // Read-only recordings publish nothing and must not consume the damage.
     if publishes_recording {
         arena.clear_paint_damage_consumed_by_published_recording();
+    } else {
+        arena.forget_paint_damage_rows_gone();
     }
     let paint_state = arena.paint_state_mut();
     if hit_test_list_changed {
@@ -416,9 +433,12 @@ mod tests {
             if read_write {
                 arena.note_publishing_paint_recording_started();
             }
+            // Each recording is of another tree, so that it takes a new list.
             let output = RecordingOutput {
+                recorded_structural_epoch: hit_test_generation,
                 hit_test_list: HitTestList {
                     generation: hit_test_generation,
+                    recorded_structural_epoch: hit_test_generation,
                     ..Default::default()
                 },
                 ..Default::default()
@@ -454,6 +474,83 @@ mod tests {
                 }
                 _ => unreachable!(),
             }
+        }
+    }
+
+    #[test]
+    fn a_take_in_that_publishes_nothing_leaves_damage_accumulating_and_quarantine_held() {
+        let mut arena = LayoutNodeArena::new();
+        let consumed = arena.allocate_for_test().slot;
+        let kept = arena.allocate_for_test().slot;
+        let gone = arena.allocate_for_test().slot;
+        for row in [consumed, kept, gone] {
+            arena.populate_paintable_row(row);
+        }
+        arena.push_paint_damage(consumed, PaintDamage::DRAW_FOREGROUND);
+        arena.note_publishing_paint_recording_started();
+        arena.push_paint_damage(kept, PaintDamage::DRAW_FOREGROUND);
+        let take_in = |arena: &mut LayoutNodeArena, publishes_recording| {
+            take_in_recording(arena, Arc::new(RecordingOutput::default()), true, publishes_recording);
+        };
+
+        // The published frame consumes what it recorded, and what was pushed as it recorded stays.
+        take_in(&mut arena, true);
+        assert_eq!(arena.paint_damage_of_row(consumed), PaintDamage::NONE);
+        assert_eq!(arena.paint_damage_of_row(kept), PaintDamage::DRAW_FOREGROUND);
+        assert!(arena.paint_state().visual_context.quarantined_slots_are_releasable);
+        arena.paint_state_mut().visual_context.quarantined_slots_are_releasable = false;
+
+        // A frame that publishes nothing consumes nothing, and nothing it replaced is released.
+        arena.push_paint_damage(gone, PaintDamage::DRAW_BACKGROUND);
+        take_in(&mut arena, false);
+        assert_eq!(arena.paint_damage_of_row(kept), PaintDamage::DRAW_FOREGROUND);
+        assert_eq!(arena.paint_damage_of_row(gone), PaintDamage::DRAW_BACKGROUND);
+        assert!(!arena.paint_state().visual_context.quarantined_slots_are_releasable);
+        assert_eq!(arena.damaged_paint_rows(), [kept, gone]);
+
+        // A row that went leaves the damage a later frame reads.
+        arena
+            .free_subtree(gone)
+            .destroy_shells_and_invoke_callbacks(&crate::stage::MainThread::for_test());
+        take_in(&mut arena, false);
+        assert_eq!(arena.paint_damage_for_frame().rows().collect::<Vec<_>>(), [kept]);
+        arena
+            .free_subtree(consumed)
+            .destroy_shells_and_invoke_callbacks(&crate::stage::MainThread::for_test());
+        arena
+            .free_subtree(kept)
+            .destroy_shells_and_invoke_callbacks(&crate::stage::MainThread::for_test());
+    }
+
+    #[test]
+    fn a_recording_that_emits_the_same_items_at_the_same_epoch_keeps_the_list() {
+        let mut arena = LayoutNodeArena::new();
+        let mut recorder = RecorderState::default();
+        let mut hit_test_list = None;
+        let mut first_items = None;
+        // Two recordings of one tree emit the same items: the first list stands, and the published items with it.
+        // A recording of another tree takes a new list.
+        for (structural_epoch, expected_generation) in [(7, 1), (7, 1), (8, 2)] {
+            arena.note_publishing_paint_recording_started();
+            let output = RecordingOutput {
+                recorded_structural_epoch: structural_epoch,
+                hit_test_list: HitTestList {
+                    recorded_structural_epoch: structural_epoch,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let mut generation = 0;
+            take_in_published_output(&mut recorder, &mut hit_test_list, output, true, |output, changed| {
+                generation = take_in_recording(&mut arena, output, changed, true);
+            });
+            assert_eq!(generation, expected_generation);
+            let items = &hit_test_list.as_ref().unwrap().items;
+            let first_items = first_items.get_or_insert_with(|| items.clone());
+            assert_eq!(Arc::ptr_eq(first_items, items), structural_epoch == 7);
+            let published = recorder.published_hit_test_items.as_ref().unwrap();
+            assert!(Arc::ptr_eq(&published.items, items));
+            assert_eq!(published.structural_epoch, structural_epoch);
         }
     }
 }

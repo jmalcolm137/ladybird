@@ -13,6 +13,7 @@ use core::ops::Deref;
 use core::ptr::NonNull;
 
 use ak::Utf16String;
+use ak::math;
 use libcompositing_rust::display_list::canvas_2d::{Compositing, Paint, Stroke};
 use libcompositing_rust::display_list::canvas_2d_recorder::{AlphaType, ColorSpace, Recorder};
 use libcompositing_rust::display_list::commands::{Canvas2DShadow, CanvasId};
@@ -74,7 +75,7 @@ unsafe impl<K: CanvasKind> Trace for RenderingContext2D<K> {
 }
 
 impl<K: CanvasKind> Wrappable for RenderingContext2D<K> {
-    fn relevant_realm(&self, _vm: &Vm) -> Option<Gc<Realm>> {
+    fn relevant_realm(&self) -> Option<Gc<Realm>> {
         self.state.canvas.relevant_realm()
     }
 
@@ -572,6 +573,9 @@ impl ContextState {
             None => {
                 let resolved_color = match value.as_units() {
                     ak::Utf16StringUnits::Ascii(units) => libweb_rust::parse_simple_color_ascii(units),
+                    ak::Utf16StringUnits::Latin1(units) => libweb_rust::parse_simple_color_utf16(
+                        &units.iter().map(|&unit| u16::from(unit)).collect::<Vec<_>>(),
+                    ),
                     ak::Utf16StringUnits::Utf16(units) => libweb_rust::parse_simple_color_utf16(units),
                 }
                 .map(|srgb| {
@@ -847,6 +851,6 @@ pub(crate) fn multiply_transforms(transform: AffineTransform, other: AffineTrans
 
 /// The transform rotated by the angle in radians, as Gfx::AffineTransform::rotate_radians().
 pub(crate) fn rotated(transform: AffineTransform, radians: f32) -> AffineTransform {
-    let (sin, cos) = radians.sin_cos();
+    let (sin, cos) = math::sincos(radians);
     multiply_transforms(transform, AffineTransform::new(cos, sin, -sin, cos, 0.0, 0.0))
 }

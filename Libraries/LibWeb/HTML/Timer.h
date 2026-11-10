@@ -37,14 +37,19 @@ public:
         Yes,
     };
 
-    static GC::Ref<Timer> create(i32 milliseconds, Function<void()> callback, i32 id, Repeating, TimerThrottlingClass, double deadline);
+    using Callback = GC::Ref<GC::Function<void()>>;
+
+    static GC::Ref<Timer> create(i32 milliseconds, Callback, i32 id, Repeating, TimerThrottlingClass, double deadline);
 
     void start();
     void stop();
     void restart(i32 milliseconds);
     bool is_active() const;
 
-    void set_callback(Function<void()>);
+    // Runs what the timer runs when it fires, without waiting for the clock.
+    void fire_now();
+
+    void set_callback(Callback callback) { m_callback = callback; }
     void set_interval(i32 milliseconds);
 
     TimerThrottlingClass throttling_class() const { return m_throttling_class; }
@@ -59,14 +64,16 @@ public:
     // neither queues a task. Running the task releases the claim.
     [[nodiscard]] bool claim_firing();
     void release_firing() { m_has_queued_firing = false; }
+    bool has_queued_firing() const { return m_has_queued_firing; }
 
 private:
-    Timer(i32 milliseconds, Function<void()> callback, i32 id, Repeating, TimerThrottlingClass, double deadline);
+    Timer(i32 milliseconds, Callback, i32 id, Repeating, TimerThrottlingClass, double deadline);
 
     virtual void visit_edges(Cell::Visitor&) override;
     virtual void finalize() override;
 
     RefPtr<Core::Timer> m_timer;
+    Callback m_callback;
     i32 m_id { 0 };
     TimerThrottlingClass m_throttling_class { TimerThrottlingClass::Delayed };
     double m_deadline { 0 };

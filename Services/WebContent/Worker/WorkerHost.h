@@ -1,0 +1,79 @@
+/*
+ * Copyright (c) 2023, Andrew Kaster <akaster@serenityos.org>
+ *
+ * SPDX-License-Identifier: BSD-2-Clause
+ */
+
+#pragma once
+
+#include <AK/RefCounted.h>
+#include <AK/Utf16String.h>
+#include <AK/Vector.h>
+#include <LibURL/URL.h>
+#include <LibWeb/Bindings/MainThreadVM.h>
+#include <LibWeb/Forward.h>
+#include <LibWeb/HTML/Scripting/WorkerEnvironmentSettingsObject.h>
+#include <LibWeb/HTML/StructuredSerialize.h>
+#include <LibWeb/HTML/WorkerGlobalScope.h>
+#include <LibWebCommon/HTML/Scripting/SerializedEnvironmentSettingsObject.h>
+
+namespace Web::HTML {
+
+class WorkerGlobalScope;
+
+}
+
+namespace WebWorker {
+
+class WorkerHost : public RefCounted<WorkerHost> {
+public:
+    GC_HOLDS_NO_CELL_EDGES;
+
+    explicit WorkerHost(URL::URL url, Web::HTML::WorkerType type, String name);
+    ~WorkerHost();
+
+    void run(GC::Ref<Web::Page>, Web::HTML::TransferDataEncoder message_port_data, Web::HTML::SerializedEnvironmentSettingsObject const&, Web::HTML::RequestCredentials, bool is_shared, URL::Origin origin, Web::HTML::EnvironmentId environment_id, bool has_process_to_itself);
+    void connect_shared_worker(Web::HTML::TransferDataEncoder message_port_data, Web::HTML::SerializedEnvironmentSettingsObject);
+
+    void terminate();
+    void run_closing_steps();
+
+    GC::Ptr<Web::HTML::WorkerGlobalScope> global_scope() { return m_worker_global_scope.cell(); }
+
+    bool script_has_run() const { return m_script_has_run; }
+    void set_on_script_ready(GC::Ref<GC::Function<void()>> callback) { m_on_script_ready = callback; }
+
+    // Called from WorkerHost::run's on_complete callback once the initial script has executed.
+    void notify_script_ran();
+
+private:
+    struct PendingSharedWorkerConnection {
+        Web::HTML::TransferDataEncoder message_port_data;
+        Web::HTML::SerializedEnvironmentSettingsObject outside_settings;
+    };
+
+    enum class ShouldAppendOwner {
+        No,
+        Yes,
+    };
+
+    void connect_shared_worker_impl(Web::HTML::TransferDataEncoder message_port_data, Web::HTML::SerializedEnvironmentSettingsObject const&, ShouldAppendOwner);
+    void flush_pending_shared_worker_connections();
+
+    GC::Root<Web::HTML::WorkerDebugConsoleClient> m_console;
+    GC::Root<Web::HTML::WorkerGlobalScope> m_worker_global_scope;
+    GC::Root<Web::HTML::WorkerEnvironmentSettingsObject> m_inside_settings;
+
+    URL::URL m_url;
+    Web::HTML::WorkerType m_type;
+    Utf16String m_name;
+    bool m_is_shared { false };
+    bool m_accepting_shared_worker_connections { false };
+    // WorkerHost is only touched on the worker's thread.
+    Vector<PendingSharedWorkerConnection> m_pending_shared_worker_connections;
+
+    bool m_script_has_run { false };
+    GC::Root<GC::Function<void()>> m_on_script_ready;
+};
+
+}

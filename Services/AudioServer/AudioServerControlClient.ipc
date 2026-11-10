@@ -3,9 +3,14 @@
 
 endpoint AudioServerControlClient
 {
-    // A client of the tab asks to capture from the device; the Browser rules on every request with capture_decided.
-    capture_requested(u64 tab_id, u64 request_id, ByteString device_id) =|
+    // A client of the tab asks to capture from the device; the Browser rules on every request with capture_decided. The
+    // group is the page the client says it captures for.
+    capture_requested(u64 tab_id, u64 request_id, ByteString device_id, Audio::PlaybackGroupId group) =|
 
     // An authorized group of the tab is heard, muted or not, or has gone quiet for long enough to be forgotten.
     playback_group_audibility_changed(u64 tab_id, Audio::PlaybackGroupId group, Audio::Audibility audibility) =|
+
+    // A capture stream of the tab, labelled with the group, may capture, or the last such stream has been gone for long
+    // enough to be forgotten. Nothing about what the device delivers counts.
+    capture_activity_changed(u64 tab_id, Audio::PlaybackGroupId group, bool capturing) =|
 }

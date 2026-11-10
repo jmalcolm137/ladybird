@@ -19,7 +19,6 @@
 #include <LibWebView/ChildIdentity.h>
 #include <LibWebView/Forward.h>
 #include <LibWebView/WebContentClient.h>
-#include <LibWebView/WebWorkerClient.h>
 #include <RequestServer/SiteBinding.h>
 
 namespace WebView {
@@ -31,23 +30,16 @@ WEBVIEW_API ErrorOr<NonnullRefPtr<AudioServerControlClient>> launch_audio_server
 WEBVIEW_API ErrorOr<NonnullRefPtr<VideoDecoderServerControlClient>> launch_video_decoder_server_process(u64 owner_child_id, Optional<Gfx::GpuDeviceIdentity> const&);
 WEBVIEW_API void shut_down_video_decoder_servers();
 WEBVIEW_API ErrorOr<NonnullRefPtr<WebView::CompositorClient>> launch_compositor_process();
-WEBVIEW_API ErrorOr<NonnullRefPtr<WebView::WebWorkerClient>> launch_web_worker_process(Web::HTML::AgentType, IsPrivate, Web::HTML::WorkerAgentId);
-// Serves the given site's partitions, or all partitions if site is empty. With sites_have_their_own,
-// the server with no site only handles site requests in transit to their site's RequestServer.
-WEBVIEW_API ErrorOr<NonnullRefPtr<Requests::RequestControlClient>> launch_request_server_process(ByteString const& cache_path, Optional<Utf16String> const& site, bool sites_have_their_own, HTTPDiskCacheMode, ChildIdentity* identity = nullptr);
+// Serves the given site's partitions, or all partitions if site is empty.
+WEBVIEW_API ErrorOr<NonnullRefPtr<Requests::RequestControlClient>> launch_request_server_process(ByteString const& cache_path, Optional<Utf16String> const& site, HTTPDiskCacheMode, ChildIdentity* identity = nullptr);
 WEBVIEW_API void apply_dns_settings(Requests::RequestControlClient&);
 
-struct ImageDecoderConnection {
-    IPC::TransportHandle handle;
-    u64 child_id { 0 };
-};
+// Launches an ImageDecoder, which is listed with the given site, or with the given process if it serves no site.
+WEBVIEW_API ErrorOr<NonnullRefPtr<ImageDecoderControlClient>> launch_image_decoder_process(u64 owner_child_id, Optional<Utf16String> const& site);
 
-// Launches an ImageDecoder that serves a single renderer or worker, which talks to it over the returned handle.
-WEBVIEW_API ErrorOr<ImageDecoderConnection> launch_image_decoder_process();
-
-// Hands the client its ImageDecoder. If that decoder dies while the client is still connected, the client gets a new one.
-WEBVIEW_API void connect_to_image_decoder(WebContentClient&, ImageDecoderConnection);
-WEBVIEW_API void connect_to_image_decoder(WebWorkerClient&, ImageDecoderConnection);
+// Launches a WebRTCClient that serves the given renderer alone, which talks to it over the returned handle, and ends any
+// helper the renderer had before. The helper exits once that renderer's end of the transport is gone.
+WEBVIEW_API ErrorOr<IPC::TransportHandle> launch_webrtc_client_process(WebContentClient&);
 
 struct RequestServerClientConnection {
     IPC::TransportHandle handle;
@@ -57,7 +49,7 @@ struct RequestServerClientConnection {
 // A new client of the session's RequestServer with no site. The client uses the cookies of the given session, which
 // must be the session of the process the client is for.
 WEBVIEW_API ErrorOr<RequestServerClientConnection> connect_new_request_server_client(BrowsingSession&, RequestServer::SiteBinding);
-// Names a tab's mix in the AudioServer. Every renderer and worker process gets one of its own, and every process
+// Names a tab's mix in the AudioServer. Every renderer and worker gets one of its own, and every process
 // that plays on its behalf plays into the same mix.
 WEBVIEW_API u64 allocate_audio_tab_id();
 // Launches the AudioServer for a renderer if it has none, keeping its controller connection in the given slot. The

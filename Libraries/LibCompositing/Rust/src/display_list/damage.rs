@@ -6,16 +6,18 @@
 
 use super::effect_clip_plan::EffectClipPlan;
 use super::effect_geometry::{Extent, SpaceMatrices, changed_extent_through_filters, nearest_spreading_effects};
+use super::replay::{OwnSpaceClipExtent, own_space_clip_extent};
 use super::summary::{DisplayListSummary, LiveContent};
 use crate::display_list::builder::{
-    HEADER_SIZE, for_each_command, inline_transform_entry_offset, read_command, read_header,
+    HEADER_SIZE, for_each_command, has_inline_clip_in_its_own_space, inline_clips_of, inline_transform_entry_offset,
+    read_command, read_header,
 };
 use crate::display_list::commands::{
     CanvasId, ClipMode, ClipNodeIndex, CompositorScrollbar, ContextRef, DeclareMaskContent, DisplayListCommandHeader,
     DisplayListCommandRun, DisplayListCommandType, DisplayListDataSpan, DisplayListInlineClip,
     DisplayListPaintStyleType, DrawGlyphRun, DrawScaledDecodedImageFrame, EffectNodeIndex, FillPath, FillRect,
-    INLINE_CLIP_ENTRY_SIZE, OptionalColor, OptionalFloatRect, PaintScrollBar, PaintTextShadow, PathPaintKind,
-    SpatialNodeIndex, StrokePath, VISUAL_VIEWPORT_NODE_INDEX, VideoSinkResourceId,
+    INLINE_CLIP_ENTRY_SIZE, ImageFrameResourceId, OptionalColor, OptionalFloatRect, PaintScrollBar, PaintTextShadow,
+    PathPaintKind, SpatialNodeIndex, StrokePath, VISUAL_VIEWPORT_NODE_INDEX, VideoSinkResourceId,
 };
 use crate::fast_hash::FastMap;
 use crate::host::FfiAnimatedContentViewportEffect;
@@ -96,7 +98,10 @@ fn static_mask_contents(tape: Tape<'_>, effect_count: usize) -> Vec<Option<Stati
             let content = super::nested_records::span_bytes(payload, declaration.content);
             let nested = collect_nested_command_references(content, run.context);
             // Mask groups use their declaration's visual context. Only compare drawing commands whose
-            // complete appearance is encoded in the payload, without canvas, video, or nested scenes.
+            // complete appearance is encoded in the payload, without canvas or video. The id of a nested
+            // display list, such as that of an SVG mask image, names one recording whose commands never
+            // change. The video and animated image frames drawn only inside it can, and for those
+            // ContextPresenter damages the whole viewport.
             if nested.iter().all(|nested| match nested.header.command_type {
                 DisplayListCommandType::FillRect => read_command::<FillRect>(nested.payload)
                     .background_color_animation_effect
@@ -114,6 +119,7 @@ fn static_mask_contents(tape: Tape<'_>, effect_count: usize) -> Vec<Option<Stati
                 DisplayListCommandType::PaintLinearGradient
                 | DisplayListCommandType::PaintRadialGradient
                 | DisplayListCommandType::PaintConicGradient
+                | DisplayListCommandType::PaintNestedDisplayList
                 | DisplayListCommandType::DrawEllipse
                 | DisplayListCommandType::DrawLine
                 | DisplayListCommandType::DrawRect => true,
@@ -224,6 +230,8 @@ fn inline_clip_lists_are_equal(a: &CommandReference<'_>, b: &CommandReference<'_
             && same_entry_field(offset_of!(DisplayListInlineClip, path_winding_rule), 4)
             && same_entry_field(offset_of!(DisplayListInlineClip, kind), 1)
             && same_entry_field(offset_of!(DisplayListInlineClip, mode), 1)
+            && same_entry_field(offset_of!(DisplayListInlineClip, has_own_space), 1)
+            && same_entry_field(offset_of!(DisplayListInlineClip, space), 4)
             && first.span_bytes_at(a_entry + offset_of!(DisplayListInlineClip, path_data))
                 == second.span_bytes_at(b_entry + offset_of!(DisplayListInlineClip, path_data))
     })
@@ -486,6 +494,33 @@ impl SpaceMatrices for TreeSpaces<'_> {
                 .accumulated_matrix(space, self.scroll_offsets, IncludeVisualViewportTransform::Yes)
         })
     }
+}
+
+// Where a command's inline clips in spaces of their own let it draw on one side of the comparison.
+fn own_space_clip_extent_on(command: &CommandReference<'_>, side: TreeSide<'_>) -> Option<OwnSpaceClipExtent> {
+    if command.header.inline_clip_count == 0
+        || !command.header.has_bounding_rect
+        || !has_inline_clip_in_its_own_space(&command.header, command.payload)
+    {
+        return None;
+    }
+    let mut to_root_matrices = side.filter_spreading.to_root_matrices.borrow_mut();
+    let mut spaces = TreeSpaces {
+        tree: side.tree,
+        scroll_offsets: side.scroll_offsets,
+        to_root_matrices: &mut to_root_matrices,
+    };
+    let mut to_root = |space: SpatialNodeIndex| {
+        ((space.0 as usize) < side.tree.spatial_nodes.len()).then(|| spaces.to_root_matrix(space))
+    };
+    let command_to_root = to_root(command.context.spatial)?;
+    own_space_clip_extent(
+        &command.header,
+        command.payload,
+        command.header.bounding_rect.to_float(),
+        command_to_root,
+        to_root,
+    )
 }
 
 // One side of the comparison, as command damage needs it.
@@ -790,24 +825,12 @@ fn filter_output_clip_bounds(
                 )
                 .inflated(1.0, 1.0);
             if bounds.x.is_finite() && bounds.y.is_finite() && bounds.width.is_finite() && bounds.height.is_finite() {
-                output_bounds =
-                    Some(output_bounds.map_or(bounds, |output_bounds| intersect_like_gfx_rect(output_bounds, bounds)));
+                output_bounds = Some(output_bounds.map_or(bounds, |output_bounds| output_bounds.intersected(bounds)));
             }
         }
         clip = node.parent;
     }
     output_bounds
-}
-
-fn intersect_like_gfx_rect(rect: FloatRect, other: FloatRect) -> FloatRect {
-    let left = rect.x.max(other.x);
-    let right = rect.right().min(other.right());
-    let top = rect.y.max(other.y);
-    let bottom = rect.bottom().min(other.bottom());
-    if left > right || top > bottom {
-        return FloatRect::default();
-    }
-    FloatRect::new(left, top, right - left, bottom - top)
 }
 
 fn intersect_like_gfx_int_rect(rect: IntRect, other: IntRect) -> IntRect {
@@ -845,7 +868,15 @@ impl DamageAccumulator {
         if !command.header.has_bounding_rect {
             return;
         }
-        self.add_changed_content_damage(command.header.bounding_rect.to_float(), context, side);
+        // The bounds of a command leave out its inline clips in spaces of their own, so they limit it here.
+        let rect = match own_space_clip_extent_on(command, side) {
+            Some(OwnSpaceClipExtent::Within(rect)) => rect,
+            _ => command.header.bounding_rect.to_float(),
+        };
+        if rect.is_empty() {
+            return;
+        }
+        self.add_changed_content_damage(rect, context, side);
     }
 
     // Damage for content drawn within `rect` in `context` that changed, wherever the filters above
@@ -901,20 +932,17 @@ impl DamageAccumulator {
             return;
         }
         if let Some(output_clip_bounds) = output_clip_bounds {
-            transformed_rect = intersect_like_gfx_rect(transformed_rect, output_clip_bounds);
+            transformed_rect = transformed_rect.intersected(output_clip_bounds);
         }
         // Eye-plane clamping in the projection can produce coordinates beyond integer range, and converting
         // such a float to int is undefined.
         const DAMAGE_COORDINATE_LIMIT: f32 = 16777216.0;
-        transformed_rect = intersect_like_gfx_rect(
-            transformed_rect,
-            FloatRect::new(
-                -DAMAGE_COORDINATE_LIMIT,
-                -DAMAGE_COORDINATE_LIMIT,
-                2.0 * DAMAGE_COORDINATE_LIMIT,
-                2.0 * DAMAGE_COORDINATE_LIMIT,
-            ),
-        );
+        transformed_rect = transformed_rect.intersected(FloatRect::new(
+            -DAMAGE_COORDINATE_LIMIT,
+            -DAMAGE_COORDINATE_LIMIT,
+            2.0 * DAMAGE_COORDINATE_LIMIT,
+            2.0 * DAMAGE_COORDINATE_LIMIT,
+        ));
         if transformed_rect.is_empty() {
             return;
         }
@@ -933,7 +961,7 @@ impl DamageAccumulator {
         self.add_command_damage(command, chains.new_side());
     }
 
-    // A backdrop filter reads the pixels around its region, so damage beneath the region changes it
+    // A backdrop filter can read the pixels around its region, so damage beneath the region changes it
     // wherever the filter carries that damage in. The whole region then changes as content of the
     // backdrop's effect: that effect's own filter and the filters above it spread it further, and it
     // can carry the damage on to the backdrop filters above it.
@@ -990,7 +1018,7 @@ impl DamageAccumulator {
                     }
                     let damage_in_effect_space = to_root_matrix.extract_2d_affine().inverse()?.map_rect(damage);
                     let reached = crate::filter_bytes::changed_output_bounds(&backdrop.filter, damage_in_effect_space)?;
-                    Some(!intersect_like_gfx_rect(reached, region).is_empty())
+                    Some(!reached.intersected(region).is_empty())
                 })()
                 .unwrap_or(true);
                 if !reads_damage {
@@ -1043,6 +1071,34 @@ impl DamageAccumulator {
         self.add_moved_command_damage(chains, old_command, new_command);
     }
 
+    // A command that draws in a different space than one of its inline clips shows another part of
+    // itself whenever one of the two spaces moves, though neither the command nor its context changed.
+    // Where the clips can be mapped into the command's space, command damage covers only what they let it draw.
+    fn add_inline_clip_scroll_damage(
+        &mut self,
+        chains: &TreeChainComparison<'_>,
+        old_command: &CommandReference<'_>,
+        new_command: &CommandReference<'_>,
+    ) {
+        if old_command.header.inline_clip_count == 0 && new_command.header.inline_clip_count == 0 {
+            return;
+        }
+        let old_extent = own_space_clip_extent_on(old_command, chains.old_side());
+        let new_extent = own_space_clip_extent_on(new_command, chains.new_side());
+        let clips_did_not_move = match (old_extent, new_extent) {
+            (None, None) => true,
+            (Some(OwnSpaceClipExtent::Within(old_rect)), Some(OwnSpaceClipExtent::Within(new_rect))) => {
+                old_rect == new_rect
+            }
+            _ => false,
+        };
+        if clips_did_not_move {
+            return;
+        }
+        self.add_old_command_damage(chains, old_command);
+        self.add_new_command_damage(chains, new_command);
+    }
+
     fn add_scrollbar_scroll_damage(
         &mut self,
         chains: &TreeChainComparison<'_>,
@@ -1082,9 +1138,10 @@ impl DamageAccumulator {
         new_run: &DisplayListCommandRun,
         verdict: ContextPairVerdict,
         scroll_offsets_differ: bool,
+        inline_clip_spaces_may_have_moved: bool,
     ) {
         let commands_moved = !verdict.equal;
-        if !commands_moved && !scroll_offsets_differ {
+        if !commands_moved && !scroll_offsets_differ && !inline_clip_spaces_may_have_moved {
             return;
         }
         for_each_command(chains.old_tape.run_bytes(old_run), |header, _, payload| {
@@ -1107,6 +1164,9 @@ impl DamageAccumulator {
             if scroll_offsets_differ {
                 self.add_scrollbar_scroll_damage(chains, &old_command, &new_command);
             }
+            if inline_clip_spaces_may_have_moved {
+                self.add_inline_clip_scroll_damage(chains, &old_command, &new_command);
+            }
         });
     }
 
@@ -1117,6 +1177,7 @@ impl DamageAccumulator {
         old_commands: &[CommandReference<'_>],
         new_commands: &[CommandReference<'_>],
         scroll_offsets_differ: bool,
+        inline_clip_spaces_may_have_moved: bool,
     ) {
         let common_length = old_commands.len().min(new_commands.len());
         let mut common_prefix_length = 0;
@@ -1141,6 +1202,9 @@ impl DamageAccumulator {
                 damage.add_visual_context_damage(chains, old_command, new_command);
                 if scroll_offsets_differ {
                     damage.add_scrollbar_scroll_damage(chains, old_command, new_command);
+                }
+                if inline_clip_spaces_may_have_moved {
+                    damage.add_inline_clip_scroll_damage(chains, old_command, new_command);
                 }
             };
 
@@ -1307,11 +1371,25 @@ pub fn animated_content_may_affect_viewport(
         runs: command_runs,
     };
     for run in command_runs {
-        for_each_command(tape.run_bytes(run), |header, _, _| {
+        for_each_command(tape.run_bytes(run), |header, _, payload| {
             if may_affect_viewport || header.command_type.is_compositor_metadata() {
                 return;
             }
             let spatial_is_animated = in_rotating_subtree[run.context.spatial.0 as usize];
+            let has_inline_clip_in_its_own_space =
+                header.inline_clip_count != 0 && has_inline_clip_in_its_own_space(header, payload);
+            if has_inline_clip_in_its_own_space
+                && !spatial_is_animated
+                && inline_clips_of(header, payload).any(|inline_clip| {
+                    inline_clip.has_own_space
+                        && in_rotating_subtree
+                            .get(inline_clip.space.0 as usize)
+                            .is_none_or(|is_animated| *is_animated)
+                })
+            {
+                may_affect_viewport = true;
+                return;
+            }
             let mut clip = run.context.clip;
             while !clip.is_none() {
                 let node = &tree.clip_nodes[clip.0 as usize];
@@ -1346,13 +1424,25 @@ pub fn animated_content_may_affect_viewport(
                 may_affect_viewport = true;
                 return;
             }
-            let rect = header.bounding_rect;
-            let Some(bounds) = tree.rect_with_rotation_bounds_to_viewport(
-                run.context.spatial,
-                FloatRect::new(rect.x as f32, rect.y as f32, rect.width as f32, rect.height as f32),
-                &rotating_nodes,
-                scroll_offsets,
-            ) else {
+            let mut rect = header.bounding_rect.to_float();
+            if has_inline_clip_in_its_own_space && header.has_bounding_rect {
+                let to_root = |space: SpatialNodeIndex| {
+                    ((space.0 as usize) < tree.spatial_nodes.len())
+                        .then(|| tree.accumulated_matrix(space, scroll_offsets, IncludeVisualViewportTransform::Yes))
+                };
+                if let Some(command_to_root) = to_root(run.context.spatial)
+                    && let Some(OwnSpaceClipExtent::Within(clipped_rect)) =
+                        own_space_clip_extent(header, payload, rect, command_to_root, to_root)
+                {
+                    if clipped_rect.is_empty() {
+                        return;
+                    }
+                    rect = clipped_rect;
+                }
+            }
+            let Some(bounds) =
+                tree.rect_with_rotation_bounds_to_viewport(run.context.spatial, rect, &rotating_nodes, scroll_offsets)
+            else {
                 may_affect_viewport = true;
                 return;
             };
@@ -1376,23 +1466,27 @@ pub struct DisplayListFrame<'a> {
     pub scroll_offsets: &'a [FloatPoint],
 }
 
-// The canvases and video sinks whose pixels changed since the old frame. The lists draw them with
-// commands that stay the same, so the diff cannot see the change.
+// The canvases, video sinks and image frames whose pixels changed since the old frame. The lists draw
+// them with commands that stay the same, so the diff cannot see the change.
 #[derive(Clone, Copy, Default)]
 pub struct LiveContentChanges<'a> {
     pub canvases: &'a [CanvasId],
     pub video_sinks: &'a [VideoSinkResourceId],
+    pub image_frames: &'a [ImageFrameResourceId],
+    /// What the compositor repaints whatever the lists hold, such as a blinking caret.
+    pub forced_damage_rect: IntRect,
 }
 
 impl LiveContentChanges<'_> {
     fn is_empty(&self) -> bool {
-        self.canvases.is_empty() && self.video_sinks.is_empty()
+        self.canvases.is_empty() && self.video_sinks.is_empty() && self.image_frames.is_empty()
     }
 
     fn includes(&self, content: LiveContent) -> bool {
         match content {
             LiveContent::Canvas(canvas_id) => self.canvases.contains(&canvas_id),
             LiveContent::VideoFrame(video_sink_id) => self.video_sinks.contains(&video_sink_id),
+            LiveContent::ImageFrame(image_frame_id) => self.image_frames.contains(&image_frame_id),
         }
     }
 }
@@ -1461,6 +1555,10 @@ pub fn compute_display_list_damage(
         new_filter_spreading: FilterSpreading::default(),
     };
     let scroll_offsets_differ = old_scroll_offsets != new_scroll_offsets;
+    // NB: An inline clip in a space of its own names its space by index, which a new tree can give to another node,
+    //     so a new tree can move the clip as much as a scroll can.
+    let inline_clip_spaces_may_have_moved =
+        scroll_offsets_differ || !std::ptr::eq(old_visual_context_tree, new_visual_context_tree);
 
     let max_common_run_count = old_command_runs.len().min(new_command_runs.len());
     let mut identical_prefix_verdicts = Vec::with_capacity(max_common_run_count);
@@ -1504,7 +1602,14 @@ pub fn compute_display_list_damage(
         if damage.covers_viewport() {
             break;
         }
-        damage.add_identical_run_damage(&chains, old_run, new_run, *verdict, scroll_offsets_differ);
+        damage.add_identical_run_damage(
+            &chains,
+            old_run,
+            new_run,
+            *verdict,
+            scroll_offsets_differ,
+            inline_clip_spaces_may_have_moved,
+        );
     }
 
     if !damage.covers_viewport() {
@@ -1517,7 +1622,13 @@ pub fn compute_display_list_damage(
             old_tape.collect_commands_of_runs(old_middle_runs, &mut old_commands);
             let mut new_commands = Vec::new();
             new_tape.collect_commands_of_runs(new_middle_runs, &mut new_commands);
-            damage.add_command_diff_damage(&chains, &old_commands, &new_commands, scroll_offsets_differ);
+            damage.add_command_diff_damage(
+                &chains,
+                &old_commands,
+                &new_commands,
+                scroll_offsets_differ,
+                inline_clip_spaces_may_have_moved,
+            );
         }
     }
 
@@ -1544,6 +1655,14 @@ pub fn compute_display_list_damage(
         }
     }
 
+    // NB: A backdrop filter reads more than the part of its region that is repainted, so forced damage goes through it too.
+    let forced_damage_rect = live_content_changes.forced_damage_rect;
+    if !forced_damage_rect.is_empty() {
+        damage.damage_rect = Some(match damage.damage_rect {
+            Some(damage_rect) => damage_rect.united(forced_damage_rect),
+            None => forced_damage_rect,
+        });
+    }
     damage.add_backdrop_filter_damage(chains.new_side(), new_command_runs);
 
     if damage.changed_unbounded_command {
@@ -1569,8 +1688,8 @@ mod tests {
     use crate::display_list::builder::{HEADER_SIZE, note_command};
     use crate::display_list::commands::{
         BackdropFilterRegion, CanvasId, CompositorMainThreadWheelEventRegion, DisplayListCommand, DisplayListGlyph,
-        DrawCanvas, DrawIsolatedGroup, DrawVideoFrame, FillRect, FontResourceId, ImageFrameResourceId, InlineClipKind,
-        TextShadowLayer, UniqueNodeId,
+        DisplayListResourceId, DrawCanvas, DrawIsolatedGroup, DrawVideoFrame, FillRect, FontResourceId, InlineClipKind,
+        PaintNestedDisplayList, TextShadowLayer,
     };
     use crate::display_list::ffi_bytes::FfiBytes;
     use crate::node_slot_id::NodeSlotId;
@@ -1584,7 +1703,7 @@ mod tests {
     use libgfx_rust::path::Path;
     use libgfx_rust::{
         Color, ColorFilterType, CompositingAndBlendingOperator, CornerRadii, FloatMatrix4x4, FloatPoint, IntPoint,
-        MaskKind, Orientation, ScalingMode, WindingRule, translation_matrix,
+        IntSize, MaskKind, Orientation, ScalingMode, WindingRule, translation_matrix,
     };
 
     const RED: Color = Color(0xffff0000);
@@ -1783,6 +1902,9 @@ mod tests {
             path_winding_rule: WindingRule::Nonzero,
             kind: InlineClipKind::Rect,
             mode: ClipMode::Intersect,
+            has_own_space: false,
+            space: SpatialNodeIndex::default(),
+            padding: 0,
         }
     }
 
@@ -1805,6 +1927,7 @@ mod tests {
             role: TransformDataRole::CssTransform,
             synthetic_plane: false,
             establishes_sorting_context: false,
+            bounds: FloatRect::default(),
         }
     }
 
@@ -2001,6 +2124,32 @@ mod tests {
             damage_for_live_content_changes(&video, &tree, changed_canvas),
             Some(IntRect::default())
         );
+
+        let image = command_bytes(
+            &DrawScaledDecodedImageFrame {
+                dst_rect: FloatRect::new(10.0, 10.0, 20.0, 20.0),
+                src_rect: OptionalFloatRect::default(),
+                frame_id: ImageFrameResourceId(1),
+                scaling_mode: ScalingMode::NearestNeighbor,
+                compositing_and_blending_operator: CompositingAndBlendingOperator::Normal,
+                isolated_backdrop_color: OptionalColor::default(),
+                apply_force_dark: false,
+            },
+            Some(rect),
+            ContextRef::default(),
+        );
+        let changed_image = LiveContentChanges {
+            image_frames: &[ImageFrameResourceId(1)],
+            ..LiveContentChanges::default()
+        };
+        assert_eq!(
+            damage_for_live_content_changes(&image, &tree, changed_image),
+            Some(IntRect::new(9, 9, 22, 22))
+        );
+        assert_eq!(
+            damage_for_live_content_changes(&image, &tree, changed_video),
+            Some(IntRect::default())
+        );
     }
 
     #[test]
@@ -2074,7 +2223,6 @@ mod tests {
             SpatialData::Scroll(ScrollData {
                 state_slot: NO_SCROLL_STATE_SLOT,
                 owner_paintable: NodeSlotId::INVALID,
-                registry_parent_node: VISUAL_VIEWPORT_NODE_INDEX,
             }),
             VISUAL_VIEWPORT_NODE_INDEX,
         );
@@ -2092,7 +2240,6 @@ mod tests {
             SpatialData::Scroll(ScrollData {
                 state_slot: NO_SCROLL_STATE_SLOT,
                 owner_paintable: NodeSlotId::INVALID,
-                registry_parent_node: VISUAL_VIEWPORT_NODE_INDEX,
             }),
             VISUAL_VIEWPORT_NODE_INDEX,
         );
@@ -2206,6 +2353,7 @@ mod tests {
             expanded_gutter_rect: IntRect::default(),
             scroll_size: 0.75,
             thumb_color: RED,
+            thumb_outline_color: Color::TRANSPARENT,
             track_color: Color::TRANSPARENT,
             vertical: false,
         };
@@ -2224,6 +2372,284 @@ mod tests {
             ),
             Some(IntRect::new(9, 9, 82, 14))
         );
+    }
+
+    #[test]
+    fn changed_scroll_offset_damages_a_draw_with_an_inline_clip_in_another_space() {
+        let mut tree = identity_tree();
+        let scroll = tree.append_spatial(
+            SpatialData::Scroll(ScrollData {
+                state_slot: 1,
+                owner_paintable: NodeSlotId::INVALID,
+            }),
+            VISUAL_VIEWPORT_NODE_INDEX,
+        );
+        let rect = IntRect::new(10, 10, 20, 20);
+        let draw_with_clip = |clip: DisplayListInlineClip| {
+            let mut display_list = TestDisplayList::default();
+            append_record(
+                &mut display_list,
+                &FillRect {
+                    rect,
+                    color: RED,
+                    compositing_and_blending_operator: CompositingAndBlendingOperator::Normal,
+                    background_color_animation_effect: EffectNodeIndex::NONE,
+                },
+                &[],
+                Some(rect),
+                ContextRef::default(),
+                &[clip],
+            );
+            display_list
+        };
+        let damage_after_scroll = |display_list: &TestDisplayList| {
+            damage_with_scroll_offsets(
+                display_list,
+                &tree,
+                &[FloatPoint::default(), FloatPoint::default()],
+                display_list,
+                &tree,
+                &[FloatPoint::default(), FloatPoint { x: 0.0, y: -40.0 }],
+                IntRect::new(0, 0, 100, 100),
+            )
+        };
+
+        let clip_in_space = |space: SpatialNodeIndex| DisplayListInlineClip {
+            has_own_space: true,
+            space,
+            ..rect_inline_clip(rect)
+        };
+
+        assert!(damage_after_scroll(&draw_with_clip(rect_inline_clip(rect))).is_none_or(|damage| damage.is_empty()));
+        // A clip whose space does not move with the scroll leaves the draw as it was.
+        assert!(
+            damage_after_scroll(&draw_with_clip(clip_in_space(VISUAL_VIEWPORT_NODE_INDEX)))
+                .is_none_or(|damage| damage.is_empty())
+        );
+        // The scroll moves the clip off the draw, so only where it was changes.
+        assert_eq!(
+            damage_after_scroll(&draw_with_clip(clip_in_space(scroll))),
+            Some(IntRect::new(9, 9, 22, 22))
+        );
+        // A partial move changes only the part of the draw that the clip uncovers or covers.
+        let damage_after_small_scroll = |display_list: &TestDisplayList| {
+            damage_with_scroll_offsets(
+                display_list,
+                &tree,
+                &[FloatPoint::default(), FloatPoint::default()],
+                display_list,
+                &tree,
+                &[FloatPoint::default(), FloatPoint { x: 0.0, y: -5.0 }],
+                IntRect::new(0, 0, 100, 100),
+            )
+        };
+        let small_scroll_damage = damage_after_small_scroll(&draw_with_clip(DisplayListInlineClip {
+            has_own_space: true,
+            space: scroll,
+            ..rect_inline_clip(IntRect::new(10, 10, 20, 5))
+        }));
+        assert!(small_scroll_damage.is_some_and(|damage| damage.height < 22 && !damage.is_empty()));
+    }
+
+    #[test]
+    fn moving_an_inline_clip_to_another_space_damages_its_draw() {
+        let mut tree = identity_tree();
+        let scroll = tree.append_spatial(
+            SpatialData::Scroll(ScrollData {
+                state_slot: 1,
+                owner_paintable: NodeSlotId::INVALID,
+            }),
+            VISUAL_VIEWPORT_NODE_INDEX,
+        );
+        let rect = IntRect::new(10, 10, 20, 20);
+        let draw_with_clip_in = |space: SpatialNodeIndex, color: Color| {
+            let mut display_list = TestDisplayList::default();
+            append_record(
+                &mut display_list,
+                &FillRect {
+                    rect,
+                    color,
+                    compositing_and_blending_operator: CompositingAndBlendingOperator::Normal,
+                    background_color_animation_effect: EffectNodeIndex::NONE,
+                },
+                &[],
+                Some(rect),
+                ContextRef::default(),
+                &[DisplayListInlineClip {
+                    has_own_space: true,
+                    space,
+                    ..rect_inline_clip(rect)
+                }],
+            );
+            display_list
+        };
+        let scrolled = [FloatPoint::default(), FloatPoint { x: 0.0, y: -40.0 }];
+        let damage_between = |old: &TestDisplayList, new: &TestDisplayList| {
+            damage_with_scroll_offsets(
+                old,
+                &tree,
+                &scrolled,
+                new,
+                &tree,
+                &scrolled,
+                IntRect::new(0, 0, 100, 100),
+            )
+        };
+        assert!(
+            damage_between(
+                &draw_with_clip_in(VISUAL_VIEWPORT_NODE_INDEX, RED),
+                &draw_with_clip_in(VISUAL_VIEWPORT_NODE_INDEX, RED)
+            )
+            .is_none_or(|damage| damage.is_empty())
+        );
+        assert_eq!(
+            damage_between(
+                &draw_with_clip_in(VISUAL_VIEWPORT_NODE_INDEX, RED),
+                &draw_with_clip_in(scroll, RED)
+            ),
+            Some(IntRect::new(9, 9, 22, 22))
+        );
+    }
+
+    #[test]
+    fn a_new_tree_that_moves_the_space_of_an_inline_clip_damages_its_draw() {
+        let mut old_tree = identity_tree();
+        let old_space = old_tree.append_spatial(
+            SpatialData::Transform(transform(FloatMatrix4x4::identity())),
+            VISUAL_VIEWPORT_NODE_INDEX,
+        );
+        // The new tree gives the index of the clip's space to a node that sits elsewhere.
+        let mut new_tree = identity_tree();
+        let new_space = new_tree.append_spatial(
+            SpatialData::Transform(transform(translation_matrix(0.0, 40.0, 0.0))),
+            VISUAL_VIEWPORT_NODE_INDEX,
+        );
+        assert_eq!(old_space, new_space);
+        let rect = IntRect::new(10, 10, 20, 20);
+        let mut display_list = TestDisplayList::default();
+        append_record(
+            &mut display_list,
+            &FillRect {
+                rect,
+                color: RED,
+                compositing_and_blending_operator: CompositingAndBlendingOperator::Normal,
+                background_color_animation_effect: EffectNodeIndex::NONE,
+            },
+            &[],
+            Some(rect),
+            ContextRef::default(),
+            &[DisplayListInlineClip {
+                has_own_space: true,
+                space: old_space,
+                ..rect_inline_clip(rect)
+            }],
+        );
+        let offsets = [FloatPoint::default()];
+        let viewport = IntRect::new(0, 0, 100, 100);
+        assert!(
+            damage_with_scroll_offsets(
+                &display_list,
+                &old_tree,
+                &offsets,
+                &display_list,
+                &old_tree,
+                &offsets,
+                viewport
+            )
+            .is_none_or(|damage| damage.is_empty())
+        );
+        assert_eq!(
+            damage_with_scroll_offsets(
+                &display_list,
+                &old_tree,
+                &offsets,
+                &display_list,
+                &new_tree,
+                &offsets,
+                viewport
+            ),
+            Some(IntRect::new(9, 9, 22, 22))
+        );
+    }
+
+    #[test]
+    fn animated_content_follows_inline_clips_in_spaces_of_their_own() {
+        let mut tree = identity_tree();
+        let scroll = tree.append_spatial(
+            SpatialData::Scroll(ScrollData {
+                state_slot: 1,
+                owner_paintable: NodeSlotId::INVALID,
+            }),
+            VISUAL_VIEWPORT_NODE_INDEX,
+        );
+        let rotating = tree.append_spatial(
+            SpatialData::Transform(transform(FloatMatrix4x4::identity())),
+            VISUAL_VIEWPORT_NODE_INDEX,
+        );
+        let effect = tree.append_effect(
+            EffectNodeData::Effects(EffectsData {
+                isolation: false,
+                opacity: 0.5,
+                blend_mode: CompositingAndBlendingOperator::Normal,
+                filter: None,
+                backdrop_filter: None,
+            }),
+            EffectNodeIndex::NONE,
+            VISUAL_VIEWPORT_NODE_INDEX,
+            ClipNodeIndex::NONE,
+        );
+        let viewport = IntRect::new(0, 0, 800, 600);
+        let draw_clipped_to = |clip_space: SpatialNodeIndex, clip_rect: IntRect, context: ContextRef| {
+            let mut display_list = TestDisplayList::default();
+            append_record(
+                &mut display_list,
+                &FillRect {
+                    rect: viewport,
+                    color: RED,
+                    compositing_and_blending_operator: CompositingAndBlendingOperator::Normal,
+                    background_color_animation_effect: EffectNodeIndex::NONE,
+                },
+                &[],
+                Some(viewport),
+                context,
+                &[DisplayListInlineClip {
+                    has_own_space: true,
+                    space: clip_space,
+                    ..rect_inline_clip(clip_rect)
+                }],
+            );
+            display_list
+        };
+        let may_affect_viewport = |display_list: &TestDisplayList, rotation_nodes: &[SpatialNodeIndex]| {
+            animated_content_may_affect_viewport(
+                display_list,
+                &display_list.runs,
+                &tree,
+                &[FloatPoint::default(), FloatPoint::default()],
+                rotation_nodes,
+                &[effect],
+                viewport,
+            )
+        };
+        let faded = ContextRef {
+            effect,
+            ..ContextRef::default()
+        };
+
+        // An animated opacity only affects the viewport where the clip lets the draw show.
+        let box_on_screen = IntRect::new(0, 10, 10, 10);
+        let box_off_screen = IntRect::new(0, 2000, 10, 10);
+        assert!(may_affect_viewport(&draw_clipped_to(scroll, box_on_screen, faded), &[]));
+        assert!(!may_affect_viewport(
+            &draw_clipped_to(scroll, box_off_screen, faded),
+            &[]
+        ));
+
+        // A clip in a rotating space moves the draw it clips, though the draw's own space stands still.
+        assert!(may_affect_viewport(
+            &draw_clipped_to(rotating, box_on_screen, ContextRef::default()),
+            &[rotating]
+        ));
     }
 
     #[test]
@@ -2416,7 +2842,6 @@ mod tests {
     fn compositor_scrollbar_bytes(is_painted_by_compositor: bool) -> TestDisplayList {
         command_bytes(
             &CompositorScrollbar {
-                document_id: UniqueNodeId(1),
                 scroll_node_index: SpatialNodeIndex(1),
                 gutter_rect: IntRect::default(),
                 thumb_rect: IntRect::new(98, 0, 2, 20),
@@ -2428,6 +2853,7 @@ mod tests {
                 min_scroll_offset: 0.0,
                 max_scroll_offset: 100.0,
                 thumb_color: RED,
+                thumb_outline_color: Color::TRANSPARENT,
                 track_color: Color::TRANSPARENT,
                 vertical: true,
                 is_painted_by_compositor,
@@ -2747,6 +3173,36 @@ mod tests {
     }
 
     #[test]
+    fn forced_damage_at_a_backdrop_filter_repaints_its_whole_region() {
+        let region = IntRect::new(25, 0, 50, 50);
+        let mut tree = identity_tree();
+        let backdrop_context = context_in(
+            VISUAL_VIEWPORT_NODE_INDEX,
+            effect_context(&mut tree, backdrop_effects(blur_filter(4.0), region)),
+        );
+        let bytes = command_bytes(&BackdropFilterRegion { rect: region }, Some(region), backdrop_context);
+        let forced_damage = |forced_damage_rect| {
+            damage_for_live_content_changes(
+                &bytes,
+                &tree,
+                LiveContentChanges {
+                    forced_damage_rect,
+                    ..LiveContentChanges::default()
+                },
+            )
+        };
+        assert_eq!(forced_damage(IntRect::default()), Some(IntRect::default()));
+        assert_eq!(
+            forced_damage(IntRect::new(40, 10, 3, 20)),
+            Some(IntRect::new(24, 0, 52, 51))
+        );
+        assert_eq!(
+            forced_damage(IntRect::new(0, 10, 3, 20)),
+            Some(IntRect::new(0, 9, 4, 22))
+        );
+    }
+
+    #[test]
     fn a_damaged_backdrop_region_is_spread_by_the_filters_of_its_effect() {
         let region = IntRect::new(25, 0, 50, 50);
         let mut tree = identity_tree();
@@ -2877,7 +3333,12 @@ mod tests {
     #[test]
     fn unchanged_static_mask_content_does_not_damage() {
         let rect = IntRect::new(10, 10, 20, 20);
-        let make_scene = |color, insert_effect, dynamic| {
+        enum MaskContent {
+            Fill,
+            Canvas,
+            NestedDisplayList(u64),
+        }
+        let make_scene = |color, insert_effect, mask_content| {
             let mut tree = identity_tree();
             if insert_effect {
                 effect_context(&mut tree, mask(rect));
@@ -2889,8 +3350,9 @@ mod tests {
                 compositing_and_blending_operator: CompositingAndBlendingOperator::Normal,
                 background_color_animation_effect: EffectNodeIndex::NONE,
             };
-            let content = if dynamic {
-                command_bytes(
+            let content = match mask_content {
+                MaskContent::Fill => command_bytes(&fill, Some(rect), context),
+                MaskContent::Canvas => command_bytes(
                     &DrawCanvas {
                         dst_rect: rect,
                         canvas_id: CanvasId(1),
@@ -2899,9 +3361,16 @@ mod tests {
                     },
                     Some(rect),
                     context,
-                )
-            } else {
-                command_bytes(&fill, Some(rect), context)
+                ),
+                MaskContent::NestedDisplayList(id) => command_bytes(
+                    &PaintNestedDisplayList {
+                        display_list_id: DisplayListResourceId(id),
+                        rect: rect.to_float(),
+                        list_size: IntSize { width: 20, height: 20 },
+                    },
+                    Some(rect),
+                    context,
+                ),
             };
             let mut bytes = TestDisplayList::default();
             append_record(
@@ -2922,8 +3391,8 @@ mod tests {
             bytes.extend_from_slice(&command_bytes(&FillRect { color: BLUE, ..fill }, Some(rect), context));
             (bytes, tree)
         };
-        let (old_bytes, old_tree) = make_scene(RED, false, false);
-        let (new_bytes, new_tree) = make_scene(RED, true, false);
+        let (old_bytes, old_tree) = make_scene(RED, false, MaskContent::Fill);
+        let (new_bytes, new_tree) = make_scene(RED, true, MaskContent::Fill);
         assert_eq!(
             damage(&old_bytes, &old_tree, &old_bytes, &old_tree),
             Some(IntRect::default())
@@ -2933,15 +3402,27 @@ mod tests {
             damage(&old_bytes, &old_tree, &new_bytes, &new_tree),
             Some(IntRect::default())
         );
-        let (new_bytes, new_tree) = make_scene(GREEN, true, false);
+        let (new_bytes, new_tree) = make_scene(GREEN, true, MaskContent::Fill);
         assert_eq!(
             damage(&old_bytes, &old_tree, &new_bytes, &new_tree),
             Some(rect.inflated_edges(1, 1, 1, 1))
         );
         // External content retains conservative damage.
-        let (bytes, tree) = make_scene(RED, false, true);
+        let (bytes, tree) = make_scene(RED, false, MaskContent::Canvas);
         assert_eq!(
             damage(&bytes, &tree, &bytes, &tree),
+            Some(rect.inflated_edges(1, 1, 1, 1))
+        );
+        // A nested display list is the same content for as long as its id is.
+        let (old_bytes, old_tree) = make_scene(RED, false, MaskContent::NestedDisplayList(1));
+        let (new_bytes, new_tree) = make_scene(RED, false, MaskContent::NestedDisplayList(1));
+        assert_eq!(
+            damage(&old_bytes, &old_tree, &new_bytes, &new_tree),
+            Some(IntRect::default())
+        );
+        let (new_bytes, new_tree) = make_scene(RED, false, MaskContent::NestedDisplayList(2));
+        assert_eq!(
+            damage(&old_bytes, &old_tree, &new_bytes, &new_tree),
             Some(rect.inflated_edges(1, 1, 1, 1))
         );
     }

@@ -34,30 +34,26 @@ public:
     Optional<StringView> class_name() const { return m_class_name; }
     CellTypeInfo const& type_info() const { return m_type_info; }
     size_t cell_size() const { return m_type_info.cell_size; }
+    void const* foreign_type() const { return m_foreign_type; }
 
-    CellAllocator& for_heap(Heap&);
+    // Where each heap keeps its allocator for this descriptor, see Heap::cell_allocator_for().
+    size_t index() const { return m_index; }
 
-    void forget_heap(Badge<Heap>, Heap& heap)
-    {
-        if (m_last_heap == &heap) {
-            m_last_heap = nullptr;
-            m_last_allocator = nullptr;
-        }
-    }
+    // The blocks of the type of this descriptor, for every heap of the process and for as long as the process lives.
+    BlockAllocator& block_allocator() const;
 
 protected:
-    CellAllocatorDescriptorBase(CellTypeInfo const& type_info, StringView class_name)
-        : m_type_info(type_info)
-        , m_class_name(class_name)
-    {
-    }
+    CellAllocatorDescriptorBase(CellTypeInfo const& type_info, StringView class_name, void const* foreign_type = nullptr);
+
+    // A descriptor that goes away while the process lives must call this, so that its index does not go to waste. No
+    // heap may have an allocator for it any more.
+    void release_index();
 
 private:
     CellTypeInfo const& m_type_info;
     Optional<StringView> m_class_name;
-
-    Heap* m_last_heap { nullptr };
-    CellAllocator* m_last_allocator { nullptr };
+    void const* m_foreign_type { nullptr };
+    size_t m_index { 0 };
 };
 
 class GC_API CellAllocator {
@@ -67,12 +63,11 @@ public:
     explicit CellAllocator(CellAllocatorDescriptorBase&);
     ~CellAllocator();
 
-    static BlockAllocator& shared_block_allocator();
-
     CellAllocatorDescriptorBase const& descriptor() const { return m_descriptor; }
     Optional<StringView> class_name() const { return m_descriptor.class_name(); }
     size_t cell_size() const { return m_descriptor.cell_size(); }
     CellTypeInfo const& type_info() const { return m_descriptor.type_info(); }
+    void const* foreign_type() const { return m_descriptor.foreign_type(); }
 
     // Cells come from the free cells that the allocator took from one of its
     // blocks (the local block) at once, so allocating is usually just popping

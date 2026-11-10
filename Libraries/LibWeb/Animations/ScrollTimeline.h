@@ -52,14 +52,21 @@ public:
     virtual bool is_stale() const;
     virtual void update_current_time(double timestamp) override;
 
-    // The scroll node the timeline followed at its last update, and the scroll offset at 100% progress there, in CSS
-    // pixels: empty while it was inactive.
+    // The scroll node the timeline followed at its last update, the style node of the element whose box scrolls, or 0
+    // for the viewport, and the scroll offset there and at 100% progress, in CSS pixels: empty while it was inactive.
     struct FollowedScroller {
         AsyncScrollNodeStableID scroll_node;
+        u32 scroller_style_node { 0 };
         bool vertical { true };
+        double scroll_offset { 0 };
         double max_scroll_offset { 0 };
+
+        bool operator==(FollowedScroller const&) const = default;
     };
     Optional<FollowedScroller> const& followed_scroller() const { return m_followed_scroller; }
+
+    // What names the timeline to the render clock, whose ticks sample its animations.
+    u64 clock_identity() const { return m_clock_identity; }
 
     virtual bool is_progress_based() const override { return true; }
     virtual AttachmentInterval interval_for_attachment_range(AnimationAttachmentRange const&) const override;
@@ -78,6 +85,7 @@ protected:
     // The scroll container the timeline follows, along the timeline's axis, in CSS pixels.
     struct ScrollerMetrics {
         Optional<AsyncScrollNodeStableID> scroll_node;
+        u32 scroller_style_node { 0 };
         bool is_vertical { true };
         double scroll_offset { 0 };
         double max_scroll_offset { 0 };
@@ -91,6 +99,9 @@ protected:
     // Empty while the source has no box, is not a scroll container or has no scrollable overflow.
     Optional<ScrollerMetrics> scroller_metrics() const;
 
+    static Optional<FollowedScroller> followed_scroller_from(ScrollerMetrics const&);
+    void set_followed_scroller(Optional<FollowedScroller> followed_scroller) { m_followed_scroller = move(followed_scroller); }
+
 private:
     Variant<GC::Ptr<DOM::Element const>, GC::Ptr<DOM::Document>> get_propagated_source() const;
 
@@ -102,6 +113,7 @@ private:
 
     Optional<double> m_last_max_scroll_offset;
     Optional<FollowedScroller> m_followed_scroller;
+    u64 m_clock_identity { 0 };
 };
 
 ScrollAxis scroll_axis_from_css_axis(CSS::Axis);

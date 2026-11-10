@@ -21,6 +21,7 @@
 #include <LibCompositing/FontServiceClient.h>
 #include <LibCore/EventLoop.h>
 #include <LibCore/Process.h>
+#include <LibCore/StatsLog.h>
 #include <LibDevTools/IndexedDBSerialization.h>
 #include <LibGC/Heap.h>
 #include <LibGfx/Bitmap.h>
@@ -93,6 +94,7 @@
 #include <LibWeb/PictureInPicture/PictureInPictureController.h>
 #include <LibWeb/Platform/EventLoopPlugin.h>
 #include <LibWeb/Platform/FontPlugin.h>
+#include <LibWeb/Platform/RemoteImageCodecPlugin.h>
 #include <LibWeb/Selection/Selection.h>
 #include <LibWeb/UIEvents/InputTypes.h>
 #include <LibWebCommon/HTML/SelectedFile.h>
@@ -111,6 +113,7 @@
 #include <WebContent/WebContentClientEndpoint.h>
 #include <WebContent/WebContentCompositorHost.h>
 #include <WebContent/WebDriverBiDi.h>
+#include <WebContent/Worker/WorkerThread.h>
 
 namespace WebContent {
 
@@ -380,6 +383,13 @@ void ConnectionFromClient::close_server()
     shutdown();
 }
 
+void ConnectionFromClient::start_worker_thread(IPC::TransportHandle worker_transport, Web::HTML::AgentType agent_type)
+{
+    // NB: The UI process notices a transport that nobody takes up, and tells the owners that their worker is gone.
+    if (auto result = WebWorker::start_worker_thread(move(worker_transport), agent_type); result.is_error())
+        dbgln("Unable to start a thread for a worker: {}", result.error());
+}
+
 Messages::WebContentServer::GetWindowHandleResponse ConnectionFromClient::get_window_handle(Web::PageId page_id)
 {
     if (auto page = this->page(page_id); page.has_value())
@@ -451,10 +461,13 @@ void ConnectionFromClient::connect_to_web_ui(Web::PageId page_id, IPC::Transport
     }
 }
 
-void ConnectionFromClient::connect_to_image_decoder(IPC::TransportHandle handle)
+void ConnectionFromClient::disconnect_from_image_decoder()
 {
-    if (on_image_decoder_connection)
-        on_image_decoder_connection(handle);
+    auto disconnect = [] {
+        static_cast<Web::Platform::RemoteImageCodecPlugin&>(Web::Platform::ImageCodecPlugin::the()).disconnect_client();
+    };
+    disconnect();
+    WebWorker::post_to_worker_threads(disconnect);
 }
 
 void ConnectionFromClient::connect_to_compositor_process(IPC::TransportHandle handle, IPC::TransportHandle render_clock_handle)
@@ -505,6 +518,22 @@ ErrorOr<NonnullOwnPtr<IPC::Transport>> ConnectionFromClient::request_audio_serve
     auto response = send_sync_but_allow_failure<Messages::WebContentClient::RequestAudioServerConnection>();
     if (!response || !response->handle().has_value())
         return Error::from_string_literal("The Browser did not connect an audio server");
+    return response->take_handle()->create_transport();
+}
+
+ErrorOr<NonnullOwnPtr<IPC::Transport>> ConnectionFromClient::request_webrtc_client_transport()
+{
+    auto response = send_sync_but_allow_failure<Messages::WebContentClient::RequestWebrtcClientConnection>();
+    if (!response || !response->handle().has_value())
+        return Error::from_string_literal("The Browser did not launch a WebRTCClient");
+    return response->take_handle()->create_transport();
+}
+
+ErrorOr<NonnullOwnPtr<IPC::Transport>> ConnectionFromClient::request_image_decoder_transport()
+{
+    auto response = send_sync_but_allow_failure<Messages::WebContentClient::RequestImageDecoderConnection>();
+    if (!response || !response->handle().has_value())
+        return Error::from_string_literal("The Browser did not connect an image decoder");
     return response->take_handle()->create_transport();
 }
 
@@ -583,8 +612,10 @@ void ConnectionFromClient::run_beforeunload_check(Web::PageId page_id, Web::HTML
         return;
     }
 
-    page->page().history_executor().run_ui_beforeunload_check(move(navigable_ids), move(target_entry), user_involvement_for_navigate_event, unload_prompt_shown, GC::create_function(Web::HTML::main_thread_event_loop().heap(), [this, page_id, check_id](Web::HTML::CheckIfUnloadingIsCanceledResult result, Web::HTML::UnloadPromptShown unload_prompt_shown) {
-        async_beforeunload_check_result(page_id, check_id, result, unload_prompt_shown);
+    page->page().history_executor().run_ui_beforeunload_check(move(navigable_ids), move(target_entry), user_involvement_for_navigate_event, unload_prompt_shown, GC::create_function(Web::HTML::main_thread_event_loop().heap(), GC::captures(make_weak_ptr<ConnectionFromClient>(), page_id, check_id), [](auto& connection, auto& page_id, auto& check_id, Web::HTML::CheckIfUnloadingIsCanceledResult result, Web::HTML::UnloadPromptShown unload_prompt_shown) {
+        if (!connection)
+            return;
+        connection->async_beforeunload_check_result(page_id, check_id, result, unload_prompt_shown);
     }));
 }
 
@@ -629,36 +660,51 @@ void ConnectionFromClient::queue_navigation_api_state_clear_task(Web::PageId pag
     navigable->queue_navigation_api_state_clear_task();
 }
 
-void ConnectionFromClient::continue_history_navigation_population(Web::PageId page_id, Web::HTML::CrossProcessId operation_id, Web::HTML::SessionHistoryEntryDescriptor target_entry, Optional<Web::Bindings::NavigationType> navigation_type, bool ongoing_navigation_is_traversal, Web::HTML::HistoryNavigationPopulation population)
+void ConnectionFromClient::continue_history_navigation_population(Web::PageId page_id, Web::HTML::CrossProcessId operation_id, Web::HTML::HistoryNavigationPopulation population)
 {
-    auto page = this->page(page_id);
     auto navigable_id = population.request.navigable_id;
-    if (!page.has_value()) {
-        async_changing_navigable_history_job_ready(page_id, operation_id, navigable_id, Web::HTML::ChangingNavigableHistoryStepJobDisposition::Skipped, false, {});
+    if (auto page = this->page(page_id); page.has_value() && page->page().history_executor().resume_history_navigation_population(operation_id, move(population)))
         return;
-    }
-    auto& history_executor = page->page().history_executor();
-    if (history_executor.resume_history_navigation_population(operation_id, move(population)))
-        return;
-    auto user_involvement = population.request.user_involvement;
-    history_executor.run_ui_changing_navigable_history_job(operation_id, navigable_id, move(target_entry), user_involvement, navigation_type, {}, ongoing_navigation_is_traversal, {},
-        GC::create_function(Web::HTML::main_thread_event_loop().heap(), [this, page_id, operation_id, navigable_id](Web::HTML::ChangingNavigableHistoryStepJobDisposition disposition, bool update_only, Optional<Web::HTML::CrossProcessId> target_document_id) {
-            async_changing_navigable_history_job_ready(page_id, operation_id, navigable_id, disposition, update_only, target_document_id);
-        }),
-        move(population));
+    async_changing_navigable_history_job_ready(page_id, operation_id, navigable_id, Web::HTML::ChangingNavigableHistoryStepJobDisposition::Skipped, false);
 }
 
-void ConnectionFromClient::run_changing_navigable_history_job(Web::PageId page_id, Web::HTML::CrossProcessId operation_id, Web::HTML::CrossProcessId navigable_id, Web::HTML::SessionHistoryEntryDescriptor target_entry, Web::HTML::UserNavigationInvolvement user_involvement, Optional<Web::Bindings::NavigationType> navigation_type, Optional<Utf16String> finalized_navigation_id, bool ongoing_navigation_is_traversal, Optional<Web::HTML::NavigationSourceSnapshot> source_snapshot_params)
+void ConnectionFromClient::populate_history_entry_document(Web::PageId page_id, Web::HTML::CrossProcessId operation_id, Web::HTML::SessionHistoryEntryDescriptor target_entry, Optional<Web::Bindings::NavigationType> navigation_type, bool ongoing_navigation_is_traversal, Web::HTML::HistoryNavigationPopulation population)
+{
+    auto navigable_id = population.request.navigable_id;
+    auto page = this->page(page_id);
+    if (!page.has_value()) {
+        async_changing_navigable_history_job_ready(page_id, operation_id, navigable_id, Web::HTML::ChangingNavigableHistoryStepJobDisposition::Skipped, false);
+        return;
+    }
+    page->page().history_executor().populate_ui_history_entry_document(operation_id, move(target_entry), navigation_type, ongoing_navigation_is_traversal, move(population),
+        GC::create_function(Web::HTML::main_thread_event_loop().heap(), GC::captures(make_weak_ptr<ConnectionFromClient>(), page_id, operation_id, navigable_id), [](auto& connection, auto& page_id, auto& operation_id, auto& navigable_id, Web::HTML::ChangingNavigableHistoryStepJobDisposition disposition, bool update_only) {
+            if (!connection)
+                return;
+            connection->async_changing_navigable_history_job_ready(page_id, operation_id, navigable_id, disposition, update_only);
+        }));
+}
+
+void ConnectionFromClient::run_changing_navigable_history_job(Web::PageId page_id, Web::HTML::CrossProcessId operation_id, Web::HTML::CrossProcessId navigable_id, Web::HTML::SessionHistoryEntryDescriptor target_entry, Web::HTML::UserNavigationInvolvement user_involvement, Optional<Web::Bindings::NavigationType> navigation_type, Optional<Utf16String> finalized_navigation_id, bool ongoing_navigation_is_traversal, bool needs_population)
 {
     auto page = this->page(page_id);
     if (!page.has_value()) {
-        async_changing_navigable_history_job_ready(page_id, operation_id, navigable_id, Web::HTML::ChangingNavigableHistoryStepJobDisposition::Skipped, false, {});
+        async_changing_navigable_history_job_ready(page_id, operation_id, navigable_id, Web::HTML::ChangingNavigableHistoryStepJobDisposition::Skipped, false);
         return;
     }
 
-    page->page().history_executor().run_ui_changing_navigable_history_job(operation_id, navigable_id, move(target_entry), user_involvement, navigation_type, move(finalized_navigation_id), ongoing_navigation_is_traversal, move(source_snapshot_params), GC::create_function(Web::HTML::main_thread_event_loop().heap(), [this, page_id, operation_id, navigable_id](Web::HTML::ChangingNavigableHistoryStepJobDisposition disposition, bool update_only, Optional<Web::HTML::CrossProcessId> target_document_id) {
-        async_changing_navigable_history_job_ready(page_id, operation_id, navigable_id, disposition, update_only, target_document_id);
+    page->page().history_executor().run_ui_changing_navigable_history_job(operation_id, navigable_id, move(target_entry), user_involvement, navigation_type, move(finalized_navigation_id), ongoing_navigation_is_traversal, needs_population, GC::create_function(Web::HTML::main_thread_event_loop().heap(), GC::captures(make_weak_ptr<ConnectionFromClient>(), page_id, operation_id, navigable_id), [](auto& connection, auto& page_id, auto& operation_id, auto& navigable_id, Web::HTML::ChangingNavigableHistoryStepJobDisposition disposition, bool update_only) {
+        if (!connection)
+            return;
+        connection->async_changing_navigable_history_job_ready(page_id, operation_id, navigable_id, disposition, update_only);
     }));
+}
+
+void ConnectionFromClient::create_history_navigation_params(Web::PageId page_id, Web::HTML::CrossProcessId operation_id, Web::HTML::NavigationPopulationRequest request, bool allow_POST)
+{
+    auto navigable_id = request.navigable_id;
+    if (auto page = this->page(page_id); page.has_value() && page->page().history_executor().create_ui_history_navigation_params(operation_id, move(request), allow_POST))
+        return;
+    async_changing_navigable_history_job_ready(page_id, operation_id, navigable_id, Web::HTML::ChangingNavigableHistoryStepJobDisposition::Skipped, false);
 }
 
 void ConnectionFromClient::clear_ongoing_history_traversal(Web::PageId page_id, Web::HTML::CrossProcessId operation_id, Web::HTML::CrossProcessId navigable_id)
@@ -667,7 +713,7 @@ void ConnectionFromClient::clear_ongoing_history_traversal(Web::PageId page_id, 
         page->page().history_executor().clear_ui_changing_navigable_ongoing_traversal(operation_id, navigable_id);
 }
 
-void ConnectionFromClient::apply_changing_navigable_continuation(Web::PageId page_id, Web::HTML::CrossProcessId operation_id, Web::HTML::CrossProcessId navigable_id, Web::HTML::SessionHistoryEntryIdentity target_entry, u64 script_history_length, u64 script_history_index, Vector<Web::HTML::SessionHistoryEntryDescriptor> entries_for_navigation_api)
+void ConnectionFromClient::apply_changing_navigable_continuation(Web::PageId page_id, Web::HTML::CrossProcessId operation_id, Web::HTML::CrossProcessId navigable_id, Web::HTML::SessionHistoryEntryIdentity target_entry, u64 script_history_length, u64 script_history_index, Vector<Web::HTML::SessionHistoryEntryDescriptor> entries_for_navigation_api, bool clear_classic_history_api_state, bool clear_navigable_target_name)
 {
     auto page = this->page(page_id);
     if (!page.has_value()) {
@@ -675,12 +721,14 @@ void ConnectionFromClient::apply_changing_navigable_continuation(Web::PageId pag
         return;
     }
 
-    page->page().history_executor().apply_ui_changing_navigable_continuation(operation_id, navigable_id, target_entry, { script_history_length, script_history_index }, move(entries_for_navigation_api), GC::create_function(Web::HTML::main_thread_event_loop().heap(), [this, page_id, operation_id, navigable_id](Optional<Web::HTML::HostedNavigableState> activated_navigable_state, Optional<Web::HTML::SessionHistoryEntryPersistedState> previous_entry_persisted_state) {
-        async_changing_navigable_continuation_applied(page_id, operation_id, navigable_id, move(activated_navigable_state), move(previous_entry_persisted_state));
+    page->page().history_executor().apply_ui_changing_navigable_continuation(operation_id, navigable_id, target_entry, { script_history_length, script_history_index }, move(entries_for_navigation_api), clear_classic_history_api_state, clear_navigable_target_name, GC::create_function(Web::HTML::main_thread_event_loop().heap(), GC::captures(make_weak_ptr<ConnectionFromClient>(), page_id, operation_id, navigable_id), [](auto& connection, auto& page_id, auto& operation_id, auto& navigable_id, Optional<Web::HTML::HostedNavigableState> activated_navigable_state, Optional<Web::HTML::SessionHistoryEntryPersistedState> previous_entry_persisted_state) {
+        if (!connection)
+            return;
+        connection->async_changing_navigable_continuation_applied(page_id, operation_id, navigable_id, move(activated_navigable_state), move(previous_entry_persisted_state));
     }));
 }
 
-void ConnectionFromClient::unload_displayed_document_and_apply_changing_navigable_continuation(Web::PageId page_id, Web::HTML::CrossProcessId operation_id, Web::HTML::CrossProcessId navigable_id, Web::HTML::SessionHistoryEntryIdentity target_entry, u64 script_history_length, u64 script_history_index, Vector<Web::HTML::SessionHistoryEntryDescriptor> entries_for_navigation_api)
+void ConnectionFromClient::unload_displayed_document_and_apply_changing_navigable_continuation(Web::PageId page_id, Web::HTML::CrossProcessId operation_id, Web::HTML::CrossProcessId navigable_id, Web::HTML::SessionHistoryEntryIdentity target_entry, u64 script_history_length, u64 script_history_index, Vector<Web::HTML::SessionHistoryEntryDescriptor> entries_for_navigation_api, bool clear_classic_history_api_state, bool clear_navigable_target_name)
 {
     auto page = this->page(page_id);
     if (!page.has_value()) {
@@ -688,8 +736,10 @@ void ConnectionFromClient::unload_displayed_document_and_apply_changing_navigabl
         return;
     }
 
-    page->page().history_executor().unload_displayed_document_and_apply_ui_changing_navigable_continuation(operation_id, navigable_id, target_entry, { script_history_length, script_history_index }, move(entries_for_navigation_api), GC::create_function(Web::HTML::main_thread_event_loop().heap(), [this, page_id, operation_id, navigable_id](Optional<Web::HTML::HostedNavigableState> activated_navigable_state, Optional<Web::HTML::SessionHistoryEntryPersistedState> previous_entry_persisted_state) {
-        async_changing_navigable_continuation_applied(page_id, operation_id, navigable_id, move(activated_navigable_state), move(previous_entry_persisted_state));
+    page->page().history_executor().unload_displayed_document_and_apply_ui_changing_navigable_continuation(operation_id, navigable_id, target_entry, { script_history_length, script_history_index }, move(entries_for_navigation_api), clear_classic_history_api_state, clear_navigable_target_name, GC::create_function(Web::HTML::main_thread_event_loop().heap(), GC::captures(make_weak_ptr<ConnectionFromClient>(), page_id, operation_id, navigable_id), [](auto& connection, auto& page_id, auto& operation_id, auto& navigable_id, Optional<Web::HTML::HostedNavigableState> activated_navigable_state, Optional<Web::HTML::SessionHistoryEntryPersistedState> previous_entry_persisted_state) {
+        if (!connection)
+            return;
+        connection->async_changing_navigable_continuation_applied(page_id, operation_id, navigable_id, move(activated_navigable_state), move(previous_entry_persisted_state));
     }));
 }
 
@@ -703,8 +753,10 @@ void ConnectionFromClient::run_descendant_unload_task(Web::PageId page_id, Web::
     }
     VERIFY(&navigable->page() == &page->page());
 
-    navigable->run_ui_descendant_unload_task(child_navigable_destruction, stop_hosting_after_unload, GC::create_function(navigable->heap(), [this, page_id, unload_id, navigable_id] {
-        async_descendant_unload_task_complete(page_id, unload_id, navigable_id);
+    navigable->run_ui_descendant_unload_task(child_navigable_destruction, stop_hosting_after_unload, GC::create_function(navigable->heap(), GC::captures(make_weak_ptr<ConnectionFromClient>(), page_id, unload_id, navigable_id), [](auto& connection, auto& page_id, auto& unload_id, auto& navigable_id) {
+        if (!connection)
+            return;
+        connection->async_descendant_unload_task_complete(page_id, unload_id, navigable_id);
     }));
 }
 
@@ -734,7 +786,7 @@ void ConnectionFromClient::abort_navigable_document(Web::PageId page_id, Web::HT
         return;
 
     // 3. For each descendantNavigable of descendantNavigables, queue a global task on the navigation and traversal task source given descendantNavigable's active window to perform the following steps:
-    Web::HTML::queue_global_task(Web::HTML::Task::Source::NavigationAndTraversal, Web::HTML::relevant_global_object(*navigable->active_window()), GC::create_function(GC::Heap::the(), [navigable = GC::Ref { *navigable }] {
+    Web::HTML::queue_global_task(Web::HTML::Task::Source::NavigationAndTraversal, Web::HTML::relevant_global_object(*navigable->active_window()), GC::create_function(GC::Heap::the(), GC::captures(GC::Ref { *navigable }), [](auto& navigable) {
         auto document = navigable->active_document();
         if (!document)
             return;
@@ -841,8 +893,10 @@ void ConnectionFromClient::update_nonchanging_navigable_history_state(Web::PageI
         return;
     }
 
-    navigable->update_nonchanging_navigable_history_step_state({ script_history_length, script_history_index }, GC::create_function(navigable->heap(), [this, page_id, operation_id, navigable_id] {
-        async_nonchanging_navigable_history_state_updated(page_id, operation_id, navigable_id);
+    navigable->update_nonchanging_navigable_history_step_state({ script_history_length, script_history_index }, GC::create_function(navigable->heap(), GC::captures(make_weak_ptr<ConnectionFromClient>(), page_id, operation_id, navigable_id), [](auto& connection, auto& page_id, auto& operation_id, auto& navigable_id) {
+        if (!connection)
+            return;
+        connection->async_nonchanging_navigable_history_state_updated(page_id, operation_id, navigable_id);
     }));
 }
 
@@ -892,6 +946,14 @@ void ConnectionFromClient::mouse_event_in_hosted_root(Web::PageId page_id, Web::
     enqueue_mouse_event(page_id, navigable_id, move(event));
 }
 
+// The compositor numbers every wheel step, so only the gesture of the steps decides whether they may become one.
+static bool wheel_steps_are_of_one_gesture(Optional<Web::WheelGestureMark> const& first, Optional<Web::WheelGestureMark> const& second)
+{
+    if (!first.has_value() || !second.has_value())
+        return first.has_value() == second.has_value();
+    return first->gesture_id == second->gesture_id && first->lasts_until_fingers_lift == second->lasts_until_fingers_lift;
+}
+
 void ConnectionFromClient::enqueue_mouse_event(Web::PageId page_id, Optional<Web::HTML::CrossProcessId> navigable_id, Web::MouseEvent event)
 {
     auto page = m_page_host->page(page_id);
@@ -923,7 +985,7 @@ void ConnectionFromClient::enqueue_mouse_event(Web::PageId page_id, Optional<Web
                 && (mouse_event->async_scroll_performed_default_action != event.async_scroll_performed_default_action
                     || mouse_event->wheel_delta_precision != event.wheel_delta_precision
                     || mouse_event->scroll_gesture_phase != event.scroll_gesture_phase
-                    || mouse_event->wheel_gesture_mark != event.wheel_gesture_mark))
+                    || !wheel_steps_are_of_one_gesture(mouse_event->wheel_gesture_mark, event.wheel_gesture_mark)))
                 return nullptr;
             return mouse_event;
         }
@@ -1021,6 +1083,57 @@ void ConnectionFromClient::enqueue_input_event(Web::QueuedInputEvent event)
     page->page().client().request_frame();
     if (is_discrete)
         Web::HTML::main_thread_event_loop().queue_task_to_process_input_events();
+}
+
+// Prints the shortest path from a root to each destroyed document that is still reachable, grouped by the classes along
+// it. Unless script still holds objects of the document, as of a removed iframe, whatever keeps it alive leaks it.
+static void report_leaked_documents()
+{
+    static constexpr size_t max_documents = 1000;
+    auto paths = Web::Bindings::main_thread_vm().heap().find_retaining_paths([](GC::Cell& cell) {
+        // NB: Most cells are not C++ objects, so check the class their heap block records before casting.
+        if (!GC::class_name_of(cell).is_one_of("Document"sv, "HTMLDocument"sv, "XMLDocument"sv))
+            return false;
+        return static_cast<Web::DOM::Document&>(cell).has_been_destroyed();
+    },
+        max_documents);
+
+    HashMap<String, size_t> counts;
+    Vector<String> order;
+    for (auto const& path : paths) {
+        StringBuilder builder;
+        builder.append(GC::Heap::describe_root(path.root));
+        for (size_t i = 0; i < path.steps.size(); ++i) {
+            auto const& step = path.steps[i];
+            builder.append(i == 0 ? ": "sv : " -> "sv);
+            builder.append(step.class_name);
+        }
+        auto signature = builder.to_string_without_validation();
+        auto& count = counts.ensure(signature, [&] -> size_t {
+            order.append(signature);
+            return 0;
+        });
+        ++count;
+    }
+    quick_sort(order, [&](auto const& a, auto const& b) { return counts.get(a).value() > counts.get(b).value(); });
+
+    dbgln("Leaked documents: {} destroyed documents are reachable{}", paths.size(), paths.size() >= max_documents ? " (or more)"sv : ""sv);
+    JsonArray groups;
+    for (auto const& signature : order) {
+        auto count = counts.get(signature).value();
+        dbgln("  {}x {}", count, signature);
+        JsonObject group;
+        group.set("count"sv, count);
+        group.set("path"sv, signature);
+        groups.must_append(move(group));
+    }
+
+    if (auto* log = Core::StatsLog::the()) {
+        JsonObject data;
+        data.set("documents"sv, paths.size());
+        data.set("paths"sv, move(groups));
+        log->event("leaked_documents"sv, move(data));
+    }
 }
 
 void ConnectionFromClient::debug_request(Web::PageId page_id, ByteString request, ByteString argument)
@@ -1134,6 +1247,14 @@ void ConnectionFromClient::debug_request(Web::PageId page_id, ByteString request
         return;
     }
 
+    if (request == "report-leaked-documents") {
+        // NOTE: We use deferred_invoke here so that as little as possible on the stack becomes a root.
+        Core::deferred_invoke([] {
+            report_leaked_documents();
+        });
+        return;
+    }
+
     if (request == "collect-garbage") {
         // NOTE: We use deferred_invoke here to ensure that GC runs with as little on the stack as possible.
         Core::deferred_invoke([] {
@@ -1178,6 +1299,8 @@ void ConnectionFromClient::debug_request(Web::PageId page_id, ByteString request
 
     if (request == "clear-cache") {
         Web::Fetch::Fetching::clear_http_memory_cache();
+        WebWorker::post_to_worker_threads(Web::Fetch::Fetching::clear_http_memory_cache);
+        Web::CSS::StyleScope::release_kept_data();
         return;
     }
 
@@ -1285,22 +1408,13 @@ void ConnectionFromClient::inspect_storage(Web::PageId page_id, Web::StorageAPI:
         return;
     }
 
-    auto storage = storage_or_error.release_value();
     JsonArray storage_items;
-    for (auto i = 0uz; i < storage->length(); ++i) {
-        auto name = storage->key(i);
-        if (!name.has_value())
-            continue;
-
-        auto value = storage->get_item(*name);
-        if (!value.has_value())
-            continue;
-
+    storage_or_error.value()->for_each_item([&](auto const& name, auto const& value) {
         JsonObject item;
-        item.set("name"sv, name.release_value().to_utf8());
-        item.set("value"sv, value.release_value().to_utf8());
+        item.set("name"sv, name.to_utf8());
+        item.set("value"sv, value.to_utf8());
         storage_items.must_append(move(item));
-    }
+    });
 
     async_did_inspect_storage(page_id, request_id, storage_items.serialized());
 }
@@ -1337,22 +1451,22 @@ void ConnectionFromClient::clear_storage_area(Web::StorageAPI::StorageAreaId are
 
 void ConnectionFromClient::storage_area_changed(Web::StorageAPI::StorageAreaId area_id, Optional<Utf16String> key, Optional<Utf16String> old_value, Optional<Utf16String> new_value, String url)
 {
-    Web::StorageAPI::StorageAreaMirror::did_change(area_id, key, old_value, new_value, url);
+    Web::StorageAPI::storage_area_did_change(area_id, key, old_value, new_value, url);
 }
 
 void ConnectionFromClient::storage_area_write_acknowledged(Web::StorageAPI::StorageAreaId area_id)
 {
-    Web::StorageAPI::StorageAreaMirror::did_acknowledge_write(area_id);
+    Web::StorageAPI::storage_area_did_acknowledge_write(area_id);
 }
 
 void ConnectionFromClient::storage_area_write_refused(Web::StorageAPI::StorageAreaId area_id, Vector<Utf16String> keys, Vector<Utf16String> values)
 {
-    Web::StorageAPI::StorageAreaMirror::did_refuse_write(area_id, move(keys), move(values));
+    Web::StorageAPI::storage_area_did_refuse_write(area_id, move(keys), move(values));
 }
 
 void ConnectionFromClient::storage_area_reset(Web::StorageAPI::StorageAreaId area_id, Vector<Utf16String> keys, Vector<Utf16String> values)
 {
-    Web::StorageAPI::StorageAreaMirror::did_reset(area_id, move(keys), move(values));
+    Web::StorageAPI::storage_area_did_reset(area_id, move(keys), move(values));
 }
 
 void ConnectionFromClient::inspect_dom_node(Web::PageId page_id, WebView::DOMNodeProperties::Type property_type, Web::UniqueNodeID node_id, Optional<Web::CSS::PseudoElement> pseudo_element, JsonValue options_value)
@@ -1874,7 +1988,7 @@ void ConnectionFromClient::clear_grid_highlight(Web::PageId page_id, Web::Unique
 
 void ConnectionFromClient::inspect_accessibility_tree(Web::PageId page_id)
 {
-    if (auto page = this->page(page_id); page.has_value()) {
+    if (auto page = this->page(page_id); page.has_value() && page->page().has_local_traversable()) {
         if (auto doc = page->page().local_traversable()->active_document())
             async_did_inspect_accessibility_tree(page_id, doc->dump_accessibility_tree_as_json().to_utf8());
     }
@@ -1888,10 +2002,7 @@ void ConnectionFromClient::request_accessibility_tree(Web::PageId page_id)
     // path, so they pay for neither.
     if (auto page = this->page(page_id); page.has_value()) {
         page->page().set_accessibility_interested(true);
-        if (auto doc = page->page().local_traversable()->active_document()) {
-            doc->update_layout(Web::DOM::UpdateLayoutReason::InspectAccessibilityTree);
-            async_did_get_accessibility_tree(page_id, doc->build_accessibility_node_data());
-        }
+        page->publish_accessibility_tree(true);
     }
 }
 
@@ -2308,6 +2419,12 @@ void ConnectionFromClient::set_has_devtools_client(Web::PageId page_id, bool has
 {
     if (auto page = this->page(page_id); page.has_value())
         page->set_has_devtools_client(has_devtools_client);
+}
+
+void ConnectionFromClient::start_sending_console_output(Web::PageId page_id, bool messages, bool errors)
+{
+    if (auto page = this->page(page_id); page.has_value())
+        page->start_sending_console_output(messages, errors);
 }
 
 void ConnectionFromClient::get_dom_node_inner_html(Web::PageId page_id, Web::UniqueNodeID node_id)
@@ -3065,11 +3182,11 @@ void ConnectionFromClient::paste(Web::PageId page_id, Utf16String text)
     }
 }
 
-void ConnectionFromClient::paste_from_clipboard(Web::PageId page_id)
+void ConnectionFromClient::paste_from_clipboard(Web::PageId page_id, Vector<Web::Clipboard::SystemClipboardItem> system_clipboard_data)
 {
     if (auto page = this->page(page_id); page.has_value()) {
         if (auto navigable = page->page().hosted_focused_navigable())
-            navigable->paste_from_clipboard();
+            navigable->paste_from_clipboard(system_clipboard_data);
     }
 }
 
@@ -3196,6 +3313,12 @@ void ConnectionFromClient::set_content_blockers(Core::AnonymousBuffer patterns_b
         m_page_host->invalidate_user_style();
 }
 
+void ConnectionFromClient::set_force_dark_settings(Web::PageId page_id, bool enabled, HashMap<String, bool> per_host)
+{
+    if (auto page = this->page(page_id); page.has_value() && page->page().has_local_traversable())
+        page->page().local_traversable()->set_force_dark_settings(enabled, move(per_host));
+}
+
 void ConnectionFromClient::set_autoplay_settings(Web::PageId, Web::HTML::AutoplayPolicy policy, Vector<Utf16String> allowlist)
 {
     Web::HTML::AutoplaySettings::the().set_policy(policy, allowlist);
@@ -3269,6 +3392,30 @@ void ConnectionFromClient::permission_request_completed(Web::PageId page_id, u64
 {
     if (auto page = this->page(page_id); page.has_value())
         page->permission_request_completed(request_id, state);
+}
+
+void ConnectionFromClient::notification_shown(Web::PageId page_id, u64 notification_id)
+{
+    if (auto page = this->page(page_id); page.has_value())
+        page->page().notification_shown(notification_id);
+}
+
+void ConnectionFromClient::notification_show_failed(Web::PageId page_id, u64 notification_id)
+{
+    if (auto page = this->page(page_id); page.has_value())
+        page->page().notification_show_failed(notification_id);
+}
+
+void ConnectionFromClient::notification_clicked(Web::PageId page_id, u64 notification_id)
+{
+    if (auto page = this->page(page_id); page.has_value())
+        page->page().notification_clicked(notification_id);
+}
+
+void ConnectionFromClient::notification_closed(Web::PageId page_id, u64 notification_id, bool by_user)
+{
+    if (auto page = this->page(page_id); page.has_value())
+        page->page().notification_closed(notification_id, by_user);
 }
 
 void ConnectionFromClient::set_has_focus(Web::PageId page_id, bool has_focus)
@@ -3380,7 +3527,7 @@ void ConnectionFromClient::update_visibility_state(Web::PageId page_id, Web::HTM
 
     // 2. Queue a global task on the user interaction task source given document's relevant global object
     //    to update the visibility state of document with newState.
-    Web::HTML::queue_global_task(Web::HTML::Task::Source::UserInteraction, Web::HTML::relevant_global_object(*document), GC::create_function(GC::Heap::the(), [visibility_state, document] {
+    Web::HTML::queue_global_task(Web::HTML::Task::Source::UserInteraction, Web::HTML::relevant_global_object(*document), GC::create_function(GC::Heap::the(), GC::captures(visibility_state, document), [](auto& visibility_state, auto& document) {
         document->update_the_visibility_state(visibility_state);
     }));
 }
@@ -3500,6 +3647,30 @@ void ConnectionFromClient::did_get_writing_suggestion(Web::PageId page_id, u64 r
 {
     if (auto page = this->page(page_id); page.has_value())
         page->page().did_get_writing_suggestion(request_id, move(suggestion));
+}
+
+void ConnectionFromClient::request_translation_language_sample(Web::PageId page_id, u64 request_id)
+{
+    if (auto page = this->page(page_id); page.has_value())
+        async_did_get_translation_language_sample(page_id, request_id, page->page().translation_language_sample());
+}
+
+void ConnectionFromClient::start_translation(Web::PageId page_id, String source_language, String target_language)
+{
+    if (auto page = this->page(page_id); page.has_value())
+        page->page().start_translation(move(source_language), move(target_language));
+}
+
+void ConnectionFromClient::stop_translation(Web::PageId page_id)
+{
+    if (auto page = this->page(page_id); page.has_value())
+        page->page().stop_translation();
+}
+
+void ConnectionFromClient::did_translate(Web::PageId page_id, Web::TranslatedUnit unit)
+{
+    if (auto page = this->page(page_id); page.has_value())
+        page->page().did_translate(move(unit));
 }
 
 void ConnectionFromClient::replace_context_menu_misspelling(Web::PageId page_id, Utf16String replacement)
@@ -3670,17 +3841,12 @@ void ConnectionFromClient::cookies_changed(Web::PageId page_id, Vector<HTTP::Coo
 
 void ConnectionFromClient::broadcast_channel_message(Web::HTML::BroadcastChannelMessage message)
 {
-    Web::HTML::BroadcastChannel::deliver_message_locally(message);
+    Web::HTML::deliver_broadcast_channel_message_locally(move(message));
 }
 
 void ConnectionFromClient::did_worker_agent_fail_loading_script(Web::HTML::WorkerAgentOwnerToken owner_token)
 {
     Web::HTML::WorkerAgentParent::did_fail_loading_worker_script(owner_token);
-}
-
-void ConnectionFromClient::did_worker_agent_report_exception(Web::HTML::WorkerAgentOwnerToken owner_token, Utf16String message, Utf16String filename, u32 lineno, u32 colno)
-{
-    Web::HTML::WorkerAgentParent::did_report_worker_exception(owner_token, move(message), move(filename), lineno, colno);
 }
 
 void ConnectionFromClient::did_worker_agent_report_content_security_policy_violation(Web::HTML::WorkerAgentOwnerToken owner_token, u64 policy_index, String effective_directive, URL::URL resource)
@@ -3726,8 +3892,10 @@ void ConnectionFromClient::request_close_preflight(Web::PageId page_id, u64 requ
         return;
     }
 
-    traversable->request_close_preflight(GC::create_function(Web::Bindings::main_thread_vm().heap(), [this, page_id, request_id](bool approved) {
-        async_did_complete_close_preflight(page_id, request_id, approved);
+    traversable->request_close_preflight(GC::create_function(Web::Bindings::main_thread_vm().heap(), GC::captures(make_weak_ptr<ConnectionFromClient>(), page_id, request_id), [](auto& connection, auto& page_id, auto& request_id, bool approved) {
+        if (!connection)
+            return;
+        connection->async_did_complete_close_preflight(page_id, request_id, approved);
     }));
 }
 

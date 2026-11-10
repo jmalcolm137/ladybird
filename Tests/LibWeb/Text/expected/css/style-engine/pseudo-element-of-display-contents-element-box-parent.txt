@@ -1,0 +1,6 @@
+in a block: inline
+in a flex container: block
+nested in a flex container: block
+added in a block: inline
+parent became a flex container: block
+parent became a block: inline

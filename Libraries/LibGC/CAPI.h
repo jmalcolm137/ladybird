@@ -93,6 +93,10 @@ typedef struct GCLayout {
     uint32_t heap_allocated_bytes_since_last_gc_offset;
     uint32_t heap_gc_bytes_threshold_offset;
     uint32_t heap_total_allocated_bytes_offset;
+    // A cell's block starts at the cell's address rounded down to a multiple of block_size, and holds the foreign
+    // type the cell's allocator was created with at block_foreign_type_offset.
+    uint32_t block_size;
+    uint32_t block_foreign_type_offset;
     uint64_t heap_region_offset_mask;
     uint64_t primitive_storage_cage_offset_mask;
 } GCLayout;
@@ -104,7 +108,7 @@ GC_API void gc_get_layout(GCLayout*);
 GC_API uintptr_t gc_heap_region_base(void);
 GC_API uintptr_t gc_primitive_storage_cage_base(void);
 
-GC_API GCHeap* gc_heap_create(GCGatherRootsCallback, void* context, bool become_process_default);
+GC_API GCHeap* gc_heap_create(GCGatherRootsCallback, void* context, bool become_thread_default);
 // Finalizes and destroys every remaining cell. Roots created with gc_root_create() must be destroyed first. The final
 // collection also runs every sweep callback and pending post-GC task, with gc_heap_is_collecting_everything() true,
 // so their contexts must stay valid until this returns; nothing they allocate then is destroyed.
@@ -129,7 +133,11 @@ GC_API void gc_heap_did_allocate_external_memory(GCHeap*, size_t);
 GC_API void gc_heap_did_free_external_memory(GCHeap*, size_t);
 
 // The type info and the name must outlive the allocator, and the allocator must outlive every heap it allocated from.
-GC_API GCAllocator* gc_allocator_create(GCCellTypeInfo const*, char const* name, size_t name_length);
+// The blocks of the allocator hold foreign_type, which also names the type of the cells for the whole process:
+// allocators with the same foreign_type and cell size share a pool of blocks, across all heaps, and blocks never leave
+// their pool. Different types must have different ones. An allocator without one has a pool of its own, and must never
+// be destroyed.
+GC_API GCAllocator* gc_allocator_create(GCCellTypeInfo const*, char const* name, size_t name_length, void const* foreign_type);
 GC_API void gc_allocator_destroy(GCAllocator*);
 
 // Returns uninitialized storage for one cell. *must_mark tells the caller what to store as the cell's mark: cells that
@@ -184,8 +192,6 @@ GC_API void gc_visitor_visit_cells(GCVisitor*, GCCell* const*, size_t count);
 GC_API void gc_visitor_visit_values(GCVisitor*, uint64_t const*, size_t count);
 // Visits a NaN-boxed value that is reachable only while key is, such as a WeakMap entry's.
 GC_API void gc_visitor_visit_ephemeron(GCVisitor*, GCCell* key, uint64_t const* value);
-// Treats every aligned word in the range as a possible pointer to a cell or NaN-boxed cell value.
-GC_API void gc_visitor_visit_possible_values(GCVisitor*, uint8_t const*, size_t size);
 
 // Primitive storage holds byte buffers inside the cage that starts at gc_primitive_storage_cage_base(), so that the
 // interpreter can reach any of their bytes as a cage offset masked with primitive_storage_cage_offset_mask. Like the
@@ -222,7 +228,6 @@ GC_API bool gc_primitive_storage_reserve(size_t size, size_t capacity, bool zero
 // Maps the first size bytes of the shared memory object behind fd into the cage. The mapping keeps the memory alive by
 // itself, so the caller keeps ownership of fd and may close it at any time. Fails if size is 0. Growing the storage
 // would replace the mapping with private memory, so shared storage keeps its size.
-GC_API bool gc_primitive_storage_adopt_shared_fd(int fd, size_t size, GCPrimitiveStorageHandle* out_handle, GCPrimitiveStorageLayout* out_layout);
 
 // The resizing functions return false and leave the storage as it was if the handle names no storage or memory runs
 // out. Within the capacity, the storage stays where it is; beyond it, the bytes move to new storage, which changes the
@@ -246,22 +251,6 @@ GC_API size_t gc_primitive_storage_capacity(GCPrimitiveStorageHandle);
 // The bytes from the offset on that are backed by memory.
 GC_API size_t gc_primitive_storage_committed_size(GCPrimitiveStorageHandle);
 GC_API uint8_t* gc_primitive_storage_data(GCPrimitiveStorageHandle);
-
-// Creates a zero-filled shared memory object of size bytes, made the way the C++ runtime makes the memory of a
-// fixed-length SharedArrayBuffer: sealed against resizing where the platform supports seals, so that another process
-// holding it cannot shrink it under this one. On success, *out_fd is a new close-on-exec descriptor that the caller owns and must
-// close, and that can be passed to other processes and to gc_primitive_storage_adopt_shared_fd(). On failure, *out_fd
-// is -1.
-GC_API bool gc_shared_memory_create(size_t size, int* out_fd);
-
-// Maps the first size bytes of the shared memory object behind fd outside the cage, for a platform where
-// gc_primitive_storage_adopt_shared_fd() cannot place the mapping inside it, as on Windows. The view keeps a duplicate
-// of fd, so the caller keeps ownership of fd. Returns null if size is 0, the object is smaller than size bytes, or
-// mapping fails.
-typedef struct GCSharedMemoryViewOutsideCage GCSharedMemoryViewOutsideCage;
-GC_API GCSharedMemoryViewOutsideCage* gc_shared_memory_view_outside_cage_create(int fd, size_t size);
-GC_API uint8_t* gc_shared_memory_view_outside_cage_data(GCSharedMemoryViewOutsideCage*);
-GC_API void gc_shared_memory_view_outside_cage_destroy(GCSharedMemoryViewOutsideCage*);
 
 #ifdef __cplusplus
 }

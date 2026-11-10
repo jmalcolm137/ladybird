@@ -25,9 +25,7 @@ use super::constants::{
     GL_UNPACK_SKIP_ROWS, GL_VERTEX_ATTRIB_ARRAY_POINTER, GL_VERTEX_SHADER,
 };
 use super::gl_string::{utf8_bytes, utf16_string_from_gl_string};
-use super::state::{
-    Binding, ContextState, MAX_WEBGL_DRAWING_BUFFER_DIMENSION, RenderingContext, Version, WebGLVersion,
-};
+use super::state::{Binding, ContextState, RenderingContext, Version, WebGLVersion, drawing_buffer_dimension};
 use super::types::Float32List;
 use super::web_gl_active_info::WebGLActiveInfo;
 use super::web_gl_buffer::WebGLBuffer;
@@ -41,7 +39,6 @@ use super::web_gl_texture::WebGLTexture;
 use super::web_gl_uniform_location::WebGLUniformLocation;
 use crate::bindings::conversions::CppInterface;
 use crate::bindings::interface::Ref;
-use crate::bindings::promise::WebIdlPromise;
 use crate::bindings::{CallContext, WebIdlResult};
 
 /// https://www.khronos.org/registry/webgl/specs/latest/1.0/#WEBGLCONTEXTATTRIBUTES
@@ -56,8 +53,6 @@ pub(crate) struct WebGLContextAttributes {
     pub(crate) power_preference: WebGLPowerPreference,
     pub(crate) fail_if_major_performance_caveat: bool,
     pub(crate) desynchronized: bool,
-    /// https://immersive-web.github.io/webxr/#dom-webglcontextattributes-xrcompatible
-    pub(crate) xr_compatible: bool,
 }
 
 const ACTIVE_INFO_NAME_BUFFER_SIZE: usize = 256;
@@ -127,12 +122,12 @@ impl<V: Version> RenderingContext<V> {
 
     pub(crate) fn drawing_buffer_width(&self, _: &mut CallContext) -> WebIdlResult<i32> {
         let (width, _) = ContextState::canvas(self).bitmap_size();
-        Ok(width.min(MAX_WEBGL_DRAWING_BUFFER_DIMENSION))
+        Ok(drawing_buffer_dimension(width))
     }
 
     pub(crate) fn drawing_buffer_height(&self, _: &mut CallContext) -> WebIdlResult<i32> {
         let (_, height) = ContextState::canvas(self).bitmap_size();
-        Ok(height.min(MAX_WEBGL_DRAWING_BUFFER_DIMENSION))
+        Ok(drawing_buffer_dimension(height))
     }
 
     pub(crate) fn get_context_attributes(&self, _: &mut CallContext) -> WebIdlResult<Option<WebGLContextAttributes>> {
@@ -855,11 +850,6 @@ impl<V: Version> RenderingContext<V> {
             return Ok(-1);
         };
         Ok(self.proxy.get_attrib_location(program_handle, &utf8_bytes(&name)))
-    }
-
-    pub(crate) fn make_xr_compatible(&self, _: &mut CallContext) -> WebIdlResult<WebIdlPromise> {
-        // SAFETY: The cell is that of this context.
-        Ok(unsafe { super::canvas::make_xr_compatible(self.context_ref().cell()) })
     }
 
     pub(crate) fn get_error(&self, _: &mut CallContext) -> WebIdlResult<u32> {

@@ -2,8 +2,8 @@ Harness status: OK
 
 Found 89 tests
 
-87 Pass
-2 Fail
+88 Pass
+1 Fail
 Pass	<img data-expect="">
 Pass	<img src="" data-expect="">
 Pass	<img src="data:,a" data-expect="data:,a">
@@ -26,9 +26,9 @@ Pass	<picture><br><img src="data:,a" data-expect="data:,a"></picture>
 Pass	<picture><p></p><img src="data:,a" data-expect="data:,a"></picture>
 Pass	<picture><video><source srcset="data:,b"></video><img src="data:,a" data-expect="data:,a"></picture>
 Pass	<picture><span><source srcset="data:,b"></span><img src="data:,a" data-expect="data:,a"></picture>
-Pass	<picture><svg><source srcset="data:,b"></svg><img src="data:,a" data-expect="data:,a"></picture>
+Pass	<picture><svg><source srcset="data:,b"></source></svg><img src="data:,a" data-expect="data:,a"></picture>
 Pass	<picture><svg></svg><source srcset="data:,b"><img src="data:,a" data-expect="data:,b"></picture>
-Pass	<picture><svg><font></font><source srcset="data:,b"></svg><img src="data:,a" data-expect="data:,a"></picture>
+Pass	<picture><svg><font></font><source srcset="data:,b"></source></svg><img src="data:,a" data-expect="data:,a"></picture>
 Pass	<picture><svg><!--<font face> tag breaks out of svg--></svg><font face=""></font><source srcset="data:,b"><img src="data:,a" data-expect="data:,b"></picture>
 Pass	<picture><img src="data:,a"><img src="data:,b" data-expect="data:,b"></picture>
 Pass	<picture><source><img src="data:,a" data-expect="data:,a"></picture>
@@ -92,4 +92,4 @@ Pass	<picture><img data-expect=""><source srcset="data:,b"></picture>
 Pass	<picture><span><source srcset="data:,b"><img data-expect=""></span></picture>
 Pass	<picture><span><source srcset="data:,b"><img src="data:,a" data-expect="data:,a"></span></picture>
 Pass	<picture><source srcset="data:,b"><span><img src="data:,a" data-expect="data:,a"></span></picture>
-Fail	<picture><source srcset="data:,b"><img data-expect="data:,b"></picture>
+Pass	<picture><source srcset="data:,b"><img data-expect="data:,b"></picture>

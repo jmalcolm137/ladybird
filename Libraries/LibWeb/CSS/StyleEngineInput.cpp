@@ -7,14 +7,16 @@
 #include <AK/HashTable.h>
 #include <AK/QuickSort.h>
 #include <AK/SetUnion.h>
-#include <AK/TemporaryChange.h>
+#include <LibGC/RootHashTable.h>
+#include <LibGC/RootVector.h>
 #include <LibWeb/Animations/KeyframeEffect.h>
 #include <LibWeb/CSS/CSSAnimation.h>
-#include <LibWeb/CSS/CSSPropertyRule.h>
 #include <LibWeb/CSS/CSSStyleRule.h>
 #include <LibWeb/CSS/CSSTransition.h>
 #include <LibWeb/CSS/ElementBoxKind.h>
+#include <LibWeb/CSS/Invalidation/FormControlInvalidator.h>
 #include <LibWeb/CSS/Invalidation/LanguageInvalidator.h>
+#include <LibWeb/CSS/Invalidation/PseudoClassInvalidator.h>
 #include <LibWeb/CSS/Selector.h>
 #include <LibWeb/CSS/SelectorMatching.h>
 #include <LibWeb/CSS/Sizing.h>
@@ -39,6 +41,7 @@
 #include <LibWeb/HTML/HTMLInputElement.h>
 #include <LibWeb/HTML/HTMLLinkElement.h>
 #include <LibWeb/HTML/HTMLObjectElement.h>
+#include <LibWeb/HTML/HTMLSelectElement.h>
 #include <LibWeb/HTML/HTMLSlotElement.h>
 #include <LibWeb/HTML/HTMLTableCellElement.h>
 #include <LibWeb/HTML/HTMLTableElement.h>
@@ -62,7 +65,11 @@
 namespace Web::CSS {
 
 static void record_element_heading_level(DOM::Element&);
-static void record_element_initial_features(DOM::Element&);
+
+class ElementPublication;
+
+static void publish_element_arrival(StyleEngine&, DOM::Element&, ElementPublication&, Optional<StyleEngineFFI::FfiArrivingElement const&> = {});
+static void finish_element_publication(StyleEngine&, ElementPublication&);
 static void record_element_inline_style_properties(DOM::Element&);
 static void record_heading_levels_in_subtree(DOM::Element&);
 static void republish_assigned_slots_of(ReadonlySpan<GC::Ref<DOM::Node>>);
@@ -70,6 +77,7 @@ static Optional<StyleEngineFFI::FfiStateFact> state_fact_for(PseudoClass);
 static StyleAtomID intern_id_or_class_atom(StyleEngine&, DOM::Element const&, Utf16FlyString const&);
 static u32 element_construction_facts(DOM::Element const&);
 static u32 element_style_adjustment_facts(DOM::Element const&);
+static void publish_element_replaced_content_input(DOM::Element&, StyleEngine&);
 
 static constexpr StyleNodeID no_style_node;
 // Shadow trees get their own scopes with the shadow surface; today everything names the document.
@@ -93,7 +101,7 @@ static StyleEngine* style_engine_for_identified(DOM::Element& element)
 static StyleEngine* style_engine_for_published(DOM::Element& element)
 {
     auto* style_engine = style_engine_for_identified(element);
-    return style_engine && !style_engine->has_deferred_element_initial_features(element.style_node_id()) ? style_engine : nullptr;
+    return style_engine && !element.initial_style_features_pending() ? style_engine : nullptr;
 }
 
 // A relation is only nameable if the element on its other end already has an identity. Naming a
@@ -289,8 +297,6 @@ static void record_feature(
     DOM::Element&,
     StyleEngineFFI::FfiFeatureKind,
     StyleAtomID name_atom,
-    StyleEngineFFI::FfiFeatureValueKind old_kind,
-    StyleAtomID old_atom,
     StyleEngineFFI::FfiFeatureValueKind new_kind,
     StyleAtomID new_atom);
 
@@ -318,43 +324,36 @@ static void record_element_relinked(StyleEngine& style_engine, StyleNodeID node,
     });
 }
 
-static void record_element_arrival_delta(DOM::Element& element, StyleEngine& style_engine, TreeScopeID tree_scope)
+// How many nodes ahead a loop over a big list of nodes asks for their memory.
+static constexpr size_t nodes_ahead = 8;
+
+// Asks for the memory of a node whose kind isn't known yet, which reading its kind would wait for.
+static void prefetch_node(DOM::Node const& node)
 {
-    // A shadow root that took its identity before its host had one is still waiting to be linked to
-    // it. A sheet adopted into a shadow tree names that root, so the root can be identified first,
-    // and the link is what lets a `:host` or `::slotted()` rule in that tree reach the host instead
-    // of the document.
-    if (auto shadow_root = element.shadow_root(); shadow_root && shadow_root->style_node_id() != no_style_node)
-        StyleEngineFFI::style_engine_set_shadow_root(style_engine.host(), element.style_node_id(), shadow_root->style_node_id());
-    style_engine.record_tree_delta({
-        .node = element.style_node_id().value(),
-        .old_connected = false,
-        .new_connected = true,
-        .old_relations = detached_relations(),
-        .new_relations = relations_of(element, style_engine, tree_scope),
-    });
-    style_engine.defer_element_initial_features(element.style_node_id());
+    auto const* bytes = reinterpret_cast<u8 const*>(&node);
+    for (size_t offset = 0; offset < sizeof(DOM::Element); offset += 64)
+        __builtin_prefetch(bytes + offset);
 }
 
-void publish_pending_element_features(StyleEngine& style_engine, StyleComputer& style_computer)
+// OPTIMIZATION: Most of an element's publication is first reading memory no one touched since the element was parsed.
+//               Asking for it ahead turns waiting for one element at a time into overlapping waits. Each stage reads
+//               what the one before it asked for, so the distances shrink along the chain.
+template<typename NodeAt>
+static void prefetch_publication_ahead(size_t index, size_t count, NodeAt const& node_at)
 {
-    auto nodes = style_engine.take_deferred_element_initial_features().values();
-    // Feature postings are ordered by node identity. Publish arrivals in that order so growing
-    // their indexes appends members instead of repeatedly searching and splitting posting chunks.
-    quick_sort(nodes);
-    for (auto node : nodes) {
-        auto element = style_computer.element_for_style_node(node);
-        if (!element)
-            continue;
-        // An inserted subtree takes its identities before its insertion steps mark its nodes connected, in tree order.
-        // A step that submits the recorded input on the way, as a <style> writing its sheet to the engine in place
-        // while a style transaction flies, finds the elements after it unconnected: their arrivals are submitted, and
-        // their features wait for the next submit, which folds them onto those arrivals.
-        if (!element->is_connected()) {
-            style_engine.defer_element_initial_features(node);
-            continue;
+    if (index + 2 * nodes_ahead < count) {
+        if (DOM::Node const* ahead = node_at(index + 2 * nodes_ahead))
+            prefetch_node(*ahead);
+    }
+    if (index + nodes_ahead < count) {
+        if (auto const* ahead = as_if<DOM::Element>(node_at(index + nodes_ahead))) {
+            __builtin_prefetch(ahead->inline_style_declarations());
+            __builtin_prefetch(ahead->attribute_list_memory());
         }
-        record_element_initial_features(*element);
+    }
+    if (index + nodes_ahead / 2 < count) {
+        if (auto const* ahead = as_if<DOM::Element>(node_at(index + nodes_ahead / 2)); ahead && ahead->inline_style_declarations())
+            Parser::ValueParserFFI::rust_declaration_block_prefetch_header(ahead->inline_style_declarations());
     }
 }
 
@@ -367,9 +366,12 @@ void publish_pending_element_features(StyleEngine& style_engine, StyleComputer& 
 static void mark_style_arrival_pending(DOM::Node& node, StyleEngine& style_engine)
 {
     style_engine.note_pending_arrivals(1);
+    style_engine.list_arrival(node);
     node.set_style_arrival_pending(true);
+    // NB: The path is marked all the way up: a take-in that finds the subtrees among the nodes listed clears only the
+    //     paths to them, and may leave the mark of a subtree that left on an element below a path it cleared.
     for (auto* ancestor = node.parent_or_shadow_host(); ancestor; ancestor = ancestor->parent_or_shadow_host()) {
-        if (ancestor->descendant_style_arrival_pending() || ancestor->style_arrival_pending())
+        if (ancestor->style_arrival_pending())
             break;
         ancestor->set_descendant_style_arrival_pending(true);
     }
@@ -448,6 +450,7 @@ static bool element_can_wait_to_arrive(DOM::Element& element, StyleEngine::Relat
 // notes that they arrive as the input is next submitted.
 static void release_waiting_children(DOM::Element& element)
 {
+    element.document().style_computer().style_engine().note_unlisted_arrivals();
     element.set_child_style_arrivals_wait(false);
     element.set_descendant_style_arrival_pending(true);
     auto mark = [](DOM::Node& child) { child.set_style_arrival_pending(true); };
@@ -459,13 +462,11 @@ static void release_waiting_children(DOM::Element& element)
     }
 }
 
-static bool s_taking_in_pending_style_arrivals = false;
-
 // Children that waited may have to arrive as the input is next submitted. A style update or a take-in only notes it.
 // Script records it as it records an insertion, which the transaction a geometry read deferred must not be waiting for.
 static void note_waiting_children_may_arrive(StyleEngine& style_engine, DOM::Document const& document)
 {
-    if (s_taking_in_pending_style_arrivals || document.is_in_style_stabilization_epoch())
+    if (style_engine.is_taking_in_pending_arrivals() || document.is_in_style_stabilization_epoch())
         style_engine.note_waiting_arrivals_may_arrive();
     else
         style_engine.note_pending_arrivals(1);
@@ -597,24 +598,278 @@ void record_subtree_connecting(DOM::Node& root)
         mark_style_arrival_pending(root, *style_engine);
 }
 
+// A node that is no element hovers the element it is inside of.
+static DOM::Element const* hovered_element_of(DOM::Node const* node)
+{
+    if (!node)
+        return nullptr;
+    if (auto const* element = as_if<DOM::Element>(*node))
+        return element;
+    return node->parent_element().ptr();
+}
+
+// The questions about an element that elements of its name answer differently.
+enum class ElementOpenFacts : u16 {
+    None = 0,
+    Input = 1 << 0,
+    Audio = 1 << 1,
+    SvgRoot = 1 << 2,
+    SvgSymbol = 1 << 3,
+    SvgElement = 1 << 4,
+    Body = 1 << 5,
+    Heading = 1 << 6,
+    ReplacedContent = 1 << 7,
+    OwnDirectionality = 1 << 8,
+    PresentationalHints = 1 << 9,
+};
+AK_ENUM_BITWISE_OPERATORS(ElementOpenFacts);
+
+static ElementOpenFacts element_open_facts(DOM::Element const&);
+static u32 kind_style_adjustment_facts(DOM::Element const&);
+static u32 kind_construction_facts(DOM::Element const&);
+static u32 open_style_adjustment_facts(DOM::Element const&, ElementOpenFacts);
+static u32 open_construction_facts(DOM::Element const&, ElementOpenFacts, bool is_in_user_agent_shadow_tree);
+
+// What an element's qualified name settles. The name picks the element's class, so this holds for every element of it,
+// and only what the name leaves open is asked of each.
+struct ElementKind {
+    DOM::QualifiedName::Impl const* name { nullptr };
+    StyleAtomID tag_atom;
+    StyleAtomID folded_tag_atom;
+    StyleAtomID namespace_atom;
+    u32 adjustment_facts { 0 };
+    u32 construction_facts { 0 };
+    ElementOpenFacts open_facts { ElementOpenFacts::None };
+    SelectorMatching::ElementStateQuestions state_questions { SelectorMatching::ElementStateQuestions::None };
+    bool is_slot { false };
+};
+
+static ElementKind element_kind_of(StyleEngine& style_engine, DOM::Element const& element)
+{
+    auto tag_atom = style_engine.intern_atom(element.local_name());
+    ElementKind kind {
+        .name = element.qualified_name_identity(),
+        .tag_atom = tag_atom,
+        .folded_tag_atom = tag_atom,
+        .namespace_atom = {},
+        .adjustment_facts = kind_style_adjustment_facts(element),
+        .construction_facts = kind_construction_facts(element),
+        .open_facts = element_open_facts(element),
+        .state_questions = SelectorMatching::element_state_questions(element),
+        .is_slot = is<HTML::HTMLSlotElement>(element),
+    };
+    if (auto folded_name = element.local_name().to_ascii_lowercase(); folded_name != element.local_name())
+        kind.folded_tag_atom = style_engine.intern_atom(folded_name);
+    if (auto const& namespace_uri = element.namespace_uri(); namespace_uri.has_value() && !namespace_uri->is_empty())
+        kind.namespace_atom = style_engine.intern_atom(*namespace_uri);
+    return kind;
+}
+
+// What one attribute name settles, which is the same on every element that has it.
+struct PublishedAttributeName {
+    DOM::QualifiedName::Impl const* name { nullptr };
+    StyleAtomID atom;
+    bool is_known_unread { false };
+    bool is_lang { false };
+    bool is_dir { false };
+};
+
+// A table a batch keeps of what it found out by name. Names repeat, so a slot a name shares with another only costs
+// asking again.
+template<typename Entry, size_t slot_count>
+class TableByName {
+public:
+    static_assert((slot_count & (slot_count - 1)) == 0);
+
+    Entry& slot_of(DOM::QualifiedName::Impl const* name)
+    {
+        // Fibonacci hashing: the high bits of the product depend on all of an allocation's address.
+        auto hash = (reinterpret_cast<FlatPtr>(name) * 0x9e3779b97f4a7c15ull) >> (64 - count_trailing_zeroes(slot_count));
+        return m_slots[hash];
+    }
+
+private:
+    Array<Entry, slot_count> m_slots {};
+};
+
+// One batch of elements publishing their initial features. Nothing but the batch changes the DOM or what the engine
+// reads while it lives, so what one element answers holds for the next one asking. The elements cross to the engine in
+// blocks: their rows are written in one call, and what is published of them beside their rows follows the call.
+class ElementPublication {
+    AK_MAKE_NONCOPYABLE(ElementPublication);
+    AK_MAKE_NONMOVABLE(ElementPublication);
+
+public:
+    // The facts an element takes from its parent where it has none of its own.
+    struct Inherited {
+        DOM::Element::Directionality directionality { DOM::Element::Directionality::Ltr };
+        StyleAtomID language_atom;
+        bool is_in_user_agent_shadow_tree { false };
+    };
+
+    ElementPublication(StyleEngine& style_engine, DOM::Document const& document)
+        : m_style_engine(style_engine)
+        , m_focus_within_chain(document)
+        , m_hovered_element(hovered_element_of(document.hovered_node()))
+        , m_ltr_atom(style_engine.intern_atom("ltr"_utf16_fly_string))
+        , m_rtl_atom(style_engine.intern_atom("rtl"_utf16_fly_string))
+    {
+    }
+
+    ~ElementPublication()
+    {
+        VERIFY(m_rows.is_empty());
+        // NB: A tag read now may not be final, as an XML parser sets attributes after insertion, so none is left cached.
+        for (auto element : m_elements_asked_their_language)
+            element->invalidate_lang_value_of_inclusive_ancestors();
+    }
+
+    ElementKind const& kind_of(DOM::Element const& element)
+    {
+        auto& kind = m_kinds.slot_of(element.qualified_name_identity());
+        if (kind.name != element.qualified_name_identity())
+            kind = element_kind_of(m_style_engine, element);
+        return kind;
+    }
+
+    PublishedAttributeName const& attribute_name(DOM::QualifiedName const& name)
+    {
+        auto& slot = m_attribute_names.slot_of(name.identity());
+        if (slot.name == name.identity())
+            return slot;
+        auto atom = m_style_engine.intern_attribute_name(name.local_name(), name.namespace_());
+        slot = {
+            .name = name.identity(),
+            .atom = atom,
+            .is_known_unread = m_style_engine.attribute_is_known_unread(atom),
+            .is_lang = name.local_name() == HTML::AttributeNames::lang,
+            .is_dir = name.local_name() == HTML::AttributeNames::dir,
+        };
+        if (slot.is_known_unread)
+            m_style_engine.note_attribute_withheld(name.local_name(), name.namespace_());
+        return slot;
+    }
+
+    // What the element's parent passes on, if it has one. Elements come mostly in tree order, so most parents were
+    // just published, and most of the rest are asked once for all the children that follow.
+    Optional<Inherited> inherited_by(DOM::Element& element)
+    {
+        auto* parent = element.parent_or_shadow_host_element();
+        while (!m_elements_to_parent.is_empty() && m_elements_to_parent.last().element.ptr() != parent)
+            m_elements_to_parent.take_last();
+        if (!parent)
+            return {};
+        if (m_elements_to_parent.is_empty()) {
+            auto const* shadow_root = parent->containing_shadow_root().ptr();
+            published(*parent, {
+                                   .directionality = parent->directionality(),
+                                   .language_atom = language_atom_asked_of(*parent),
+                                   .is_in_user_agent_shadow_tree = shadow_root && shadow_root->is_user_agent_internal(),
+                               });
+        }
+        return m_elements_to_parent.last().inherited;
+    }
+
+    void published(DOM::Element& element, Inherited inherited)
+    {
+        m_elements_to_parent.append({ element, inherited });
+    }
+
+    // The tag is computed afresh. One cached where the element used to be says nothing about where it arrives, as a
+    // subtree that moves while detached is never reached by the walk a `lang` change runs.
+    StyleAtomID language_atom_asked_of(DOM::Element& element)
+    {
+        element.invalidate_lang_value();
+        auto const language = element.lang_view();
+        m_elements_asked_their_language.append(element);
+        return language.has_value() ? m_style_engine.intern_language_atom(*language) : StyleAtomID {};
+    }
+
+    // Where the next row's custom states, classes and attributes go, in that order.
+    Vector<u32, 512>& atoms() { return m_atoms; }
+
+    void append_row(DOM::Element& element, StyleEngineFFI::FfiElementArrivalRow const& row)
+    {
+        m_rows.append(row);
+        m_elements.append(element);
+    }
+
+    bool block_is_full() const { return m_rows.size() >= rows_per_block; }
+
+    // Writes the rows of the block, and answers its elements for what follows the rows.
+    ReadonlySpan<GC::Ref<DOM::Element>> write_block()
+    {
+        m_style_engine.record_element_arrival_rows(m_rows.span(), m_atoms.span());
+        m_rows.clear_with_capacity();
+        m_atoms.clear_with_capacity();
+        return m_elements.span();
+    }
+
+    void forget_block() { m_elements.clear_with_capacity(); }
+
+    SelectorMatching::FocusWithinChain const& focus_within_chain() const { return m_focus_within_chain; }
+    DOM::Element const* hovered_element() const { return m_hovered_element.ptr(); }
+    StyleAtomID directionality_atom(DOM::Element::Directionality directionality) const
+    {
+        return directionality == DOM::Element::Directionality::Rtl ? m_rtl_atom : m_ltr_atom;
+    }
+
+private:
+    static constexpr size_t rows_per_block = 256;
+
+    struct AncestorRow {
+        GC::Ptr<DOM::Element const> element;
+        Inherited inherited;
+
+        void visit_edges(GC::Cell::Visitor& visitor) { visitor.visit(element); }
+    };
+
+    StyleEngine& m_style_engine;
+    SelectorMatching::FocusWithinChain m_focus_within_chain;
+    GC::Ptr<DOM::Element const> m_hovered_element;
+    StyleAtomID m_ltr_atom;
+    StyleAtomID m_rtl_atom;
+    TableByName<ElementKind, 64> m_kinds;
+    TableByName<PublishedAttributeName, 32> m_attribute_names;
+    GC::RootVector<AncestorRow, 32> m_elements_to_parent;
+    GC::RootVector<GC::Ref<DOM::Element>> m_elements_asked_their_language;
+    Vector<StyleEngineFFI::FfiElementArrivalRow> m_rows;
+    Vector<u32, 512> m_atoms;
+    GC::RootVector<GC::Ref<DOM::Element>> m_elements;
+};
+
+// What the engine reads decides what of the elements is withheld from it, which the host asks the engine where a rule
+// it queued since its last job leaves it not knowing.
+static void learn_what_the_engine_reads(StyleEngine& style_engine, Layout::BegunRead const& read)
+{
+    StyleEngineFFI::document_host_learn_selector_requirements(style_engine.host(), &read);
+}
+
 // A subtree waiting to arrive, and whether its root arrives alone, its children waiting on in a display:none subtree.
 struct PendingArrivalRoot {
     GC::Ref<DOM::Node> node;
     bool children_wait { false };
+
+    void visit_edges(GC::Cell::Visitor& visitor) { visitor.visit(node); }
 };
 
 // Every node in the subtrees waiting to arrive, in tree order, takes its identity, and every element records its
 // arrival. The subtrees are taken in together, so each identity is assigned before the first arrival is recorded:
 // an arrival names its parent and siblings, and a sibling that waited in another subtree has arrived by then.
-static void record_subtree_arrivals(DOM::Document& document, ReadonlySpan<PendingArrivalRoot> roots)
+//
+// With a publication, an element's features arrive with it, in one write of its row. An element not connected yet
+// stands in the way of that, as its insertion steps are still running, and waits as it would without a publication.
+static void record_subtree_arrivals(DOM::Document& document, ReadonlySpan<PendingArrivalRoot> roots, ElementPublication* publication)
 {
     auto& style_computer = document.style_computer();
     auto& style_engine = style_computer.style_engine();
     struct Arrival {
         GC::Ref<DOM::Node> node;
         TreeScopeID tree_scope;
+
+        void visit_edges(GC::Cell::Visitor& visitor) { visitor.visit(node); }
     };
-    GC::ConservativeVector<Arrival, 64> arrivals;
+    GC::RootVector<Arrival, 64> arrivals;
     GC::RootVector<GC::Ref<DOM::Text>, 64> text_arrivals;
     // Elements and text nodes in tree order, which is the order their places in the DOM child sequence can be taken
     // in: each node's previous sibling has taken its place first.
@@ -630,6 +885,9 @@ static void record_subtree_arrivals(DOM::Document& document, ReadonlySpan<Pendin
         node.set_style_arrival_pending(false);
         node.set_descendant_style_arrival_pending(false);
         if (auto* element = as_if<DOM::Element>(node); element && element->style_node_id() == no_style_node) {
+            // NB: An arrival reads its language through its parent, which may arrive after it, and whose answer an
+            //     earlier read left cached from where the subtree stood.
+            element->invalidate_lang_value();
             arrivals.append({ *element, tree_scope });
             dom_order_arrivals.append(*element);
             ++element_count;
@@ -662,14 +920,22 @@ static void record_subtree_arrivals(DOM::Document& document, ReadonlySpan<Pendin
         identities.resize(text_arrivals.size());
         style_engine.mint_text_style_nodes(identities.span());
         style_computer.ensure_style_node_slot(identities.last());
+        Vector<StyleEngineFFI::FfiArrivingText, 64> texts;
+        texts.ensure_capacity(text_arrivals.size());
         for (size_t i = 0; i < text_arrivals.size(); ++i) {
-            text_arrivals[i]->set_style_node_id(identities[i]);
-            style_computer.register_style_node(identities[i], text_arrivals[i]);
-            StyleEngineFFI::style_engine_set_text_is_ascii_whitespace(style_engine.host(), identities[i], text_arrivals[i]->data().is_ascii_whitespace());
-            StyleEngineFFI::style_engine_set_text_is_in_user_agent_shadow_tree(style_engine.host(), identities[i], text_is_in_user_agent_shadow_tree(*text_arrivals[i]));
-            StyleEngineFFI::style_engine_set_text_is_password_input(style_engine.host(), identities[i], text_arrivals[i]->is_password_input());
-            StyleEngineFFI::style_engine_set_text_data(style_engine.host(), identities[i].value(), text_arrivals[i]->data().to_raw_leaked());
+            auto& text = *text_arrivals[i];
+            text.set_style_node_id(identities[i]);
+            style_computer.register_style_node(identities[i], text);
+            texts.unchecked_append({
+                .data = text.data().to_raw_leaked(),
+                .node = identities[i].value(),
+                .is_ascii_whitespace = text.data().is_ascii_whitespace(),
+                .is_in_user_agent_shadow_tree = text_is_in_user_agent_shadow_tree(text),
+                .is_password_input = text.is_password_input(),
+            });
         }
+        // The text nodes of the subtrees take their places in the engine in one write.
+        StyleEngineFFI::style_engine_stage_text_arrivals(style_engine.host(), texts.span());
     }
 
     if (!arrivals.is_empty()) {
@@ -679,15 +945,17 @@ static void record_subtree_arrivals(DOM::Document& document, ReadonlySpan<Pendin
         style_computer.ensure_style_node_slot(identities.last());
         size_t next_element_identity = 0;
         size_t next_shadow_root_identity = element_count;
-        for (auto const& arrival : arrivals) {
+        for (size_t index = 0; index < arrivals.size(); ++index) {
+            auto const& arrival = arrivals[index];
+            if (index + nodes_ahead < arrivals.size())
+                prefetch_node(*arrivals[index + nodes_ahead].node);
             if (auto* element = as_if<DOM::Element>(*arrival.node)) {
                 auto identity = identities[next_element_identity++];
                 element->set_style_node_id(identity);
                 style_computer.register_style_node(identity, *element);
-                StyleEngineFFI::style_engine_set_element_unique_node_id(style_engine.host(), identity, static_cast<u64>(element->unique_id().value()));
                 Layout::publish_table_spans(*element);
-                if (element->style_recomputes_on_environment_move())
-                    element->publish_style_recomputes_on_environment_move();
+                if (auto* frameset = as_if<HTML::HTMLFrameSetElement>(*element))
+                    frameset->publish_layout_data();
                 if (element->is_size_query_container() || element->style_depends_on_size_container_query())
                     element->publish_size_container_query_facts();
             } else {
@@ -699,10 +967,35 @@ static void record_subtree_arrivals(DOM::Document& document, ReadonlySpan<Pendin
             }
         }
 
-        for (auto const& arrival : arrivals) {
-            if (auto* element = as_if<DOM::Element>(*arrival.node))
-                record_element_arrival_delta(*element, style_engine, arrival.tree_scope);
+        // The elements of the subtrees arrive in the engine's tree in one write, each standing in no tree before.
+        Vector<StyleEngineFFI::FfiArrivingElement, 64> arriving_elements;
+        for (size_t index = 0; index < arrivals.size(); ++index) {
+            auto const& arrival = arrivals[index];
+            prefetch_publication_ahead(index, arrivals.size(), [&](size_t index) { return arrivals[index].node.ptr(); });
+            auto* element = as_if<DOM::Element>(*arrival.node);
+            if (!element)
+                continue;
+            // A shadow root that took its identity before its host had one is still waiting to be linked to it. A sheet
+            // adopted into a shadow tree names that root, so the root can be identified first, and the link is what lets
+            // a `:host` or `::slotted()` rule in that tree reach the host instead of the document.
+            if (auto shadow_root = element->shadow_root(); shadow_root && shadow_root->style_node_id() != no_style_node)
+                StyleEngineFFI::style_engine_set_shadow_root(style_engine.host(), element->style_node_id(), shadow_root->style_node_id());
+            StyleEngineFFI::FfiArrivingElement arriving {
+                .unique_node_id = static_cast<u64>(element->unique_id().value()),
+                .node = element->style_node_id().value(),
+                .relations = relations_of(*element, style_engine, arrival.tree_scope),
+            };
+            if (publication && element->is_connected()) {
+                style_engine.note_element_awaiting_preparation_for_style_computation(*element);
+                publish_element_arrival(style_engine, *element, *publication, arriving);
+            } else {
+                arriving_elements.append(arriving);
+                style_engine.defer_element_initial_features(*element);
+            }
         }
+        if (publication)
+            finish_element_publication(style_engine, *publication);
+        style_engine.record_element_arrivals(arriving_elements.span());
         for (auto const& slottable : slottables_identified_earlier)
             record_element_assigned_slot_changed(slottable, nullptr);
     }
@@ -711,8 +1004,11 @@ static void record_subtree_arrivals(DOM::Document& document, ReadonlySpan<Pendin
         return;
     Vector<u32, 192> links;
     links.ensure_capacity(dom_order_arrivals.size() * 3);
-    for (auto const& node : dom_order_arrivals)
-        append_dom_order_link(links, node);
+    for (size_t index = 0; index < dom_order_arrivals.size(); ++index) {
+        if (index + nodes_ahead < dom_order_arrivals.size())
+            prefetch_node(*dom_order_arrivals[index + nodes_ahead]);
+        append_dom_order_link(links, dom_order_arrivals[index]);
+    }
     StyleEngineFFI::style_engine_link_style_nodes_in_dom_order(style_engine.host(), links.span());
 
     republish_assigned_slots_of(dom_order_arrivals);
@@ -720,7 +1016,10 @@ static void record_subtree_arrivals(DOM::Document& document, ReadonlySpan<Pendin
     // What the insertion steps publish about a node under its identity waited for the identity (see Node::inserted()).
     auto focused_area = document.focused_area();
     auto const* focused_text_control = is<HTML::FormAssociatedTextControlElement>(focused_area.ptr()) ? focused_area.ptr() : nullptr;
-    for (auto const& node : dom_order_arrivals) {
+    for (size_t index = 0; index < dom_order_arrivals.size(); ++index) {
+        auto const& node = dom_order_arrivals[index];
+        if (index + nodes_ahead < dom_order_arrivals.size())
+            prefetch_node(*dom_order_arrivals[index + nodes_ahead]);
         // Inertness, editability and the wheel handler state are inherited from the place the node arrived in.
         node->publish_dom_paint_facts();
         // As is being in the shadow tree of the focused text control.
@@ -738,7 +1037,7 @@ static void record_subtree_arrivals(DOM::Document& document, ReadonlySpan<Pendin
     // yet, so the mark is made here, as the insertion would have made it.
     for (auto const& root : roots) {
         auto const* parent = root.node->parent();
-        if (parent && (parent->is_html_style_element() || parent->is_svg_style_element()) && !parent->has_layout_box())
+        if (parent && (parent->is_html_style_element() || parent->is_svg_style_element()) && !parent->may_have_layout_box())
             continue;
         root.node->set_needs_layout_tree_update(true, DOM::SetNeedsLayoutTreeUpdateReason::NodeInsertBefore);
     }
@@ -860,16 +1159,62 @@ static bool collect_pending_style_arrival_roots(DOM::Node& node, Vector<PendingA
     return waits_below;
 }
 
-void take_in_pending_style_arrivals(DOM::Document& document, HiddenChildArrivals hidden_child_arrivals)
+// OPTIMIZATION: The subtrees waiting to arrive, found among the nodes marked since the last take-in rather than along the
+//               marks, which reach every child of each node on the path to one. Answers false, having found nothing,
+//               where the marks have to be walked: a node is in a shadow tree, whose tree order the walk follows.
+static bool take_listed_arrival_roots(DOM::Document& document, GC::RootVector<GC::Ref<DOM::Node>> const& listed, GC::RootVector<PendingArrivalRoot, 16>& roots, HiddenChildArrivalDecision& decision)
 {
-    if (s_taking_in_pending_style_arrivals)
-        return;
+    GC::RootVector<GC::Ref<DOM::Node>> found;
+    GC::RootHashTable<GC::Ref<DOM::Node>> seen;
+    for (auto node : listed) {
+        if (!node->is_connected() || !node->style_arrival_pending() || &node->document() != &document || seen.set(node) != HashSetResult::InsertedNewEntry)
+            continue;
+        if (is<DOM::ShadowRoot>(node->root()))
+            return false;
+        // A node in a subtree waiting to arrive arrives with it.
+        bool in_waiting_subtree = false;
+        for (auto* ancestor = node->parent_or_shadow_host(); ancestor; ancestor = ancestor->parent_or_shadow_host()) {
+            if (ancestor->style_arrival_pending()) {
+                in_waiting_subtree = true;
+                break;
+            }
+        }
+        if (!in_waiting_subtree)
+            found.append(node);
+    }
+    quick_sort(found, [](auto const& a, auto const& b) {
+        return (a->compare_document_position(b) & DOM::Node::DOCUMENT_POSITION_FOLLOWING) != 0;
+    });
+    // The marks on the path to each subtree are cleared, and kept on the path to one whose children go on waiting.
+    GC::RootVector<GC::Ref<DOM::Node>> waiting;
+    for (auto node : found) {
+        auto children_wait = decision.children_of_arrival_can_wait(node);
+        roots.append({ node, children_wait });
+        if (children_wait)
+            waiting.append(node);
+        for (auto* ancestor = node->parent_or_shadow_host(); ancestor && ancestor->descendant_style_arrival_pending(); ancestor = ancestor->parent_or_shadow_host())
+            ancestor->set_descendant_style_arrival_pending(false);
+    }
+    for (auto node : waiting) {
+        for (auto* ancestor = node->parent_or_shadow_host(); ancestor; ancestor = ancestor->parent_or_shadow_host())
+            ancestor->set_descendant_style_arrival_pending(true);
+    }
+    document.style_computer().style_engine().set_may_have_waiting_children(!waiting.is_empty());
+    return true;
+}
+
+static void take_in_pending_style_arrivals(DOM::Document& document, HiddenChildArrivals hidden_child_arrivals, Layout::BegunRead const* read)
+{
     auto& style_engine = document.style_computer().style_engine();
+    if (style_engine.is_taking_in_pending_arrivals())
+        return;
     // Nodes that waited and left the tree again are counted too, and nothing is left of them to take in.
     auto arrivals_were_noted = style_engine.has_pending_arrivals();
     style_engine.forget_pending_arrivals();
-    if (!document.descendant_style_arrival_pending())
+    if (!document.descendant_style_arrival_pending()) {
+        (void)style_engine.take_listed_arrivals();
         return;
+    }
     // Children that wait in a display:none subtree go on waiting until a node connects, something notes they may have
     // to arrive, or the keys they were looked at against move. Until then, the marks on the path to them lead to nothing
     // that has to arrive.
@@ -879,14 +1224,40 @@ void take_in_pending_style_arrivals(DOM::Document& document, HiddenChildArrivals
     // Only the arrivals of a tracked tree record which children wait.
     if (!document.style_engine_tracks_tree())
         hidden_child_arrivals = HiddenChildArrivals::TakeIn;
-    TemporaryChange taking_in { s_taking_in_pending_style_arrivals, true };
-    GC::ConservativeVector<PendingArrivalRoot, 16> roots;
+    // NB: Publication can bring another document up to date, as an SVG image's for its natural size, whose own take-in
+    //     this says nothing about.
+    auto taking_in = style_engine.begin_taking_in_pending_arrivals();
+    GC::RootVector<PendingArrivalRoot, 16> roots;
     {
         HiddenChildArrivalDecision decision { document, hidden_child_arrivals };
-        style_engine.set_may_have_waiting_children(collect_pending_style_arrival_roots(document, roots, decision));
+        auto listed = style_engine.take_listed_arrivals();
+        if (!listed.has_value() || style_engine.may_have_waiting_children() || !take_listed_arrival_roots(document, *listed, roots, decision))
+            style_engine.set_may_have_waiting_children(collect_pending_style_arrival_roots(document, roots, decision));
     }
-    if (!roots.is_empty() && document.style_engine_tracks_tree())
-        record_subtree_arrivals(document, roots);
+    if (!roots.is_empty() && document.style_engine_tracks_tree()) {
+        if (read) {
+            learn_what_the_engine_reads(style_engine, *read);
+            ElementPublication publication { style_engine, document };
+            record_subtree_arrivals(document, roots, &publication);
+        } else {
+            record_subtree_arrivals(document, roots, nullptr);
+        }
+        // NB: An element shows a highlight only once it has an identity to be named by, which a hidden child can take
+        //     without the tree changing.
+        document.set_needs_highlight_style_update(PseudoElement::Selection);
+        document.set_needs_highlight_style_update(PseudoElement::SearchText);
+        document.set_needs_highlight_style_update(PseudoElement::SpellingError);
+    }
+}
+
+void take_in_pending_style_arrivals(DOM::Document& document, HiddenChildArrivals hidden_child_arrivals)
+{
+    take_in_pending_style_arrivals(document, hidden_child_arrivals, nullptr);
+}
+
+void take_in_and_publish_pending_style_arrivals(DOM::Document& document, HiddenChildArrivals hidden_child_arrivals, Layout::BegunRead const& read)
+{
+    take_in_pending_style_arrivals(document, hidden_child_arrivals, &read);
 }
 
 void record_element_associated_with_animation(DOM::Element& element)
@@ -919,16 +1290,6 @@ void record_waiting_children_may_be_revealed(DOM::Element& element)
         note_waiting_children_may_arrive(*style_engine, element.document());
 }
 
-// A node that is no element hovers the element it is inside of.
-static DOM::Element const* hovered_element_of(DOM::Node const* node)
-{
-    if (!node)
-        return nullptr;
-    if (auto const* element = as_if<DOM::Element>(*node))
-        return element;
-    return node->parent_element().ptr();
-}
-
 // The element-backed pseudo-element an element in its host's shadow tree stands for, as one plus
 // its kind, or zero.
 static u8 associated_pseudo_kind_plus_one(DOM::Element const& element)
@@ -940,39 +1301,39 @@ static u8 associated_pseudo_kind_plus_one(DOM::Element const& element)
 // Publish every selector-visible fact intrinsic to one element.
 //
 // An element arrives with facts already true of it, and the engine has heard none of them. They are
-// published as ordinary deltas from absent, so the resident fact store is built by exactly the same
-// path later mutations take rather than by a second one.
-static void publish_element_selector_features(StyleEngine& style_engine, DOM::Element& element)
+// published as ordinary deltas from absent, so the projection learns them by exactly the same path
+// later mutations take rather than by a second one.
+static void publish_element_selector_features(StyleEngine& style_engine, DOM::Element& element, ElementPublication& publication, Optional<StyleEngineFFI::FfiArrivingElement const&> arriving)
 {
     auto node = element.style_node_id();
-    auto publish_feature = [&](StyleEngineFFI::FfiFeatureKind kind, StyleAtomID name_atom, StyleEngineFFI::FfiFeatureValueKind value_kind, StyleAtomID value_atom) {
-        style_engine.record_local_feature_delta({
-            .node = node.value(),
-            .feature_kind = kind,
-            .name_atom = name_atom.value(),
-            .old_kind = StyleEngineFFI::FfiFeatureValueKind::Absent,
-            .old_atom = 0,
-            .new_kind = value_kind,
-            .new_atom = value_atom.value(),
-        });
-    };
+    // Everything the element's selectors test arrives as one row, which the engine writes in one go.
     // Slot identity and namespace never change during an element's lifetime.
-    auto is_slot = is<HTML::HTMLSlotElement>(element);
-    StyleAtomID namespace_atom;
-    if (auto const& namespace_uri = element.namespace_uri(); namespace_uri.has_value() && !namespace_uri->is_empty())
-        namespace_atom = style_engine.intern_atom(*namespace_uri);
-
-    publish_feature(StyleEngineFFI::FfiFeatureKind::TagName, StyleAtomID {}, StyleEngineFFI::FfiFeatureValueKind::Atom, style_engine.intern_atom(element.local_name()));
-    if (auto folded_name = element.local_name().to_ascii_lowercase(); folded_name != element.local_name())
-        publish_feature(StyleEngineFFI::FfiFeatureKind::FoldedTagName, StyleAtomID {}, StyleEngineFFI::FfiFeatureValueKind::Atom, style_engine.intern_atom(folded_name));
+    auto const& kind = publication.kind_of(element);
+    StyleAtomID id_atom;
     if (auto const& id = element.id(); id.has_value())
-        publish_feature(StyleEngineFFI::FfiFeatureKind::Id, StyleAtomID {}, StyleEngineFFI::FfiFeatureValueKind::Atom, intern_id_or_class_atom(style_engine, element, *id));
+        id_atom = intern_id_or_class_atom(style_engine, element, *id);
+    auto& atoms = publication.atoms();
+    auto atoms_before = atoms.size();
+    if (auto states = element.custom_state_set()) {
+        for (auto const& state : states->states())
+            atoms.append(style_engine.intern_atom(state).value());
+    }
+    auto custom_state_count = atoms.size() - atoms_before;
     for (auto const& class_name : element.class_names())
-        publish_feature(StyleEngineFFI::FfiFeatureKind::Class, intern_id_or_class_atom(style_engine, element, class_name), StyleEngineFFI::FfiFeatureValueKind::Present, StyleAtomID {});
-    element.for_each_attribute([&](DOM::QualifiedName const& name, Utf16String const& value) {
-        auto name_atom = style_engine.intern_attribute_name(name.local_name(), name.namespace_());
-        publish_feature(StyleEngineFFI::FfiFeatureKind::Attribute, name_atom, StyleEngineFFI::FfiFeatureValueKind::Atom, style_engine.intern_attribute_value(name_atom, value));
-    });
+        atoms.append(intern_id_or_class_atom(style_engine, element, class_name).value());
+    auto class_count = atoms.size() - atoms_before - custom_state_count;
+    bool has_own_language = false;
+    bool has_own_directionality = has_flag(kind.open_facts, ElementOpenFacts::OwnDirectionality);
+    for (auto const& [name, value] : element.attribute_list()) {
+        auto const& attribute_name = publication.attribute_name(name);
+        has_own_language |= attribute_name.is_lang;
+        has_own_directionality |= attribute_name.is_dir;
+        if (attribute_name.is_known_unread)
+            continue;
+        atoms.append(attribute_name.atom.value());
+        atoms.append(style_engine.intern_attribute_value(attribute_name.atom, value).value());
+    }
+    auto attribute_count = (atoms.size() - atoms_before - custom_state_count - class_count) / 2;
 
     bool has_nonempty_text_child = false;
     for (GC::Ptr<DOM::Node const> child = element.first_child(); child; child = child->next_sibling()) {
@@ -981,63 +1342,72 @@ static void publish_element_selector_features(StyleEngine& style_engine, DOM::El
             break;
         }
     }
-    style_engine.record_local_feature_delta({
-        .node = node.value(),
-        .feature_kind = StyleEngineFFI::FfiFeatureKind::Emptiness,
-        .name_atom = 0,
-        .old_kind = has_nonempty_text_child ? StyleEngineFFI::FfiFeatureValueKind::Present : StyleEngineFFI::FfiFeatureValueKind::Absent,
-        .old_atom = 0,
-        .new_kind = has_nonempty_text_child ? StyleEngineFFI::FfiFeatureValueKind::Absent : StyleEngineFFI::FfiFeatureValueKind::Present,
-        .new_atom = 0,
+
+    auto ask_local_link = SelectorMatching::AskLocalLink::Yes;
+    if (has_flag(kind.state_questions, SelectorMatching::ElementStateQuestions::Link) && element.matches_link_pseudo_class() && style_engine.local_link_is_known_untested()) {
+        ask_local_link = SelectorMatching::AskLocalLink::No;
+        style_engine.note_local_link_state_withheld();
+    }
+    auto ask_validity = SelectorMatching::AskValidity::Yes;
+    // A custom element's definition can make it a control, whatever its name settles.
+    if ((has_flag(kind.state_questions, SelectorMatching::ElementStateQuestions::Control) || element.has_custom_element_definition())
+        && SelectorMatching::element_can_have_validity(element) && style_engine.validity_is_known_untested()) {
+        ask_validity = SelectorMatching::AskValidity::No;
+        style_engine.note_validity_state_withheld();
+    }
+    auto states = SelectorMatching::element_states(element, kind.state_questions, publication.focus_within_chain(), ask_local_link, ask_validity);
+    u64 state_bits = 0;
+    states.for_each_set([&](PseudoClass pseudo_class) {
+        if (auto fact = state_fact_for(pseudo_class); fact.has_value())
+            state_bits |= static_cast<u64>(1) << to_underlying(*fact);
     });
 
-    auto states = SelectorMatching::element_states(element);
-    for (size_t index = 0; index < to_underlying(PseudoClass::__Count); ++index) {
-        auto pseudo_class = static_cast<PseudoClass>(index);
-        // The engine's hover chain holds `:hover`, which the hover follows to an element that arrives hovered.
-        if (pseudo_class == PseudoClass::Hover || !states.get(pseudo_class))
-            continue;
-        auto fact = state_fact_for(pseudo_class);
-        if (fact.has_value())
-            style_engine.record_state_delta({ .node = node.value(), .fact = *fact, .new_value = true });
+    auto inherited = publication.inherited_by(element);
+    ElementPublication::Inherited own;
+    own.language_atom = inherited.has_value() && !has_own_language ? inherited->language_atom : publication.language_atom_asked_of(element);
+    auto directionality = has_own_directionality ? element.directionality_unless_from_parent() : Optional<DOM::Element::Directionality> {};
+    own.directionality = directionality.value_or_lazy_evaluated([&] {
+        return inherited.has_value() ? inherited->directionality : element.directionality();
+    });
+    if (auto const* shadow_root = as_if<DOM::ShadowRoot>(element.parent())) {
+        own.is_in_user_agent_shadow_tree = shadow_root->is_user_agent_internal();
+    } else if (inherited.has_value()) {
+        own.is_in_user_agent_shadow_tree = inherited->is_in_user_agent_shadow_tree;
+    } else {
+        auto const* containing_shadow_root = element.containing_shadow_root().ptr();
+        own.is_in_user_agent_shadow_tree = containing_shadow_root && containing_shadow_root->is_user_agent_internal();
     }
+    publication.published(element, own);
 
-    // The tag is computed afresh and not left cached. One cached where the element used to be says nothing about where
-    // it arrives, as a subtree that moves while detached is never reached by the walk a `lang` change runs, and one
-    // read now may not be final, as an XML parser sets attributes after insertion.
-    element.invalidate_lang_value();
-    auto const language = element.lang_view();
-    auto language_atom = language.has_value() ? style_engine.intern_language_atom(*language) : StyleAtomID {};
-    auto const directionality = element.directionality() == DOM::Element::Directionality::Rtl ? "rtl"_utf16_fly_string : "ltr"_utf16_fly_string;
-    auto directionality_atom = style_engine.intern_atom(directionality);
-    element.invalidate_lang_value();
+    u8 heading_level = 0;
+    if (has_flag(kind.open_facts, ElementOpenFacts::Heading))
+        heading_level = static_cast<u8>(min(as<HTML::HTMLHeadingElement>(element).heading_level(), 255u));
 
-    GC::Ptr<HTML::HTMLHeadingElement const> heading = as_if<HTML::HTMLHeadingElement>(element);
-    auto heading_level = static_cast<u8>(min(heading ? heading->heading_level() : 0, 255u));
-
-    Vector<StyleAtomID> custom_states;
-    if (auto states = element.custom_state_set()) {
-        for (auto const& state : states->states())
-            custom_states.append(style_engine.intern_atom(state));
-    }
-    style_engine.record_element_arrival({
+    publication.append_row(element, {
+                                        .arrival = {
+                                            .states = state_bits,
                                             .node = node.value(),
-                                            .namespace_atom = namespace_atom.value(),
-                                            .language_atom = language_atom.value(),
-                                            .directionality_atom = directionality_atom.value(),
-                                            .custom_state_offset = 0,
-                                            .custom_state_count = 0,
+                                            .tag_atom = kind.tag_atom.value(),
+                                            .folded_tag_atom = kind.folded_tag_atom.value(),
+                                            .id_atom = id_atom.value(),
+                                            .namespace_atom = kind.namespace_atom.value(),
+                                            .language_atom = own.language_atom.value(),
+                                            .directionality_atom = publication.directionality_atom(own.directionality).value(),
+                                            .custom_state_count = static_cast<u32>(custom_state_count),
+                                            .class_count = static_cast<u32>(class_count),
+                                            .attribute_count = static_cast<u32>(attribute_count),
                                             .heading_level = heading_level,
-                                            .is_slot = is_slot,
+                                            .is_slot = kind.is_slot,
+                                            .has_text_content = has_nonempty_text_child,
                                             .associated_pseudo_kind_plus_one = associated_pseudo_kind_plus_one(element),
                                             .box_kind = to_underlying(box_kind_for_layout(element)),
-                                            .adjustment_facts = element_style_adjustment_facts(element),
-                                            .construction_facts = element_construction_facts(element),
+                                            .adjustment_facts = kind.adjustment_facts | open_style_adjustment_facts(element, kind.open_facts),
+                                            .construction_facts = kind.construction_facts | open_construction_facts(element, kind.open_facts, own.is_in_user_agent_shadow_tree),
                                         },
-        custom_states);
-    // The hover follows the element the events hover to where it arrives, the place a move took it to.
-    if (&element == hovered_element_of(element.document().hovered_node()))
-        style_engine.record_hover(node);
+                                        .unique_node_id = arriving.has_value() ? arriving->unique_node_id : 0,
+                                        .relations = arriving.has_value() ? arriving->relations : detached_relations(),
+                                        .has_relations = arriving.has_value(),
+                                    });
 }
 
 // An element's hints move when something beside its own attributes that they are mapped from
@@ -1053,35 +1423,33 @@ void republish_presentational_hints(DOM::Element& element)
     record_element_declarations_changed(element, ElementDeclarationKind::SvgPresentationAttribute, true, true);
 }
 
-static bool element_has_presentational_hints_to_publish(DOM::Element const& element)
+static bool element_has_presentational_hints_to_publish(DOM::Element const& element, ElementKind const& kind)
 {
-    if (element.publishes_presentational_hints_on_arrival())
-        return true;
-    // A table cell can take hints from its table's border and cellpadding, and an image from its
-    // <picture>'s <source>, without a presentational attribute of its own.
-    if (element.namespace_uri() == Namespace::HTML && first_is_one_of(element.local_name(), HTML::TagNames::td, HTML::TagNames::th, HTML::TagNames::img))
-        return true;
+    if (has_flag(kind.open_facts, ElementOpenFacts::PresentationalHints)) {
+        if (element.publishes_presentational_hints_on_arrival())
+            return true;
+        // A table cell can take hints from its table's border and cellpadding, and an image from its
+        // <picture>'s <source>, without a presentational attribute of its own.
+        if (element.namespace_uri() == Namespace::HTML && first_is_one_of(element.local_name(), HTML::TagNames::td, HTML::TagNames::th, HTML::TagNames::img))
+            return true;
+        // The cascade also reads the width and height attributes of an element that supports them.
+        if (element.supports_dimension_attributes()
+            && (element.has_attribute(HTML::AttributeNames::width) || element.has_attribute(HTML::AttributeNames::height)))
+            return true;
+        // A body takes its margins from its frame's marginwidth and marginheight.
+        if (is<HTML::HTMLBodyElement>(element)) {
+            if (auto navigable = element.document().navigable(); navigable && navigable->container()
+                && (navigable->container()->has_attribute(HTML::AttributeNames::marginwidth) || navigable->container()->has_attribute(HTML::AttributeNames::marginheight)))
+                return true;
+        }
+    }
     // A body's link, vlink and alink attributes are presentational hints on every link, by the
     // link's :link, :visited and :active state.
-    if ((element.matches_link_pseudo_class() || element.matches_visited_pseudo_class())
+    if (has_flag(kind.state_questions, SelectorMatching::ElementStateQuestions::Link)
+        && (element.matches_link_pseudo_class() || element.matches_visited_pseudo_class())
         && (element.document().normal_link_color().has_value() || element.document().visited_link_color().has_value() || element.document().active_link_color().has_value()))
         return true;
-    // The cascade also reads the width and height attributes of an element that supports them.
-    if (element.supports_dimension_attributes()
-        && (element.has_attribute(HTML::AttributeNames::width) || element.has_attribute(HTML::AttributeNames::height)))
-        return true;
-    // A body takes its margins from its frame's marginwidth and marginheight.
-    if (is<HTML::HTMLBodyElement>(element)) {
-        if (auto navigable = element.document().navigable(); navigable && navigable->container()
-            && (navigable->container()->has_attribute(HTML::AttributeNames::marginwidth) || navigable->container()->has_attribute(HTML::AttributeNames::marginheight)))
-            return true;
-    }
-    bool has_presentational_hint = false;
-    element.for_each_attribute([&](Utf16FlyString const& name, Utf16View) {
-        if (!has_presentational_hint && element.is_presentational_hint(name))
-            has_presentational_hint = true;
-    });
-    return has_presentational_hint;
+    return any_of(element.attribute_list(), [&](auto const& attribute) { return element.is_presentational_hint(attribute.name.as_string()); });
 }
 
 // The element facts the style computation's box-type transformation and element style adjustments
@@ -1137,7 +1505,7 @@ enum ElementStyleAdjustmentFact : u32 {
 // tree build can read it out of the mirror rather than off the DOM node. Mirrors Rust `element_construction_fact`.
 enum ElementConstructionFact : u32 {
     IsHtmlInputElement = 1 << 0,
-    // This and ConstructedAsDocumentElement are also ElementStyleAdjustmentFacts. A row is built out of this word
+    // This and ConstructedAsDocumentElement are also ElementStyleAdjustmentFact bits. A row is built out of this word
     // alone, so they are published into both rather than read across two.
     ConstructedAsHtmlHtmlElement = 1 << 1,
     IsInUserAgentShadowTree = 1 << 2,
@@ -1147,6 +1515,7 @@ enum ElementConstructionFact : u32 {
     ConstructedAsDocumentElement = 1 << 6,
     IsSvgResourceElement = 1 << 7,
     IsSvgGeometryElement = 1 << 8,
+    IsHtmlSelectElement = 1 << 9,
     // The layout algorithm a MathML element's tag name selects, as a MathMLLayoutKind in these bits.
     MathMLLayoutKindShift = 16,
     MathMLLayoutKindMask = 0x1f << MathMLLayoutKindShift,
@@ -1223,63 +1592,46 @@ static MathMLLayoutKind mathml_layout_kind(DOM::Element const& element)
     // Unknown MathML elements behave the same as the <mrow> element.
     return MathMLLayoutKind::Mrow;
 }
-u32 element_box_type_adjustment_facts(DOM::Element const& element)
+static ElementOpenFacts element_open_facts(DOM::Element const& element)
+{
+    bool is_html_element = element.namespace_uri() == Namespace::HTML;
+    bool is_svg_element = element.namespace_uri() == Namespace::SVG;
+    auto const& local_name = element.local_name();
+    auto facts = ElementOpenFacts::None;
+    auto set = [&](bool condition, ElementOpenFacts fact) {
+        if (condition)
+            facts |= fact;
+    };
+    auto is_input = is<HTML::HTMLInputElement>(element);
+    auto is_body = is<HTML::HTMLBodyElement>(element);
+    set(is_input, ElementOpenFacts::Input);
+    set(is_html_element && local_name == HTML::TagNames::audio, ElementOpenFacts::Audio);
+    set(is_svg_element && local_name == "svg"sv, ElementOpenFacts::SvgRoot);
+    set(is_svg_element && local_name == "symbol"sv, ElementOpenFacts::SvgSymbol);
+    set(is<SVG::SVGElement>(element), ElementOpenFacts::SvgElement);
+    set(is_body || is<HTML::HTMLFrameSetElement>(element), ElementOpenFacts::Body);
+    set(is<HTML::HTMLHeadingElement>(element), ElementOpenFacts::Heading);
+    set(is_input || is<HTML::HTMLTextAreaElement>(element) || is<HTML::HTMLImageElement>(element) || is<HTML::HTMLObjectElement>(element) || is<HTML::HTMLVideoElement>(element)
+            || is<SVG::SVGImageElement>(element) || is<HTML::HTMLCanvasElement>(element),
+        ElementOpenFacts::ReplacedContent);
+    set(is_input || local_name == HTML::TagNames::bdi, ElementOpenFacts::OwnDirectionality);
+    set(is_body || is_input || element.publishes_presentational_hints_on_arrival() || element.supports_dimension_attributes()
+            || (is_html_element && first_is_one_of(local_name, HTML::TagNames::td, HTML::TagNames::th, HTML::TagNames::img)),
+        ElementOpenFacts::PresentationalHints);
+    return facts;
+}
+
+// The box-type adjustment facts every element of a name shares.
+static u32 kind_box_type_adjustment_facts(DOM::Element const& element)
 {
     bool is_html_element = element.namespace_uri() == Namespace::HTML;
     bool is_svg_element = element.namespace_uri() == Namespace::SVG;
     bool is_mathml_element = element.namespace_uri() == Namespace::MathML;
     auto local_name = element.local_name();
 
-    bool input_allows_adjustment = false;
-    bool input_is_single_line = false;
-    if (is<HTML::HTMLInputElement>(element)) {
-        auto const& input = static_cast<HTML::HTMLInputElement const&>(element);
-        input_allows_adjustment = !first_is_one_of(
-            input.type_state(),
-            HTML::HTMLInputElement::TypeAttributeState::Hidden,
-            HTML::HTMLInputElement::TypeAttributeState::SubmitButton,
-            HTML::HTMLInputElement::TypeAttributeState::Button,
-            HTML::HTMLInputElement::TypeAttributeState::ResetButton,
-            HTML::HTMLInputElement::TypeAttributeState::ImageButton,
-            HTML::HTMLInputElement::TypeAttributeState::Checkbox,
-            HTML::HTMLInputElement::TypeAttributeState::RadioButton);
-        input_is_single_line = input_allows_adjustment && input.is_single_line();
-    }
-
-    bool is_outermost_svg_element = false;
-    bool force_position_static = false;
-    if (is_svg_element) {
-        force_position_static = true;
-        if (local_name == "svg"sv) {
-            is_outermost_svg_element = true;
-            for (auto ancestor = element.parent_element(); ancestor; ancestor = ancestor->parent_element()) {
-                if (ancestor->namespace_uri() == Namespace::SVG && ancestor->local_name() == "foreignObject"sv)
-                    break;
-                if (ancestor->namespace_uri() == Namespace::SVG && ancestor->local_name() == "svg"sv) {
-                    is_outermost_svg_element = false;
-                    break;
-                }
-            }
-            force_position_static = !is_outermost_svg_element;
-        }
-    }
-
-    bool force_symbol_display_inline = false;
-    if (is_svg_element && local_name == "symbol"sv) {
-        if (auto* shadow_root = as_if<DOM::ShadowRoot>(element.parent())) {
-            if (auto* host = shadow_root->host())
-                force_symbol_display_inline = host->namespace_uri() == Namespace::SVG && host->local_name() == "use"sv;
-        }
-    }
-
     bool display_contents_computes_to_none = false;
 
     // https://drafts.csswg.org/css-display-3/#unbox-svg
-    // - An svg element that has CSS box layout (this includes all svg whose parent is an HTML element, as well as
-    //   document root elements):
-    //     display: contents computes to display: none.
-    display_contents_computes_to_none |= is_outermost_svg_element;
-
     // - All other SVG container elements that are also renderable elements
     // - SVG text content child elements
     // - <use>
@@ -1301,50 +1653,153 @@ u32 element_box_type_adjustment_facts(DOM::Element const& element)
     };
     set(is<HTML::HTMLBRElement>(element), ElementStyleAdjustmentFact::IsBr);
     set(is_html_element && local_name == HTML::TagNames::wbr, ElementStyleAdjustmentFact::IsWbr);
-    set(input_allows_adjustment || display_contents_computes_to_none || (is_html_element && first_is_one_of(local_name, HTML::TagNames::textarea, HTML::TagNames::audio, HTML::TagNames::video, HTML::TagNames::canvas, HTML::TagNames::object, HTML::TagNames::iframe, HTML::TagNames::progress, HTML::TagNames::embed, HTML::TagNames::frame, HTML::TagNames::meter, HTML::TagNames::frameset, HTML::TagNames::img)), ElementStyleAdjustmentFact::DisallowDisplayContents);
-    set(input_allows_adjustment || (is_html_element && first_is_one_of(local_name, HTML::TagNames::textarea, HTML::TagNames::audio, HTML::TagNames::video, HTML::TagNames::select)), ElementStyleAdjustmentFact::RewriteInlineFlow);
+    set(display_contents_computes_to_none || (is_html_element && first_is_one_of(local_name, HTML::TagNames::textarea, HTML::TagNames::audio, HTML::TagNames::video, HTML::TagNames::canvas, HTML::TagNames::object, HTML::TagNames::iframe, HTML::TagNames::progress, HTML::TagNames::embed, HTML::TagNames::frame, HTML::TagNames::meter, HTML::TagNames::frameset, HTML::TagNames::img)), ElementStyleAdjustmentFact::DisallowDisplayContents);
+    set(is_html_element && first_is_one_of(local_name, HTML::TagNames::textarea, HTML::TagNames::audio, HTML::TagNames::video, HTML::TagNames::select), ElementStyleAdjustmentFact::RewriteInlineFlow);
     set(is_html_element && local_name == HTML::TagNames::button, ElementStyleAdjustmentFact::IsButton);
     set(is_html_element && local_name == HTML::TagNames::select, ElementStyleAdjustmentFact::ForceLineHeightNormal);
-    set(input_is_single_line, ElementStyleAdjustmentFact::CheckInputLineHeight);
-    set(is_html_element && local_name == HTML::TagNames::audio && !element.has_attribute(HTML::AttributeNames::controls), ElementStyleAdjustmentFact::HideAudioWithoutControls);
     set(is_html_element && local_name == HTML::TagNames::table, ElementStyleAdjustmentFact::IsTable);
-    set(force_position_static, ElementStyleAdjustmentFact::ForcePositionStatic);
-    set(force_symbol_display_inline, ElementStyleAdjustmentFact::ForceSymbolDisplayInline);
+    set(is_svg_element && local_name != "svg"sv, ElementStyleAdjustmentFact::ForcePositionStatic);
     set(is_mathml_element, ElementStyleAdjustmentFact::IsMathML);
     set(local_name.equals_ignoring_ascii_case("mtable"sv), ElementStyleAdjustmentFact::IsMathMLMtable);
     set(local_name.equals_ignoring_ascii_case("mtr"sv), ElementStyleAdjustmentFact::IsMathMLMtr);
     set(local_name.equals_ignoring_ascii_case("mtd"sv), ElementStyleAdjustmentFact::IsMathMLMtd);
     set(is_html_element && local_name.equals_ignoring_ascii_case(HTML::TagNames::th), ElementStyleAdjustmentFact::IsTh);
+    return facts;
+}
+
+// The box-type adjustment facts that hang on the element itself or on where it stands.
+static u32 open_box_type_adjustment_facts(DOM::Element const& element, ElementOpenFacts open_facts)
+{
+    u32 facts = 0;
+    auto set = [&](bool condition, ElementStyleAdjustmentFact fact) {
+        if (condition)
+            facts |= fact;
+    };
+
+    if (has_flag(open_facts, ElementOpenFacts::Input)) {
+        auto const& input = static_cast<HTML::HTMLInputElement const&>(element);
+        bool input_allows_adjustment = !first_is_one_of(
+            input.type_state(),
+            HTML::HTMLInputElement::TypeAttributeState::Hidden,
+            HTML::HTMLInputElement::TypeAttributeState::SubmitButton,
+            HTML::HTMLInputElement::TypeAttributeState::Button,
+            HTML::HTMLInputElement::TypeAttributeState::ResetButton,
+            HTML::HTMLInputElement::TypeAttributeState::ImageButton,
+            HTML::HTMLInputElement::TypeAttributeState::Checkbox,
+            HTML::HTMLInputElement::TypeAttributeState::RadioButton);
+        set(input_allows_adjustment, ElementStyleAdjustmentFact::DisallowDisplayContents);
+        set(input_allows_adjustment, ElementStyleAdjustmentFact::RewriteInlineFlow);
+        set(input_allows_adjustment && input.is_single_line(), ElementStyleAdjustmentFact::CheckInputLineHeight);
+    }
+
+    if (has_flag(open_facts, ElementOpenFacts::SvgRoot)) {
+        bool is_outermost_svg_element = true;
+        for (auto ancestor = element.parent_element(); ancestor; ancestor = ancestor->parent_element()) {
+            if (ancestor->namespace_uri() == Namespace::SVG && ancestor->local_name() == "foreignObject"sv)
+                break;
+            if (ancestor->namespace_uri() == Namespace::SVG && ancestor->local_name() == "svg"sv) {
+                is_outermost_svg_element = false;
+                break;
+            }
+        }
+        set(!is_outermost_svg_element, ElementStyleAdjustmentFact::ForcePositionStatic);
+
+        // https://drafts.csswg.org/css-display-3/#unbox-svg
+        // - An svg element that has CSS box layout (this includes all svg whose parent is an HTML element, as well as
+        //   document root elements):
+        //     display: contents computes to display: none.
+        set(is_outermost_svg_element, ElementStyleAdjustmentFact::DisallowDisplayContents);
+    }
+
+    if (has_flag(open_facts, ElementOpenFacts::SvgSymbol)) {
+        if (auto* shadow_root = as_if<DOM::ShadowRoot>(element.parent())) {
+            if (auto* host = shadow_root->host())
+                set(host->namespace_uri() == Namespace::SVG && host->local_name() == "use"sv, ElementStyleAdjustmentFact::ForceSymbolDisplayInline);
+        }
+    }
+
+    set(has_flag(open_facts, ElementOpenFacts::Audio) && !element.has_attribute(HTML::AttributeNames::controls), ElementStyleAdjustmentFact::HideAudioWithoutControls);
     set(element.is_document_element(), ElementStyleAdjustmentFact::IsDocumentElement);
     return facts;
 }
 
-static u32 element_construction_facts(DOM::Element const& element)
+u32 element_box_type_adjustment_facts(DOM::Element const& element)
+{
+    return kind_box_type_adjustment_facts(element) | open_box_type_adjustment_facts(element, element_open_facts(element));
+}
+
+// The construction facts every element of a name shares.
+static u32 kind_construction_facts(DOM::Element const& element)
 {
     u32 facts = 0;
     auto set = [&](bool condition, ElementConstructionFact fact) {
         if (condition)
             facts |= fact;
     };
-    auto shadow_root = element.containing_shadow_root();
     auto const* html_element = as_if<HTML::HTMLElement>(element);
-    auto const* svg_element = as_if<SVG::SVGElement>(element);
-    set(is<HTML::HTMLInputElement>(element), ElementConstructionFact::IsHtmlInputElement);
+    auto is_input = is<HTML::HTMLInputElement>(element);
+    set(is_input, ElementConstructionFact::IsHtmlInputElement);
     set(element.is_html_html_element(), ElementConstructionFact::ConstructedAsHtmlHtmlElement);
-    set(shadow_root && shadow_root->is_user_agent_internal(), ElementConstructionFact::IsInUserAgentShadowTree);
-    set(html_element && html_element->uses_button_layout(), ElementConstructionFact::UsesButtonLayout);
-    set(element.is_editing_host(), ElementConstructionFact::IsEditingHost);
-    set(&element == element.document().body(), ElementConstructionFact::IsBody);
-    set(element.is_document_element(), ElementConstructionFact::ConstructedAsDocumentElement);
-    set(svg_element && svg_element->is_resource_element(), ElementConstructionFact::IsSvgResourceElement);
+    set(!is_input && html_element && html_element->uses_button_layout(), ElementConstructionFact::UsesButtonLayout);
     set(element.is_svg_geometry_element(), ElementConstructionFact::IsSvgGeometryElement);
+    set(is<HTML::HTMLSelectElement>(element), ElementConstructionFact::IsHtmlSelectElement);
     facts |= to_underlying(mathml_layout_kind(element)) << ElementConstructionFact::MathMLLayoutKindShift;
     return facts;
 }
 
-static u32 element_style_adjustment_facts(DOM::Element const& element)
+// The construction facts that hang on the element itself or on where it stands.
+static u32 open_construction_facts(DOM::Element const& element, ElementOpenFacts open_facts, bool is_in_user_agent_shadow_tree)
 {
-    auto facts = element_box_type_adjustment_facts(element);
+    u32 facts = 0;
+    auto set = [&](bool condition, ElementConstructionFact fact) {
+        if (condition)
+            facts |= fact;
+    };
+    set(is_in_user_agent_shadow_tree, ElementConstructionFact::IsInUserAgentShadowTree);
+    set(has_flag(open_facts, ElementOpenFacts::Input) && static_cast<HTML::HTMLInputElement const&>(element).uses_button_layout(), ElementConstructionFact::UsesButtonLayout);
+    set(element.may_be_editable_or_editing_host() && element.is_editing_host(), ElementConstructionFact::IsEditingHost);
+    // NB: The document's body is found by walking its html element's children, which only these elements need to do.
+    set(has_flag(open_facts, ElementOpenFacts::Body) && &element == element.document().body(), ElementConstructionFact::IsBody);
+    set(element.is_document_element(), ElementConstructionFact::ConstructedAsDocumentElement);
+    set(has_flag(open_facts, ElementOpenFacts::SvgElement) && static_cast<SVG::SVGElement const&>(element).is_resource_element(), ElementConstructionFact::IsSvgResourceElement);
+    return facts;
+}
+
+static u32 element_construction_facts(DOM::Element const& element)
+{
+    auto shadow_root = element.containing_shadow_root();
+    return kind_construction_facts(element) | open_construction_facts(element, element_open_facts(element), shadow_root && shadow_root->is_user_agent_internal());
+}
+
+// The style adjustment facts every element of a name shares.
+static u32 kind_style_adjustment_facts(DOM::Element const& element)
+{
+    auto facts = kind_box_type_adjustment_facts(element);
+    auto set = [&](bool condition, ElementStyleAdjustmentFact fact) {
+        if (condition)
+            facts |= fact;
+    };
+    set(element.is_html_html_element(), ElementStyleAdjustmentFact::IsHtmlHtmlElement);
+    set(is<HTML::HTMLBodyElement>(element), ElementStyleAdjustmentFact::IsHtmlBodyElement);
+    if (is<SVG::SVGElement>(element)) {
+        facts |= ElementStyleAdjustmentFact::IsSvgElement;
+        set(is<SVG::SVGGraphicsElement>(element), ElementStyleAdjustmentFact::IsSvgGraphicsElement);
+        set(is<SVG::SVGSwitchElement>(element), ElementStyleAdjustmentFact::IsSvgSwitchElement);
+        set(element.is_svg_container(), ElementStyleAdjustmentFact::IsSvgContainer);
+        set(element.requires_svg_container(), ElementStyleAdjustmentFact::RequiresSvgContainer);
+        set(element.is_svg_foreign_object_element(), ElementStyleAdjustmentFact::IsSvgForeignObjectElement);
+        set(is<SVG::SVGMaskElement>(element), ElementStyleAdjustmentFact::IsSvgMaskElement);
+        set(is<SVG::SVGClipPathElement>(element), ElementStyleAdjustmentFact::IsSvgClipPathElement);
+        set(is<SVG::SVGPatternElement>(element), ElementStyleAdjustmentFact::IsSvgPatternElement);
+    }
+    set(is<HTML::HTMLFrameSetElement>(element), ElementStyleAdjustmentFact::IsHtmlFramesetElement);
+    return facts;
+}
+
+// The style adjustment facts that hang on the element itself or on where it stands.
+static u32 open_style_adjustment_facts(DOM::Element const& element, ElementOpenFacts open_facts)
+{
+    auto facts = open_box_type_adjustment_facts(element, open_facts);
     auto set = [&](bool condition, ElementStyleAdjustmentFact fact) {
         if (condition)
             facts |= fact;
@@ -1354,20 +1809,13 @@ static u32 element_style_adjustment_facts(DOM::Element const& element)
     // which its timeline can make it after the element's arrival.
     set(element.has_relevant_animations() || element.has_associated_animations(), ElementStyleAdjustmentFact::HasAnimations);
     set(element.associated_shadow_host_pseudo_element().has_value(), ElementStyleAdjustmentFact::IsShadowHostPseudoElement);
-    set(is<SVG::SVGElement>(element), ElementStyleAdjustmentFact::IsSvgElement);
-    set(is<SVG::SVGGraphicsElement>(element), ElementStyleAdjustmentFact::IsSvgGraphicsElement);
-    set(element.is_html_html_element(), ElementStyleAdjustmentFact::IsHtmlHtmlElement);
-    set(is<HTML::HTMLBodyElement>(element), ElementStyleAdjustmentFact::IsHtmlBodyElement);
-    set(is<SVG::SVGSwitchElement>(element), ElementStyleAdjustmentFact::IsSvgSwitchElement);
-    set(element.is_svg_container(), ElementStyleAdjustmentFact::IsSvgContainer);
-    set(element.requires_svg_container(), ElementStyleAdjustmentFact::RequiresSvgContainer);
-    set(element.is_svg_foreign_object_element(), ElementStyleAdjustmentFact::IsSvgForeignObjectElement);
-    set(is<SVG::SVGMaskElement>(element), ElementStyleAdjustmentFact::IsSvgMaskElement);
-    set(is<SVG::SVGClipPathElement>(element), ElementStyleAdjustmentFact::IsSvgClipPathElement);
-    set(is<SVG::SVGPatternElement>(element), ElementStyleAdjustmentFact::IsSvgPatternElement);
     set(element.rendered_in_top_layer(), ElementStyleAdjustmentFact::RenderedInTopLayer);
-    set(is<HTML::HTMLFrameSetElement>(element), ElementStyleAdjustmentFact::IsHtmlFramesetElement);
     return facts;
+}
+
+static u32 element_style_adjustment_facts(DOM::Element const& element)
+{
+    return kind_style_adjustment_facts(element) | open_style_adjustment_facts(element, element_open_facts(element));
 }
 
 void record_element_adjustment_facts(DOM::Element& element)
@@ -1378,14 +1826,13 @@ void record_element_adjustment_facts(DOM::Element& element)
     StyleEngineFFI::style_engine_set_element_adjustment_facts(style_engine->host(), element.style_node_id(), element_style_adjustment_facts(element));
     StyleEngineFFI::style_engine_set_element_construction_facts(style_engine->host(), element.style_node_id(), element_construction_facts(element));
     StyleEngineFFI::style_engine_set_element_box_kind(style_engine->host(), element.style_node_id(), to_underlying(box_kind_for_layout(element)));
-    StyleEngineFFI::style_engine_set_element_associated_pseudo_kind(style_engine->host(), element.style_node_id(), associated_pseudo_kind_plus_one(element));
+    auto pseudo_kind_plus_one = associated_pseudo_kind_plus_one(element);
+    StyleEngineFFI::style_engine_set_element_backing_pseudo_kind(style_engine->host(), element.style_node_id(), pseudo_kind_plus_one);
 }
 
 void record_element_animations_changed(DOM::Element& element)
 {
     record_element_adjustment_facts(element);
-    if (auto* style_engine = style_engine_for_identified(element))
-        style_engine->note_animations_changed(element.style_node_id());
 }
 
 void record_element_box_kind(DOM::Element& element)
@@ -1437,31 +1884,34 @@ static void set_image_natural_size_input(StyleEngine& style_engine, StyleNodeID 
 // element's box: what its attributes say, or the size of what it has loaded.
 void record_element_replaced_content_input(DOM::Element& element)
 {
+    if (auto* style_engine = style_engine_for_identified(element))
+        publish_element_replaced_content_input(element, *style_engine);
+}
+
+static void publish_element_replaced_content_input(DOM::Element& element, StyleEngine& style_engine)
+{
     using Kind = StyleEngineFFI::FfiReplacedContentInputKind;
-    auto* style_engine = style_engine_for_identified(element);
-    if (!style_engine)
-        return;
     auto node = element.style_node_id();
     if (auto const* text_area = as_if<HTML::HTMLTextAreaElement>(element)) {
-        set_replaced_content_input(*style_engine, node, Kind::TextArea, 0, text_area->cols(), text_area->rows());
+        set_replaced_content_input(style_engine, node, Kind::TextArea, 0, text_area->cols(), text_area->rows());
         return;
     }
     if (auto const* image = as_if<HTML::HTMLImageElement>(element)) {
-        set_image_natural_size_input(*style_engine, node, *image);
+        set_image_natural_size_input(style_engine, node, *image);
         return;
     }
     if (auto const* object = as_if<HTML::HTMLObjectElement>(element)) {
         // An object representing its content navigable is sized from the SVG document it shows.
         if (object->represents_its_content_navigable())
-            set_natural_size_input(*style_engine, node, object->natural_size_of_content_document());
+            set_natural_size_input(style_engine, node, object->natural_size_of_content_document());
         else
-            set_image_natural_size_input(*style_engine, node, *object);
+            set_image_natural_size_input(style_engine, node, *object);
         return;
     }
     if (auto const* input = as_if<HTML::HTMLInputElement>(element)) {
         // An image button's box is an image box, which no size attribute sizes.
         if (input->type_state() == HTML::HTMLInputElement::TypeAttributeState::ImageButton) {
-            set_image_natural_size_input(*style_engine, node, *input);
+            set_image_natural_size_input(style_engine, node, *input);
             return;
         }
         auto kind = Kind::Input;
@@ -1478,7 +1928,7 @@ void record_element_replaced_content_input(DOM::Element& element)
         default:
             break;
         }
-        set_replaced_content_input(*style_engine, node, kind, 0, input->size());
+        set_replaced_content_input(style_engine, node, kind, 0, input->size());
         return;
     }
     if (auto const* video = as_if<HTML::HTMLVideoElement>(element)) {
@@ -1489,18 +1939,18 @@ void record_element_replaced_content_input(DOM::Element& element)
             else
                 natural_size = { size->width(), size->height(), size->width() / size->height() };
         }
-        set_natural_size_input(*style_engine, node, natural_size);
+        set_natural_size_input(style_engine, node, natural_size);
         return;
     }
     if (auto const* image = as_if<SVG::SVGImageElement>(element)) {
         // An SVG <image> takes its image's natural size as the image reports it, and the default object size once
         // something has decoded.
-        set_natural_size_input(*style_engine, node, { image->intrinsic_width(), image->intrinsic_height(), image->intrinsic_aspect_ratio() },
+        set_natural_size_input(style_engine, node, { image->intrinsic_width(), image->intrinsic_height(), image->intrinsic_aspect_ratio() },
             image->decoded_image_data() ? Kind::DecodedSvgImage : Kind::NaturalSize);
         return;
     }
     if (auto const* canvas = as_if<HTML::HTMLCanvasElement>(element))
-        set_replaced_content_input(*style_engine, node, Kind::Canvas, 0, canvas->width(), canvas->height());
+        set_replaced_content_input(style_engine, node, Kind::Canvas, 0, canvas->width(), canvas->height());
 }
 
 void record_element_construction_facts(DOM::Element& element)
@@ -1511,13 +1961,51 @@ void record_element_construction_facts(DOM::Element& element)
     StyleEngineFFI::style_engine_set_element_construction_facts(style_engine->host(), element.style_node_id(), element_construction_facts(element));
 }
 
-void publish_required_attribute_value_texts(StyleEngine& style_engine, StyleComputer& style_computer)
+void publish_withheld_element_features(StyleEngine& style_engine, StyleComputer& style_computer, Layout::BegunRead const& read)
 {
-    style_computer.for_each_style_node([&](DOM::Element& element) {
-        element.for_each_attribute([&](DOM::QualifiedName const& name, Utf16String const& value) {
-            auto name_atom = style_engine.intern_attribute_name(name.local_name(), name.namespace_());
-            style_engine.backfill_attribute_value_text_if_required(name_atom, value);
-        });
+    auto now_read = style_engine.take_withheld_features_now_read(read);
+    if (!now_read.local_link_state && !now_read.validity_state && now_read.attributes.is_empty())
+        return;
+    auto local_link = state_fact_for(PseudoClass::LocalLink);
+    VERIFY(local_link.has_value());
+    struct NameNowRead {
+        StyleEngine::WithheldAttributeName name;
+        StyleAtomID atom;
+    };
+    Vector<NameNowRead, 2> names_now_read;
+    names_now_read.ensure_capacity(now_read.attributes.size());
+    for (auto const& name : now_read.attributes)
+        names_now_read.unchecked_append({ name, style_engine.intern_attribute_name(name.local_name, name.namespace_uri) });
+    // NB: A name comes to be read once in a document's life, so nothing is kept per element for it. An element whose
+    //     initial features still wait reads the names as they are by then.
+    style_computer.for_each_element_with_style_node([&](DOM::Element& element) {
+        if (!element.is_connected() || element.initial_style_features_pending())
+            return;
+        auto node = element.style_node_id();
+        if (now_read.local_link_state && element.matches_local_link_pseudo_class())
+            style_engine.record_state_delta({ .node = node.value(), .fact = *local_link, .new_value = true });
+        if (now_read.validity_state && SelectorMatching::element_can_have_validity(element))
+            Invalidation::record_validity_states(element);
+        for (auto const& [name, atom] : names_now_read) {
+            if (auto value = element.get_attribute_ns(name.namespace_uri, name.local_name); value.has_value()) {
+                style_engine.record_local_feature_delta({
+                    .node = node.value(),
+                    .feature_kind = StyleEngineFFI::FfiFeatureKind::Attribute,
+                    .name_atom = atom.value(),
+                    .new_kind = StyleEngineFFI::FfiFeatureValueKind::Atom,
+                    .new_atom = style_engine.intern_attribute_value(atom, *value).value(),
+                });
+            } else if (StyleEngineFFI::style_engine_row_holds_attribute(style_engine.host(), node.value(), atom.value())) {
+                // NB: The row holds a value published before the name was known to be unread, of an attribute removed since.
+                style_engine.record_local_feature_delta({
+                    .node = node.value(),
+                    .feature_kind = StyleEngineFFI::FfiFeatureKind::Attribute,
+                    .name_atom = atom.value(),
+                    .new_kind = StyleEngineFFI::FfiFeatureValueKind::Absent,
+                    .new_atom = 0,
+                });
+            }
+        }
     });
 }
 
@@ -1531,24 +2019,63 @@ static StyleAtomID intern_id_or_class_atom(StyleEngine& style_engine, DOM::Eleme
     return style_engine.intern_atom(name);
 }
 
-static void record_element_initial_features(DOM::Element& element)
+// Writes the block of rows the publication gathered, and what is published of their elements beside their rows.
+static void finish_element_publication(StyleEngine& style_engine, ElementPublication& publication)
 {
-    auto* style_engine = style_engine_for_identified(element);
-    if (!style_engine)
+    for (auto element : publication.write_block()) {
+        // The hover follows the element the events hover to where it arrives, the place a move took it to.
+        if (element.ptr() == publication.hovered_element())
+            style_engine.record_hover(element->style_node_id());
+        if (auto const& id = element->id(); id.has_value())
+            StyleEngineFFI::style_engine_set_element_id_name(style_engine.host(), element->style_node_id(), style_engine.intern_atom(*id));
+        if (!element->part_names().is_empty())
+            record_element_parts_changed(element);
+        if (element->has_inline_style_declarations())
+            record_element_inline_style_properties(element);
+        auto const& kind = publication.kind_of(element);
+        if (element_has_presentational_hints_to_publish(element, kind))
+            StyleComputer::collect_presentational_hint_properties({ element });
+        if (has_flag(kind.open_facts, ElementOpenFacts::ReplacedContent))
+            publish_element_replaced_content_input(element, style_engine);
+    }
+    publication.forget_block();
+}
+
+static void publish_element_arrival(StyleEngine& style_engine, DOM::Element& element, ElementPublication& publication, Optional<StyleEngineFFI::FfiArrivingElement const&> arriving)
+{
+    publish_element_selector_features(style_engine, element, publication, arriving);
+    if (publication.block_is_full())
+        finish_element_publication(style_engine, publication);
+}
+
+void publish_pending_element_features(StyleEngine& style_engine, StyleComputer& style_computer, Layout::BegunRead const& read)
+{
+    auto nodes = style_engine.take_deferred_element_initial_features();
+    if (nodes.is_empty())
         return;
-
-    publish_element_selector_features(*style_engine, element);
-
-    if (auto const& id = element.id(); id.has_value())
-        StyleEngineFFI::style_engine_set_element_id_name(style_engine->host(), element.style_node_id(), style_engine->intern_atom(*id));
-
-    if (!element.part_names().is_empty())
-        record_element_parts_changed(element);
-    if (element.has_inline_style_declarations())
-        record_element_inline_style_properties(element);
-    if (element_has_presentational_hints_to_publish(element))
-        StyleComputer::collect_presentational_hint_properties({ element });
-    record_element_replaced_content_input(element);
+    learn_what_the_engine_reads(style_engine, read);
+    ElementPublication publication { style_engine, style_computer.document() };
+    for (size_t index = 0; index < nodes.size(); ++index) {
+        prefetch_publication_ahead(index, nodes.size(), [&](size_t index) { return style_computer.node_for_style_node(nodes[index]).ptr(); });
+        auto node = nodes[index];
+        auto element = style_computer.element_for_style_node(node);
+        // NB: An element that left the tree gave up its mark. Its identity may have gone to an element since, which is
+        //     then listed twice and published at the first.
+        if (!element || !element->initial_style_features_pending())
+            continue;
+        // An inserted subtree takes its identities before its insertion steps mark its nodes connected, in tree order.
+        // A step that submits the recorded input on the way, as a <style> writing its sheet to the engine in place
+        // while a style update flies, finds the elements after it unconnected: their arrivals are submitted, and
+        // their features wait for the next submit, which folds them onto those arrivals.
+        if (!element->is_connected()) {
+            style_engine.defer_element_initial_features(*element);
+            continue;
+        }
+        element->set_initial_style_features_pending(false);
+        if (style_engine_for_identified(*element))
+            publish_element_arrival(style_engine, *element, publication);
+    }
+    finish_element_publication(style_engine, publication);
 }
 
 void record_node_moved_in_dom_order(DOM::Node& node, DOM::Node const& old_parent)
@@ -1562,7 +2089,7 @@ void record_node_moved_in_dom_order(DOM::Node& node, DOM::Node const& old_parent
     link_in_dom_order(*style_engine, node);
 }
 
-void record_element_moved(DOM::Element& element, DOM::Node* old_parent, DOM::Element* old_previous_sibling, DOM::Element* old_next_sibling)
+void record_element_moved(DOM::Element& element, DOM::Node* old_parent, DOM::Element* old_previous_sibling, DOM::Element* old_next_sibling, DOM::Element* old_assigned_slot)
 {
     auto* style_engine = style_engine_for_identified(element);
     if (!style_engine)
@@ -1580,13 +2107,15 @@ void record_element_moved(DOM::Element& element, DOM::Node* old_parent, DOM::Ele
         previous.parent = old_shadow_root->style_node_id().value();
     previous.previous_element_sibling = identity_of_arrived_previous_sibling(old_previous_sibling).value();
     previous.next_element_sibling = identity_of_arrived_next_sibling(old_next_sibling).value();
+    previous.assigned_slot = identity_of(old_assigned_slot).value();
+    if (old_parent)
+        previous.tree_scope = tree_scope_of(old_parent->root()).value();
     if (previous.parent == relations.parent
         && previous.previous_element_sibling == relations.previous_element_sibling
-        && previous.next_element_sibling == relations.next_element_sibling) {
+        && previous.next_element_sibling == relations.next_element_sibling
+        && previous.assigned_slot == relations.assigned_slot) {
         return;
     }
-    // A style transaction that flew styled the element where it was, and what inherits from it under where it was.
-    style_engine->note_style_node_arrived_or_retired(element.style_node_id());
 
     // A heading's level counts the heading offset its ancestors declare, so moving under a
     // different ancestor can change it without the element itself changing at all.
@@ -1616,6 +2145,26 @@ void record_element_moved(DOM::Element& element, DOM::Node* old_parent, DOM::Ele
         // matches exactly the same rules. Recomputing its style lets ordinary inherited-style
         // propagation carry any change through its light and shadow subtrees.
         style_engine->record_derived_element_style_input_change(element.style_node_id(), StyleEngine::RecomputeStyle);
+
+        // The tree the element's light descendants stand in moved with it, which they answer for themselves. Their own
+        // shadow trees are scopes of their own.
+        if (previous.tree_scope != relations.tree_scope) {
+            element.for_each_in_subtree_of_type<DOM::Element>([&](DOM::Element& descendant) {
+                if (descendant.style_node_id() == no_style_node)
+                    return TraversalDecision::Continue;
+                auto descendant_relations = relations_of(descendant, *style_engine, TreeScopeID { relations.tree_scope });
+                auto descendant_previous = descendant_relations;
+                descendant_previous.tree_scope = previous.tree_scope;
+                record_element_relinked(*style_engine, descendant.style_node_id(), descendant_previous, descendant_relations);
+                return TraversalDecision::Continue;
+            });
+            // The hosts it and those below it are exposed to as parts are those of the tree it stands in now.
+            element.for_each_shadow_including_inclusive_descendant([](DOM::Node& node) {
+                if (auto* moved = as_if<DOM::Element>(node))
+                    record_element_parts_changed(*moved);
+                return TraversalDecision::Continue;
+            });
+        }
     }
 
     // The relinking path rather than the neighbour one. A move rewrites the DOM's own links without
@@ -1624,21 +2173,17 @@ void record_element_moved(DOM::Element& element, DOM::Node* old_parent, DOM::Ele
     // them. Publishing this as a neighbour change leaves the columns holding the order the element
     // left, which is the order every positional question is then answered in.
     record_element_relinked(*style_engine, element.style_node_id(), previous, relations);
-
-    // A move across parents is a departure from one child list and an arrival in another, so both
-    // parents' emptiness can have moved even though no node was created or destroyed.
-    if (old_parent != element.parent()) {
-        if (auto* old_parent_element = as_if<DOM::Element>(old_parent))
-            record_element_emptiness_changed(*old_parent_element, element, true, false);
-        if (auto* new_parent = as_if<DOM::Element>(element.parent()))
-            record_element_emptiness_changed(*new_parent, element, false, true);
-    }
 }
 
 void record_element_assigned_slot_changed(DOM::Element& element, DOM::Element* old_slot)
 {
     auto* style_engine = style_engine_for_identified(element);
     if (!style_engine)
+        return;
+    // An element without a parent is between the removal and insertion steps of a move, or has
+    // left. The move or the departure publishes its relations: relinking it here would report it
+    // as having had no parent before, which a transaction keeps as where the element came from.
+    if (!element.parent())
         return;
 
     auto relations = relations_of(element, *style_engine);
@@ -1650,9 +2195,6 @@ void record_element_assigned_slot_changed(DOM::Element& element, DOM::Element* o
     // The engine holds the slot a slottable is assigned to, and only relinking updates it. Every other relation is
     // identical on both sides, so unlinking and linking again leaves them where they were.
     record_element_relinked(*style_engine, element.style_node_id(), previous, relations);
-    // A style transaction already running on the StyleLayout thread styled the element under its previous slot,
-    // as for a move.
-    style_engine->note_style_node_arrived_or_retired(element.style_node_id());
 }
 
 void record_slot_assignment_changed(HTML::HTMLSlotElement& slot)
@@ -1672,6 +2214,7 @@ void record_slot_assignment_changed(HTML::HTMLSlotElement& slot)
             identities.unchecked_append(identity);
     }
     StyleEngineFFI::style_engine_set_slot_assigned_nodes(slot.document().style_computer().style_engine().host(), slot.style_node_id(), identities.span());
+    Invalidation::invalidate_style_after_slot_assignment_changed(slot);
 }
 
 // Only a connected element in a fully active document enters the top layer. A member still waiting to arrive has no
@@ -1744,7 +2287,7 @@ static void record_element_disconnecting(DOM::Element& element, TreeScopeID tree
         }
     }
 
-    style_engine->cancel_deferred_element_initial_features(node);
+    style_engine->cancel_deferred_element_initial_features(element);
 
     style_engine->record_tree_delta({
         .node = node.value(),
@@ -1757,24 +2300,6 @@ static void record_element_disconnecting(DOM::Element& element, TreeScopeID tree
     // Dropping the identity is what makes a second removal a no-op rather than a double retirement.
     element.document().style_computer().unregister_style_node(node);
     element.set_style_node_id(no_style_node);
-}
-
-// The animation names an element's computed style references.
-//
-// Not an input: the element was recomputed by whatever moved its `animation-name`. This is the index
-// that lets a `@keyframes` rule find the elements running the animation it describes, which nothing
-// about selector matching can say.
-void record_element_animation_names(DOM::Element& element, ReadonlySpan<Utf16FlyString> names)
-{
-    auto* style_engine = style_engine_for_identified(element);
-    if (!style_engine)
-        return;
-
-    Vector<StyleAtomID> atoms;
-    atoms.ensure_capacity(names.size());
-    for (auto const& name : names)
-        atoms.unchecked_append(style_engine->intern_atom(name));
-    StyleEngineFFI::style_engine_set_element_animation_names(style_engine->host(), element.style_node_id(), atoms);
 }
 
 // The names of the CSS animations the element owns, in one of its per-pseudo-element lists, and the
@@ -1846,6 +2371,27 @@ static void describe_easing(EasingFunction const& easing, StyleEngineFFI::FfiPub
 //
 // Everything a keyframe declares that does not depend on the element being sampled is settled here. What
 // does, a value or an easing still to be substituted against the element, travels as written.
+void record_attr_names_read_by_keyframes(DOM::Element& element, Animations::KeyframeEffect const& effect)
+{
+    auto* style_engine = style_engine_for(element);
+    if (!style_engine || !effect.key_frame_set())
+        return;
+    bool reads_more_attributes = false;
+    for (auto const& keyframe : effect.key_frame_set()->keyframes_by_key) {
+        for (auto const& [property, value] : keyframe.properties) {
+            if (auto const* handle = value.get_pointer<RustStyleValueHandle>())
+                reads_more_attributes |= StyleEngineFFI::style_engine_note_attr_names_read_by_value(style_engine->host(), handle->data());
+        }
+        if (auto const* easing = keyframe.easing.get_pointer<RustStyleValueHandle>())
+            reads_more_attributes |= StyleEngineFFI::style_engine_note_attr_names_read_by_value(style_engine->host(), easing->data());
+    }
+    // NB: An effect is sampled against what the engine holds as a read begins, so the attributes go over
+    //     now. Only a script's keyframes get here with a new name, between reads: the keyframes of a CSS
+    //     animation were noted as their rule was published.
+    if (reads_more_attributes)
+        style_engine->flush();
+}
+
 void record_element_animation_effect_descriptions(DOM::Element& element, u8 slot, ReadonlySpan<GC::Ref<Animations::KeyframeEffect>> effects)
 {
     auto* style_engine = style_engine_for_identified(element);
@@ -1951,57 +2497,6 @@ void record_element_animation_effect_descriptions(DOM::Element& element, u8 slot
         base_url_bytes.data(), base_url_bytes.size());
 }
 
-// The custom properties an element declares or references.
-//
-// Also an index rather than an input, and for the same reason as the animation names: what it answers
-// is which elements an `@property` registration reaches, and nothing about selector matching or the
-// element's own recomputation can say that.
-void record_element_custom_property_names(DOM::Element& element, CustomPropertyData const* data, ReadonlySpan<RefPtr<CustomPropertyData const>> pseudo_element_data, ReadonlySpan<Utf16FlyString> references, bool uses_unnamed, bool uses_custom_functions)
-{
-    auto* style_engine = style_engine_for_identified(element);
-    if (!style_engine)
-        return;
-
-    // OPTIMIZATION: Each environment hands out its declared names sorted and deduplicated, so they are merged
-    //               rather than sorted once more for every element that holds that environment.
-    ReadonlySpan<StyleAtomID> published;
-    Vector<StyleAtomID> atoms;
-    Vector<StyleAtomID> merged;
-    auto merge_names = [&](ReadonlySpan<StyleAtomID> names) {
-        if (names.is_empty())
-            return;
-        if (published.is_empty()) {
-            published = names;
-            return;
-        }
-        merged.clear_with_capacity();
-        merged.ensure_capacity(published.size() + names.size());
-        set_union(published, names, merged);
-        swap(atoms, merged);
-        published = atoms;
-    };
-    Vector<CustomPropertyData const*, 4> merged_environments;
-    auto merge_declared_names = [&](CustomPropertyData const* custom_property_data) {
-        if (!custom_property_data || merged_environments.contains_slow(custom_property_data))
-            return;
-        merged_environments.append(custom_property_data);
-        merge_names(custom_property_data->declared_name_atoms(bit_cast<FlatPtr>(&element.document()), style_engine->atom_generation(), [&](Utf16FlyString const& name) { return style_engine->intern_atom(name); }));
-    };
-    merge_declared_names(data);
-    for (auto const& pseudo_data : pseudo_element_data)
-        merge_declared_names(pseudo_data.ptr());
-    // The references arrive deduplicated, and interning is injective, so their atoms only need sorting.
-    Vector<StyleAtomID> reference_atoms;
-    if (!references.is_empty()) {
-        reference_atoms.ensure_capacity(references.size());
-        for (auto const& name : references)
-            reference_atoms.unchecked_append(style_engine->intern_atom(name));
-        quick_sort(reference_atoms);
-        merge_names(reference_atoms);
-    }
-    StyleEngineFFI::style_engine_set_element_custom_property_names(style_engine->host(), element.style_node_id(), published, uses_unnamed, uses_custom_functions);
-}
-
 // An element's heading level, which `:heading()` tests. It follows from what the element is plus
 // the heading offset its ancestors declare, so it moves when the element does and when one of those
 // attributes changes - not with anything the element itself publishes.
@@ -2057,8 +2552,8 @@ void record_element_directionality(DOM::Element& element)
     if (!style_engine)
         return;
 
-    auto const directionality = element.directionality() == DOM::Element::Directionality::Rtl ? "rtl"sv : "ltr"sv;
-    StyleEngineFFI::style_engine_set_element_directionality(style_engine->host(), element.style_node_id(), style_engine->intern_text_atom(Utf16View { directionality }));
+    auto const directionality = element.directionality() == DOM::Element::Directionality::Rtl ? u"rtl"sv : u"ltr"sv;
+    StyleEngineFFI::style_engine_set_element_directionality(style_engine->host(), element.style_node_id(), style_engine->intern_text_atom(directionality));
 }
 
 void record_element_custom_states_changed(DOM::Element& element)
@@ -2147,18 +2642,24 @@ void record_element_emptiness_changed(DOM::Element& element, DOM::Node const& ch
     if (!style_engine)
         return;
 
-    // Whether the element is empty either side of the change is decided by the child that moved
-    // together with the ones that did not, and the ones that did not are the same both times.
-    auto empty_but_for_the_changing_child = SelectorMatching::element_is_empty_ignoring_child(element, changing_child);
-    auto was_empty = empty_but_for_the_changing_child && !counted_before;
-    auto is_empty = empty_but_for_the_changing_child && !counts_after;
+    // The engine reads an element's element children from its tree, so what it holds here is whether the element has
+    // text: an element child that comes or goes beside the text leaves it as it is.
+    auto has_other_text = false;
+    for (GC::Ptr<DOM::Node const> child = element.first_child(); child; child = child->next_sibling()) {
+        if (GC::Ptr<DOM::Text const> text = as_if<DOM::Text>(*child); text && child.ptr() != &changing_child && !text->data().is_empty()) {
+            has_other_text = true;
+            break;
+        }
+    }
+    auto was_empty = !has_other_text && !counted_before;
+    auto is_empty = !has_other_text && !counts_after;
     if (was_empty == is_empty)
         return;
 
     auto kind_of = [](bool empty) {
         return empty ? StyleEngineFFI::FfiFeatureValueKind::Present : StyleEngineFFI::FfiFeatureValueKind::Absent;
     };
-    record_feature(element, StyleEngineFFI::FfiFeatureKind::Emptiness, 0, kind_of(was_empty), 0, kind_of(is_empty), 0);
+    record_feature(element, StyleEngineFFI::FfiFeatureKind::Emptiness, 0, kind_of(is_empty), 0);
 }
 
 // An element can arrive with a style attribute already written, so this is published on arrival as
@@ -2186,8 +2687,6 @@ bool record_element_presentational_hint_properties(DOM::Element& element, Readon
 
 void record_element_declarations_changed(DOM::Element& element, ElementDeclarationKind kind, bool had_declarations, bool has_declarations)
 {
-    if (element.style_node_id() != no_style_node)
-        StyleEngineFFI::style_engine_note_element_declarations_changed(element.document().style_computer().style_engine().host(), element.style_node_id().value());
     element.document().flush_deferred_style_change_event();
     auto* style_engine = style_engine_for_published(element);
     if (!style_engine)
@@ -2200,7 +2699,6 @@ void record_element_declarations_changed(DOM::Element& element, ElementDeclarati
     // applies the delta.
     style_engine->record_element_declaration_delta({
         .node = element.style_node_id().value(),
-        .kind = kind,
         .old_block = had_declarations ? 1u : 0u,
         .new_block = has_declarations ? 1u : 0u,
     });
@@ -2403,6 +2901,22 @@ static void compile_rules_into(RuleCompilationContext const& context, StyleSheet
         publish_layer_order_for_sheet(sheet, *context.document);
 }
 
+// Has the process keep the rules of `sheet`, a user agent sheet, where it does not yet. No document records them: a
+// user agent sheet has no import, no scope and no owning style scope, and declares no transition.
+void publish_user_agent_sheet(StyleSheetState const& sheet, DOM::Document const& document)
+{
+    MediaEnvironmentSnapshot environment { document };
+    Parser::ValueParserFFI::NativeCompilationCallbacks callbacks {
+        .context = nullptr,
+        .import_source = [](void const*, u64, Parser::ValueParserFFI::NativeStyleSheet const*) -> void const* { VERIFY_NOT_REACHED(); },
+        .implicit_scope_root = [](void const*) -> u32 { VERIFY_NOT_REACHED(); },
+        .visit_rule = [](void const*, void const*, u64, RustRule::Type, Parser::ValueParserFFI::NativeCompilationContext const*, Parser::ValueParserFFI::NativeCompilationResult result) {
+            VERIFY(!result.declares_transitions);
+            return true; },
+    };
+    Parser::ValueParserFFI::rust_user_agent_style_sheet_publish(sheet.native_sheet().handle(), &sheet, environment.ffi_environment(), &callbacks);
+}
+
 // The sheet a rule's compiled rules belong to. An imported sheet's rules cascade in the importing
 // sheet's program, so the handle to compile into is the outermost sheet's. A constructed sheet is
 // always its own engine sheet: its ids are held per adopting document, so its raw id member being 0
@@ -2471,8 +2985,10 @@ static bool sheet_can_share_compiled_style_sheet(StyleSheetState const& sheet)
         return false;
     if (!sheet.title().is_empty() || !sheet.native_rules().shared_contents_identity())
         return false;
+    // NB: A link loads a sheet of its own, but the parse cache answers the same text with the same contents, as it
+    //     does for style elements: components commonly link each shadow tree to one sheet.
     auto const* owner_node = sheet.owner_node();
-    if (!owner_node || !(owner_node->is_html_style_element() || owner_node->is_svg_style_element()))
+    if (!owner_node || !(owner_node->is_html_style_element() || owner_node->is_svg_style_element() || owner_node->is_html_link_element()))
         return false;
     return !sheet.native_rules().has_implicit_scope();
 }
@@ -2490,22 +3006,17 @@ static RefPtr<SharedCompiledStyleSheet> shared_compiled_style_sheet_for(StyleShe
         // Keep a separate program when another occurrence already occupies this scope.
         if ((*existing)->is_attached_to(tree_scope) && sheet.native_rules().has_anonymous_layer())
             return nullptr;
-        if (!(*existing)->has_attachments()) {
+        if (!(*existing)->has_attachments())
             style_computer.detached_shared_compiled_style_sheets().remove_first_matching([&](auto const& detached) { return detached == key; });
-            StyleEngineFFI::style_engine_set_sheet_kept_for_reattachment(style_engine.host(), (*existing)->sheet_id(), false);
-        }
         return *existing;
     }
     auto contents = StyleSheetState::create(sheet.native_rules().clone_shared_contents(), &document, RustMediaList {}, {});
     contents->set_base_url(sheet.style_resource_base_url().value_or(document.base_url()));
-    auto sheet_id = style_engine.add_sheet(
-        static_cast<u32>(reinterpret_cast<FlatPtr>(contents.ptr()) >> 3),
-        StyleEngineFFI::FfiCascadeOrigin::Author);
+    auto sheet_id = style_engine.add_sheet(StyleEngineFFI::FfiCascadeOrigin::Author);
     contents->set_style_engine_sheet_id(sheet_id);
     RuleCompilationContext context { style_engine, sheet_id, 0, document, style_computer };
     compile_rules_into(context, *contents);
     contents->evaluate_media_queries(document);
-    contents->load_pending_image_resources(document);
     auto shared_compiled_style_sheet = make_ref_counted<SharedCompiledStyleSheet>(move(key), move(contents), sheet_id);
     shared_compiled_style_sheets.set(shared_compiled_style_sheet->key(), shared_compiled_style_sheet);
     return shared_compiled_style_sheet;
@@ -2516,7 +3027,6 @@ static void release_shared_compiled_style_sheet(SharedCompiledStyleSheetKey cons
     auto& shared_compiled_style_sheets = style_computer.shared_compiled_style_sheets();
     auto sheet_id = shared_compiled_style_sheets.get(key).value()->sheet_id();
     auto& style_engine = style_computer.style_engine();
-    StyleEngineFFI::style_engine_set_sheet_kept_for_reattachment(style_engine.host(), sheet_id, false);
     StyleEngineFFI::style_engine_begin_sheet_rules_replacement(style_engine.host(), sheet_id.value());
     style_engine.finish_sheet_rules_replacement(sheet_id);
     shared_compiled_style_sheets.remove(key);
@@ -2537,7 +3047,6 @@ static void detach_shared_compiled_style_sheet(SharedCompiledStyleSheet& sheet, 
     // and since it holds the parsed contents, the parse cache answers the arriving text without parsing it again.
     auto& detached = style_computer.detached_shared_compiled_style_sheets();
     detached.append(sheet.key());
-    StyleEngineFFI::style_engine_set_sheet_kept_for_reattachment(style_engine.host(), sheet.sheet_id(), true);
     if (detached.size() > StyleComputer::max_detached_shared_compiled_style_sheets)
         release_shared_compiled_style_sheet(detached.take_first(), style_computer);
 }
@@ -2752,11 +3261,7 @@ void record_stylesheet_attached(StyleSheetState& sheet, DOM::Node& document_or_s
             sheet_id = shared_compiled_style_sheet->sheet_id();
             sheet.set_shared_compiled_style_sheet(move(shared_compiled_style_sheet));
         } else {
-            // The CSSOM object's identity is what the program keys its wrapper by; the semantic sheet
-            // is a separate identity that survives edits to its contents.
-            sheet_id = style_engine.add_sheet(
-                static_cast<u32>(reinterpret_cast<FlatPtr>(&sheet) >> 3),
-                StyleEngineFFI::FfiCascadeOrigin::Author);
+            sheet_id = style_engine.add_sheet(StyleEngineFFI::FfiCascadeOrigin::Author);
         }
         style_computer.set_style_engine_sheet_id_for(sheet, sheet_id);
     }
@@ -2804,6 +3309,12 @@ void record_stylesheet_attached(StyleSheetState& sheet, DOM::Node& document_or_s
         return;
     RuleCompilationContext context { style_engine, sheet_id, 0, document_or_shadow_root.document(), style_computer };
     compile_rules_into(context, sheet);
+
+    // OPTIMIZATION: Until a document's first style update, the render owner has nothing else to do for it, so it takes
+    //               each sheet's rules in as the sheet arrives, beside the parser, rather than the first style update
+    //               waiting while it takes in every sheet the document parsed.
+    if (auto& document = document_or_shadow_root.document(); document.navigable() && !document.has_completed_style_update())
+        StyleEngineFFI::style_engine_stream_rule_writes(style_engine.host());
 }
 
 // The user-agent and user origins have no style sheet list to attach from, so nothing announces
@@ -2817,10 +3328,41 @@ void record_stylesheet_attached(StyleSheetState& sheet, DOM::Node& document_or_s
 // sheets they name. The user sheet is rebuilt rather than edited when content blockers change, so
 // the set is compared by identity. A set that keeps the order of the sheets it had attaches only the
 // sheets new to it; any other difference re-attaches the set whole.
+// The key the document's user-agent and user sheets are collected under: its mode, whether it holds MathML or SVG, its
+// kind, and its user sheet, which is rebuilt rather than edited. The sheets the key names are shared, or held by the
+// recorded set, so an equal key names the sheets that were recorded.
+static StyleComputer::NonAuthorStyleSheetsKey non_author_style_sheets_key(DOM::Document& document)
+{
+    auto& style_scope = document.style_scope();
+    style_scope.build_user_style_sheet_if_needed();
+    return {
+        .in_quirks_mode = document.in_quirks_mode(),
+        .needs_mathml_and_svg_user_agent_style_sheets = document.needs_mathml_and_svg_user_agent_style_sheets(),
+        .is_html_document = document.document_type() == DOM::Document::Type::HTML,
+        .user_style_sheet = style_scope.m_user_style_sheet.ptr(),
+    };
+}
+
+// Whether the user-agent and user sheets the document's scope holds are the ones recorded with the style engine, in
+// order.
+bool non_author_stylesheets_are_recorded(DOM::Document const& document)
+{
+    auto& mutable_document = const_cast<DOM::Document&>(document);
+    return mutable_document.style_computer().non_author_style_sheets_key() == non_author_style_sheets_key(mutable_document);
+}
+
 void record_non_author_stylesheets(DOM::Document& document)
 {
     auto& style_computer = document.style_computer();
     auto& style_scope = document.style_scope();
+
+    // OPTIMIZATION: The sheets follow from the key, so an unchanged key leaves nothing to collect or compare.
+    auto key = non_author_style_sheets_key(document);
+    if (style_computer.non_author_style_sheets_key() == key)
+        return;
+    ScopeGuard record_key = [&] {
+        style_computer.non_author_style_sheets_key() = key;
+    };
 
     publish_document_kind(document);
 
@@ -2864,18 +3406,28 @@ void record_non_author_stylesheets(DOM::Document& document)
     }
 
     auto attach_sheet = [&](size_t index, SheetID successor) {
-        auto sheet_id = style_engine.add_sheet(
-            static_cast<u32>(reinterpret_cast<FlatPtr>(sheets[index].ptr()) >> 3),
-            origins[index]);
+        // A user agent sheet's rules are the process's: the first document needing the sheet has them compiled, and
+        // each document only notes what its media leave out of them.
+        if (origins[index] == StyleEngineFFI::FfiCascadeOrigin::UserAgent) {
+            publish_user_agent_sheet(*sheets[index], document);
+            SheetID sheet_id { StyleEngineFFI::style_engine_add_user_agent_sheet(style_engine.host(), sheets[index]->native_sheet().identity()) };
+            StyleEngineFFI::style_engine_attach_sheet(style_engine.host(), sheet_id, document_tree_scope, successor);
+            style_computer.register_style_engine_sheet_source(*sheets[index]);
+            MediaEnvironmentSnapshot environment { document };
+            Parser::ValueParserFFI::rust_style_sheet_publish_failing_conditions(sheets[index]->native_sheet().handle(), style_engine.host(), environment.ffi_environment());
+            return StyleComputer::NonAuthorStyleSheet { sheets[index], sheet_id };
+        }
+        auto sheet_id = style_engine.add_sheet(origins[index]);
         StyleEngineFFI::style_engine_attach_sheet(style_engine.host(), sheet_id, document_tree_scope, successor);
         RuleCompilationContext context { style_engine, sheet_id, 0, document, style_computer };
         compile_rules_into(context, *sheets[index]);
         return StyleComputer::NonAuthorStyleSheet { sheets[index], sheet_id };
     };
 
-    // OPTIMIZATION: A document takes in the MathML and SVG user-agent sheets once it first holds such an element. The
-    //               sheets recorded before keep their places among them, so only the new ones are attached, each before
-    //               the sheet that follows it, rather than detaching every sheet and routing all of their rules again.
+    // OPTIMIZATION: A document takes in the MathML and SVG user-agent sheets once it first holds such an element, and
+    //               a new user sheet replaces the old one. The sheets recorded before that stay keep their places
+    //               among them, so only the sheets that left are detached and the new ones attached, each before the
+    //               sheet that follows it, rather than detaching every sheet and routing all of their rules again.
     auto recorded_index_of = [&](StyleSheetState const& sheet) -> Optional<size_t> {
         for (size_t index = 0; index < recorded.size(); ++index) {
             if (recorded[index].sheet.ptr() == &sheet)
@@ -2884,18 +3436,25 @@ void record_non_author_stylesheets(DOM::Document& document)
         return {};
     };
     auto recorded_sheets_keep_their_order = [&] {
-        size_t found = 0;
+        Optional<size_t> previous;
         for (auto const& sheet : sheets) {
             auto index = recorded_index_of(*sheet);
             if (!index.has_value())
                 continue;
-            if (*index != found)
+            if (previous.has_value() && *index < *previous)
                 return false;
-            ++found;
+            previous = index;
         }
-        return found == recorded.size();
+        return true;
     };
     if (recorded_sheets_keep_their_order()) {
+        for (auto const& entry : recorded) {
+            auto stays = false;
+            for (auto const& sheet : sheets)
+                stays |= sheet.ptr() == entry.sheet.ptr();
+            if (!stays)
+                StyleEngineFFI::style_engine_detach_sheet(style_engine.host(), entry.sheet_id, document_tree_scope);
+        }
         Vector<StyleComputer::NonAuthorStyleSheet> updated;
         for (size_t index = 0; index < sheets.size(); ++index) {
             if (auto recorded_index = recorded_index_of(*sheets[index]); recorded_index.has_value()) {
@@ -2991,6 +3550,15 @@ void record_stylesheet_detached(StyleSheetState& sheet, DOM::Node& document_or_s
 // inputs the engine already routes, not with a state transition published here.
 #include <LibWeb/StyleEngineStateFactsGenerated.inc>
 
+bool element_validity_is_withheld(DOM::Element& element)
+{
+    auto* style_engine = style_engine_for(element);
+    if (!style_engine || !style_engine->validity_is_known_untested())
+        return false;
+    style_engine->note_validity_state_withheld();
+    return true;
+}
+
 bool can_record_element_state_change(DOM::Element& element)
 {
     // A state an element waiting in a display:none subtree takes matters where a `:has()` argument may reach the
@@ -3038,8 +3606,6 @@ static void record_feature(
     DOM::Element& element,
     StyleEngineFFI::FfiFeatureKind kind,
     StyleAtomID name_atom,
-    StyleEngineFFI::FfiFeatureValueKind old_kind,
-    StyleAtomID old_atom,
     StyleEngineFFI::FfiFeatureValueKind new_kind,
     StyleAtomID new_atom)
 {
@@ -3052,14 +3618,12 @@ static void record_feature(
             .node = element.style_node_id().value(),
             .feature_kind = kind,
             .name_atom = name_atom.value(),
-            .old_kind = old_kind,
-            .old_atom = old_atom.value(),
             .new_kind = new_kind,
             .new_atom = new_atom.value(),
         });
 }
 
-void record_element_id_changed(DOM::Element& element, Optional<Utf16FlyString> const& old_value, Optional<Utf16FlyString> const& new_value)
+void record_element_id_changed(DOM::Element& element, Optional<Utf16FlyString> const& new_value)
 {
     auto* style_engine = style_engine_for_identified(element);
     if (!style_engine) {
@@ -3075,7 +3639,7 @@ void record_element_id_changed(DOM::Element& element, Optional<Utf16FlyString> c
         return value.has_value() ? StyleEngineFFI::FfiFeatureValueKind::Atom : StyleEngineFFI::FfiFeatureValueKind::Absent;
     };
 
-    record_feature(element, StyleEngineFFI::FfiFeatureKind::Id, 0, kind_of(old_value), atom_of(old_value), kind_of(new_value), atom_of(new_value));
+    record_feature(element, StyleEngineFFI::FfiFeatureKind::Id, 0, kind_of(new_value), atom_of(new_value));
 
     // `getElementById` is case-sensitive in every mode, so the name the inverse index is keyed by
     // is the one written rather than the one a quirks-mode selector folds it to.
@@ -3096,11 +3660,21 @@ void record_element_class_list_changed(DOM::Element& element, ReadonlySpan<Utf16
     // exists to avoid.
     // Two class names that differ only in case are one class where the document folds them, so
     // membership is decided between the folded names rather than the written ones.
-    auto folded = [&](Utf16FlyString const& name) {
-        return element.document().in_quirks_mode() ? name.to_ascii_lowercase() : name;
-    };
-    auto contains_folded = [&](ReadonlySpan<Utf16FlyString> names, Utf16FlyString const& folded_name) {
-        return any_of(names, [&](auto const& name) { return folded(name) == folded_name; });
+    Vector<Utf16FlyString> folded_old_classes;
+    Vector<Utf16FlyString> folded_new_classes;
+    if (element.document().in_quirks_mode()) {
+        auto fold = [](ReadonlySpan<Utf16FlyString> names, Vector<Utf16FlyString>& folded_names) {
+            folded_names.ensure_capacity(names.size());
+            for (auto const& name : names)
+                folded_names.unchecked_append(name.to_ascii_lowercase());
+        };
+        fold(old_classes, folded_old_classes);
+        fold(new_classes, folded_new_classes);
+        old_classes = folded_old_classes;
+        new_classes = folded_new_classes;
+    }
+    auto contains = [](ReadonlySpan<Utf16FlyString> names, Utf16FlyString const& name) {
+        return any_of(names, [&](auto const& other) { return other == name; });
     };
 
     auto record_membership = [&](Utf16FlyString const& folded_name, bool was_present, bool is_present) {
@@ -3111,17 +3685,15 @@ void record_element_class_list_changed(DOM::Element& element, ReadonlySpan<Utf16
             element,
             StyleEngineFFI::FfiFeatureKind::Class,
             atom,
-            was_present ? StyleEngineFFI::FfiFeatureValueKind::Present : StyleEngineFFI::FfiFeatureValueKind::Absent,
-            0,
             is_present ? StyleEngineFFI::FfiFeatureValueKind::Present : StyleEngineFFI::FfiFeatureValueKind::Absent,
             0);
     };
 
     for (auto const& name : old_classes)
-        record_membership(folded(name), true, contains_folded(new_classes, folded(name)));
+        record_membership(name, true, contains(new_classes, name));
     for (auto const& name : new_classes) {
-        if (!contains_folded(old_classes, folded(name)))
-            record_membership(folded(name), false, true);
+        if (!contains(old_classes, name))
+            record_membership(name, false, true);
     }
 }
 
@@ -3159,32 +3731,45 @@ void record_element_attribute_changed(DOM::Element& element, Utf16FlyString cons
         });
     }
 
-    // Both values cross as atoms. Their text is recorded once per distinct value only when a
+    // The new value crosses as an atom. Its text is recorded once per distinct value only when a
     // compiled selector for this attribute uses an operator that cannot compare atom identities,
-    // or when an attr() can read the name. This lets the match evaluator reconstruct either side
-    // of such a transaction without asking the DOM, and two different values cannot cancel in the
-    // journal merely because both are present.
+    // or when an attr() can read the name, so the match evaluator reads it without asking the DOM.
     // The same name an arriving attribute publishes, with the same other forms noted alongside it.
     // See `StyleEngine::intern_attribute_name`.
     auto atom = style_engine->intern_attribute_name(name, namespace_uri);
+    // OPTIMIZATION: Nothing of the engine reads this name, so the element's row need not hear of the change. The element
+    //               is noted as an arrival withholding the name is, and is published if something comes to read it.
+    if (style_engine->attribute_is_known_unread(atom)) {
+        style_engine->note_attribute_withheld(name, namespace_uri);
+        return;
+    }
     auto kind_of = [](Optional<Utf16String> const& value) {
         return value.has_value() ? StyleEngineFFI::FfiFeatureValueKind::Atom : StyleEngineFFI::FfiFeatureValueKind::Absent;
     };
     auto atom_of = [&](Optional<Utf16String> const& value) {
         return value.has_value() ? style_engine->intern_attribute_value(atom, *value) : 0;
     };
-    auto old_kind = kind_of(old_value);
-    auto old_atom = atom_of(old_value);
     auto new_kind = kind_of(new_value);
     auto new_atom = atom_of(new_value);
     record_feature(
         element,
         StyleEngineFFI::FfiFeatureKind::Attribute,
         atom,
-        old_kind,
-        old_atom,
         new_kind,
         new_atom);
+}
+
+// OPTIMIZATION: A document records its user-agent and user sheets once it knows its mode, which decides which user-agent
+//               sheets it takes and how their selectors compile, rather than in its first style update. The render
+//               owner takes their rules in beside the parser, compiling the selectors of the user agent rules the
+//               process has not compiled yet, so the first style update does not wait on it.
+void prepare_non_author_stylesheets(DOM::Document& document)
+{
+    // NB: A document nothing renders, as DOMParser makes, never styles anything.
+    if (!document.navigable())
+        return;
+    record_non_author_stylesheets(document);
+    StyleEngineFFI::style_engine_stream_rule_writes(document.style_computer().style_engine().host());
 }
 
 }

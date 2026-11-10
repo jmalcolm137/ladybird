@@ -64,9 +64,9 @@ public:
     virtual Media::DecoderErrorOr<Media::DemuxerSeekResult> seek_to_most_recent_keyframe(Media::Track const& track, AK::Duration timestamp, Media::DemuxerSeekOptions options) override
     {
         m_seek_is_expected.store(false);
-        m_seek_count++;
         if (has_flag(options, Media::DemuxerSeekOptions::Force))
             m_forced_seek_count++;
+        m_seek_count++;
         return m_inner->seek_to_most_recent_keyframe(track, timestamp, options);
     }
     virtual Media::DecoderErrorOr<AK::Duration> duration_of_track(Media::Track const& track) override { return m_inner->duration_of_track(track); }
@@ -372,6 +372,28 @@ private:
     Atomic<bool> m_stop { false };
     RefPtr<Threading::Thread> m_thread;
 };
+
+bool has_h264_decoder()
+{
+    if (Media::select_video_decoder(Media::ParsedCodec { Media::CodecID::H264 }).has_value())
+        return true;
+    warnln("No decoder for H.264, skipping");
+    return false;
+}
+
+RefPtr<Media::VideoFrame> peek_frame_within_time_limit(Media::VideoProducer& producer, Core::EventLoop& loop, AK::Duration time_limit)
+{
+    auto start_time = MonotonicTime::now_coarse();
+    while (MonotonicTime::now_coarse() - start_time < time_limit) {
+        auto output = producer.peek();
+        if (output.status == Media::PipelineStatus::HaveData)
+            return output.frame;
+        if (output.status == Media::PipelineStatus::EndOfStream)
+            return nullptr;
+        loop.pump(Core::EventLoop::WaitMode::PollForEvents);
+    }
+    return nullptr;
+}
 
 RefPtr<Media::VideoFrame> take_frame_within_time_limit(Media::VideoProducer& producer, Core::EventLoop& loop, AK::Duration time_limit)
 {
@@ -716,10 +738,15 @@ TEST_CASE(a_seek_resolves_on_held_output_when_data_becomes_permanently_unavailab
     RefPtr<Media::VideoFrame> frame;
     while (frame == nullptr && MonotonicTime::now_coarse() < deadline) {
         auto output = producer->peek();
-        if (output.status == Media::PipelineStatus::HaveData)
+        if (output.status == Media::PipelineStatus::HaveData) {
             frame = output.frame;
-        else
-            loop.pump(Core::EventLoop::WaitMode::PollForEvents);
+            continue;
+        }
+        loop.pump(Core::EventLoop::WaitMode::PollForEvents);
+        if (output.status != Media::PipelineStatus::Pending) {
+            FAIL(ByteString::formatted("Unexpected status {}", output.status));
+            return;
+        }
     }
     if (frame == nullptr)
         FAIL("The seek did not resolve on the output held by the decoder");
@@ -929,6 +956,89 @@ TEST_CASE(a_seek_back_within_the_last_decoded_frame_lands_on_it)
         return;
     }
     EXPECT_EQ(frame->timestamp(), last_read_sample_timestamp);
+}
+
+// The last sample of a reordered stream precedes its last frame, so after draining the decoder at the end, the
+// demuxer's position is still before a seek back into the frame between them. The decoder already output that frame.
+TEST_CASE(a_seek_back_into_a_frame_output_after_the_last_sample_lands_on_it)
+{
+    if (!has_h264_decoder())
+        return;
+    auto& loop = never_destroyed_event_loop();
+
+    AK::Duration last_sample_timestamp;
+    {
+        auto [demuxer, track] = demuxer_and_video_track_for("./avc.mp4"sv);
+        TRY_OR_FAIL(demuxer->create_context_for_track(track));
+        while (true) {
+            auto sample = demuxer->get_next_sample_for_track(track);
+            if (sample.is_error())
+                break;
+            last_sample_timestamp = sample.value().presentation_timestamp();
+        }
+    }
+
+    auto producer = create_started_producer(loop, "./avc.mp4"sv);
+    auto time_limit = AK::Duration::from_seconds(10);
+    auto start_time = MonotonicTime::now_coarse();
+    RefPtr<Media::VideoFrame> last_frame;
+    while (true) {
+        auto output = producer->peek();
+        if (output.status == Media::PipelineStatus::HaveData) {
+            last_frame = output.frame;
+            producer->consume();
+        } else if (output.status == Media::PipelineStatus::EndOfStream) {
+            break;
+        }
+        if (MonotonicTime::now_coarse() - start_time >= time_limit) {
+            FAIL("Timed out decoding to the end of the stream");
+            return;
+        }
+        loop.pump(Core::EventLoop::WaitMode::PollForEvents);
+    }
+    VERIFY(last_frame != nullptr);
+    VERIFY(last_frame->timestamp() > last_sample_timestamp);
+
+    producer->seek(last_sample_timestamp + AK::Duration::from_milliseconds(10));
+    auto frame = peek_frame_within_time_limit(*producer, loop, time_limit);
+    if (frame == nullptr)
+        FAIL("The seek did not resolve with a frame");
+    else
+        EXPECT_EQ(frame->timestamp(), last_sample_timestamp);
+}
+
+// A seek decodes the samples before its target only as references, so the decoder outputs none of them, and it skips
+// those that nothing references. The demuxer's position is still before a second seek back to one of them.
+TEST_CASE(a_seek_back_into_a_frame_decoded_only_as_a_reference_lands_on_it)
+{
+    if (!has_h264_decoder())
+        return;
+    auto& loop = never_destroyed_event_loop();
+
+    // The first five samples in decode order are at 0, 160, 80, 40 and 120 ms, and those at 40 and 120 are not
+    // referenced.
+    auto [inner_demuxer, track] = demuxer_and_video_track_for("./avc.mp4"sv);
+    auto demuxer = BlockingDemuxer::create(inner_demuxer, 5);
+    auto producer = TRY_OR_FAIL(Media::DecodedVideoProducer::try_create(loop, demuxer, track));
+    producer->set_error_handler([&](Media::DecoderError&& error) {
+        FAIL(ByteString::formatted("An error occurred while decoding: {}", error.description()));
+    });
+    producer->seek(AK::Duration::from_milliseconds(330));
+    producer->start();
+
+    auto time_limit = AK::Duration::from_seconds(5);
+    if (!demuxer->wait_until_a_read_blocks(time_limit)) {
+        FAIL("Timed out waiting for the decode thread to block on the demuxer");
+        return;
+    }
+
+    producer->seek(AK::Duration::from_milliseconds(130));
+    demuxer->stop_blocking_reads();
+    auto frame = peek_frame_within_time_limit(*producer, loop, time_limit);
+    if (frame == nullptr)
+        FAIL("The seek did not resolve with a frame");
+    else
+        EXPECT_EQ(frame->timestamp(), AK::Duration::from_milliseconds(120));
 }
 
 // A stream can grow after the demuxer reported its end, by which point the decoder was drained on that report.
@@ -1310,8 +1420,12 @@ TEST_CASE(frames_held_by_the_decoder_are_delivered_when_data_becomes_permanently
 
     auto deadline = MonotonicTime::now() + AK::Duration::from_milliseconds(200);
     while (MonotonicTime::now() < deadline) {
-        EXPECT_EQ(producer->peek().status, Media::PipelineStatus::Pending);
+        auto status = producer->peek().status;
         loop.pump(Core::EventLoop::WaitMode::PollForEvents);
+        if (status != Media::PipelineStatus::Pending) {
+            FAIL(ByteString::formatted("Unexpected status {}", status));
+            break;
+        }
     }
 
     // The drained decoder has to start over, so the next seek moves the demuxer.

@@ -15,25 +15,15 @@ namespace Web::CSS {
 // https://www.w3.org/TR/css-values-4/#custom-idents
 class CustomIdentStyleValue final : public StyleValueWithDefaultOperators<CustomIdentStyleValue> {
 public:
-    static ValueComparingNonnullRefPtr<CustomIdentStyleValue const> create(Utf16FlyString custom_ident)
-    {
-        return adopt_ref(*new (nothrow) CustomIdentStyleValue(move(custom_ident)));
-    }
     virtual ~CustomIdentStyleValue() override = default;
 
     Utf16FlyString custom_ident() const { return css_string_from_rust(&m_value->custom_ident.custom_ident); }
-    GC::Ref<CSSStyleValue> reify(Utf16FlyString const&) const;
 
 private:
     friend class StyleValue;
 
     explicit CustomIdentStyleValue(StyleValueFFI::StyleValueData const* data)
         : StyleValueWithDefaultOperators(Type::CustomIdent, data)
-    {
-    }
-
-    explicit CustomIdentStyleValue(Utf16FlyString custom_ident)
-        : StyleValueWithDefaultOperators(Type::CustomIdent, StyleValueFFI::rust_style_value_create_custom_ident(custom_ident.to_raw_leaked()))
     {
     }
 };

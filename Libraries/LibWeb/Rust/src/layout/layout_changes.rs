@@ -25,10 +25,18 @@ use smallvec::SmallVec;
 pub(crate) enum LayoutChange {
     SetNeedsLayoutUpdate {
         node: NodeSlotId,
-        propagate_through_ancestors: bool,
+    },
+    RelayoutElementAfterStyleChange {
+        element: StyleNodeID,
+        rebuilds_layout_tree: bool,
     },
     /// The whole layout tree is built again.
     SetNeedsFullLayoutTreeUpdate,
+    /// Loads filled faces into the font cascades of these addresses in place, so the styles naming them stay as they
+    /// are: the boxes whose text renders in one of them lay out again.
+    RelayoutUsersOfFontLists {
+        font_lists: Box<[u64]>,
+    },
     /// The box takes `marks`.
     MarkBox {
         target: super::tree_update_marks::MarkedBox,
@@ -111,6 +119,11 @@ pub(crate) enum LayoutChange {
     },
     /// A layout committed: the text find in page searches is mapped again.
     InvalidateSearchableText,
+    /// The frameset the row was built for published another layout: the row takes it, and lays out again where it
+    /// changed.
+    RestampFrameSetLayout {
+        node: NodeSlotId,
+    },
     /// The element the row was built for published other table spans: the row takes them, and lays out again where
     /// they changed.
     RestampTableSpans {
@@ -127,7 +140,7 @@ pub(crate) enum LayoutChange {
     SetNodeStyle {
         node: NodeSlotId,
         record: u64,
-        payloads: super::node_data::StylePayloadsRef,
+        payloads: Option<super::node_data::LayoutStyleRef>,
     },
     /// The style record of the box the node `style_node` is bound to, or of the box of its pseudo-element
     /// `generated_for`, stays readable once the node has left the document.
@@ -169,7 +182,9 @@ impl LayoutChange {
             Self::SetNodeFlag { flag, .. } if *flag as u32 & NodeFlag::IDENTITY != 0 => RowWrite::Identities,
             Self::SetNodeStyle { .. } => RowWrite::NamedStyles,
             Self::SetNeedsLayoutUpdate { .. }
+            | Self::RelayoutElementAfterStyleChange { .. }
             | Self::SetNeedsFullLayoutTreeUpdate
+            | Self::RelayoutUsersOfFontLists { .. }
             | Self::MarkBox { .. }
             | Self::ApplyLayoutTreeUpdateMark { .. }
             | Self::RecordPartialRelayoutEscape
@@ -186,6 +201,7 @@ impl LayoutChange {
             | Self::HandOverOwnedProvider { .. }
             | Self::SetOwnedImageNaturalSize { .. }
             | Self::RestampTableSpans { .. }
+            | Self::RestampFrameSetLayout { .. }
             | Self::SetNodeNeedsCompositorAnimationFrame { .. }
             | Self::PinBoundBoxStyleRecordForDetachment { .. }
             | Self::PinNodeStyleRecordForHost { .. }
@@ -228,15 +244,17 @@ impl LayoutChange {
     /// left to change.
     pub(crate) fn apply(self, arena: &mut LayoutNodeArena) {
         match self {
-            Self::SetNeedsLayoutUpdate {
-                node,
-                propagate_through_ancestors,
-            } => {
+            Self::SetNeedsLayoutUpdate { node } => {
                 if arena.slot_is_live(node) {
-                    arena.set_needs_layout_update(node, propagate_through_ancestors);
+                    arena.set_needs_layout_update(node, true);
                 }
             }
+            Self::RelayoutElementAfterStyleChange {
+                element,
+                rebuilds_layout_tree,
+            } => arena.mark_element_for_relayout_after_style_change(element, rebuilds_layout_tree),
             Self::SetNeedsFullLayoutTreeUpdate => arena.set_needs_full_layout_tree_update(true),
+            Self::RelayoutUsersOfFontLists { font_lists } => arena.relayout_users_of_font_lists(&font_lists),
             Self::MarkBox { target, marks } => marks.apply(arena, target),
             Self::ApplyLayoutTreeUpdateMark { node, mark } => arena.apply_layout_tree_update_mark(node, mark),
             Self::RecordPartialRelayoutEscape => arena.record_partial_relayout_escape(),
@@ -291,6 +309,11 @@ impl LayoutChange {
                 }
             }
             Self::InvalidateSearchableText => arena.invalidate_searchable_text(),
+            Self::RestampFrameSetLayout { node } => {
+                if arena.slot_is_live(node) && arena.restamp_frameset_layout(node) {
+                    arena.set_needs_layout_update(node, true);
+                }
+            }
             Self::RestampTableSpans { node } => {
                 if arena.slot_is_live(node) && arena.restamp_table_spans(node) {
                     arena.set_needs_layout_update(node, true);
@@ -300,10 +323,12 @@ impl LayoutChange {
                 arena.set_node_needs_compositor_animation_frame(node, kind, value);
             }
             Self::SetNodeStyle { node, record, payloads } => {
-                // A style the arena derived is replaced only to be derived again, which decides the relayout itself.
-                let previous_payloads = (arena.slot_is_live(node) && !arena.node_style_record_is_derived(node))
-                    .then(|| arena.data(node).style.get());
-                arena.install_style_record(node, record, payloads, previous_payloads);
+                if arena.slot_is_live(node) && arena.node_style_record_is_derived(node) {
+                    arena.install_style_record_in_place_of_derived_style(node, record, payloads);
+                } else {
+                    let previous_payloads = arena.slot_is_live(node).then(|| arena.data(node).style.get());
+                    arena.install_style_record(node, record, payloads, previous_payloads);
+                }
             }
             Self::PinBoundBoxStyleRecordForDetachment {
                 style_node,
@@ -456,16 +481,24 @@ pub(crate) fn queue(host: &DocumentHost, change: LayoutChange) {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn render_state_set_needs_layout_update(
+pub extern "C" fn render_state_set_needs_layout_update(host: &DocumentHost, node: NodeSlotId) {
+    queue(host, LayoutChange::SetNeedsLayoutUpdate { node });
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn render_state_relayout_element_after_style_change(
     host: &DocumentHost,
-    node: NodeSlotId,
-    propagate_through_ancestors: bool,
+    style_node: u32,
+    rebuilds_layout_tree: bool,
 ) {
+    let Some(element) = StyleNodeID::from_raw(style_node) else {
+        return;
+    };
     queue(
         host,
-        LayoutChange::SetNeedsLayoutUpdate {
-            node,
-            propagate_through_ancestors,
+        LayoutChange::RelayoutElementAfterStyleChange {
+            element,
+            rebuilds_layout_tree,
         },
     );
 }
@@ -480,6 +513,18 @@ pub extern "C" fn render_state_detach_remaining_rows_for_removal(host: &Document
         return;
     }
     host.queue_change(ArenaChange::DetachForRemoval(style_nodes.into()));
+}
+
+/// Marks for layout every box whose text renders in one of the font cascades of `font_lists`, which loads filled faces
+/// into in place.
+#[unsafe(no_mangle)]
+pub extern "C" fn render_state_relayout_users_of_font_lists(host: &DocumentHost, font_lists: ak::Span<'_, u64>) {
+    queue(
+        host,
+        LayoutChange::RelayoutUsersOfFontLists {
+            font_lists: font_lists.as_slice().into(),
+        },
+    );
 }
 
 #[unsafe(no_mangle)]
@@ -701,6 +746,11 @@ pub extern "C" fn render_state_invalidate_searchable_text(host: &DocumentHost) {
 }
 
 #[unsafe(no_mangle)]
+pub extern "C" fn render_state_restamp_frameset_layout(host: &DocumentHost, node: NodeSlotId) {
+    queue(host, LayoutChange::RestampFrameSetLayout { node });
+}
+
+#[unsafe(no_mangle)]
 pub extern "C" fn render_state_restamp_table_spans(host: &DocumentHost, node: NodeSlotId) {
     queue(host, LayoutChange::RestampTableSpans { node });
 }
@@ -719,11 +769,7 @@ mod tests {
         arena
             .free_subtree(freed)
             .destroy_shells_and_invoke_callbacks(&crate::stage::MainThread::for_test());
-        LayoutChange::SetNeedsLayoutUpdate {
-            node: freed,
-            propagate_through_ancestors: true,
-        }
-        .apply(&mut arena);
+        LayoutChange::SetNeedsLayoutUpdate { node: freed }.apply(&mut arena);
         assert!(!arena.slot_is_live(freed));
     }
 
@@ -734,11 +780,7 @@ mod tests {
         arena.write_shape(node).set_kind(NodeKind::BlockContainer);
         arena.reset_layout_update_flags_in_subtree(node);
         assert!(!arena.node_needs_layout_update(node));
-        LayoutChange::SetNeedsLayoutUpdate {
-            node,
-            propagate_through_ancestors: false,
-        }
-        .apply(&mut arena);
+        LayoutChange::SetNeedsLayoutUpdate { node }.apply(&mut arena);
         assert!(arena.node_needs_layout_update(node));
         arena
             .free_subtree(node)

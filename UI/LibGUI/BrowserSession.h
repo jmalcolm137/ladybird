@@ -70,6 +70,15 @@ public:
     String const& current_navigator_compatibility_mode() const { return m_current_navigator_compatibility_mode; }
     void set_navigator_compatibility_mode(String const& mode) { m_engine->set_navigator_compatibility_mode(mode); }
 
+    // Page preferences from View > Color Scheme / Contrast / Motion. The engine applies them to every page and worker,
+    // and reports the current values when the chrome connects.
+    String const& website_color_scheme() const { return m_website_color_scheme; }
+    String const& preferred_contrast() const { return m_preferred_contrast; }
+    String const& preferred_motion() const { return m_preferred_motion; }
+    void set_website_color_scheme(String const& color_scheme);
+    void set_preferred_contrast(String const& contrast);
+    void set_preferred_motion(String const& motion);
+
     JsonArray clipboard_items_for_paste();
 
     // Permission decisions for the site information popover. Decisions marked "remember" are written to the profile
@@ -137,6 +146,9 @@ private:
     String m_current_user_agent;
     Vector<NavigatorCompatibilityModeOption> m_navigator_compatibility_modes;
     String m_current_navigator_compatibility_mode;
+    String m_website_color_scheme { "auto"_string };
+    String m_preferred_contrast { "auto"_string };
+    String m_preferred_motion { "auto"_string };
     ByteString m_exit_reason;
 };
 

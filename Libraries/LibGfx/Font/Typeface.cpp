@@ -308,27 +308,27 @@ void keep_recent_font(NonnullRefPtr<Font const> font)
 
 }
 
-NonnullRefPtr<Font> Typeface::font(float point_size, FontVariationSettings const& variations, Gfx::ShapeFeatures const& shape_features) const
+NonnullRefPtr<Font> Typeface::font(float point_size, FontVariationSettings const& variations, Gfx::ShapeFeatures const& shape_features, FontSynthesis synthesis) const
 {
     RefPtr<Font> font;
     {
         MutexLocker locker { m_fonts_mutex };
-        FontCacheKey key { point_size, variations.to_sorted_list(), shape_features };
+        FontCacheKey key { point_size, variations.to_sorted_list(), shape_features, synthesis };
 
         // A font that another thread is destroying cannot be referenced any more, and a new font replaces it.
         if (auto it = m_fonts.find(key); it != m_fonts.end() && it->value->try_ref())
             return adopt_ref(*it->value);
 
-        font = adopt_ref(*new Font(*this, point_size, point_size, variations, shape_features));
+        font = adopt_ref(*new Font(*this, point_size, point_size, variations, shape_features, synthesis));
         m_fonts.set(move(key), font.ptr());
     }
     keep_recent_font(*font);
     return font.release_nonnull();
 }
 
-NonnullRefPtr<Font> Typeface::invisible_font(float point_size, FontVariationSettings const& variations, Gfx::ShapeFeatures const& shape_features) const
+NonnullRefPtr<Font> Typeface::invisible_font(float point_size, FontVariationSettings const& variations, Gfx::ShapeFeatures const& shape_features, FontSynthesis synthesis) const
 {
-    auto font = adopt_ref(*new Font(*this, point_size, point_size, variations, shape_features));
+    auto font = adopt_ref(*new Font(*this, point_size, point_size, variations, shape_features, synthesis));
     font->m_is_invisible = true;
     return font;
 }
@@ -336,7 +336,7 @@ NonnullRefPtr<Font> Typeface::invisible_font(float point_size, FontVariationSett
 void Typeface::forget_font(Font const& font) const
 {
     MutexLocker locker { m_fonts_mutex };
-    FontCacheKey key { font.point_size(), font.variation_settings().to_sorted_list(), font.features() };
+    FontCacheKey key { font.point_size(), font.variation_settings().to_sorted_list(), font.features(), font.synthesis() };
     // Invisible variants are not in the cache, and a newer font may have replaced this one.
     if (auto it = m_fonts.find(key); it != m_fonts.end() && it->value == &font)
         m_fonts.remove(it);
@@ -473,6 +473,24 @@ FaceDescription const& Typeface::description() const
         m_description = FaceDescription::read(harfbuzz_typeface());
     });
     return *m_description;
+}
+
+// NB: A slant of 90 degrees has an infinite skew, so a synthetic oblique stops just short of it.
+static constexpr float max_synthetic_oblique_angle = 89;
+
+FontSynthesis Typeface::synthesis_for(FontSynthesisRequest const& request, FontVariationSettings const& variations) const
+{
+    auto style = style_for_variations(variations.to_sorted_list());
+    FontSynthesis synthesis;
+    // A face that is lighter than bold is drawn bolder for a bold request. A variable face whose weight axis stops
+    // short of the weight asked for is drawn at the end of its axis instead, as its designer made it.
+    if (request.allows_weight && request.weight >= 600 && style.weight < 600 && !description().has_axis(FourCC("wght").to_u32()))
+        synthesis.bold = true;
+    // An upright face is slanted for an italic or oblique request, unless its axes give it a slant of its own.
+    if (request.allows_style && request.slope != 0 && style.slope == 0
+        && !description().has_axis(FourCC("ital").to_u32()) && !description().has_axis(FourCC("slnt").to_u32()))
+        synthesis.oblique_angle = clamp(request.oblique_angle, -max_synthetic_oblique_angle, max_synthetic_oblique_angle);
+    return synthesis;
 }
 
 FaceStyle Typeface::style_for_variations(ReadonlySpan<FontVariationAxis> variations) const

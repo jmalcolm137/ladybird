@@ -16,6 +16,7 @@
 #include <LibCore/File.h>
 #include <LibFileSystem/FileSystem.h>
 #include <LibTest/TestCase.h>
+#include <LibWebView/CrashReportOutbox.h>
 #include <LibWebView/CrashReportReview.h>
 
 using namespace ReportServerTest;
@@ -142,7 +143,7 @@ TEST_CASE(crash_report_submission)
 
     // Once the server has a report, the local copy has done its job.
     VERIFY(!FileSystem::exists(LexicalPath::join(reports_directory, "Seen"sv, name).string()));
-    VERIFY(!store.has_pending_reports());
+    VERIFY(MUST(store.pending_report_names()).is_empty());
 
     // A request the server rejects would be rejected again, so it ends the submission until the user tries again.
     server.requests.clear();
@@ -209,6 +210,63 @@ TEST_CASE(crash_report_submission)
     Core::EventLoop::current().spin_until([&] { return server.has_answered_everything() && !FileSystem::exists(LexicalPath::join(reports_directory, "Seen"sv, name).string()); });
     VERIFY(server.requests.size() == 2);
     VERIFY(server.requests[1].path == "/api/v1/reports"sv);
+
+    // Only one place sends a report at a time, and a report sent from a review counts as on its way until it has gone,
+    // even when the review goes first.
+    WebView::CrashReportOutbox outbox { store };
+    name = write_report(reports_directory, "2026-10-01T15-00-00Z-WebContent-abc123.txt"sv);
+    {
+        WebView::CrashReportReview first_review { store };
+        WebView::CrashReportReview second_review { store };
+        MUST(first_review.open(name));
+        MUST(second_review.open(name));
+        server.respond_with(challenge("fifth"sv));
+        server.respond_with({ 200, R"({"receipt":"receipt-4"})", {} });
+        VERIFY(!outbox.send_from_review(first_review, ""_string, {}).has_value());
+        VERIFY(outbox.is_sending(name));
+        VERIFY(outbox.send_from_review(second_review, ""_string, {}).has_value());
+    }
+    Core::EventLoop::current().spin_until([&] { return !outbox.is_sending(name); });
+    VERIFY(MUST(store.pending_report_names()).is_empty());
+
+    // Choosing to keep nothing stops what a review has started.
+    name = write_report(reports_directory, "2026-10-01T16-00-00Z-WebContent-abc123.txt"sv);
+    {
+        WebView::CrashReportReview review_to_stop { store };
+        MUST(review_to_stop.open(name));
+        VERIFY(!outbox.send_from_review(review_to_stop, ""_string, {}).has_value());
+        VERIFY(outbox.is_sending(name));
+        outbox.discard_all();
+        VERIFY(!outbox.is_sending(name));
+    }
+    VERIFY(MUST(store.pending_report_names()).is_empty());
+
+    // Reports still waiting behind one that failed after retries keep what the user chose for them.
+    auto first_name = write_report(reports_directory, "2026-10-01T17-00-00Z-WebContent-abc123.txt"sv);
+    auto second_name = write_report(reports_directory, "2026-10-01T18-00-00Z-WebContent-abc123.txt"sv);
+    server.respond_with({ 503, "{}", {} });
+    server.respond_with({ 400, "{}", {} });
+    Vector<WebView::CrashReportOutbox::Report> reports;
+    reports.append({ first_name, "I clicked a link"_string, "https://example.com/"_string });
+    reports.append({ second_name, "I clicked a link"_string, "https://example.com/other"_string });
+    outbox.send(move(reports));
+    Core::EventLoop::current().spin_until([&] { return !outbox.is_sending(first_name) && !outbox.is_sending(second_name); });
+    VERIFY(outbox.could_not_send(second_name));
+    VERIFY(outbox.failed_attempt(second_name)->description == "I clicked a link"sv);
+    VERIFY(outbox.failed_attempt(second_name)->url == "https://example.com/other"sv);
+
+    // A report that fails after its review went away keeps what the user chose, and its submission ID.
+    name = write_report(reports_directory, "2026-10-01T19-00-00Z-WebContent-abc123.txt"sv);
+    {
+        WebView::CrashReportReview departing_review { store };
+        MUST(departing_review.open(name));
+        server.respond_with({ 400, "{}", {} });
+        VERIFY(!outbox.send_from_review(departing_review, "I closed the tab"_string, {}).has_value());
+    }
+    Core::EventLoop::current().spin_until([&] { return !outbox.is_sending(name); });
+    VERIFY(outbox.could_not_send(name));
+    VERIFY(outbox.failed_attempt(name)->description == "I closed the tab"sv);
+    VERIFY(!outbox.failed_attempt(name)->manifest.is_empty());
 
     outln("PASS: Crash reports reach the report server in the format it expects");
 }

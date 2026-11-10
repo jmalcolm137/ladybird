@@ -555,6 +555,15 @@ fn json_text_bytes(text: Utf16View<'_>) -> Option<JSONTextBytes<'_>> {
 
     match text {
         Utf16View::Ascii(bytes) => utf8.extend_from_slice(bytes),
+        Utf16View::Latin1(bytes) => {
+            let mut code_unit_offset = 0;
+            offsets.push(0);
+            for &byte in bytes {
+                let mut buffer = [0; 4];
+                utf8.extend_from_slice(char::from(byte).encode_utf8(&mut buffer).as_bytes());
+            }
+            append_code_unit_offsets_of_utf8(&mut offsets, &utf8, &mut code_unit_offset);
+        }
         Utf16View::Utf16(code_units) => {
             let mut code_unit_offset = 0;
             offsets.push(0);
@@ -1010,7 +1019,8 @@ impl JSONObject {
             base: Object::new_with_prototype(
                 vm,
                 Self::CLASS,
-                realm.object_prototype(),
+                realm,
+                Some(realm.object_prototype()),
                 MayInterfereWithIndexedPropertyAccess::No,
             ),
         })

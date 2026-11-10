@@ -15,7 +15,6 @@
 #include <AK/RefCounted.h>
 #include <AK/RefPtr.h>
 #include <LibCompositing/Scrolling/AsyncScrollingState.h>
-#include <LibCompositing/Scrolling/WheelGestureIdentity.h>
 #include <LibCompositing/Types.h>
 #include <LibGC/Ptr.h>
 #include <LibGC/Weak.h>
@@ -29,6 +28,7 @@
 #include <LibWeb/Forward.h>
 #include <LibWeb/Layout/LayoutRustFFI.h>
 #include <LibWeb/Painting/Forward.h>
+#include <LibWebCommon/Clipboard/SystemClipboard.h>
 #include <LibWebCommon/Gamepad/GamepadSnapshot.h>
 #include <LibWebCommon/Page/EventResult.h>
 #include <LibWebCommon/Page/InputEvent.h>
@@ -91,13 +91,24 @@ public:
 #if defined(AK_OS_MACOS)
     bool select_word_for_dictionary_lookup(CSSPixelPoint visual_viewport_position);
 #endif
-    void update_hover_after_scroll();
-    // Hovers what is under the pointer at `visual_viewport_position`, where a hover beside the event loop shows it
-    // already: the boundary events of the move fire, with no mouse move event.
+    void update_hover_at_last_known_mouse_position(Optional<i64> visual_animation_sample_time_nanoseconds = {});
     void update_hover_at(CSSPixelPoint visual_viewport_position, GC::Ptr<DOM::Node> hover_target = {});
-    // Shows the cursor of what is under the pointer again, where a move resolved it before it hovered that, once a
-    // rendering update has applied the style of the hover.
-    void update_cursor_after_rendering_update();
+    // Call once per rendering update, after its layout and before it paints.
+    void update_hover_after_rendering_update();
+    // Whether a frame that landed may have moved what is under the pointer: it has other hit-test items than the frame
+    // before it, or it places the items it kept through other visual contexts.
+    enum class FramePlacement {
+        Unchanged,
+        Changed,
+    };
+    // Call once a frame landed, or presented nothing.
+    void note_frame_landed(FramePlacement);
+    // Call where the hover may be stale (see EventLoop::note_hover_may_be_stale). Answers whether it still is: a
+    // frame to come shows what it waits for.
+    bool update_hover_where_the_pointer_rests(HTML::HoverUpdatePoint);
+    // Call as the compositor reports a frame of a transform animation it runs that moved content under the pointer at
+    // rest, or away from it. The hover follows with the animations sampled at the frame's time.
+    void note_animated_content_moved_under_pointer(i64 frame_time_nanoseconds);
     GC::Ptr<DOM::Node> target_node_for_mouse_position(CSSPixelPoint);
 
     EventResult handle_keydown(UIEvents::KeyCode, unsigned modifiers, u32 code_point, bool repeat, bool should_insert_text, bool async_scroll_performed_default_action = false, ReadonlySpan<TextEditingCommand> editing_commands = {}, bool native_editing_binding_resolved = false);
@@ -113,8 +124,10 @@ public:
 
     EventResult handle_drag_and_drop_event(DragEvent::Type, CSSPixelPoint, CSSPixelPoint screen_position, unsigned button, unsigned buttons, unsigned modifiers, Vector<HTML::SelectedFile> files, Optional<String> text = {}, Vector<String> urls = {});
     EventResult handle_pinch_event(CSSPixelPoint, PinchEvent const&, Optional<RemoteInputEventTarget>* remote_target);
-    [[nodiscard]] EventResult perform_paste_action();
-    EventResult perform_paste_action(NonnullRefPtr<HTML::DragDataStore> const&);
+    [[nodiscard]] EventResult perform_paste_action(Clipboard::PasteMode);
+    EventResult perform_paste_action(Vector<Clipboard::SystemClipboardItem> const& system_clipboard_data);
+    // A null system_clipboard_data stands for content the UI process pastes in its place, like the primary selection.
+    EventResult perform_paste_action(NonnullRefPtr<HTML::DragDataStore> const&, Vector<Clipboard::SystemClipboardItem> const* system_clipboard_data);
 
     enum class ClipboardActionTrigger {
         User,
@@ -136,6 +149,18 @@ public:
         Paragraph,
     };
     bool is_handling_mouse_selection() const { return m_selection_mode != SelectionMode::None; }
+
+    // What a clock lane reads of a drag selecting the page's text by characters, which it shows beside a task.
+    struct SelectionDragForLanes {
+        CSS::StyleNodeID anchor;
+        // Where the anchor is a text node, the offset in its text.
+        size_t anchor_offset { 0 };
+        // Where the anchor is an element, the first child after the boundary point that the lane knows of.
+        CSS::StyleNodeID anchor_child;
+        Optional<CSSPixelRect> scrollport;
+    };
+    Optional<SelectionDragForLanes> selection_drag_for_lanes(Layout::BegunRead const&) const;
+
     void reset_mouse_input_tracking(Badge<Page>);
     void reset_hover_for_document_replacement(Badge<HTML::LocalNavigable>);
 
@@ -239,7 +264,7 @@ private:
         Layout::Node* layout_node(Layout::BegunRead const& read) const;
         GC::Ptr<DOM::Node> dom_node() const;
     };
-    Optional<Target> target_for_mouse_position(CSSPixelPoint position);
+    Optional<Target> target_for_mouse_position(CSSPixelPoint position, Optional<i64> visual_animation_sample_time_nanoseconds = {});
     GC::Ptr<DOM::Node> focus_candidate_for_position(Layout::BegunRead const& read, CSSPixelPoint) const;
 
     void run_mousedown_default_actions(Layout::BegunRead const& read, DOM::Document&, CSSPixelPoint visual_viewport_position, unsigned button, unsigned modifiers, int click_count);
@@ -249,6 +274,9 @@ private:
     bool maybe_request_paste_for_middle_click(Layout::BegunRead const& read, DOM::Document&, CSSPixelPoint visual_viewport_position);
 
     Optional<Painting::CaretPosition> prepare_mouse_selection(DOM::Document&, CSSPixelPoint visual_viewport_position);
+    Optional<Painting::CaretPosition> caret_position_for_mouse_selection(Layout::BegunRead const& read, DOM::Document&, CSSPixelPoint visual_viewport_position, GC::Ptr<DOM::Node> editable_hit_node_before_focus, GC::Ptr<DOM::Node> editing_host_before_focus);
+    bool dispatch_selectstart_event(DOM::Document&, DOM::Node& target);
+    bool fire_selectstart_event(Layout::BegunRead const& read, DOM::Document&, CSSPixelPoint visual_viewport_position, Optional<Painting::CaretPosition>&, CSS::UserSelect&);
     bool initiate_character_selection(DOM::Document&, Painting::CaretPosition const&, CSS::UserSelect, bool shift_held);
     bool initiate_word_selection(Layout::BegunRead const& read, DOM::Document&, Painting::CaretPosition const&, CSS::UserSelect);
     bool initiate_paragraph_selection(DOM::Document&, Painting::CaretPosition const&, CSS::UserSelect);
@@ -267,11 +295,14 @@ private:
     void clear_mousedown_tracking();
     void stop_updating_selection();
 
-    void update_hover_after_scroll(CSSPixelPoint visual_viewport_position, CSSPixelPoint screen_position, unsigned button, unsigned buttons, unsigned modifiers, GC::Ptr<DOM::Node> hover_target = {});
+    enum class HoverUpdateCause : u8 {
+        PointerMoved,
+        PointerRests,
+    };
+    void update_hover_after_scroll(HoverUpdateCause, CSSPixelPoint visual_viewport_position, CSSPixelPoint screen_position, unsigned button, unsigned buttons, unsigned modifiers, GC::Ptr<DOM::Node> hover_target = {}, Optional<i64> visual_animation_sample_time_nanoseconds = {});
     EventResult dispatch_wheel_event(Layout::BegunRead const& read, Layout::Node&, CSSPixelPoint visual_viewport_position, CSSPixelPoint screen_position, unsigned button, unsigned buttons, unsigned modifiers, double wheel_delta_x, double wheel_delta_y, double wheel_tick_120ths_x, double wheel_tick_120ths_y, bool is_cancelable);
     // Both drop the latch when what it refers to is gone from the document, so that the event is targeted afresh.
-    Layout::Node* validated_wheel_scroll_latch_target_layout_node(Layout::BegunRead const& read, DOM::Document&);
-    Layout::Node* validated_latched_wheel_scrolling_box();
+    Layout::Node* validated_latched_wheel_event_target_layout_node(Layout::BegunRead const& read, DOM::Document&);
     EventResult dispatch_synthetic_pinch_wheel_event(CSSPixelPoint visual_viewport_position, CSSPixelPoint screen_position, unsigned modifiers, double wheel_delta_y, bool is_cancelable, Optional<RemoteInputEventTarget>* remote_target);
 
     enum class PointerEventType : u8 {
@@ -303,11 +334,13 @@ private:
     void release_pointer_capture_implicitly(Layout::BegunRead const&, PointerState&);
     void track_the_effective_position_of_the_legacy_mouse_pointer(GC::Ptr<DOM::Node>, Optional<DOM::HoverEventData> = {});
     void report_hovered_node_to_client(GC::Ptr<DOM::Node>);
+    void report_hovered_link_to_client(GC::Ptr<DOM::Node>);
 
     void dispatch_chrome_widget_pointer_event(RefPtr<Painting::ChromeWidget>, Utf16FlyString const& type, unsigned button, CSSPixelPoint visual_viewport_position);
     void update_nested_navigable_under_pointer(GC::Ptr<HTML::LocalNavigable>);
 
     void update_cursor(Layout::BegunRead const& read, Layout::Node const*, GC::Ptr<DOM::Node> host_element, RefPtr<Painting::ChromeWidget>, bool hit_text_fragment = false);
+    void note_hover_may_be_stale();
     void record_last_known_mouse_position(CSSPixelPoint visual_viewport_position, CSSPixelPoint screen_position, unsigned buttons, unsigned modifiers);
     EventResult cancel_drag_and_drop_event(CSSPixelPoint, CSSPixelPoint screen_position, unsigned button, unsigned buttons, unsigned modifiers);
 
@@ -335,8 +368,11 @@ private:
 
     Optional<CSSPixelPoint> m_mousemove_previous_screen_position;
     Optional<CSSPixelPoint> m_last_known_mouse_visual_viewport_position;
-    // Whether a move resolved the cursor before it hovered what is under the pointer, since the last rendering update.
-    bool m_cursor_resolved_before_hover { false };
+    // Whether what is under the pointer may have moved, or changed its cursor, since the hover last followed it.
+    bool m_hover_may_be_stale { false };
+    // The time of the compositor's frame whose animations moved what is under the pointer, which the hover samples
+    // them at.
+    Optional<i64> m_visual_animation_sample_time_nanoseconds;
     bool m_handling_outdated_input { false };
     // The UI process's id of the input event being handled, or 0.
     u64 m_handling_input_event_id { 0 };
@@ -356,19 +392,18 @@ private:
     Optional<UIEvents::KeyCode> m_held_scroll_key;
     OwnPtr<HTML::UserScrollGestureHold> m_scroll_key_gesture_hold;
 
-    // The target and the scrolling box of the wheel gesture in progress: the gesture's later wheel events go to them
-    // without hit testing, and the scrolling box absorbs the gesture at its edge. The compositor latches by the same
-    // rules, so the two agree on the scroller of an event.
-    struct WheelScrollLatch {
-        Compositing::WheelGestureIdentity gesture;
+    // The target of the wheel gesture in progress, which the gesture's later wheel events go to without hit testing.
+    // The compositor latches the scroller of the gesture.
+    struct WheelEventTargetLatch {
+        // The gesture the compositor named for the event that started the latch, which only events it names the same
+        // gesture for continue.
+        Optional<u64> wheel_gesture_id;
         GC::Weak<DOM::Node> wheel_event_target;
-        // The default action walks the boxes of this pseudo-element rather than the target's own.
+        // The events go to the box of this pseudo-element rather than the target's own.
         Optional<CSS::PseudoElement> wheel_event_target_pseudo_element {};
         bool gesture_handed_to_nested_navigable { false };
-        // Unset until the default action of this thread has moved a box, so for as long as the compositor scrolls.
-        Optional<Web::AsyncScrollNodeStableID> scrolling_box {};
     };
-    Optional<WheelScrollLatch> m_wheel_scroll_latch;
+    Optional<WheelEventTargetLatch> m_wheel_event_target_latch;
 };
 
 }

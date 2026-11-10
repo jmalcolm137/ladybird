@@ -5,7 +5,7 @@ line-oriented JSON protocol over a Unix socket. Frame pixels never travel over
 the socket: the engine publishes a POSIX shared-memory ring per tab and the
 frontend maps it.
 
-Version: 17. `Shared/EngineProtocol.h` is authoritative.
+Version: 18. `Shared/EngineProtocol.h` is authoritative.
 
 ## Frontend → engine
 
@@ -46,6 +46,9 @@ Version: 17. `Shared/EngineProtocol.h` is authoritative.
 | `drag` | `tab`, `drag_type`, `x`, `y`, `ctrl`, `shift`, `alt`, `super`, `text`, `urls` | Forward a desktop drag to the page. `drag_type` is `start`, `move`, `end`, or `drop`; coordinates are logical. `urls` carries `text/uri-list` entries; `file://` entries become drag-and-drop files. |
 | `set_user_agent` | `value` | Replace the User-Agent that every page and worker reports. An empty value restores the default. The engine answers with `user_agent_changed`. |
 | `set_navigator_compatibility_mode` | `value` | Select `chrome`, `gecko`, or `webkit` for `navigator.appVersion`, `platform`, `vendor`, and `productSub` in every page and worker. The engine answers with `navigator_compatibility_mode_changed`. |
+| `set_website_color_scheme` | `value` | Select `auto`, `light`, or `dark` for the page's `prefers-color-scheme`. Persisted in the profile and applied to every page. The engine answers with `view_preferences`. |
+| `set_preferred_contrast` | `value` | Select `auto`, `less`, `more`, or `no-preference` for `prefers-contrast` in every page. The engine answers with `view_preferences`. |
+| `set_preferred_motion` | `value` | Select `auto`, `reduce`, or `no-preference` for `prefers-reduced-motion` in every page. The engine answers with `view_preferences`. |
 | `request_processes` | | Ask for the process manager snapshot; the engine answers with `processes`. |
 | `end_process` | `child` | Ask the process manager to end a child process. The engine answers with `processes` or `process_error`. |
 | `crash_report_open` | optional `name` | Open a saved crash report for review. With no name, the newest pending report opens. The engine answers with `crash_report_ready` or `crash_report_failed`. |
@@ -87,6 +90,7 @@ Version: 17. `Shared/EngineProtocol.h` is authoritative.
 | `user_agent_changed` | `value` | The application User-Agent changed. |
 | `navigator_compatibility_modes` | `current`, `modes` | The current navigator compatibility mode and the available modes. Each mode is `{name, value}`. Sent after `user_agents`. |
 | `navigator_compatibility_mode_changed` | `value` | The navigator compatibility mode changed. |
+| `view_preferences` | `color_scheme`, `contrast`, `motion` | The current `prefers-color-scheme`, `prefers-contrast`, and `prefers-reduced-motion` choices. Sent after `navigator_compatibility_modes` and after any `set_website_color_scheme` / `set_preferred_contrast` / `set_preferred_motion`. |
 | `crash_report_available` | `name` | A saved crash report is waiting for review. |
 | `crash_report_ready` | `name`, `fields`, `has_next` | The open crash report's summary. Each field is `{label, value, code}`. |
 | `crash_report_text` | `text` | The full text of the open crash report. |

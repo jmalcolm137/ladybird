@@ -14,6 +14,7 @@
 #include <AK/kmalloc.h>
 #include <LibURL/Forward.h>
 #include <LibWebView/Forward.h>
+#include <LibWebView/ProcessSnapshot.h>
 
 #include <QDialog>
 #include <QIcon>
@@ -42,7 +43,15 @@ class ProcessManagerWindow final : public QDialog {
 public:
     AK_ALLOC_WITH_KMALLOC;
 
-    explicit ProcessManagerWindow(WebView::ProcessManager&);
+    // Where the window gets what it shows, and how it ends a process.
+    struct Source {
+        Function<Vector<WebView::ProcessSnapshot>()> take_snapshots;
+        Function<bool(u64 child_id)> end_process;
+        Function<Optional<String>(WebView::ProcessPageSnapshot const&)> favicon_hash;
+        Function<Optional<ByteBuffer>(String const& favicon_hash)> favicon_png;
+    };
+
+    explicit ProcessManagerWindow(Source);
 
     // Called as the window is shown, and as its title changes, so the platform can hide the title and place the window
     // controls in the window's title bar.
@@ -64,7 +73,9 @@ private:
     void show_context_menu(QPoint const&);
     QIcon favicon_for(WebView::ProcessPageSnapshot const&);
 
-    WebView::ProcessManager& m_process_manager;
+    Source m_source;
+    // The kind of each process in the last refresh, by its child ID.
+    HashMap<u64, WebView::ProcessType> m_process_types;
     QAction* m_end_action { nullptr };
     QAction* m_copy_pid_action { nullptr };
     QPushButton* m_end_button { nullptr };
@@ -81,6 +92,7 @@ private:
     QIcon m_document_icon;
     QIcon m_network_icon;
     QIcon m_compositor_icon;
+    QIcon m_hub_icon;
     QIcon m_image_icon;
     QIcon m_service_icon;
     HashMap<String, QIcon> m_favicons;

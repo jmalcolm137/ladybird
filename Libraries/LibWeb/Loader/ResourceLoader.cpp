@@ -7,6 +7,7 @@
 
 #include <AK/AllOf.h>
 #include <AK/Debug.h>
+#include <AK/NeverDestroyed.h>
 #include <LibCore/Directory.h>
 #include <LibCore/MimeData.h>
 #include <LibCore/Resource.h>
@@ -17,7 +18,6 @@
 #include <LibRequests/Request.h>
 #include <LibRequests/RequestClient.h>
 #include <LibURL/Parser.h>
-#include <LibWeb/Bindings/MainThreadVM.h>
 #include <LibWeb/DOM/Document.h>
 #include <LibWeb/Fetch/Engine/NetworkTransportHandle.h>
 #include <LibWeb/Fetch/Infrastructure/HTTP/Requests.h>
@@ -35,10 +35,11 @@ namespace Web {
 
 static RefPtr<ResourceLoader>& resource_loader()
 {
-    static RefPtr<ResourceLoader>& resource_loader = *new RefPtr<ResourceLoader>;
-    return resource_loader;
+    static thread_local NeverDestroyed<RefPtr<ResourceLoader>> resource_loader;
+    return *resource_loader;
 }
 
+// NB: This is set from the command line, before any agent starts.
 static Optional<URL::URL>& proxy_autoconfig_url_storage()
 {
     static Optional<URL::URL>& proxy_autoconfig_url = *new Optional<URL::URL>;
@@ -60,6 +61,19 @@ void ResourceLoader::initialize(GC::Heap& heap)
     resource_loader() = adopt_ref(*new ResourceLoader(heap));
 }
 
+void ResourceLoader::shut_down()
+{
+    resource_loader() = nullptr;
+}
+
+void ResourceLoader::stop_all_requests()
+{
+    // NB: A stopped request removes itself from the set.
+    auto active_requests = m_active_requests;
+    for (auto const& request : active_requests)
+        request->stop();
+}
+
 bool ResourceLoader::is_initialized()
 {
     return resource_loader() != nullptr;
@@ -76,11 +90,10 @@ ResourceLoader& ResourceLoader::the()
 
 ResourceLoader::ResourceLoader(GC::Heap& heap)
     : m_heap(heap)
-    , m_platform(MUST(String::from_utf8(default_platform)))
 {
 }
 
-NavigatorCompatibilityMode ResourceLoader::s_navigator_compatibility_mode = default_navigator_compatibility_mode;
+Atomic<NavigatorCompatibilityMode, AK::MemoryOrder::memory_order_relaxed> ResourceLoader::s_navigator_compatibility_mode { default_navigator_compatibility_mode };
 
 void ResourceLoader::set_navigator_compatibility_mode(NavigatorCompatibilityMode mode)
 {
@@ -88,11 +101,10 @@ void ResourceLoader::set_navigator_compatibility_mode(NavigatorCompatibilityMode
 
     // A script reads two strings to tell engines apart that no navigator attribute covers: the frames of an error's
     // stack, and the source text of a built-in function. Both follow the engine the navigator claims.
-    auto& vm = Bindings::main_thread_vm();
     if (mode == NavigatorCompatibilityMode::Chrome)
-        vm.set_source_text_syntaxes(JS::VM::StackFrameSyntax::Indented, JS::VM::NativeFunctionSourceSyntax::SingleLine);
+        JS::VM::set_source_text_syntaxes(JS::VM::StackFrameSyntax::Indented, JS::VM::NativeFunctionSourceSyntax::SingleLine);
     else
-        vm.set_source_text_syntaxes(JS::VM::StackFrameSyntax::AtSign, JS::VM::NativeFunctionSourceSyntax::MultiLine);
+        JS::VM::set_source_text_syntaxes(JS::VM::StackFrameSyntax::AtSign, JS::VM::NativeFunctionSourceSyntax::MultiLine);
 }
 
 void ResourceLoader::set_client(Optional<Utf16String> const& top_level_site, NonnullRefPtr<Requests::RequestClient> request_client)
@@ -389,8 +401,8 @@ void ResourceLoader::handle_file_load_request(LoadRequest& request, FileHandler 
     page->client().request_file(move(file_request));
 }
 
-template<typename ResourceHandler, typename ErrorHandler>
-void ResourceLoader::handle_about_load_request(LoadRequest const& request, ResourceHandler on_resource, ErrorHandler on_error)
+template<typename ResourceHandler>
+void ResourceLoader::handle_about_load_request(LoadRequest const& request, ResourceHandler on_resource, GC::Ref<GC::Function<void(ByteString const&)>> on_error)
 {
     auto const& url = request.url().value();
 
@@ -418,9 +430,8 @@ void ResourceLoader::handle_about_load_request(LoadRequest const& request, Resou
     }
 
     Platform::EventLoopPlugin::the().deferred_invoke(GC::create_function(
-        m_heap,
-        [on_error, error_message = ByteString::formatted("No such about page: {}", serialized_path)]() {
-            on_error(error_message);
+        m_heap, GC::captures(on_error, ByteString::formatted("No such about page: {}", serialized_path)), [](auto& on_error, auto& error_message) {
+            on_error->function()(error_message);
         }));
 }
 
@@ -484,15 +495,15 @@ RefPtr<Fetch::Engine::NetworkTransportHandle> ResourceLoader::load(LoadRequest& 
             request,
             [on_headers_received = move(on_headers_received), on_data_received = move(on_data_received), on_complete, request](ReadonlyBytes data, Requests::RequestTimingInfo const& timing_info, HTTP::HeaderList const& response_headers) {
                 log_success(request);
-                on_headers_received->function()(nullptr, response_headers, {}, {}, {}, {}, Requests::CacheState::NotCached);
+                on_headers_received->function()(nullptr, response_headers, {}, {}, Requests::CacheState::NotCached);
                 on_data_received->function()(Requests::ResponseData::from_bytes(data));
                 on_complete->function()(true, timing_info, {});
             },
-            [on_complete, request](ByteString const& message) {
+            GC::create_function(m_heap, GC::captures(on_complete, request), [](auto& on_complete, auto& request, ByteString const& message) {
                 log_failure(request, message);
                 Requests::RequestTimingInfo fixme_implement_timing_info {};
                 on_complete->function()(false, fixme_implement_timing_info, StringView(message));
-            });
+            }));
         return nullptr;
     }
 
@@ -500,7 +511,7 @@ RefPtr<Fetch::Engine::NetworkTransportHandle> ResourceLoader::load(LoadRequest& 
         handle_resource_load_request(
             request,
             [on_headers_received = move(on_headers_received), on_data_received = move(on_data_received), on_complete](FileLoadResult const& load_result) {
-                on_headers_received->function()(nullptr, load_result.response_headers, {}, {}, {}, {}, Requests::CacheState::NotCached);
+                on_headers_received->function()(nullptr, load_result.response_headers, {}, {}, Requests::CacheState::NotCached);
                 on_data_received->function()(Requests::ResponseData::from_bytes(load_result.data));
                 on_complete->function()(true, load_result.timing_info, {});
             },
@@ -516,7 +527,7 @@ RefPtr<Fetch::Engine::NetworkTransportHandle> ResourceLoader::load(LoadRequest& 
             request,
             [request, on_headers_received = move(on_headers_received), on_data_received = move(on_data_received), on_complete](FileLoadResult const& load_result) {
                 log_success(request);
-                on_headers_received->function()(nullptr, load_result.response_headers, {}, {}, {}, {}, Requests::CacheState::NotCached);
+                on_headers_received->function()(nullptr, load_result.response_headers, {}, {}, Requests::CacheState::NotCached);
                 on_data_received->function()(Requests::ResponseData::from_bytes(load_result.data));
                 on_complete->function()(true, load_result.timing_info, {});
             },
@@ -552,11 +563,11 @@ RefPtr<Fetch::Engine::NetworkTransportHandle> ResourceLoader::load(LoadRequest& 
 
     auto network_transport = Fetch::Engine::NetworkTransportHandle::create(*protocol_request);
 
-    auto protocol_headers_received = [on_headers_received = move(on_headers_received), request, &protocol_request = *protocol_request, network_transport](auto const& response_headers, auto status_code, auto const& reason_phrase, auto javascript_bytecode, auto javascript_bytecode_cache_vary_key, auto cache_state) {
+    auto protocol_headers_received = [on_headers_received = move(on_headers_received), request, &protocol_request = *protocol_request, network_transport](auto const& response_headers, auto status_code, auto const& reason_phrase, auto cache_state) {
         if (auto page = request.page())
             page->client().page_did_receive_network_response_headers(protocol_request.id(), status_code.value_or(0), reason_phrase, response_headers->headers(), cache_state);
 
-        on_headers_received->function()(network_transport.ptr(), response_headers, move(status_code), reason_phrase, move(javascript_bytecode), javascript_bytecode_cache_vary_key, cache_state);
+        on_headers_received->function()(network_transport.ptr(), response_headers, move(status_code), reason_phrase, cache_state);
     };
 
     auto protocol_data_received = [on_data_received = move(on_data_received), request, request_id = protocol_request->id()](auto data) {
@@ -618,10 +629,10 @@ RefPtr<Requests::Request> ResourceLoader::start_network_request(LoadRequest cons
         ? Requests::RequestClient::CacheMissNotification::Yes
         : Requests::RequestClient::CacheMissNotification::No;
     // NB: Workers have a Page shim without a navigable or a browser page ID. Their
-    //     requests are attributed through the worker process's browser-level owners.
+    //     requests are attributed through the worker's browser-level owners.
     auto originating_page_id = request.page() && request.page()->has_top_level_traversable() ? request.page()->client().id().value() : 0;
     auto headers = headers_with_normalized_values(request.headers());
-    auto protocol_request = request_client->start_request(request.method(), request.url().value(), *headers, request.body(), request.cache_mode(), request.include_credentials(), transfer_lease, {}, cache_miss_notification, originating_page_id, request.network_isolation_key());
+    auto protocol_request = request_client->start_request(request.method(), request.url().value(), request.same_site_context(), *headers, request.body(), request.cache_mode(), request.include_credentials(), transfer_lease, {}, cache_miss_notification, originating_page_id, request.network_isolation_key());
     if (!protocol_request) {
         log_failure(request, "Failed to initiate load"sv);
         return nullptr;

@@ -257,6 +257,20 @@ void BrowserWindow::create_actions()
         m_session.create_window({}, true);
     }, m_window.ptr());
 
+    m_open_file_action = GUI::Action::create("&Open File…"sv, { Mod_Ctrl, Key_O }, [this](auto&) {
+        if (auto* tab = active_tab())
+            tab->open_file();
+    }, m_window.ptr());
+    m_open_file_action->set_status_tip("Open a file from this computer"_string);
+
+    m_always_on_top_action = GUI::Action::create_checkable("Always on &Top"sv, [this](auto& action) {
+        m_always_on_top = action.is_checked();
+        if (Core::Environment::has("LADYBIRD_SDE_TEST_LOG_QUICK_PARITY"sv))
+            warnln("always on top: {}", m_always_on_top);
+        m_window->set_always_on_top(m_always_on_top);
+    }, m_window.ptr());
+    m_always_on_top_action->set_status_tip("Keep this window above other windows"_string);
+
     m_bookmarks_bar_action = GUI::Action::create_checkable("Show &Bookmarks Bar"sv, { static_cast<u8>(Mod_Ctrl | Mod_Shift), Key_B }, [this](auto& action) {
         m_show_bookmarks_bar = action.is_checked();
         for (auto& tab : m_tabs)
@@ -414,6 +428,7 @@ void BrowserWindow::create_menus()
     file_menu.add_action(*m_new_private_window_action);
     file_menu.add_action(*m_close_tab_action);
     file_menu.add_action(*m_reopen_closed_tab_action);
+    file_menu.add_action(*m_open_file_action);
     file_menu.add_separator();
     file_menu.add_action(*m_next_tab_action);
     file_menu.add_action(*m_previous_tab_action);
@@ -446,8 +461,51 @@ void BrowserWindow::create_menus()
     view_menu.add_action(*m_reset_zoom_action);
     view_menu.add_separator();
     view_menu.add_action(*m_find_action);
+    view_menu.add_action(*m_focus_location_action);
     view_menu.add_action(*m_fullscreen_action);
+    view_menu.add_action(*m_always_on_top_action);
     view_menu.add_action(*m_bookmarks_bar_action);
+    view_menu.add_separator();
+
+    auto add_view_preference = [&](GUI::Menu& menu, HashMap<String, RefPtr<GUI::Action>>& actions, StringView label, StringView value, Function<void(String const&)> setter) {
+        auto action = GUI::Action::create_checkable(label, [setter = move(setter), value = String::from_utf8(value).release_value()](auto&) {
+            setter(value);
+        }, m_window.ptr());
+        menu.add_action(*action);
+        actions.set(String::from_utf8(value).release_value(), move(action));
+    };
+
+    auto add_color_scheme = [&](GUI::Menu& menu, StringView label, StringView value) {
+        add_view_preference(menu, m_color_scheme_actions, label, value, [this](String const& choice) {
+            m_session.set_website_color_scheme(choice);
+        });
+    };
+    auto add_contrast = [&](GUI::Menu& menu, StringView label, StringView value) {
+        add_view_preference(menu, m_contrast_actions, label, value, [this](String const& choice) {
+            m_session.set_preferred_contrast(choice);
+        });
+    };
+    auto add_motion = [&](GUI::Menu& menu, StringView label, StringView value) {
+        add_view_preference(menu, m_motion_actions, label, value, [this](String const& choice) {
+            m_session.set_preferred_motion(choice);
+        });
+    };
+
+    auto color_scheme_menu = view_menu.add_submenu("&Color Scheme"_string);
+    add_color_scheme(*color_scheme_menu, "Auto"sv, "auto"sv);
+    add_color_scheme(*color_scheme_menu, "Dark"sv, "dark"sv);
+    add_color_scheme(*color_scheme_menu, "Light"sv, "light"sv);
+
+    auto contrast_menu = view_menu.add_submenu("&Contrast"_string);
+    add_contrast(*contrast_menu, "Auto"sv, "auto"sv);
+    add_contrast(*contrast_menu, "Less"sv, "less"sv);
+    add_contrast(*contrast_menu, "More"sv, "more"sv);
+    add_contrast(*contrast_menu, "No Preference"sv, "no-preference"sv);
+
+    auto motion_menu = view_menu.add_submenu("&Motion"_string);
+    add_motion(*motion_menu, "Auto"sv, "auto"sv);
+    add_motion(*motion_menu, "Reduce"sv, "reduce"sv);
+    add_motion(*motion_menu, "No Preference"sv, "no-preference"sv);
 
     auto& bookmarks_menu = *m_window->add_menu("&Bookmarks"_string);
     bookmarks_menu.add_action(*m_bookmark_action);
@@ -512,6 +570,21 @@ void BrowserWindow::create_menus()
     help_menu.add_action(*m_crash_reports_action);
     help_menu.add_action(*m_report_website_issue_action);
     help_menu.add_action(GUI::CommonActions::make_about_action("Ladybird"_string, GUI::Icon::default_icon("app-browser"sv), m_window.ptr()));
+
+    update_view_preference_actions();
+}
+
+void BrowserWindow::update_view_preference_actions()
+{
+    auto update = [](HashMap<String, RefPtr<GUI::Action>> const& actions, String const& current) {
+        for (auto const& entry : actions) {
+            if (entry.value)
+                entry.value->set_checked(entry.key == current);
+        }
+    };
+    update(m_color_scheme_actions, m_session.website_color_scheme());
+    update(m_contrast_actions, m_session.preferred_contrast());
+    update(m_motion_actions, m_session.preferred_motion());
 }
 
 void BrowserWindow::create_initial_tabs(Vector<InitialTab> const& initial_tabs, Optional<size_t> active_tab, bool lazy_load)
@@ -1896,6 +1969,9 @@ void BrowserWindow::show_tab_context_menu(BrowserTab& tab, Gfx::IntPoint screen_
     }));
     menu->add_separator();
     menu->add_action(*m_reopen_closed_tab_action);
+    menu->add_separator();
+    m_always_on_top_action->set_checked(m_always_on_top);
+    menu->add_action(*m_always_on_top_action);
 
     m_tab_context_menu = menu;
     m_tab_context_menu->popup(screen_position);

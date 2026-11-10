@@ -41,6 +41,7 @@ String PictureInPictureManager::open_window(WebContentPage& requesting_page, Can
     auto window = Application::the().create_picture_in_picture_window(requesting_page, traversable, video_size);
     if (!window)
         return {};
+    window->act_for_document(requesting_navigable.active_document());
 
     window->on_resize = [this, window = window.ptr()](Gfx::IntSize size) {
         if (auto index = index_of(*window); index.has_value() && m_windows[*index].page->is_open())
@@ -122,11 +123,12 @@ Optional<size_t> PictureInPictureManager::index_of(PictureInPictureWindow const&
 }
 
 // The page that a window shows outlives the window's place as another page's window, so a retired window stays hidden
-// until the page that it shows has closed.
+// until the page that it shows has closed. Its process decides when that is, so the window leaves the tab now.
 void PictureInPictureManager::retire_window(size_t index)
 {
     auto window = m_windows.take(index).window;
     window->hide();
+    window->leave_owners_tab();
     m_retired_windows.append(move(window));
 }
 
@@ -146,15 +148,25 @@ void PictureInPictureManager::window_did_close(PictureInPictureWindow& window, P
 
 void PictureInPictureManager::window_page_did_close(PictureInPictureWindow& window)
 {
-    OwnPtr<PictureInPictureWindow> closed_window;
     if (auto index = index_of(window); index.has_value()) {
-        closed_window = m_windows.take(*index).window;
+        m_closed_windows.append(m_windows.take(*index).window);
     } else if (auto index = m_retired_windows.find_first_index_if([&](auto const& retired_window) { return retired_window.ptr() == &window; }); index.has_value()) {
-        closed_window = m_retired_windows.take(*index);
+        m_closed_windows.append(m_retired_windows.take(*index));
     }
 
-    // The window's page closes from within a callback of its view, so the window is destroyed once that returns.
-    Core::deferred_invoke([closed_window = move(closed_window)] { });
+    // The window's page closes from within a callback of its view, so the window is destroyed once that returns. The
+    // event loop may never get to this, so the window stays here for destroy_all_windows() to find.
+    Core::deferred_invoke([this] {
+        auto closed_windows = exchange(m_closed_windows, {});
+    });
+}
+
+void PictureInPictureManager::destroy_all_windows()
+{
+    // Destroying a window's view closes its page, which comes back here, so the windows leave their lists first.
+    auto windows = exchange(m_windows, {});
+    auto retired_windows = exchange(m_retired_windows, {});
+    auto closed_windows = exchange(m_closed_windows, {});
 }
 
 }

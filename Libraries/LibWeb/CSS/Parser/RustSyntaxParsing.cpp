@@ -7,12 +7,12 @@
 #include <AK/Utf16View.h>
 #include <LibCore/EventLoop.h>
 #include <LibGC/Root.h>
-#include <LibThreading/ThreadPool.h>
 #include <LibWeb/CSS/Parser/ErrorReporter.h>
 #include <LibWeb/CSS/Parser/Parser.h>
 #include <LibWeb/CSS/Parser/RustSyntaxParsing.h>
 #include <LibWeb/CSS/Parser/SourcePosition.h>
 #include <LibWeb/DOM/Document.h>
+#include <LibWeb/Platform/ThreadPoolWork.h>
 #include <LibWeb/StyleValueRustFFI.h>
 #include <LibWeb/ValueParserRustFFI.h>
 
@@ -185,18 +185,13 @@ void Parser::parse_stylesheet_off_thread(ParsingParams const& params, Utf16Strin
 
     // NB: Retain all borrowed input storage and GC roots on the main thread. The worker only
     //     accesses the immutable source and context snapshots, plus this private parser's counter.
-    auto* callback = new Function<void(RustStyleSheetParse)>(
+    auto parse = [input, parse_context] {
+        return RustStyleSheetParse { rust_parse_css_stylesheet_syntax(input, parse_context) };
+    };
+    Platform::run_on_thread_pool<RustStyleSheetParse>(move(parse),
         [source = move(source_storage), parser = move(parser), context = move(context), document = GC::Root<DOM::Document const>::create(params.document.ptr()), on_complete = move(on_complete)](RustStyleSheetParse result) mutable {
             on_complete(move(result));
         });
-    auto& main_thread_event_loop = Core::EventLoop::current();
-    Threading::ThreadPool::the().submit([input, parse_context, callback, &main_thread_event_loop] {
-        RustStyleSheetParse result { rust_parse_css_stylesheet_syntax(input, parse_context) };
-        main_thread_event_loop.deferred_invoke([result = move(result), callback]() mutable {
-            (*callback)(move(result));
-            delete callback;
-        });
-    });
 }
 
 RustRuleList RustStyleSheetParse::native_rules() const
@@ -235,7 +230,7 @@ Optional<RustRule> Parser::parse_as_keyframe_rule(Utf16View source)
     return rules.at(0);
 }
 
-RustDeclarationBlock Parser::parse_as_property_declaration_block(Utf16View source)
+RustDeclarationBlock Parser::parse_as_property_declaration_block(Utf16View source, bool* parsed_cleanly)
 {
     auto context = make_parse_context(ParseContextMode::Syntax);
     // https://drafts.csswg.org/cssom/#parse-a-css-declaration-block
@@ -244,6 +239,8 @@ RustDeclarationBlock Parser::parse_as_property_declaration_block(Utf16View sourc
     RustStyleSheetParse parse { handle };
     report_diagnostics(parse);
     rust_css_syntax_visit_declaration_errors(parse.handle(), report_declaration_error);
+    if (parsed_cleanly)
+        *parsed_cleanly = rust_css_syntax_parse_is_clean(parse.handle());
     return RustDeclarationBlock { rust_css_syntax_parse_declaration_block(handle) };
 }
 

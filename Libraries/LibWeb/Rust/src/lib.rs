@@ -15,10 +15,13 @@ mod rust_demangle;
 mod rust_panic;
 
 pub(crate) mod cow_column;
+pub(crate) mod cow_map;
 mod encoding_detection;
 pub(crate) mod fork;
+pub(crate) mod fork_vec;
 #[cfg(test)]
 mod gfx_test_stubs;
+pub(crate) mod heap_size;
 pub(crate) use libcompositing_rust::fast_hash;
 
 pub(crate) mod css;
@@ -28,9 +31,25 @@ pub(crate) mod painting;
 pub(crate) mod render_state;
 pub(crate) mod stage;
 pub(crate) mod stage_thread;
+pub(crate) mod style_layout_pool;
 pub(crate) mod svg;
+pub mod web_audio;
 
 // What libweb_bindings_rust, whose interfaces are implemented in Rust, uses of this crate.
+pub use css::font_feature_values::FontFeatureValuesRuleKind;
+pub use css::media_list::{MediaList as NativeMediaList, MediaListDeleteResult};
+pub use css::rule::cssom;
+pub use css::rule::{NativeRule, NativeRuleList, NativeRuleType, RuleInsertionResult, RuleRemovalResult};
+pub use css::style_sheet::NativeStyleSheetFlag;
+
+/// The names of the CSS properties and of their legacy aliases, which have an accessor on CSSStyleProperties.
+pub fn css_property_names() -> impl Iterator<Item = &'static str> {
+    css::property_metadata::PROPERTY_NAME_LOOKUP
+        .iter()
+        .map(|(name, _)| *name)
+}
+pub use css::serialize::TextSink;
+pub use css::typed_om;
 pub use svg::gfx_path_from_path_data;
 
 /// The red, green, blue and alpha of a CSS <color> in ASCII that needs nothing to be resolved against, or None for any

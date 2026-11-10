@@ -35,6 +35,8 @@ trap cleanup EXIT
 
 env -u WAYLAND_DISPLAY -u DISPLAY \
     WLR_BACKENDS=headless WLR_HEADLESS_OUTPUTS=1 \
+    XDG_DATA_HOME="$RUNTIME/data" \
+    XDG_CONFIG_HOME="$RUNTIME/config" \
     SDE_WM_PORTAL_PATH="$RUNTIME/wm" \
     SERENITY_RES_ROOT="$SERENITY/Base/res" \
     LD_LIBRARY_PATH="$LAGOM/lib" \

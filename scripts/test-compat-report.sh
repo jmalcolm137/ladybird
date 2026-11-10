@@ -71,6 +71,8 @@ done
 
 env -u WAYLAND_DISPLAY -u DISPLAY \
     WLR_BACKENDS=headless WLR_HEADLESS_OUTPUTS=1 \
+    XDG_DATA_HOME="$RUNTIME/data" \
+    XDG_CONFIG_HOME="$RUNTIME/config" \
     SDE_WM_PORTAL_PATH="$RUNTIME/wm" \
     SERENITY_RES_ROOT="$SERENITY/Base/res" \
     LD_LIBRARY_PATH="$LAGOM/lib" \
@@ -109,7 +111,7 @@ type_text() {
         ch="${text:i:1}"
         code="${keys[$ch]:-}"
         [[ -n "$code" ]] || continue
-        args+=(--key "$code" press --sleep 25 --key "$code" release --sleep 25)
+        args+=(--key "$code" press --sleep 40 --key "$code" release --sleep 40)
     done
     WAYLAND_DISPLAY="$SOCK" "$VI" "${args[@]}" >/dev/null 2>&1
 }
@@ -117,11 +119,26 @@ type_text() {
 # Help -> Report Website Issue..., then describe the problem and send.
 click 424 135
 click 424 184
+for _ in $(seq 1 100); do
+    grep -q "title='Report Website Issue'" "$RUNTIME/chrome.log" 2>/dev/null && break
+    sleep 0.1
+done
 sleep 2
 click 400 350
 type_text "broken page"
+sleep 1
 click 704 505
-sleep 6
+sleep 5
+if ! (grep -q '^/api/v1/challenges$' "$RUNTIME/server.log" 2>/dev/null && grep -q '^/api/v1/reports$' "$RUNTIME/server.log" 2>/dev/null); then
+    # A click during layout can land before the button is ready; give it one more try.
+    click 704 505
+fi
+for _ in $(seq 1 100); do
+    if grep -q '^/api/v1/challenges$' "$RUNTIME/server.log" 2>/dev/null && grep -q '^/api/v1/reports$' "$RUNTIME/server.log" 2>/dev/null; then
+        break
+    fi
+    sleep 0.2
+done
 
 if grep -q '^/api/v1/challenges$' "$RUNTIME/server.log" && grep -q '^/api/v1/reports$' "$RUNTIME/server.log"; then
     echo "  ok: the report service received a challenge request and a report"

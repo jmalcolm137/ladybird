@@ -10,6 +10,7 @@
 
 #include <AK/AllOf.h>
 #include <LibGC/Heap.h>
+#include <LibWeb/CSS/HighlightRegistry.h>
 #include <LibWeb/DOM/Comment.h>
 #include <LibWeb/DOM/Document.h>
 #include <LibWeb/DOM/DocumentFragment.h>
@@ -99,6 +100,18 @@ void Range::update_owner_document()
         m_owner_document->detach_range({}, *this);
     m_owner_document = document;
     document.attach_range({}, *this);
+}
+
+void Range::update_associated_highlights(GC::Ptr<Document> previous_owner_document)
+{
+    auto invalidate_if_registered_in = [&](GC::Ptr<Document> document) {
+        auto* registry = document ? document->highlight_registry_if_exists() : nullptr;
+        if (registry && registry->contains_range(*this))
+            document->invalidate_custom_highlights();
+    };
+    invalidate_if_registered_in(previous_owner_document);
+    if (m_owner_document != previous_owner_document)
+        invalidate_if_registered_in(m_owner_document);
 }
 
 void Range::set_associated_selection(Badge<Selection::Selection>, GC::Ptr<Selection::Selection> selection)
@@ -297,6 +310,7 @@ WebIDL::ExceptionOr<void> Range::set_start_or_end(GC::Ref<Node> node, u32 offset
         return WebIDL::IndexSizeError::create(Utf16String::formatted("Node does not contain a child at offset {}", offset));
 
     // 3. Let bp be the boundary point (node, offset).
+    GC::Ptr<Document> previous_owner_document = m_owner_document;
 
     if (start_or_end == StartOrEnd::Start) {
         // -> If these steps were invoked as "set the start"
@@ -327,6 +341,7 @@ WebIDL::ExceptionOr<void> Range::set_start_or_end(GC::Ref<Node> node, u32 offset
 
     update_owner_document();
     update_associated_selection();
+    update_associated_highlights(previous_owner_document);
     return {};
 }
 
@@ -499,6 +514,7 @@ WebIDL::ExceptionOr<void> Range::select(GC::Ref<Node> node)
 
     // 3. Let index be node’s index.
     auto index = node->index();
+    GC::Ptr<Document> previous_owner_document = m_owner_document;
 
     // 4. Set range’s start to boundary point (parent, index).
     m_start_container = *parent;
@@ -510,6 +526,7 @@ WebIDL::ExceptionOr<void> Range::select(GC::Ref<Node> node)
 
     update_owner_document();
     update_associated_selection();
+    update_associated_highlights(previous_owner_document);
     return {};
 }
 
@@ -532,6 +549,7 @@ void Range::collapse(bool to_start)
         m_start_offset = m_end_offset;
     }
     update_associated_selection();
+    update_associated_highlights(m_owner_document);
 }
 
 // https://dom.spec.whatwg.org/#dom-range-selectnodecontents
@@ -543,6 +561,7 @@ WebIDL::ExceptionOr<void> Range::select_node_contents(GC::Ref<Node> node)
 
     // 2. Let length be the length of node.
     auto length = node->length();
+    GC::Ptr<Document> previous_owner_document = m_owner_document;
 
     // 3. Set start to the boundary point (node, 0).
     m_start_container = node;
@@ -554,6 +573,7 @@ WebIDL::ExceptionOr<void> Range::select_node_contents(GC::Ref<Node> node)
 
     update_owner_document();
     update_associated_selection();
+    update_associated_highlights(previous_owner_document);
     return {};
 }
 
@@ -566,7 +586,7 @@ GC::Ref<Range> Range::clone_range() const
 GC::Ref<Node> Range::common_ancestor_container() const
 {
     // 1. Let container be start node.
-    auto container = m_start_container;
+    GC::Ref<Node> container = m_start_container;
 
     // 2. While container is not an inclusive ancestor of end node, let container be container’s parent.
     while (!container->is_inclusive_ancestor_of(m_end_container)) {
@@ -1378,11 +1398,10 @@ Vector<Gfx::DoubleRect> Range::client_rects()
             if (selection_state == Painting::SelectionState::None)
                 continue;
 
+            // A text node without a box renders nothing, so it has no rects.
             auto const* layout_node = text.layout_node(read);
-            if (!layout_node) {
-                dbgln("FIXME: Failed to get client rects for node {}", node->debug_description());
+            if (!layout_node)
                 continue;
-            }
 
             if (!visual_context_tree.has_value() && !document.can_compute_client_rects_without_accumulated_visual_contexts_update(*layout_node)) {
                 document.update_paint_and_hit_testing_properties_if_needed();
@@ -1454,7 +1473,7 @@ Gfx::DoubleRect Range::bounding_client_rect()
 
 // https://html.spec.whatwg.org/multipage/dynamic-markup-insertion.html#dom-range-createcontextualfragment
 // NB: The steps after node, compliantString and compliantOptions have been determined.
-static WebIDL::ExceptionOr<GC::Ref<DocumentFragment>> create_contextual_fragment_for_node(GC::Ref<Node> node, StringView string, GC::Ptr<TrustedTypes::TrustedHTMLParserOptions> trusted_options)
+static WebIDL::ExceptionOr<GC::Ref<DocumentFragment>> create_contextual_fragment_for_node(GC::Ref<Node> node, StringView string, GC::Ptr<TrustedTypes::TrustedHTMLParserOptions> trusted_options, HTML::ParserScriptingMode scripting_mode)
 {
     // 3. Let element be null.
     GC::Ptr<Element> element = nullptr;
@@ -1480,7 +1499,7 @@ static WebIDL::ExceptionOr<GC::Ref<DocumentFragment>> create_contextual_fragment
     // 7. Return the result of invoking the fragment parsing algorithm steps given element, compliantString,
     //    compliantOptions, and Legacy.
     auto markup = Utf16String::from_utf8(string);
-    return Element::parse_fragment(Variant<GC::Ref<Element>, GC::Ref<DocumentFragment>> { *element }, markup.utf16_view(), HTML::ParserScriptingMode::Fragment, HTML::FragmentFastPath::Allow, trusted_options);
+    return Element::parse_fragment(Variant<GC::Ref<Element>, GC::Ref<DocumentFragment>> { *element }, markup.utf16_view(), scripting_mode, HTML::FragmentFastPath::Allow, trusted_options);
 }
 
 // https://html.spec.whatwg.org/multipage/dynamic-markup-insertion.html#dom-range-createcontextualfragment
@@ -1497,14 +1516,14 @@ WebIDL::ExceptionOr<GC::Ref<DocumentFragment>> Range::create_contextual_fragment
     //       prevent scripts from executing when inserting the returned fragment.
     auto const [compliant_string, trusted_options] = TRY(HTML::get_trusted_type_compliant_input_for_legacy_sink(node, string, TrustedTypes::InjectionSink::Range_createContextualFragment, HTML::LegacySinkRunScripts::Yes));
 
-    return create_contextual_fragment_for_node(node, compliant_string.to_utf8_but_should_be_ported_to_utf16(), trusted_options);
+    return create_contextual_fragment_for_node(node, compliant_string.to_utf8_but_should_be_ported_to_utf16(), trusted_options, HTML::ParserScriptingMode::Fragment);
 }
 
 // https://html.spec.whatwg.org/multipage/dynamic-markup-insertion.html#dom-range-createcontextualfragment
-WebIDL::ExceptionOr<GC::Ref<DocumentFragment>> Range::create_contextual_fragment(StringView string, GC::Ptr<TrustedTypes::TrustedHTMLParserOptions> trusted_options)
+WebIDL::ExceptionOr<GC::Ref<DocumentFragment>> Range::create_contextual_fragment(StringView string, HTML::ParserScriptingMode scripting_mode)
 {
     // 1. Let node be this's start node.
-    return create_contextual_fragment_for_node(*start_container(), string, trusted_options);
+    return create_contextual_fragment_for_node(*start_container(), string, nullptr, scripting_mode);
 }
 
 }

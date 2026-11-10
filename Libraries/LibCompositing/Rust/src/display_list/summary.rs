@@ -27,6 +27,7 @@ pub struct IndexedRecord {
 pub enum LiveContent {
     Canvas(CanvasId),
     VideoFrame(VideoSinkResourceId),
+    ImageFrame(ImageFrameResourceId),
 }
 
 // A top-level record that draws live content, itself or in a record nested in it.
@@ -57,10 +58,20 @@ struct ReferencedIds {
 }
 
 fn live_content_of(command_type: DisplayListCommandType, payload: &[u8]) -> Option<LiveContent> {
+    use DisplayListCommandType as T;
     match command_type {
-        DisplayListCommandType::DrawCanvas => Some(LiveContent::Canvas(read_command::<DrawCanvas>(payload).canvas_id)),
-        DisplayListCommandType::DrawVideoFrame => Some(LiveContent::VideoFrame(
+        T::DrawCanvas => Some(LiveContent::Canvas(read_command::<DrawCanvas>(payload).canvas_id)),
+        T::DrawVideoFrame => Some(LiveContent::VideoFrame(
             read_command::<DrawVideoFrame>(payload).video_sink_id,
+        )),
+        T::DrawScaledDecodedImageFrame => Some(LiveContent::ImageFrame(
+            read_command::<DrawScaledDecodedImageFrame>(payload).frame_id,
+        )),
+        T::DrawRepeatedDecodedImageFrame => Some(LiveContent::ImageFrame(
+            read_command::<DrawRepeatedDecodedImageFrame>(payload).frame_id,
+        )),
+        T::DrawTiledDecodedImageFrame => Some(LiveContent::ImageFrame(
+            read_command::<DrawTiledDecodedImageFrame>(payload).frame_id,
         )),
         _ => None,
     }
@@ -136,12 +147,11 @@ fn note_referenced_ids(command_type: DisplayListCommandType, payload: &[u8], ids
         | T::PaintScrollBar
         | T::CompositorSnapContainer
         | T::CompositorSnapArea
-        | T::CompositorScrollChainingBarrier
         | T::CompositorNestedContextWheelRegion
         // The display list of a page holds none of the commands of the canvas 2D stream.
         | T::Canvas2DFillPath
         | T::Canvas2DStrokePath
-        | T::Canvas2DDrawGlyphRun
+        | T::Canvas2DDrawGlyphRuns
         | T::Canvas2DClearRect
         | T::Canvas2DDrawImageFrame
         | T::Canvas2DDrawCanvas
@@ -290,12 +300,11 @@ fn command_blend(
         | T::PaintScrollBar
         | T::CompositorSnapContainer
         | T::CompositorSnapArea
-        | T::CompositorScrollChainingBarrier
         | T::CompositorNestedContextWheelRegion
         // The display list of a page holds none of the commands of the canvas 2D stream.
         | T::Canvas2DFillPath
         | T::Canvas2DStrokePath
-        | T::Canvas2DDrawGlyphRun
+        | T::Canvas2DDrawGlyphRuns
         | T::Canvas2DClearRect
         | T::Canvas2DDrawImageFrame
         | T::Canvas2DDrawCanvas

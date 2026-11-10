@@ -32,6 +32,7 @@
 #include <LibWebView/RequestServerManager.h>
 
 #if defined(AK_OS_MACOS)
+#    include <LibWebView/QuarantineMacOS.h>
 #    include <sys/xattr.h>
 #endif
 
@@ -131,6 +132,8 @@ struct FileDownloader::ActiveDownload {
     u32 redirect_count { 0 };
     bool can_issue_own_requests { false };
     bool can_restart_from_zero { false };
+    // The context of the request that started the download, so later requests send the same cookies.
+    HTTP::Cookie::SameSiteContext same_site_context { HTTP::Cookie::SameSiteContext::same_site() };
     DownloadRangeSupport range_support;
     bool segmentation_abandoned { false };
     bool restored_from_disk { false };
@@ -167,10 +170,16 @@ FileDownloader::~FileDownloader() = default;
 
 // The operating system checks a downloaded file before it is first opened, as long as the file carries the mark that
 // browsers give their downloads.
-static void mark_as_downloaded([[maybe_unused]] Core::File& file)
+static void mark_as_downloaded([[maybe_unused]] Core::File& file, [[maybe_unused]] LexicalPath const& path, [[maybe_unused]] IsPrivate is_private)
 {
 #if defined(AK_OS_MACOS)
-    // NB: These are the quarantine flags other browsers set, and the time of the download in hexadecimal seconds.
+    // The quarantine event of a web download stays in a system log after the file is gone, which a private download must
+    // not leave behind.
+    if (is_private == IsPrivate::No && mark_as_web_download(path.string()))
+        return;
+
+    // Without a quarantine event the system tells the user that we created the file, but it does check the file. These
+    // are the quarantine flags of a download, and the time of the download in hexadecimal seconds.
     auto quarantine = ByteString::formatted("0083;{:08x};Ladybird;", UnixDateTime::now().seconds_since_epoch());
     if (::fsetxattr(file.fd(), "com.apple.quarantine", quarantine.characters(), quarantine.length(), 0, 0) < 0)
         dbgln("Unable to quarantine a download: {}", Error::from_errno(errno));
@@ -239,7 +248,7 @@ void FileDownloader::start_download_request(u64 download_id, URL::URL const& url
         fail_download(download_id, MUST(String::formatted("Unable to launch RequestServer: {}", client.error())));
         return;
     }
-    auto request = client.value()->start_request("GET"sv, url, *request_headers, {}, HTTP::CacheMode::Default, HTTP::Cookie::IncludeCredentials::Yes, Requests::RequestClient::TransferLease::No, 0u);
+    auto request = client.value()->start_request("GET"sv, url, active->same_site_context, *request_headers, {}, HTTP::CacheMode::Default, HTTP::Cookie::IncludeCredentials::Yes, Requests::RequestClient::TransferLease::No, 0u);
     if (!request) {
         fail_download(download_id, "Unable to start request to download file"_string);
         return;
@@ -278,7 +287,7 @@ void FileDownloader::follow_download_redirect(u64 download_id, HTTP::HeaderList 
     start_download_request(download_id, redirect_url.release_value());
 }
 
-u64 FileDownloader::adopt_download(IsPrivate is_private, URL::URL const& url, LexicalPath destination, Optional<u64> total_size, int request_server_client_id, u64 request_server_request_id, ReadonlyBytes initial_data,
+u64 FileDownloader::adopt_download(IsPrivate is_private, URL::URL const& url, LexicalPath destination, Optional<u64> total_size, HTTP::Cookie::SameSiteContext same_site_context, int request_server_client_id, u64 request_server_request_id, ReadonlyBytes initial_data,
     ResponseFinished on_response_finished)
 {
     ScopeGuard report_failure = [&] {
@@ -293,6 +302,7 @@ u64 FileDownloader::adopt_download(IsPrivate is_private, URL::URL const& url, Le
 
     active->effective_url = url;
     active->can_issue_own_requests = true;
+    active->same_site_context = same_site_context;
 
     if (!initial_data.is_empty()) {
         append_download_data(download_id, initial_data);
@@ -344,7 +354,7 @@ void FileDownloader::attach_request_to_download(u64 download_id, size_t segment_
     request->set_body_delivery_paused(true);
 
     request->set_unbuffered_request_callbacks(
-        [this, download_id, segment_index, request_generation](NonnullRefPtr<HTTP::HeaderList> response_headers, Optional<u32> response_code, Optional<String> const& reason_phrase, Optional<Core::ImmutableBytes>, Optional<u64>, Requests::CacheState cache_state) {
+        [this, download_id, segment_index, request_generation](NonnullRefPtr<HTTP::HeaderList> response_headers, Optional<u32> response_code, Optional<String> const& reason_phrase, Requests::CacheState cache_state) {
             handle_segment_headers(download_id, segment_index, request_generation, *response_headers, response_code, reason_phrase, cache_state);
         },
         [this, download_id, segment_index, request_generation](Requests::ResponseData data) {
@@ -627,7 +637,7 @@ void FileDownloader::start_segment_request(u64 download_id, size_t segment_index
         fail_download(download_id, MUST(String::formatted("Unable to launch RequestServer: {}", client.error())));
         return;
     }
-    auto request = client.value()->start_request("GET"sv, active->effective_url, *request_headers, {}, HTTP::CacheMode::NoStore, HTTP::Cookie::IncludeCredentials::Yes, Requests::RequestClient::TransferLease::No, static_cast<u32>(segment_index));
+    auto request = client.value()->start_request("GET"sv, active->effective_url, active->same_site_context, *request_headers, {}, HTTP::CacheMode::NoStore, HTTP::Cookie::IncludeCredentials::Yes, Requests::RequestClient::TransferLease::No, static_cast<u32>(segment_index));
     if (!request) {
         fail_download(download_id, "Unable to start request to download file"_string);
         return;
@@ -963,7 +973,7 @@ u64 FileDownloader::start_download(IsPrivate is_private, URL::URL const& url, Le
         return download_id;
     }
     auto file = file_or_error.release_value();
-    mark_as_downloaded(*file);
+    mark_as_downloaded(*file, temporary_destination, is_private);
 
     auto active = make<ActiveDownload>(move(file), temporary_destination);
     active->may_replace_destination = may_replace_destination == MayReplaceDestination::Yes;
@@ -1239,7 +1249,7 @@ void FileDownloader::resume_download(u64 id)
 
         active->file = file_or_error.release_value();
         // NB: The file may come from a build that did not mark downloads, or have been created anew by opening it.
-        mark_as_downloaded(*active->file);
+        mark_as_downloaded(*active->file, active->temporary_destination, download->is_private);
         active->file_offset = {};
     }
 
@@ -1365,6 +1375,7 @@ void FileDownloader::persist_download_snapshot(u64 id, PersistUrgency urgency)
         .created_time = active->created_time,
         .can_restart_from_zero = active->can_restart_from_zero,
         .may_replace_destination = active->may_replace_destination,
+        .same_site_context = active->same_site_context,
     };
 
     record.segments.ensure_capacity(active->segments.size());
@@ -1463,6 +1474,7 @@ bool FileDownloader::restore_persisted_download(DownloadRecord& record)
     active->can_issue_own_requests = true;
     active->can_restart_from_zero = record.can_restart_from_zero;
     active->may_replace_destination = record.may_replace_destination;
+    active->same_site_context = record.same_site_context;
     active->created_time = record.created_time;
     active->restored_from_disk = true;
     active->range_support.supports_ranges = true;

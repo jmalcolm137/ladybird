@@ -1,12 +1,13 @@
 set(ladybird_helper_processes
     AudioServer
     Compositor
+    Hub
     ImageDecoder
     MediaServer
     RequestServer
     VideoDecoderServer
     WebContent
-    WebWorker
+    WebRTCClient
 )
 
 # Kills the helpers when the Browser is gone, which the kernel cannot do on macOS.
@@ -33,9 +34,9 @@ function(ladybird_sign_helper_process target)
     if (NOT APPLE)
         return()
     endif()
-    cmake_parse_arguments(PARSE_ARGV 1 ARG "ALLOW_JIT" "" "")
+    cmake_parse_arguments(PARSE_ARGV 1 ARG "ALLOW_JIT" "" "ENTITLEMENTS")
 
-    set(entitlements com.apple.security.cs.disable-library-validation)
+    set(entitlements com.apple.security.cs.disable-library-validation ${ARG_ENTITLEMENTS})
     if (ARG_ALLOW_JIT)
         list(APPEND entitlements com.apple.security.cs.allow-jit)
     endif()
@@ -46,7 +47,7 @@ function(ladybird_sign_helper_process target)
     set(entitlements_file "${CMAKE_CURRENT_BINARY_DIR}/${target}.entitlements")
     ladybird_write_entitlements("${entitlements_file}" ${entitlements})
 
-    set(release_entitlements)
+    set(release_entitlements ${ARG_ENTITLEMENTS})
     if (ARG_ALLOW_JIT)
         list(APPEND release_entitlements com.apple.security.cs.allow-jit)
     endif()

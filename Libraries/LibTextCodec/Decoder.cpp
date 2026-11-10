@@ -94,7 +94,7 @@ Optional<StringView> get_standardized_encoding(Utf16View encoding)
         return {};
     }
 
-    if (encoding.has_ascii_storage()) {
+    if (encoding.has_latin1_storage()) {
         auto ascii = encoding.ascii_span();
         return get_standardized_encoding(StringView { ascii.data(), ascii.size() });
     }
@@ -139,20 +139,6 @@ ErrorOr<Utf16String> Decoder::to_utf16(ReadonlyBytes input) const
     if (!succeeded)
         return Error::from_string_literal("Failed to decode input");
     return context.builder.to_string();
-}
-
-ErrorOr<size_t> Decoder::length_in_utf16_code_units(ReadonlyBytes input) const
-{
-    size_t length = 0;
-    auto succeeded = FFI::textcodec_rust_decoded_length_in_utf16_code_units(
-        reinterpret_cast<u8 const*>(m_encoding.characters_without_null_termination()),
-        m_encoding.length(),
-        input.data(),
-        input.size(),
-        &length);
-    if (!succeeded)
-        return Error::from_string_literal("Failed to decode input");
-    return length;
 }
 
 // https://encoding.spec.whatwg.org/#bom-sniff
@@ -208,13 +194,6 @@ ErrorOr<Utf16String> decode_to_utf16(ReadonlyBytes input, Decoder fallback_decod
 {
     auto decoder = decoder_for_decode(fallback_decoder, input);
     return decoder.to_utf16(input);
-}
-
-// https://encoding.spec.whatwg.org/#decode
-ErrorOr<size_t> decoded_length_in_utf16_code_units(ReadonlyBytes input, Decoder fallback_decoder)
-{
-    auto decoder = decoder_for_decode(fallback_decoder, input);
-    return decoder.length_in_utf16_code_units(input);
 }
 
 // https://encoding.spec.whatwg.org/#utf-8-decode

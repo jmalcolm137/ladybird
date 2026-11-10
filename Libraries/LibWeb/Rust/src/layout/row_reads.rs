@@ -14,7 +14,7 @@ use super::RowsVersion;
 use super::host_tables::ShellFacts;
 use super::layout_node_arena::PublishedBoundRows;
 use super::node_data::{
-    CompositorAnimationFrameKind, FfiNodeLink, NodeFlag, NodeKind, NodeSlotId, PaintNode, StylePayloadsRef,
+    CompositorAnimationFrameKind, FfiNodeLink, LayoutStyleRef, NodeFlag, NodeKind, NodeSlotId, PaintNode,
 };
 use super::node_facts;
 use crate::css::style::tree::StyleNodeID;
@@ -38,7 +38,7 @@ pub(crate) struct RowSnapshot {
     /// How far the arena's rows had been written when they were published.
     version: RowsVersion,
     /// Whether every row's scrollable overflow was measured when the rows were published.
-    overflow_is_measured: bool,
+    overflow_is_settled: bool,
     /// The text rows that waited for their text to be rendered again when the rows were published, by slot index:
     /// every other text row carries the text it renders.
     text_awaiting_render: Box<[NodeSlotId]>,
@@ -85,8 +85,8 @@ impl RowSnapshot {
 
     /// Whether every row's scrollable overflow was measured when the rows were published, which a read of overflow
     /// needs.
-    pub(crate) fn overflow_is_measured(&self) -> bool {
-        self.overflow_is_measured
+    pub(crate) fn overflow_is_settled(&self) -> bool {
+        self.overflow_is_settled
     }
 
     /// The row in slot `id`, if the slot held it when the rows were published.
@@ -131,7 +131,7 @@ impl RowSnapshot {
         self.live_node(id).style_record
     }
 
-    pub(crate) fn style_payloads(&self, id: NodeSlotId) -> StylePayloadsRef {
+    pub(crate) fn style(&self, id: NodeSlotId) -> Option<LayoutStyleRef> {
         self.live_node(id).style
     }
 
@@ -175,6 +175,40 @@ impl RowSnapshot {
         self.node(id).is_some().then_some(id)
     }
 
+    /// Whether a row is of a kind that may make an element contentful without an image observer: text that is not all
+    /// white space, or a box that holds replaced content. A text row that does not carry its text yet counts.
+    pub(crate) fn any_row_may_be_contentful(&self) -> bool {
+        self.paintable.live_nodes().any(|(id, node)| match node.kind {
+            kind if node_facts::kind_is_text(kind) => self.text_row_may_be_non_empty(id),
+            NodeKind::ImageBox
+            | NodeKind::SVGImageBox
+            | NodeKind::CanvasBox
+            | NodeKind::VideoBox
+            | NodeKind::SVGSVGBox
+            | NodeKind::TextInputBox => true,
+            _ => false,
+        })
+    }
+
+    fn text_row_may_be_non_empty(&self, id: NodeSlotId) -> bool {
+        if self
+            .text_awaiting_render
+            .binary_search_by_key(&id.index, |row| row.index)
+            .is_ok()
+        {
+            return true;
+        }
+        self.paintable
+            .text(id)
+            .and_then(|text| text.rendered.as_deref())
+            .is_none_or(|rendered| {
+                rendered
+                    .text
+                    .iter()
+                    .any(|unit| !matches!(unit, 0x09 | 0x0a | 0x0c | 0x0d | 0x20))
+            })
+    }
+
     /// What the shell factory needs to make the layout node of the row in slot `id`, or none for a row that is gone or
     /// has no layout node.
     pub(crate) fn shell_facts(&self, id: NodeSlotId) -> Option<ShellFacts> {
@@ -197,8 +231,8 @@ impl RowStyles {
         self.0.style_record(id)
     }
 
-    pub(crate) fn style_payloads(&self, id: NodeSlotId) -> StylePayloadsRef {
-        self.0.style_payloads(id)
+    pub(crate) fn style(&self, id: NodeSlotId) -> Option<LayoutStyleRef> {
+        self.0.style(id)
     }
 
     pub(crate) fn style_is_derived(&self, id: NodeSlotId) -> bool {
@@ -247,11 +281,11 @@ impl RowIdentities {
 }
 
 impl LayoutNodeArena {
-    /// The rows as they are now, for the host to read, once every row's scrollable overflow is measured where
-    /// `measure_overflow` says so.
-    pub(crate) fn publish_row_snapshot(&mut self, measure_overflow: bool) -> RowSnapshot {
-        if measure_overflow {
-            self.measure_scrollable_overflow();
+    /// The rows as they are now, for the host to read, once every row's scrollable overflow is settled where
+    /// `settle_overflow` says so.
+    pub(crate) fn publish_row_snapshot(&mut self, settle_overflow: bool) -> RowSnapshot {
+        if settle_overflow {
+            self.settle_scrollable_overflow();
         }
         let paintable = self.publish_rows();
         let bound = self.bound_rows_mut().publish();
@@ -261,7 +295,7 @@ impl LayoutNodeArena {
             image_maps: self.image_map_areas().snapshot(),
             visual_context_tree: self.paint_state().visual_context.tree.clone(),
             version: self.rows_version(),
-            overflow_is_measured: self.scrollable_overflow_is_measured(),
+            overflow_is_settled: self.scrollable_overflow_is_settled(),
             text_awaiting_render: self.text_rows_awaiting_sync(),
         }
     }

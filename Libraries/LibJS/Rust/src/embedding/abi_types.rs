@@ -23,12 +23,11 @@
 //! - Property keys cross as the one word of the engine's own property key, which JS::PropertyKey encodes the same way.
 
 use core::ffi::c_void;
-use core::mem::ManuallyDrop;
 use core::ptr::NonNull;
 
 use ak::Utf16String;
 
-use crate::gc::class::Extends;
+use crate::gc::class::{Extends, GcCell, block_class_pointer_at};
 use crate::interpreter::vm::Vm;
 use crate::layout::cell::Gc;
 use crate::layout::host_class::{
@@ -40,7 +39,7 @@ use crate::layout::value::Value;
 use crate::runtime::big_int::BigInt;
 use crate::runtime::completion::{Throw, ThrowCompletionOr};
 use crate::runtime::error::ErrorKind;
-use crate::runtime::error_data::{ErrorData, ErrorDataCell};
+use crate::runtime::error_data::{ERROR_DATA_CELL_ERROR_DATA_OFFSET, ErrorData, ErrorDataCell};
 use crate::runtime::primitive_string::PrimitiveString;
 use crate::runtime::promise_capability::PromiseCapability;
 use crate::runtime::property_key::PropertyKey;
@@ -116,15 +115,34 @@ impl CellAbi for JSPromiseCapability {
     type Cell = PromiseCapability;
 }
 
+/// The error data of an error data cell goes to the embedder as the cell (see error_data_from_abi).
 pub fn error_data_into_abi(error_data: &ErrorData) -> *const JSErrorData {
-    core::ptr::from_ref(error_data).cast()
+    let address = core::ptr::from_ref(error_data).cast::<u8>();
+    // SAFETY: Error data lives in a cell.
+    if core::ptr::eq(unsafe { block_class_pointer_at(address) }, ErrorDataCell::CLASS) {
+        return address.wrapping_sub(ERROR_DATA_CELL_ERROR_DATA_OFFSET).cast();
+    }
+    address.cast()
 }
 
+/// The error data that the embedder passes as a JSErrorData: the error data of an Error, or an error data cell, whose
+/// address the C++ ErrorDataCell gives as the address of its ErrorData. Error data in an error data cell reaches the
+/// embedder as the cell (see error_data_into_abi), so an address in a block of error data cells is the address of a
+/// cell.
+///
 /// # Safety
 ///
-/// `error_data` must point to the error data of a cell that stays alive for `'cell`.
+/// `error_data` must be the error data or the error data cell of a cell that stays alive for `'cell`.
 pub unsafe fn error_data_from_abi<'cell>(error_data: *const JSErrorData) -> &'cell ErrorData {
     assert!(!error_data.is_null(), "the embedder passes error data");
+    // SAFETY: Error data lives in a cell.
+    if core::ptr::eq(
+        unsafe { block_class_pointer_at(error_data.cast()) },
+        ErrorDataCell::CLASS,
+    ) {
+        // SAFETY: The pointer is the address of a live error data cell.
+        return unsafe { &*error_data.cast::<ErrorDataCell>() }.error_data();
+    }
     // SAFETY: The caller guarantees that the pointer is to error data, which lives as long as its cell.
     unsafe { &*error_data.cast::<ErrorData>() }
 }
@@ -284,14 +302,16 @@ pub fn value_from_abi(value: JSValue) -> Value {
 }
 
 /// A borrowed run of code units in the two storage kinds of AK::Utf16View: `data` points to `length_in_code_units`
-/// ASCII bytes if `has_ascii_storage` is set, and to as many UTF-16 code units otherwise. `data` may be null when the
+/// Latin-1 bytes if `has_latin1_storage` is set, which are ASCII if `is_ascii` is set too, and to as many UTF-16 code
+/// units otherwise. `data` may be null when the
 /// length is 0.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct JSUtf16View {
     pub data: *const c_void,
     pub length_in_code_units: usize,
-    pub has_ascii_storage: bool,
+    pub has_latin1_storage: bool,
+    pub is_ascii: bool,
 }
 
 impl JSUtf16View {
@@ -300,12 +320,20 @@ impl JSUtf16View {
             Utf16View::Ascii(bytes) => Self {
                 data: bytes.as_ptr().cast(),
                 length_in_code_units: bytes.len(),
-                has_ascii_storage: true,
+                has_latin1_storage: true,
+                is_ascii: true,
+            },
+            Utf16View::Latin1(bytes) => Self {
+                data: bytes.as_ptr().cast(),
+                length_in_code_units: bytes.len(),
+                has_latin1_storage: true,
+                is_ascii: false,
             },
             Utf16View::Utf16(code_units) => Self {
                 data: code_units.as_ptr().cast(),
                 length_in_code_units: code_units.len(),
-                has_ascii_storage: false,
+                has_latin1_storage: false,
+                is_ascii: false,
             },
         }
     }
@@ -319,9 +347,14 @@ impl JSUtf16View {
             return Utf16View::EMPTY;
         }
         assert!(!self.data.is_null(), "a view of code units has its data");
-        if self.has_ascii_storage {
-            // SAFETY: The caller guarantees that the data is this many ASCII bytes.
-            Utf16View::Ascii(unsafe { ak::slice_from_raw_parts(self.data.cast(), self.length_in_code_units) })
+        if self.has_latin1_storage {
+            // SAFETY: The caller guarantees that the data is this many Latin-1 bytes.
+            let bytes = unsafe { ak::slice_from_raw_parts(self.data.cast(), self.length_in_code_units) };
+            if self.is_ascii {
+                Utf16View::Ascii(bytes)
+            } else {
+                Utf16View::Latin1(bytes)
+            }
         } else {
             // SAFETY: The caller guarantees that the data is this many UTF-16 code units.
             Utf16View::Utf16(unsafe { ak::slice_from_raw_parts(self.data.cast(), self.length_in_code_units) })
@@ -347,15 +380,6 @@ pub unsafe fn owned_utf16_string_from_abi(string: JSOwnedUtf16String) -> Utf16St
 // A property key and its C form are the same word, so a borrowed one can be viewed as the other.
 const _: () = assert!(size_of::<JSPropertyKey>() == size_of::<PropertyKey>());
 const _: () = assert!(align_of::<JSPropertyKey>() == align_of::<PropertyKey>());
-
-/// Gives the key's reference, if it holds a string, to the embedder.
-pub fn property_key_into_abi(key: PropertyKey) -> JSPropertyKey {
-    let key = ManuallyDrop::new(key);
-    // SAFETY: A property key is one word, which the key no longer releases.
-    JSPropertyKey {
-        bits: unsafe { core::ptr::from_ref(&*key).cast::<usize>().read() },
-    }
-}
 
 /// # Safety
 ///
@@ -421,11 +445,11 @@ pub fn append_to_value_sink(sink: &JSValueSink, value: Value) {
 /// Hands `string` to the embedder's sink, which takes UTF-16 code units.
 pub fn append_to_string_sink(sink: &JSStringSink, string: Utf16View<'_>) {
     let append = sink.append.expect("a string sink has an append function");
-    let widened_ascii;
+    let widened_latin1;
     let code_units = match string {
-        Utf16View::Ascii(bytes) => {
-            widened_ascii = bytes.iter().map(|&byte| u16::from(byte)).collect::<Vec<u16>>();
-            widened_ascii.as_slice()
+        Utf16View::Ascii(bytes) | Utf16View::Latin1(bytes) => {
+            widened_latin1 = bytes.iter().map(|&byte| u16::from(byte)).collect::<Vec<u16>>();
+            widened_latin1.as_slice()
         }
         Utf16View::Utf16(code_units) => code_units,
     };

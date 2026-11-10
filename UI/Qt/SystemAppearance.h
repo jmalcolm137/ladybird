@@ -28,19 +28,25 @@ public:
     static bool prefers_reduced_motion();
 
     void apply_interface_theme(WebView::ThemePreference);
+    void apply_color_theme(WebView::ColorTheme);
 
 signals:
     void changed();
+    // Our windows switched between the light and dark appearance, whether the system or the interface theme switched
+    // them.
+    void interface_appearance_changed();
 
 private:
     SystemAppearance();
 
     void update();
+    void update_interface_appearance(bool was_dark);
     bool query_system_prefers_dark() const;
     void observe_platform_changes();
 
     bool m_prefers_dark { false };
     WebView::ThemePreference m_interface_theme { WebView::ThemePreference::System };
+    WebView::ColorTheme m_color_theme { WebView::ColorTheme::Neutral };
 };
 
 }

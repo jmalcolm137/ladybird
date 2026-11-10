@@ -13,8 +13,14 @@
 #include <LibCore/File.h>
 #include <LibCore/StandardPaths.h>
 #include <LibCore/System.h>
+#include <LibGamepad/SDLGamepadSource.h>
 #include <LibWebCommon/Loader/DownloadFilename.h>
+#include <LibWebView/GamepadManager.h>
+#include <LibWebView/NotificationManager.h>
+#include <LibWebView/RecordingNotificationBackend.h>
 #include <LibWebView/TestSpellChecker.h>
+#include <LibWebView/TestTranslator.h>
+#include <LibWebView/WebContentPage.h>
 #include <errno.h>
 
 namespace TestWeb {
@@ -22,11 +28,7 @@ namespace TestWeb {
 Application::Application(Optional<ByteString> ladybird_binary_path)
     : WebView::Application(move(ladybird_binary_path))
     , test_concurrency(Core::System::hardware_concurrency())
-#if defined(AK_OS_WINDOWS)
-    , python_executable_path("python")
-#else
-    , python_executable_path("python3")
-#endif
+    , python_executable_path(LADYBIRD_PYTHON_EXECUTABLE)
 {
     if (auto ladybird_source_dir = Core::Environment::get("LADYBIRD_SOURCE_DIR"sv); ladybird_source_dir.has_value())
         test_root_path = LexicalPath::join(*ladybird_source_dir, "Tests"sv, "LibWeb"sv).string();
@@ -35,6 +37,8 @@ Application::Application(Optional<ByteString> ladybird_binary_path)
         quiet = true;
 
     set_spell_checker(make<WebView::TestSpellChecker>());
+    set_translator(make<WebView::TestTranslator>());
+    WebView::GamepadManager::the().set_source(make<Gamepad::SDLGamepadSource>(Gamepad::IgnoreSystemGamepads::Yes));
 }
 
 Application::~Application()
@@ -82,20 +86,20 @@ void Application::create_platform_arguments(Core::ArgsParser& args_parser)
 void Application::create_platform_options(WebView::BrowserOptions& browser_options, WebView::RequestServerOptions& request_server_options, WebView::WebContentOptions& web_content_options)
 {
     if (verify_style) {
-        static constexpr Array verification_variables {
-            "LIBWEB_VERIFY_STYLE_PLAN_PROVENANCE"sv,
-            "LIBWEB_VERIFY_PUBLISHED_STYLE_TRANSACTION"sv,
-            "LIBWEB_VERIFY_STYLE_ANSWER_PATCH"sv,
-            "LIBWEB_VERIFY_CASCADE_WINNERS"sv,
-            "LIBWEB_VERIFY_PREFIX_RELATION"sv,
-        };
-        for (auto variable : verification_variables)
-            MUST(Core::Environment::set(variable, "1"sv, Core::Environment::Overwrite::Yes));
+        // NB: The style engine checks what it installed against a cold computation of the document.
+        MUST(Core::Environment::set("LIBWEB_STYLE_SELFCHECK"sv, "1"sv, Core::Environment::Overwrite::Yes));
+        // NB: The style engine compares each group an element takes with the one its values build.
+        MUST(Core::Environment::set("LIBWEB_VERIFY_STYLE_CHUNKS"sv, "1"sv, Core::Environment::Overwrite::Yes));
+        // NB: A cold computation per update takes a large document's test past the usual timeout.
+        per_test_timeout_in_seconds = max(per_test_timeout_in_seconds, 180);
     }
     browser_options.headless_mode = WebView::HeadlessMode::Test;
     browser_options.disable_sql_database = WebView::DisableSQLDatabase::Yes;
 
     request_server_options.http_disk_cache_mode = WebView::HTTPDiskCacheMode::Testing;
+
+    // Every test is served from a site of its own, so a site's RequestServer is never used again once its test is done.
+    request_server_options.idle_site_request_server_timeout = AK::Duration::zero();
 
     // Trust the AIA integration test's root CA (written by the http-test-server fixture) — so its broken-chain HTTPS
     // hosts validate once their intermediate is fetched. Must match the path passed in HttpEchoServerFixture::setup.
@@ -134,6 +138,23 @@ ErrorOr<LexicalPath> Application::default_path_for_downloaded_file(ByteString co
     if (!downloads_directory.has_value())
         return Error::from_errno(ECANCELED);
     return LexicalPath::join(*downloads_directory, Web::sanitize_suggested_download_filename(file));
+}
+
+NonnullOwnPtr<WebView::NotificationBackend> Application::create_notification_backend()
+{
+    return make<WebView::RecordingNotificationBackend>();
+}
+
+void Application::focus_page_from_notification(WebView::WebContentPage& page)
+{
+    if (auto* recording_backend = WebView::NotificationManager::the().backend().as_recording_backend())
+        recording_backend->record_focus(page.id());
+}
+
+void Application::open_url_in_new_tab_from_notification(URL::URL const& url, Web::PageId originating_page, WebView::CanonicalTraversable*, WebView::IsPrivate)
+{
+    if (auto* recording_backend = WebView::NotificationManager::the().backend().as_recording_backend())
+        recording_backend->record_open(url, originating_page);
 }
 
 ErrorOr<void> Application::launch_test_fixtures()

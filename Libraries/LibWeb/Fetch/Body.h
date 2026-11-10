@@ -39,6 +39,7 @@ class BodyMixin {
 public:
     virtual ~BodyMixin();
 
+    virtual GC::Cell const& this_impl() const = 0;
     virtual Optional<MimeSniff::MimeType> mime_type_impl() const = 0;
     virtual GC::Ptr<Infrastructure::Body> body_impl() = 0;
     virtual GC::Ptr<Infrastructure::Body const> body_impl() const = 0;
@@ -53,8 +54,9 @@ public:
     void form_data(GC::Ref<WebIDL::Promise>) const;
     void json(GC::Ref<WebIDL::Promise>) const;
     void text(GC::Ref<WebIDL::Promise>) const;
+    WebIDL::ExceptionOr<GC::Ref<Streams::ReadableStream>> text_stream(JS::Realm&) const;
 };
 
-[[nodiscard]] MultipartParsingErrorOr<GC::ConservativeVector<XHR::FormDataEntry>> parse_multipart_form_data(StringView input, MimeSniff::MimeType const& mime_type);
+[[nodiscard]] MultipartParsingErrorOr<GC::RootVector<XHR::FormDataEntry>> parse_multipart_form_data(StringView input, MimeSniff::MimeType const& mime_type);
 
 }

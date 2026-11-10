@@ -18,9 +18,8 @@ from pathlib import Path
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("test_web", type=Path)
-    parser.add_argument("source", type=Path)
     args = parser.parse_args()
-    source = args.source.resolve()
+    source = Path(os.environ["LADYBIRD_SOURCE_DIR"]).resolve()
 
     with tempfile.TemporaryDirectory(prefix="test-web-history-rate-limit-reset-") as temporary:
         root = Path(temporary)
@@ -29,19 +28,25 @@ def main():
                 (root / directory / kind).mkdir(parents=True)
         (root / "Crash").mkdir()
         (root / "TestConfig.ini").write_text("")
-        (root / "Fixtures").symlink_to(source / "Tests/LibWeb/Fixtures", target_is_directory=True)
-        (root / "test-web").symlink_to(source / "Tests/LibWeb/test-web", target_is_directory=True)
+        for file in ("Fixtures/http-test-server.py", "test-web/results-index.html"):
+            (root / file).parent.mkdir()
+            shutil.copyfile(source / "Tests/LibWeb" / file, root / file)
         (root / "Text/input/wpt-import").mkdir()
         shutil.copyfile(source / "Tests/LibWeb/Text/input/include.js", root / "Text/input/include.js")
-        # More history updates than a navigable may make in one rate-limit window.
-        (root / "Text/input/flood.html").write_text(
-            '<!doctype html><script src="include.js"></script><script>asyncTest(done => {'
-            'console.log("HISTORY_RESET_FLOOD");'
-            'for (let i = 0; i < 250; ++i) history.pushState(null, "", "#" + i);'
-            'println("flooded"); done();'
+        # Leaves the view's navigable at its rate limit, held there until the reset between tests. Using the limit up
+        # directly, rather than with as many real history updates, leaves no backlog of them for the next test's load
+        # to wait behind.
+        (root / "Text/input/exhaust.html").write_text(
+            '<!doctype html><script src="include.js"></script><script>test(() => {'
+            'console.log("HISTORY_RESET_EXHAUST");'
+            "internals.exhaustNavigationRateLimit();"
+            "const length = history.length;"
+            'history.pushState(null, "", "#blocked");'
+            "println(`history update blocked: ${history.length === length}`);"
             "});</script>"
         )
-        (root / "Text/expected/flood.txt").write_text("flooded\n")
+        with (root / "Text/expected/exhaust.txt").open("w", newline="\n") as file:
+            file.write("history update blocked: true\n")
         # Text tests precede reference tests. At -j1 these two files use the same view, without relying on directory
         # order. The page turns green only if its own history update goes through.
         (root / "Ref/input/consumer.html").write_text(
@@ -61,7 +66,6 @@ def main():
 
         results = root / "results"
         env = os.environ.copy()
-        env["LADYBIRD_SOURCE_DIR"] = str(source)
         # The echo server imports its vendored tools even though these fixtures use only file URLs. Keep those tools
         # outside the private input tree so test discovery cannot collect their own HTML fixtures.
         wpt = source / "Tests/LibWeb/Text/input/wpt-import"
@@ -93,8 +97,8 @@ def main():
             line.split(": ", 1) for line in (results / "harness-status.txt").read_text().splitlines() if ": " in line
         )
         assert status["completed"] == "2/2" and status["pass"] == "2", status
-        processes = re.findall(r"WebContent\((\d+)\).*HISTORY_RESET_(FLOOD|CONSUMER)", process.stdout)
-        assert len(processes) == 2 and processes[0][1] == "FLOOD" and processes[1][1] == "CONSUMER", processes
+        processes = re.findall(r"WebContent\((\d+)\).*HISTORY_RESET_(EXHAUST|CONSUMER)", process.stdout)
+        assert len(processes) == 2 and processes[0][1] == "EXHAUST" and processes[1][1] == "CONSUMER", processes
         assert processes[0][0] == processes[1][0], f"WebContent was not reused: {processes}"
 
 

@@ -26,6 +26,13 @@ static WebView::PermissionPromptRequest request_for(StringView url, PermissionNa
     return { name, parsed_url->origin(), parsed_url->scheme() == "file"sv, show_os_hint };
 }
 
+static WebView::PermissionPromptRequest notice_for(StringView url)
+{
+    auto request = request_for(url, PermissionName::Microphone);
+    request.kind = WebView::PermissionPromptKind::SystemDeniedNotice;
+    return request;
+}
+
 template<typename T>
 static T& child(QWidget& parent, char const* name)
 {
@@ -125,12 +132,41 @@ TEST_CASE(question_and_answers)
     PermissionPromptPopover port(nullptr, request_for("https://maps.example.com:8443/"sv, PermissionName::Microphone));
     EXPECT_EQ(child<QLabel>(port, "LadybirdPermissionPromptTitle").text(), QStringLiteral("maps.example.com:8443 wants to use your microphone"));
 
+    PermissionPromptPopover mail(nullptr, request_for("https://mail.example.com/"sv, PermissionName::Notifications));
+    EXPECT_EQ(child<QLabel>(mail, "LadybirdPermissionPromptTitle").text(), QStringLiteral("mail.example.com wants to send you notifications"));
+
     PermissionPromptPopover file(nullptr, request_for("file:///Users/someone/map.html"sv));
     EXPECT_EQ(child<QLabel>(file, "LadybirdPermissionPromptTitle").text(), QStringLiteral("This file wants to know your location"));
 
     EXPECT_EQ(child<QPushButton>(site, "LadybirdPermissionPromptAllowAlways").text(), QStringLiteral("Allow while visiting the site"));
     EXPECT_EQ(child<QPushButton>(site, "LadybirdPermissionPromptAllowOnce").text(), QStringLiteral("Allow this time"));
     EXPECT_EQ(child<QPushButton>(site, "LadybirdPermissionPromptBlock").text(), QStringLiteral("Never allow"));
+}
+
+TEST_CASE(notifications_prompt_has_two_answers)
+{
+    PermissionPromptPopover mail(nullptr, request_for("https://mail.example.com/"sv, PermissionName::Notifications));
+    EXPECT_EQ(child<QPushButton>(mail, "LadybirdPermissionPromptAllowAlways").text(), QStringLiteral("Allow"));
+    EXPECT_EQ(child<QPushButton>(mail, "LadybirdPermissionPromptBlock").text(), QStringLiteral("Never allow"));
+    EXPECT(mail.findChild<QPushButton*>(QStringLiteral("LadybirdPermissionPromptAllowOnce")) == nullptr);
+
+    Recorder recorder;
+    recorder.attach(mail);
+    child<QPushButton>(mail, "LadybirdPermissionPromptAllowAlways").click();
+    EXPECT_EQ(recorder.outcomes.size(), 1u);
+    EXPECT(recorder.outcomes[0] == PromptOutcome::AllowAlways);
+}
+
+TEST_CASE(hint_text_names_the_feature)
+{
+    PermissionPromptPopover location(nullptr, request_for("https://maps.example.com/"sv, PermissionName::Geolocation, true));
+    EXPECT_EQ(child<QLabel>(location, "LadybirdPermissionPromptHint").text(), QStringLiteral("Your system will then ask you to let Ladybird know your location."));
+
+    PermissionPromptPopover microphone(nullptr, request_for("https://talk.example.org/"sv, PermissionName::Microphone, true));
+    EXPECT_EQ(child<QLabel>(microphone, "LadybirdPermissionPromptHint").text(), QStringLiteral("Your system will then ask you to let Ladybird use your microphone."));
+
+    PermissionPromptPopover notifications(nullptr, request_for("https://mail.example.com/"sv, PermissionName::Notifications, true));
+    EXPECT_EQ(child<QLabel>(notifications, "LadybirdPermissionPromptHint").text(), QStringLiteral("Your system will then ask you to let Ladybird send you notifications."));
 }
 
 TEST_CASE(hint_shows_only_when_requested)
@@ -141,7 +177,7 @@ TEST_CASE(hint_shows_only_when_requested)
     PermissionPromptPopover with_hint(nullptr, request_for("https://maps.example.com/"sv, PermissionName::Geolocation, true));
     auto& hint = child<QLabel>(with_hint, "LadybirdPermissionPromptHint");
     EXPECT(!hint.isHidden());
-    EXPECT_EQ(hint.text(), QStringLiteral("macOS will then ask you to let Ladybird use your location."));
+    EXPECT_EQ(hint.text(), QStringLiteral("Your system will then ask you to let Ladybird know your location."));
 }
 
 TEST_CASE(suspending_hides_without_an_answer)
@@ -159,6 +195,25 @@ TEST_CASE(suspending_hides_without_an_answer)
     popover.ignore();
     VERIFY(recorder.outcomes.size() == 1);
     EXPECT(recorder.outcomes[0] == PromptOutcome::Ignored);
+}
+
+TEST_CASE(a_prompt_closed_as_its_window_goes_inactive_waits)
+{
+    PermissionPromptPopover popover(nullptr, request_for("https://maps.example.com/"sv));
+    Recorder recorder;
+    recorder.attach(popover);
+    popover.show();
+
+    // Qt closes a popup as its window goes inactive, and says so afterwards, which is when the prompt is suspended.
+    popover.close();
+    popover.suspend();
+    let_time_pass();
+    EXPECT(recorder.outcomes.is_empty());
+
+    popover.resume();
+    EXPECT(popover.isVisible());
+    child<QPushButton>(popover, "LadybirdPermissionPromptAllowOnce").click();
+    EXPECT(recorder.outcomes == Vector { PromptOutcome::AllowOnce });
 }
 
 TEST_CASE(queued_requests_show_one_at_a_time)
@@ -184,6 +239,46 @@ TEST_CASE(queued_requests_show_one_at_a_time)
 
     queue.ignore_all();
     EXPECT(second_outcomes == Vector { PromptOutcome::Ignored });
+}
+
+TEST_CASE(a_notice_tells_and_offers_the_setting)
+{
+    PermissionPromptPopover popover(nullptr, notice_for("https://talk.example.org/"sv));
+    EXPECT_EQ(child<QLabel>(popover, "LadybirdPermissionPromptTitle").text(), QStringLiteral("Ladybird can't use your microphone"));
+    EXPECT_EQ(child<QLabel>(popover, "LadybirdPermissionPromptBody").text(), QStringLiteral("Your system's privacy settings don't let Ladybird use your microphone."));
+    EXPECT(!popover.findChild<QPushButton*>(QStringLiteral("LadybirdPermissionPromptAllowAlways")));
+
+    Recorder recorder;
+    recorder.attach(popover);
+    auto settings_opened = 0;
+    popover.on_open_settings = [&] { ++settings_opened; };
+    popover.show();
+    child<QPushButton>(popover, "LadybirdPermissionPromptOpenSettings").click();
+    EXPECT_EQ(settings_opened, 1);
+    EXPECT(recorder.outcomes == Vector { PromptOutcome::Dismissed });
+}
+
+TEST_CASE(a_suspended_queue_shows_its_notice_once_resumed)
+{
+    PermissionPromptQueue queue;
+    PermissionPromptPopover* popover = nullptr;
+    auto times_shown = 0;
+    queue.create_popover = [&](WebView::PermissionPromptRequest const& request) {
+        popover = new PermissionPromptPopover(nullptr, request);
+        popover->on_shown = [&] { ++times_shown; };
+        return popover;
+    };
+
+    queue.suspend();
+    queue.enqueue(notice_for("https://talk.example.org/"sv), [](PromptOutcome) { });
+    VERIFY(popover);
+    EXPECT(!popover->isVisible());
+    EXPECT_EQ(times_shown, 0);
+
+    queue.resume();
+    EXPECT(popover->isVisible());
+    EXPECT_EQ(times_shown, 1);
+    queue.ignore_all();
 }
 
 TEST_CASE(cancelling_a_queued_request_drops_it_silently)

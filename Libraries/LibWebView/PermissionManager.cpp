@@ -109,6 +109,8 @@ EffectiveState PermissionManager::global_default(PermissionName name) const
         return m_geolocation_default;
     case PermissionName::Microphone:
         return m_microphone_default;
+    case PermissionName::Notifications:
+        return m_notifications_default;
     }
     VERIFY_NOT_REACHED();
 }
@@ -234,7 +236,7 @@ void PermissionManager::set_decision(PermissionName name, URL::Origin const& ori
 
 void PermissionManager::reset_origin(URL::Origin const& origin)
 {
-    for (auto name : { PermissionName::Geolocation, PermissionName::Microphone })
+    for (auto name : { PermissionName::Geolocation, PermissionName::Microphone, PermissionName::Notifications })
         bump_generation(name, origin);
 
     auto removed = m_entries.remove_all_matching([&](auto const& entry) { return entry.origin.is_same_origin(origin); });
@@ -348,7 +350,17 @@ void PermissionManager::remove_view(u64 view_id)
 void PermissionManager::set_global_default(PermissionName name, EffectiveState state)
 {
     VERIFY(!m_ordinary_session);
-    auto& current = name == PermissionName::Geolocation ? m_geolocation_default : m_microphone_default;
+    auto& current = [&]() -> EffectiveState& {
+        switch (name) {
+        case PermissionName::Geolocation:
+            return m_geolocation_default;
+        case PermissionName::Microphone:
+            return m_microphone_default;
+        case PermissionName::Notifications:
+            return m_notifications_default;
+        }
+        VERIFY_NOT_REACHED();
+    }();
     if (current == state)
         return;
     current = state;
@@ -370,6 +382,7 @@ Web::Permissions::PermissionSnapshot PermissionManager::snapshot() const
     snapshot.revision = m_revision;
     snapshot.geolocation_default = global_default(PermissionName::Geolocation);
     snapshot.microphone_default = global_default(PermissionName::Microphone);
+    snapshot.notifications_default = global_default(PermissionName::Notifications);
 
     auto add_entry = [&](PermissionName name, URL::Origin const& origin) {
         auto state = effective_state(name, origin);
@@ -483,6 +496,12 @@ void PermissionManager::age_origin_for_testing(URL::Origin const& origin, AK::Du
             *entry.embargo_until -= duration;
     }
     run_expiry();
+}
+
+u8 PermissionManager::dismissals_for_testing(PermissionName name, URL::Origin const& top_level_origin) const
+{
+    auto const* entry = find_entry(name, top_level_origin);
+    return entry ? entry->dismissals : 0;
 }
 
 void PermissionManager::set_clock_for_testing(Function<UnixDateTime()> clock)

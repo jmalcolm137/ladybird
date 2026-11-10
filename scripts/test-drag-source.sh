@@ -55,6 +55,8 @@ done
 
 env -u WAYLAND_DISPLAY -u DISPLAY \
     WLR_BACKENDS=headless WLR_HEADLESS_OUTPUTS=1 \
+    XDG_DATA_HOME="$RUNTIME/data" \
+    XDG_CONFIG_HOME="$RUNTIME/config" \
     SDE_WM_PORTAL_PATH="$RUNTIME/wm" \
     SERENITY_RES_ROOT="$SERENITY/Base/res" \
     LD_LIBRARY_PATH="$LAGOM/lib" \
@@ -89,9 +91,10 @@ if [[ "$mapped" != 1 ]]; then
 fi
 # The title is set before layout finishes; the drag source needs the page's
 # hit-test, so leave the renderer time to lay out the document.
-sleep 3
+sleep 5
 
 env WAYLAND_DISPLAY="$SOCK" "$VI" --extent 1280 720 \
+    --move 200 150 --sleep 300 \
     --move 400 320 --sleep 200 \
     --button 0x110 press --sleep 400 \
     --move 500 320 --sleep 400 \

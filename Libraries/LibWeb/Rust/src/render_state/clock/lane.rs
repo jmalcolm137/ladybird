@@ -14,7 +14,8 @@
 //! was sampled, which the state then still shows: as the first tick that needs it runs, or before the host first writes
 //! the state, where the pointer moves over the document or a task runs the plan's animations. Until a lane comes
 //! together, the one before it follows the pointer, whose frames the presenter drops once it presented the newer
-//! frame.
+//! frame. A rendering update that presents no frame of its own leaves the lane of the frame before it to go on from the
+//! state as the update left it: a fork the update's writes passed goes, and the state is forked again.
 
 use super::super::owner::{self, DocumentId};
 use super::{
@@ -133,8 +134,8 @@ enum FramePlan {
     Sealed(ClockPlan),
 }
 
-/// Lets go of `lanes`, whose forks copy the document's whole render state: they are dropped once the owner no longer
-/// holds the render states, which the host may be waiting for.
+/// Lets go of `lanes`, whose forks may take long to drop: they are dropped once the owner no longer holds the render
+/// states, which the host may be waiting for.
 fn retire(lanes: Lanes) {
     owner::drop_after_hold(lanes);
 }
@@ -170,6 +171,7 @@ impl LaneDelivery {
             Some(output) => TickPresented::Frame {
                 output,
                 hit_test_list_changed: true,
+                publishes: true,
             },
             None => TickPresented::Nothing,
         };
@@ -177,6 +179,7 @@ impl LaneDelivery {
             recorder,
             presentation,
             presented,
+            presented_hit_test_items: None,
         };
         let (ticks, frame) = (Arc::clone(&self.ticks), self.frame);
         super::super::post_to_render_side(move || {
@@ -192,6 +195,19 @@ fn with_slot<R>(document: DocumentId, job: impl FnOnce(&mut LaneSlot) -> R) -> O
         let answer = job(slot);
         slot.publish();
         Some(answer)
+    })
+    .flatten()
+}
+
+/// The nodes the selection in the fork of the lane that follows the presented frame of `document` highlights. For a test.
+pub(in crate::render_state) fn selection_shown_for_testing(
+    document: DocumentId,
+) -> Option<Vec<super::selection::SelectionRowForTesting>> {
+    with_slot(document, |slot| {
+        match slot.lanes.current_ref().map(|lane| &lane.state) {
+            Some(super::LaneState::Forked { fork, .. }) => Some(super::selection::rows_for_testing(fork)),
+            _ => None,
+        }
     })
     .flatten()
 }
@@ -242,6 +258,16 @@ pub(in crate::render_state) fn note_host_write(document: DocumentId) {
             lane.state.move_on();
             return;
         }
+        // NB: Nor does a coming lane tick while the update holds it, and with no animations to sample, what it would show
+        //     is what the update replaces or leaves showing, as above.
+        if slot.taken_in.is_some()
+            && let Lanes::Coming { pieces, .. } = &slot.lanes
+            && matches!(&pieces.plan, FramePlan::Sealed(plan) if !plan.animates())
+            && let Some(state) = slot.lanes.newest_state()
+        {
+            state.move_on();
+            return;
+        }
         // A lane that follows the pointer hovers beside the next task, which may begin as soon as this job is done,
         // whether or not its animations run beside the idle event loop.
         let needs_state = match &slot.lanes {
@@ -281,6 +307,13 @@ pub(in crate::render_state) fn take_lanes_in(ticks: &Arc<ClockTicks>, update: u6
         report
     })
     .unwrap_or_default()
+}
+
+/// On the render owner: answers what the hover of the lanes of the document `ticks` belong to did so far, and leaves
+/// them ticking, for the host to take in between two rendering updates.
+#[must_use]
+pub(in crate::render_state) fn take_lane_report(ticks: &Arc<ClockTicks>) -> LaneReport {
+    with_slot(ticks.document, LaneSlot::take_report).unwrap_or_default()
 }
 
 /// On the render owner: runs the tick queued for the lanes `ticks` belong to.
@@ -341,6 +374,10 @@ impl LaneSlot {
         }
         match (&mut self.lanes, plan) {
             (Lanes::Coming { pieces, .. }, plan) => {
+                // NB: The frame's own update sealed already, so this one presented no frame of its own.
+                if self.taken_in.is_none() && !matches!(pieces.plan, FramePlan::Unsealed) {
+                    pieces.state.rejoin_the_state();
+                }
                 pieces.plan = plan.map_or(FramePlan::None, FramePlan::Sealed);
                 self.come_together();
             }
@@ -348,8 +385,8 @@ impl LaneSlot {
             (Lanes::Newest(lane), Some(plan)) => {
                 // NB: With no replacement frame, the completed update left the host showing this lane's frame.
                 //     Its next tick or the next task's first write can preserve that state then.
-                if self.taken_in.is_none() && matches!(lane.state, LaneState::MovedOn) && lane.samples_nothing() {
-                    lane.state = LaneState::Shown;
+                if self.taken_in.is_none() {
+                    lane.rejoin_the_state();
                 }
                 lane.replan(plan);
             }
@@ -429,10 +466,53 @@ impl LaneSlot {
         }
     }
 
+    /// Shows the cursor of what is under the move that waits for a tick, if one waits, in the frame the screen shows,
+    /// as a tick that presents nothing: the host hovers the move once it takes the lanes in.
+    fn show_cursor_where_a_move_waits(&mut self) {
+        let Some(pointer) = self.ticks.pointer_state().take() else {
+            return;
+        };
+        self.show_cursor_for(pointer);
+    }
+
+    fn show_cursor_for(&mut self, pointer: PendingPointer) {
+        let frame_time_nanoseconds = self.ticks.latest.load(Ordering::Acquire);
+        let document = self.ticks.document;
+        let nested = self.nested;
+        let (hovered, nested) = match self.lanes.current() {
+            // A lane that needs no render state hovers its read-only frame as it always does, which presents nothing.
+            Some(lane) if !lane.needs_render_state() => {
+                lane.hovered.go_on_from_nested(nested);
+                let hovered = lane.hover_read_only(pointer, frame_time_nanoseconds);
+                (Some(hovered), lane.hovered.nested())
+            }
+            // A lane without a fork, which the host's write let go of as the update took the lane in, hit tests the
+            // state the host writes: what the frame the update presents next shows, which the cursor follows ahead of it.
+            Some(lane) => {
+                let hovered = lane
+                    .show_cursor_on_fork(frame_time_nanoseconds, pointer)
+                    .unwrap_or_else(|| {
+                        owner::with_state(document, None, |state| {
+                            lane.show_cursor_only(state, pointer, frame_time_nanoseconds)
+                        })
+                    });
+                (Some(hovered), nested)
+            }
+            None => (None, nested),
+        };
+        self.nested = nested;
+        self.last_move = Some(hovered.unwrap_or(LaneMove {
+            input_event_id: pointer.input_event_id,
+            target: None,
+            handed: false,
+        }));
+    }
+
     fn tick(&mut self) {
         self.take_in_scroll_offsets();
         // A recording of the host's own adds to the resource storage the lane presents with: a move waits for it.
         if self.ticks.is_held() {
+            self.show_cursor_where_a_move_waits();
             return;
         }
         // A rendering update took in what the lanes did, and the frame it presents shows that, at the time it took it
@@ -445,16 +525,28 @@ impl LaneSlot {
                     super::hover::log_time()
                 );
             }
+            self.show_cursor_where_a_move_waits();
             return;
         }
         let samples_animations = !self.ticks.animations_held.load(Ordering::Relaxed);
-        let pointer = self.ticks.pointer_state().take();
+        // NB: Beside an idle event loop the host gets to the move of a drag at once, and paints it itself. The move waits
+        //     until then, as a task that begins first keeps the host from it.
+        let host_paints_the_drag = !samples_animations
+            && self
+                .lanes
+                .current_ref()
+                .is_some_and(|lane| lane.selection_drag().is_some())
+            && self.ticks.pointer_state().holds_the_primary_button();
+        let pointer = match host_paints_the_drag {
+            true => None,
+            false => self.ticks.pointer_state().take(),
+        };
         if let Lanes::Newest(lane) = &mut self.lanes
             && !lane.needs_render_state()
         {
             if let Some(pointer) = pointer {
                 lane.hovered.go_on_from_nested(self.nested);
-                self.last_move = Some(lane.hover_read_only(pointer));
+                self.last_move = Some(lane.hover_read_only(pointer, self.ticks.latest.load(Ordering::Acquire)));
                 self.nested = lane.hovered.nested();
             }
             return;
@@ -472,6 +564,9 @@ impl LaneSlot {
             if newest {
                 lane.parked = true;
                 lane.hovered.park();
+            }
+            if let Some(pointer) = pointer {
+                self.show_cursor_for(pointer);
             }
             return;
         }
@@ -507,6 +602,11 @@ impl LaneSlot {
                 colors: lane.presented_colors.clone(),
                 compositor_animations: lane.presented_compositor_animations.clone(),
             };
+            // The samples the tick showed may have moved a box under the pointer at rest, or away from under it: the
+            // next tick hovers where the pointer rests again, in the frame this tick presented.
+            if ticked.sampled {
+                let _ = self.ticks.pointer_rests_on_moving_content();
+            }
         }
     }
 

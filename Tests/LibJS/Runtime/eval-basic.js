@@ -19,12 +19,23 @@ test("returns value of last value-producing statement", () => {
 
 test("completion value of a labelled break", () => {
     // A `break label;` carries the last value V of the labelled statement (UpdateEmpty), and an
-    // empty completion becomes undefined. The completion register must be initialized so that the
-    // break path never exposes a stale register.
+    // empty completion leaves the running value of the statement list. The completion register must
+    // be initialized so that the break path never exposes a stale register.
     expect(eval("L: { break L; }")).toBeUndefined();
     expect(eval("L: { 1; break L; 2; }")).toBe(1);
     expect(eval("L: { 1; break L; }")).toBe(1);
     expect(eval("x: { 42; break x; 99; }")).toBe(42);
+});
+
+test("completion value of a labelled statement that completes empty", () => {
+    expect(eval("11; L: { break L; }")).toBe(11);
+    expect(eval("12; L: break L;")).toBe(12);
+    expect(eval("15; L: { }")).toBe(15);
+    expect(eval("18; L: ;")).toBe(18);
+    expect(eval("19; { L: { break L; } }")).toBe(19);
+    expect(eval("20; L: { if (true) break L; }")).toBeUndefined();
+    expect(eval("21; L: { 22; break L; }")).toBe(22);
+    expect(eval("23; L: { while (true) break L; }")).toBeUndefined();
 });
 
 test("a for-in iterator does not leak through a labelled break", () => {
@@ -37,6 +48,13 @@ test("a for-in iterator does not leak through a labelled break", () => {
     expect(leaked).toBeUndefined();
 });
 
+test("completion value read from a local that a later declaration reassigns", () => {
+    expect(eval("{ let a = 1; a; let b = (a = 9); }")).toBe(1);
+    expect(eval("{ let a = 1; if (true) { a; let b = (a = 9); } }")).toBe(1);
+    expect(eval("{ let a = 1; L: { a; let b = (a = 9); } }")).toBe(1);
+    expect(eval("{ let a = 1, i = 0; while (i++ < 1) { a; let b = (a = 9); } }")).toBe(1);
+});
+
 test("completion value of a try statement whose catch clause runs", () => {
     expect(eval("try { class C extends null.x {} } catch (e) {}")).toBeUndefined();
     expect(eval("try { function f() {} null.x; } catch (e) { 3; } finally {}")).toBe(3);
@@ -45,7 +63,7 @@ test("completion value of a try statement whose catch clause runs", () => {
 test("syntax error", () => {
     expect(() => {
         eval("{");
-    }).toThrowWithMessage(SyntaxError, "Unexpected token Eof. Expected CurlyClose (line: 1, column: 2)");
+    }).toThrowWithMessage(SyntaxError, "Unexpected end of input. Expected '}' (line: 1, column: 2)");
 });
 
 test("returns 1st argument unless 1st argument is a string", () => {
@@ -110,10 +128,10 @@ test("indirect eval with syntax error can be called multiple times", function ()
     }
     expect(f).toThrowWithMessage(
         SyntaxError,
-        "Unexpected token Invalid. Expected statement or declaration (line: 1, column: 1)"
+        "Unexpected token '@'. Expected statement or declaration (line: 1, column: 1)"
     );
     expect(f).toThrowWithMessage(
         SyntaxError,
-        "Unexpected token Invalid. Expected statement or declaration (line: 1, column: 1)"
+        "Unexpected token '@'. Expected statement or declaration (line: 1, column: 1)"
     );
 });

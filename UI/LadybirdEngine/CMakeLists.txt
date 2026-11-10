@@ -4,12 +4,17 @@ add_executable(LadybirdEngine
     EngineApplication.cpp
     EngineServer.cpp
     main.cpp
+    ../Qt/BookmarkStore.cpp
+    ../Qt/SessionHistorySnapshotStorage.cpp
+    ../Qt/SessionStore.cpp
 )
 
 add_dependencies(LadybirdEngine ladybird_build_resource_files ${ladybird_helper_processes})
 target_link_libraries(LadybirdEngine PRIVATE
     AK
     LibCore
+    LibDatabase
+    LibFileSystem
     LibGfx
     LibIPC
     LibJS

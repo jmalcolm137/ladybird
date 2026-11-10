@@ -3,9 +3,10 @@
 
 # Tab performance monitor
 
-Enable **Show tab performance monitor** in **Settings → Advanced**, or set
+Enable **Show Tab Performance Monitor** in the **Debug** menu, which **Show
+Debug menu** in **Settings → Advanced** turns on, or set
 `debug.ui.show_tab_performance_monitor` to `true`. It defaults to `false`.
-The UI's toolbars display the current tab's statistics inline.
+A row of its own below the page displays the current tab's statistics.
 Each tab retains its own CPU history while monitoring is enabled.
 
 `LibWebView::TabPerformanceMonitor` resolves browser ownership and supplies
@@ -16,11 +17,11 @@ counter differencing and windowing independently of the UI and OS APIs.
 
 * **CPU:** CPU-time deltas divided by actual monotonic elapsed time. 100% is
   one logical CPU; values above 100% are expected. All live and terminated
-  threads in exclusively owned WebContent and WebWorker processes contribute.
-  Registered page and embedded-frame ownership identify WebContent owners.
-  Worker ownership is resolved transitively, including nested workers and
-  shared workers whose owners all resolve to the same tab. Processes shared
-  across tabs, unresolved owners and cyclic ownership remain unattributed.
+  threads in exclusively owned WebContent processes contribute, so a worker
+  counts under the WebContent process that hosts it. Registered page and
+  embedded-frame ownership identify WebContent owners. Processes shared across
+  tabs remain unattributed, and so does a process that runs on without pages
+  for its shared workers.
   The first sample establishes a baseline. The sparkline retains ten seconds.
 * **MEM:** An estimate of owned process memory, counted once per process.
   macOS uses the kernel's physical-footprint ledger, including compressed

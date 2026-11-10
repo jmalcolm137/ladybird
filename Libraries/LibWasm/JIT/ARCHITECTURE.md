@@ -20,6 +20,7 @@ reused from one compile to the next:
 |---|---|---|
 | Decode and build | `decode.rs`, `builder/` | One forward pass over the validated, quickened body. Produces typed SSA with phis, folding and value numbering as it goes. |
 | Cleanup | `passes/cleanup.rs` | Removes trivial phis to a fixed point, dead pure nodes, and fuses branches with the comparisons only they use. |
+| Interrupt check elimination | `passes/interrupt_checks.rs` | Small innermost loops that count towards an end lose their `CheckInterrupt`. |
 | Loop invariant code motion | `passes/licm.rs` | Finds the nodes of call-free loops that compute the same value in every iteration. |
 | Scheduling | `passes/schedule.rs` | Rebuilds the node arena in linear order without the dead nodes, with the invariant nodes at the end of their loop's preheader. |
 | Liveness | `regalloc/liveness.rs` | One interval per value in linear order, extended over loops. |
@@ -99,6 +100,7 @@ truncations, unless their flags say they cannot), and are neither removed nor mo
 | CheckFunction, CheckNull | The checks of `call_indirect` (null, then type identity, then the subtype check of GC types) and of references that must not be null. |
 | Call | A call through a `FunctionHeader`, direct or not; its value is the first result. |
 | Helper | A call of a function of the runtime, which takes its operands in the context and may return a trap code. |
+| CheckInterrupt | Traps if another thread interrupted the store (section on calls, "Interrupts"). |
 | CallResult | A further result of the call right before it. Never removed, since the results' places depend on them all. |
 | Jump, Branch, BranchCompare, BranchFloatCompare, BrTable, Return, Trap, TailCall | Terminators. A branch goes to its first successor where its condition holds. |
 
@@ -243,6 +245,22 @@ recomputed from fp, which also undoes whatever a callee's tail calls did to it.
 The prologue writes the instance to the frame and checks the new rsp against the stack limit of
 the store's `ExecutionContext`, which `InstanceData::context` points at, trapping with
 `TRAP_STACK_EXHAUSTED`. `RuntimeInfo` has the trap exit.
+
+**Interrupts.** Another thread stops the code of a store by making that limit
+`STACK_LIMIT_INTERRUPTED`, above every stack pointer. Calls then trap in their prologue at no cost,
+and `CheckInterrupt`, in the header of every loop, compares the limit with rsp for code that does
+not call. Each store has its own code, so x86-64 code has the limit's address as a constant: a move,
+a compare and a branch to the shared trap stub, which take no allocatable register. aarch64 reaches
+it through the frame's instance. The embedder turns the trap into whatever stopped the store;
+nothing else can observe it.
+
+Small innermost loops without calls lose their check (`passes/interrupt_checks.rs`) if an i32 counts
+by one towards a bound a step cannot go past: `<`, `>` or `!=` of an invariant bound. Everything wraps
+around here, so loops that step by more keep it. One known to run under 5000 times goes anywhere.
+Any other ends within 2^32 iterations, and goes only where a loop around it keeps its check, so that
+an interrupt takes as long as the rest of that loop at most. x86-64 aligns loop headers to 64 bytes,
+and code to the same: what lies in front of a small loop otherwise decides how it lies across what
+the CPU fetches. That is worth 6% of CoreMark's score.
 
 **Calls.** Every call goes through `FunctionHeader::native_entry`. A direct call of a function of
 the same instance passes the caller's instance and memory base; any other call (imports,

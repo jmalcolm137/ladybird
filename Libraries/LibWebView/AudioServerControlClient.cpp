@@ -23,10 +23,10 @@ void AudioServerControlClient::die()
         on_death();
 }
 
-void AudioServerControlClient::capture_requested(u64 tab_id, u64 request_id, ByteString device_id)
+void AudioServerControlClient::capture_requested(u64 tab_id, u64 request_id, ByteString device_id, Audio::PlaybackGroupId group)
 {
     if (on_capture_requested)
-        on_capture_requested(tab_id, request_id, device_id);
+        on_capture_requested(tab_id, request_id, device_id, group);
 }
 
 void AudioServerControlClient::playback_group_audibility_changed(u64 tab_id, Audio::PlaybackGroupId group, Audio::Audibility audibility)
@@ -36,6 +36,14 @@ void AudioServerControlClient::playback_group_audibility_changed(u64 tab_id, Aud
         return;
     if (on_playback_group_audibility_changed)
         on_playback_group_audibility_changed(tab_id, group, audibility);
+}
+
+void AudioServerControlClient::capture_activity_changed(u64 tab_id, Audio::PlaybackGroupId group, bool capturing)
+{
+    if (!is_open())
+        return;
+    if (on_capture_activity_changed)
+        on_capture_activity_changed(tab_id, group, capturing);
 }
 
 }

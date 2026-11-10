@@ -10,10 +10,13 @@
 #include <LibCore/Directory.h>
 #include <LibCore/File.h>
 #include <LibCore/StandardPaths.h>
+#include <LibCore/System.h>
 #include <LibFileSystem/FileSystem.h>
 #include <LibTest/TestCase.h>
+#include <LibURL/Parser.h>
 #include <LibWebView/CrashReportReview.h>
 #include <stdlib.h>
+#include <sys/time.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -145,26 +148,80 @@ TEST_CASE(a_report_that_does_not_say_when_it_crashed_has_no_crash_date)
         EXPECT(field.label != "Crash date"sv);
 }
 
-TEST_CASE(an_opened_report_is_no_longer_pending)
+TEST_CASE(a_report_waits_until_it_is_declined)
 {
     cleanup();
     ScopeGuard guard = cleanup;
 
-    auto older = write_report("2026-10-01T12-00-00Z"sv);
-    auto newer = write_report("2026-10-01T13-00-00Z"sv);
+    auto name = write_report("2026-10-01T12-00-00Z"sv);
     WebView::CrashReportStore store { test_directory() };
     CrashReportReview review { store };
 
-    // Without a name, the newest report waiting for an answer is shown.
-    EXPECT_EQ(MUST(review.open()).name, newer);
-    EXPECT(!is_pending(newer));
-    EXPECT(review.has_next_report());
+    EXPECT_EQ(MUST(review.open(name)).name, name);
+    EXPECT(is_pending(name));
 
-    EXPECT_EQ(MUST(review.open()).name, older);
-    EXPECT(!is_pending(older));
-    EXPECT(!review.has_next_report());
+    MUST(review.decline());
+    EXPECT(!is_pending(name));
+}
 
-    EXPECT(review.open().is_error());
+TEST_CASE(a_website_stays_out_of_the_report_and_goes_with_it)
+{
+    cleanup();
+    ScopeGuard guard = cleanup;
+
+    auto name = write_report("2026-10-01T12-00-00Z"sv);
+    WebView::CrashReportStore store { test_directory() };
+    MUST(store.save_website(name, "https://example.com/page"sv));
+    EXPECT_EQ(store.website(name), "https://example.com/page"_string);
+    EXPECT(!MUST(store.saved_report(name)).text.contains("example.com"sv));
+
+    auto website_path = LexicalPath::join(test_directory(), ByteString::formatted("{}.website", name)).string();
+    EXPECT_EQ(static_cast<u32>(MUST(Core::System::stat(website_path)).st_mode & 0777), 0600u);
+
+    MUST(store.mark_seen(name));
+    EXPECT(!store.website(name).has_value());
+}
+
+TEST_CASE(clearing_history_removes_websites_but_keeps_reports)
+{
+    cleanup();
+    ScopeGuard guard = cleanup;
+
+    auto name = write_report("2026-10-01T12-00-00Z"sv);
+    WebView::CrashReportStore store { test_directory() };
+    MUST(store.save_website(name, "https://example.com/page"sv));
+
+    MUST(store.remove_websites_saved_since(UnixDateTime::now() + AK::Duration::from_seconds(3600)));
+    EXPECT(store.website(name).has_value());
+
+    // A website saved at the very moment history is cleared from goes too.
+    auto website_path = LexicalPath::join(test_directory(), ByteString::formatted("{}.website", name)).string();
+    time_t saved_at = 1'790'000'000;
+    timeval times[2] { { saved_at, 0 }, { saved_at, 0 } };
+    VERIFY(utimes(website_path.characters(), times) == 0);
+
+    MUST(store.remove_websites_saved_since(UnixDateTime::from_seconds_since_epoch(saved_at + 1)));
+    EXPECT(store.website(name).has_value());
+
+    MUST(store.remove_websites_saved_since(UnixDateTime::from_seconds_since_epoch(saved_at)));
+    EXPECT(!store.website(name).has_value());
+    EXPECT(is_pending(name));
+}
+
+TEST_CASE(a_website_keeps_its_query_but_not_its_credentials_or_fragment)
+{
+    auto website = [](StringView url) {
+        return CrashReportReview::website_from_url(URL::Parser::basic_parse(url).release_value());
+    };
+
+    EXPECT_EQ(website("https://user:secret@example.com/page?id=1#private"sv), "https://example.com/page?id=1"_string);
+    EXPECT(!website("file:///etc/passwd"sv).has_value());
+    EXPECT(!website("about:blank"sv).has_value());
+
+    auto prefix = "https://example.com/"sv;
+    auto longest_url = ByteString::formatted("{}{}", prefix, ByteString::repeated('a', CrashReportReview::maximum_url_bytes - prefix.length()));
+    EXPECT(website(longest_url).has_value());
+    EXPECT(!website(ByteString::formatted("{}a", longest_url)).has_value());
 }
 
 TEST_CASE(a_report_can_be_reopened_by_name_once_seen)
@@ -226,10 +283,7 @@ TEST_CASE(a_report_changed_after_it_was_reviewed_is_not_sent)
     CrashReportReview review { store };
     MUST(review.open(name));
 
-    auto seen_directory = LexicalPath::join(test_directory(), "Seen"sv).string();
-    auto directory = MUST(Core::Directory::create(seen_directory, Core::Directory::CreateDirectories::No));
-    auto file = MUST(directory.open(name, Core::File::OpenMode::Write | Core::File::OpenMode::Truncate));
-    MUST(file->write_until_depleted("Ladybird crash report, format 1\nProcess: Browser\n"sv.bytes()));
+    write_named_report(name, "Ladybird crash report, format 1\nProcess: Browser\n"sv);
 
     Optional<ReportSubmission::Failure> failure;
     String reason;

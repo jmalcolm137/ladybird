@@ -30,6 +30,8 @@ static Optional<Web::Permissions::PermissionName> permission_name_from(Utf16View
         return Web::Permissions::PermissionName::Geolocation;
     if (name == "microphone"_utf16)
         return Web::Permissions::PermissionName::Microphone;
+    if (name == "notifications"_utf16)
+        return Web::Permissions::PermissionName::Notifications;
     return {};
 }
 
@@ -45,6 +47,9 @@ static Optional<PermissionsPolicy::PolicyControlledFeature> policy_controlled_fe
         return PermissionsPolicy::PolicyControlledFeature::Geolocation;
     case Web::Permissions::PermissionName::Microphone:
         return PermissionsPolicy::PolicyControlledFeature::Microphone;
+    case Web::Permissions::PermissionName::Notifications:
+        // Notifications is a powerful feature, but not a policy-controlled one.
+        return {};
     }
     VERIFY_NOT_REACHED();
 }
@@ -74,7 +79,7 @@ static void store_permission_decision(PermissionDescriptor const& descriptor, HT
     PermissionStore::the().set_permission_store_entry(descriptor, key, current_state);
 
     // 7. Queue a task on the current settings object's responsible event loop to set a permission store entry with descriptor, key, and current state.
-    HTML::queue_global_task(HTML::Task::Source::Permissions, settings.global_object(), GC::create_function(GC::Heap::the(), [descriptor, key, current_state] {
+    HTML::queue_global_task(HTML::Task::Source::Permissions, settings.global_object(), GC::create_function(GC::Heap::the(), GC::captures(descriptor, key, current_state), [](auto& descriptor, auto& key, auto& current_state) {
         PermissionStore::the().set_permission_store_entry(descriptor, key, current_state);
     }));
 }
@@ -99,7 +104,7 @@ void request_permission_with_user_prompt(PermissionDescriptor const& descriptor,
         return;
     }
 
-    auto settle = GC::create_function(GC::Heap::the(), [descriptor, settings = GC::Ref(settings), on_decided](Web::Permissions::EffectiveState answer) {
+    auto settle = GC::create_function(GC::Heap::the(), GC::captures(descriptor, GC::Ref(settings), on_decided), [](auto& descriptor, auto& settings, auto& on_decided, Web::Permissions::EffectiveState answer) {
         // 4. If the user gives express permission to use the powerful feature, set current state to "granted"; otherwise to "denied".
         //    The user's interaction may provide new information about the user's intent for the origin.
         // AD-HOC: A prompt the user dismisses or ignores leaves the permission at "prompt", rather than storing "denied";
@@ -137,12 +142,13 @@ PermissionState permission_state(PermissionDescriptor descriptor, Optional<HTML:
     auto feature = permission_name_from(descriptor.name);
 
     // 4. If there exists a policy-controlled feature for feature and settings' relevant global object has an associated Document run the following step:
-    if (auto* window = HTML::window_from_global_object(settings_object.global_object()); feature.has_value() && window) {
+    auto policy_controlled_feature = feature.has_value() ? policy_controlled_feature_for(*feature) : Optional<PermissionsPolicy::PolicyControlledFeature> {};
+    if (auto* window = HTML::window_from_global_object(settings_object.global_object()); policy_controlled_feature.has_value() && window) {
         // 1. Let document be settings' relevant global object's associated Document.
         auto& document = window->associated_document();
 
         // 2. If document is not allowed to use feature, return "denied".
-        if (!document.is_allowed_to_use_feature(*policy_controlled_feature_for(*feature)))
+        if (!document.is_allowed_to_use_feature(*policy_controlled_feature))
             return PermissionState::Denied;
     }
 
@@ -228,7 +234,7 @@ void Permissions::query(GC::Ref<JS::Object> permission_desc, GC::Ref<WebIDL::Pro
         permission_query_algorithm(query, status, HTML::relevant_settings_object(relevant_global_object));
 
         // 4. Queue a global task on the permissions task source with this's relevant global object to resolve promise with status.
-        HTML::queue_global_task(HTML::Task::Source::Permissions, relevant_global_object, GC::create_function(GC::Heap::the(), [relevant_global_object = GC::Ref(relevant_global_object), promise, status]() mutable {
+        HTML::queue_global_task(HTML::Task::Source::Permissions, relevant_global_object, GC::create_function(GC::Heap::the(), GC::captures(GC::Ref(relevant_global_object), promise, status), [](auto& relevant_global_object, auto& promise, auto& status) {
             auto& realm = HTML::relevant_realm(relevant_global_object);
             HTML::TemporaryExecutionContext execution_context { realm };
             WebIDL::resolve_promise(promise, Bindings::wrap(Bindings::host_defined_wrapper_world(realm), realm, status));

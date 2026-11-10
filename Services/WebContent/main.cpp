@@ -40,12 +40,14 @@
 #include <LibWeb/Painting/BoxViews.h>
 #include <LibWeb/Platform/EventLoopPlugin.h>
 #include <LibWeb/Platform/RemoteImageCodecPlugin.h>
+#include <LibWeb/WebRTC/WebRTCAgent.h>
 #include <LibWebCommon/WebView/Utilities.h>
 #include <Services/RendererSandbox.h>
 #include <WebContent/ConnectionFromClient.h>
 #include <WebContent/PageClient.h>
 #include <WebContent/WebContentCompositorHost.h>
 #include <WebContent/WebDriverConnection.h>
+#include <WebContent/Worker/WorkerThread.h>
 
 #include <openssl/thread.h>
 
@@ -78,7 +80,7 @@ static void crash_signal_handler(int signo)
     }
     warnln("\n\033[31;1mCRASH\033[0m: Received signal {} ({})", name, signo);
     dump_backtrace(2, 100);
-    Core::Process::terminate_immediately(128 + signo);
+    Core::Process::terminate_immediately((WebWorker::is_worker_thread() ? WebView::worker_thread_crash_exit_status : 128) + signo);
 }
 
 static void install_crash_signal_handlers()
@@ -158,7 +160,6 @@ static void install_crash_signal_handlers()
 #endif
 
 static ErrorOr<void> connect_to_resource_loader(GC::Heap& heap, IPC::TransportHandle const& handle, Optional<int> client_id, Optional<Utf16String> const& top_level_site);
-static ErrorOr<void> connect_to_image_decoder(IPC::TransportHandle const& handle);
 
 ErrorOr<int> ladybird_main(Main::Arguments arguments)
 {
@@ -278,12 +279,10 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
     Web::HTML::Window::set_internals_object_exposed(expose_internals_object);
     Web::HTML::WindowOrWorkerGlobalScopeMixin::set_experimental_interfaces_exposed(expose_experimental_interfaces);
 
-    Web::Bindings::initialize_main_thread_vm(Web::HTML::AgentType::SimilarOriginWindow);
+    Web::Bindings::set_collect_garbage_on_every_allocation_in_new_agents(collect_garbage_on_every_allocation);
+    Web::Bindings::initialize_agent(Web::HTML::AgentType::SimilarOriginWindow);
     if (stats_log)
         Web::Bindings::main_thread_vm().heap().enable_stats();
-
-    if (collect_garbage_on_every_allocation)
-        Web::Bindings::main_thread_vm().heap().set_should_collect_on_every_allocation(true);
 
     if (log_all_js_exceptions) {
         JS::set_log_all_js_exceptions(true);
@@ -299,10 +298,12 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
         if (auto result = connect_to_resource_loader(heap, handle, client_id, top_level_site); result.is_error())
             dbgln("Failed to connect to resource loader: {}", result.error());
     };
-    webcontent_client->on_image_decoder_connection = [](auto const& handle) {
-        if (auto result = connect_to_image_decoder(handle); result.is_error())
-            dbgln("Failed to connect to image decoder: {}", result.error());
-    };
+    // Many processes never decode an image, so the Browser connects this one to a decoder when it first has one to decode.
+    Web::Platform::ImageCodecPlugin::install(*new Web::Platform::RemoteImageCodecPlugin(
+        [webcontent_client] -> ErrorOr<NonnullRefPtr<ImageDecoderClient::Client>> {
+            return try_make_ref_counted<ImageDecoderClient::Client>(TRY(webcontent_client->request_image_decoder_transport()));
+        },
+        [webcontent_client] { webcontent_client->async_did_release_image_decoder(); }));
 
     MediaClient::Client::set_transport_factory([webcontent_client] {
         return webcontent_client->request_media_server_transport();
@@ -311,11 +312,16 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
     Audio::ClientConnection::set_transport_factory([webcontent_client] {
         return webcontent_client->request_audio_server_transport();
     });
+    // The sandbox keeps this process from spawning the WebRTC helper, so the Browser launches one for it.
+    Web::WebRTC::WebRTCAgent::set_transport_factory([webcontent_client] {
+        return webcontent_client->request_webrtc_client_transport();
+    });
 
     if (stats_log) {
         stats_log->start_sampling([&heap](JsonObject& values) {
             heap.add_stats(values);
             Web::HTML::main_thread_event_loop().add_stats(values);
+            values.set("workers.agents"sv, Web::Bindings::worker_agent_count());
             values.set("fonts.system_fallback_cache_entries"sv, Gfx::system_fallback_font_cache_size());
         });
     }
@@ -333,16 +339,5 @@ ErrorOr<void> connect_to_resource_loader(GC::Heap& heap, IPC::TransportHandle co
     if (!Web::ResourceLoader::is_initialized())
         Web::ResourceLoader::initialize(heap);
     Web::ResourceLoader::the().set_client(top_level_site, move(request_client));
-    return {};
-}
-
-ErrorOr<void> connect_to_image_decoder(IPC::TransportHandle const& handle)
-{
-    auto transport = TRY(handle.create_transport());
-    auto new_client = TRY(try_make_ref_counted<ImageDecoderClient::Client>(move(transport)));
-    if (Web::Platform::ImageCodecPlugin::is_initialized())
-        static_cast<Web::Platform::RemoteImageCodecPlugin&>(Web::Platform::ImageCodecPlugin::the()).set_client(move(new_client));
-    else
-        Web::Platform::ImageCodecPlugin::install(*new Web::Platform::RemoteImageCodecPlugin(move(new_client)));
     return {};
 }

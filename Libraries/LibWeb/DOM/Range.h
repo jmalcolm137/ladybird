@@ -15,6 +15,7 @@
 #include <LibWeb/DOM/AbstractRange.h>
 #include <LibWeb/DOM/Node.h>
 #include <LibWeb/Export.h>
+#include <LibWeb/HTML/Parser/ParserScriptingMode.h>
 #include <LibWeb/Selection/Selection.h>
 #include <LibWeb/TrustedTypes/TrustedHTML.h>
 #include <LibWebCommon/WebIDL/Types.h>
@@ -106,7 +107,7 @@ public:
     void set_associated_selection(Badge<Selection::Selection>, GC::Ptr<Selection::Selection>);
 
     WebIDL::ExceptionOr<GC::Ref<DocumentFragment>> create_contextual_fragment(TrustedTypes::TrustedHTMLOrString const&);
-    WebIDL::ExceptionOr<GC::Ref<DocumentFragment>> create_contextual_fragment(StringView fragment, GC::Ptr<TrustedTypes::TrustedHTMLParserOptions> = nullptr);
+    WebIDL::ExceptionOr<GC::Ref<DocumentFragment>> create_contextual_fragment(StringView fragment, HTML::ParserScriptingMode = HTML::ParserScriptingMode::Fragment);
 
     template<typename Callback>
     void for_each_contained(Callback callback) const
@@ -145,6 +146,7 @@ private:
     GC::Ref<Node> root() const;
 
     void update_associated_selection();
+    void update_associated_highlights(GC::Ptr<Document> previous_owner_document);
 
     enum class StartOrEnd {
         Start,
@@ -180,8 +182,8 @@ private:
 
     void update_owner_document();
 
-    GC::Ptr<Selection::Selection> m_associated_selection;
-    GC::Ptr<Document> m_owner_document;
+    GC::Member<Selection::Selection> m_associated_selection;
+    GC::Member<Document> m_owner_document;
 
     IntrusiveListNode<Range> m_live_range_list_node;
 

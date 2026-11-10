@@ -210,8 +210,8 @@ public:
     {
         auto view = utf16_view();
 
-        if (view.has_ascii_storage()) {
-            if (!any_of(view.ascii_span(), is_ascii_upper_alpha))
+        if (view.has_latin1_storage()) {
+            if (!any_of(view.latin1_span(), is_ascii_upper_alpha))
                 return *this;
         } else {
             if (!any_of(view.utf16_span(), is_ascii_upper_alpha))
@@ -225,8 +225,8 @@ public:
     {
         auto view = utf16_view();
 
-        if (view.has_ascii_storage()) {
-            if (!any_of(view.ascii_span(), is_ascii_lower_alpha))
+        if (view.has_latin1_storage()) {
+            if (!any_of(view.latin1_span(), is_ascii_lower_alpha))
                 return *this;
         } else {
             if (!any_of(view.utf16_span(), is_ascii_lower_alpha))
@@ -285,7 +285,7 @@ public:
     ALWAYS_INLINE Utf16String escape_html_entities() const { return utf16_view().escape_html_entities(); }
 
     static Utf16String from_string_builder(Badge<Utf16StringBuilder>, Utf16StringBuilder& builder);
-    static ErrorOr<Utf16String> from_ipc_stream(Stream&, size_t length_in_code_units, bool is_ascii);
+    static ErrorOr<Utf16String> from_ipc_stream(Stream&, size_t length_in_code_units, bool has_latin1_storage);
 
     template<typename Callback>
     static Utf16String create_uninitialized_ascii(size_t length_in_code_units, Callback callback)

@@ -8,9 +8,11 @@
 #include <AK/QuickSort.h>
 #include <AK/kmalloc.h>
 #include <LibURL/InternalURLs.h>
+#include <LibWebView/Application.h>
 #include <LibWebView/ProcessManager.h>
 #include <LibWebView/ProcessSnapshot.h>
 #include <UI/Qt/ChromeStyle.h>
+#include <UI/Qt/HubConnection.h>
 #include <UI/Qt/Icon.h>
 #include <UI/Qt/ProcessManagerWindow.h>
 #include <UI/Qt/StringUtils.h>
@@ -78,6 +80,7 @@ enum class RowKind {
     Site,
     Group,
     Tab,
+    Frame,
 };
 
 // Process rows are identified by the process's child ID, which, unlike its PID, never comes to name another process.
@@ -276,6 +279,16 @@ public:
     }
 };
 
+// A frame's URL without what follows its path, which on the frames this names most often is a long tracking query.
+static QString frame_name(URL::URL const& url)
+{
+    if (url.host().has_value())
+        return qstring_from_ak_string(ByteString::formatted("{}{}", url.host()->serialize(), url.serialize_path()));
+    if (url.scheme() == "data"sv)
+        return QStringLiteral("data:");
+    return qstring_from_ak_string(url.serialize_for_display());
+}
+
 // What a row is sorted by in a column.
 QVariant sort_key(QTreeWidgetItem const* item, int column)
 {
@@ -334,8 +347,14 @@ private:
 
 }
 
-ProcessManagerWindow::ProcessManagerWindow(WebView::ProcessManager& process_manager)
-    : m_process_manager(process_manager)
+// The processes that are the browser itself, which cannot go without taking everything else with them.
+static bool is_browser_process(WebView::ProcessType type)
+{
+    return first_is_one_of(type, WebView::ProcessType::Browser, WebView::ProcessType::UI, WebView::ProcessType::Hub);
+}
+
+ProcessManagerWindow::ProcessManagerWindow(Source source)
+    : m_source(AK::move(source))
 {
     setWindowFlags(Qt::Window);
 #if defined(AK_OS_MACOS)
@@ -563,6 +582,7 @@ QTreeWidget::item {{
     m_document_icon = create_chrome_icon(ChromeIcon::Document, panel.body);
     m_network_icon = create_chrome_icon(ChromeIcon::Network, panel.body);
     m_compositor_icon = create_chrome_icon(ChromeIcon::Compositor, panel.body);
+    m_hub_icon = create_chrome_icon(ChromeIcon::Hub, panel.body);
     m_image_icon = create_chrome_icon(ChromeIcon::Image, panel.body);
     m_service_icon = create_chrome_icon(ChromeIcon::WindowRestore, panel.body);
     auto search_icon = create_chrome_icon(ChromeIcon::Search, panel.muted);
@@ -591,16 +611,20 @@ void ProcessManagerWindow::hideEvent(QHideEvent* event)
 
 QIcon ProcessManagerWindow::favicon_for(WebView::ProcessPageSnapshot const& page)
 {
-    if (!page.favicon_hash.has_value())
+    // NB: The view's favicon is its top-level page's, which an embedded frame of another site does not share.
+    Optional<String> favicon_hash;
+    if (page.kind == WebView::ProcessPageKind::TopLevel && m_source.favicon_hash)
+        favicon_hash = m_source.favicon_hash(page);
+    if (!favicon_hash.has_value())
         return create_chrome_icon(ChromeIcon::Globe, Theme::panel().body);
-    if (auto icon = m_favicons.get(*page.favicon_hash); icon.has_value())
+    if (auto icon = m_favicons.get(*favicon_hash); icon.has_value())
         return *icon;
     QIcon icon;
-    if (auto png = WebView::favicon_png_for_page(page); png.has_value())
+    if (auto png = m_source.favicon_png ? m_source.favicon_png(*favicon_hash) : Optional<ByteBuffer> {}; png.has_value())
         icon = favicon_with_rounded_corners(icon_from_png(png->bytes(), 16), 16);
     if (icon.isNull())
         icon = create_chrome_icon(ChromeIcon::Globe, Theme::panel().body);
-    m_favicons.set(*page.favicon_hash, icon);
+    m_favicons.set(*favicon_hash, icon);
     return icon;
 }
 
@@ -609,7 +633,10 @@ void ProcessManagerWindow::refresh()
     if (m_is_updating_style)
         return;
 
-    auto processes = WebView::process_snapshots(m_process_manager);
+    auto processes = m_source.take_snapshots();
+    m_process_types.clear();
+    for (auto const& process : processes)
+        m_process_types.set(process.child_id, process.type);
     QLocale locale;
 
     HashMap<u64, WebView::ProcessSnapshot const*> processes_by_child_id;
@@ -617,18 +644,18 @@ void ProcessManagerWindow::refresh()
         processes_by_child_id.set(process.child_id, &process);
 
     // Each process is listed with the browser's own processes, with a site, or with the spare processes. A process
-    // that works for another, such as a page's image decoder or a worker's media server, is listed with it.
+    // that works for another, such as a renderer's media server, is listed with it.
     auto is_spare = [](WebView::ProcessSnapshot const& process) {
         return process.type == WebView::ProcessType::WebContent && process.title.has_value() && *process.title == "(spare)"_utf16;
     };
-    // NB: A page's process, a worker's process, and a request server bound to a site, belong to that site.
+    // NB: A page's process, a process that runs on for a shared worker, and a request server or image decoder bound to a
+    //     site, belong to that site.
     auto site_of = [](WebView::ProcessSnapshot const& process) -> QString {
-        if (!first_is_one_of(process.type, WebView::ProcessType::WebContent, WebView::ProcessType::WebWorker, WebView::ProcessType::RequestServer) || !process.site_url.has_value())
+        if (!first_is_one_of(process.type, WebView::ProcessType::WebContent, WebView::ProcessType::RequestServer, WebView::ProcessType::ImageDecoder) || !process.site_url.has_value())
             return {};
         return task_manager_site_label(*process.site_url);
     };
-    // NB: A process that works for another may itself work for a third, as a worker's image decoder works for the
-    //     worker. A worker with its own site stays with that site; an opaque-origin worker follows its owner.
+    // NB: A process that works for another may itself work for a third.
     auto section_process = [&](WebView::ProcessSnapshot const& process) -> WebView::ProcessSnapshot const& {
         auto const* section = &process;
         for (size_t depth = 0; depth < processes.size() && section->owner_child_id.has_value() && site_of(*section).isEmpty(); ++depth) {
@@ -677,7 +704,7 @@ void ProcessManagerWindow::refresh()
         }
         site->processes.append(&process);
         site->tab_count += process.tabs.size();
-        site->frame_count += process.frame_count;
+        site->frame_count += process.frames.size();
         if (process.page.has_value() && (!site->page || (process.page->kind == WebView::ProcessPageKind::TopLevel && site->page->kind != WebView::ProcessPageKind::TopLevel)))
             site->page = &*process.page;
         site->cpu += process.cpu_percent;
@@ -717,8 +744,10 @@ void ProcessManagerWindow::refresh()
         item->setText(Name, name);
         item->setToolTip(Name, name);
         switch (process.type) {
-        case WebView::ProcessType::Browser: {
-            item->setIcon(Name, m_browser_icon);
+        case WebView::ProcessType::Browser:
+        case WebView::ProcessType::UI:
+        case WebView::ProcessType::Hub: {
+            item->setIcon(Name, process.type == WebView::ProcessType::Hub ? m_hub_icon : m_browser_icon);
             auto font = item->font(Name);
             font.setWeight(QFont::DemiBold);
             item->setFont(Name, font);
@@ -752,6 +781,27 @@ void ProcessManagerWindow::refresh()
             tab_item->setToolTip(Name, title);
             tab_item->setIcon(Name, favicon_for(tab.page));
         }
+        size_t sandboxed_frame_count = 0;
+        for (auto const& frame : process.frames) {
+            auto* frame_item = new QTreeWidgetItem(item, { frame_name(frame.url) });
+            frame_item->setData(Name, KindRole, static_cast<int>(RowKind::Frame));
+            frame_item->setFlags(Qt::ItemIsEnabled);
+            frame_item->setToolTip(Name, qstring_from_ak_string(frame.url.serialize_for_display()));
+            if (frame.is_sandboxed) {
+                frame_item->setData(Name, NoteRole, tr("Sandboxed"));
+                ++sandboxed_frame_count;
+            }
+        }
+        if (auto frame_count = process.frames.size(); frame_count > 0) {
+            if (sandboxed_frame_count == frame_count)
+                item->setData(Name, NoteRole, frame_count == 1 ? tr("1 sandboxed frame") : tr("%1 sandboxed frames").arg(frame_count));
+            else if (sandboxed_frame_count > 0)
+                item->setData(Name, NoteRole, tr("%1 frames, %2 sandboxed").arg(frame_count).arg(sandboxed_frame_count));
+            else
+                item->setData(Name, NoteRole, frame_count == 1 ? tr("1 frame") : tr("%1 frames").arg(frame_count));
+            if (sandboxed_frame_count > 0)
+                item->setToolTip(Name, tr("Sandboxed frames run apart from the other documents of their site."));
+        }
         return item;
     };
 
@@ -780,17 +830,19 @@ void ProcessManagerWindow::refresh()
         }
     };
 
-    // The browser comes first among its own processes, whatever the order.
+    // The browser comes first among its own processes, whatever the order, with the UI ahead of the Hub.
     Vector<QTreeWidgetItem*> own_items;
-    QTreeWidgetItem* browser_item = nullptr;
+    Vector<QTreeWidgetItem*> browser_items;
     for (auto const* process : own_processes) {
         auto* item = make_process_item(*process, true);
-        if (process->type == WebView::ProcessType::Browser)
-            browser_item = item;
+        if (process->type == WebView::ProcessType::UI)
+            browser_items.prepend(item);
+        else if (is_browser_process(process->type))
+            browser_items.append(item);
         else
             own_items.append(item);
     }
-    if (browser_item) {
+    for (auto* browser_item : browser_items) {
         m_processes->addTopLevelItem(browser_item);
         if (selected_child_id.isValid() && browser_item->data(PID, ChildIDRole) == selected_child_id)
             item_to_select = browser_item;
@@ -934,9 +986,9 @@ void ProcessManagerWindow::update_actions()
         m_end_action->setEnabled(false);
         return;
     }
-    auto process = m_process_manager.find_child(item->data(PID, ChildIDRole).toULongLong());
-    m_copy_pid_action->setEnabled(process.has_value());
-    m_end_action->setEnabled(process.has_value() && process->type() != WebView::ProcessType::Browser);
+    auto process_type = m_process_types.get(item->data(PID, ChildIDRole).toULongLong());
+    m_copy_pid_action->setEnabled(process_type.has_value());
+    m_end_action->setEnabled(process_type.has_value() && !is_browser_process(*process_type));
 }
 
 void ProcessManagerWindow::end_selection()
@@ -960,10 +1012,8 @@ void ProcessManagerWindow::end_selection()
     for (auto* item : items) {
         auto pid = static_cast<pid_t>(item->data(PID, Qt::UserRole).toLongLong());
         auto child_id = item->data(PID, ChildIDRole).toULongLong();
-        if (auto result = m_process_manager.terminate_child(child_id, Core::Process::TerminationMode::Forceful); result.is_error()) {
-            if (!result.error().is_errno() || result.error().code() != ESRCH)
-                QMessageBox::warning(this, tr("Unable to end process"), qformatted("Could not end process {}: {}", pid, result.error()));
-        }
+        if (!m_source.end_process(child_id))
+            QMessageBox::warning(this, tr("Unable to end process"), qformatted("Could not end process {}", pid));
     }
     m_processes->clearSelection();
     refresh();

@@ -8,25 +8,14 @@
 
 #include <AK/Array.h>
 #include <AK/Types.h>
+#include <LibCrypto/KeyHandle.h>
 #include <LibWeb/HTML/StructuredSerializeTypes.h>
 
 namespace Web::Crypto {
 
 // HandleTag and KeyAlgorithmTag values are part of the stable storage serialization format.
 // Do not reorder or reuse values; leave removed tags reserved.
-enum class HandleTag : u8 {
-    ByteBuffer = 0,
-    RSAPublicKey = 1,
-    RSAPrivateKey = 2,
-    ECPublicKey = 3,
-    ECPrivateKey = 4,
-    MLDSAPublicKey = 5,
-    MLDSAPrivateKey = 6,
-    MLKEMPublicKey = 7,
-    MLKEMPrivateKey = 8,
-    OKPPublicKey = 9,
-    OKPPrivateKey = 10,
-};
+using ::Crypto::HandleTag;
 
 enum class KeyAlgorithmTag : u8 {
     KeyAlgorithm = 0,
@@ -73,23 +62,5 @@ static constexpr Array<KeyAlgorithmTagExpectation, 7> s_key_algorithm_tag_expect
     { KeyAlgorithmTag::HmacKeyAlgorithm, HTML::Expectation::PositiveGolden },
     { KeyAlgorithmTag::KmacKeyAlgorithm, HTML::Expectation::PositiveGolden },
 } };
-
-static constexpr bool handle_tag_is_in_table(HandleTag tag)
-{
-    for (auto const& entry : s_handle_tag_expectations) {
-        if (entry.tag == tag)
-            return true;
-    }
-    return false;
-}
-
-static constexpr bool key_algorithm_tag_is_in_table(KeyAlgorithmTag tag)
-{
-    for (auto const& entry : s_key_algorithm_tag_expectations) {
-        if (entry.tag == tag)
-            return true;
-    }
-    return false;
-}
 
 }

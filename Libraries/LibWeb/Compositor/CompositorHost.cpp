@@ -61,10 +61,19 @@ void CompositorContextHandle::invalidate_wheel_event_listener_state(u64 generati
     m_host.invalidate_wheel_event_listener_state(m_context_id, generation);
 }
 
-Compositing::AsyncScrollEnqueueResult CompositorContextHandle::async_scroll_by(UniqueNodeID expected_document_id, Gfx::FloatPoint position,
-    Gfx::FloatPoint delta_in_device_pixels, Gfx::IntRect viewport_rect, Web::WheelDeltaPrecision wheel_delta_precision, Web::ScrollGesturePhase scroll_gesture_phase, u32 modifiers, Compositing::AsyncScrollOperationTracking operation_tracking, Compositing::WheelStepDispatch wheel_step_dispatch, u64 input_event_id)
+Compositing::WheelEventAnswer CompositorContextHandle::take_wheel_event_from_main_thread(Web::MouseEvent const& event, Compositing::AsyncScrollOperationTracking operation_tracking, Compositing::WheelEventRouting routing)
 {
-    return m_host.async_scroll_by(m_context_id, expected_document_id, position, delta_in_device_pixels, viewport_rect, wheel_delta_precision, scroll_gesture_phase, modifiers, operation_tracking, wheel_step_dispatch, input_event_id);
+    return m_host.take_wheel_event_from_main_thread(m_context_id, event, operation_tracking, routing);
+}
+
+Compositing::WheelEventAnswer CompositorContextHandle::wheel_event_let_through(Compositing::WheelStepLetThrough const& step, Compositing::AsyncScrollOperationTracking operation_tracking)
+{
+    return m_host.wheel_event_let_through(m_context_id, step, operation_tracking);
+}
+
+void CompositorContextHandle::wheel_event_canceled(u64 wheel_gesture_id)
+{
+    m_host.wheel_event_canceled(m_context_id, wheel_gesture_id);
 }
 
 String CompositorContextHandle::scroll_state_for_testing(Web::AsyncScrollNodeStableID stretched_scroller)
@@ -117,7 +126,7 @@ void CompositorContextHandle::hurry_rendering_opportunity()
     m_host.hurry_rendering_opportunity(m_context_id);
 }
 
-void CompositorContextHandle::request_screenshot(NonnullRefPtr<Gfx::Bitmap> target_bitmap, Function<void()>&& callback)
+void CompositorContextHandle::request_screenshot(NonnullRefPtr<Gfx::Bitmap> target_bitmap, Function<void(ScreenshotResult)>&& callback)
 {
     m_host.flush_canvas_2d_stream();
     m_host.request_screenshot(m_context_id, move(target_bitmap), move(callback));
@@ -421,6 +430,53 @@ void CompositorHost::stop_presenting_to_client(Web::CompositorContextId context_
         connection->stop_presenting_to_client(context_id);
 }
 
+void CompositorHost::add_animated_image(u64 frame_id, AnimatedImageRegistration image)
+{
+    if (auto* connection = compositor_connection())
+        connection->add_animated_image(frame_id, image);
+    m_animated_images.set(frame_id, move(image));
+}
+
+void CompositorHost::remove_animated_image(u64 frame_id)
+{
+    m_animated_images.remove(frame_id);
+    if (auto* connection = compositor_connection())
+        connection->remove_animated_image(frame_id);
+}
+
+void CompositorHost::start_animated_image(u64 frame_id)
+{
+    m_animated_images.get(frame_id)->is_started = true;
+    if (auto* connection = compositor_connection())
+        connection->start_animated_image(frame_id);
+}
+
+void CompositorHost::stop_animated_image(u64 frame_id)
+{
+    m_animated_images.get(frame_id)->is_started = false;
+    if (auto* connection = compositor_connection())
+        connection->stop_animated_image(frame_id);
+}
+
+AnimatedImageState CompositorHost::animated_image_state_for_testing(u64 frame_id) const
+{
+    if (auto* connection = compositor_connection())
+        return connection->animated_image_state_for_testing(frame_id);
+    return {};
+}
+
+void CompositorHost::register_animated_images_with_new_compositor()
+{
+    auto* connection = compositor_connection();
+    if (!connection)
+        return;
+    for (auto const& [frame_id, image] : m_animated_images) {
+        connection->add_animated_image(frame_id, image);
+        if (image.is_started)
+            connection->start_animated_image(frame_id);
+    }
+}
+
 void CompositorHost::add_video_sink(Media::VideoSinkHandle video_sink_handle, NonnullRefPtr<Compositing::VideoFramePresentationPage> presentation_page)
 {
     if (auto* connection = compositor_connection())
@@ -462,12 +518,24 @@ void CompositorHost::invalidate_wheel_event_listener_state(Web::CompositorContex
         connection->invalidate_wheel_event_listener_state(context_id, generation);
 }
 
-Compositing::AsyncScrollEnqueueResult CompositorHost::async_scroll_by(Web::CompositorContextId context_id, Web::UniqueNodeID expected_document_id, Gfx::FloatPoint position,
-    Gfx::FloatPoint delta_in_device_pixels, Gfx::IntRect viewport_rect, Web::WheelDeltaPrecision wheel_delta_precision, Web::ScrollGesturePhase scroll_gesture_phase, u32 modifiers, Compositing::AsyncScrollOperationTracking operation_tracking, Compositing::WheelStepDispatch wheel_step_dispatch, u64 input_event_id)
+Compositing::WheelEventAnswer CompositorHost::take_wheel_event_from_main_thread(Web::CompositorContextId context_id, Web::MouseEvent const& event, Compositing::AsyncScrollOperationTracking operation_tracking, Compositing::WheelEventRouting routing)
 {
     if (auto* connection = compositor_connection())
-        return connection->async_scroll_by(context_id, expected_document_id, position, delta_in_device_pixels, viewport_rect, wheel_delta_precision, scroll_gesture_phase, modifiers, operation_tracking, wheel_step_dispatch, input_event_id);
+        return connection->take_wheel_event_from_main_thread(context_id, event, operation_tracking, routing);
     return {};
+}
+
+Compositing::WheelEventAnswer CompositorHost::wheel_event_let_through(Web::CompositorContextId context_id, Compositing::WheelStepLetThrough const& step, Compositing::AsyncScrollOperationTracking operation_tracking)
+{
+    if (auto* connection = compositor_connection())
+        return connection->wheel_event_let_through(context_id, step, operation_tracking);
+    return {};
+}
+
+void CompositorHost::wheel_event_canceled(Web::CompositorContextId context_id, u64 wheel_gesture_id)
+{
+    if (auto* connection = compositor_connection())
+        connection->wheel_event_canceled(context_id, wheel_gesture_id);
 }
 
 String CompositorHost::scroll_state_for_testing(Web::CompositorContextId context_id, Web::AsyncScrollNodeStableID stretched_scroller)
@@ -535,14 +603,14 @@ void CompositorHost::hurry_rendering_opportunity(Web::CompositorContextId contex
         connection->hurry_rendering_opportunity(context_id);
 }
 
-void CompositorHost::request_screenshot(Web::CompositorContextId context_id, NonnullRefPtr<Gfx::Bitmap> target_bitmap, Function<void()>&& callback)
+void CompositorHost::request_screenshot(Web::CompositorContextId context_id, NonnullRefPtr<Gfx::Bitmap> target_bitmap, Function<void(ScreenshotResult)>&& callback)
 {
     if (auto* connection = compositor_connection()) {
         connection->request_screenshot(context_id, move(target_bitmap), move(callback));
         return;
     }
     if (callback)
-        callback();
+        callback(ScreenshotResult::Failed);
 }
 
 }

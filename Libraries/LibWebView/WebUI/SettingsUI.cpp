@@ -7,6 +7,7 @@
 #include <AK/JsonArray.h>
 #include <AK/Platform.h>
 #include <AK/Utf16String.h>
+#include <LibCore/BrowserVersion.h>
 #include <LibCore/EventLoop.h>
 #include <LibCore/GeolocationProvider.h>
 #include <LibCore/Promise.h>
@@ -18,6 +19,7 @@
 #include <LibWebView/CrashReportStore.h>
 #include <LibWebView/PermissionManager.h>
 #include <LibWebView/SearchEngine.h>
+#include <LibWebView/WebContentClient.h>
 #include <LibWebView/WebUI/SettingsUI.h>
 
 namespace WebView {
@@ -44,6 +46,11 @@ static StringView config_variable_type_to_string(JsonValue::Type type)
 
 static bool should_show_config_variable(ConfigVariableID id)
 {
+    // NB: The Debug menu has the toggle for this one.
+    if (id == ConfigVariableID::ShowTabPerformanceMonitor)
+        return false;
+    if (id == ConfigVariableID::ShowFeedbackButton)
+        return !BROWSER_IS_FINAL_RELEASE;
     if (id == ConfigVariableID::UseClientSideWindowDecorations)
         return Application::the().supports_client_side_window_decorations();
     if (id == ConfigVariableID::VerticalTabsHoverExpandDelay || id == ConfigVariableID::VerticalTabsHoverExpandAnimationDuration)
@@ -116,6 +123,9 @@ void SettingsUI::register_interfaces()
         return;
     }
 
+    register_interface("loadCrashReportsWaiting"sv, [this](auto const&) {
+        crash_reports_changed();
+    });
     register_interface("showCrashReports"sv, [this](auto const&) {
         if (!CrashReport::is_supported()) {
             async_send_message("crashReportsStatus"sv, "Crash reporting is not available on this platform yet."_string);
@@ -136,6 +146,9 @@ void SettingsUI::register_interfaces()
     });
     register_interface("setAppearance"sv, [this](auto const& data) {
         set_appearance(data);
+    });
+    register_interface("resetForceDarkForHost"sv, [this](auto const& data) {
+        reset_force_dark_for_host(data);
     });
     register_interface("setContentSettings"sv, [this](auto const& data) {
         set_content_settings(data);
@@ -172,6 +185,12 @@ void SettingsUI::register_interfaces()
     register_interface("setLocationPolicy"sv, [this](auto const& data) {
         set_location_policy(data);
     });
+    register_interface("setMicrophonePolicy"sv, [this](auto const& data) {
+        set_microphone_policy(data);
+    });
+    register_interface("setNotificationsPolicy"sv, [this](auto const& data) {
+        set_notifications_policy(data);
+    });
 
     register_interface("estimateBrowsingDataSizes"sv, [this](auto const& data) {
         estimate_browsing_data_sizes(data);
@@ -184,6 +203,9 @@ void SettingsUI::register_interfaces()
     });
     register_interface("setGlobalPrivacyControl"sv, [this](auto const& data) {
         set_global_privacy_control(data);
+    });
+    register_interface("setCrashReportSending"sv, [this](auto const& data) {
+        set_crash_report_sending(data);
     });
 
     register_interface("setServicesNetworkAccessEnabled"sv, [this](auto const& data) {
@@ -226,10 +248,11 @@ void SettingsUI::load_features()
 JsonObject SettingsUI::serialize_settings() const
 {
     auto settings = Application::settings().serialize_json();
+    settings.as_object().set("forceDarkSitesReadOnly"sv, !has_client() || client().is_private() == IsPrivate::Yes);
 
     // The sites the user allowed or blocked, for each permission.
     JsonObject site_permissions;
-    for (auto name : { Web::Permissions::PermissionName::Geolocation, Web::Permissions::PermissionName::Microphone }) {
+    for (auto name : { Web::Permissions::PermissionName::Geolocation, Web::Permissions::PermissionName::Microphone, Web::Permissions::PermissionName::Notifications }) {
         JsonArray sites;
         for (auto const& site : Application::the().default_session().permission_manager->site_decisions(name)) {
             JsonObject entry;
@@ -382,8 +405,17 @@ void SettingsUI::set_content_settings(JsonValue const& content_settings)
 
     // Zoom-per-host is not controlled by the settings UI. Don't overwrite it.
     parsed_content_settings.zoom_per_host = current_content_settings.zoom_per_host;
+    // Host choices change through their own controls, independently of edits to the default.
+    parsed_content_settings.force_dark_per_host = current_content_settings.force_dark_per_host;
 
     Application::settings().set_content_settings(move(parsed_content_settings));
+}
+
+void SettingsUI::reset_force_dark_for_host(JsonValue const& host)
+{
+    if (!host.is_string() || !has_client() || client().is_private() == IsPrivate::Yes)
+        return;
+    Application::settings().reset_force_dark_for_host(host.as_string());
 }
 
 void SettingsUI::set_tab_settings(JsonValue const& tab_settings)
@@ -606,6 +638,28 @@ void SettingsUI::set_location_policy(JsonValue const& policy)
         Application::settings().set_location_policy(LocationPolicy::Block);
 }
 
+void SettingsUI::set_microphone_policy(JsonValue const& policy)
+{
+    if (!policy.is_string())
+        return;
+
+    if (policy.as_string() == "ask"sv)
+        Application::settings().set_microphone_policy(MicrophonePolicy::Ask);
+    else if (policy.as_string() == "block"sv)
+        Application::settings().set_microphone_policy(MicrophonePolicy::Block);
+}
+
+void SettingsUI::set_notifications_policy(JsonValue const& policy)
+{
+    if (!policy.is_string())
+        return;
+
+    if (policy.as_string() == "ask"sv)
+        Application::settings().set_notifications_policy(NotificationsPolicy::Ask);
+    else if (policy.as_string() == "block"sv)
+        Application::settings().set_notifications_policy(NotificationsPolicy::Block);
+}
+
 void SettingsUI::estimate_browsing_data_sizes(JsonValue const& options)
 {
     if (!options.is_object())
@@ -686,6 +740,24 @@ void SettingsUI::set_global_privacy_control(JsonValue const& global_privacy_cont
         return;
 
     Application::settings().set_global_privacy_control(global_privacy_control.as_bool() ? GlobalPrivacyControl::Yes : GlobalPrivacyControl::No);
+}
+
+void SettingsUI::crash_reports_changed()
+{
+    if (has_client())
+        async_send_message("crashReportsWaiting"sv, CrashReportOutbox::the().waiting_report_count());
+}
+
+void SettingsUI::set_crash_report_sending(JsonValue const& crash_report_sending)
+{
+    if (!crash_report_sending.is_string())
+        return;
+
+    auto sending = crash_report_sending_from_string(crash_report_sending.as_string());
+    Application::settings().set_crash_report_sending(sending);
+
+    if (sending == CrashReportSending::NeverSend)
+        CrashReportOutbox::the().discard_all();
 }
 
 void SettingsUI::set_services_network_access_enabled(JsonValue const& enabled)

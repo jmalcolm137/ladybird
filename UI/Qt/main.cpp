@@ -4,16 +4,17 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <LibCore/BrowserVersion.h>
 #include <LibCore/GeolocationProvider.h>
+#include <LibCore/System.h>
 #include <LibMain/Main.h>
 #include <LibWebView/Application.h>
-#include <LibWebView/BrowserProcess.h>
-#include <LibWebView/CrashReportStore.h>
 #include <LibWebView/URL.h>
 #include <LibWebView/Utilities.h>
 #include <UI/Qt/Application.h>
 #include <UI/Qt/BrowserWindow.h>
 #include <UI/Qt/ChromeStyle.h>
+#include <UI/Qt/HubConnection.h>
 #include <UI/Qt/SystemAppearance.h>
 #if defined(LADYBIRD_QT_HAVE_POSITIONING)
 #    include <UI/Qt/GeolocationProviderQt.h>
@@ -27,17 +28,21 @@
 #if defined(AK_OS_MACOS)
 #    include <QColorSpace>
 #    include <QSurfaceFormat>
-#    include <UI/Qt/ApplicationIcon.h>
 #    include <UI/Qt/MacWindow.h>
-#    include <UI/Qt/SpellCheckerMac.h>
 #endif
 
 ErrorOr<int> ladybird_main(Main::Arguments arguments)
 {
     AK::set_rich_debug_enabled(true);
 
-    if (auto result = WebView::CrashReportStore::the().initialize_browser_crash_handler(); result.is_error())
-        warnln("Could not prepare Browser crash reporting: {}", result.error());
+#ifdef LADYBIRD_HUB_IN_OWN_PROCESS
+    // Headless mode has no use for a UI, so the Hub takes over this process.
+    if (any_of(arguments.strings, [](auto argument) { return argument.starts_with("--headless"sv); })) {
+        auto hub_path = TRY(Ladybird::Application::hub_executable_path());
+        execv(hub_path.characters(), arguments.argv);
+        return Error::from_syscall("execv"sv, errno);
+    }
+#endif
 
     // The web content view is presented in a native child window. Without this attribute, a widget
     // gaining a native window would force every other widget in the browser window to become native
@@ -57,22 +62,14 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
 #endif
 
     auto app = TRY(Ladybird::Application::create(arguments));
-    Ladybird::ChromeStyle::install_application_style();
-#if defined(AK_OS_MACOS)
-    app->set_spell_checker(Ladybird::create_platform_spell_checker());
-#endif
-    if (app->should_exit_after_profile_coordination()) {
-        outln("Opening in existing process");
-        return 0;
-    }
+    if (auto exit_status = app->exit_status_if_done(); exit_status.has_value())
+        return *exit_status;
 
-    auto& browser_process = app->browser_process();
+    Ladybird::ChromeStyle::install_application_style();
 
     if (auto const& browser_options = Ladybird::Application::browser_options(); !browser_options.headless_mode.has_value()) {
-#if defined(AK_OS_MACOS)
-        Ladybird::set_profile_application_icon(Ladybird::Application::profile());
-#endif
         Ladybird::SystemAppearance::the().apply_interface_theme(Ladybird::Application::settings().appearance().interface_theme);
+        Ladybird::SystemAppearance::the().apply_color_theme(Ladybird::Application::settings().appearance().color_theme);
 
         app->on_open_file = [&](auto const& file_url) {
             if (auto* window = app->non_private_window_if_any()) {
@@ -91,18 +88,15 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
             app->new_window({ file_url });
         };
 
-        browser_process.on_open_urls = [&](auto const& urls) {
-            for (auto const& url : urls)
-                app->on_open_file(url);
-        };
-
-        browser_process.on_new_tab = [&](auto const& urls) {
-            if (!app->active_window_if_any()) {
+        // NB: URLs from outside the browser, such as a link clicked in another app, never open in a private window.
+        app->on_new_tab = [&](auto const& urls) {
+            auto* non_private_window = app->non_private_window_if_any();
+            if (!non_private_window) {
                 app->new_window(urls);
                 return;
             }
 
-            auto& window = *app->active_window_if_any();
+            auto& window = *non_private_window;
             for (size_t i = 0; i < urls.size(); ++i) {
                 window.new_tab_from_url(urls[i], (i == 0) ? Web::HTML::ActivateTab::Yes : Web::HTML::ActivateTab::No, Ladybird::BrowserWindow::TabLocation::end());
             }
@@ -111,7 +105,7 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
             window.raise();
         };
 
-        browser_process.on_new_window = [&](auto const& urls) {
+        app->on_new_window = [&](auto const& urls) {
             app->new_window(urls, app->configuration_for_new_window());
         };
 
@@ -119,18 +113,20 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
         if (auto* restored_window = app->restore_previous_session(configuration)) {
             // A whole restored session replaces the usual startup tab, so only the URLs the user passed open with it.
             // With only pinned tabs restored, the usual startup tabs open after them.
-            auto restored_everything = app->launch_restore_policy() == WebView::SessionLaunchPolicy::Everything;
+            auto restored_everything = app->launch_restore_policy() == Ladybird::SessionLaunchPolicy::Everything;
             if (!restored_everything || !browser_options.raw_urls.is_empty())
                 app->open_startup_tabs(*restored_window, browser_options.urls);
             app->offer_to_restore_unexpectedly_closed_tabs(*restored_window);
         } else {
             auto& window = app->new_window(browser_options.urls, configuration);
-            window.setWindowTitle("Ladybird");
+            window.setWindowTitle(BROWSER_PRODUCT_NAME);
             app->offer_to_restore_unexpectedly_closed_tabs(window);
         }
-
-        app->offer_newest_pending_crash_report();
     }
+
+    // NB: Messages to the Hub arrive in order, so this comes after whatever these windows have asked to show.
+    if (auto* hub = Ladybird::HubConnection::the_if_connected())
+        hub->async_ui_did_start();
 
     return app->execute();
 }

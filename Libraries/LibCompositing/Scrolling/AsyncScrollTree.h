@@ -33,13 +33,13 @@ enum class WheelHitTestOutcome : u8 {
 struct WheelHitTestResult {
     WheelHitTestOutcome outcome { WheelHitTestOutcome::NoScrollTarget };
     // Set exactly when the outcome is FoundScrollTarget.
-    Optional<AsyncScrollNodeID> node_id {};
-    // The scroller the wheel is over, which is where the search for `node_id` started. It is set even if neither it
-    // nor any scroller around it can scroll by the delta.
-    Optional<AsyncScrollNodeID> innermost_scroll_node_id {};
+    Optional<Compositing::SpatialNodeIndex> scroll_node_index {};
+    // The scroller the wheel is over, which is where the search for `scroll_node_index` started. It is set even if
+    // neither it nor any scroller around it can scroll by the delta.
+    Optional<Compositing::SpatialNodeIndex> innermost_scroll_node_index {};
     // The scroller that keeps the delta from the scrollers around it, when the outcome is NoScrollTarget for that
     // reason rather than because no scroller is left to offer it to.
-    Optional<AsyncScrollNodeID> node_keeping_the_scroll {};
+    Optional<Compositing::SpatialNodeIndex> scroll_node_index_keeping_the_scroll {};
 
     bool is_blocked_by_a_region() const
     {
@@ -47,8 +47,8 @@ struct WheelHitTestResult {
     }
 };
 
-// A first step of a wheel gesture is latched to the scroller the hit test found, and is otherwise left to the main
-// thread for the outcome's reason.
+// A first step of a wheel gesture is latched to the scroller the hit test found, and is otherwise left to the page for
+// the outcome's reason.
 COMPOSITING_API Web::InputRoutingDecision input_routing_decision_for_first_wheel_step(WheelHitTestOutcome);
 
 // Where the first step of a wheel gesture over a position goes, as far as the admission and the hit test decide it.
@@ -65,7 +65,7 @@ struct FirstWheelStepRouteForTesting {
 
 // What the wheel hit test does where a nested context's content is painted.
 enum class NestedContextRegions : u8 {
-    // The step is left to the main thread, which hands it to the nested navigable.
+    // The step is left to the page, which hands it to the nested navigable.
     LeaveToMainThread,
     // The step is handed to the nested context under it, which only gets here if there is none.
     HandToNestedContext,
@@ -92,7 +92,7 @@ struct WheelScrollTarget {
 };
 
 struct CachedWheelHitTestTarget {
-    Optional<AsyncScrollNodeID> target_node_id;
+    Optional<Compositing::SpatialNodeIndex> target_scroll_node_index;
     Compositing::ContextRef context;
     Gfx::FloatRect rect;
     Gfx::CornerRadii corner_radii;
@@ -117,11 +117,6 @@ struct CachedBlockingWheelEventTarget {
     Optional<Gfx::FloatRect> viewport_rect;
 };
 
-struct CachedScrollChainingBarrier {
-    ScrollChainingBarrier barrier;
-    Optional<Gfx::FloatRect> viewport_rect;
-};
-
 enum class ScrollChaining : u8 {
     ToScrollableAncestors,
     None,
@@ -135,21 +130,24 @@ public:
 
     void rebuild_wheel_hit_test_targets(RefPtr<Compositing::DisplayList const> const&, Compositing::AccumulatedVisualContextTree const*, Compositing::ScrollStateSnapshot const&);
 
-    Optional<Gfx::FloatPoint> scroll_offset_for_node(AsyncScrollNodeID, Compositing::ScrollStateSnapshot const&) const;
-    Optional<Web::UniqueNodeID> document_id() const;
-    Optional<AsyncScrollNodeID> viewport_scroll_node_id() const;
-    Optional<AsyncScrollNodeID> scroll_node_id_for_stable_id(Web::AsyncScrollNodeStableID) const;
-    AsyncScrollNode const* scroll_node_for_id(AsyncScrollNodeID) const;
+    Optional<Gfx::FloatPoint> scroll_offset_for_node(Compositing::SpatialNodeIndex, Compositing::ScrollStateSnapshot const&) const;
+    static Gfx::FloatPoint scroll_offset_for_node(AsyncScrollNode const&, Compositing::ScrollStateSnapshot const&);
+    Optional<Web::UniqueNodeID> document_id() const { return m_document_id; }
+    Optional<Compositing::SpatialNodeIndex> viewport_scroll_node_index() const;
+    Optional<Compositing::SpatialNodeIndex> scroll_node_index_for_stable_id(Web::AsyncScrollNodeStableID) const;
+    AsyncScrollNode const* scroll_node_for_index(Compositing::SpatialNodeIndex) const;
     ReadonlySpan<AsyncScrollNode> scroll_nodes() const { return m_scroll_nodes; }
-    AsyncSnapContainer const* snap_container_for_node(AsyncScrollNodeID) const;
+    AsyncSnapContainer const* snap_container_for_node(Compositing::SpatialNodeIndex) const;
 
     // Scroll offsets are held in the device pixels of the display list; snap geometry is in the CSS pixels it was
     // recorded from, at the scale the display list carries.
     double device_pixels_per_css_pixel() const { return m_device_pixels_per_css_pixel; }
     Web::CSSPixelPoint css_pixels_from_device_offset(Gfx::FloatPoint) const;
     Gfx::FloatPoint device_offset_from_css_pixels(Web::CSSPixelPoint) const;
-    Optional<Web::CSSPixelPoint> css_scroll_offset_for_node(AsyncScrollNodeID, Compositing::ScrollStateSnapshot const&) const;
+    Optional<Web::CSSPixelPoint> css_scroll_offset_for_node(Compositing::SpatialNodeIndex, Compositing::ScrollStateSnapshot const&) const;
+    Web::CSSPixelPoint css_scroll_offset_for_node(AsyncScrollNode const&, Compositing::ScrollStateSnapshot const&) const;
     bool blocks_wheel_event_at_position(Compositing::AccumulatedVisualContextTree const&, Gfx::FloatPoint position) const;
+    bool main_thread_wheel_event_region_contains(Compositing::AccumulatedVisualContextTree const&, Gfx::FloatPoint position) const;
     WheelHitTestResult hit_test_scroll_node_for_wheel(Compositing::AccumulatedVisualContextTree const&, Gfx::FloatPoint position, Gfx::FloatPoint delta, Function<Optional<Gfx::FloatPoint>(Web::AsyncScrollNodeStableID)> const& in_flight_destination_for = {}, WheelStepDispatch = WheelStepDispatch::NotYetDispatched, NestedContextRegions = NestedContextRegions::LeaveToMainThread) const;
     // The nested context whose content is the topmost thing taking pointer input at the position, if any.
     Optional<NestedContextHit> nested_context_at(Compositing::AccumulatedVisualContextTree const&, Gfx::FloatPoint position) const;
@@ -158,12 +156,14 @@ public:
     // Where the position lands in the content of the nested context, even outside of that content and its clips, as
     // the pointer of a drag that began in there moves on.
     Optional<NestedContextHit> position_in_content_of_nested_context(Web::CompositorContextId, Compositing::AccumulatedVisualContextTree const&, Gfx::FloatPoint position) const;
+    // Where a position in the viewport of the nested context lies in this context's viewport.
+    Optional<Gfx::FloatPoint> position_of_nested_context_position(Web::CompositorContextId, Gfx::FloatPoint position_in_nested_context, Gfx::FloatSize nested_context_viewport_size, Compositing::AccumulatedVisualContextTree const&) const;
     bool has_nested_contexts() const { return !m_nested_context_wheel_regions.is_empty(); }
     bool has_wheel_hit_test_targets_for(Compositing::AccumulatedVisualContextTree const& visual_context_tree) const { return m_visual_context_tree_structural_epoch == visual_context_tree.structural_epoch(); }
     // Whether something painted above the given place in paint order takes pointer input at the position. It is taken
     // to be covered whenever that cannot be told.
     bool is_covered_by_hit_test_target_painted_after(u32 paint_order_index, Compositing::AccumulatedVisualContextTree const&, Gfx::FloatPoint position) const;
-    bool scroll_node_is_viewport(AsyncScrollNodeID) const;
+    bool scroll_node_is_viewport(Compositing::SpatialNodeIndex) const;
     // Whether the viewport keeps a scroll by the delta from the document it is nested in, whether or not it has a
     // scroll node.
     bool viewport_keeps_scrolls_along_main_axis_of(Gfx::FloatPoint delta) const;
@@ -172,28 +172,29 @@ public:
     FirstWheelStepRoute route_first_wheel_step(WheelRoutingAdmission, Compositing::AccumulatedVisualContextTree const&, Gfx::FloatPoint position, Gfx::FloatPoint delta, NestedContextRegions = NestedContextRegions::LeaveToMainThread) const;
     // Of the scroller and the scrollers around it that a scroll by the delta may be passed on to, the outermost one a
     // wheel can scroll along the main axis of the delta at all, wherever it is scrolled to.
-    Optional<AsyncScrollNodeID> outermost_scroll_node_wheel_scrollable_along_main_axis_of(AsyncScrollNodeID innermost_node_id, Gfx::FloatPoint delta) const;
-    Optional<AsyncScrollNodeID> scroll_node_for_keyboard_scroll(Web::AsyncScrollNodeStableID, Gfx::FloatPoint delta, Compositing::ScrollStateSnapshot const&) const;
-    Gfx::FloatPoint clamped_scroll_offset_for_node(AsyncScrollNodeID, Gfx::FloatPoint) const;
-    Optional<AsyncScrollOffset> apply_scroll_delta(AsyncScrollNodeID, Gfx::FloatPoint delta, Compositing::AccumulatedVisualContextTree const&, Compositing::ScrollStateSnapshot&, ScrollChaining);
-    Optional<WheelScrollTarget> select_wheel_scroll_target(AsyncScrollNodeID, Gfx::FloatPoint delta, Compositing::ScrollStateSnapshot const&, Function<Optional<Gfx::FloatPoint>(Web::AsyncScrollNodeStableID)> const& in_flight_destination_for, ScrollChaining scroll_chaining) const;
-    Optional<Gfx::FloatPoint> set_scroll_offset(AsyncScrollNodeID, Gfx::FloatPoint, Compositing::AccumulatedVisualContextTree const&, Compositing::ScrollStateSnapshot&);
+    Optional<Compositing::SpatialNodeIndex> outermost_scroll_node_wheel_scrollable_along_main_axis_of(Compositing::SpatialNodeIndex innermost_scroll_node_index, Gfx::FloatPoint delta) const;
+    // The scroller, of the given one and those it passes a scroll by the delta on to, that takes a wheel step by it, as
+    // the hit test finds one for a step over the given scroller.
+    WheelHitTestResult hit_test_result_for_scroll_node(Compositing::SpatialNodeIndex, Gfx::FloatPoint delta, Function<Optional<Gfx::FloatPoint>(Web::AsyncScrollNodeStableID)> const& in_flight_destination_for) const;
+    Optional<Compositing::SpatialNodeIndex> scroll_node_for_keyboard_scroll(Web::AsyncScrollNodeStableID, Gfx::FloatPoint delta, Compositing::ScrollStateSnapshot const&) const;
+    Gfx::FloatPoint clamped_scroll_offset_for_node(Compositing::SpatialNodeIndex, Gfx::FloatPoint) const;
+    Optional<AsyncScrollOffset> apply_scroll_delta(Compositing::SpatialNodeIndex, Gfx::FloatPoint delta, Compositing::AccumulatedVisualContextTree const&, Compositing::ScrollStateSnapshot&, ScrollChaining);
+    Optional<WheelScrollTarget> select_wheel_scroll_target(Compositing::SpatialNodeIndex, Gfx::FloatPoint delta, Compositing::ScrollStateSnapshot const&, Function<Optional<Gfx::FloatPoint>(Web::AsyncScrollNodeStableID)> const& in_flight_destination_for, ScrollChaining scroll_chaining) const;
+    Optional<Gfx::FloatPoint> set_scroll_offset(Compositing::SpatialNodeIndex, Gfx::FloatPoint, Compositing::AccumulatedVisualContextTree const&, Compositing::ScrollStateSnapshot&);
+    Gfx::FloatPoint set_scroll_offset_leaving_sticky_offsets_unresolved(AsyncScrollNode const&, Gfx::FloatPoint, Compositing::ScrollStateSnapshot&);
 
 private:
     static Gfx::FloatPoint clamp_scroll_offset_to_node(AsyncScrollNode const&, Gfx::FloatPoint);
-    static Gfx::FloatPoint scroll_offset_for_node(AsyncScrollNode const&, Compositing::ScrollStateSnapshot const&);
     static bool can_scroll_node_by_delta(AsyncScrollNode const&, Compositing::ScrollStateSnapshot const&, Gfx::FloatPoint);
     static bool can_scroll_node_from_offset_by_delta(AsyncScrollNode const&, Gfx::FloatPoint scroll_offset, Gfx::FloatPoint delta);
 
-    WheelHitTestResult hit_test_result_for_scroll_node(AsyncScrollNodeID, Gfx::FloatPoint delta, Function<Optional<Gfx::FloatPoint>(Web::AsyncScrollNodeStableID)> const& in_flight_destination_for, ReadonlySpan<AsyncScrollNodeID> scroll_nodes_behind_scroll_chaining_barriers) const;
     AsyncScrollNode const* scroll_node_for_stable_id(Web::AsyncScrollNodeStableID) const;
-    bool main_thread_wheel_event_region_contains(Compositing::AccumulatedVisualContextTree const&, Gfx::FloatPoint position) const;
     struct NestedContextWheelRegionHit {
         NestedContextWheelRegion const& region;
         Gfx::FloatPoint position_in_context;
     };
     Optional<NestedContextWheelRegionHit> topmost_nested_context_wheel_region_at(Compositing::AccumulatedVisualContextTree const&, Gfx::FloatPoint position) const;
-    Optional<AsyncScrollNodeID> scrollable_ancestor_for_node(AsyncScrollNodeID, Compositing::ScrollStateSnapshot const&, Gfx::FloatPoint delta) const;
+    Optional<Compositing::SpatialNodeIndex> scrollable_ancestor_for_node(Compositing::SpatialNodeIndex, Compositing::ScrollStateSnapshot const&, Gfx::FloatPoint delta) const;
     Gfx::FloatPoint apply_scroll_delta_to_node(AsyncScrollNode const&, Gfx::FloatPoint delta, Compositing::ScrollStateSnapshot&);
 
     Optional<Web::UniqueNodeID> m_document_id;
@@ -208,8 +209,6 @@ private:
     Vector<CachedMainThreadWheelEventTarget> m_cached_main_thread_wheel_event_targets;
     Vector<CachedNestedContextWheelRegion> m_cached_nested_context_wheel_regions;
     Vector<CachedBlockingWheelEventTarget> m_cached_blocking_wheel_event_targets;
-    Vector<ScrollChainingBarrier> m_scroll_chaining_barriers;
-    Vector<CachedScrollChainingBarrier> m_cached_scroll_chaining_barriers;
     Optional<u64> m_visual_context_tree_structural_epoch;
     Compositing::ScrollStateSnapshot m_scroll_state_snapshot;
     bool m_has_blocking_wheel_event_region_covering_viewport { false };

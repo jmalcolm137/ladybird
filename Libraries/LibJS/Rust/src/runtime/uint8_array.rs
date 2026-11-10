@@ -10,7 +10,9 @@ use crate::interpreter::vm::Vm;
 use crate::layout::cell::Gc;
 use crate::layout::object::Object;
 use crate::layout::value::Value;
-use crate::runtime::abstract_operations::get_options_object;
+use crate::runtime::abstract_operations::{
+    checked_js_string_length_product, checked_js_string_length_sum, get_options_object,
+};
 use crate::runtime::array_buffer::{ArrayBuffer, Order, Shared};
 use crate::runtime::completion::{Must, Throw, ThrowCompletionOr};
 use crate::runtime::error::ErrorKind;
@@ -123,7 +125,7 @@ impl Uint8ArrayConstructorHelpers {
         // 14. Set the value at each index of ta.[[ViewedArrayBuffer]].[[ArrayBufferData]] to the value at the corresponding
         //     index of result.[[Bytes]].
         let array_buffer = ArrayBuffer::create_from_bytes(vm, realm, &result.bytes, Shared::No);
-        let typed_array = Uint8Array::create_on_buffer(vm, realm, result_length as u32, array_buffer);
+        let typed_array = Uint8Array::create_on_buffer(vm, realm, result_length, array_buffer);
 
         // 13. Assert: ta.[[ViewedArrayBuffer]].[[ArrayBufferByteLength]] is the number of elements in result.[[Bytes]].
         assert!(typed_array.viewed_array_buffer().byte_length() == result_length);
@@ -157,7 +159,7 @@ impl Uint8ArrayConstructorHelpers {
         let result_length = result.bytes.len();
 
         // 5. Let ta be ? AllocateTypedArray("Uint8Array", %Uint8Array%, "%Uint8Array.prototype%", resultLength).
-        let typed_array = Uint8Array::create(vm, realm, result_length as u32)?;
+        let typed_array = Uint8Array::create(vm, realm, result_length)?;
 
         // 6. Assert: ta.[[ViewedArrayBuffer]].[[ArrayBufferByteLength]] is the number of elements in result.[[Bytes]].
         assert!(typed_array.viewed_array_buffer().byte_length() == result_length);
@@ -449,6 +451,22 @@ impl Uint8ArrayPrototypeHelpers {
         let length = typed_array_length(&typed_array_record) as usize;
         let byte_offset = typed_array.byte_offset() as usize;
 
+        // NB: Every 3 bytes become 4 characters. A final 1 or 2 bytes become 4 characters with padding, or 2 or 3 without
+        //     it. Reject a result too long for a string before copying or encoding any bytes.
+        let full_groups_length =
+            checked_js_string_length_product(vm, length / 3, 4, ErrorType::StringSizeMustNotOverflow)?;
+        let final_group_length = match length % 3 {
+            0 => 0,
+            remaining_bytes if omit_padding => remaining_bytes + 1,
+            _ => 4,
+        };
+        checked_js_string_length_sum(
+            vm,
+            full_groups_length,
+            final_group_length,
+            ErrorType::StringSizeMustNotOverflow,
+        )?;
+
         let to_encode = typed_array
             .viewed_array_buffer()
             .copy_to_byte_buffer(byte_offset, length);
@@ -481,8 +499,11 @@ impl Uint8ArrayPrototypeHelpers {
         let length = typed_array_length(&typed_array_record) as usize;
         let byte_offset = typed_array.byte_offset() as usize;
 
+        // NB: Every byte becomes 2 characters. Reject a result too long for a string before copying or encoding any bytes.
+        let out_length = checked_js_string_length_product(vm, length, 2, ErrorType::StringSizeMustNotOverflow)?;
+
         // 4. Let out be the empty String.
-        let mut out = Utf16StringBuilder::with_capacity(length * 2);
+        let mut out = Utf16StringBuilder::with_capacity(out_length);
 
         let to_encode = typed_array
             .viewed_array_buffer()
@@ -536,12 +557,12 @@ pub fn set_uint8_array_bytes(vm: &Vm, into: &TypedArrayBase, bytes: &[u8]) {
     for (index, byte) in bytes.iter().enumerate() {
         // a. Let byte be bytes[index].
         // b. Let byteIndexInBuffer be index + offset.
-        let byte_index_in_buffer = index as u32 + offset;
+        let byte_index_in_buffer = index + offset;
 
         // c. Perform SetValueInBuffer(into.[[ViewedArrayBuffer]], byteIndexInBuffer, uint8, 𝔽(byte), true, unordered).
         into.set_value_in_buffer(
             vm,
-            byte_index_in_buffer as usize,
+            byte_index_in_buffer,
             Value::from_i32(i32::from(*byte)),
             Order::Unordered,
         );

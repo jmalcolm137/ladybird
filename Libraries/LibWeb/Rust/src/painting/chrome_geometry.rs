@@ -104,12 +104,12 @@ pub(crate) fn physical_resize_axes(arena: &impl PaintRead, slot: NodeSlotId) -> 
     let overflow_allows_resize =
         |overflow| overflow != css_enums::overflow::VISIBLE && overflow != css_enums::overflow::CLIP;
     PhysicalAxes {
-        horizontal: overflow_allows_resize(box_values.overflow_x)
+        horizontal: overflow_allows_resize(style.overflow_x())
             && (box_values.resize == css_enums::resize::BOTH
                 || box_values.resize == css_enums::resize::HORIZONTAL
                 || (box_values.resize == css_enums::resize::INLINE && horizontal_writing_mode)
                 || (box_values.resize == css_enums::resize::BLOCK && !horizontal_writing_mode)),
-        vertical: overflow_allows_resize(box_values.overflow_y)
+        vertical: overflow_allows_resize(style.overflow_y())
             && (box_values.resize == css_enums::resize::BOTH
                 || box_values.resize == css_enums::resize::VERTICAL
                 || (box_values.resize == css_enums::resize::INLINE && !horizontal_writing_mode)
@@ -163,7 +163,7 @@ pub(crate) fn scroll_boundary_behavior(arena: &impl PaintRead, slot: NodeSlotId)
     };
 
     use css_enums::overscroll_behavior::{AUTO, CHAIN, CONTAIN};
-    let misc_reset = style.misc_reset();
+    let misc_interaction = style.misc_interaction();
     // contain: The element must not perform non-local boundary default actions such as scroll chaining. This value
     //          must not modify the behavior of how local boundary default actions should behave, such as showing any
     //          overscroll affordances.
@@ -175,14 +175,21 @@ pub(crate) fn scroll_boundary_behavior(arena: &impl PaintRead, slot: NodeSlotId)
     let shows_overscroll_effect = |value: u8| value == AUTO || value == CONTAIN;
     ScrollBoundaryBehavior {
         chains_to_ancestors: PhysicalAxes {
-            horizontal: chains(misc_reset.overscroll_behavior_x),
-            vertical: chains(misc_reset.overscroll_behavior_y),
+            horizontal: chains(misc_interaction.overscroll_behavior_x),
+            vertical: chains(misc_interaction.overscroll_behavior_y),
         },
         shows_overscroll_effect: PhysicalAxes {
-            horizontal: shows_overscroll_effect(misc_reset.overscroll_behavior_x),
-            vertical: shows_overscroll_effect(misc_reset.overscroll_behavior_y),
+            horizontal: shows_overscroll_effect(misc_interaction.overscroll_behavior_x),
+            vertical: shows_overscroll_effect(misc_interaction.overscroll_behavior_y),
         },
     }
+}
+
+// A scroll container that keeps the scrolls along some axis to itself gets a scroll node even when it has nothing to
+// scroll, so that the compositor stops passing a scroll on at it.
+pub(crate) fn keeps_scrolls_along_some_axis(arena: &impl PaintRead, slot: NodeSlotId) -> bool {
+    let chains_to_ancestors = scroll_boundary_behavior(arena, slot).chains_to_ancestors;
+    !chains_to_ancestors.horizontal || !chains_to_ancestors.vertical
 }
 
 // NB: The viewport's own overflow is the one the layout pass propagated to it, as applied to the viewport.
@@ -190,12 +197,11 @@ pub(crate) fn wheel_scrollable_axes(arena: &impl PaintRead, slot: NodeSlotId) ->
     let Some(style) = arena.node_style_if_live(slot) else {
         return PhysicalAxes::default();
     };
-    let box_values = style.box_values();
     let allows_wheel_scrolling =
         |overflow| overflow == css_enums::overflow::AUTO || overflow == css_enums::overflow::SCROLL;
     let mut axes = PhysicalAxes {
-        horizontal: allows_wheel_scrolling(box_values.overflow_x),
-        vertical: allows_wheel_scrolling(box_values.overflow_y),
+        horizontal: allows_wheel_scrolling(style.overflow_x()),
+        vertical: allows_wheel_scrolling(style.overflow_y()),
     };
     if !axes.horizontal && !axes.vertical {
         return axes;
@@ -337,7 +343,7 @@ impl<'a, Arena: PaintRead> ChromeGeometry<'a, Arena> {
             return None;
         }
         let style = self.arena.node_style_if_live(slot)?;
-        if style.misc_reset().scrollbar_width == css_enums::scrollbar_width::NONE {
+        if style.misc_interaction().scrollbar_width == css_enums::scrollbar_width::NONE {
             return None;
         }
 
@@ -393,13 +399,19 @@ impl<'a, Arena: PaintRead> ChromeGeometry<'a, Arena> {
         }
         let style = arena.node_style_if_live(slot)?;
         let overflow = match direction {
-            ScrollDirection::Horizontal => style.box_values().overflow_x,
-            ScrollDirection::Vertical => style.box_values().overflow_y,
+            ScrollDirection::Horizontal => style.overflow_x(),
+            ScrollDirection::Vertical => style.overflow_y(),
         };
         if overflow != css_enums::overflow::SCROLL && !self.wheel_scrollable_axes(slot).along(direction) {
             return None;
         }
         if arena.paintable_data(slot).own_scroll_node_index == VISUAL_VIEWPORT_NODE_INDEX {
+            return None;
+        }
+        // NB: A box that keeps its scrolls has a scroll node even when it has nothing to scroll.
+        if arena.node_kind_if_live(slot) != Some(NodeKind::Viewport)
+            && !paintable_geometry::has_scrollable_overflow(arena, slot)
+        {
             return None;
         }
         let overflow_length = primary_size(paintable_geometry::scrollable_overflow_rect(arena, slot)?, direction);
@@ -457,20 +469,22 @@ fn is_canvas_background_source(
         || (root_background_source.use_body_background_properties && root_background_source.body_layout_node == slot)
 }
 
-pub(crate) fn scrollbar_colors_for_paint(
+#[derive(Clone, Copy)]
+pub(crate) struct ScrollbarColors {
+    pub thumb: Color,
+    // The thumb is stroked with this, so that it stays visible over whatever the scrollbar is drawn on.
+    pub thumb_outline: Color,
+    pub track: Color,
+}
+
+/// The color behind what `slot` paints, as far as background colors tell: the canvas's, with the backgrounds of `slot`
+/// and its ancestors composited over it. Background images, and content of other boxes painted underneath, don't count.
+pub(crate) fn estimated_backdrop_color(
     arena: &impl PaintRead,
     slot: NodeSlotId,
     root_background_source: RootBackgroundSource,
     canvas_background_color: Color,
-) -> (Color, Color) {
-    let Some(style) = arena.node_style_if_live(slot) else {
-        return (Color::TRANSPARENT, Color::TRANSPARENT);
-    };
-    let colors = style.inherited_ui().scrollbar_color;
-    if !colors.is_auto {
-        return (Color(colors.thumb_color), Color(colors.track_color));
-    }
-
+) -> Color {
     let mut ancestors = Vec::new();
     let mut current = Some(slot);
     while let Some(ancestor) = current {
@@ -485,19 +499,62 @@ pub(crate) fn scrollbar_colors_for_paint(
         let Some(style) = arena.node_style_if_live(ancestor) else {
             continue;
         };
-        let color = Color(style.background().background_color);
+        let color = Color(style.background_color());
         if color.alpha() != 0 {
             background_color = background_color.blend(color);
         }
     }
+    background_color
+}
+
+pub(crate) fn scrollbar_colors_for_paint(
+    arena: &impl PaintRead,
+    slot: NodeSlotId,
+    root_background_source: RootBackgroundSource,
+    canvas_background_color: Color,
+) -> ScrollbarColors {
+    let Some(style) = arena.node_style_if_live(slot) else {
+        return ScrollbarColors {
+            thumb: Color::TRANSPARENT,
+            thumb_outline: Color::TRANSPARENT,
+            track: Color::TRANSPARENT,
+        };
+    };
+    // https://drafts.csswg.org/css-scrollbars/#scrollbar-color
+    // UAs must apply the scrollbar-color value set on the root element to the viewport.
+    let color_style = if arena.node_kind_if_live(slot) == Some(NodeKind::Viewport) {
+        style_queries::document_element_box_under(arena, slot)
+            .and_then(|root| arena.node_style_if_live(root))
+            .unwrap_or(style)
+    } else {
+        style
+    };
+    let colors = color_style.inherited_ui().scrollbar_color;
+    if !colors.is_auto {
+        let thumb = Color(colors.thumb_color);
+        return ScrollbarColors {
+            thumb,
+            thumb_outline: thumb.lightened(1.2),
+            track: Color(colors.track_color),
+        };
+    }
+
+    let background_color = estimated_backdrop_color(arena, slot, root_background_source, canvas_background_color);
     let black_thumb = Color::from_rgb(0, 0, 0).with_alpha(128);
     let white_thumb = Color::from_rgb(255, 255, 255).with_alpha(128);
     let black_contrast = background_color.contrast_ratio(background_color.blend(black_thumb));
     let white_contrast = background_color.contrast_ratio(background_color.blend(white_thumb));
-    let thumb = if black_contrast >= white_contrast {
-        black_thumb
+    let (thumb, thumb_outline) = if black_contrast >= white_contrast {
+        (black_thumb, white_thumb)
     } else {
-        white_thumb
+        (white_thumb, black_thumb)
     };
-    (thumb, thumb.with_alpha(25))
+    // The background guessed above is what's behind the scroll container, which isn't always what's under the
+    // scrollbar: Content of the opposite lightness can cover it. An outline in the opposite color to the thumb's keeps
+    // the thumb visible over that content too.
+    ScrollbarColors {
+        thumb,
+        thumb_outline: thumb_outline.with_alpha(64),
+        track: thumb.with_alpha(25),
+    }
 }

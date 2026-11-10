@@ -17,12 +17,14 @@ ProcessType process_type_from_name(StringView name)
 {
     if (name == "Browser"sv)
         return ProcessType::Browser;
+    if (name == "UI"sv)
+        return ProcessType::UI;
+    if (name == "Hub"sv)
+        return ProcessType::Hub;
     if (name == "Compositor"sv)
         return ProcessType::Compositor;
     if (name == "WebContent"sv)
         return ProcessType::WebContent;
-    if (name == "WebWorker"sv)
-        return ProcessType::WebWorker;
     if (name == "RequestServer"sv)
         return ProcessType::RequestServer;
     if (name == "ImageDecoder"sv)
@@ -33,6 +35,8 @@ ProcessType process_type_from_name(StringView name)
         return ProcessType::AudioServer;
     if (name == "VideoDecoderServer"sv)
         return ProcessType::VideoDecoderServer;
+    if (name == "WebRTCClient"sv)
+        return ProcessType::WebRTCClient;
 
     dbgln("Unknown process type: '{}'", name);
     VERIFY_NOT_REACHED();
@@ -43,12 +47,14 @@ StringView process_name_from_type(ProcessType type)
     switch (type) {
     case ProcessType::Browser:
         return "Browser"sv;
+    case ProcessType::UI:
+        return "UI"sv;
+    case ProcessType::Hub:
+        return "Hub"sv;
     case ProcessType::Compositor:
         return "Compositor"sv;
     case ProcessType::WebContent:
         return "WebContent"sv;
-    case ProcessType::WebWorker:
-        return "WebWorker"sv;
     case ProcessType::RequestServer:
         return "RequestServer"sv;
     case ProcessType::ImageDecoder:
@@ -59,6 +65,8 @@ StringView process_name_from_type(ProcessType type)
         return "AudioServer"sv;
     case ProcessType::VideoDecoderServer:
         return "VideoDecoderServer"sv;
+    case ProcessType::WebRTCClient:
+        return "WebRTCClient"sv;
     }
     VERIFY_NOT_REACHED();
 }
@@ -85,6 +93,8 @@ ProcessManager::ProcessManager()
     set_process_task_name_port(getpid(), Core::MachPort::adopt_right(task_name_port, Core::MachPort::PortRight::Send));
 #endif
 }
+
+ProcessManager::~ProcessManager() = default;
 
 Optional<Process&> ProcessManager::find_process(pid_t pid)
 {

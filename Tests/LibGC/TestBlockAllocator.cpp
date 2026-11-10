@@ -4,7 +4,9 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <AK/ScopeGuard.h>
 #include <AK/Time.h>
+#include <AK/Vector.h>
 #include <LibCore/System.h>
 #include <LibGC/BlockAllocator.h>
 #include <LibGC/HeapBlock.h>
@@ -34,6 +36,32 @@ TEST_CASE(all_blocks_share_one_reserved_region)
 
     first_allocator.deallocate_block(first_block, GC::DeferDecommit::No);
     second_allocator.deallocate_block(second_block, GC::DeferDecommit::No);
+}
+
+TEST_CASE(blocks_stay_out_of_the_region_guards)
+{
+    GC::BlockAllocator allocator;
+    auto region_start = GC::BlockAllocator::heap_region_start();
+    auto region_end = GC::BlockAllocator::heap_region_end();
+
+    // Enough blocks to take several fresh chunks.
+    static constexpr size_t BLOCK_COUNT = 1024;
+    Vector<void*> blocks;
+    for (size_t i = 0; i < BLOCK_COUNT; ++i)
+        blocks.append(allocator.allocate_block("guards"));
+
+    auto committed_end = GC::BlockAllocator::heap_region_committed_end();
+    EXPECT(committed_end >= region_start + GC::HEAP_REGION_LOW_GUARD_SIZE + BLOCK_COUNT * GC::HeapBlock::BLOCK_SIZE);
+    EXPECT(committed_end <= region_end - GC::HEAP_REGION_HIGH_GUARD_SIZE);
+
+    for (auto* block : blocks) {
+        auto address = reinterpret_cast<FlatPtr>(block);
+        EXPECT(address >= region_start + GC::HEAP_REGION_LOW_GUARD_SIZE);
+        EXPECT(address + GC::HeapBlock::BLOCK_SIZE <= committed_end);
+    }
+
+    for (auto* block : blocks)
+        allocator.deallocate_block(block, GC::DeferDecommit::No);
 }
 
 TEST_CASE(decommitted_block_can_be_reused)
@@ -68,3 +96,33 @@ TEST_CASE(decommitted_block_can_be_reused)
 
     allocator.deallocate_block(reused_block, GC::DeferDecommit::No);
 }
+
+#if defined(AK_OS_LINUX) && !defined(HAS_ADDRESS_SANITIZER)
+TEST_CASE(pages_of_a_block_that_stays_unused_go_back_to_the_system)
+{
+    auto cold_block_age = GC::BlockAllocator::set_cold_block_age_for_testing(AK::Duration::from_milliseconds(10));
+    ScopeGuard restore_cold_block_age = [&] { GC::BlockAllocator::set_cold_block_age_for_testing(cold_block_age); };
+
+    GC::BlockAllocator allocator;
+
+    auto* block = static_cast<u8 volatile*>(allocator.allocate_block("cold"));
+    block[0] = 0xab;
+    allocator.deallocate_block(const_cast<u8*>(block), GC::DeferDecommit::Yes);
+    GC::BlockAllocator::wake_decommit_worker_async();
+
+    // NB: MADV_FREE leaves the contents until the system runs short of memory, so only a real return zeroes the page.
+    //     Nothing has to collect garbage for this to happen.
+    // The worker zeroes the pages before it puts the block back in the pool, so wait until the block is back: An
+    // allocation before then would get a fresh slot.
+    auto deadline = MonotonicTime::now() + AK::Duration::from_seconds(30);
+    while (allocator.returned_block_count_for_testing() == 0 && MonotonicTime::now() < deadline)
+        (void)Core::System::sleep_ms(1);
+    EXPECT_EQ(allocator.returned_block_count_for_testing(), 1u);
+    u8 first_byte = block[0];
+    EXPECT_EQ(first_byte, 0);
+
+    auto* reused_block = allocator.allocate_block("cold");
+    EXPECT_EQ(reused_block, const_cast<u8*>(block));
+    allocator.deallocate_block(reused_block, GC::DeferDecommit::No);
+}
+#endif

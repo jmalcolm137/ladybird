@@ -50,10 +50,13 @@ fn link_content_rect(link: &crate::layout::fragment_tree::FragmentLink) -> CssPi
 }
 
 pub(crate) fn committed_offset(arena: &impl GeometryRead, slot: NodeSlotId) -> used_values::FfiCssPixelPoint {
-    let data = arena.paintable_data(slot);
-    if node_painting::is_fragmented_inline(arena, slot) {
-        return data.offset;
+    // NB: An inline box without pieces keeps the geometry its link gives it.
+    if node_painting::is_fragmented_inline(arena, slot)
+        && let Some(unions) = crate::painting::inline_box_geometry::unions(arena, slot)
+    {
+        return unions.content.location().into();
     }
+    let data = arena.paintable_data(slot);
     let frame = data.frame();
     if !frame.is_physical() {
         let containing_block = data.containing_block;
@@ -71,10 +74,12 @@ pub(crate) fn committed_offset(arena: &impl GeometryRead, slot: NodeSlotId) -> u
 }
 
 pub(crate) fn committed_content_size(arena: &impl GeometryRead, slot: NodeSlotId) -> used_values::FfiCssPixelSize {
-    let data = arena.paintable_data(slot);
-    if node_painting::is_fragmented_inline(arena, slot) {
-        return data.content_size;
+    if node_painting::is_fragmented_inline(arena, slot)
+        && let Some(unions) = crate::painting::inline_box_geometry::unions(arena, slot)
+    {
+        return unions.content.size().into();
     }
+    let data = arena.paintable_data(slot);
     let frame = data.frame();
     arena.with_committed_fragment_link(slot, |link| {
         link.map_or_else(used_values::FfiCssPixelSize::default, |link| {
@@ -271,7 +276,10 @@ pub(crate) fn committed_svg_text_character_cells(
 }
 
 pub(crate) fn committed_containing_line_box_index(arena: &impl GeometryRead, slot: NodeSlotId) -> Option<usize> {
-    arena.with_committed_fragment_link(slot, |link| link.and_then(|link| link.containing_line_box_index))
+    arena.with_committed_fragment_link(slot, |link| {
+        link.and_then(|link| link.containing_line_box_index)
+            .map(|index| index as usize)
+    })
 }
 
 pub(crate) fn committed_svg_viewport_transform(
@@ -345,6 +353,14 @@ pub(crate) fn committed_svg_viewport_percentage_basis(arena: &impl GeometryRead,
     arena.with_committed_fragment_link(slot, |link| {
         link.and_then(|link| link.fragment.svg.as_ref())
             .map_or_else(CssPixels::default, |svg| svg.viewport_percentage_basis)
+    })
+}
+
+/// The `pathLength` the box of a geometry element committed, where its element has one.
+pub(crate) fn committed_svg_author_path_length(arena: &impl GeometryRead, slot: NodeSlotId) -> Option<f32> {
+    arena.with_committed_fragment_link(slot, |link| {
+        link.and_then(|link| link.fragment.svg.as_ref())
+            .and_then(|svg| svg.author_path_length)
     })
 }
 
@@ -621,11 +637,26 @@ pub(crate) fn absolute_padding_box_rect(arena: &impl GeometryRead, slot: NodeSlo
     rect
 }
 
+/// A union of the pieces of the inline box `slot`, placed where its content union lies at `absolute_content_rect`.
+fn inline_box_union_at(
+    arena: &impl GeometryRead,
+    slot: NodeSlotId,
+    absolute_content_rect: CssPixelRect,
+    union: impl FnOnce(&crate::painting::inline_box_geometry::InlineBoxUnions) -> CssPixelRect,
+) -> CssPixelRect {
+    let Some(unions) = crate::painting::inline_box_geometry::unions(arena, slot) else {
+        return CssPixelRect::from_location_and_size(absolute_content_rect.location(), Default::default());
+    };
+    union(&unions).translated(
+        absolute_content_rect.x - unions.content.x,
+        absolute_content_rect.y - unions.content.y,
+    )
+}
+
 pub(crate) fn first_fragment_padding_box_rect(arena: &impl GeometryRead, slot: NodeSlotId) -> CssPixelRect {
     let absolute = absolute_rect(arena, slot);
     if node_painting::is_fragmented_inline(arena, slot) {
-        return CssPixelRect::from(arena.paintable_data(slot).local_padding_box_union)
-            .translated_by(absolute.location());
+        return inline_box_union_at(arena, slot, absolute, |unions| unions.padding);
     }
     let padding = committed_padding(arena, slot);
     let content_size = committed_content_size(arena, slot);
@@ -685,8 +716,7 @@ pub(crate) fn absolute_border_box_rects_of_fragments(
 
 pub(crate) fn first_fragment_border_box_rect(arena: &impl GeometryRead, slot: NodeSlotId) -> CssPixelRect {
     if node_painting::is_fragmented_inline(arena, slot) {
-        return CssPixelRect::from(arena.paintable_data(slot).local_border_box_union)
-            .translated_by(absolute_rect(arena, slot).location());
+        return inline_box_union_at(arena, slot, absolute_rect(arena, slot), |unions| unions.border);
     }
     let padded = first_fragment_padding_box_rect(arena, slot);
     let border = committed_border_box_edges(arena, slot);
@@ -698,25 +728,50 @@ pub(crate) fn first_fragment_border_box_rect(arena: &impl GeometryRead, slot: No
     )
 }
 
-/// The overflow the pass measured. Reading it never measures it.
+/// The scrollable overflow of the box in `slot`, united over its fragments, where its committed fragments hold one. An
+/// inline box has none until it stores a scroll offset, which its padding box then bounds.
 pub(crate) fn scrollable_overflow_rect(arena: &impl GeometryRead, slot: NodeSlotId) -> Option<CssPixelRect> {
     if !arena.paintable_row_is_populated(slot) {
         return None;
     }
-    let cache = arena.committed_side_data(slot);
-    if !cache.overflow_valid_across_recommits {
-        return None;
+    if !arena
+        .node_kind_if_live(slot)
+        .is_some_and(crate::layout::node_facts::kind_is_box)
+    {
+        let stores_scroll_offset =
+            arena.node_flags_if_live(slot) & crate::layout::node_data::NodeFlag::HasScrollOffset as u32 != 0;
+        return stores_scroll_offset.then(|| first_fragment_padding_box_rect(arena, slot));
     }
-    Some(
-        CssPixelRect::from(cache.overflow_relative_to_padding_box.rect)
-            .translated_by(first_fragment_padding_box_rect(arena, slot).location()),
-    )
+    let first = arena.with_committed_fragment_link(slot, |link| {
+        link.map(|link| link.fragment.scrollable_overflow.rect_relative_to_padding_box)
+    })?;
+    let mut rect = first.translated_by(first_fragment_padding_box_rect(arena, slot).location());
+    for (index, fragment) in arena.committed_side_data(slot).box_fragments().iter().enumerate() {
+        rect.unite(
+            fragment
+                .link
+                .fragment
+                .scrollable_overflow
+                .rect_relative_to_padding_box
+                .translated_by(absolute_fragment_padding_box_rect(arena, slot, index + 1).location()),
+        );
+    }
+    Some(rect)
 }
 
 pub(crate) fn has_scrollable_overflow(arena: &impl GeometryRead, slot: NodeSlotId) -> bool {
-    if !arena.paintable_row_is_populated(slot) {
+    if !arena.paintable_row_is_populated(slot)
+        || !arena
+            .node_kind_if_live(slot)
+            .is_some_and(crate::layout::node_facts::kind_is_box)
+    {
         return false;
     }
-    let cache = arena.committed_side_data(slot);
-    cache.overflow_valid_across_recommits && cache.overflow_relative_to_padding_box.has_scrollable_overflow
+    arena.with_committed_fragment_link(slot, |link| {
+        link.is_some_and(|link| link.fragment.scrollable_overflow.has_scrollable_overflow)
+    }) || arena
+        .committed_side_data(slot)
+        .box_fragments()
+        .iter()
+        .any(|fragment| fragment.link.fragment.scrollable_overflow.has_scrollable_overflow)
 }

@@ -1,5 +1,5 @@
 // https://drafts.csswg.org/cssom/#cssstyledeclaration
-[Exposed=Window]
+[Exposed=Window, ImplementedIn=Rust]
 interface CSSStyleDeclaration {
     [CEReactions] attribute CSSOMString cssText;
 
@@ -12,5 +12,5 @@ interface CSSStyleDeclaration {
     [CEReactions] undefined setProperty(CSSOMString property, [LegacyNullToEmptyString] CSSOMString value, optional [LegacyNullToEmptyString] CSSOMString priority = "");
     [CEReactions] CSSOMString removeProperty(CSSOMString property);
 
-    [DirectGetter] readonly attribute CSSRule? parentRule;
+    readonly attribute CSSRule? parentRule;
 };

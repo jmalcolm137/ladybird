@@ -106,14 +106,13 @@ static void call_pause_callback(void* context, JSVM*, JSDebuggerPauseInfo const*
     pause_callback.function()(pause_info_from_abi(*pause_info));
 }
 
-void Debugger::set_pause_callback(Function<void(PauseInfo const&)> callback)
+void Debugger::set_pause_callback(GC::Ptr<PauseCallback> callback)
 {
     if (!callback) {
         js_debugger_set_pause_callback(vm_to_abi(vm()), nullptr, nullptr);
         return;
     }
-    auto pause_callback = PauseCallback::create(vm().heap(), move(callback));
-    js_debugger_set_pause_callback(vm_to_abi(vm()), call_pause_callback, static_cast<GC::Cell*>(pause_callback.ptr()));
+    js_debugger_set_pause_callback(vm_to_abi(vm()), call_pause_callback, static_cast<GC::Cell*>(callback.ptr()));
 }
 
 void Debugger::continue_execution(ResumeMode resume_mode)
@@ -134,7 +133,7 @@ bool Debugger::is_paused() const
 static void append_frame_binding(void* context, JSDebuggerFrameBinding const* binding)
 {
     VERIFY(binding);
-    auto& bindings = *static_cast<GC::ConservativeVector<Debugger::FrameBinding>*>(context);
+    auto& bindings = *static_cast<GC::RootVector<Debugger::FrameBinding>*>(context);
     bindings.append({
         .name = Utf16FlyString::from_utf16(utf16_view_from_abi(binding->name)),
         .value = value_from_abi(binding->value),
@@ -142,9 +141,9 @@ static void append_frame_binding(void* context, JSDebuggerFrameBinding const* bi
     });
 }
 
-GC::ConservativeVector<Debugger::FrameBinding> Debugger::bindings_for_frame(ExecutionContext const& execution_context) const
+GC::RootVector<Debugger::FrameBinding> Debugger::bindings_for_frame(ExecutionContext const& execution_context) const
 {
-    GC::ConservativeVector<FrameBinding> bindings;
+    GC::RootVector<FrameBinding> bindings;
     JSDebuggerFrameBindingSink sink { .context = &bindings, .append = append_frame_binding };
     js_debugger_bindings_for_frame(vm_to_abi(vm()), execution_context_to_abi(execution_context), &sink);
     return bindings;

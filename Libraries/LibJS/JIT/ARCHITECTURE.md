@@ -70,8 +70,9 @@ from them alone:
 - **Memory.** `reads` and `writes`: sets of abstract locations (`ir::Locations`): `FRAME`,
   `NAMED_SLOTS` (property values), `SHAPES` (shapes and prototypes), `ELEMENTS` (element values),
   `ELEMENT_COUNTS` (element storage kind, length, capacity and the storage offset of typed arrays), `GLOBAL_BINDINGS` and `BINDINGS` (the
-  bindings of declarative environments), `ITERATORS` (the state of iterators), and `COLLECTIONS` (the
-  entries of Map, Set, WeakMap and WeakSet objects). Passes ask
+  bindings of declarative environments), `ITERATORS` (the state of iterators), `COLLECTIONS` (the
+  entries of Map, Set, WeakMap and WeakSet objects), and `INTERRUPT`, which only `CheckInterrupt`
+  writes, so that loop invariant code motion leaves it in its loop and nothing else cares. Passes ask
   one question: whether one node's writes intersect another's reads. `runs_code`: may run other
   code, which may write anything, or invalidate the compiled code. The op table below names the
   locations coarsely (Named for slots and shapes, Elements for values and counts, Any for all);
@@ -167,6 +168,7 @@ Exits: E = eager, L = lazy. Every node that can exit has a frame state. "Call" m
 | CheckNotHole | Exits at holes (the empty value). The value is input 0, refined. | E | | | cse |
 | CheckInitialized | Exits unless the binding or local variable (input 0) is initialized (not the empty value). The value is input 0, refined. | E | | | cse |
 | AssumeValid | Exits if the code was invalidated; a patchable no-op (section 5). | E | Any | | |
+| CheckInterrupt | Exits if another thread interrupted the VM (section 9, "Interrupts"). At every loop back edge; never moved. | E | | Interrupt | |
 | AssumeLegacyArgumentsUnread | After an instruction whose calls may run code reading the legacy `arguments` of inlined frames; escape analysis makes it an `AssumeValid` or removes it (section 4, "Legacy arguments"). | E | Any | | |
 | **Object memory** | | | | | |
 | LoadNamed | A named property at an offset; exits for accessors, unless the shape check of its object input ensures that it `holds_data` (the own property is writable in the checked shape, and accessor properties never are). Loads from prototypes always check: no check guards their constant object as an input, so they could move above their guards. | E unless `holds_data` | Named | | cse |
@@ -224,7 +226,7 @@ Exits: E = eager, L = lazy. Every node that can exit has a frame state. "Call" m
 | SliceArguments | `Array.prototype.slice.call(arguments, start)` of an arguments object never created. | E | Frame | | call, allocates |
 | **Calls** | | | | | |
 | CallDirect | A `Call` to its feedback's ECMAScript target, entering its code directly. | L, throws | Any | Any | call, allocates |
-| CallNative | A `Call` to its feedback's native target, in the interpreter's lightweight frame. | L, throws | Any | Any | call, allocates |
+| CallNative | A `Call` to its feedback's raw or capturing native target, in the interpreter's lightweight frame. Capturing functions enter through a thunk that reads the function from that frame. | L, throws | Any | Any | call, allocates |
 | CallNativeAccessor | The raw native getter (of a `GetById` or `GetLength`) or setter (of a `PutById`) that the checks before it established the property has, called like `CallNative` calls its target. A getter of a platform object attribute backed by a field reads the main world wrapper it would return inline where there is one, if the interpreter validated the cache entries for that. The getter's result (for the setter, its result too). | L, throws | Any | Any | call, allocates |
 | CallForwardingArguments | `f.apply(this, arguments)` with an arguments object never created. | L, throws | Any | Any | call, allocates |
 | CallSlowPath | One bytecode instruction through the interpreter's slow path, on SSA operands, with SSA outputs, with a frame state after the instruction. `saves_registers`: in a cold block, preserving every register. | L unless it saves registers; throws per opcode | Any | Any | call unless it saves registers; allocates |
@@ -410,12 +412,13 @@ unreachable. Each one keeps the graph valid (`passes/verify.rs`), and IR tests i
 | Global value numbering | Again, for the nodes that check elimination and simplification made the same. |
 | Loop invariant code motion | Gives loops entered from several blocks a merged preheader, then moves effect-free nodes with inputs from outside the loop to it (but calls in cold blocks); nodes that may exit too, exiting to the loop header, and not where that kind of exit was taken there before. Those from blocks that not every iteration runs, but for cold ones, move speculatively: they exit with `Hoisted`, and stay in the loop where such an exit was taken there before. |
 | Bounds check elimination | Bounds checks against constant counts go away where the index is known to be in range: induction variables of loops whose back edge compares the grown counter with a constant bound, merges of values from outside a loop, and int32 arithmetic on them that cannot overflow. The counter an on-stack replacement entry brings is checked against the bound once where it enters, unless such a check exited there before. With the same ranges, `((x << k) + c) >> k` becomes `x + (c >> k)` where nothing overflows and `c` is a multiple of 2^k. Int32 additions, subtractions and multiplications become `Int32WrappingBinary` where the ranges of their operands keep the result an int32 (and not -0), with operands also bounded by the masks and shifts of any int32, and by the dominating bounds checks and in-bounds branches of indices. |
+| Interrupt check elimination | Small innermost loops that count towards an end lose their `CheckInterrupt`, if they run under 5000 times or a loop around them keeps its check (section 9, "Interrupts"). |
 | Exit unboxing | Frame states take the unboxed value of an int32, float64 or bool boxing that only frame states use, so that exits box it instead of the fast path. |
 | Dead code elimination | Removes nodes without uses and without effects; frame states count as uses. Branches whose edges lead to the same place doing the same thing become jumps. |
 | Escape analysis | Allocations that do not escape become their properties' SSA values; frame states refer to `VirtualObject`s. `AssumeLegacyArgumentsUnread` nodes after calls whose frame states have virtual objects among legacy arguments become `AssumeValid` nodes; the others go away. |
 | Dead code elimination | Again, for what escape analysis left unused. |
 | Branch fusion | A branch on a single-use comparison (int32, float64 or tagged) compares itself, after a block that only branches on a phi of booleans hands the branch to its predecessors. |
-| Refinement removal | Every use of a refined value becomes a use of the value itself; `Refine` nodes go away and checks lose their values; value numbering then merges what differed only in refinements (section 3.2). |
+| Refinement removal | Every use of a refined value becomes a use of the value itself; `Refine` nodes go away and checks lose their values; value numbering then merges what differed only in refinements (section 3.2), and dead code elimination removes what only the merged checks' frame states kept alive. |
 | Frame initialization | Moves `InitializeFrame` to the first node that observes the frame's slots on each path, and puts `PublishFrame` before nodes that only need the frame visible (allocations, calls in inlined callees) where it may not be yet. |
 | Frame state cleanup | Drops the frame states no node uses. |
 | Cold block layout | Moves the cold blocks after all others. |
@@ -429,6 +432,31 @@ predecessor, cold blocks, the verifier.
 
 To be written: per-op lowering, slow path calling conventions and the operand record, the call
 stub, cache probes, the allocation contract, the entry and exit stubs.
+
+### 8.1 The calling convention of JIT code
+
+JIT code uses the System V calling convention on every x86-64 target and AAPCS64 on AArch64, which
+keeps code generation the same across operating systems. Windows x86-64 is the one target where
+that is not what the platform uses, so everything that crosses into or out of JIT code says so
+explicitly:
+
+- Native code enters JIT code through `extern "sysv64"` function pointers (`JitEntry`,
+  `EntryTrampoline`). The compiler then treats RSI, RDI and XMM6-15, which are callee-saved on
+  Windows only, as clobbered by the call, and takes two-register results where System V returns
+  them.
+- Every function JIT code calls has the `#[jit_abi]` attribute, which makes it `extern "sysv64"` on
+  Windows x86-64 and leaves it `extern "C"` elsewhere. Taking the address of a function erases its
+  calling convention, so JIT code gets the addresses of these functions from
+  `jit_function_address!`, which does not build for a function that lacks the attribute.
+- The interpreter calls the runtime functions in `interpreter::runtime_functions` with the Win64
+  convention on Windows, so `runtime_function_addresses()` gives JIT code System V forwarders to
+  them there.
+- Windows commits a thread's stack as code touches its guard pages, so JIT code that moves the
+  stack pointer goes through `emit_prologue()` or `allocate_stack()`, which touch the pages on the
+  way down (with the stack probes in `asm::x86_64`, which the Wasm JIT shares). Code that moves it
+  any other way can skip the guard pages and fault. Compiled functions check the native stack limit
+  before they touch their frames, with `emit_prologue_unprobed()` and `probe_frame()`, so that a
+  frame that does not fit makes the code exit instead of touching past the end of the stack.
 
 ## 9. Speculation and exits
 
@@ -468,6 +496,32 @@ the exit out of the sites they avoid once the cache has more (`Executable::jit_e
 since the interpreter added the shapes the code did not know. Each such exit needs a larger cache,
 and caches stop growing once megamorphic, so this ends.
 
+**Interrupts.** Another thread can stop script on a VM (`Vm::request_interrupt()`). It cannot patch
+compiled code the VM's thread is running, so it raises `Vm::jit_native_stack_limit` above every
+stack pointer. Every entry of compiled code and every call out of it then takes the path it takes
+when the stack is nearly exhausted, to the interpreter, at no cost to running code, since those
+paths compare with the limit anyway. A `CheckInterrupt` right before each loop back edge compares
+the same limit, for code that never calls, and exits to the back edge. The interrupt also made
+every dispatch table entry of the VM the fallback handler, so the interpreter does not run the
+back edge: it unwinds (`Vm::handle_exception()` catches nothing on an interrupted VM), and the frame
+runs no further script.
+
+A `CheckInterrupt` also exits where the stack really got that deep, which only a frame that entered
+compiled code below the limit does; the interpreter then continues the frame, like after any exit.
+The exit counts as nothing learned, and not towards discarding the code.
+
+The check is two instructions, which costs a loop of a few instructions up to 18% of them. So
+interrupt check elimination removes it from small innermost loops without calls that count: a
+branch on every iteration tests an int32 that changes by a constant on every back edge against a
+bound in that direction. A loop whose constant start and bound say it runs under 5000 times (V8's
+bound for the same thing) goes wherever it is. Any other counting loop ends within 2^32 iterations,
+like a builtin that goes through a huge array, and only goes where it has a loop around it: an edge
+path from its exits back to its header, whose back edge keeps a check. An interrupt can thus take as
+long as one such loop takes to finish, up to seconds for one of 2^31 iterations, but only in a loop
+around it. An on-stack replacement entry into an inner loop keeps the outer one from being a natural
+loop, which is why this follows edges. Loops with an edge to a block before them, like a `continue`
+of the loop around them, keep their check, as that may be the only one of the loop around them.
+
 To be written: exit reasons, recompiles.
 
 ## 10. The snapshot and the caches
@@ -497,7 +551,7 @@ How to build without the JIT, and how to turn it off and tune it at run time.
 ### 13.1 Building without the JIT
 
 The `ENABLE_JS_JIT` CMake option builds the JIT. It is on by default on x86-64 and AArch64 Linux and
-macOS, the platforms the JIT generates code for, and off elsewhere, Windows included. To build
+macOS and on x86-64 Windows, the platforms the JIT generates code for, and off elsewhere. To build
 without it:
 
 ```bash
@@ -516,8 +570,8 @@ JIT.
 
 Builds with the JIT run it unless the `LIBJS_JIT` environment variable says otherwise. LibJS reads
 it whenever it creates a VM, in every process that runs JavaScript: `js`, `test-js`,
-`test262-runner`, and the browser's WebContent and WebWorker processes, to which the browser passes
-on every `LIBJS_` variable.
+`test262-runner`, and the browser's WebContent processes, to which the browser passes on every
+`LIBJS_` variable. Each worker on a thread of a WebContent process has a VM of its own.
 
 `LIBJS_JIT` holds comma-separated options, applied left to right from the defaults. A value with an
 unknown option, or with an option written wrong, stops the process with a message that says why.

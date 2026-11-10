@@ -10,7 +10,7 @@ use crate::css::css_enums::{
     backface_visibility, content_visibility, isolation, line_style, mix_blend_mode, outline_style, overflow,
     positioning, transform_style,
 };
-use crate::css::css_pixels::{CssPixelRect, CssPixels};
+use crate::css::css_pixels::CssPixels;
 use crate::css::css_string::CssString;
 use crate::css::property_metadata::property_name;
 use crate::css::serialize::{StringUnits, with_fly_string_units};
@@ -83,14 +83,14 @@ fn fly_string_equals_ascii(string: &CssString, expected: &[u8]) -> bool {
 }
 
 fn will_change_has_any_property(style: ComputedValuesView<'_>, names: &[&[u8]]) -> bool {
-    let hints = style.misc_reset().implicit_will_change.as_slice();
+    let hints = style.misc_interaction().implicit_will_change.as_slice();
     if hints
         .iter()
         .any(|&property| names.contains(&property_name(property).as_bytes()))
     {
         return true;
     }
-    let Some(value) = handle_value(&style.misc_reset().will_change) else {
+    let Some(value) = handle_value(&style.misc_interaction().will_change) else {
         return false;
     };
     let StyleValueData::ValueList { values, .. } = value else {
@@ -172,7 +172,7 @@ pub(crate) fn clip_path_has_value(mask: &MaskValues) -> bool {
 }
 
 fn view_transition_name_has_value(style: ComputedValuesView<'_>) -> bool {
-    handle_value(&style.misc_reset().view_transition_name)
+    handle_value(&style.misc_interaction().view_transition_name)
         .is_some_and(|value| matches!(value, StyleValueData::CustomIdent { .. }))
 }
 
@@ -216,6 +216,20 @@ pub(crate) fn has_paint_containment(arena: &impl PaintRead, node: NodeSlotId, st
 
 pub(crate) fn kind_is_svg_element_box(kind: NodeKind) -> bool {
     node_facts::kind_is_svg_box(kind) || matches!(kind, NodeKind::SVGSVGBox | NodeKind::SVGForeignObjectBox)
+}
+
+/// The document element's box among `parent`'s children, looking through anonymous wrappers.
+pub(crate) fn document_element_box_under(arena: &impl PaintRead, parent: NodeSlotId) -> Option<NodeSlotId> {
+    arena.children(parent).find_map(|child| {
+        let flags = arena.node_flags_if_live(child);
+        if flags & NodeFlag::IsDocumentElement as u32 != 0 {
+            return Some(child);
+        }
+        if flags & NodeFlag::Anonymous as u32 != 0 {
+            return document_element_box_under(arena, child);
+        }
+        None
+    })
 }
 
 pub(crate) fn node_is_root_element(arena: &impl PaintRead, node: NodeSlotId) -> bool {
@@ -298,7 +312,7 @@ fn style_establishes_fixed_positioning_containing_block(
 
 pub(crate) fn inline_establishes_absolute_position_containing_block(style: ComputedValuesView<'_>) -> bool {
     let effects = style.effects();
-    style.box_values().position != positioning::STATIC
+    style.position() != positioning::STATIC
         || filter_has_filters(&effects.filter)
         || filter_has_filters(&effects.backdrop_filter)
         || will_change_has_any_property(style, &[b"position", b"filter", b"backdrop-filter"])
@@ -324,7 +338,7 @@ pub(crate) fn establishes_positioning_containing_blocks(arena: &impl PaintRead, 
         return (true, true);
     }
 
-    if style.box_values().position != positioning::STATIC || will_change_has_property(style, b"position") {
+    if style.position() != positioning::STATIC || will_change_has_property(style, b"position") {
         return (true, false);
     }
 
@@ -423,11 +437,10 @@ fn used_transform_style_is_preserve_3d(arena: &impl PaintRead, node: NodeSlotId)
         return false;
     }
     let effects = style.effects();
-    let box_values = style.box_values();
     let mask_values = style.mask();
     let grouping_overflow = |value: u8| value != overflow::VISIBLE && value != overflow::CLIP;
-    let has_transform_style_grouping_property = grouping_overflow(box_values.overflow_x)
-        || grouping_overflow(box_values.overflow_y)
+    let has_transform_style_grouping_property = grouping_overflow(style.overflow_x())
+        || grouping_overflow(style.overflow_y())
         || effects.opacity < 1.0
         || filter_has_filters(&effects.filter)
         || effects.clip_is_rect
@@ -500,7 +513,7 @@ pub(crate) fn auto_outline_width() -> CssPixels {
 }
 
 pub(crate) fn outline_geometry(style: ComputedValuesView<'_>) -> Option<OutlineGeometry> {
-    let misc = style.misc_reset();
+    let misc = style.misc_layout();
     let (line_style, width) = if misc.outline_style == outline_style::AUTO {
         (line_style::SOLID, auto_outline_width())
     } else {
@@ -530,7 +543,7 @@ pub(crate) fn outline_data(
     auto_outline_color: u32,
 ) -> Option<OutlineData> {
     let style = arena.node_style_if_live(node)?;
-    let is_auto = style.misc_reset().outline_style == outline_style::AUTO;
+    let is_auto = style.misc_layout().outline_style == outline_style::AUTO;
     if is_auto && !window_is_focused() {
         return None;
     }
@@ -538,7 +551,7 @@ pub(crate) fn outline_data(
     let color = if is_auto {
         auto_outline_color
     } else {
-        style.misc_reset().outline_color
+        style.outline_color()
     };
     if color >> 24 == 0 {
         return None;
@@ -553,7 +566,7 @@ pub(crate) fn outline_data(
 pub(crate) fn outline_offset(arena: &impl PaintRead, node: NodeSlotId) -> CssPixels {
     arena
         .node_style_if_live(node)
-        .map_or(CssPixels::from_raw(0), |style| style.misc_reset().outline_offset)
+        .map_or(CssPixels::from_raw(0), |style| style.misc_layout().outline_offset)
 }
 
 pub(crate) fn is_text_decoration_propagation_boundary(arena: &impl PaintRead, node: NodeSlotId) -> bool {
@@ -606,58 +619,11 @@ pub(crate) fn is_fixed_position(arena: &impl PaintRead, node: NodeSlotId) -> boo
 }
 
 pub(crate) fn is_sticky_position(style: ComputedValuesView<'_>) -> bool {
-    style.box_values().position == positioning::STICKY
+    style.position() == positioning::STICKY
 }
 
 pub(crate) fn is_floating(arena: &impl PaintRead, node: NodeSlotId) -> bool {
     arena.node(node).is_some_and(PaintRow::is_floating)
-}
-
-pub(crate) fn is_invisible_for_line_clamp(arena: &impl PaintRead, node: NodeSlotId) -> bool {
-    arena.with_committed_fragment_link(node, |link| link.is_some_and(|link| link.is_invisible_for_line_clamp))
-}
-
-pub(crate) fn has_line_clamp_point(arena: &impl PaintRead, node: NodeSlotId) -> bool {
-    arena.with_committed_fragment_link(node, |link| link.is_some_and(|link| link.fragment.has_line_clamp_point))
-}
-
-pub(crate) fn clamped_content_is_scrollable_overflow(arena: &impl PaintRead, container: NodeSlotId) -> bool {
-    arena.with_committed_fragment_link(container, |link| {
-        link.is_some_and(|link| link.fragment.clamped_content_is_scrollable_overflow)
-    })
-}
-
-fn line_clamp_container(arena: &impl PaintRead, start: Option<NodeSlotId>) -> Option<NodeSlotId> {
-    std::iter::successors(start, |node| arena.node_parent_if_live(*node))
-        .find(|node| has_line_clamp_point(arena, *node))
-}
-
-pub(crate) fn is_excluded_from_scrollable_overflow_by_line_clamp(arena: &impl PaintRead, node: NodeSlotId) -> bool {
-    is_invisible_for_line_clamp(arena, node)
-        && !line_clamp_container(arena, arena.node_parent_if_live(node))
-            .is_some_and(|container| clamped_content_is_scrollable_overflow(arena, container))
-}
-pub(crate) fn line_clamp_clip_rect(arena: &impl PaintRead, container: NodeSlotId) -> CssPixelRect {
-    let style = arena
-        .node_style_if_live(container)
-        .expect("line clamp container must be live");
-    let content_rect = crate::painting::paintable_geometry::absolute_rect(arena, container);
-    let extent = CssPixels::from_integer((crate::css::css_pixels::MAX_INTEGER_VALUE / 4) as i64);
-    if style.writing_mode() == crate::css::css_enums::writing_mode::HORIZONTAL_TB {
-        CssPixelRect::new(-extent, -extent, extent * 2, content_rect.bottom() + extent)
-    } else if style.block_axis_is_reverse() {
-        CssPixelRect::new(content_rect.x, -extent, extent - content_rect.x, extent * 2)
-    } else {
-        CssPixelRect::new(-extent, -extent, content_rect.right() + extent, extent * 2)
-    }
-}
-
-pub(crate) fn line_clamp_float_clip_rect(arena: &impl PaintRead, node: NodeSlotId) -> Option<CssPixelRect> {
-    if is_invisible_for_line_clamp(arena, node) {
-        return Some(CssPixelRect::default());
-    }
-    let container = line_clamp_container(arena, Some(node))?;
-    Some(line_clamp_clip_rect(arena, container))
 }
 
 pub(crate) fn is_inline(arena: &impl PaintRead, node: NodeSlotId) -> bool {
@@ -707,7 +673,7 @@ pub(crate) fn establishes_stacking_context(arena: &impl PaintRead, node: NodeSlo
     let box_values = style.box_values();
     let will_change = |name: &[u8]| will_change_has_property(style, name);
 
-    let position = box_values.position;
+    let position = style.position();
     let has_z_index = box_values.has_z_index || will_change(b"z-index");
 
     if (position == positioning::ABSOLUTE || position == positioning::RELATIVE) && has_z_index {

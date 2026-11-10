@@ -43,12 +43,6 @@ enum class UserSelect : u8;
 
 }
 
-namespace Web::Layout {
-
-enum class LayoutUpdatePropagation : u8;
-
-}
-
 namespace Web::Layout::RustFFI {
 
 struct FfiBoxMarks;
@@ -120,6 +114,7 @@ enum class SetNeedsLayoutReason {
     X(DetailsElementOpenedOrClosed)                       \
     X(HTMLImageElementUpdateTheImageData)                 \
     X(HTMLInputElementSrcAttribute)                       \
+    X(HTMLInputElementTypeAttribute)                      \
     X(HTMLObjectElementUpdateLayoutAndChildObjects)       \
     X(KeyframeEffect)                                     \
     X(LanguageChangeUnderCasingTextTransform)             \
@@ -128,6 +123,7 @@ enum class SetNeedsLayoutReason {
     X(NodeInsertBefore)                                   \
     X(NodeInsertBeforeWithDisplayContents)                \
     X(NodeRemove)                                         \
+    X(TableCellSpanAttribute)                             \
     X(NodeSetTextContent)                                 \
     X(None)                                               \
     X(PseudoElementBoxEscapedRebuildRoot)                 \
@@ -137,7 +133,9 @@ enum class SetNeedsLayoutReason {
     X(SVGResourceContentChange)                           \
     X(SVGResourceElementRemoved)                          \
     X(SVGResourceReferenceChange)                         \
+    X(SVGUseElementShadowTreeRebuild)                     \
     X(TopLayerMembershipChange)                           \
+    X(WhitespaceTextBoxChange)                            \
     X(WritingSuggestionChange)
 
 enum class SetNeedsLayoutTreeUpdateReason {
@@ -212,6 +210,7 @@ public:
     virtual bool is_svg_text_path_element() const { return false; }
     virtual bool is_svg_geometry_element() const { return false; }
     virtual bool is_svg_filter_element() const { return false; }
+    virtual bool is_mathml_anchor_element() const { return false; }
 
     bool in_a_document_tree() const;
 
@@ -221,6 +220,8 @@ public:
     bool is_editable() const;
     bool is_editing_host() const;
     bool is_editable_or_editing_host() const { return is_editable() || is_editing_host(); }
+    // NB: A false answer settles is_editable_or_editing_host() without asking what kind of node this is.
+    bool may_be_editable_or_editing_host() const;
     GC::Ptr<Node> editing_host();
 
     bool has_spelling_markers() const { return m_has_spelling_markers; }
@@ -413,11 +414,11 @@ public:
     Node* parent_node() { return parent(); }
     Node const* parent_node() const { return parent(); }
 
-    static constexpr size_t parent_node_offset() { return TreeNode<Node>::parent_offset<Node>(); }
-    static constexpr size_t first_child_offset() { return TreeNode<Node>::first_child_offset<Node>(); }
-    static constexpr size_t last_child_offset() { return TreeNode<Node>::last_child_offset<Node>(); }
-    static constexpr size_t previous_sibling_offset() { return TreeNode<Node>::previous_sibling_offset<Node>(); }
-    static constexpr size_t next_sibling_offset() { return TreeNode<Node>::next_sibling_offset<Node>(); }
+    static constexpr GC::MemberOffset parent_node_offset() { return TreeNode<Node>::parent_offset<Node>(); }
+    static constexpr GC::MemberOffset first_child_offset() { return TreeNode<Node>::first_child_offset<Node>(); }
+    static constexpr GC::MemberOffset last_child_offset() { return TreeNode<Node>::last_child_offset<Node>(); }
+    static constexpr GC::MemberOffset previous_sibling_offset() { return TreeNode<Node>::previous_sibling_offset<Node>(); }
+    static constexpr GC::MemberOffset next_sibling_offset() { return TreeNode<Node>::next_sibling_offset<Node>(); }
 
     GC::Ptr<Element> parent_element();
     GC::Ptr<Element const> parent_element() const;
@@ -464,6 +465,7 @@ public:
     // that only needs to know whether there is a box should ask these instead of reaching for the box. The layout
     // node arena writes both as it changes the boxes they describe, so asking reads the node, not the arena.
     [[nodiscard]] bool has_layout_box() const { return m_has_layout_box; }
+    [[nodiscard]] bool may_have_layout_box() const;
     [[nodiscard]] bool is_rendered() const { return m_has_committed_box; }
     void set_box_presence(Badge<Layout::NodeArena>, bool has_layout_box, bool has_committed_box)
     {
@@ -483,7 +485,6 @@ public:
     // The facts about this node that a box built for it paints (inertness, editability, and so on) may have changed.
     void publish_dom_paint_facts();
     void set_needs_layout_update(SetNeedsLayoutReason);
-    void set_needs_layout_update(SetNeedsLayoutReason, Layout::LayoutUpdatePropagation);
 
     // Whether the node's layout subtree can leave the parent's box without restructuring the
     // anonymous boxes around it, so the parent's subtree keeps its layout tree.
@@ -517,12 +518,6 @@ public:
     [[nodiscard]] u32 associated_animation_count_in_subtree() const { return m_associated_animation_count_in_subtree; }
     void change_associated_animation_count_in_subtree(i32 delta);
 
-    [[nodiscard]] u32 children_explicitly_inherited_non_inherited_style_groups() const { return m_children_explicitly_inherited_non_inherited_style_groups; }
-    void add_children_explicitly_inherited_non_inherited_style_groups(u32 style_groups);
-    // Tell the style engine of this node's mark, which it keeps for the node's style node.
-    void publish_children_explicitly_inherit_mark();
-
-    void record_style_environment_change();
     CSS::StyleScope& style_scope();
     CSS::StyleScope const& style_scope() const { return const_cast<Node*>(this)->style_scope(); }
 
@@ -555,8 +550,6 @@ public:
     bool is_shadow_including_inclusive_ancestor_of(Node const&) const;
 
     [[nodiscard]] UniqueNodeID unique_id() const;
-    // The node's unique id, without giving it one if it has none.
-    [[nodiscard]] Optional<UniqueNodeID> unique_id_if_assigned() const;
     static Node* from_unique_id(UniqueNodeID);
 
     Optional<String> webdriver_node_id() const;
@@ -674,8 +667,8 @@ protected:
         // "Nodes have a strong reference to registered observers in their registered observer list." https://dom.spec.whatwg.org/#garbage-collection
         OwnPtr<Vector<GC::Ref<RegisteredObserver>>> registered_observer_list;
 
-        GC::Ptr<NodeList> child_nodes;
-        GC::Ptr<HTMLCollection> children;
+        GC::Member<NodeList> child_nodes;
+        GC::Member<HTMLCollection> children;
         OwnPtr<HTMLCollectionCacheRegistration::List> html_collections_with_valid_caches;
 
         // The collections getElementsByTagName() returned, which it may return again for the same argument while the
@@ -706,8 +699,8 @@ protected:
     virtual void finalize() override;
     virtual size_t external_memory_size() const override;
 
-    GC::Ptr<Document> m_document;
-    GC::Ptr<Node> m_root;
+    GC::Member<Document> m_document;
+    GC::Member<Node> m_root;
     NodeType m_type { NodeType::INVALID };
     bool m_has_layout_box { false };
     bool m_has_committed_box { false };
@@ -718,7 +711,6 @@ protected:
     };
     [[nodiscard]] u8 layout_tree_update_reuse_reasons() const;
 
-    u32 m_children_explicitly_inherited_non_inherited_style_groups { 0 };
     u32 m_associated_animation_count_in_subtree { 0 };
     bool m_in_editable_subtree { false };
     bool m_is_connected { false };

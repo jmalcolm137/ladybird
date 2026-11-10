@@ -27,6 +27,8 @@ use crate::runtime::abstract_operations::{
 };
 use crate::runtime::array::Array;
 use crate::runtime::bound_function::BoundFunction;
+use crate::runtime::class_construction::ClassHeritage;
+use crate::runtime::class_construction::class_proto_parent;
 use crate::runtime::class_construction::construct_class;
 use crate::runtime::class_field_definition::ClassElementName;
 use crate::runtime::completion::{Must, ThrowCompletionOr};
@@ -43,7 +45,7 @@ use crate::runtime::native_javascript_backed_function::NativeJavaScriptBackedFun
 use crate::runtime::object::{Object, StackFrameInfo};
 use crate::runtime::property_attributes::DEFAULT_ATTRIBUTES;
 use crate::runtime::property_key::PropertyKey;
-use crate::runtime::shared_function_instance_data::{ConstructorKind, FunctionKind};
+use crate::runtime::shared_function_instance_data::{ClassFieldInitializerName, ConstructorKind, FunctionKind};
 use crate::utf16::Utf16Display;
 
 /// Op::CallType: how a call instruction calls its callee.
@@ -74,7 +76,7 @@ fn caller_mode_of(strict: Strict) -> CallerMode {
 
 /// Executable::get_string().
 fn get_string(vm: &Vm, index: StringTableIndex) -> Utf16FlyString {
-    vm.current_executable().string_table[index.0 as usize].clone()
+    vm.current_executable().string_table()[index.0 as usize].clone()
 }
 
 /// Value::as_array_exotic_object(): the arguments the bytecode collected into an Array for a call.
@@ -128,13 +130,17 @@ fn internal_construct(
 }
 
 /// What FunctionObject::get_stack_frame_info() reports for a call of `function` with `argument_count` arguments.
-fn stack_frame_info_for_call(vm: &Vm, function: Gc<FunctionObject>, argument_count: u32) -> StackFrameInfo {
+fn stack_frame_info_for_call(
+    vm: &Vm,
+    function: Gc<FunctionObject>,
+    argument_count: u32,
+) -> ThrowCompletionOr<StackFrameInfo> {
     let mut stack_frame_info = StackFrameInfo {
         argument_count,
         ..Default::default()
     };
-    function.get_stack_frame_info(vm, &mut stack_frame_info);
-    stack_frame_info
+    function.get_stack_frame_info(vm, &mut stack_frame_info)?;
+    Ok(stack_frame_info)
 }
 
 fn argument_count_of(count: usize) -> u32 {
@@ -156,6 +162,29 @@ fn element_key_operands(instruction: &op::NewClass) -> &[OptionalOperand] {
     instruction.element_keys()
 }
 
+/// The [[ClassFieldInitializerName]] of the running field initializer, whose field has a computed key.
+pub fn get_class_field_initializer_name(
+    vm: &Vm,
+    pc: u32,
+    values: &mut op::GetClassFieldInitializerNameValues,
+) -> SlowPathControl {
+    let function = running_execution_context(vm)
+        .function
+        .get()
+        .and_then(as_ecmascript_function_object)
+        .expect("a field initializer is an ECMAScript function");
+    let ClassFieldInitializerName::PropertyKey(name) = function.class_field_initializer_name() else {
+        unreachable!("a field with a computed key is named by a property key");
+    };
+    values.dst = name.to_value(vm);
+    SlowPathControl::continue_at(pc + op::GetClassFieldInitializerName::LENGTH)
+}
+
+pub fn get_class_proto_parent(vm: &Vm, pc: u32, values: &mut op::GetClassProtoParentValues) -> SlowPathControl {
+    values.dst = asm_try!(vm, pc, class_proto_parent(vm, values.super_class));
+    SlowPathControl::continue_at(pc + op::GetClassProtoParent::LENGTH)
+}
+
 pub fn new_class(
     vm: &Vm,
     pc: u32,
@@ -163,9 +192,13 @@ pub fn new_class(
     values: &mut op::NewClassValues,
     element_keys: &mut [Value],
 ) -> SlowPathControl {
-    let mut super_class = Value::UNDEFINED;
+    let mut heritage = None;
     if instruction.super_class.get().is_some() {
-        super_class = values.super_class;
+        assert!(instruction.proto_parent.get().is_some());
+        heritage = Some(ClassHeritage {
+            super_class: values.super_class,
+            proto_parent: values.proto_parent,
+        });
     }
     // NB: The element keys stay in the operand record the interpreter passed, which lives on its stack, so the keys
     //     of elements without one become undefined in place.
@@ -186,10 +219,12 @@ pub fn new_class(
     if !blueprint.has_name
         && let Some(lhs_name) = instruction.lhs_name.get()
     {
-        class_name = executable.get_identifier(lhs_name).clone();
+        class_name = ClassElementName::PropertyKey(PropertyKey::from(executable.get_identifier(lhs_name).clone()));
+    } else if !blueprint.has_name && instruction.computed_name.get().is_some() {
+        class_name = ClassElementName::PropertyKey(asm_try!(vm, pc, values.computed_name.to_property_key(vm)));
     } else {
-        class_name = blueprint.name.clone();
-        binding_name = Some(class_name.clone());
+        class_name = ClassElementName::PropertyKey(PropertyKey::from(blueprint.name.clone()));
+        binding_name = Some(blueprint.name.clone());
     }
 
     let retval = asm_try!(
@@ -201,7 +236,7 @@ pub fn new_class(
             executable,
             Some(class_environment),
             outer_environment,
-            super_class,
+            heritage,
             element_keys,
             binding_name.as_ref(),
             &class_name,
@@ -226,6 +261,14 @@ fn throw_type_error_for_asm_callee(
         );
     }
 
+    let program_counter = vm.running_execution_context_ref().program_counter.get();
+    if let Some(text) = vm.current_executable().callee_text_at(program_counter) {
+        return vm.throw_completion(
+            ErrorKind::TypeError,
+            ErrorType::IsNotAEvaluatedFrom,
+            &[&callee, &callee_type, &text],
+        );
+    }
     vm.throw_completion(ErrorKind::TypeError, ErrorType::IsNotA, &[&callee, &callee_type])
 }
 
@@ -290,7 +333,7 @@ pub(crate) fn execute_asm_call(
     let function = callee.as_function();
 
     let argument_count = argument_count_of(arguments.len());
-    let stack_frame_info = stack_frame_info_for_call(vm, function, argument_count);
+    let stack_frame_info = stack_frame_info_for_call(vm, function, argument_count)?;
 
     let stack = vm.interpreter_stack();
     let stack_mark = stack.top.get();
@@ -405,7 +448,7 @@ fn call_direct_eval_impl(
     let function = callee.as_function();
 
     let argument_count = argument_count_of(arguments.len());
-    let stack_frame_info = stack_frame_info_for_call(vm, function, argument_count);
+    let stack_frame_info = stack_frame_info_for_call(vm, function, argument_count)?;
 
     let stack = vm.interpreter_stack();
     let stack_mark = stack.top.get();
@@ -477,7 +520,7 @@ fn call_with_argument_array_impl(
     let argument_array = as_array_exotic_object(arguments);
     let argument_array_length = argument_array.indexed_array_like_size();
 
-    let stack_frame_info = stack_frame_info_for_call(vm, function, argument_array_length);
+    let stack_frame_info = stack_frame_info_for_call(vm, function, argument_array_length)?;
 
     let stack = vm.interpreter_stack();
     let stack_mark = stack.top.get();
@@ -599,7 +642,12 @@ pub fn call_construct(
             get_prototype_from_constructor(vm, function.as_function_object_gc(), Intrinsics::object_prototype)
         );
         // NB: OrdinaryObjectCreate(prototype), with room for the properties the constructor is known to add.
-        let this_object = Object::create_for_construct(vm, prototype, function.shared_data());
+        let this_object = Object::create_for_construct(
+            vm,
+            vm.current_realm().expect("a construction runs in a realm"),
+            prototype,
+            function.shared_data(),
+        );
         let Some(context) = vm.push_inline_frame(
             function,
             function.inline_call_executable(),
@@ -690,7 +738,7 @@ pub fn super_call_with_argument_array(
     };
     let argument_array_length = u32::try_from(argument_array_length).expect("the argument count fits in u32");
 
-    let stack_frame_info = stack_frame_info_for_call(vm, function, argument_array_length);
+    let stack_frame_info = asm_try!(vm, pc, stack_frame_info_for_call(vm, function, argument_array_length));
 
     let stack = vm.interpreter_stack();
     let stack_mark = stack.top.get();
@@ -956,19 +1004,26 @@ pub fn new_function(
         FunctionKind::AsyncGenerator => realm.async_generator_function_prototype(),
     };
 
-    let function = EcmascriptFunctionObject::create_from_function_data_with_prototype(
-        vm,
-        realm,
-        shared_data,
-        vm.lexical_environment(),
-        running_execution_context(vm).private_environment.get(),
-        prototype,
-    );
-
-    if instruction.home_object.get().is_some() {
-        let home_object_value = values.home_object;
-        function.make_method(home_object_value.as_object());
-    }
+    let function = if instruction.home_object.get().is_some() {
+        EcmascriptFunctionObject::create_method(
+            vm,
+            realm,
+            shared_data,
+            vm.lexical_environment(),
+            running_execution_context(vm).private_environment.get(),
+            values.home_object.as_object(),
+            prototype,
+        )
+    } else {
+        EcmascriptFunctionObject::create_from_function_data_with_prototype(
+            vm,
+            realm,
+            shared_data,
+            vm.lexical_environment(),
+            running_execution_context(vm).private_environment.get(),
+            prototype,
+        )
+    };
 
     values.dst = Value::from_object(function);
     SlowPathControl::continue_at(pc + op::NewFunction::LENGTH)

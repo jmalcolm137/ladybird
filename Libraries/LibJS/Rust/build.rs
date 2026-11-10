@@ -98,24 +98,8 @@ fn target() -> Target {
     }
 }
 
-/// Mirrors GC::HEAP_REGION_SIZE in Libraries/LibGC/HeapRegion.h, whose choice depends on the target and on whether
-/// LibGC is built with ThreadSanitizer, which Rust's own cfg cannot see.
-fn heap_region_size(target: &Target, thread_sanitizer: bool) -> u64 {
-    let os = env::var("CARGO_CFG_TARGET_OS").expect("CARGO_CFG_TARGET_OS");
-    let address_space_is_small = matches!(target.architecture, flapc::Architecture::Aarch64) && os != "macos";
-    if address_space_is_small || thread_sanitizer {
-        128 * GIB
-    } else {
-        4 * TIB
-    }
-}
-
-/// The 64-bit FNV-1a hash of `bytes`, which stays the same from build to build, unlike std's hashers.
-fn fnv1a_64(bytes: &[u8]) -> u64 {
-    bytes.iter().fold(0xcbf2_9ce4_8422_2325, |hash, &byte| {
-        (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3)
-    })
-}
+/// Mirrors GC::HEAP_REGION_SIZE in Libraries/LibGC/HeapRegion.h.
+const HEAP_REGION_SIZE: u64 = 32 * GIB;
 
 fn main() {
     let manifest_directory = PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
@@ -134,24 +118,10 @@ fn main() {
 
     instructions::generate(&interpreter_source, &output_directory).expect("generate the frontend's instruction types");
 
-    // NB: Bytecode cache blobs hold encoded instructions, so a blob is only good for the instruction set it was encoded
-    //     with. The generated instruction types spell out every opcode, in the order that numbers them, and every
-    //     operand, so their fingerprint changes with any change to the instructions in interpreter.flap.
-    let instruction_types =
-        fs::read(output_directory.join("instruction_generated.rs")).expect("read instruction_generated.rs");
-    write_if_changed(
-        &output_directory.join("instruction_set_fingerprint.rs"),
-        &format!(
-            "pub(crate) const INSTRUCTION_SET_FINGERPRINT: u64 = {:#018x};\n",
-            fnv1a_64(&instruction_types)
-        ),
-    );
-
     let target = target();
     let address_sanitizer = env::var_os("CARGO_FEATURE_ADDRESS_SANITIZER").is_some();
-    let thread_sanitizer = env::var_os("CARGO_FEATURE_THREAD_SANITIZER").is_some();
     let configuration = layout_table::LayoutConfiguration {
-        heap_region_offset_mask: heap_region_size(&target, thread_sanitizer) - 1,
+        heap_region_offset_mask: HEAP_REGION_SIZE - 1,
         // Mirrors GC::PrimitiveStorage::default_cage_size.
         primitive_storage_cage_offset_mask: 4 * TIB - 1,
         // Instrumented frames need more room before the stack is considered exhausted.

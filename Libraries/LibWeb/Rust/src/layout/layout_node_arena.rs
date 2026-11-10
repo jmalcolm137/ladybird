@@ -11,30 +11,31 @@ use super::shell_reads::read_arena;
 use super::tree_builder::FfiLayoutTreeBuildOutcome;
 use super::tree_shape::{Chunk, PUBLISHED_ROWS_PER_CHUNK, ShapeWriter, ShapeWrites, TreeShape};
 use super::update_layout::FfiLayoutTreeBuildStats;
-use crate::cow_column::{ColumnSnapshot, CowColumn};
+use crate::cow_column::{ColumnSnapshot, CowColumn, CowVec};
+use crate::cow_map::{CowMap, CowSet};
 use crate::css::css_pixels::{CssPixelPoint, FfiCssPixelPoint};
 use crate::css::style::bridge::ElementBoxKind;
+use crate::css::style::bridge::{REBUILD_LEVEL, RELAYOUT_LEVEL};
 use crate::css::style::fast_hash::{FastMap as HashMap, FastSet as HashSet};
-use crate::css::style::flight_style_rows::{Decline, FlightStyleRow, REBUILD_LEVEL, RELAYOUT_LEVEL};
 use crate::css::style::tree::{StyleNodeID, TableSpans};
 use crate::css::style::{
     PublishedBoxFacts, PublishedTextSource, StyleEngine, TextStyleParentFacts,
     engine_sample::NeedsHost,
     layout_style::{AnonymousStyleKind, AnonymousStyleOverrides, DerivedStyleRecord, LayoutStyle},
 };
+use crate::fork_vec::ForkVec;
 use crate::layout::ComputedValuesView;
 use crate::layout::CssPixels;
 use crate::layout::node_data::{
-    AncestorFact, DomPaintFact, FfiStylePayloads, GENERATED_FOR_AFTER, GENERATED_FOR_BEFORE,
-    GENERATED_FOR_FIRST_LETTER, GENERATED_FOR_LAST_SYNTHETIC, GENERATED_FOR_MARKER, MAX_NODE_SLOT_COUNT, NodeData,
-    NodeFlag, NodeKind, NodeSlotId, StylePayloadsRef, pseudo_kind_of,
+    AncestorFact, DomPaintFact, GENERATED_FOR_AFTER, GENERATED_FOR_BEFORE, GENERATED_FOR_FIRST_LETTER,
+    GENERATED_FOR_LAST_SYNTHETIC, GENERATED_FOR_MARKER, LayoutStyleRef, MAX_NODE_SLOT_COUNT, NodeData, NodeFlag,
+    NodeKind, NodeSlotId, pseudo_kind_of,
 };
 use crate::layout::node_facts::ReplacedContentFacts;
 use crate::layout::tree_mutation::HostCalls;
 use crate::painting::paint_read::{GeometryRead, PaintRead};
 use crate::render_state::DocumentHost;
 use crate::stage::MainThread;
-use std::cell::RefCell;
 use std::ffi::c_void;
 use std::hash::Hash;
 use std::ops::{Deref, DerefMut};
@@ -42,11 +43,31 @@ use std::sync::Arc;
 
 crate::render_state::held_node_entries!();
 
+mod installed_styles;
 mod main_thread_entries;
+
+pub(crate) use installed_styles::{ElementInstall, StyledRows};
 
 pub(crate) use main_thread_entries::MainThreadFfiEntry;
 
 pub(crate) const SLOTS_PER_CHUNK: usize = 256;
+
+#[cold]
+#[inline(never)]
+#[track_caller]
+fn invalid_slot_access(id: NodeSlotId) -> ! {
+    panic!("invalid layout node arena slot ID {id:?}")
+}
+
+#[cold]
+#[inline(never)]
+#[track_caller]
+fn stale_slot_access(id: NodeSlotId, slot_generation: u8, access: &str) -> ! {
+    panic!(
+        "layout node arena {access} a stale or unused slot: {id:?} has generation {}, the slot {slot_generation}",
+        id.generation()
+    )
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct IntrinsicSizeCacheKey {
@@ -235,24 +256,29 @@ struct IntrinsicSizeCacheSlot {
 /// went stale in its memo invalidations, which the stage applies before its next run reads any.
 #[derive(Default)]
 pub(crate) struct IntrinsicSizeCaches {
-    slots: RefCell<Vec<IntrinsicSizeCacheSlot>>,
+    slots: super::pass_column::PassColumn<IntrinsicSizeCacheSlot>,
 }
 
 impl IntrinsicSizeCaches {
-    pub(crate) fn drop_entries_of_slot(&self, slot: u32) {
-        if let Some(slot) = self.slots.borrow_mut().get_mut(slot as usize) {
+    pub(super) fn cover_slots(&mut self, slot_count: usize) {
+        self.slots.cover_slots(slot_count);
+    }
+
+    pub(crate) fn drop_entries_of_slot(&mut self, slot: u32) {
+        if let Some(slot) = self.slots.row_mut(slot as usize) {
             *slot = IntrinsicSizeCacheSlot::default();
         }
     }
 
     /// Answers `answer` from the maps of `node`, where they hold what was measured for it.
     fn with_maps<R>(&self, node: NodeSlotId, answer: impl FnOnce(&IntrinsicSizeMaps) -> Option<R>) -> Option<R> {
-        let caches = self.slots.borrow();
-        let slot = caches.get(node.slot_index() as usize)?;
-        if slot.generation != node.generation() {
-            return None;
-        }
-        answer(slot.sizes.as_ref()?)
+        self.slots.with_row(node.slot_index() as usize, |slot| {
+            let slot = slot?;
+            if slot.generation != node.generation() {
+                return None;
+            }
+            answer(slot.sizes.as_ref()?)
+        })
     }
 
     pub(crate) fn max_content_block_size_cache_get(
@@ -264,19 +290,15 @@ impl IntrinsicSizeCaches {
     }
 
     fn with_maps_mut(&self, node: NodeSlotId, callback: impl FnOnce(&mut IntrinsicSizeMaps)) {
-        let index = node.slot_index() as usize;
-        let mut caches = self.slots.borrow_mut();
-        if caches.len() <= index {
-            caches.resize_with(index + 1, IntrinsicSizeCacheSlot::default);
-        }
-        let slot = &mut caches[index];
-        if slot.generation != node.generation() {
-            *slot = IntrinsicSizeCacheSlot {
-                generation: node.generation(),
-                sizes: None,
-            };
-        }
-        callback(slot.sizes.get_or_insert_with(Box::default));
+        self.slots.with_row_mut(node.slot_index() as usize, |slot| {
+            if slot.generation != node.generation() {
+                *slot = IntrinsicSizeCacheSlot {
+                    generation: node.generation(),
+                    sizes: None,
+                };
+            }
+            callback(slot.sizes.get_or_insert_with(Box::default));
+        });
     }
 
     pub(crate) fn max_content_block_size_cache_put(
@@ -337,29 +359,35 @@ impl Default for TextNodeSlot {
 /// Each text row's state, and what it publishes for the paint side. A slot is written only through
 /// a [`TextStateMut`], which republishes the slot when it drops, or by [`TextSlots::reset`], so
 /// the published column cannot fall behind the slots. The states live side by side rather than
-/// each in an allocation of its own, which keeps a copy of the slots to one allocation.
+/// each in an allocation of its own, in chunks a fork of the arena shares until either side writes
+/// one, so forking the arena does not copy every text row's state.
 #[derive(Clone, Default)]
 struct TextSlots {
-    slots: Vec<TextNodeSlot>,
-    states: Vec<TextNodeState>,
+    slots: ForkVec<TextNodeSlot>,
+    states: CowVec<TextNodeState, TEXT_STATES_PER_CHUNK>,
     /// The places in `states` no slot uses.
-    vacant_states: Vec<u32>,
+    vacant_states: ForkVec<u32>,
+    released_states: ForkVec<u32>,
     published: CowColumn<PublishedTextSlot, SLOTS_PER_CHUNK>,
 }
 
 impl TextSlots {
-    fn state(&self, id: NodeSlotId) -> Option<&TextNodeState> {
+    fn state_index(&self, id: NodeSlotId) -> Option<u32> {
         self.slots
             .get(id.slot_index() as usize)
             .filter(|slot| slot.generation == id.generation() && slot.state != TextNodeSlot::NO_STATE)
-            .map(|slot| &self.states[slot.state as usize])
+            .map(|slot| slot.state)
+    }
+
+    fn state(&self, id: NodeSlotId) -> Option<&TextNodeState> {
+        self.state_index(id).map(|state| &self.states[state as usize])
     }
 
     /// The state of `id`'s slot, for writing. A slot last used by another generation starts over.
     fn state_mut(&mut self, id: NodeSlotId) -> TextStateMut<'_> {
         let index = id.slot_index() as usize;
         if self.slots.len() <= index {
-            self.slots.resize_with(index + 1, TextNodeSlot::default);
+            self.slots.resize_with_default(index + 1);
         }
         if self.slots[index].generation != id.generation() {
             self.release_state(index);
@@ -392,6 +420,7 @@ impl TextSlots {
         if state != TextNodeSlot::NO_STATE {
             self.states[state as usize] = TextNodeState::default();
             self.vacant_states.push(state);
+            self.released_states.push(state);
         }
     }
 
@@ -450,6 +479,9 @@ impl Drop for TextStateMut<'_> {
     }
 }
 
+/// How many text states a chunk of [`TextSlots::states`] holds: a write after a fork copies this many.
+const TEXT_STATES_PER_CHUNK: usize = 64;
+
 #[derive(Clone, Default)]
 struct TextNodeState {
     source_range: Option<FfiTextSourceRange>,
@@ -473,9 +505,11 @@ pub(crate) struct RowsVersion {
     style: u64,
     /// The part of `writes` that populated or reset a paintable row.
     population: u64,
-    /// Where the paint fact tables, the image maps and the visual context tree are, which moves
-    /// when a write copies one a publication shares or replaces the tree.
-    tables: [usize; 5],
+    /// The writes to the paint fact tables and the image maps.
+    table_writes: u64,
+    /// Which copy of the visual context tree the rows are at, which moves when a write copies one a
+    /// publication shares or replaces the tree.
+    visual_context_tree: u64,
 }
 
 impl RowsVersion {
@@ -502,6 +536,9 @@ impl RowsVersion {
     }
 }
 
+/// How many slots a chunk of [`LayoutNodeArena::replaced_content_facts`] holds: a write after a fork copies this many.
+const REPLACED_CONTENT_FACTS_PER_CHUNK: usize = 128;
+
 #[derive(Clone, Default)]
 struct ReplacedContentFactsSlot {
     generation: u8,
@@ -512,12 +549,6 @@ struct ReplacedContentFactsSlot {
 struct SlotMetadata {
     generation: u8,
     occupied: bool,
-}
-
-#[derive(Clone, Copy)]
-struct ChunkAddress {
-    start: usize,
-    chunk_index: usize,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -599,31 +630,26 @@ pub struct FfiStyleRecordHostCallbacks {
 }
 
 /// Whether `a` and `b` hold equal payloads in the inherited groups, which are all an anonymous box inherits.
-fn style_payloads_equal_in_inherited_groups(a: StylePayloadsRef, b: StylePayloadsRef) -> bool {
+fn style_payloads_equal_in_inherited_groups(a: Option<LayoutStyleRef>, b: Option<LayoutStyleRef>) -> bool {
     style_payloads_equal_in_groups(a, b, |group_index| {
         group_index < crate::css::style::ENGINE_INHERITED_GROUP_COUNT
     })
 }
 
-fn style_payloads_equal_in_groups(a: StylePayloadsRef, b: StylePayloadsRef, compares: impl Fn(usize) -> bool) -> bool {
+fn style_payloads_equal_in_groups(
+    a: Option<LayoutStyleRef>,
+    b: Option<LayoutStyleRef>,
+    compares: impl Fn(usize) -> bool,
+) -> bool {
     if a == b {
         return true;
     }
-    if a.is_null() || b.is_null() {
+    let (Some(a), Some(b)) = (a, b) else {
         return false;
-    }
-    // SAFETY: A row's non-null style addresses the payload array of the record pinned for it.
-    let (a, b) = unsafe { (a.deref(), b.deref()) };
-    (0..a.groups.len()).all(|group_index| {
-        !compares(group_index)
-            || a.groups[group_index] == b.groups[group_index]
-            // SAFETY: Published style-group payloads stay live while their records do.
-            || unsafe { crate::css::computed_values::style_group_payloads_equal(
-                group_index,
-                a.groups[group_index],
-                b.groups[group_index],
-            ) }
-    })
+    };
+    // SAFETY: A row's style is that of the record pinned for it.
+    let (a, b) = unsafe { (a.view(), b.view()) };
+    crate::css::computed_values::style_groups_equal_in(a, b, compares)
 }
 
 /// The image resources a tree build owes the host for a row it stamped, which the host attaches
@@ -749,7 +775,7 @@ const BOUND_ROWS_PER_CHUNK: usize = 64;
 pub(crate) struct BoundRows {
     elements: CowColumn<NodeSlotId, BOUND_ROWS_PER_CHUNK>,
     texts: CowColumn<NodeSlotId, BOUND_ROWS_PER_CHUNK>,
-    pseudo_elements: Arc<HashMap<StyleNodeID, PseudoElementRows>>,
+    pseudo_elements: CowMap<StyleNodeID, PseudoElementRows>,
     viewport: NodeSlotId,
     /// Advanced by every write to the pseudo-element or viewport rows.
     writes: u64,
@@ -759,7 +785,7 @@ pub(crate) struct BoundRows {
 pub(crate) struct PublishedBoundRows {
     elements: ColumnSnapshot<NodeSlotId, BOUND_ROWS_PER_CHUNK>,
     texts: ColumnSnapshot<NodeSlotId, BOUND_ROWS_PER_CHUNK>,
-    pseudo_elements: Arc<HashMap<StyleNodeID, PseudoElementRows>>,
+    pseudo_elements: CowMap<StyleNodeID, PseudoElementRows>,
     viewport: NodeSlotId,
 }
 
@@ -816,17 +842,17 @@ impl BoundRows {
         let previous = self.pseudo_element_row(generator, generated_for);
         if previous != row {
             self.writes += 1;
-            let rows = Arc::make_mut(&mut self.pseudo_elements);
-            let element_rows = rows
+            let element_rows = self
+                .pseudo_elements
                 .entry(generator)
-                .or_insert(PseudoElementRows([NodeSlotId::INVALID; _]));
+                .or_insert_with(|| PseudoElementRows([NodeSlotId::INVALID; _]));
             let slot = element_rows
                 .0
                 .get_mut(usize::from(generated_for))
                 .expect("only an element's synthetic pseudo-elements are bound to rows");
             *slot = row;
             if element_rows.0.iter().all(|row| row.is_invalid()) {
-                rows.remove(&generator);
+                self.pseudo_elements.remove(&generator);
             }
         }
         previous
@@ -876,8 +902,8 @@ impl PublishedBoundRows {
 /// and text identities each cost one entry per node of their own kind.
 #[derive(Clone, Default)]
 struct RowsByStyleNode {
-    elements: Vec<NodeSlotId>,
-    texts: Vec<NodeSlotId>,
+    elements: ForkVec<NodeSlotId>,
+    texts: ForkVec<NodeSlotId>,
 }
 
 impl RowsByStyleNode {
@@ -895,7 +921,7 @@ impl RowsByStyleNode {
             None => (&mut self.elements, style_node.element_slot()),
         };
         if rows.len() <= index {
-            rows.resize(index + 1, NodeSlotId::INVALID);
+            rows.resize_with_default(index + 1);
         }
         &mut rows[index]
     }
@@ -937,26 +963,26 @@ struct StyleNodeTables {
     /// The maps are borrowed for writing only by the publication entry points, which can run while a
     /// tree build is under way: an element styled on the build's behalf replaces its style record,
     /// which republishes the resources its style names. No reader holds a borrow across a host call.
-    svg_attribute_facts: HashMap<StyleNodeID, super::svg_formatting_context::FfiSvgAttributeFacts>,
+    svg_attribute_facts: CowMap<StyleNodeID, super::svg_formatting_context::FfiSvgAttributeFacts>,
     /// The parsed MathML attributes each MathML element published, keyed by its style node.
-    math_attribute_facts: HashMap<StyleNodeID, super::math_formatting_context::FfiMathAttributeFacts>,
+    math_attribute_facts: CowMap<StyleNodeID, super::math_formatting_context::FfiMathAttributeFacts>,
     /// The `points` list each <polyline> and <polygon> published beside its facts.
-    svg_points: HashMap<StyleNodeID, std::sync::Arc<[super::svg_formatting_context::FfiFloatPoint]>>,
+    svg_points: CowMap<StyleNodeID, std::sync::Arc<[super::svg_formatting_context::FfiFloatPoint]>>,
     /// The elements carrying each anchor name, in tree order. The DOM's registry republishes a
     /// name's list whenever it changes.
-    anchor_name_elements: HashMap<ScopedAnchorName, Vec<StyleNodeID>>,
+    anchor_name_elements: CowMap<ScopedAnchorName, Vec<StyleNodeID>>,
     /// The nodes sitting in the user agent shadow tree of the focused text control, which is what
     /// a caret is painted inside. At most one control is focused, so this holds one control's
     /// shadow tree and is empty the rest of the time.
-    identities_in_focused_text_control: HashSet<StyleNodeID>,
+    identities_in_focused_text_control: CowSet<StyleNodeID>,
     /// What each element has scrolled to, held against its identity because the element's box is
     /// replaced whenever its subtree is rebuilt. The element still stores the offset it answers
     /// `scrollTop` with, and publishes it here as it changes, arrives and changes identity. Zero is
     /// the absence of an entry, which is nearly every element.
-    element_scroll_offsets: HashMap<StyleNodeID, CssPixelPoint>,
+    element_scroll_offsets: CowMap<StyleNodeID, CssPixelPoint>,
     /// What each element's pseudo-elements have scrolled to, held against the element's identity,
     /// since a pseudo-element has none of its own, and published the way the element's offset is.
-    pseudo_element_scroll_offsets: HashMap<StyleNodeID, PseudoElementScrollOffsets>,
+    pseudo_element_scroll_offsets: CowMap<StyleNodeID, PseudoElementScrollOffsets>,
     /// The writing suggestion showing after the caret, if any: at most one per document, held
     /// against the identity of the text node the caret is in.
     writing_suggestion: Option<PublishedWritingSuggestion>,
@@ -993,8 +1019,9 @@ struct ScopedAnchorName {
 }
 
 /// Why the arena holds a pin on the style record a row names.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
 enum ArenaStylePin {
+    #[default]
     None,
     /// The arena derived the record for the row: an anonymous box's, or a style layout adjusted.
     Derived,
@@ -1040,31 +1067,40 @@ impl HostStyle {
     }
 }
 
+#[derive(Clone, Copy, Default)]
+struct CommittedLinkHolder {
+    generation: u8,
+    holder: Option<NodeSlotId>,
+    met_at_commit: u32,
+}
+
 #[derive(Clone)]
 pub(crate) struct LayoutNodeArena {
-    chunks: Vec<Box<Chunk>>,
+    chunks: ForkVec<Box<Chunk>>,
     tree_shape: TreeShape,
     /// Advanced by every write to a node's shape, or to the style record or node kept beside it, which
     /// publication takes into the published rows.
     shape_writes: ShapeWrites,
-    chunks_by_address: Vec<ChunkAddress>,
-    slot_metadata: Vec<SlotMetadata>,
-    style_records: Vec<u64>,
+    slot_metadata: ForkVec<SlotMetadata>,
+    style_records: ForkVec<u64>,
+    /// How many of `style_records` name a record other than one the engine installed.
+    rows_naming_uninstalled_records: u32,
     /// The style record whose image resources the host was last owed for each row, or zero. A row whose record has not
     /// changed since holds those resources still, so a build that visits it again owes it nothing.
-    image_resources_owed_records: Vec<u64>,
-    style_record_pins: Vec<ArenaStylePin>,
+    image_resources_owed_records: ForkVec<u64>,
+    style_record_pins: ForkVec<ArenaStylePin>,
     /// The style record the host pinned for its readers of a row that outlive the row's place in
     /// the tree (a detached box is read until its row is freed), or zero. A pin is counted, so this
     /// is a pin of its own beside the arena's, and it names the record it took rather than whichever
     /// record the row holds when it goes.
-    style_records_pinned_by_host: Vec<u64>,
+    style_records_pinned_by_host: ForkVec<u64>,
+    derived_styles_shown_before_host_installs: CowMap<NodeSlotId, DerivedStyleRecord>,
     /// The StyleNodeID of the element or text node each row is bound to, or of the element it is
     /// generated for. Rows carrying one identity are chained through `next_rows_with_same_style_node`
     /// from `first_rows_by_style_node`, so retiring an identity reaches every row that carries it,
     /// bound or not, before the identity can be reused.
-    style_nodes: Vec<Option<StyleNodeID>>,
-    next_rows_with_same_style_node: Vec<NodeSlotId>,
+    style_nodes: ForkVec<Option<StyleNodeID>>,
+    next_rows_with_same_style_node: ForkVec<NodeSlotId>,
     first_rows_by_style_node: RowsByStyleNode,
     /// The row each element or text node is bound to: the row its layout node is. Carrying the
     /// identity does not make a row bound, since first-letter slices and rows awaiting a rebuild
@@ -1102,27 +1138,31 @@ pub(crate) struct LayoutNodeArena {
     full_layout_count: u64,
     /// How many layouts were committed, full and partial.
     layout_commit_count: u64,
-    committed_subtree_tokens: Vec<u32>,
+    /// Per slot, which fragment held the box's committed link when a commit last met it.
+    committed_link_holders: ForkVec<CommittedLinkHolder>,
+    /// The boxes whose committed links a full commit met at the top of its pass, which no fragment holds.
+    pass_level_committed_links: Vec<NodeSlotId>,
+    pub(crate) links_held_apart_from_their_containing_blocks: CowSet<NodeSlotId>,
     layout_tree_build_stats: FfiLayoutTreeBuildStats,
-    pre_order_labels: Vec<u64>,
+    pre_order_labels: ForkVec<u64>,
     pre_order_relabel_count: u64,
-    free_list: Vec<u32>,
-    next_index: u32,
+    free_list: ForkVec<u32>,
     live_count: u32,
     default_scroll_shift_anchors: Vec<DefaultScrollShiftAnchorSlot>,
-    any_default_scroll_shift_anchor_ever_stored: bool,
     text_slots: TextSlots,
-    pub(super) searchable_text: Option<Vec<super::text_queries::MappedText>>,
-    replaced_content_facts: Vec<ReplacedContentFactsSlot>,
+    pub(super) searchable_text: crate::fork::ForkReset<Option<Vec<super::text_queries::MappedText>>>,
+    replaced_content_facts: CowVec<ReplacedContentFactsSlot, REPLACED_CONTENT_FACTS_PER_CHUNK>,
     /// The layout kind of each row built for a MathML element, from its tag name.
-    math_layout_kinds: HashMap<NodeSlotId, super::math_formatting_context::MathLayoutKind>,
+    math_layout_kinds: CowMap<NodeSlotId, super::math_formatting_context::MathLayoutKind>,
     replaced_paint_facts: Arc<crate::painting::replaced_paint_facts::ReplacedPaintFactsTable>,
     layer_image_paint_facts: Arc<crate::painting::layer_image_paint_facts::LayerImagePaintFactsTable>,
     svg_paint_resources: crate::painting::svg_paint_resources::SvgPaintResources,
+    /// The writes to `replaced_paint_facts` and `layer_image_paint_facts`.
+    paint_fact_writes: u64,
     /// The rows built for one DOM node, chained into a ring through the rows themselves; a row that
     /// is the only one built for its node links to nothing. The chain lives on the rows rather than
     /// under a key so that it survives the node's identity being retired and re-issued.
-    next_rows_built_for_same_node: Vec<NodeSlotId>,
+    next_rows_built_for_same_node: ForkVec<NodeSlotId>,
     /// What writes since the layout stage last looked did to the boxes its run memos hold entries of.
     memo_invalidations: super::memo_invalidations::MemoInvalidations,
     pub(super) layout_trace: super::trace::TraceRecord,
@@ -1133,33 +1173,32 @@ pub(crate) struct LayoutNodeArena {
     pub(crate) scrollable_overflow: crate::painting::scrollable_overflow::ScrollableOverflowState,
     pub(crate) partial_relayout_boundary_roots: super::partial_relayout::PartialRelayoutBoundaryRoots,
     nodes_with_layout_update_flags: Vec<NodeSlotId>,
-    layout_update_flag_node_indices: HashMap<NodeSlotId, usize>,
-    pub(super) pending_attached_subtree_roots: Vec<NodeSlotId>,
+    layout_update_flag_node_indices: CowMap<NodeSlotId, usize>,
     /// Boxes whose child lists gained children since the last layout tree build, held back from
     /// layout invalidation until the build shows what the new children are.
     pub(crate) deferred_child_list_insertion_parents: Vec<(NodeSlotId, NodeSlotId)>,
+    pub(super) deferred_child_list_insertion_parent_slots: CowSet<NodeSlotId>,
+    pub(super) children_inserted_under_deferred_parents: Vec<(NodeSlotId, NodeSlotId)>,
     /// Layout inputs for new absolutely positioned boxes that the build confined to themselves.
     /// They stand in for the committed inputs such a box does not have yet.
-    pub(crate) confined_abspos_layout_inputs: HashMap<NodeSlotId, AbsposLayoutInputs>,
+    pub(crate) confined_abspos_layout_inputs: CowMap<NodeSlotId, AbsposLayoutInputs>,
     /// The position option each box with position options was last laid out with.
     /// https://drafts.csswg.org/css-anchor-position-1/#fallback-apply
-    position_options_in_use: HashMap<NodeSlotId, super::abspos_inputs::PositionOptionChoice>,
+    position_options_in_use: CowMap<NodeSlotId, super::abspos_inputs::PositionOptionChoice>,
     /// https://drafts.csswg.org/css-anchor-position-1/#last-successful-position-option
-    last_successful_position_options: HashMap<NodeSlotId, super::abspos_inputs::PositionOptionChoice>,
+    last_successful_position_options: CowMap<NodeSlotId, super::abspos_inputs::PositionOptionChoice>,
     /// The style record and custom property environment of the element containing the letter, as each
     /// `::first-letter` box's style was last derived from them.
-    first_letter_parent_styles: HashMap<NodeSlotId, (u64, u64)>,
+    first_letter_parent_styles: CowMap<NodeSlotId, (u64, u64)>,
     first_letter_styles_derived: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    pub(crate) inline_boxes_lifted_out_of: HashMap<NodeSlotId, NodeSlotId>,
-    pub(crate) out_of_flow_positioning_contained: HashMap<NodeSlotId, u32>,
+    pub(crate) inline_boxes_lifted_out_of: CowMap<NodeSlotId, NodeSlotId>,
+    pub(crate) out_of_flow_positioning_contained: CowMap<NodeSlotId, u32>,
     /// Attribution of pending updates for partial relayout. Invariant: every update recorded
     /// since the last layout pass is either attributed to a boundary in the root set above, or
     /// this escape bit is set. Partial relayout may only run while the bit is clear; a full
     /// layout pass re-derives every fact boundary qualification depends on, so it clears the bit.
     pub(crate) pending_updates_escape_partial_relayout: bool,
-    pub(crate) boxes_needing_scrollable_overflow_recalculation: Vec<NodeSlotId>,
-    pub(crate) needs_full_scrollable_overflow_recalculation: bool,
-    text_nodes_enrolled_for_content_sync: HashSet<NodeSlotId>,
+    text_nodes_enrolled_for_content_sync: CowSet<NodeSlotId>,
     /// The scroll containers a running tree build gave a style, which may be where scroll
     /// snapping happens once the build is over.
     built_scroll_containers: Vec<NodeSlotId>,
@@ -1167,9 +1206,9 @@ pub(crate) struct LayoutNodeArena {
     /// the builds came to owe them, until the layout update the builds ran in is over.
     image_resources_owed_to_host: Vec<(NodeSlotId, OwedImageResources)>,
     /// The image boxes among the rows that own the provider of the image they show.
-    owned_image_providers: HashMap<NodeSlotId, OwnedImageProvider>,
+    owned_image_providers: CowMap<NodeSlotId, OwnedImageProvider>,
     /// The text node that each `display: contents` text wrapper box wraps.
-    display_contents_text_wrappers: HashMap<NodeSlotId, StyleNodeID>,
+    display_contents_text_wrappers: CowMap<NodeSlotId, StyleNodeID>,
     /// Whether a row has ever been given a style with `content-visibility: auto`.
     may_have_auto_content_visibility: bool,
     /// Whether a row has ever been given a style with a scroll snap type.
@@ -1178,10 +1217,12 @@ pub(crate) struct LayoutNodeArena {
     /// The natural size of the image each image box that owns its image's provider shows
     /// (`content: url(...)`), as the provider publishes it: zero while the image is not available.
     /// Such a box shows an image of its own rather than its element's.
-    owned_image_natural_sizes: HashMap<NodeSlotId, crate::css::style::NaturalSize>,
+    owned_image_natural_sizes: CowMap<NodeSlotId, crate::css::style::NaturalSize>,
     /// The natural size layout last negotiated for the box of an `<svg>` document element, and that
     /// box. An `<object>` showing the document is sized from it.
     document_svg_root_natural_size: Option<(NodeSlotId, crate::css::style::NaturalSize)>,
+    container_bases_read_by_committed_layout:
+        CowMap<NodeSlotId, Vec<(StyleNodeID, crate::css::style::ContainerUnitBases)>>,
     /// The document element's natural size as it was last handed to the `<object>` showing the
     /// document, if it has been.
     handed_over_document_svg_root_natural_size: Option<crate::css::style::NaturalSize>,
@@ -1198,19 +1239,28 @@ pub(crate) struct LayoutNodeArena {
 }
 
 impl LayoutNodeArena {
+    /// The bytes of the columns that name the style record each row is built from.
+    pub(crate) fn style_column_heap_size(&self) -> usize {
+        self.style_records.row_bytes()
+            + self.image_resources_owed_records.row_bytes()
+            + self.style_record_pins.row_bytes()
+            + self.style_records_pinned_by_host.row_bytes()
+    }
+
     pub(crate) fn new() -> Self {
         Self {
-            chunks: Vec::new(),
+            chunks: ForkVec::default(),
             tree_shape: TreeShape::default(),
             shape_writes: ShapeWrites::default(),
-            chunks_by_address: Vec::new(),
-            slot_metadata: Vec::new(),
-            style_records: Vec::new(),
-            image_resources_owed_records: Vec::new(),
-            style_record_pins: Vec::new(),
-            style_records_pinned_by_host: Vec::new(),
-            style_nodes: Vec::new(),
-            next_rows_with_same_style_node: Vec::new(),
+            slot_metadata: ForkVec::default(),
+            style_records: ForkVec::default(),
+            rows_naming_uninstalled_records: 0,
+            image_resources_owed_records: ForkVec::default(),
+            style_record_pins: ForkVec::default(),
+            style_records_pinned_by_host: ForkVec::default(),
+            derived_styles_shown_before_host_installs: Default::default(),
+            style_nodes: ForkVec::default(),
+            next_rows_with_same_style_node: ForkVec::default(),
             first_rows_by_style_node: RowsByStyleNode::default(),
             bound_rows: Default::default(),
             viewport_scroll_offset: CssPixelPoint::default(),
@@ -1227,23 +1277,24 @@ impl LayoutNodeArena {
             partial_layout_count: (0),
             full_layout_count: (0),
             layout_commit_count: 0,
-            committed_subtree_tokens: Vec::new(),
+            committed_link_holders: ForkVec::default(),
+            pass_level_committed_links: Vec::new(),
+            links_held_apart_from_their_containing_blocks: Default::default(),
             layout_tree_build_stats: (FfiLayoutTreeBuildStats::default()),
-            pre_order_labels: Vec::new(),
+            pre_order_labels: ForkVec::default(),
             pre_order_relabel_count: 0,
-            free_list: Vec::new(),
-            next_index: 0,
+            free_list: ForkVec::default(),
             live_count: 0,
             default_scroll_shift_anchors: Vec::new(),
-            any_default_scroll_shift_anchor_ever_stored: false,
             text_slots: TextSlots::default(),
-            searchable_text: None,
-            replaced_content_facts: Vec::new(),
+            searchable_text: Default::default(),
+            replaced_content_facts: CowVec::default(),
             math_layout_kinds: Default::default(),
             replaced_paint_facts: Default::default(),
             layer_image_paint_facts: Default::default(),
             svg_paint_resources: crate::painting::svg_paint_resources::SvgPaintResources::default(),
-            next_rows_built_for_same_node: Vec::new(),
+            paint_fact_writes: 0,
+            next_rows_built_for_same_node: ForkVec::default(),
             memo_invalidations: Default::default(),
             layout_trace: super::trace::TraceRecord::default(),
             paintable_rows: crate::painting::paintable_rows::PaintableRowStore::default(),
@@ -1251,20 +1302,19 @@ impl LayoutNodeArena {
             scrollable_overflow: Default::default(),
             partial_relayout_boundary_roots: Default::default(),
             nodes_with_layout_update_flags: Vec::new(),
-            layout_update_flag_node_indices: HashMap::default(),
-            pending_attached_subtree_roots: Vec::new(),
+            layout_update_flag_node_indices: Default::default(),
             deferred_child_list_insertion_parents: Vec::new(),
-            confined_abspos_layout_inputs: HashMap::default(),
-            position_options_in_use: (HashMap::default()),
-            last_successful_position_options: (HashMap::default()),
-            first_letter_parent_styles: HashMap::default(),
+            deferred_child_list_insertion_parent_slots: Default::default(),
+            children_inserted_under_deferred_parents: Vec::new(),
+            confined_abspos_layout_inputs: Default::default(),
+            position_options_in_use: (Default::default()),
+            last_successful_position_options: (Default::default()),
+            first_letter_parent_styles: Default::default(),
             first_letter_styles_derived: std::sync::Arc::default(),
-            inline_boxes_lifted_out_of: HashMap::default(),
-            out_of_flow_positioning_contained: HashMap::default(),
+            inline_boxes_lifted_out_of: Default::default(),
+            out_of_flow_positioning_contained: Default::default(),
             pending_updates_escape_partial_relayout: false,
-            boxes_needing_scrollable_overflow_recalculation: Vec::new(),
-            needs_full_scrollable_overflow_recalculation: false,
-            text_nodes_enrolled_for_content_sync: HashSet::default(),
+            text_nodes_enrolled_for_content_sync: Default::default(),
             built_scroll_containers: Default::default(),
             image_resources_owed_to_host: Default::default(),
             owned_image_providers: Default::default(),
@@ -1272,14 +1322,45 @@ impl LayoutNodeArena {
             may_have_auto_content_visibility: false,
             may_have_scroll_snap_areas: false,
             nodes_enrolled_for_replaced_content_facts_sync: Vec::new(),
-            owned_image_natural_sizes: HashMap::default(),
+            owned_image_natural_sizes: Default::default(),
             document_svg_root_natural_size: None,
+            container_bases_read_by_committed_layout: Default::default(),
             handed_over_document_svg_root_natural_size: (None),
             layout_style_snapshot_commit: Vec::new(),
             layout_tree_update_marks: Default::default(),
             counter_styles: Default::default(),
             style_node_tables: StyleNodeTables::default(),
         }
+    }
+
+    /// Notes that the commit numbered `commit` met the committed link of `id` in the fragment of `holder`, or at the top
+    /// of its pass where `holder` is invalid.
+    pub(crate) fn note_committed_link_holder(&mut self, id: NodeSlotId, holder: NodeSlotId, commit: u32) {
+        let index = id.slot_index() as usize;
+        if self.committed_link_holders.len() <= index {
+            self.committed_link_holders.resize_with_default(index + 1);
+        }
+        self.committed_link_holders[index] = CommittedLinkHolder {
+            generation: id.generation(),
+            holder: Some(holder),
+            met_at_commit: commit,
+        };
+    }
+
+    /// The fragment that held the committed link of `id` when a commit last met it, and that commit's number.
+    pub(crate) fn committed_link_holder(&self, id: NodeSlotId) -> Option<(NodeSlotId, u32)> {
+        self.committed_link_holders
+            .get(id.slot_index() as usize)
+            .filter(|holder| holder.generation == id.generation())
+            .and_then(|holder| holder.holder.map(|node| (node, holder.met_at_commit)))
+    }
+
+    pub(crate) fn take_pass_level_committed_links(&mut self) -> Vec<NodeSlotId> {
+        std::mem::take(&mut self.pass_level_committed_links)
+    }
+
+    pub(crate) fn set_pass_level_committed_links(&mut self, links: Vec<NodeSlotId>) {
+        self.pass_level_committed_links = links;
     }
 
     pub(crate) fn layout_commit_count(&self) -> u64 {
@@ -1300,14 +1381,17 @@ impl LayoutNodeArena {
 
     /// What writes did to the boxes the layout stage's run memos hold entries of since the stage last took it.
     pub(crate) fn take_memo_invalidations(&mut self) -> super::memo_invalidations::MemoInvalidations {
+        for state in self.text_slots.released_states.take_rows() {
+            self.memo_invalidations.note_text_state_dropped(state);
+        }
         std::mem::take(&mut self.memo_invalidations)
     }
 
-    /// Drops the entries of `store` whose slot or epoch no longer matches, marks the entry whose fragments each box
+    /// Drops the entries of `store` whose slot or epoch no longer matches, keeps the entry whose fragments each box
     /// committed and ages the others. Checks only boxes whose entries were invalidated, stored or used since the
     /// previous sweep, or can still age out. Stale entries survive until commit so inline layout can reuse their
     /// undamaged line prefixes.
-    pub(crate) fn sweep_stale_fc_run_cache_entries(&self, store: &super::fc_run_cache::FcRunCacheStore) {
+    pub(crate) fn sweep_stale_fc_run_cache_entries(&self, store: &mut super::fc_run_cache::FcRunCacheStore) {
         store.sweep_pending_entries(
             |slot, validity| {
                 let Some(metadata) = self.slot_metadata.get(slot as usize) else {
@@ -1319,44 +1403,13 @@ impl LayoutNodeArena {
                 let id = NodeSlotId::new(slot, metadata.generation);
                 self.data(id).fragment_cache_epoch == validity.fragment_cache_epoch
             },
-            |box_, entry| {
-                entry
-                    .describes_committed_subtree(self, box_)
-                    .then(|| self.committed_subtree_token(box_))
-            },
+            |box_, entry| entry.holds_committed_fragments(self, box_),
             self.layout_commit_count(),
         );
     }
 
-    /// Moves on whenever a commit lays the subtree of `id` out anew or clears it, which tells a layout run cache
-    /// entry that found its fragments committed whether they still are.
-    pub(crate) fn committed_subtree_token(&self, id: NodeSlotId) -> u32 {
-        self.committed_subtree_tokens
-            .get(id.slot_index() as usize)
-            .copied()
-            .unwrap_or_default()
-    }
-
-    pub(crate) fn note_subtree_committed_anew(&mut self, id: NodeSlotId) {
-        let tokens = &mut self.committed_subtree_tokens;
-        let index = id.slot_index() as usize;
-        if tokens.len() <= index {
-            tokens.resize(index + 1, 0);
-        }
-        tokens[index] = tokens[index].wrapping_add(1);
-    }
-
-    /// Notes that the subtrees of `id` and its ancestors were committed anew.
-    pub(crate) fn note_subtrees_of_self_and_ancestors_committed_anew(&mut self, id: NodeSlotId) {
-        let mut node = id;
-        while !node.is_invalid() && self.slot_is_live(node) {
-            self.note_subtree_committed_anew(node);
-            node = self.data(node).parent.get();
-        }
-    }
-
-    /// Checks that the calling thread may reach the arena: the StyleLayout thread, which the arena's render state lives
-    /// on, or the host's, while the StyleLayout thread waits for its next message.
+    /// Checks that the calling thread may reach the arena: the Render thread, which the arena's render state lives
+    /// on, or the host's, while the Render thread waits for its next message.
     // Freshly created chunks are default-initialized and free() resets slots on release, so
     // allocate() always hands out clean NodeData without writing it again.
     #[cfg(test)]
@@ -1448,19 +1501,14 @@ impl LayoutNodeArena {
         let index = if let Some(index) = self.free_list.pop() {
             index
         } else {
-            let index = self.next_index;
+            let index = u32::try_from(self.slot_metadata.len()).expect("layout node arena exhausted its slot ID space");
             assert!(
                 index < MAX_NODE_SLOT_COUNT,
                 "layout node arena exhausted its 24-bit slot index space"
             );
             if (index as usize).is_multiple_of(SLOTS_PER_CHUNK) {
-                let chunk = Chunk::new();
-                let start = chunk.slots_address();
                 let chunk_index = self.chunks.len();
-                let insertion_index = self.chunks_by_address.partition_point(|address| address.start < start);
-                self.chunks_by_address
-                    .insert(insertion_index, ChunkAddress { start, chunk_index });
-                self.chunks.push(chunk);
+                self.chunks.resize_with_default(chunk_index + 1);
                 self.shape_writes.add_chunk(chunk_index);
             }
             self.slot_metadata.push(SlotMetadata::default());
@@ -1472,10 +1520,6 @@ impl LayoutNodeArena {
             self.next_rows_with_same_style_node.push(NodeSlotId::INVALID);
             self.next_rows_built_for_same_node.push(NodeSlotId::INVALID);
             self.pre_order_labels.push(0);
-            self.next_index = self
-                .next_index
-                .checked_add(1)
-                .expect("layout node arena exhausted its slot ID space");
             index
         };
 
@@ -1504,17 +1548,12 @@ impl LayoutNodeArena {
             self.layout_root = NodeSlotId::INVALID;
             self.pending_rebuilt_subtree_roots.clear();
             self.pending_layout_tree_update_escaped_rebuild_roots = false;
-        }
-        // NB: The root was unlinked through remove_child(), which already noted what its subtree takes out of the
-        //     overflow index.
-        if self.scrollable_overflow.viewport == Some(root) {
-            self.scrollable_overflow.viewport = None;
-            self.scrollable_overflow.non_child_boxes.clear();
-            self.scrollable_overflow.full_layout_commit = false;
-            self.scrollable_overflow.geometry_changed = false;
-            self.scrollable_overflow.scrollability_changed = false;
-            self.boxes_needing_scrollable_overflow_recalculation.clear();
-            self.needs_full_scrollable_overflow_recalculation = false;
+            let overflow = &mut self.scrollable_overflow;
+            overflow.recalculation_requests.clear();
+            overflow.scroll_offset_clamp_candidates.clear();
+            overflow.geometry_changed = false;
+            overflow.scrollability_changed = false;
+            self.links_held_apart_from_their_containing_blocks.clear();
         }
         let mut rows = Vec::new();
         self.for_each_node_in_layout_subtree_in_pre_order(root, |slot| rows.push(slot));
@@ -1528,6 +1567,9 @@ impl LayoutNodeArena {
             let host_pinned_style_record = self.style_records_pinned_by_host[slot.slot_index() as usize];
             if host_pinned_style_record != 0 {
                 arena_pinned_style_records.push(host_pinned_style_record);
+            }
+            if let Some(shown) = self.derived_styles_shown_before_host_installs.remove(&slot) {
+                arena_pinned_style_records.push(shown.record);
             }
             self.unlink_children_of_node_being_freed(slot);
             if let Some(reset) = self.free_unlinked_slot(slot) {
@@ -1563,7 +1605,7 @@ impl LayoutNodeArena {
     }
 
     fn free_unlinked_slot(&mut self, id: NodeSlotId) -> Option<crate::painting::paintable_rows::PaintableRowReset> {
-        self.searchable_text = None;
+        *self.searchable_text = None;
         let index = id.slot_index();
         let id_generation = id.generation();
         let should_reuse = {
@@ -1588,7 +1630,7 @@ impl LayoutNodeArena {
         self.forget_row_sharing_dom_node(id);
         self.unbind_row(id);
         self.set_node_style_node(id, None);
-        self.style_records[index as usize] = 0;
+        self.replace_style_record(index as usize, 0);
         self.image_resources_owed_records[index as usize] = 0;
         self.style_record_pins[index as usize] = ArenaStylePin::None;
         self.style_records_pinned_by_host[index as usize] = 0;
@@ -1599,8 +1641,12 @@ impl LayoutNodeArena {
         self.paintable_rows.reset_committed_fragment_link_slot(index);
         self.text_slots.reset(index as usize);
         self.text_nodes_enrolled_for_content_sync.remove(&id);
-        if let Some(slot) = self.replaced_content_facts.get_mut(index as usize) {
-            *slot = ReplacedContentFactsSlot::default();
+        if self
+            .replaced_content_facts
+            .get(index as usize)
+            .is_some_and(|slot| slot.facts.is_some())
+        {
+            self.replaced_content_facts[index as usize] = ReplacedContentFactsSlot::default();
         }
         self.owned_image_natural_sizes.remove(&id);
         self.owned_image_providers.remove(&id);
@@ -1610,9 +1656,11 @@ impl LayoutNodeArena {
         self.math_layout_kinds.remove(&id);
         if self.replaced_paint_facts.contains_key(&id) {
             Arc::make_mut(&mut self.replaced_paint_facts).remove(&id);
+            self.paint_fact_writes += 1;
         }
         if self.layer_image_paint_facts.contains_key(&id) {
             Arc::make_mut(&mut self.layer_image_paint_facts).remove(&id);
+            self.paint_fact_writes += 1;
         }
         self.svg_paint_resources.forget_slot(id);
         for highlight in crate::painting::selection::HighlightPseudoElement::ALL {
@@ -1620,6 +1668,24 @@ impl LayoutNodeArena {
             if styles.contains_key(&id) {
                 Arc::make_mut(styles).remove(&id);
             }
+        }
+        if self
+            .paint_state
+            .custom_highlight_pseudo_styles
+            .values()
+            .any(|styles| styles.contains_key(&id))
+        {
+            let table = Arc::make_mut(&mut self.paint_state.custom_highlight_pseudo_styles);
+            for styles in table.values_mut() {
+                if styles.contains_key(&id) {
+                    Arc::make_mut(styles).remove(&id);
+                }
+            }
+            table.retain(|_, styles| !styles.is_empty());
+        }
+        if self.paint_state.custom_highlights.covers_row(id) {
+            Arc::make_mut(&mut self.paint_state.custom_highlights).forget_row(id);
+            self.paint_state.bump_custom_highlight_row_generation();
         }
         let data = self.data_mut(index);
         debug_assert!(
@@ -1642,37 +1708,31 @@ impl LayoutNodeArena {
         paintable_row_reset
     }
 
+    // NB: The invalid ID names a slot past every chunk the arena can hold, or one whose generation never matches, so
+    //     the chunk lookup and the generation check reject it too.
     #[inline]
     pub(crate) fn data(&self, id: NodeSlotId) -> &NodeData {
-        assert!(!id.is_invalid(), "invalid layout node arena slot ID");
         let index = id.slot_index() as usize;
-        let chunk = self
-            .chunks
-            .get(index / SLOTS_PER_CHUNK)
-            .expect("invalid layout node arena slot ID");
+        let Some(chunk) = self.chunks.get(index / SLOTS_PER_CHUNK) else {
+            invalid_slot_access(id)
+        };
         let data = chunk.slot(index % SLOTS_PER_CHUNK);
-        assert_eq!(
-            data.slot_generation.get(),
-            id.generation(),
-            "layout node arena read a stale or unused slot"
-        );
+        if data.slot_generation.get() != id.generation() {
+            stale_slot_access(id, data.slot_generation.get(), "read")
+        }
         data
     }
 
     /// The node's shape, for writing. See [`ShapeWriter`].
     pub(crate) fn write_shape(&mut self, id: NodeSlotId) -> ShapeWriter<'_> {
-        assert!(!id.is_invalid(), "invalid layout node arena slot ID");
         let index = id.slot_index() as usize;
-        let shape = self
-            .chunks
-            .get_mut(index / SLOTS_PER_CHUNK)
-            .expect("invalid layout node arena slot ID")
-            .write_shape(index / SLOTS_PER_CHUNK, index % SLOTS_PER_CHUNK, &mut self.shape_writes);
-        assert_eq!(
-            shape.slot_generation.get(),
-            id.generation(),
-            "layout node arena wrote a stale or unused slot"
-        );
+        let Some(chunk) = self.chunks.get_mut(index / SLOTS_PER_CHUNK) else {
+            invalid_slot_access(id)
+        };
+        let shape = chunk.write_shape(index / SLOTS_PER_CHUNK, index % SLOTS_PER_CHUNK, &mut self.shape_writes);
+        if shape.slot_generation.get() != id.generation() {
+            stale_slot_access(id, shape.slot_generation.get(), "wrote")
+        }
         shape
     }
 
@@ -1753,7 +1813,7 @@ impl LayoutNodeArena {
     pub(crate) fn retire_layout_tree_update_marks_of_cleared_node(&mut self, node: StyleNodeID) {
         let mut current = node;
         while self.layout_tree_update_marks.merge(current, false, 0) {
-            let Some(host) = self.with_style_store(|engine| engine.tree().host_of(current)) else {
+            let Some(host) = self.with_style_store(|engine| engine.host_of(current)) else {
                 break;
             };
             current = host;
@@ -2031,13 +2091,13 @@ impl LayoutNodeArena {
 
     /// The parent element of `element` in the style tree, if any.
     pub(crate) fn style_node_parent(&self, element: StyleNodeID) -> Option<StyleNodeID> {
-        self.with_style_store(|engine| engine.tree().parent(element))
+        self.with_style_store(|engine| engine.dom_parent(element))
     }
 
     /// The shadow host of the shadow tree `element` is in, or none in the document tree. A shadow
     /// root has no layout row, so the tree scope is named by its host.
     pub(crate) fn tree_scope_host(&self, element: StyleNodeID) -> Option<StyleNodeID> {
-        self.with_style_store(|engine| engine.tree().shadow_host_of(element))
+        self.with_style_store(|engine| engine.shadow_host_of(element))
     }
 
     /// What the row is scrolled to: the viewport's row holds the navigable's offset, a
@@ -2159,10 +2219,23 @@ impl LayoutNodeArena {
     /// Record whether the node sits in the user agent shadow tree of the focused text control.
     pub(crate) fn set_identity_in_focused_text_control(&mut self, node: StyleNodeID, value: bool) {
         let identities = &mut self.style_node_tables.identities_in_focused_text_control;
-        if value {
-            identities.insert(node);
+        let changed = if value {
+            identities.insert(node)
         } else {
-            identities.remove(&node);
+            identities.remove(&node)
+        };
+        if !changed {
+            return;
+        }
+        let mut row = self.first_rows_by_style_node.head(node);
+        while !row.is_invalid() {
+            if let Some(line_root) = self.node_containing_block_if_live(row)
+                && self.paintable_row_is_populated(line_root)
+            {
+                self.invalidate_fragments_of_self_and_ancestors_for_change_that_sizes_no_box(line_root);
+                self.request_fragment_overflow_recalculation(line_root);
+            }
+            row = self.next_rows_with_same_style_node[row.slot_index() as usize];
         }
     }
 
@@ -2226,7 +2299,12 @@ impl LayoutNodeArena {
         }
     }
 
-    pub(crate) fn set_node_style(&mut self, id: NodeSlotId, style_record: u64, payloads: StylePayloadsRef) -> bool {
+    pub(crate) fn set_node_style(
+        &mut self,
+        id: NodeSlotId,
+        style_record: u64,
+        payloads: Option<LayoutStyleRef>,
+    ) -> bool {
         self.write_shape(id).set_style(payloads);
         self.note_row_style(id);
         self.set_node_flag(id, NodeFlag::FollowsPrincipalStyle, false);
@@ -2253,17 +2331,94 @@ impl LayoutNodeArena {
         &mut self,
         slot: NodeSlotId,
         style_record: u64,
-        payloads: StylePayloadsRef,
-        previous_payloads: Option<StylePayloadsRef>,
+        payloads: Option<LayoutStyleRef>,
+        previous_payloads: Option<Option<LayoutStyleRef>>,
     ) {
+        let keeps_layout_inputs = match previous_payloads {
+            Some(previous) => {
+                self.forget_last_successful_position_option_after_fallback_sensitive_change(slot, previous, payloads);
+                self.style_move_keeps_layout_inputs(slot, previous, payloads)
+            }
+            None => true,
+        };
         if self.set_node_style(slot, style_record, payloads) {
             self.refresh_style_flags(slot);
         }
         self.publish_new_size_container_geometry(slot);
         self.enroll_node_for_svg_paint_resources_sync(slot);
-        if previous_payloads.is_some_and(|previous| !self.style_move_keeps_layout_inputs(slot, previous, payloads)) {
+        if !keeps_layout_inputs {
             self.invalidate_fragments_and_intrinsic_sizes_of_self_and_ancestors(slot);
         }
+    }
+
+    /// https://drafts.csswg.org/css-anchor-position-1/#last-successful-position-option
+    fn forget_last_successful_position_option_after_fallback_sensitive_change(
+        &mut self,
+        slot: NodeSlotId,
+        previous: Option<LayoutStyleRef>,
+        new: Option<LayoutStyleRef>,
+    ) {
+        if previous == new
+            || self.last_successful_position_options.is_empty()
+            || !self.last_successful_position_options.contains_key(&slot)
+        {
+            return;
+        }
+        let made_fallback_sensitive_change = match (previous, new) {
+            (Some(previous), Some(new)) => {
+                // SAFETY: A row's style is that of the record pinned for it.
+                let (previous, new) = unsafe { (previous.view(), new.view()) };
+                !crate::css::computed_values::style_payloads_position_fallback_inputs_equal(previous, new)
+            }
+            _ => true,
+        };
+        if made_fallback_sensitive_change {
+            self.last_successful_position_options.remove(&slot);
+        }
+    }
+
+    pub(crate) fn install_style_record_in_place_of_derived_style(
+        &mut self,
+        slot: NodeSlotId,
+        style_record: u64,
+        payloads: Option<LayoutStyleRef>,
+    ) {
+        let index = slot.slot_index() as usize;
+        debug_assert!(self.style_record_pins[index] == ArenaStylePin::Derived);
+        let shown = DerivedStyleRecord {
+            record: self.style_records[index],
+            payloads: self
+                .data(slot)
+                .style
+                .get()
+                .expect("a derived style row holds its style"),
+        };
+        self.style_record_pins[index] = ArenaStylePin::None;
+        if self.derived_styles_shown_before_host_installs.contains_key(&slot) {
+            self.with_style_engine(|engine| engine.unpin_layout_style_record(shown.record));
+        } else {
+            self.derived_styles_shown_before_host_installs.insert(slot, shown);
+        }
+        self.install_style_record(slot, style_record, payloads, None);
+    }
+
+    fn holds_derived_style_shown_before_host_install(&self, slot: NodeSlotId) -> bool {
+        !self.derived_styles_shown_before_host_installs.is_empty()
+            && self.derived_styles_shown_before_host_installs.contains_key(&slot)
+    }
+
+    fn decide_relayout_against_derived_style_shown_before_host_install(&mut self, slot: NodeSlotId) {
+        if self.derived_styles_shown_before_host_installs.is_empty() {
+            return;
+        }
+        let Some(shown) = self.derived_styles_shown_before_host_installs.remove(&slot) else {
+            return;
+        };
+        if !self.style_move_keeps_layout_inputs(slot, Some(shown.payloads), self.data(slot).style.get()) {
+            self.invalidate_fragments_and_intrinsic_sizes_of_self_and_ancestors(slot);
+            self.set_needs_layout_update(slot, true);
+        }
+        self.with_style_engine(|engine| engine.unpin_layout_style_record(shown.record));
     }
 
     /// Whether the box `slot` keeps the layout it cached when it shows `new` in place of `previous` (see
@@ -2271,78 +2426,40 @@ impl LayoutNodeArena {
     pub(crate) fn style_move_keeps_layout_inputs(
         &self,
         slot: NodeSlotId,
-        previous: StylePayloadsRef,
-        new: StylePayloadsRef,
+        previous: Option<LayoutStyleRef>,
+        new: Option<LayoutStyleRef>,
     ) -> bool {
         if previous == new {
             return true;
         }
-        if previous.is_null() || new.is_null() {
+        let (Some(previous), Some(new)) = (previous, new) else {
             return false;
-        }
-        // SAFETY: A row's non-null style addresses the payload array of the record pinned for it.
-        let (previous, new) = unsafe { (previous.deref(), new.deref()) };
+        };
+        // SAFETY: A row's style is that of the record pinned for it.
+        let (previous, new) = unsafe { (previous.view(), new.view()) };
         let is_svg_box = super::node_facts::kind_is_svg_box(self.data(slot).kind.get());
-        // SAFETY: Published style-group payloads stay live while their records do.
-        unsafe {
-            crate::css::computed_values::style_payloads_layout_inputs_equal(&previous.groups, &new.groups, is_svg_box)
-        }
+        crate::css::computed_values::style_payloads_layout_inputs_equal(previous, new, is_svg_box)
     }
 
-    /// Applies `rows`, the rows of a style transaction a frame applies ahead of the host, to the boxes of their elements,
+    /// Applies `rows`, the rows of a style update a frame applies ahead of the host, to the boxes of their elements,
     /// as the host's install of each row does: the row's record, the styles the box's anonymous descendants inherit, and
     /// the relayout the move asks for. Answers the rows it applied, by element, or why it applied none: a row's box is
     /// one the host styles in a way of its own. The host installs the rows on the elements once the frame has landed.
-    pub(crate) fn apply_flight_style_rows(
-        &mut self,
-        host_calls: HostCalls<'_>,
-        rows: Vec<FlightStyleRow>,
-    ) -> Result<Vec<FlightStyleRow>, Decline> {
-        let mut applied = Vec::with_capacity(rows.len());
-        for row in rows {
-            let slot = self.bound_row(row.style_node);
-            if slot.is_invalid() {
-                continue;
-            }
-            // Replaced content, form controls, list items, tables and SVG take facts from their element the host
-            // publishes as it styles them, and a box that holds a style of the arena's or one the host pins is styled
-            // in a way of its own. So is a table box, whose wrapper may take properties of it and so give it a style of
-            // the arena's, which its layout node hears of only as the host pays the frame, after the host installs the
-            // row.
-            let parent = self.data(slot).parent.get();
-            if !matches!(
-                self.data(slot).kind.get(),
-                NodeKind::Box | NodeKind::BlockContainer | NodeKind::InlineNode
-            ) || self.style_records[slot.slot_index() as usize] != row.old_style_record
-                || self.node_style_record_is_derived(slot)
-                || self.node_style_record_pinned_by_host(slot) != 0
-                || (!parent.is_invalid() && self.data(parent).kind.get() == NodeKind::TableWrapper)
-            {
-                return Err(Decline::LayoutNode);
-            }
-            applied.push(row);
-        }
-        for row in &applied {
-            let slot = self.bound_row(row.style_node);
-            let previous_payloads = self.data(slot).style.get();
-            let payloads = self.with_style_engine(|engine| {
-                engine
-                    .style_record_payloads(row.new_style_record)
-                    .map_or(std::ptr::null(), <[_]>::as_ptr)
-            });
-            let payloads = StylePayloadsRef::new(payloads.cast());
-            self.install_style_record(slot, row.new_style_record, payloads, Some(previous_payloads));
-            self.set_node_flag(slot, NodeFlag::HasAnimatedOpacityOrTransform, false);
-            self.reinherit_anonymous_descendants(HostCalls(host_calls.0), slot);
-            if row.relayout {
-                self.mark_row_for_relayout_after_style_change(row.style_node, slot);
-            }
-        }
-        applied.sort_unstable_by_key(|row| row.style_node);
-        Ok(applied)
+    /// Whether the box `slot` is one only the host styles. Replaced content, form controls, list items, tables and SVG
+    /// take facts from their element the host publishes as it styles them, and a box that holds a style of the arena's
+    /// or one the host pins is styled in a way of its own. So is a table box, whose wrapper may take properties of it
+    /// and so give it a style of the arena's, which its layout node hears of only as the host installs its record.
+    pub(crate) fn box_is_styled_by_host(&self, slot: NodeSlotId) -> bool {
+        let parent = self.data(slot).parent.get();
+        !matches!(
+            self.data(slot).kind.get(),
+            NodeKind::Box | NodeKind::BlockContainer | NodeKind::InlineNode
+        ) || self.node_style_record_is_derived(slot)
+            || self.node_style_record_pinned_by_host(slot) != 0
+            || (!parent.is_invalid() && self.data(parent).kind.get() == NodeKind::TableWrapper)
     }
 
-    /// The box of the element or pseudo-element `row` of a hover's style transaction styles, `generated_for` naming the
+    /// The box of the element or pseudo-element `row` of a hover's style update styles, `generated_for` naming the
     /// pseudo-element, or 0 for the element.
     fn hover_row_box(&self, row: &crate::css::style::bridge::FfiStyleDelta, generated_for: u8) -> NodeSlotId {
         let Some(node) = StyleNodeID::from_raw(row.style_node) else {
@@ -2354,7 +2471,7 @@ impl LayoutNodeArena {
         }
     }
 
-    /// Whether the box of the element or pseudo-element `row` of a hover's style transaction moves takes the row's
+    /// Whether the box of the element or pseudo-element `row` of a hover's style update moves takes the row's
     /// record as the host's install of it would, without the host: the move rebuilds no box, and a box it styles is a
     /// plain one that shows the record the row moves from. List items, images and SVG boxes, which take facts from their
     /// element as the host styles them, take a move that only repaints them.
@@ -2367,7 +2484,7 @@ impl LayoutNodeArena {
         self.hover_row_box_refusal(row, generated_for).is_none()
     }
 
-    /// Why the box of the element or pseudo-element `row` of a hover's style transaction moves cannot take the row's
+    /// Why the box of the element or pseudo-element `row` of a hover's style update moves cannot take the row's
     /// record without the host, or none where it can (see [`Self::takes_hover_row`]).
     pub(crate) fn hover_row_box_refusal(
         &self,
@@ -2417,7 +2534,7 @@ impl LayoutNodeArena {
         (!parent.is_invalid() && self.data(parent).kind.get() == NodeKind::TableWrapper).then(|| "a table box".into())
     }
 
-    /// Whether the box of the element or pseudo-element `row` of a hover's style transaction styles shows the record the
+    /// Whether the box of the element or pseudo-element `row` of a hover's style update styles shows the record the
     /// row moves to already, or there is no box.
     pub(crate) fn hover_row_box_shows_its_record(
         &self,
@@ -2428,7 +2545,7 @@ impl LayoutNodeArena {
         slot.is_invalid() || self.style_records[slot.slot_index() as usize] == row.new_style_record
     }
 
-    /// Installs the record `row` of a hover's style transaction moves to in the box of its element or pseudo-element,
+    /// Installs the record `row` of a hover's style update moves to in the box of its element or pseudo-element,
     /// which [`Self::takes_hover_row`] took, as the host's install of the row does: the style, the styles the box's
     /// anonymous descendants inherit, and the relayout, the visual contexts and the repaint the move asks for.
     pub(crate) fn install_hover_row(
@@ -2446,9 +2563,8 @@ impl LayoutNodeArena {
         let payloads = self.with_style_engine(|engine| {
             engine
                 .style_record_payloads(row.new_style_record)
-                .map_or(std::ptr::null(), <[_]>::as_ptr)
+                .map(LayoutStyleRef::of_groups)
         });
-        let payloads = StylePayloadsRef::new(payloads.cast());
         self.install_style_record(slot, row.new_style_record, payloads, Some(previous_payloads));
         self.reinherit_anonymous_descendants(HostCalls(host_calls.0), slot);
         let level = row.record_damage & FfiStyleInvalidationField::LevelMask as u32;
@@ -2487,7 +2603,7 @@ impl LayoutNodeArena {
     /// whose sample moves the style of an anonymous box: its layout node would have to hear of a style no host reads.
     pub(crate) fn takes_sample(&self, row: NodeSlotId, sample: &DerivedStyleRecord, kind: SampleKind) -> bool {
         self.takes_sample_beside_anonymous_boxes(row, kind)
-            && !self.sample_moves_anonymous_box_style(row, sample.payloads)
+            && !self.sample_moves_anonymous_box_style(row, Some(sample.payloads))
     }
 
     /// Whether the box `row` shows a sample of `kind` of the effects of its element where the anonymous boxes below it
@@ -2610,25 +2726,22 @@ impl LayoutNodeArena {
         relayout: StyleRelayout,
     ) -> Option<HostStyle> {
         let index = row.slot_index() as usize;
+        let previous = self.style_records[index];
         let host_style = match self.style_record_pins[index] {
-            ArenaStylePin::Sampled => {
-                let previous = self.style_records[index];
-                self.with_style_engine(|engine| engine.unpin_layout_style_record(previous));
-                None
-            }
-            pin => Some(HostStyle {
-                record: self.style_records[index],
-                pin,
-            }),
+            ArenaStylePin::Sampled => None,
+            pin => Some(HostStyle { record: previous, pin }),
         };
         self.style_record_pins[index] = ArenaStylePin::Sampled;
         self.show_style(row, self.node_style_node(row), sample, relayout);
+        if host_style.is_none() {
+            self.with_style_engine(|engine| engine.unpin_layout_style_record(previous));
+        }
         host_style
     }
 
     /// Whether showing a style with `payloads` in `row` moves the style of an anonymous box: the table wrapper's, which
     /// takes properties of its table box of its own, or an anonymous child's, which inherits the inherited groups.
-    fn sample_moves_anonymous_box_style(&self, row: NodeSlotId, payloads: StylePayloadsRef) -> bool {
+    fn sample_moves_anonymous_box_style(&self, row: NodeSlotId, payloads: Option<LayoutStyleRef>) -> bool {
         let parent = self.data(row).parent.get();
         if !parent.is_invalid() && self.data(parent).kind.get() == NodeKind::TableWrapper {
             return true;
@@ -2647,14 +2760,12 @@ impl LayoutNodeArena {
     /// Whether the style the box `row` shows differs from the record `host_record`, which the host installed for it, in
     /// what its children inherit.
     pub(crate) fn shows_other_inherited_style_than(&self, row: NodeSlotId, host_record: u64) -> bool {
-        let Some(host_payloads) = self.with_style_store(|engine| {
-            engine
-                .style_record_payloads(host_record)
-                .map(|payloads| StylePayloadsRef::new(payloads.as_ptr().cast()))
-        }) else {
+        let Some(host_payloads) =
+            self.with_style_store(|engine| engine.style_record_payloads(host_record).map(LayoutStyleRef::of_groups))
+        else {
             return true;
         };
-        !style_payloads_equal_in_inherited_groups(self.data(row).style.get(), host_payloads)
+        !style_payloads_equal_in_inherited_groups(self.data(row).style.get(), Some(host_payloads))
     }
 
     /// Gives `row` back the style the host installed for it, which a clock tick took to show a sample in its place. The
@@ -2666,24 +2777,22 @@ impl LayoutNodeArena {
             "a box shows a sample until its host's style is restored"
         );
         let sample = self.style_records[index];
-        self.with_style_engine(|engine| engine.unpin_layout_style_record(sample));
         let HostStyle { record, pin } = host_style;
         let payloads = self.with_style_store(|engine| {
-            engine
-                .style_record_payloads(record)
-                .expect("the host's style record is live while a box shows a sample")
-                .as_ptr()
+            LayoutStyleRef::of_groups(
+                engine
+                    .style_record_payloads(record)
+                    .expect("the host's style record is live while a box shows a sample"),
+            )
         });
         self.style_record_pins[index] = pin;
         self.show_style(
             row,
             self.node_style_node(row),
-            DerivedStyleRecord {
-                record,
-                payloads: StylePayloadsRef::new(payloads.cast()),
-            },
+            DerivedStyleRecord { record, payloads },
             relayout,
         );
+        self.with_style_engine(|engine| engine.unpin_layout_style_record(sample));
     }
 
     /// Shows `style` in `row`, whose pin the caller set, as the host's install of a row of a box that styles no anonymous
@@ -2699,14 +2808,14 @@ impl LayoutNodeArena {
         let previous_payloads = self.data(row).style.get();
         self.replace_style_record(row.slot_index() as usize, style.record);
         let mut shape = self.write_shape(row);
-        shape.set_style(style.payloads);
+        shape.set_style(Some(style.payloads));
         shape.mark();
         self.note_row_style(row);
         self.refresh_style_flags(row);
         self.invalidate_overflow_after_style_change(row);
         self.enroll_text_children_for_content_sync(row);
         self.enroll_node_for_svg_paint_resources_sync(row);
-        if self.style_move_keeps_layout_inputs(row, previous_payloads, style.payloads) {
+        if self.style_move_keeps_layout_inputs(row, previous_payloads, Some(style.payloads)) {
             return;
         }
         if let StyleRelayout::ByDamage(damage) = relayout
@@ -2721,21 +2830,44 @@ impl LayoutNodeArena {
         }
     }
 
-    /// Marks `slot`, the box of the element `style_node` names, for the relayout a style change asks for, as the host
-    /// does. Only a full layout pass propagates the viewport's overflow, writing mode and direction from their elements
-    /// again, so the relayout of one of them does not finish as a partial relayout. A relayout of an absolutely
-    /// positioned partial relayout boundary stays confined to it, as the box contributes nothing to ancestor layout;
-    /// a rendered ::backdrop keeps it from being confined, as its box is the element box's sibling.
-    fn mark_row_for_relayout_after_style_change(&mut self, style_node: StyleNodeID, slot: NodeSlotId) {
+    /// Marks the box of the element `element` names for the relayout a style change asks for. Only a full layout pass
+    /// propagates the viewport's overflow, writing mode and direction from their elements again, so the relayout of one
+    /// of them does not finish as a partial relayout, even where the element has no box.
+    pub(crate) fn mark_element_for_relayout_after_style_change(
+        &mut self,
+        element: StyleNodeID,
+        rebuilds_layout_tree: bool,
+    ) {
         let viewport_propagation_source =
-            self.data(slot).flags.get() & (NodeFlag::IsDocumentElement as u32 | NodeFlag::IsBody as u32) != 0;
+            super::viewport_propagation::element_is_viewport_propagation_source(self, element);
         if viewport_propagation_source {
             self.record_partial_relayout_escape();
         }
-        let confined = !viewport_propagation_source
+        let slot = self.bound_row(element);
+        if !slot.is_invalid() {
+            self.mark_row_for_relayout(element, slot, !viewport_propagation_source && !rebuilds_layout_tree);
+        }
+    }
+
+    /// Marks `slot`, the box of the element `style_node` names or of one of its pseudo-elements, for the relayout a style
+    /// change that builds no box again asks for.
+    fn mark_row_for_relayout_after_style_change(&mut self, style_node: StyleNodeID, slot: NodeSlotId) {
+        if slot == self.bound_row(style_node) {
+            self.mark_element_for_relayout_after_style_change(style_node, false);
+        } else {
+            self.mark_row_for_relayout(style_node, slot, true);
+        }
+    }
+
+    /// A relayout of an absolutely positioned partial relayout boundary stays confined to it, as the box contributes
+    /// nothing to ancestor layout; a rendered ::backdrop keeps it from being confined, as its box is the element box's
+    /// sibling.
+    fn mark_row_for_relayout(&mut self, style_node: StyleNodeID, slot: NodeSlotId, may_be_confined_to_boundary: bool) {
+        let confined = may_be_confined_to_boundary
+            && super::node_facts::kind_is_box(self.data(slot).kind.get())
             && self
-                .style_payloads(slot)
-                .is_some_and(|payloads| ComputedValuesView::new(&payloads.groups).is_absolutely_positioned())
+                .style_view(slot)
+                .is_some_and(|payloads| payloads.is_absolutely_positioned())
             && self.node_is_partial_relayout_boundary(slot)
             && self
                 .bound_pseudo_element_row(style_node, super::node_data::GENERATED_FOR_BACKDROP)
@@ -2779,20 +2911,10 @@ impl LayoutNodeArena {
         &mut self.svg_paint_resources
     }
 
-    /// A fork of the arena, linked to `engine`, the fork of its style engine: its chunks have addresses of their own,
-    /// and the flags the arena shares with the host are its own. See [`crate::fork`].
+    /// A fork of the arena, linked to `engine`, the fork of its style engine: the flags the arena shares with the host
+    /// are its own. See [`crate::fork`].
     pub(crate) fn fork(&self, engine: crate::css::style::StyleEngineHandle) -> Self {
         let mut fork = self.clone();
-        fork.chunks_by_address = fork
-            .chunks
-            .iter()
-            .enumerate()
-            .map(|(chunk_index, chunk)| ChunkAddress {
-                start: chunk.slots_address(),
-                chunk_index,
-            })
-            .collect();
-        fork.chunks_by_address.sort_unstable_by_key(|address| address.start);
         fork.style_engine = ArenaStyleEngine(engine);
         fork.svg_paint_resources.detach_enrolled_flag_for_fork();
         fork.first_letter_styles_derived = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
@@ -2817,6 +2939,8 @@ impl LayoutNodeArena {
         let previous = std::mem::replace(&mut self.style_records[index], record);
         if previous != record {
             self.image_resources_owed_records[index] = 0;
+            self.rows_naming_uninstalled_records += u32::from(crate::css::style::names_an_uninstalled_record(record));
+            self.rows_naming_uninstalled_records -= u32::from(crate::css::style::names_an_uninstalled_record(previous));
         }
         previous
     }
@@ -2955,6 +3079,49 @@ impl LayoutNodeArena {
         self.document_svg_root_natural_size = Some((root_box, natural_size));
     }
 
+    pub(crate) fn note_container_bases_read_by_committed_layout(
+        &mut self,
+        reads: Vec<super::run_state::ContainerLengthRead>,
+    ) {
+        let mut readers_noted = HashSet::default();
+        for read in reads {
+            let bases_read = self
+                .container_bases_read_by_committed_layout
+                .entry(read.reader)
+                .or_default();
+            if readers_noted.insert(read.reader) {
+                bases_read.clear();
+            }
+            bases_read.push((read.element, read.bases));
+        }
+    }
+
+    pub(crate) fn mark_container_length_readers_whose_bases_moved_for_layout(&mut self) {
+        if self.container_bases_read_by_committed_layout.is_empty() {
+            return;
+        }
+        let mut readers_whose_bases_moved = Vec::new();
+        for (&reader, bases_read) in self.container_bases_read_by_committed_layout.iter() {
+            if !self.slot_is_live(reader) {
+                readers_whose_bases_moved.push(reader);
+                continue;
+            }
+            let bases_moved = bases_read.iter().any(|&(element, bases)| {
+                self.dom_node_style_node(reader) != Some(element)
+                    || self.with_style_store(|engine| engine.container_unit_bases(element, false)) != bases
+            });
+            if bases_moved {
+                readers_whose_bases_moved.push(reader);
+            }
+        }
+        for reader in readers_whose_bases_moved {
+            self.container_bases_read_by_committed_layout.remove(&reader);
+            if self.slot_is_live(reader) {
+                self.set_needs_layout_update(reader, true);
+            }
+        }
+    }
+
     /// The natural size of the document's `<svg>` document element as its last layout negotiated
     /// it, unless it is what the last call handed over. The size is all absent if the document
     /// element is no `<svg>` with a box.
@@ -2988,8 +3155,16 @@ impl LayoutNodeArena {
         }
         !self.node_needs_layout_update(layout_root)
             && !document_needs_layout_tree_build
+            && !self.layout_tree_update_marks_need_build()
             && !self.needs_full_layout_tree_update()
             && !self.has_partial_relayout_boundary_roots()
+    }
+
+    pub(crate) fn layout_tree_update_marks_need_build(&self) -> bool {
+        self.document_style_node.is_some_and(|document| {
+            let marks = self.layout_tree_update_marks();
+            marks.needs(document) || marks.child_needs(document)
+        })
     }
 
     pub(crate) fn set_pending_rebuilt_subtree_roots(
@@ -3157,7 +3332,7 @@ impl LayoutNodeArena {
             return None;
         }
         self.with_style_store(|engine| {
-            let scope = engine.tree().tree_scope(referrer);
+            let scope = engine.element_tree_scope(referrer);
             engine
                 .element_by_id(crate::css::style::tree::TreeScopeID::DOCUMENT, name)
                 .or_else(|| {
@@ -3173,12 +3348,11 @@ impl LayoutNodeArena {
     ///
     /// The group pointers are copied out rather than borrowed, since the style store's borrow ends
     /// with the query while the record they address is retained for the pass.
-    pub(crate) fn style_node_style_payloads(&self, style_node: StyleNodeID) -> Option<FfiStylePayloads> {
+    pub(crate) fn style_node_style(&self, style_node: StyleNodeID) -> Option<LayoutStyleRef> {
         self.with_style_store(|engine| {
-            let groups = engine.element_published_style_payloads(style_node)?;
-            let mut payloads = FfiStylePayloads::default();
-            payloads.groups.copy_from_slice(groups);
-            Some(payloads)
+            engine
+                .element_published_style(style_node)
+                .map(|style| LayoutStyleRef::of(style.record_groups()))
         })
     }
 
@@ -3238,7 +3412,7 @@ impl LayoutNodeArena {
     /// Whether the element has an element child, which is what `childElementCount` counts.
     pub(crate) fn has_dom_element_children(&self, style_node: StyleNodeID) -> bool {
         style_node.element_index().is_some()
-            && self.with_style_store(|engine| engine.tree().first_element_child(style_node).is_some())
+            && self.with_style_store(|engine| engine.first_element_child(style_node).is_some())
     }
 
     /// The names a publication holds a sweep retention on: the one an `href` names, and the four
@@ -3301,22 +3475,21 @@ impl LayoutNodeArena {
     /// none. Nodes that can never have a box (a comment, a doctype, a processing instruction) hold
     /// no place in it.
     pub(crate) fn first_dom_child(&self, style_node: StyleNodeID) -> Option<StyleNodeID> {
-        self.with_style_store(|engine| engine.tree().dom_children(style_node).next())
+        self.with_style_store(|engine| engine.dom_children(style_node).next())
     }
 
     /// Everything one step of the stale-subtree walk reads out of the style mirror, in one borrow.
     pub(crate) fn stale_walk_facts(&self, style_node: StyleNodeID) -> StaleWalkFacts {
         self.with_style_store(|engine| {
-            let tree = engine.tree();
             let owns_children = style_node.text_index().is_none();
             StaleWalkFacts {
                 rendered_in_top_layer: owns_children
                     && engine.element_adjustment_facts(style_node)
                         & crate::css::style::bridge::element_adjustment_fact::RENDERED_IN_TOP_LAYER
                         != 0,
-                shadow_root: owns_children.then(|| tree.shadow_root_of(style_node)).flatten(),
-                first_dom_child: owns_children.then(|| tree.dom_children(style_node).next()).flatten(),
-                next_dom_sibling: tree.next_sibling_in_dom_order(style_node),
+                shadow_root: owns_children.then(|| engine.shadow_root_of(style_node)).flatten(),
+                first_dom_child: owns_children.then(|| engine.dom_children(style_node).next()).flatten(),
+                next_dom_sibling: engine.next_sibling_in_dom_order(style_node),
             }
         })
     }
@@ -3324,12 +3497,12 @@ impl LayoutNodeArena {
     /// The shadow root the element `host` hosts, if any. The style mirror names a root the moment it
     /// is attached to a host in the document.
     pub(crate) fn shadow_root_of(&self, host: StyleNodeID) -> Option<StyleNodeID> {
-        self.with_style_store(|engine| engine.tree().shadow_root_of(host))
+        self.with_style_store(|engine| engine.shadow_root_of(host))
     }
 
     /// The node after `style_node` in its parent's DOM child sequence.
     pub(crate) fn next_dom_sibling(&self, style_node: StyleNodeID) -> Option<StyleNodeID> {
-        self.with_style_store(|engine| engine.tree().next_sibling_in_dom_order(style_node))
+        self.with_style_store(|engine| engine.next_sibling_in_dom_order(style_node))
     }
 
     /// The element facts the style mirror holds for `style_node`, as
@@ -3398,12 +3571,10 @@ impl LayoutNodeArena {
     /// in the element relations, so the document element has none.
     pub(crate) fn flat_tree_parent(&self, style_node: StyleNodeID) -> Option<StyleNodeID> {
         self.with_style_store(|engine| {
-            let tree = engine.tree();
-            if let Some(slot) = tree.assigned_slot_of(style_node) {
+            if let Some(slot) = engine.assigned_slot_of(style_node) {
                 return Some(slot);
             }
-            let parent = tree.parent(style_node)?;
-            Some(tree.host_of(parent).unwrap_or(parent))
+            engine.parent_element_or_host(style_node)
         })
     }
 
@@ -3424,19 +3595,19 @@ impl LayoutNodeArena {
     /// is not a slot with assigned nodes answers zero.
     pub(crate) fn assigned_node_count(&self, style_node: Option<StyleNodeID>) -> usize {
         style_node.map_or(0, |style_node| {
-            self.with_style_store(|engine| engine.tree().assigned_nodes_of(style_node).len())
+            self.with_style_store(|engine| engine.assigned_node_count(style_node))
         })
     }
 
     /// The node assigned to the slot `style_node` names at `index`, in flat-tree order.
     pub(crate) fn assigned_node_at(&self, style_node: StyleNodeID, index: usize) -> StyleNodeID {
-        self.with_style_store(|engine| engine.tree().assigned_nodes_of(style_node)[index])
+        self.with_style_store(|engine| engine.assigned_node(style_node, index))
     }
 
     /// The document's top layer member at `index`, in the order the members were added, or nothing
     /// past the last one.
     pub(crate) fn top_layer_element(&self, index: usize) -> Option<StyleNodeID> {
-        self.with_style_store(|engine| engine.tree().top_layer().get(index).copied())
+        self.with_style_store(|engine| engine.top_layer_element(index))
     }
 
     /// Whether a style engine hosts this arena's records; a layout test's arena has none.
@@ -3544,7 +3715,10 @@ impl LayoutNodeArena {
             );
             return;
         }
-        let shown_record = self.node_style_record(slot);
+        let shown_record = self
+            .derived_styles_shown_before_host_installs
+            .get(&slot)
+            .map_or_else(|| self.node_style_record(slot), |shown| shown.record);
         let damage = self
             .with_style_engine(|engine| engine.element_record_damage(originating, true, shown_record, derived.record));
         if self.apply_reinherited_style_record(host_calls, slot, derived) {
@@ -3580,14 +3754,7 @@ impl LayoutNodeArena {
         parent: u64,
         column_source: Option<u64>,
     ) -> DerivedStyleRecord {
-        self.with_style_engine(|engine| {
-            let mut style = LayoutStyle::from_record(engine, record);
-            style.inherit_from(engine, parent);
-            if let Some(column_source) = column_source {
-                style.copy_column_properties(&LayoutStyle::from_record(engine, column_source));
-            }
-            style.intern(engine)
-        })
+        self.with_style_engine(|engine| engine.reinherited_anonymous_style_record(record, parent, column_source))
     }
 
     fn anonymous_box_column_source(&self, node: NodeSlotId) -> Option<NodeSlotId> {
@@ -3613,12 +3780,12 @@ impl LayoutNodeArena {
         &mut self,
         host_calls: HostCalls<'_>,
         node: NodeSlotId,
-        update: impl FnOnce(&mut LayoutStyle),
+        update: impl FnOnce(&mut LayoutStyle, &crate::css::computed_values::DefaultGroups),
     ) {
         let record = self.node_style_record(node);
         let derived = self.with_style_engine(|engine| {
             let mut style = LayoutStyle::from_record(engine, record);
-            update(&mut style);
+            update(&mut style, engine.default_groups());
             if style.is_unchanged() {
                 return None;
             }
@@ -3639,7 +3806,7 @@ impl LayoutNodeArena {
         host_calls: HostCalls<'_>,
         node: NodeSlotId,
     ) {
-        self.update_layout_style(host_calls, node, |style| {
+        self.update_layout_style(host_calls, node, |style, _| {
             style.set_display(crate::layout::FfiDisplay::outside_and_inside(
                 crate::css::css_enums::display_outside::INLINE,
                 crate::css::css_enums::display_inside::FLOW,
@@ -3653,11 +3820,16 @@ impl LayoutNodeArena {
         data.kind.get() == NodeKind::InlineNode
             && super::node_facts::has_flag(data, NodeFlag::IsPseudoElementPrincipalBox)
             && self
-                .style_payloads(node)
-                .is_some_and(|payloads| ComputedValuesView::new(&payloads.groups).display().is_contents())
+                .style_view(node)
+                .is_some_and(|payloads| payloads.display().is_contents())
     }
 
     pub(crate) fn reinherit_anonymous_descendants(&mut self, host_calls: HostCalls<'_>, node: NodeSlotId) {
+        self.reinherit_own_derived_style_and_anonymous_descendants(host_calls, node);
+        self.decide_relayout_against_derived_style_shown_before_host_install(node);
+    }
+
+    fn reinherit_own_derived_style_and_anonymous_descendants(&mut self, host_calls: HostCalls<'_>, node: NodeSlotId) {
         if self.node_style_record(node) == 0 {
             return;
         }
@@ -3669,8 +3841,8 @@ impl LayoutNodeArena {
         let parent_is_table_wrapper_of_this_table_box = !parent.is_invalid()
             && self.data(parent).kind.get() == NodeKind::TableWrapper
             && self
-                .style_payloads(node)
-                .is_some_and(|payloads| ComputedValuesView::new(&payloads.groups).display().is_table_inside());
+                .style_view(node)
+                .is_some_and(|payloads| payloads.display().is_table_inside());
         if parent_is_table_wrapper_of_this_table_box {
             let derived = self.derive_anonymous_style_record(
                 self.node_style_record(node),
@@ -3754,8 +3926,8 @@ impl LayoutNodeArena {
         derived: DerivedStyleRecord,
     ) -> bool {
         let previous_payloads = self.data(slot).style.get();
-        let changes_layout_affecting_style =
-            !self.style_move_keeps_layout_inputs(slot, previous_payloads, derived.payloads);
+        let changes_layout_affecting_style = !self.holds_derived_style_shown_before_host_install(slot)
+            && !self.style_move_keeps_layout_inputs(slot, previous_payloads, Some(derived.payloads));
         self.replace_arena_pinned_style_record(slot, derived);
         if changes_layout_affecting_style {
             self.invalidate_fragments_and_intrinsic_sizes_of_self_and_ancestors(slot);
@@ -3868,7 +4040,6 @@ impl LayoutNodeArena {
             return;
         }
         self.set_needs_layout_update(node, true);
-        self.scrollable_overflow.contained_boxes_dirty = true;
         if releases_contained_boxes {
             self.record_partial_relayout_escape();
         }
@@ -3944,16 +4115,15 @@ impl LayoutNodeArena {
         }
     }
 
-    pub(crate) fn hover_frame_style_records(&self) -> Vec<u64> {
-        let mut records: Vec<_> = self
-            .style_records
-            .iter()
-            .copied()
-            .filter(|&record| record != 0)
-            .collect();
-        records.sort_unstable();
-        records.dedup();
-        records
+    /// The style records the rows name.
+    pub(crate) fn style_records(&self) -> &ForkVec<u64> {
+        &self.style_records
+    }
+
+    /// Whether a row names a style record other than one the engine installed, as an animation overlay record, which a
+    /// row of a removed element can still name, where no element is assigned it anymore.
+    pub(crate) fn names_uninstalled_style_records(&self) -> bool {
+        self.rows_naming_uninstalled_records != 0
     }
 
     pub(crate) fn refresh_style_flags(&mut self, slot: NodeSlotId) {
@@ -3987,32 +4157,13 @@ impl LayoutNodeArena {
             first_styled_child = self.data(first_styled_child).next_sibling.get();
         }
         if !first_styled_child.is_invalid()
-            && super::node_facts::has_ancestor_fact(self.data(first_styled_child), AncestorFact::ParentLaysOutInColumns)
-                != super::node_facts::node_style_view(self.data(slot))
-                    .is_some_and(|style| super::node_facts::node_lays_out_in_columns(self.data(slot), style))
+            && self.ancestor_facts_from_parent(first_styled_child) != self.data(first_styled_child).ancestor_facts
         {
             let mut child = first_styled_child;
             while !child.is_invalid() {
                 if self.derive_ancestor_facts_for_node(child) {
                     self.invalidate_fragments_of_self_and_ancestors_leaving_intrinsic_sizes_to_its_cause(child);
                 }
-                child = self.data(child).next_sibling.get();
-            }
-        }
-    }
-
-    /// Marks the flex and grid items among the nodes marked for layout and their children, ahead of the layout that
-    /// lays them out: a style change can make a box, or the children of a box, items without rebuilding them.
-    pub(crate) fn mark_flex_and_grid_items_of_nodes_marked_for_layout(&mut self) {
-        let nodes = self.nodes_with_layout_update_flags.clone();
-        for node in nodes {
-            if !self.slot_is_live(node) {
-                continue;
-            }
-            self.mark_flex_or_grid_item(node);
-            let mut child = self.data(node).first_child.get();
-            while !child.is_invalid() {
-                self.mark_flex_or_grid_item(child);
                 child = self.data(child).next_sibling.get();
             }
         }
@@ -4055,6 +4206,9 @@ impl LayoutNodeArena {
             self.set_table_spans(slot, spans);
         }
         self.set_node_style_node(slot, style_node);
+        if kind == NodeKind::FrameSetBox {
+            self.restamp_frameset_layout(slot);
+        }
         self.refresh_has_scroll_offset_flag(slot);
         self.enroll_node_for_replaced_content_facts_sync_if_eligible(slot);
         // A text row renders what the mirror publishes for its node, synced before layout.
@@ -4076,7 +4230,7 @@ impl LayoutNodeArena {
     /// is made when first asked for and reads the row's style as it is made, so the record must
     /// outlive a publication that replaces it before then.
     fn stamp_published_style_record(&mut self, slot: NodeSlotId, published: DerivedStyleRecord) {
-        if self.set_node_style(slot, published.record, published.payloads) {
+        if self.set_node_style(slot, published.record, Some(published.payloads)) {
             self.refresh_style_flags(slot);
         }
         self.style_record_pins[slot.slot_index() as usize] = ArenaStylePin::Published;
@@ -4179,22 +4333,22 @@ impl LayoutNodeArena {
             NodeKind::Unset,
             "stamped an anonymous box onto a bound slot"
         );
-        assert!(derived.record != 0 && !derived.payloads.is_null());
+        assert!(derived.record != 0);
         data.set_kind(kind);
         data.set_flags(super::node_facts::construction_flags(kind, true, 0));
         self.replace_style_record(slot.slot_index() as usize, derived.record);
         self.style_record_pins[slot.slot_index() as usize] = ArenaStylePin::Derived;
         let mut data = self.write_shape(slot);
-        data.set_style(derived.payloads);
+        data.set_style(Some(derived.payloads));
         data.mark();
         self.note_row_style(slot);
         self.enroll_node_for_replaced_content_facts_sync_if_eligible(slot);
     }
 
     pub(crate) fn refresh_insets_use_anchor_functions_flag(&mut self, slot: NodeSlotId) {
-        let insets_use_anchor_functions = self.style_payloads(slot).is_some_and(|payloads| {
-            super::node_facts::style_insets_use_anchor_functions(ComputedValuesView::new(&payloads.groups))
-        });
+        let insets_use_anchor_functions = self
+            .style_view(slot)
+            .is_some_and(|payloads| super::node_facts::style_insets_use_anchor_functions(payloads));
         self.set_node_flag(slot, NodeFlag::InsetsUseAnchorFunctions, insets_use_anchor_functions);
     }
 
@@ -4276,11 +4430,11 @@ impl LayoutNodeArena {
             &mut self.style_record_pins[slot.slot_index() as usize],
             ArenaStylePin::Derived,
         ) != ArenaStylePin::None;
-        assert!(derived.record != 0 && !derived.payloads.is_null());
+        assert!(derived.record != 0);
         let previous_style_record = self.replace_style_record(slot.slot_index() as usize, derived.record);
         self.shape_writes.note_style();
         let mut shape = self.write_shape(slot);
-        shape.set_style(derived.payloads);
+        shape.set_style(Some(derived.payloads));
         shape.mark();
         self.note_row_style(slot);
         self.refresh_style_flags(slot);
@@ -4335,6 +4489,7 @@ impl LayoutNodeArena {
             true
         };
         if changed {
+            self.paint_fact_writes += 1;
             use crate::painting::record::damage::PaintDamage;
             self.push_paint_damage_for_repaint(
                 id,
@@ -4371,6 +4526,7 @@ impl LayoutNodeArena {
                     }
             }
             ReplacedPaintFacts::Video(_) => kind == NodeKind::VideoBox,
+            ReplacedPaintFacts::FrameSet(_) => kind == NodeKind::FrameSetBox,
         };
         if !shows {
             return;
@@ -4382,6 +4538,7 @@ impl LayoutNodeArena {
                 continue;
             }
             Arc::make_mut(&mut self.replaced_paint_facts).insert(row, facts.clone());
+            self.paint_fact_writes += 1;
             self.push_paint_damage_for_repaint(row, damage);
         }
     }
@@ -4398,17 +4555,13 @@ impl LayoutNodeArena {
             identity: self.rows_identity_version(),
             style: self.shape_writes.style(),
             population: self.paintable_population_version(),
-            tables: [
-                Arc::as_ptr(&self.replaced_paint_facts).addr(),
-                Arc::as_ptr(&self.layer_image_paint_facts).addr(),
-                self.svg_paint_resources.address(),
-                self.image_map_areas().address(),
-                self.paint_state
-                    .visual_context
-                    .tree
-                    .as_ref()
-                    .map_or(0, |tree| Arc::as_ptr(tree).addr()),
-            ],
+            table_writes: self.paint_fact_writes + self.svg_paint_resources.writes() + self.image_map_areas().writes(),
+            visual_context_tree: self
+                .paint_state
+                .visual_context
+                .tree
+                .as_ref()
+                .map_or(0, |tree| tree.copy.number()),
         }
     }
 
@@ -4551,24 +4704,16 @@ impl LayoutNodeArena {
         }
         self.write_shape(id).set_flags(updated);
         // A box that becomes a flex or grid item can lay out to the fragment it committed before, but orders its
-        // painting differently, so its committed geometry no longer lets its commit be skipped.
+        // painting differently, so its committed geometry no longer lets its commit be skipped, nor that of the boxes
+        // whose committed fragments hold it.
         if matches!(flag, NodeFlag::IsFlexItem | NodeFlag::IsGridItem) && updated != previous {
             self.paintable_rows.invalidate_committed_geometry(id.slot_index());
+            self.invalidate_committed_geometry_of_ancestors(id);
         }
         // Retaining compositor-animated content decides whether a non-invertible transform
         // still records its stacking context.
         if flag == NodeFlag::HasAnimatedOpacityOrTransform && updated != previous {
             self.push_paint_damage(id, crate::painting::record::damage::PaintDamage::ELIGIBILITY);
-        }
-        // A commit leaves an ordinary inline's overflow unmeasured, since nothing reads it. Once the
-        // inline stores a scroll offset, its overflow clamps that offset, so the pass measures it.
-        if flag == NodeFlag::HasScrollOffset
-            && value
-            && updated != previous
-            && self.paintable_row_is_populated(id)
-            && !self.paintable_side_data(id).overflow_measured_this_commit
-        {
-            self.note_row_overflow_unmeasured(id);
         }
     }
 
@@ -4695,6 +4840,11 @@ impl LayoutNodeArena {
 
     /// Returns whether the node's ancestor facts changed.
     fn derive_ancestor_facts_for_node(&mut self, node: NodeSlotId) -> bool {
+        let facts = self.ancestor_facts_from_parent(node);
+        std::mem::replace(self.unpublished_facts_mut(node).ancestor_facts, facts) != facts
+    }
+
+    fn ancestor_facts_from_parent(&self, node: NodeSlotId) -> u8 {
         let data = self.data(node);
         let parent = data.parent.get();
         let mut facts = 0;
@@ -4734,7 +4884,7 @@ impl LayoutNodeArena {
                 }
             }
         }
-        std::mem::replace(self.unpublished_facts_mut(node).ancestor_facts, facts) != facts
+        facts
     }
 
     /// A style change reaches the anonymous boxes below the node without rebuilding them, and
@@ -4752,88 +4902,81 @@ impl LayoutNodeArena {
         }
     }
 
-    /// Returns every attached subtree root the derivation visited.
-    pub(crate) fn derive_facts_after_tree_update(&mut self, rebuilt_roots: &[NodeSlotId]) -> HashSet<NodeSlotId> {
-        // NB: Anonymous wrappers, generated content, and table fixup can attach nodes
-        // outside the builder's reported rebuild roots. Include every attached subtree.
-        let mut pending = std::mem::take(&mut self.pending_attached_subtree_roots);
-        let roots: HashSet<_> = pending
-            .drain(..)
-            .chain(rebuilt_roots.iter().copied())
-            .filter(|&root| self.slot_is_live(root))
-            .collect();
-        self.pending_attached_subtree_roots = pending;
-        for &root in &roots {
-            let mut ancestor = self.data(root).parent.get();
-            if ancestor.is_invalid() && self.data(root).kind.get() != NodeKind::Viewport {
-                continue;
-            }
-            while !ancestor.is_invalid() && !roots.contains(&ancestor) {
-                ancestor = self.data(ancestor).parent.get();
-            }
-            if ancestor.is_invalid() {
-                self.derive_facts_in_subtree(root);
-                // NB: Whether an anonymous box is a flex or grid item depends on its children.
-                let parent = self.data(root).parent.get();
-                if !parent.is_invalid() {
-                    self.mark_flex_or_grid_item(parent);
+    fn derive_facts_of_attached_node(&mut self, node: NodeSlotId) {
+        self.derive_containing_block_establishment_flags(node);
+        let brings_children = !self.data(node).first_child.get().is_invalid();
+        if self.derive_ancestor_facts_for_node(node) && brings_children {
+            self.refresh_ancestor_facts_of_anonymous_children(node);
+        }
+        self.mark_nodes_escaped_by_out_of_flow_boxes_attached_with(node);
+        self.derive_flex_or_grid_item_flags(node);
+        let parent = self.data(node).parent.get();
+        if super::node_facts::has_flag(self.data(parent), NodeFlag::Anonymous) {
+            self.derive_flex_or_grid_item_flags(parent);
+        }
+    }
+
+    fn mark_nodes_escaped_by_out_of_flow_boxes_attached_with(&mut self, root: NodeSlotId) {
+        self.mark_nodes_escaped_by_attached_out_of_flow_box(root);
+        let mut boxes_with_escaping_descendants: smallvec::SmallVec<[NodeSlotId; 8]> = smallvec::smallvec![root];
+        while let Some(node) = boxes_with_escaping_descendants.pop() {
+            let mut child = self.data(node).first_child.get();
+            while !child.is_invalid() {
+                self.mark_nodes_escaped_by_attached_out_of_flow_box(child);
+                if super::node_facts::has_flag(self.data(child), NodeFlag::AbsposDescendantEscapes) {
+                    boxes_with_escaping_descendants.push(child);
                 }
+                child = self.data(child).next_sibling.get();
             }
         }
-        roots
     }
 
-    /// Derives what the nodes in the inclusive subtree of `root` take from their ancestors: whether they
-    /// establish containing blocks, and their ancestor facts, which the pre-order walk finds already derived
-    /// for the parent. Out-of-flow boxes in the subtree also mark the ancestors they escape.
-    pub(crate) fn derive_facts_in_subtree(&mut self, root: NodeSlotId) {
-        let mut cursor = Some(root);
-        while let Some(node) = cursor {
-            self.derive_containing_block_establishment_flags(node);
-            self.mark_nodes_escaped_by_attached_out_of_flow_box(node);
-            self.derive_ancestor_facts_for_node(node);
-            self.mark_flex_or_grid_item(node);
-            cursor = self.next_node_in_layout_subtree_in_pre_order(root, node);
-        }
-    }
-
-    /// Marks `node` as a flex or grid item once its parent lays it out as one, as its parent's run would: an in-flow
-    /// box that is not an anonymous run of collapsible whitespace. The mark is never taken back.
-    pub(crate) fn mark_flex_or_grid_item(&mut self, node: NodeSlotId) {
+    /// Marks `node` as a flex or grid item exactly when its parent lays it out as one, as its parent's run would: an
+    /// in-flow box that is not an anonymous run of collapsible whitespace.
+    pub(crate) fn derive_flex_or_grid_item_flags(&mut self, node: NodeSlotId) {
         let data = self.data(node);
         let parent = data.parent.get();
         if parent.is_invalid() || !super::node_facts::kind_is_box(data.kind.get()) {
             return;
         }
         let parent_data = self.data(parent);
-        let parents_formatting_context = super::formatting_context::formatting_context_type_created_by_node_data(
-            parent_data,
-            super::node_facts::node_style_view(parent_data),
-            super::node_facts::has_ancestor_fact(parent_data, AncestorFact::ParentIsFlexOrGridContainer),
-            || {
-                let grandparent = parent_data.parent.get();
-                (!grandparent.is_invalid())
-                    .then(|| super::node_facts::node_style_view(self.data(grandparent)))
-                    .flatten()
-                    .map(|style| style.writing_mode())
-            },
-        );
-        let flag = match parents_formatting_context {
-            Some(super::formatting_context::FormattingContextType::Flex) => NodeFlag::IsFlexItem,
-            Some(super::formatting_context::FormattingContextType::Grid) => NodeFlag::IsGridItem,
-            _ => return,
+        let parent_style = super::node_facts::node_style_view(parent_data);
+        let parents_formatting_context = if super::node_facts::node_is_flex_or_grid_container(parent_style) {
+            super::formatting_context::formatting_context_type_created_by_node_data(
+                parent_data,
+                parent_style,
+                super::node_facts::has_ancestor_fact(parent_data, AncestorFact::ParentIsFlexOrGridContainer),
+                || {
+                    let grandparent = parent_data.parent.get();
+                    (!grandparent.is_invalid())
+                        .then(|| super::node_facts::node_style_view(self.data(grandparent)))
+                        .flatten()
+                        .map(|style| style.writing_mode())
+                },
+            )
+        } else {
+            None
         };
-        if super::node_facts::has_flag(data, flag)
-            || super::node_facts::node_style_view(data).is_some_and(|style| style.is_absolutely_positioned())
-            || self.may_be_anonymous_run_of_collapsible_whitespace(node)
-        {
-            return;
+        let item_flag = match parents_formatting_context {
+            Some(super::formatting_context::FormattingContextType::Flex) => Some(NodeFlag::IsFlexItem),
+            Some(super::formatting_context::FormattingContextType::Grid) => Some(NodeFlag::IsGridItem),
+            _ => None,
         }
-        self.set_node_flag(node, flag, true);
+        .filter(|_| {
+            !super::node_facts::node_style_view(data).is_some_and(|style| style.is_absolutely_positioned())
+                && !self.may_be_anonymous_run_of_collapsible_whitespace(node)
+        });
+        for flag in [NodeFlag::IsFlexItem, NodeFlag::IsGridItem] {
+            let is_item = item_flag == Some(flag);
+            if super::node_facts::has_flag(self.data(node), flag) != is_item {
+                self.set_node_flag(node, flag, is_item);
+            }
+        }
     }
 
     /// Whether `node` is an anonymous box holding only text that is ASCII whitespace, which flex and grid containers
-    /// do not lay out as an item. A child whose text is not synced yet counts too: the sync marks its parent again.
+    /// do not lay out as an item. A child whose text is not synced yet counts too: publishing its text marks its parent
+    /// again.
     fn may_be_anonymous_run_of_collapsible_whitespace(&self, node: NodeSlotId) -> bool {
         let data = self.data(node);
         if !super::node_facts::has_flag(data, NodeFlag::Anonymous) || data.generated_for.get() != 0 {
@@ -4852,38 +4995,6 @@ impl LayoutNodeArena {
             child = child_data.next_sibling.get();
         }
         true
-    }
-
-    fn slot_for_data(&self, data: &NodeData) -> (u32, SlotMetadata) {
-        let data_address = std::ptr::from_ref(data) as usize;
-        let slot_size = size_of::<NodeData>();
-
-        let address_index = self
-            .chunks_by_address
-            .partition_point(|address| address.start <= data_address);
-        assert_ne!(
-            address_index, 0,
-            "layout node data pointer does not belong to this arena"
-        );
-        let address = self.chunks_by_address[address_index - 1];
-        let chunk_end = address.start + size_of::<[NodeData; SLOTS_PER_CHUNK]>();
-        assert!(
-            data_address < chunk_end,
-            "layout node data pointer does not belong to this arena"
-        );
-
-        let offset = data_address - address.start;
-        assert_eq!(offset % slot_size, 0, "unaligned layout node arena data pointer");
-        let index = address.chunk_index * SLOTS_PER_CHUNK + offset / slot_size;
-        let index = u32::try_from(index).expect("layout node arena slot index overflowed");
-        let metadata = *self.metadata(index);
-        assert!(metadata.occupied, "layout node arena access for an unused slot");
-        let generation = data.slot_generation.get();
-        assert_eq!(
-            generation, metadata.generation,
-            "layout node arena access used a stale slot"
-        );
-        (index, metadata)
     }
 
     pub(crate) fn node_pre_order_label(&self, id: NodeSlotId) -> u64 {
@@ -5025,18 +5136,18 @@ impl LayoutNodeArena {
         root_of(node) == root_of(other)
     }
 
-    pub(crate) fn is_before(&self, node: &NodeData, other: &NodeData) -> bool {
-        let (node_index, node_metadata) = self.slot_for_data(node);
-        let (other_index, other_metadata) = self.slot_for_data(other);
-        let node = NodeSlotId::new(node_index, node_metadata.generation);
-        let other = NodeSlotId::new(other_index, other_metadata.generation);
+    pub(crate) fn is_before(&self, node: NodeSlotId, other: NodeSlotId) -> bool {
+        assert!(
+            self.slot_is_live(node) && self.slot_is_live(other),
+            "layout node arena compared a stale or unused slot"
+        );
         assert_ne!(node, other, "a layout node cannot precede itself");
         #[cfg(debug_assertions)]
         debug_assert!(
             self.nodes_share_a_layout_tree_root(node, other),
             "layout nodes belong to different trees"
         );
-        self.node_pre_order_label(node) < self.node_pre_order_label(other)
+        self.pre_order_labels[node.slot_index() as usize] < self.pre_order_labels[other.slot_index() as usize]
     }
 
     /// Notes the position option the committed layout of the box `node` uses, or that it uses none.
@@ -5079,17 +5190,16 @@ impl LayoutNodeArena {
         self.position_options_in_use = in_use;
     }
 
-    pub(crate) fn saved_abspos_layout_inputs(&self, data: &NodeData) -> Option<AbsposLayoutInputs> {
-        let (index, metadata) = self.slot_for_data(data);
+    pub(crate) fn saved_abspos_layout_inputs(&self, node: NodeSlotId) -> Option<AbsposLayoutInputs> {
+        assert!(
+            self.slot_is_live(node),
+            "layout node arena read absolute positioning inputs of a stale or unused slot"
+        );
         self.paintable_rows
-            .with_committed_fragment_link(index, metadata.generation, |link| {
+            .with_committed_fragment_link(node.slot_index(), node.generation(), |link| {
                 link.and_then(|link| link.abspos_layout_inputs.as_deref().copied())
             })
-            .or_else(|| {
-                self.confined_abspos_layout_inputs
-                    .get(&NodeSlotId::new(index, metadata.generation))
-                    .copied()
-            })
+            .or_else(|| self.confined_abspos_layout_inputs.get(&node).copied())
     }
 
     pub(crate) fn set_default_scroll_shift(
@@ -5133,9 +5243,6 @@ impl LayoutNodeArena {
             NodeFlag::CompensatesForVerticalScroll,
             compensates_for_vertical_scroll,
         );
-        if anchor_is_live {
-            self.any_default_scroll_shift_anchor_ever_stored = true;
-        }
         if scroll_shift_inputs_changed {
             self.note_visual_context_box_dirty(
                 id,
@@ -5145,9 +5252,6 @@ impl LayoutNodeArena {
     }
 
     pub(crate) fn default_scroll_shift_anchor(&self, id: NodeSlotId) -> NodeSlotId {
-        if !self.any_default_scroll_shift_anchor_ever_stored {
-            return NodeSlotId::INVALID;
-        }
         let slots = &self.default_scroll_shift_anchors;
         let Some(slot) = slots.get(id.slot_index() as usize) else {
             return NodeSlotId::INVALID;
@@ -5159,13 +5263,10 @@ impl LayoutNodeArena {
     }
 
     pub(crate) fn may_have_default_scroll_shift_anchor(&self) -> bool {
-        self.any_default_scroll_shift_anchor_ever_stored
+        !self.default_scroll_shift_anchors.is_empty()
     }
 
     pub(crate) fn for_each_default_scroll_shift_anchor(&self, mut visit: impl FnMut(NodeSlotId, NodeSlotId)) {
-        if !self.any_default_scroll_shift_anchor_ever_stored {
-            return;
-        }
         let slots = &self.default_scroll_shift_anchors;
         for (index, slot) in slots.iter().enumerate() {
             if slot.anchor.is_invalid() || slot.generation == 0 {
@@ -5178,13 +5279,16 @@ impl LayoutNodeArena {
         }
     }
 
-    pub(crate) fn committed_fragment_link(&self, data: &NodeData) -> Option<super::fragment_tree::FragmentLink> {
-        let (index, metadata) = self.slot_for_data(data);
+    pub(crate) fn committed_fragment_link(&self, node: NodeSlotId) -> Option<super::fragment_tree::FragmentLink> {
+        assert!(
+            self.slot_is_live(node),
+            "layout node arena read a committed fragment link of a stale or unused slot"
+        );
         let link = self
             .paintable_rows
-            .committed_fragment_link_cloned(index, metadata.generation);
+            .committed_fragment_link_cloned(node.slot_index(), node.generation());
 
-        let flags = data.flags.get();
+        let flags = self.data(node).flags.get();
         assert_eq!(
             flags & NodeFlag::HasCommittedFragmentLink as u32 != 0,
             link.is_some(),
@@ -5260,11 +5364,23 @@ impl LayoutNodeArena {
         link
     }
 
+    /// Makes the committed geometry of the ancestors of `id` stale up to the first that is stale already, so that the
+    /// next commit walks down to `id` rather than keeping a committed subtree that holds it.
+    pub(crate) fn invalidate_committed_geometry_of_ancestors(&mut self, id: NodeSlotId) {
+        let mut ancestor = self.data(id).parent.get();
+        while !ancestor.is_invalid()
+            && self.slot_is_live(ancestor)
+            && self.with_current_committed_fragment_link(ancestor, |_| ()).is_some()
+        {
+            self.paintable_rows.invalidate_committed_geometry(ancestor.slot_index());
+            ancestor = self.data(ancestor).parent.get();
+        }
+    }
+
     pub(crate) fn clear_committed_fragment_link(&mut self, id: NodeSlotId) {
         // Cached runs may reuse the committed paintable subtree without replaying its fragments.
         // Once that subtree is cleared, a later layout must rebuild it instead.
         self.memo_invalidations.note_run_cache_entries_dropped(id.slot_index());
-        self.note_subtrees_of_self_and_ancestors_committed_anew(id);
         drop(self.take_committed_fragment_link(id));
     }
 
@@ -5349,8 +5465,16 @@ impl LayoutNodeArena {
         }
         state.content = Some(content);
         drop(state);
-        self.memo_invalidations.note_text_replaced(id.slot_index());
-        self.searchable_text = None;
+        let parent = self.data(id).parent.get();
+        if !parent.is_invalid() && super::node_facts::has_flag(self.data(parent), NodeFlag::Anonymous) {
+            self.derive_flex_or_grid_item_flags(parent);
+        }
+        let text_state = self
+            .text_slots
+            .state_index(id)
+            .expect("the row has the text it was just given");
+        self.memo_invalidations.note_text_state_dropped(text_state);
+        *self.searchable_text = None;
         // Publication can happen through a C++ text read before the enrolled
         // sync runs. Invalidate here so every publication invalidates layout,
         // including mapping-only changes with identical rendered code units.
@@ -5393,15 +5517,16 @@ impl LayoutNodeArena {
         self.data(id);
         let index = id.slot_index() as usize;
         if self.replaced_content_facts.len() <= index {
-            self.replaced_content_facts
-                .resize_with(index + 1, ReplacedContentFactsSlot::default);
+            self.replaced_content_facts.resize_with_default(index + 1);
         }
         let previous = &self.replaced_content_facts[index];
         let changed = previous.generation != id.generation() || previous.facts != Some(facts);
-        self.replaced_content_facts[index] = ReplacedContentFactsSlot {
-            generation: id.generation(),
-            facts: Some(facts),
-        };
+        if changed {
+            self.replaced_content_facts[index] = ReplacedContentFactsSlot {
+                generation: id.generation(),
+                facts: Some(facts),
+            };
+        }
         changed
     }
 
@@ -5413,8 +5538,16 @@ impl LayoutNodeArena {
             .and_then(|slot| slot.facts)
     }
 
+    #[inline]
+    pub(crate) fn has_replaced_content_facts(&self, id: NodeSlotId) -> bool {
+        assert!(!id.is_invalid(), "invalid layout node arena slot ID");
+        self.replaced_content_facts
+            .get(id.slot_index() as usize)
+            .is_some_and(|slot| slot.generation == id.generation() && slot.facts.is_some())
+    }
+
     pub(crate) fn invalidate_searchable_text(&mut self) {
-        self.searchable_text = None;
+        *self.searchable_text = None;
     }
 
     /// Gives the row the spans its element published again, after one of the element's span
@@ -5425,6 +5558,23 @@ impl LayoutNodeArena {
             .expect("a row whose spans are restamped is built for an element");
         let spans = self.with_style_store(|engine| engine.element_table_spans(element));
         self.set_table_spans(id, spans)
+    }
+
+    /// Gives a frameset's row what its element published, and answers whether that changed.
+    pub(crate) fn restamp_frameset_layout(&mut self, id: NodeSlotId) -> bool {
+        use crate::painting::replaced_paint_facts::ReplacedPaintFacts;
+        let Some(element) = self.node_style_node(id) else {
+            return false;
+        };
+        let Some(layout) = self.with_style_store(|engine| engine.element_frameset_layout(element)) else {
+            return false;
+        };
+        let facts = ReplacedPaintFacts::FrameSet(layout);
+        if self.replaced_paint_facts.get(&id) == Some(&facts) {
+            return false;
+        }
+        self.set_replaced_paint_facts(super::tree_update_marks::MarkedBox::Row(id), facts);
+        true
     }
 
     /// Gives the row the spans its table cell or table column element has, and answers whether
@@ -5447,6 +5597,17 @@ impl LayoutNodeArena {
 
     pub(crate) fn text_content(&self, id: NodeSlotId) -> Option<&TextContent> {
         self.text_node_state(id)?.content.as_ref()
+    }
+
+    pub(crate) fn text_state_index(&self, id: NodeSlotId) -> Option<u32> {
+        if !self.slot_is_live(id) {
+            return None;
+        }
+        self.text_slots.state_index(id)
+    }
+
+    pub(crate) fn text_state_capacity(&self) -> usize {
+        self.text_slots.states.len()
     }
 
     pub(super) fn set_first_letter_slices(
@@ -5505,7 +5666,7 @@ impl LayoutNodeArena {
                 .map(|index| self.assigned_node_at(element, index))
                 .collect()
         } else {
-            self.with_style_store(|engine| engine.tree().dom_children(element).collect())
+            self.with_style_store(|engine| engine.dom_children(element).collect())
         };
         for child in children {
             let row = self.bound_row(child);
@@ -5612,13 +5773,12 @@ impl LayoutNodeArena {
         if self.may_have_auto_content_visibility && self.may_have_scroll_snap_areas {
             return;
         }
-        let Some(payloads) = self.style_payloads(slot) else {
+        let Some(style) = self.style_view(slot) else {
             return;
         };
-        let style = ComputedValuesView::new(&payloads.groups);
         let has_auto_content_visibility = style.content_visibility() == crate::css::css_enums::content_visibility::AUTO;
         let has_scroll_snap_area =
-            style.misc_reset().scroll_snap_strictness != crate::css::css_enums::scroll_snap_strictness::NONE;
+            style.misc_interaction().scroll_snap_strictness != crate::css::css_enums::scroll_snap_strictness::NONE;
         self.may_have_auto_content_visibility |= has_auto_content_visibility;
         self.may_have_scroll_snap_areas |= has_scroll_snap_area;
     }
@@ -5634,14 +5794,14 @@ impl LayoutNodeArena {
     }
 
     #[inline]
-    pub(crate) fn style_payloads(&self, id: NodeSlotId) -> Option<&FfiStylePayloads> {
-        Self::row_style_payloads(self.data(id))
+    pub(crate) fn style_view(&self, id: NodeSlotId) -> Option<ComputedValuesView<'_>> {
+        Self::row_style_view(self.data(id))
     }
 
     #[inline]
-    fn row_style_payloads(data: &NodeData) -> Option<&FfiStylePayloads> {
+    fn row_style_view(data: &NodeData) -> Option<ComputedValuesView<'_>> {
         // SAFETY: The arena pins the style record of each of its rows while the row holds it.
-        unsafe { super::node_data::style_payloads(data.style.get()) }
+        data.style.get().map(|style| unsafe { style.view() })
     }
 
     /// The row of the node `id` names, or `None` once the node is gone.
@@ -5666,12 +5826,16 @@ impl LayoutNodeArena {
         intrinsic_sizes: AncestorIntrinsicSizes,
     ) {
         self.invalidate_one(node, invalidation);
+        let mut ancestor_intrinsic_sizes = intrinsic_sizes;
         if intrinsic_sizes == AncestorIntrinsicSizes::Reset
             && super::node_facts::kind_is_box(self.data(node).kind.get())
         {
             self.reset_cached_intrinsic_sizes(node);
+            if self.box_contributes_to_no_ancestor_intrinsic_size(node) {
+                ancestor_intrinsic_sizes = AncestorIntrinsicSizes::Kept;
+            }
         }
-        self.invalidate_ancestors_for_change_below(node, invalidation, intrinsic_sizes);
+        self.invalidate_ancestors_for_change_below(node, invalidation, ancestor_intrinsic_sizes);
     }
 
     pub(super) fn invalidate_ancestors_for_change_below(
@@ -5708,14 +5872,16 @@ impl LayoutNodeArena {
     }
 
     /// Whether a change inside the box leaves the intrinsic sizes of its ancestors as they are.
-    /// Absolutely positioned elements don't contribute to ancestor intrinsic sizes. SVG root
-    /// elements have intrinsic sizes determined solely by their own attributes (width, height,
-    /// viewBox), not by their children.
+    /// SVG root elements have intrinsic sizes determined solely by their own attributes (width,
+    /// height, viewBox), not by their children.
     fn content_does_not_size_box(&self, node: NodeSlotId) -> bool {
-        self.data(node).kind.get() == NodeKind::SVGSVGBox
-            || self
-                .node_style_if_live(node)
-                .is_some_and(|style| style.is_absolutely_positioned())
+        self.data(node).kind.get() == NodeKind::SVGSVGBox || self.box_contributes_to_no_ancestor_intrinsic_size(node)
+    }
+
+    /// Absolutely positioned elements don't contribute to ancestor intrinsic sizes.
+    pub(super) fn box_contributes_to_no_ancestor_intrinsic_size(&self, node: NodeSlotId) -> bool {
+        self.node_style_if_live(node)
+            .is_some_and(|style| style.is_absolutely_positioned())
     }
 
     pub(super) fn invalidate_one(&mut self, node: NodeSlotId, invalidation: AncestorInvalidation) {
@@ -5723,9 +5889,6 @@ impl LayoutNodeArena {
             self.memo_invalidations.note_structural_inline_change(node);
         }
         self.bump_fragment_cache_epoch(node);
-        if super::node_facts::kind_is_box(self.data(node).kind.get()) {
-            self.paintable_rows_mut().clear_cached_overflow_data(node);
-        }
     }
 
     pub(super) fn bump_fragment_cache_epoch(&mut self, node: NodeSlotId) {
@@ -5824,21 +5987,22 @@ impl LayoutNodeArena {
 
         self.assign_pre_order_labels_to_inserted_subtree(parent, child);
         self.note_layout_subtree_attached(child);
-        self.pending_attached_subtree_roots.push(child);
-        self.note_overflow_contained_boxes_may_move_with_subtree(child);
+        if self.deferred_child_list_insertion_parent_slots.contains(&parent) {
+            self.children_inserted_under_deferred_parents.push((parent, child));
+        }
         // NB: Resolving the deferred insertion marks the parent for layout, which resets its intrinsic sizes.
         self.invalidate_self_and_ancestors(
             parent,
             AncestorInvalidation::StructuralChange,
             AncestorIntrinsicSizes::Kept,
         );
+        self.derive_facts_of_attached_node(child);
     }
 
     pub(crate) fn remove_child(&mut self, parent: NodeSlotId, child: NodeSlotId) {
         if self.paintable_row_count() > 0 {
             self.push_enclosing_paint_order_damage(child);
         }
-        self.note_overflow_contained_boxes_may_move_with_subtree(child);
         self.unlink_child(parent, child);
         self.invalidate_self_and_ancestors(
             parent,
@@ -5918,6 +6082,10 @@ impl LayoutNodeArena {
             .get(&node)
             .copied()
             .filter(|&inline_box| self.slot_is_live(inline_box))
+    }
+
+    pub(crate) fn slot_capacity(&self) -> usize {
+        self.slot_metadata.len()
     }
 
     /// The live node in the slot at `index`, if there is one.
@@ -6076,12 +6244,6 @@ impl LayoutNodeArena {
         chunk.slot_mut(index / SLOTS_PER_CHUNK, index % SLOTS_PER_CHUNK, &mut self.shape_writes)
     }
 
-    fn metadata(&self, index: u32) -> &SlotMetadata {
-        self.slot_metadata
-            .get(index as usize)
-            .expect("invalid layout node arena slot ID")
-    }
-
     fn metadata_mut(&mut self, index: u32) -> &mut SlotMetadata {
         self.slot_metadata
             .get_mut(index as usize)
@@ -6132,7 +6294,7 @@ impl<'a> crate::painting::paint_read::PaintRow<'a> for LiveRow<'a> {
     }
 
     fn style(self) -> Option<ComputedValuesView<'a>> {
-        LayoutNodeArena::row_style_payloads(self.data).map(|payloads| ComputedValuesView::new(&payloads.groups))
+        LayoutNodeArena::row_style_view(self.data)
     }
 
     fn style_node(self) -> Option<StyleNodeID> {
@@ -6146,40 +6308,19 @@ pub(crate) struct NodeAllocation {
     pub(crate) slot: NodeSlotId,
 }
 
-/// Whether the counter styles the generated content of the element `style_node` names, or of its
-/// pseudo-element `generated_for`, names now differ from the ones its box was built with.
-#[unsafe(no_mangle)]
-pub extern "C" fn render_state_content_counter_styles_changed(
-    host: &DocumentHost,
-    read: &crate::render_state::BegunRead,
-    style_node: u32,
-    generated_for: u8,
-) -> bool {
-    let Some(owner) = counter_owner(style_node, generated_for) else {
-        return false;
-    };
-    read_arena(host, read, owner, |arena, owner| {
-        super::generated_content::content_counter_styles_changed(arena, owner)
-    })
-}
-
-fn counter_owner(style_node: u32, generated_for: u8) -> Option<super::counters::CounterOwner> {
-    StyleNodeID::from_raw(style_node).map(|element| super::counters::CounterOwner { element, generated_for })
-}
-
-/// Whether an element whose installed style has the `count` group payloads `payloads` has an innermost `list-item`
-/// counter of its own that counts forward, as the counters a layout tree build resolves for it from that style have:
-/// appending a last list item to such an element leaves the items before it as they are numbered.
+/// Whether an element whose installed style is `style` has an innermost `list-item` counter of its own that counts
+/// forward, as the counters a layout tree build resolves for it from that style have: appending a last list item to
+/// such an element leaves the items before it as they are numbered.
 ///
 /// # Safety
 ///
-/// `payloads` must point at `count` live group payloads.
+/// `style` must point at the groups of a live style record.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn style_resets_forward_list_item_counter(payloads: *const *const c_void, count: usize) -> bool {
-    assert!(!payloads.is_null(), "style group payload array is null");
+pub unsafe extern "C" fn style_resets_forward_list_item_counter(style: *const c_void) -> bool {
     // SAFETY: Guaranteed by the caller.
-    let groups = unsafe { ak::slice_from_raw_parts(payloads, count) };
-    super::counters::style_resets_forward_list_item_counter(ComputedValuesView::new(groups))
+    let style = unsafe { LayoutStyleRef::from_raw(style) }.expect("an element's style record is not null");
+    // SAFETY: Guaranteed by the caller.
+    super::counters::style_resets_forward_list_item_counter(unsafe { style.view() })
 }
 
 #[unsafe(no_mangle)]
@@ -6215,7 +6356,8 @@ pub unsafe extern "C" fn render_state_set_node_style(
     let change = LayoutChange::SetNodeStyle {
         node: id,
         record: style_record,
-        payloads: StylePayloadsRef::new(payloads.cast()),
+        // SAFETY: The host keeps the record it names alive while the row holds it.
+        payloads: unsafe { LayoutStyleRef::from_raw(payloads) },
     };
     queue(host, change);
 }
@@ -6411,8 +6553,6 @@ pub(crate) fn sync_enrolled_content_for_layout(arena: &mut LayoutNodeArena) {
             continue;
         }
         super::rendered_text::ensure_text_content(arena, node);
-        // NB: Whether an anonymous box is a flex or grid item depends on whether its text is all whitespace.
-        arena.mark_flex_or_grid_item(arena.data(node).parent.get());
     }
     arena.sync_enrolled_replaced_content_facts();
 }
@@ -6874,14 +7014,13 @@ mod tests {
         // The rows' styles hold no group, so the arena is told up front what it would read from them.
         arena.may_have_auto_content_visibility = true;
         arena.may_have_scroll_snap_areas = true;
-        let payloads = [std::ptr::null::<c_void>(); 1];
         let slot = arena.allocate_unbound();
         arena.stamp_anonymous_box(
             slot,
             NodeKind::InlineNode,
             DerivedStyleRecord {
                 record: 7,
-                payloads: crate::layout::node_data::StylePayloadsRef::new(payloads.as_ptr().cast()),
+                payloads: crate::layout::node_data::LayoutStyleRef::dangling(),
             },
         );
         assert_eq!(arena.data(slot).kind.get(), NodeKind::InlineNode);
@@ -6891,11 +7030,7 @@ mod tests {
         assert!(arena.node_style_record_is_derived(slot));
 
         let element = arena.allocate(test_construction_facts_with_kind(NodeKind::InlineNode));
-        arena.set_node_style(
-            element,
-            9,
-            crate::layout::node_data::StylePayloadsRef::new(payloads.as_ptr().cast()),
-        );
+        arena.set_node_style(element, 9, Some(crate::layout::node_data::LayoutStyleRef::dangling()));
         assert_eq!(arena.node_style_record(element), 9);
         assert!(!arena.node_style_record_is_derived(element));
 
@@ -7481,7 +7616,6 @@ mod tests {
                 inline_alignment: StaticPositionAlignment::Center,
                 block_alignment: StaticPositionAlignment::End,
                 alignment_derives_from_own_computed_values: true,
-                is_known: true,
             },
             containing_block_info: AbsposContainingBlockInfo {
                 rect: Default::default(),
@@ -7506,11 +7640,8 @@ mod tests {
         let mut link = fragment_tree::FragmentLink::for_test(allocation.slot);
         link.abspos_layout_inputs = Some(std::sync::Arc::new(inputs));
         arena.set_committed_fragment_link(allocation.slot, link, None);
-        assert!(arena.committed_fragment_link(arena.data(allocation.slot)).is_some());
-        assert_eq!(
-            arena.saved_abspos_layout_inputs(arena.data(allocation.slot)),
-            Some(inputs)
-        );
+        assert!(arena.committed_fragment_link(allocation.slot).is_some());
+        assert_eq!(arena.saved_abspos_layout_inputs(allocation.slot), Some(inputs));
 
         let work = crate::layout::tree_mutation::OwedHostWork::default();
         crate::painting::ffi::paintable_cleared_from_node(
@@ -7519,8 +7650,8 @@ mod tests {
             allocation.slot,
         );
 
-        assert!(arena.committed_fragment_link(arena.data(allocation.slot)).is_none());
-        assert_eq!(arena.saved_abspos_layout_inputs(arena.data(allocation.slot)), None);
+        assert!(arena.committed_fragment_link(allocation.slot).is_none());
+        assert_eq!(arena.saved_abspos_layout_inputs(allocation.slot), None);
         arena
             .free_subtree(allocation.slot)
             .destroy_shells_and_invoke_callbacks(&crate::stage::MainThread::for_test());
@@ -7543,15 +7674,15 @@ mod tests {
         assert!(std::sync::Arc::ptr_eq(&moved.fragment, &retained_fragment));
         arena.set_committed_fragment_link(new.slot, moved, None);
 
-        assert!(arena.committed_fragment_link(arena.data(old.slot)).is_none());
-        assert_eq!(arena.saved_abspos_layout_inputs(arena.data(old.slot)), None);
-        assert_eq!(arena.saved_abspos_layout_inputs(arena.data(new.slot)), Some(inputs));
+        assert!(arena.committed_fragment_link(old.slot).is_none());
+        assert_eq!(arena.saved_abspos_layout_inputs(old.slot), None);
+        assert_eq!(arena.saved_abspos_layout_inputs(new.slot), Some(inputs));
         let moved = arena
-            .committed_fragment_link(arena.data(new.slot))
+            .committed_fragment_link(new.slot)
             .expect("new slot must receive the committed fragment");
         assert!(std::sync::Arc::ptr_eq(&moved.fragment, &retained_fragment));
         arena.set_committed_fragment_link(new.slot, fragment_tree::FragmentLink::for_test(new.slot), None);
-        assert_eq!(arena.saved_abspos_layout_inputs(arena.data(new.slot)), None);
+        assert_eq!(arena.saved_abspos_layout_inputs(new.slot), None);
         arena
             .free_subtree(old.slot)
             .destroy_shells_and_invoke_callbacks(&crate::stage::MainThread::for_test());
@@ -7563,8 +7694,7 @@ mod tests {
     #[test]
     fn intrinsic_size_cache_entries_go_with_noted_resets_and_slot_reuse() {
         let mut arena = LayoutNodeArena::new();
-        let scratch = crate::layout::run_state::LayoutScratch::default();
-        let caches = &scratch.intrinsic_size_caches;
+        let mut scratch = crate::layout::run_state::LayoutScratch::default();
         let first = arena.allocate_for_test();
         scratch.apply_memo_invalidations(&mut arena);
         let key = IntrinsicSizeCacheKey {
@@ -7584,28 +7714,50 @@ mod tests {
             depends_on_percentage_inline_basis: false,
             depends_on_block_size: false,
         };
-        caches.max_content_block_size_cache_put(first.slot, key, value);
-        caches.intrinsic_inline_size_measurement_cache_put(first.slot, key, inline_measurement);
-        assert_eq!(caches.max_content_block_size_cache_get(first.slot, key), Some(value));
+        scratch
+            .intrinsic_size_caches
+            .max_content_block_size_cache_put(first.slot, key, value);
+        scratch
+            .intrinsic_size_caches
+            .intrinsic_inline_size_measurement_cache_put(first.slot, key, inline_measurement);
         assert_eq!(
-            caches.intrinsic_inline_size_measurement_cache_get(first.slot, key),
+            scratch
+                .intrinsic_size_caches
+                .max_content_block_size_cache_get(first.slot, key),
+            Some(value)
+        );
+        assert_eq!(
+            scratch
+                .intrinsic_size_caches
+                .intrinsic_inline_size_measurement_cache_get(first.slot, key),
             Some(inline_measurement)
         );
 
         arena.reset_cached_intrinsic_sizes(first.slot);
         assert_eq!(
-            caches.intrinsic_inline_size_measurement_cache_get(first.slot, key),
+            scratch
+                .intrinsic_size_caches
+                .intrinsic_inline_size_measurement_cache_get(first.slot, key),
             Some(inline_measurement),
             "a reset reaches the cache when the stage applies the arena's notes"
         );
         scratch.apply_memo_invalidations(&mut arena);
-        assert_eq!(caches.max_content_block_size_cache_get(first.slot, key), None);
         assert_eq!(
-            caches.intrinsic_inline_size_measurement_cache_get(first.slot, key),
+            scratch
+                .intrinsic_size_caches
+                .max_content_block_size_cache_get(first.slot, key),
+            None
+        );
+        assert_eq!(
+            scratch
+                .intrinsic_size_caches
+                .intrinsic_inline_size_measurement_cache_get(first.slot, key),
             None
         );
 
-        caches.intrinsic_inline_size_measurement_cache_put(first.slot, key, inline_measurement);
+        scratch
+            .intrinsic_size_caches
+            .intrinsic_inline_size_measurement_cache_put(first.slot, key, inline_measurement);
         arena
             .free_subtree(first.slot)
             .destroy_shells_and_invoke_callbacks(&crate::stage::MainThread::for_test());
@@ -7613,13 +7765,17 @@ mod tests {
         assert_eq!(second.slot.slot_index(), first.slot.slot_index());
         assert_ne!(second.slot, first.slot);
         assert_eq!(
-            caches.intrinsic_inline_size_measurement_cache_get(second.slot, key),
+            scratch
+                .intrinsic_size_caches
+                .intrinsic_inline_size_measurement_cache_get(second.slot, key),
             None,
             "a reused slot misses by its generation before the stage applies the freeing note"
         );
         scratch.apply_memo_invalidations(&mut arena);
         assert_eq!(
-            caches.intrinsic_inline_size_measurement_cache_get(second.slot, key),
+            scratch
+                .intrinsic_size_caches
+                .intrinsic_inline_size_measurement_cache_get(second.slot, key),
             None
         );
         arena
@@ -7630,7 +7786,8 @@ mod tests {
     #[test]
     fn intrinsic_size_cache_answers_masked_probes_only_from_independent_measurements() {
         let mut arena = LayoutNodeArena::new();
-        let caches = super::IntrinsicSizeCaches::default();
+        let mut caches = super::IntrinsicSizeCaches::default();
+        caches.cover_slots(64);
         let allocation = arena.allocate_for_test();
         let dependent_allocation = arena.allocate_for_test();
         let key_with_basis = |basis: i32| IntrinsicSizeCacheKey {
@@ -7767,7 +7924,8 @@ mod tests {
     #[test]
     fn intrinsic_inline_size_cache_answers_probes_through_every_combination_of_masked_key_parts() {
         let mut arena = LayoutNodeArena::new();
-        let caches = super::IntrinsicSizeCaches::default();
+        let mut caches = super::IntrinsicSizeCaches::default();
+        caches.cover_slots(64);
         let measured_key = inline_size_cache_key(Some(100), Some(300), Some(50));
         for observed_parts in every_combination_of_key_parts() {
             let allocation = arena.allocate_for_test();
@@ -7800,7 +7958,8 @@ mod tests {
     #[test]
     fn intrinsic_inline_size_cache_masks_the_block_size_of_measurements_that_never_observed_it() {
         let mut arena = LayoutNodeArena::new();
-        let caches = super::IntrinsicSizeCaches::default();
+        let mut caches = super::IntrinsicSizeCaches::default();
+        caches.cover_slots(64);
         let observes_block_size = IntrinsicMeasurementDependencies {
             block_size: true,
             ..Default::default()

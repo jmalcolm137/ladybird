@@ -40,11 +40,12 @@ define_native_function_class!(
 impl DataViewConstructor {
     pub fn create(vm: &Vm, realm: Gc<Realm>) -> Gc<DataViewConstructor> {
         realm.create_object(vm, |_| DataViewConstructor {
-            base: NativeFunction::new_with_name(
+            base: NativeFunction::new_with_prototype(
                 vm,
                 Self::CLASS,
-                vm.names.DataView.as_string().clone(),
+                realm,
                 realm.function_prototype(),
+                Some(vm.names.DataView.as_string().clone()),
             ),
         })
     }
@@ -128,8 +129,7 @@ impl DataViewConstructor {
             // a. If bufferIsFixedLength is true, then
             if buffer_is_fixed_length {
                 // i. Let viewByteLength be bufferByteLength - offset.
-                // NB: The length is truncated to the u32 that a ByteLength holds.
-                view_byte_length = ByteLength::Length((buffer_byte_length - offset) as u32);
+                view_byte_length = ByteLength::Length(buffer_byte_length - offset);
             }
             // b. Else,
             else {
@@ -140,11 +140,10 @@ impl DataViewConstructor {
         // 9. Else,
         else {
             // a. Let viewByteLength be ? ToIndex(byteLength).
-            // NB: The length is truncated to the u32 that a ByteLength holds.
-            view_byte_length = ByteLength::Length(byte_length.to_index(vm)? as u32);
+            view_byte_length = ByteLength::Length(byte_length.to_index(vm)? as usize);
 
             // b. If offset + viewByteLength > bufferByteLength, throw a RangeError exception.
-            let checked_add = offset.checked_add(view_byte_length.length() as usize);
+            let checked_add = offset.checked_add(view_byte_length.length());
 
             if checked_add.is_none_or(|end| end > buffer_byte_length) {
                 return vm.throw_completion(ErrorKind::RangeError, ErrorType::InvalidLength, &[&vm.names.DataView]);
@@ -157,7 +156,7 @@ impl DataViewConstructor {
             realm,
             new_target,
             Intrinsics::data_view_prototype,
-            |_, prototype| DataView::new(vm, buffer, view_byte_length, offset, prototype),
+            |_, prototype| DataView::new(vm, realm, buffer, view_byte_length, offset, prototype),
         )?;
 
         // 11. If IsDetachedBuffer(buffer) is true, throw a TypeError exception.
@@ -180,7 +179,7 @@ impl DataViewConstructor {
         // 14. If byteLength is not undefined, then
         if !byte_length.is_undefined() {
             // a. If offset + viewByteLength > bufferByteLength, throw a RangeError exception.
-            let checked_add = offset.checked_add(view_byte_length.length() as usize);
+            let checked_add = offset.checked_add(view_byte_length.length());
 
             if checked_add.is_none_or(|end| end > buffer_byte_length) {
                 return vm.throw_completion(ErrorKind::RangeError, ErrorType::InvalidLength, &[&vm.names.DataView]);

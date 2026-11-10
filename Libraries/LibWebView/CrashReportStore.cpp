@@ -20,6 +20,7 @@
 #include <LibCore/Process.h>
 #include <LibCore/StandardPaths.h>
 #include <LibCore/System.h>
+#include <LibFileSystem/FileSystem.h>
 #include <LibWebView/CrashReport.h>
 #include <LibWebView/CrashReportStore.h>
 #include <LibWebView/ProcessManager.h>
@@ -41,7 +42,7 @@ ByteString CrashReportStore::default_directory()
     return LexicalPath::join(Core::StandardPaths::user_data_directory(), "Ladybird"sv, "CrashReports"sv).string();
 }
 
-// The browser's own store lives under the user data directory.
+// The browser's own store. It moves into the profile once the profile is known.
 CrashReportStore& CrashReportStore::the()
 {
     static NeverDestroyed<CrashReportStore> store { default_directory() };
@@ -65,7 +66,7 @@ bool CrashReportStore::is_saved_report_name(StringView name)
         if (has_timestamp)
             suffix = name.substring_view(timestamp_pattern.length());
     }
-    for (auto type : { ProcessType::Browser, ProcessType::WebContent, ProcessType::WebWorker,
+    for (auto type : { ProcessType::Browser, ProcessType::WebContent,
              ProcessType::RequestServer, ProcessType::ImageDecoder, ProcessType::MediaServer, ProcessType::AudioServer, ProcessType::VideoDecoderServer, ProcessType::Compositor }) {
         auto prefix = ByteString::formatted("{}-", process_name_from_type(type));
         if (!suffix.starts_with(prefix) || suffix.length() != prefix.length() + 10)
@@ -83,8 +84,9 @@ static constexpr auto pending_prefix = "Browser-"sv;
 static constexpr auto pending_suffix = ".pending"sv;
 static constexpr off_t maximum_report_size = 1048576;
 static constexpr size_t retained_report_count = 20;
+static constexpr size_t maximum_waiting_report_count = 100;
 static constexpr auto hard_cutoff_date = UnixDateTime::from_unix_time_parts(2026, 10, 2, 20, 0, 0, 0);
-static constexpr auto maximum_pending_report_age = AK::Duration::from_seconds(14ll * 24 * 60 * 60);
+static constexpr auto maximum_unsent_report_age = AK::Duration::from_seconds(30ll * 24 * 60 * 60);
 
 static NeverDestroyed<ByteString> s_browser_pending_path;
 static NeverDestroyed<OwnPtr<CrashReport>> s_browser_crash_report;
@@ -167,11 +169,37 @@ static ErrorOr<Optional<Core::Directory>> open_seen_directory_if_exists(Core::Di
 }
 
 // Moving is atomic, so a report is always in exactly one of the two directories. Moving it where it already is succeeds.
+static timespec modified_time(struct stat const&);
+
+// A profile can live on another file system than the place reports used to be kept, which rename cannot reach.
+static ErrorOr<void> copy_report_across_file_systems(Core::Directory const& from, Core::Directory const& to, ByteString const& name, struct stat const& status)
+{
+    auto text = TRY(read_owned_file(from, name));
+    auto file = TRY(to.open(name, Core::File::OpenMode::Write | Core::File::OpenMode::MustBeNew | Core::File::OpenMode::NoFollow, 0400));
+    ArmedScopeGuard remove_incomplete_copy = [&] { (void)unlinkat(to.fd(), name.characters(), 0); };
+    TRY(file->write_until_depleted(text.bytes()));
+
+    // A report's age is based on this, so the copy has to expire when the report would have.
+    auto modified = modified_time(status);
+    timespec times[2] { modified, modified };
+    if (futimens(file->fd(), times) < 0 || fsync(file->fd()) < 0)
+        return Error::from_errno(errno);
+    remove_incomplete_copy.disarm();
+
+    if (unlinkat(from.fd(), name.characters(), 0) < 0)
+        return Error::from_errno(errno);
+    return {};
+}
+
 static ErrorOr<void> move_report(Core::Directory const& from, Core::Directory const& to, ByteString const& name)
 {
     struct stat status {};
     if (is_owned_regular_file_at(from, name, status)) {
-        TRY(Core::System::renameat(from.fd(), name, to.fd(), name));
+        if (auto result = Core::System::renameat(from.fd(), name, to.fd(), name); result.is_error()) {
+            if (result.error().code() != EXDEV)
+                return result.release_error();
+            TRY(copy_report_across_file_systems(from, to, name, status));
+        }
         // The move is only durable once both directories are, or a report could be offered again.
         if (fsync(to.fd()) < 0 || fsync(from.fd()) < 0)
             return Error::from_errno(errno);
@@ -180,6 +208,30 @@ static ErrorOr<void> move_report(Core::Directory const& from, Core::Directory co
     if (is_owned_regular_file_at(to, name, status))
         return {};
     return Error::from_string_literal("Crash report no longer exists");
+}
+
+static constexpr auto website_suffix = ".website"sv;
+
+static ByteString website_file_name(StringView report_name)
+{
+    return ByteString::formatted("{}{}", report_name, website_suffix);
+}
+
+static void remove_website(Core::Directory const& directory, StringView report_name)
+{
+    (void)unlinkat(directory.fd(), website_file_name(report_name).characters(), 0);
+}
+
+static void move_all_reports(Core::Directory const& from, Core::Directory const& to)
+{
+    Core::DirIterator iterator(from.path().string(), Core::DirIterator::SkipDots);
+    while (iterator.has_next()) {
+        auto name = iterator.next_path();
+        if (!CrashReportStore::is_saved_report_name(name))
+            continue;
+        if (auto result = move_report(from, to, name); result.is_error())
+            warnln("Could not move crash report {}: {}", name, result.error());
+    }
 }
 
 static timespec modified_time(struct stat const& status)
@@ -191,8 +243,8 @@ static timespec modified_time(struct stat const& status)
 #    endif
 }
 
-// Bound disk use by the reports kept for reference. Unrelated files and symlinks are ignored.
-static void apply_retention(Core::Directory const& seen_directory, ByteString const& offered_name)
+// Bound disk use by a directory of reports. Unrelated files and symlinks are ignored.
+static void apply_retention(Core::Directory const& directory, ByteString const& offered_name, size_t maximum_count)
 {
     struct RetainedReport {
         ByteString name;
@@ -200,13 +252,13 @@ static void apply_retention(Core::Directory const& seen_directory, ByteString co
     };
 
     Vector<RetainedReport> reports;
-    Core::DirIterator iterator(seen_directory.path().string(), Core::DirIterator::SkipDots);
+    Core::DirIterator iterator(directory.path().string(), Core::DirIterator::SkipDots);
     while (iterator.has_next()) {
         auto name = iterator.next_path();
         if (!CrashReportStore::is_saved_report_name(name))
             continue;
         struct stat status {};
-        if (!is_owned_regular_file_at(seen_directory, name, status))
+        if (!is_owned_regular_file_at(directory, name, status))
             continue;
         reports.append({ move(name), modified_time(status) });
     }
@@ -217,13 +269,14 @@ static void apply_retention(Core::Directory const& seen_directory, ByteString co
         return a.modified.tv_nsec < b.modified.tv_nsec;
     });
     // The report just offered is kept however old it is, so it can still be read and sent. An older one goes instead.
-    auto excess_count = reports.size() > retained_report_count ? reports.size() - retained_report_count : 0;
+    auto excess_count = reports.size() > maximum_count ? reports.size() - maximum_count : 0;
     for (auto const& report : reports) {
         if (excess_count == 0)
             break;
         if (report.name == offered_name)
             continue;
-        (void)unlinkat(seen_directory.fd(), report.name.characters(), 0);
+        (void)unlinkat(directory.fd(), report.name.characters(), 0);
+        remove_website(directory, report.name);
         --excess_count;
     }
 }
@@ -245,7 +298,7 @@ ErrorOr<Vector<ByteString>> CrashReportStore::pending_report_names(UnixDateTime 
 {
     // Runs on every launch, so this only lists names instead of reading every report.
     auto directory = TRY(open_report_directory(m_directory));
-    auto earliest_time = max(hard_cutoff_date, now - maximum_pending_report_age);
+    auto earliest_time = max(hard_cutoff_date, now - maximum_unsent_report_age);
 
     Vector<ByteString> names;
     Core::DirIterator iterator(directory.path().string(), Core::DirIterator::SkipDots);
@@ -266,10 +319,61 @@ ErrorOr<Vector<ByteString>> CrashReportStore::pending_report_names(UnixDateTime 
     return names;
 }
 
-bool CrashReportStore::has_pending_reports(UnixDateTime now) const
+// Without an earliest time, every report goes.
+static void remove_reports_older_than(Core::Directory const& directory, Optional<UnixDateTime> earliest_time)
 {
-    auto names = pending_report_names(now);
-    return !names.is_error() && !names.value().is_empty();
+    Core::DirIterator iterator(directory.path().string(), Core::DirIterator::SkipDots);
+    while (iterator.has_next()) {
+        auto name = iterator.next_path();
+        if (!CrashReportStore::is_saved_report_name(name))
+            continue;
+        struct stat status {};
+        if (!is_owned_regular_file_at(directory, name, status))
+            continue;
+        if (!earliest_time.has_value() || UnixDateTime::from_unix_timespec(modified_time(status)) < *earliest_time) {
+            (void)unlinkat(directory.fd(), name.characters(), 0);
+            remove_website(directory, name);
+        }
+    }
+}
+
+// A website goes after its report, so stopping between the two can leave it behind without one.
+static void remove_orphaned_websites(Core::Directory const& directory)
+{
+    Core::DirIterator iterator(directory.path().string(), Core::DirIterator::SkipDots);
+    while (iterator.has_next()) {
+        auto name = iterator.next_path();
+        if (!name.ends_with(website_suffix))
+            continue;
+        struct stat status {};
+        if (!is_owned_regular_file_at(directory, name.substring(0, name.length() - website_suffix.length()), status))
+            (void)unlinkat(directory.fd(), name.characters(), 0);
+    }
+}
+
+static ErrorOr<void> remove_reports_in_directory(ByteString const& path, Optional<UnixDateTime> earliest_time)
+{
+    auto directory = TRY(open_report_directory(path));
+    remove_reports_older_than(directory, earliest_time);
+    remove_orphaned_websites(directory);
+    if (auto seen_directory = TRY(open_seen_directory_if_exists(directory)); seen_directory.has_value())
+        remove_reports_older_than(*seen_directory, earliest_time);
+    return {};
+}
+
+// A report that could not be moved in stays where it was, but it is still ours to delete.
+ErrorOr<void> CrashReportStore::remove_reports(Optional<UnixDateTime> earliest_time) const
+{
+    ErrorOr<void> adopted_directory_result {};
+    if (m_adopted_directory.has_value() && FileSystem::exists(*m_adopted_directory))
+        adopted_directory_result = remove_reports_in_directory(*m_adopted_directory, earliest_time);
+    TRY(remove_reports_in_directory(m_directory, earliest_time));
+    return adopted_directory_result;
+}
+
+ErrorOr<void> CrashReportStore::remove_expired_reports(UnixDateTime now) const
+{
+    return remove_reports(now - maximum_unsent_report_age);
 }
 
 ErrorOr<void> CrashReportStore::mark_seen(ByteString const& name) const
@@ -279,21 +383,73 @@ ErrorOr<void> CrashReportStore::mark_seen(ByteString const& name) const
     auto directory = TRY(open_report_directory(m_directory));
     auto seen_directory = TRY(open_seen_directory(directory));
     TRY(move_report(directory, seen_directory, name));
-    apply_retention(seen_directory, name);
+    remove_website(directory, name);
+    apply_retention(seen_directory, name, retained_report_count);
     return {};
 }
 
-ErrorOr<void> CrashReportStore::mark_all_seen(UnixDateTime now) const
+ErrorOr<void> CrashReportStore::save_website(ByteString const& name, StringView website) const
 {
-    ErrorOr<void> result;
-    for (auto const& name : TRY(pending_report_names(now))) {
-        if (auto marked = mark_seen(name); marked.is_error() && !result.is_error())
-            result = marked.release_error();
-    }
-    return result;
+    if (!is_saved_report_name(name))
+        return Error::from_string_literal("Invalid crash report name");
+    auto directory = TRY(open_report_directory(m_directory));
+    auto file = TRY(directory.open(website_file_name(name), Core::File::OpenMode::Write | Core::File::OpenMode::Truncate | Core::File::OpenMode::NoFollow, 0600));
+    TRY(file->write_until_depleted(website.bytes()));
+    return {};
 }
 
-ErrorOr<void> CrashReportStore::remove_sent_report(ByteString const& name) const
+Optional<String> CrashReportStore::website(ByteString const& name) const
+{
+    if (!is_saved_report_name(name))
+        return {};
+    auto directory = open_report_directory(m_directory);
+    if (directory.is_error())
+        return {};
+    auto contents = read_owned_file(directory.value(), website_file_name(name));
+    if (contents.is_error() || contents.value().is_empty())
+        return {};
+    return String::from_utf8_with_replacement_character(contents.value().view());
+}
+
+ErrorOr<void> CrashReportStore::adopt_reports_from(ByteString const& directory)
+{
+    if (directory == m_directory || !FileSystem::exists(directory))
+        return {};
+    m_adopted_directory = directory;
+
+    auto from = TRY(open_report_directory(directory, Core::Directory::CreateDirectories::No));
+    auto to = TRY(open_report_directory(m_directory));
+    move_all_reports(from, to);
+    if (auto seen_from = TRY(open_seen_directory_if_exists(from)); seen_from.has_value()) {
+        auto seen_to = TRY(open_seen_directory(to));
+        move_all_reports(*seen_from, seen_to);
+    }
+    return {};
+}
+
+ErrorOr<void> CrashReportStore::remove_websites_saved_since(UnixDateTime since) const
+{
+    auto directory = TRY(open_report_directory(m_directory));
+    Core::DirIterator iterator(directory.path().string(), Core::DirIterator::SkipDots);
+    while (iterator.has_next()) {
+        auto name = iterator.next_path();
+        if (!name.ends_with(website_suffix))
+            continue;
+        struct stat status {};
+        if (!is_owned_regular_file_at(directory, name, status))
+            continue;
+        if (UnixDateTime::from_unix_timespec(modified_time(status)) >= since)
+            (void)unlinkat(directory.fd(), name.characters(), 0);
+    }
+    return {};
+}
+
+ErrorOr<void> CrashReportStore::remove_all_reports() const
+{
+    return remove_reports({});
+}
+
+ErrorOr<void> CrashReportStore::remove_report(ByteString const& name) const
 {
     if (!is_saved_report_name(name))
         return Error::from_string_literal("Invalid crash report name");
@@ -303,7 +459,7 @@ ErrorOr<void> CrashReportStore::remove_sent_report(ByteString const& name) const
                 return {};
             return Error::from_errno(errno);
         }
-        // The removal is only durable once the directory is, or a sent report could be offered and sent again.
+        // The removal is only durable once the directory is, or a removed report could be offered again.
         if (fsync(from.fd()) < 0)
             return Error::from_errno(errno);
         return {};
@@ -311,6 +467,7 @@ ErrorOr<void> CrashReportStore::remove_sent_report(ByteString const& name) const
 
     auto directory = TRY(open_report_directory(m_directory));
     TRY(remove_from(directory));
+    remove_website(directory, name);
     if (auto seen_directory = TRY(open_seen_directory_if_exists(directory)); seen_directory.has_value())
         TRY(remove_from(*seen_directory));
     return {};
@@ -348,6 +505,8 @@ ErrorOr<ByteString> CrashReportStore::store_report(ProcessType process_type, Str
     if (fsync(directory.fd()) < 0)
         return Error::from_errno(errno);
     remove_incomplete_report.disarm();
+    // Nothing else bounds the reports waiting for an answer, and a crash loop can save them faster than anyone looks.
+    apply_retention(directory, name, maximum_waiting_report_count);
     return name;
 }
 
@@ -415,6 +574,8 @@ ErrorOr<void> CrashReportStore::initialize_browser_crash_handler()
     // process installs a handler of its own. One unreadable file must not prevent that.
     if (auto result = recover_pending_reports(); result.is_error())
         warnln("Could not recover browser crash reports: {}", result.error());
+    if (auto result = remove_expired_reports(); result.is_error())
+        warnln("Could not remove expired crash reports: {}", result.error());
 
     ByteString pending_name;
     auto file = TRY(create_unique_file(directory, pending_prefix, pending_suffix, pending_name));
@@ -464,16 +625,20 @@ ErrorOr<CrashReportStore::SavedReport> CrashReportStore::saved_report(ByteString
 }
 
 ErrorOr<Vector<ByteString>> CrashReportStore::pending_report_names(UnixDateTime) const { return Vector<ByteString> {}; }
-bool CrashReportStore::has_pending_reports(UnixDateTime) const { return false; }
 ErrorOr<void> CrashReportStore::mark_seen(ByteString const&) const { return {}; }
-ErrorOr<void> CrashReportStore::mark_all_seen(UnixDateTime) const { return {}; }
-ErrorOr<void> CrashReportStore::remove_sent_report(ByteString const&) const { return {}; }
+ErrorOr<void> CrashReportStore::remove_report(ByteString const&) const { return {}; }
+ErrorOr<void> CrashReportStore::remove_all_reports() const { return {}; }
+ErrorOr<void> CrashReportStore::adopt_reports_from(ByteString const&) { return {}; }
+ErrorOr<void> CrashReportStore::save_website(ByteString const&, StringView) const { return {}; }
+Optional<String> CrashReportStore::website(ByteString const&) const { return {}; }
+ErrorOr<void> CrashReportStore::remove_websites_saved_since(UnixDateTime) const { return {}; }
 
 ErrorOr<ByteString> CrashReportStore::store_report(ProcessType, StringView, UnixDateTime) const
 {
     return Error::from_string_literal("Crash reports are not supported on this platform yet");
 }
 
+ErrorOr<void> CrashReportStore::remove_expired_reports(UnixDateTime) const { return {}; }
 ErrorOr<size_t> CrashReportStore::recover_pending_reports() const { return 0; }
 
 ErrorOr<void> CrashReportStore::initialize_browser_crash_handler()

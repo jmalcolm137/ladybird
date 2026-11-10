@@ -11,6 +11,7 @@
 #include <LibTest/TestCase.h>
 #include <LibURL/Parser.h>
 #include <LibWebView/ProcessManager.h>
+#include <LibWebView/ProcessSnapshot.h>
 #include <UI/Qt/ProcessManagerWindow.h>
 
 #include <QAction>
@@ -32,12 +33,22 @@
 #    include <unistd.h>
 #endif
 
+static Ladybird::ProcessManagerWindow::Source source_for(WebView::ProcessManager& manager)
+{
+    return {
+        .take_snapshots = [&manager] { return WebView::process_snapshots(manager); },
+        .end_process = [&manager](u64 child_id) { return WebView::end_process(manager, child_id); },
+        .favicon_hash = {},
+        .favicon_png = {},
+    };
+}
+
 TEST_CASE(palette_changes_do_not_reenter_style_updates)
 {
     Core::EventLoop event_loop;
     Core::ResourceImplementation::install(make<Core::ResourceImplementationFile>(MUST(String::from_utf8(TEST_RESOURCE_ROOT ""sv))));
     WebView::ProcessManager manager;
-    Ladybird::ProcessManagerWindow window(manager);
+    Ladybird::ProcessManagerWindow window(source_for(manager));
     window.ensurePolished();
 
     for (auto color : { Qt::black, Qt::white, Qt::black }) {
@@ -61,7 +72,7 @@ TEST_CASE(search_keeps_matching_child_processes_visible)
     Core::EventLoop event_loop;
     Core::ResourceImplementation::install(make<Core::ResourceImplementationFile>(MUST(String::from_utf8(TEST_RESOURCE_ROOT ""sv))));
     WebView::ProcessManager manager;
-    Ladybird::ProcessManagerWindow window(manager);
+    Ladybird::ProcessManagerWindow window(source_for(manager));
     auto* processes = window.findChild<QTreeWidget*>();
     auto* search = window.findChild<QLineEdit*>();
 
@@ -100,7 +111,7 @@ TEST_CASE(browser_is_not_terminable_and_can_be_copied)
     Core::EventLoop event_loop;
     Core::ResourceImplementation::install(make<Core::ResourceImplementationFile>(MUST(String::from_utf8(TEST_RESOURCE_ROOT ""sv))));
     WebView::ProcessManager manager;
-    Ladybird::ProcessManagerWindow window(manager);
+    Ladybird::ProcessManagerWindow window(source_for(manager));
     window.show();
     auto* processes = window.findChild<QTreeWidget*>();
     auto* button = window.findChild<QPushButton*>();
@@ -155,7 +166,7 @@ TEST_CASE(end_process_terminates_a_child_and_handles_disappearing_selection)
         (void)Core::System::close(pipe[1]);
     };
     auto identity = manager.add_process(WebView::Process(WebView::ProcessType::WebContent, nullptr, move(child)));
-    Ladybird::ProcessManagerWindow window(manager);
+    Ladybird::ProcessManagerWindow window(source_for(manager));
     window.show();
     auto* processes = window.findChild<QTreeWidget*>();
     auto* button = window.findChild<QPushButton*>();
@@ -250,23 +261,20 @@ TEST_CASE(helper_processes_are_listed_with_the_site_they_work_for)
         return identity.child_id;
     };
 
-    // A worker of an opaque origin has no site of its own, and its helpers are listed with the page that started it.
+    // A page's helpers are listed with it, also those that work for another of its helpers.
     auto page = add_process(WebView::ProcessType::WebContent, {}, "https://example.com/"sv);
-    auto worker = add_process(WebView::ProcessType::WebWorker, page, {});
-    add_process(WebView::ProcessType::ImageDecoder, worker, {});
-    add_process(WebView::ProcessType::AudioServer, worker, {});
-    add_process(WebView::ProcessType::MediaServer, page, {});
-    // A shared worker outlives the page that started it, and is then listed with the site of its own origin.
-    auto gone_page = add_process(WebView::ProcessType::WebContent, {}, "https://example.org/"sv);
-    auto surviving_worker = add_process(WebView::ProcessType::WebWorker, gone_page, "https://example.org"sv);
-    add_process(WebView::ProcessType::ImageDecoder, surviving_worker, {});
-    (void)manager.remove_process(gone_page);
+    add_process(WebView::ProcessType::ImageDecoder, page, {});
+    auto media_server = add_process(WebView::ProcessType::MediaServer, page, {});
+    add_process(WebView::ProcessType::AudioServer, media_server, {});
+    // A process runs on without pages for a shared worker, and is then listed with the site of the worker's origin.
+    auto worker_host = add_process(WebView::ProcessType::WebContent, {}, "https://example.org"sv);
+    add_process(WebView::ProcessType::ImageDecoder, worker_host, {});
 
-    // With top-level site isolation, a cross-site frame shares its parent's process. Its worker has its own site.
-    auto frame_worker = add_process(WebView::ProcessType::WebWorker, page, "https://example.net"sv);
-    add_process(WebView::ProcessType::ImageDecoder, frame_worker, {});
+    // With top-level site isolation, a cross-site frame's shared worker can have a process to itself.
+    auto frame_worker_host = add_process(WebView::ProcessType::WebContent, {}, "https://example.net"sv);
+    add_process(WebView::ProcessType::ImageDecoder, frame_worker_host, {});
 
-    Ladybird::ProcessManagerWindow window(manager);
+    Ladybird::ProcessManagerWindow window(source_for(manager));
     window.show();
     auto* processes = window.findChild<QTreeWidget*>();
     auto child_count_of_site = [&](QString const& name) -> Optional<int> {
@@ -279,7 +287,7 @@ TEST_CASE(helper_processes_are_listed_with_the_site_they_work_for)
 
     // The browser, the sites heading, and the three sites.
     EXPECT_EQ(processes->topLevelItemCount(), 5);
-    EXPECT_EQ(child_count_of_site("example.com"), 5);
+    EXPECT_EQ(child_count_of_site("example.com"), 4);
     EXPECT_EQ(child_count_of_site("example.org"), 2);
     EXPECT_EQ(child_count_of_site("example.net"), 2);
 }
@@ -291,7 +299,7 @@ TEST_CASE(pressing_the_title_bar_moves_the_window)
     Core::EventLoop event_loop;
     Core::ResourceImplementation::install(make<Core::ResourceImplementationFile>(MUST(String::from_utf8(TEST_RESOURCE_ROOT ""sv))));
     WebView::ProcessManager manager;
-    Ladybird::ProcessManagerWindow window(manager);
+    Ladybird::ProcessManagerWindow window(source_for(manager));
     size_t drag_count = 0;
     window.on_title_bar_drag = [&] {
         ++drag_count;

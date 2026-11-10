@@ -702,6 +702,30 @@ void EngineClient::set_navigator_compatibility_mode(String const& mode)
     send(event);
 }
 
+void EngineClient::set_website_color_scheme(String const& color_scheme)
+{
+    JsonObject event;
+    event.set("type"sv, "set_website_color_scheme"sv);
+    event.set("value"sv, color_scheme.bytes_as_string_view());
+    send(event);
+}
+
+void EngineClient::set_preferred_contrast(String const& contrast)
+{
+    JsonObject event;
+    event.set("type"sv, "set_preferred_contrast"sv);
+    event.set("value"sv, contrast.bytes_as_string_view());
+    send(event);
+}
+
+void EngineClient::set_preferred_motion(String const& motion)
+{
+    JsonObject event;
+    event.set("type"sv, "set_preferred_motion"sv);
+    event.set("value"sv, motion.bytes_as_string_view());
+    send(event);
+}
+
 void EngineClient::request_processes()
 {
     JsonObject event;

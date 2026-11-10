@@ -16,6 +16,7 @@
 #include <LibJS/Forward.h>
 #include <LibWeb/CSS/StyleSheetIdentifier.h>
 #include <LibWeb/ContentSecurityPolicy/Directives/Directive.h>
+#include <LibWeb/DOM/AccessibilityChangeTracker.h>
 #include <LibWeb/HTML/EventLoop/EventLoop.h>
 #include <LibWeb/HTML/SameDocumentNavigationEntry.h>
 #include <LibWeb/HTML/Scripting/ConsoleInputCompletion.h>
@@ -33,6 +34,7 @@
 #include <LibWebCommon/WebDriver/Capabilities.h>
 #include <LibWebCommon/WebDriver/Response.h>
 #include <LibWebCommon/WebDriver/UserPrompt.h>
+#include <LibWebCommon/WebView/ConsoleOutputBuffer.h>
 #include <LibWebCommon/WebView/Geolocation.h>
 #include <LibWebCommon/WebView/Mutation.h>
 #include <LibWebCommon/WebView/StorageSetResult.h>
@@ -121,8 +123,14 @@ public:
     void set_has_devtools_client(bool);
     bool has_devtools_client() const { return m_has_devtools_client; }
     virtual bool has_active_devtools_client() const override { return has_devtools_client(); }
+    void start_sending_console_output(bool messages, bool errors);
+    void buffer_console_output(WebView::ConsoleOutput);
+    bool devtools_takes_console_messages() const { return m_devtools_takes_console_messages; }
+    bool devtools_takes_console_errors() const { return m_devtools_takes_console_errors; }
 
     void initialize_js_console(Web::DOM::Document& document);
+    GC::Ptr<WebContentConsoleClient> attach_js_console(Web::DOM::Document&);
+    void for_each_devtools_console_client(Function<void(DevToolsConsoleClient&)> const&);
     void js_console_input(StringView js_source);
     Optional<Web::HTML::ConsoleInputCompletion> complete_js_console_input(StringView input);
     void did_execute_js_console_input(WebView::DebuggerValue const&);
@@ -163,6 +171,8 @@ public:
     void did_delete_all_cookies(u64 request_id);
 
     void schedule_accessibility_tree_update();
+    // Sends the UI process what changed in the accessibility tree since the last tree sent, or the whole tree.
+    void publish_accessibility_tree(bool whole_tree_requested);
 
 private:
     struct PendingDOMMutation {
@@ -201,7 +211,8 @@ private:
     virtual void request_window_focus_of_remote_navigable(Web::HTML::RemoteNavigable&) override;
     virtual void request_set_opener_of_remote_navigable(Web::HTML::RemoteNavigable&, Web::HTML::Navigable const& opener) override;
     virtual void navigation_params_creation_finished(Web::HTML::LocalNavigable&, Web::HTML::NavigationPopulationRequest, Web::HTML::NavigationPopulationResult) override;
-    virtual void history_navigation_params_creation_finished(Web::HTML::CrossProcessId operation_id, Web::HTML::HistoryNavigationPopulation) override;
+    virtual void changing_navigable_history_job_reached_population(Web::HTML::CrossProcessId operation_id, Web::HTML::CrossProcessId navigable_id, Web::HTML::NavigationSourceSnapshot) override;
+    virtual void history_navigation_params_creation_finished(Web::HTML::CrossProcessId operation_id, Web::HTML::CrossProcessId navigable_id, Web::HTML::NavigationPopulationResult) override;
     virtual void navigation_population_failed(Web::HTML::CrossProcessId, Utf16String const&) override;
     virtual void page_did_change_hosted_navigable_state(Web::HTML::CrossProcessId navigable_id, Web::HTML::HostedNavigableState const&) override;
     virtual void page_did_set_opener_browsing_context(Web::HTML::CrossProcessId navigable_id, Optional<Web::HTML::CrossProcessId> opener_navigable_id) override;
@@ -216,6 +227,7 @@ private:
     virtual void page_did_destroy_child_frame(Web::HTML::CrossProcessId frame_id) override;
     virtual String dump_site_isolation_process_tree_for_testing() override;
     virtual void crash_remote_frame_processes_for_testing() override;
+    virtual void close_tab_for_testing() override;
     virtual void page_did_spoof_document_origin_for_testing(Web::HTML::EnvironmentSettingsObject const&, URL::Origin const&) override;
     virtual void stop_loading_through_ui_process_for_testing() override;
     virtual void reload_through_ui_process_for_testing(bool bypass_cache) override;
@@ -244,7 +256,6 @@ private:
     virtual void page_did_change_title(Utf16String const&) override;
     virtual void page_did_update_editing_history_state(bool can_undo, bool can_redo) override;
     virtual void page_did_set_text_fragment_indication_visibility(bool) override;
-    virtual void page_did_request_refresh() override;
     virtual void page_did_request_resize_window(Gfx::IntSize, u64 completion_id) override;
     virtual void page_did_request_reposition_window(Gfx::IntPoint, u64 completion_id) override;
     virtual void page_did_request_restore_window() override;
@@ -255,23 +266,20 @@ private:
     virtual void page_did_exit_picture_in_picture() override;
     virtual void page_did_change_picture_in_picture_video_size(Gfx::IntSize) override;
     virtual void page_did_change_picture_in_picture_player_controls_visibility(bool shown) override;
-    virtual void page_did_request_tooltip_override(Web::CSSPixelPoint, ByteString const&) override;
-    virtual void page_did_stop_tooltip_override() override;
     virtual void page_did_enter_tooltip_area(ByteString const&) override;
     virtual void page_did_leave_tooltip_area() override;
-    virtual void page_did_hover_link(URL::URL const&) override;
-    virtual void page_did_unhover_link() override;
     virtual void page_did_click_link(Web::HTML::PreparedNavigationDescriptor, ByteString const& target, unsigned modifiers) override;
     virtual void page_did_middle_click_link(Web::HTML::PreparedNavigationDescriptor, ByteString const& target, unsigned modifiers) override;
     virtual void page_did_request_external_url(URL::URL const&, URL::Origin const& initiator_origin, bool has_transient_activation) override;
     virtual void page_did_request_context_menu(Web::HTML::CrossProcessId local_root_id, Web::CSSPixelPoint, Web::ContextMenuForInputEventsTarget, Optional<Utf16String> misspelled_word, GC::Ptr<Web::DOM::Range> selected_text_range) override;
     virtual void page_did_request_spelling_menu_action_for_testing(Web::SpellingMenuActionForTesting, u32 guess_index) override;
     virtual void page_did_request_link_context_menu(Web::HTML::CrossProcessId local_root_id, Web::CSSPixelPoint, Web::HTML::PreparedNavigationDescriptor, ByteString const& target, unsigned modifiers, GC::Ptr<Web::DOM::Range> selected_text_range) override;
-    virtual void page_did_request_image_context_menu(Web::HTML::CrossProcessId local_root_id, Web::CSSPixelPoint, Web::HTML::PreparedNavigationDescriptor, ByteString const& target, unsigned modifiers, Optional<Gfx::Bitmap const*>) override;
+    virtual void page_did_request_image_context_menu(Web::HTML::CrossProcessId local_root_id, Web::CSSPixelPoint, Web::HTML::PreparedNavigationDescriptor, ByteString const& target, unsigned modifiers, Optional<Gfx::Bitmap const*>, Optional<Web::HTML::PreparedNavigationDescriptor> link_navigation, Optional<String> image_mime_type) override;
     virtual void page_did_request_media_context_menu(Web::HTML::CrossProcessId local_root_id, Web::CSSPixelPoint, ByteString const& target, unsigned modifiers, Web::Page::MediaContextMenu const&, Optional<Web::HTML::PreparedNavigationDescriptor>) override;
     virtual void page_did_change_active_document_in_top_level_browsing_context(Web::DOM::Document&) override;
+    virtual void page_did_change_active_document_in_child_navigable(Web::DOM::Document&) override;
     virtual void page_did_finish_loading(Web::HTML::CrossProcessId, Web::HTML::CrossProcessId) override;
-    virtual Optional<u64> page_did_start_download(Web::HTML::CrossProcessId navigable_id, Optional<Utf16String> const& navigation_id, URL::URL const&, ByteString const& suggested_filename, Optional<u64> total_size, int request_server_client_id, u64 request_server_request_id, ByteBuffer initial_data, JsonValue network_response) override;
+    virtual Optional<u64> page_did_start_download(Web::HTML::CrossProcessId navigable_id, Optional<Utf16String> const& navigation_id, URL::URL const&, ByteString const& suggested_filename, Optional<u64> total_size, HTTP::Cookie::SameSiteContext, int request_server_client_id, u64 request_server_request_id, ByteBuffer initial_data, JsonValue network_response) override;
     virtual Optional<u64> page_did_start_download(URL::URL const&, ByteString const& suggested_filename, Optional<u64> total_size) override;
     virtual void page_did_receive_download_data(u64 download_id, ByteBuffer data) override;
     virtual void page_did_finish_download(u64 download_id) override;
@@ -314,6 +322,7 @@ private:
     virtual void page_did_close() override;
     virtual void page_did_change_needs_beforeunload_check(bool needs_beforeunload_check) override;
     virtual void page_did_consume_user_activation(Web::HTML::UserActivationConsumption) override;
+    virtual void page_did_notify_about_user_activation(Web::HTML::CrossProcessId document_id) override;
     virtual void page_did_update_session_history_entry_navigation_api_state(Web::HTML::CrossProcessId navigable_id, Web::HTML::SessionHistoryEntryIdentity const& entry_identity, Web::HTML::StorageSerializationRecord const& navigation_api_state) override;
     virtual void page_did_update_session_history_entry_scroll_restoration_mode(Web::HTML::CrossProcessId navigable_id, Web::HTML::SessionHistoryEntryIdentity const& entry_identity, Web::HTML::ScrollRestorationMode scroll_restoration_mode) override;
     virtual void page_did_update_session_history_entry_document_state_navigable_target_name(Web::HTML::CrossProcessId navigable_id, Web::HTML::SessionHistoryEntryIdentity const& entry_identity, Utf16String const& navigable_target_name) override;
@@ -337,11 +346,16 @@ private:
     virtual String page_did_request_ui_process_session_history_for_testing() override;
     virtual bool page_did_request_has_populated_document_for_testing(Web::HTML::CrossProcessId navigable_id) override;
     virtual bool page_did_request_tab_is_playing_audio_for_testing() override;
+    virtual bool page_did_request_tab_is_heard_playing_audio_for_testing() override;
+    virtual bool page_did_request_tab_is_using_microphone_for_testing() override;
+    virtual bool page_did_request_tab_is_capturing_audio_for_testing() override;
+    virtual void page_did_report_audio_capture_for_testing(Web::PageId labelled_page_id, bool capturing) override;
+    virtual void page_did_retire_picture_in_picture_window_for_testing() override;
     virtual u64 page_did_request_tab_audibility_change_count_for_testing() override;
     virtual bool page_did_request_capture_session_history_snapshot_for_testing() override;
     virtual bool page_did_request_restore_session_history_snapshot_for_testing() override;
-    virtual bool page_did_request_register_session_store_tab_for_testing() override;
-    virtual String page_did_request_session_store_tab_state_for_testing() override;
+    virtual bool page_did_request_record_reported_session_history_for_testing() override;
+    virtual String page_did_request_reported_session_history_for_testing() override;
     virtual void request_file(Web::FileRequest) override;
     virtual URL::BlobURLEntry::Token page_did_add_blob_url_entry(Web::HTML::EnvironmentSettingsObject const&, Utf16String const& url, Web::FileAPI::SerializedBlobURLEntry const&) override;
     virtual void page_did_remove_blob_url_entries(Web::HTML::EnvironmentSettingsObject const&, Vector<Utf16String> const& urls) override;
@@ -359,8 +373,19 @@ private:
     virtual Optional<Web::Permissions::PermissionSnapshot> page_did_request_permission_snapshot(URL::Origin const& top_level_origin) override;
     virtual Optional<Web::Permissions::PermissionSnapshot> page_did_set_permission_for_testing(Web::HTML::CrossProcessId document_id, String const& name, String const& state) override;
     virtual void page_did_set_next_permission_prompt_outcome_for_testing(String const& name, String const& outcome, bool held) override;
+    virtual void page_did_set_system_microphone_authorization_for_testing(String const& authorization, String const& answer, bool held) override;
+    virtual void page_did_release_system_microphone_answer_for_testing() override;
+    virtual String page_did_request_microphone_state_for_testing() override;
     virtual void page_did_release_held_permission_prompt_for_testing(u32 waiters) override;
     virtual Optional<Web::Permissions::PermissionSnapshot> page_did_advance_permission_clock_for_testing(u64 milliseconds) override;
+    virtual void page_did_request_show_notification(u64 notification_id, Web::HTML::CrossProcessId document_id, Web::NotificationsAPI::NotificationData const&, RefPtr<Gfx::Bitmap const> icon) override;
+    virtual void page_did_request_close_notification(u64 notification_id) override;
+    virtual void page_did_abandon_notification(u64 notification_id) override;
+    virtual void page_did_handle_notification_click(u64 notification_id, bool into_focus) override;
+    virtual String page_did_request_notifications_state_for_testing() override;
+    virtual void page_did_request_click_notification_for_testing(u64 notification_id) override;
+    virtual void page_did_request_click_notification_by_id_for_testing(u64 browser_notification_id) override;
+    virtual void page_did_request_dismiss_notification_for_testing(u64 notification_id) override;
     virtual void page_did_finish_test(Utf16String const& text) override;
     virtual void page_did_set_test_timeout(double milliseconds) override;
     virtual void page_did_receive_reference_test_metadata(JsonValue) override;
@@ -368,9 +393,13 @@ private:
     virtual void page_did_set_device_pixel_ratio_for_testing(double ratio) override;
     virtual void page_did_change_theme_color(Gfx::Color color) override;
     virtual void page_did_change_background_color(Gfx::Color color) override;
-    virtual void page_did_insert_clipboard_item(Web::Clipboard::SystemClipboardItem const&, StringView presentation_style) override;
-    virtual void page_did_request_clipboard_entries(u64 request_id) override;
+    virtual void page_did_insert_clipboard_item(Web::Clipboard::SystemClipboardItem const&, StringView presentation_style, Optional<Web::HTML::CrossProcessId> writing_document_id) override;
+    virtual void page_did_request_clipboard_entries_for_paste(u64 request_id) override;
+    virtual void page_did_request_clipboard_entries(u64 request_id, Web::HTML::CrossProcessId reading_document_id) override;
+    virtual void page_did_request_paste_from_clipboard_for_testing() override;
     virtual void page_did_request_spell_check(u64 request_id, Utf16String const& text) override;
+    virtual void page_did_request_translation(Web::TranslationUnit const&) override;
+    virtual void page_did_request_page_translation_for_testing(String const& target_language) override;
     virtual void page_did_request_writing_suggestion(u64 request_id, Utf16String const& text, u32 caret_offset) override;
     virtual void page_did_request_primary_paste() override;
     virtual void page_did_complete_paste_action() override;
@@ -378,6 +407,7 @@ private:
     virtual NonnullRefPtr<Media::AudioOutputFactory> create_audio_output_factory() override;
     virtual NonnullOwnPtr<MediaClient::RemotePlaybackManager> create_media_playback_manager() override;
     virtual void rebind_media_playback_manager(MediaClient::RemotePlaybackManager&) override;
+    virtual NonnullRefPtr<Core::Promise<NonnullRefPtr<Audio::RecordStream>>> create_audio_record_stream(StringView device_id, Function<void(ReadonlyBytes, Audio::SampleSpecification const&)>) override;
     virtual void page_did_change_screen_wake_lock_state(Web::ScreenWakeLockState) override;
     virtual void page_did_start_using_gamepads() override;
     virtual void page_did_play_gamepad_effect(Web::Gamepad::GamepadHandle, Web::Gamepad::GamepadEffect const&) override;
@@ -389,7 +419,8 @@ private:
     virtual Web::Gamepad::ReceivedRumbleEffects virtual_gamepad_received_rumble_effects(Web::Gamepad::GamepadHandle) override;
     virtual void pump_gamepad_events() override;
     virtual void reset_gamepad_access_for_testing() override;
-    virtual Web::HTML::WorkerAgentId start_worker_agent(Web::HTML::WorkerAgentStartRequest&&) override;
+    virtual Web::PageClient::StartedWorkerAgent start_worker_agent(Web::HTML::WorkerAgentStartRequest&&) override;
+    virtual RefPtr<Web::HTML::DedicatedWorkerThreadLink> start_dedicated_worker(Web::HTML::WorkerAgentStartRequest&&) override;
     virtual void close_worker_agent(Web::HTML::WorkerAgentId, Web::HTML::WorkerAgentOwnerToken) override;
     virtual void page_did_mutate_dom(Utf16FlyString const& type, Web::DOM::Node const& target, Web::DOM::NodeList& added_nodes, Web::DOM::NodeList& removed_nodes, GC::Ptr<Web::DOM::Node> previous_sibling, GC::Ptr<Web::DOM::Node> next_sibling, Optional<Utf16FlyString> const& attribute_name) override;
     virtual void flush_pending_dom_mutations() override;
@@ -466,10 +497,20 @@ private:
     Optional<Web::HTML::CrossProcessId> m_pending_root_navigable_id;
 
     RefPtr<Core::Timer> m_accessibility_update_timer;
+    // What the UI process was last sent of the accessibility tree, and the number of the last tree sent: Each change
+    // names the number of the tree it applies to, so the UI process can tell when it doesn't hold that tree.
+    Web::DOM::AccessibilityChangeTracker m_accessibility_change_tracker;
+    u64 m_accessibility_tree_sequence { 0 };
     RefPtr<Core::Timer> m_accessibility_focus_timer;
     Optional<i64> m_pending_accessibility_focus;
 
     bool m_has_devtools_client { false };
+    bool m_devtools_takes_console_messages { false };
+    bool m_devtools_takes_console_errors { false };
+
+    // The latest output of the document that the tab shows and of its iframes, which a DevTools client gets once it
+    // asks, so it sees what the page output before.
+    WebView::ConsoleOutputBuffer m_console_output_buffer;
 };
 
 }

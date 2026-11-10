@@ -18,7 +18,9 @@ use libjs_rust::api::{
 
 use crate::bindings::CallContext;
 use crate::bindings::conversions::ToJs;
-use crate::bindings::interface::{Interface, Ref, define_operation, implementation_of, this_object};
+use crate::bindings::interface::{
+    Interface, SecurityCheckType, define_operation, perform_a_security_check, this_object,
+};
 use crate::bindings::services::web_bindings_ensure_web_iterator_prototype;
 
 // https://webidl.spec.whatwg.org/#default-iterator-object-kind
@@ -33,8 +35,8 @@ pub(crate) enum IterationKind {
 /// a host object of the iterator class of its interface.
 #[derive(Trace)]
 #[gc(crate = libjs_rust)]
-pub(crate) struct DefaultIterator<T: Interface> {
-    target: Ref<T>,
+pub(crate) struct DefaultIterator<T: PairIterable> {
+    target: T::Target,
     #[gc(untraced)]
     kind: IterationKind,
     #[gc(untraced)]
@@ -42,13 +44,20 @@ pub(crate) struct DefaultIterator<T: Interface> {
 }
 
 /// What the implementation of an interface with a pair iterator implements: its value pairs to iterate over, with
-/// the Rust types of the key and value types of the iterable declaration.
+/// Rust types that convert to the key and value types of the iterable declaration.
 pub(crate) trait PairIterable: Interface {
     type Key: ToJs + Clone;
     type Value: ToJs + Clone;
 
+    /// What an iteration reads its value pairs from: normally the object, or what the object looked like when the
+    /// iteration started, for an interface that does not follow the changes of the object during an iteration.
+    type Target: Trace + 'static;
+
+    /// The target of an iteration of the kind over the object that the wrapper wraps.
+    fn iteration_target(cx: &CallContext, wrapper: Gc<Object>, kind: IterationKind) -> Self::Target;
+
     // https://webidl.spec.whatwg.org/#dfn-value-pairs-to-iterate-over
-    fn value_pairs_to_iterate_over(&self) -> impl Deref<Target = [(Self::Key, Self::Value)]> + '_;
+    fn value_pairs_to_iterate_over(target: &Self::Target) -> impl Deref<Target = [(Self::Key, Self::Value)]> + '_;
 }
 
 /// What the generated bindings of an interface with a pair iterator define: the classes of its default iterator
@@ -94,11 +103,12 @@ pub(crate) fn define_pair_iterator_properties(
 /// to 0, in the realm of the call context.
 pub(crate) fn create_default_iterator<T: DefaultIteratorClasses>(
     cx: &CallContext,
-    target: Ref<T>,
+    wrapper: Gc<Object>,
     kind: IterationKind,
 ) -> Value {
     let vm = cx.vm();
     let realm = cx.realm();
+    let target = T::iteration_target(cx, wrapper, kind);
     let iterator = T::ITERATOR_CELL_CLASS.allocate(vm, |_| DefaultIterator {
         target,
         kind,
@@ -133,10 +143,10 @@ pub(crate) fn iterator_next<T: DefaultIteratorClasses>(vm: &Vm) -> ThrowCompleti
     //     * the platform object object,
     //     * the identifier "next", and
     //     * the type "method".
-    // NB: A default iterator object is not a platform object.
-
     // 5. If object is not a default iterator object for interface, then throw a TypeError.
     let Some(iterator) = default_iterator_of::<T>(object) else {
+        // NB: This runs after the check above, which no Window or Location object passes.
+        perform_a_security_check(vm, Value::from_object(object), "next", SecurityCheckType::Method)?;
         let name = format!("{}Iterator", T::NAME);
         return vm.throw_completion(ErrorKind::TypeError, ErrorType::NotAnObjectOfType, &[&name]);
     };
@@ -150,7 +160,7 @@ pub(crate) fn iterator_next<T: DefaultIteratorClasses>(vm: &Vm) -> ThrowCompleti
 
     let pair = {
         // 8. Let values be object's target's value pairs to iterate over.
-        let values = iterator.target.value_pairs_to_iterate_over();
+        let values = T::value_pairs_to_iterate_over(&iterator.target);
 
         // 9. Let len be the length of values.
         let len = values.len();
@@ -233,13 +243,19 @@ pub(crate) fn entries<T: DefaultIteratorClasses>(vm: &Vm) -> ThrowCompletionOr<V
     // 2. If jsValue is a platform object, then perform a security check, passing jsValue, "%Symbol.iterator%", and
     //    "method".
     // 3. If jsValue does not implement definition, then throw a TypeError.
-    let (js_value, realm) = this_object(vm, T::wrapper_class(), T::NAME)?;
+    let (js_value, realm) = this_object(
+        vm,
+        T::wrapper_class(),
+        T::NAME,
+        "%Symbol.iterator%",
+        SecurityCheckType::Method,
+    )?;
 
     // 4. Return a newly created default iterator object for definition, with jsValue as its target, "key+value" as its
     //    kind, and index set to 0.
-    Ok(create_default_iterator(
+    Ok(create_default_iterator::<T>(
         &CallContext::new(vm, realm),
-        implementation_of::<T>(js_value),
+        js_value,
         IterationKind::KeyAndValue,
     ))
 }
@@ -250,13 +266,13 @@ pub(crate) fn keys<T: DefaultIteratorClasses>(vm: &Vm) -> ThrowCompletionOr<Valu
     // 1. Let jsValue be ? ToObject(this value).
     // 2. If jsValue is a platform object, then perform a security check, passing jsValue, "keys", and "method".
     // 3. If jsValue does not implement definition, then throw a TypeError.
-    let (js_value, realm) = this_object(vm, T::wrapper_class(), T::NAME)?;
+    let (js_value, realm) = this_object(vm, T::wrapper_class(), T::NAME, "keys", SecurityCheckType::Method)?;
 
     // 4. Return a newly created default iterator object for definition, with jsValue as its target, "key" as its kind,
     //    and index set to 0.
-    Ok(create_default_iterator(
+    Ok(create_default_iterator::<T>(
         &CallContext::new(vm, realm),
-        implementation_of::<T>(js_value),
+        js_value,
         IterationKind::Key,
     ))
 }
@@ -267,13 +283,13 @@ pub(crate) fn values<T: DefaultIteratorClasses>(vm: &Vm) -> ThrowCompletionOr<Va
     // 1. Let jsValue be ? ToObject(this value).
     // 2. If jsValue is a platform object, then perform a security check, passing jsValue, "values", and "method".
     // 3. If jsValue does not implement definition, then throw a TypeError.
-    let (js_value, realm) = this_object(vm, T::wrapper_class(), T::NAME)?;
+    let (js_value, realm) = this_object(vm, T::wrapper_class(), T::NAME, "values", SecurityCheckType::Method)?;
 
     // 4. Return a newly created default iterator object for definition, with jsValue as its target, "value" as its
     //    kind, and index set to 0.
-    Ok(create_default_iterator(
+    Ok(create_default_iterator::<T>(
         &CallContext::new(vm, realm),
-        implementation_of::<T>(js_value),
+        js_value,
         IterationKind::Value,
     ))
 }
@@ -287,7 +303,7 @@ pub(crate) fn for_each<T: DefaultIteratorClasses>(vm: &Vm) -> ThrowCompletionOr<
     // 1. Let jsValue be ? ToObject(this value).
     // 2. If jsValue is a platform object, then perform a security check, passing jsValue, "forEach", and "method".
     // 3. If jsValue does not implement definition, then throw a TypeError.
-    let (js_value, realm) = this_object(vm, T::wrapper_class(), T::NAME)?;
+    let (js_value, realm) = this_object(vm, T::wrapper_class(), T::NAME, "forEach", SecurityCheckType::Method)?;
     let cx = CallContext::new(vm, realm);
 
     // 4. Let idlCallback be callback, converted to a Function.
@@ -296,16 +312,16 @@ pub(crate) fn for_each<T: DefaultIteratorClasses>(vm: &Vm) -> ThrowCompletionOr<
     }
 
     // 5. Let idlObject be the IDL interface type value that represents a reference to jsValue.
-    let idl_object = implementation_of::<T>(js_value);
+    let idl_object = T::iteration_target(&cx, js_value, IterationKind::KeyAndValue);
 
     // 6. Let pairs be idlObject's list of value pairs to iterate over.
     // 7. Let i be 0.
     let mut i = 0;
 
     // 8. While i < pairs's size:
-    while i < idl_object.value_pairs_to_iterate_over().len() {
+    while i < T::value_pairs_to_iterate_over(&idl_object).len() {
         // 1. Let pair be pairs[i].
-        let (key, value) = idl_object.value_pairs_to_iterate_over()[i].clone();
+        let (key, value) = T::value_pairs_to_iterate_over(&idl_object)[i].clone();
 
         // 2. Invoke idlCallback with « pair's value, pair's key, idlObject » and with thisArg as the callback this
         //    value.

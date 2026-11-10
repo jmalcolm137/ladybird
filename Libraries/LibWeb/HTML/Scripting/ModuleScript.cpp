@@ -137,28 +137,6 @@ WebIDL::ExceptionOr<GC::Ptr<ModuleScript>> ModuleScript::create_from_pre_compile
     return script;
 }
 
-WebIDL::ExceptionOr<GC::Ptr<ModuleScript>> ModuleScript::create_from_bytecode_cache(ByteString const& filename, NonnullRefPtr<JS::SourceCode const> source_code, EnvironmentSettingsObject& settings, URL::URL base_url, NonnullRefPtr<JS::DecodedBytecodeCache> bytecode_cache)
-{
-    auto& realm = settings.realm();
-    auto script = create_internal(move(base_url), filename, settings);
-
-    script->set_parse_error(JS::js_null());
-    script->set_error_to_rethrow(JS::js_null());
-
-    auto result = JS::SourceTextModule::parse_from_bytecode_cache(bytecode_cache, move(source_code), realm, script->filename(), script.ptr());
-
-    if (result.is_error()) {
-        auto& parse_error = result.error().first();
-        dbgln("JavaScriptModuleScript: Failed to materialize bytecode cache: {}", parse_error.to_utf16_string());
-        script->set_parse_error(JS::SyntaxError::create(realm, parse_error.to_utf16_string()), parse_error.position);
-        return script;
-    }
-
-    script->m_record = result.value();
-    register_source(*script, ScriptRegistry::IsInlineSource::No, 1);
-    return script;
-}
-
 // https://html.spec.whatwg.org/multipage/webappapis.html#creating-a-css-module-script
 WebIDL::ExceptionOr<GC::Ptr<ModuleScript>> ModuleScript::create_a_css_module_script(ByteString const& filename, Utf16View source, EnvironmentSettingsObject& settings)
 {
@@ -179,11 +157,8 @@ WebIDL::ExceptionOr<GC::Ptr<ModuleScript>> ModuleScript::create_a_css_module_scr
 
     // 6. Run the steps to synchronously replace the rules of a CSSStyleSheet on sheet given source.
     //    If this throws an exception, catch it, and set script's parse error to that exception, and return script.
-    if (auto result = sheet->replace_sync(source); result.is_error()) {
-        auto throw_completion = WebIDL::exception_to_throw_completion(realm.vm(), realm, result.exception());
-        script->set_parse_error(throw_completion.value());
-        return script;
-    }
+    // NB: A new constructed sheet has the constructed flag and not the disallow modification flag, so this cannot throw.
+    sheet->replace_rules(source);
 
     // 7. Set script's record to the result of CreateDefaultExportSyntheticModule(sheet).
     script->m_record = CSS::create_css_style_sheet_default_export_module(realm, sheet, filename.view());
@@ -352,7 +327,7 @@ GC::Ptr<WebIDL::Promise> ModuleScript::run(PreventErrorReporting prevent_error_r
     // 8. If preventErrorReporting is false, then upon rejection of evaluationPromise with reason, report the exception given by reason for script.
     if (prevent_error_reporting == PreventErrorReporting::No) {
         HTML::TemporaryExecutionContext execution_context { realm, HTML::TemporaryExecutionContext::CallbacksEnabled::Yes };
-        WebIDL::upon_rejection(*evaluation_promise, GC::create_function(GC::Heap::the(), [&realm, script = GC::Ref { *this }](JS::Value reason) -> WebIDL::ExceptionOr<JS::Value> {
+        WebIDL::upon_rejection(*evaluation_promise, GC::create_function(GC::Heap::the(), GC::captures(realm, GC::Ref { *this }), [](auto& realm, auto& script, JS::Value reason) -> WebIDL::ExceptionOr<JS::Value> {
             report_an_exception(realm.global_object(), reason, OmitError::No, script);
             return JS::js_undefined();
         }));

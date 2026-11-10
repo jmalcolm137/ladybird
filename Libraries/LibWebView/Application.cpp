@@ -47,37 +47,43 @@
 #include <LibWebCommon/WebDriver/TimeoutsConfiguration.h>
 #include <LibWebCommon/WebView/SiteIsolation.h>
 #include <LibWebView/Application.h>
-#include <LibWebView/AutocompleteService.h>
 #include <LibWebView/BlobURLStore.h>
 #include <LibWebView/CompositorClient.h>
 #include <LibWebView/CompositorPresentationClient.h>
 #include <LibWebView/CookieJar.h>
+#include <LibWebView/CrashReportOutbox.h>
 #include <LibWebView/CrashReportStore.h>
-#include <LibWebView/FaviconStore.h>
 #include <LibWebView/FontService.h>
 #include <LibWebView/FontServiceHost.h>
 #include <LibWebView/HSTSStore.h>
 #include <LibWebView/HeadlessWebView.h>
 #include <LibWebView/HelperProcess.h>
-#include <LibWebView/HistoryStore.h>
-#include <LibWebView/Menu.h>
+#include <LibWebView/ImageDecoderManager.h>
+#include <LibWebView/NoOpMicrophoneAuthorizer.h>
+#include <LibWebView/NoOpNotificationBackend.h>
+#include <LibWebView/PageTranslation.h>
 #include <LibWebView/PermissionManager.h>
+#include <LibWebView/PictureInPictureManager.h>
 #include <LibWebView/PictureInPictureWindow.h>
 #include <LibWebView/ProcessType.h>
 #include <LibWebView/RequestServerManager.h>
-#include <LibWebView/SessionStore.h>
 #include <LibWebView/SiteCompatibility.h>
 #include <LibWebView/SpellChecker.h>
 #include <LibWebView/StorageAreaRegistry.h>
 #include <LibWebView/TabPerformanceMonitor.h>
+#include <LibWebView/Translator.h>
 #include <LibWebView/URL.h>
 #include <LibWebView/UserAgent.h>
 #include <LibWebView/Utilities.h>
+#include <LibWebView/ViewImplementation.h>
 #include <LibWebView/WebContentClient.h>
 #include <LibWebView/WebDriverBiDi.h>
 #include <LibWebView/WebDriverBrowserConnection.h>
-#include <LibWebView/WebWorkerClient.h>
-#include <LibWebView/WorkerProcessManager.h>
+#include <LibWebView/WorkerAgentManager.h>
+
+#if !defined(AK_OS_WINDOWS)
+#    include <LibWebView/TerminalWebView.h>
+#endif
 
 #if defined(AK_OS_MACOS)
 #    include <LibIPC/MachBootstrapListener.h>
@@ -142,14 +148,6 @@ struct ApplicationSettingsObserver final : public SettingsObserver {
         Application::request_server_manager().dns_settings_changed();
     }
 
-    virtual void config_variable_changed(ConfigVariableID variable) override
-    {
-        if (variable == ConfigVariableID::ShowAdvancedDebugMenu) {
-            auto enabled = Application::settings().config_variable_as_bool(ConfigVariableID::ShowAdvancedDebugMenu);
-            Application::the().debug_menu().set_visible(enabled);
-        }
-    }
-
     virtual void background_networking_settings_changed() override
     {
         Application::the().background_networking_settings_changed({});
@@ -164,6 +162,16 @@ struct ApplicationSettingsObserver final : public SettingsObserver {
     {
         Application::the().location_policy_changed({});
     }
+
+    virtual void microphone_settings_changed() override
+    {
+        Application::the().microphone_policy_changed({});
+    }
+
+    virtual void notifications_settings_changed() override
+    {
+        Application::the().notifications_policy_changed({});
+    }
 };
 
 struct ApplicationPermissionManagerObserver final : public PermissionManagerObserver {
@@ -174,48 +182,6 @@ struct ApplicationPermissionManagerObserver final : public PermissionManagerObse
         Application::the().permissions_changed({}, manager);
     }
 };
-
-struct ApplicationBookmarkStoreObserver final : public BookmarkStoreObserver {
-    AK_ALLOC_WITH_KMALLOC;
-
-    virtual void bookmarks_changed() override
-    {
-        Application::the().bookmarks_changed({});
-    }
-};
-
-static void append_autocomplete_bookmarks(Vector<AutocompleteBookmark>& bookmarks, ReadonlySpan<BookmarkItem> items, Optional<String> const& parent_folder)
-{
-    for (auto const& item : items) {
-        if (item.is_bookmark()) {
-            auto const& bookmark = item.bookmark();
-            bookmarks.append({
-                .url = bookmark.url.serialize(URL::ExcludeFragment::Yes),
-                .title = bookmark.title,
-                .folder = parent_folder,
-                .favicon_png = bookmark.favicon_hash.has_value()
-                    ? Application::default_session().favicon_store->favicon_png(*bookmark.favicon_hash)
-                    : OptionalNone {},
-            });
-            continue;
-        }
-
-        auto folder = parent_folder;
-        if (item.folder().title.has_value() && !item.folder().title->is_empty()) {
-            folder = parent_folder.has_value()
-                ? MUST(String::formatted("{} / {}", *parent_folder, *item.folder().title))
-                : *item.folder().title;
-        }
-        append_autocomplete_bookmarks(bookmarks, item.folder().children, folder);
-    }
-}
-
-static Vector<AutocompleteBookmark> autocomplete_bookmark_snapshot(BookmarkStore const& bookmark_store)
-{
-    Vector<AutocompleteBookmark> bookmarks;
-    append_autocomplete_bookmarks(bookmarks, bookmark_store.root_items(), {});
-    return bookmarks;
-}
 
 Application::Application(Optional<ByteString> ladybird_binary_path)
     : m_site_compatibility_data(JsonArray {})
@@ -239,8 +205,6 @@ Application::~Application()
     // Stop bootstrap callbacks before destroying the state they use.
     m_mach_port_server.clear();
 #endif
-
-    m_autocomplete_service.clear();
 
     if (m_compositor_client)
         m_compositor_client->on_death = nullptr;
@@ -269,24 +233,20 @@ Application::~Application()
 
     m_spare_web_content_process = nullptr;
 
+    PictureInPictureManager::the().destroy_all_windows();
+
     // Connection die() handlers use the process manager, so destroy the processes while it is still reachable.
     if (m_process_manager)
         m_process_manager->remove_all_processes();
     m_process_manager = nullptr;
     m_browser_process = nullptr;
 
-    // Only a normal exit gets this far, and only after every teardown step above, so a crash never records a clean one.
-    if (m_default_session && m_default_session->session_store) {
-        m_default_session->session_store->flush_dirty_state();
-        m_default_session->session_store->mark_clean_exit();
-    }
-
     s_the = nullptr;
 }
 
-SessionLaunchPolicy Application::launch_restore_policy() const
+void Application::quit_for_signal()
 {
-    return SessionLaunchPolicy::None;
+    m_event_loop->quit(0);
 }
 
 bool Application::claim_cpu_profiler(ProcessType process_type)
@@ -336,6 +296,7 @@ ErrorOr<void> Application::initialize(Main::Arguments const& arguments)
     Optional<HeadlessMode> headless_mode;
     Optional<int> window_width;
     Optional<int> window_height;
+    Optional<double> device_pixel_ratio;
     Optional<u32> screenshot_delay;
     Optional<StringView> screenshot_path;
     bool new_window = false;
@@ -363,6 +324,7 @@ ErrorOr<void> Application::initialize(Main::Arguments const& arguments)
     bool validate_dnssec_locally = false;
     bool log_all_js_exceptions = false;
     auto site_isolation_mode = default_site_isolation_mode();
+    bool disable_same_origin_tab_sharing = false;
     Optional<size_t> maximum_site_request_servers;
     bool disable_http_memory_cache = false;
     bool disable_http_disk_cache = false;
@@ -386,7 +348,7 @@ ErrorOr<void> Application::initialize(Main::Arguments const& arguments)
 
     args_parser.add_option(Core::ArgsParser::Option {
         .argument_mode = Core::ArgsParser::OptionArgumentMode::Optional,
-        .help_string = "Run Ladybird without a browser window. Mode may be 'screenshot' (default), 'layout-tree', 'text', or 'manual'.",
+        .help_string = "Run Ladybird without a browser window. Mode may be 'screenshot' (default), 'layout-tree', 'text', 'manual', or 'terminal'.",
         .long_name = "headless",
         .value_name = "mode",
         .accept_value = [&](StringView value) {
@@ -401,6 +363,10 @@ ErrorOr<void> Application::initialize(Main::Arguments const& arguments)
                 headless_mode = HeadlessMode::Text;
             else if (value.equals_ignoring_ascii_case("manual"sv))
                 headless_mode = HeadlessMode::Manual;
+#if !defined(AK_OS_WINDOWS)
+            else if (value.equals_ignoring_ascii_case("terminal"sv))
+                headless_mode = HeadlessMode::Terminal;
+#endif
 
             return headless_mode.has_value();
         },
@@ -410,6 +376,7 @@ ErrorOr<void> Application::initialize(Main::Arguments const& arguments)
     args_parser.add_option(screenshot_path, "Save screenshots to the given location (only supported for headless screenshot mode)", "screenshot-path", 0, "path");
     args_parser.add_option(window_width, "Set viewport width in pixels (default: 800) (currently only supported for headless mode)", "window-width", 0, "pixels");
     args_parser.add_option(window_height, "Set viewport height in pixels (default: 600) (currently only supported for headless mode)", "window-height", 0, "pixels");
+    args_parser.add_option(device_pixel_ratio, "Set the device pixel ratio (default: 1) (only supported for headless terminal mode)", "device-pixel-ratio", 0, "ratio");
     args_parser.add_option(certificates, "Path to a certificate file", "certificate", 'C', "certificate");
     args_parser.add_option(Core::ArgsParser::Option {
         .argument_mode = Core::ArgsParser::OptionArgumentMode::Required,
@@ -472,6 +439,7 @@ ErrorOr<void> Application::initialize(Main::Arguments const& arguments)
             return true;
         },
     });
+    args_parser.add_option(disable_same_origin_tab_sharing, "Disable hosting tabs of the same origin in one WebContent process", "disable-same-origin-tab-sharing");
     args_parser.add_option(disable_http_memory_cache, "Disable HTTP memory cache", "disable-http-memory-cache");
     args_parser.add_option(disable_http_disk_cache, "Disable HTTP disk cache", "disable-http-disk-cache");
     args_parser.add_option(maximum_site_request_servers, "How many RequestServers a session may have for the sites it visits, 0 to share one", "max-site-request-servers", 0, "count");
@@ -598,6 +566,13 @@ ErrorOr<void> Application::initialize(Main::Arguments const& arguments)
         m_browser_options.window_width = *window_width;
     if (window_height.has_value())
         m_browser_options.window_height = *window_height;
+    if (device_pixel_ratio.has_value())
+        m_browser_options.device_pixel_ratio = *device_pixel_ratio;
+
+#if !defined(AK_OS_WINDOWS)
+    if (headless_mode == HeadlessMode::Terminal)
+        TRY(TerminalWebView::take_over_terminal());
+#endif
 
     if (webdriver_browser_endpoint.has_value())
         m_browser_options.webdriver_browser_endpoint = *webdriver_browser_endpoint;
@@ -620,6 +595,7 @@ ErrorOr<void> Application::initialize(Main::Arguments const& arguments)
         .is_test_mode = enable_test_mode ? IsTestMode::Yes : IsTestMode::No,
         .log_all_js_exceptions = log_all_js_exceptions ? LogAllJSExceptions::Yes : LogAllJSExceptions::No,
         .site_isolation_mode = site_isolation_mode,
+        .share_process_between_same_origin_tabs = disable_same_origin_tab_sharing ? ShareProcessBetweenSameOriginTabs::No : ShareProcessBetweenSameOriginTabs::Yes,
         .enable_http_memory_cache = disable_http_memory_cache ? EnableMemoryHTTPCache::No : EnableMemoryHTTPCache::Yes,
         .expose_experimental_interfaces = expose_experimental_interfaces ? ExposeExperimentalInterfaces::Yes : ExposeExperimentalInterfaces::No,
         .expose_internals_object = expose_internals_object ? ExposeInternalsObject::Yes : ExposeInternalsObject::No,
@@ -656,11 +632,26 @@ ErrorOr<void> Application::initialize(Main::Arguments const& arguments)
         }
     }
 
+    // Reports belong to the profile they came from, whose own setting decides what happens to them. A temporary
+    // profile takes nothing over, since it would take it to its grave.
+    auto& crash_report_store = CrashReportStore::the();
+    crash_report_store.set_directory(LexicalPath::join(profile().paths().data, "CrashReports"sv).string());
+    if (!profile().is_temporary()) {
+        if (auto result = crash_report_store.adopt_reports_from(CrashReportStore::default_directory()); result.is_error())
+            warnln("Could not move crash reports into the profile: {}", result.error());
+    }
+    if (captures_browser_crashes()) {
+        if (auto result = crash_report_store.initialize_browser_crash_handler(); result.is_error())
+            warnln("Could not prepare Browser crash reporting: {}", result.error());
+    }
+
     // Test results must not depend on the languages of the machine running the tests.
     auto platform_languages = m_web_content_options.is_test_mode == IsTestMode::Yes ? Vector<String> {} : platform_preferred_languages();
 
     m_settings = make<Settings>(Settings::create(LexicalPath::join(profile().paths().config, "Settings.json"sv).string(), move(platform_languages)));
-    m_bookmark_store = make<BookmarkStore>(BookmarkStore::create(LexicalPath::join(profile().paths().config, "Bookmarks.json"sv).string()));
+    // A browser that crashed left a report that was recovered before the settings were read.
+    if (m_settings->crash_report_sending() == CrashReportSending::NeverSend)
+        CrashReportOutbox::the().discard_all();
 
     if (m_web_content_options.is_test_mode == IsTestMode::Yes) {
         TRY(m_settings->complete_first_run());
@@ -704,6 +695,8 @@ ErrorOr<void> Application::initialize(Main::Arguments const& arguments)
 
     if (!m_event_loop)
         m_event_loop = &create_platform_event_loop();
+    if (captures_browser_crashes())
+        CrashReportOutbox::the().start_removing_expired_reports();
 
     // NB: The host's thread makes an event loop, which would install the default event loop manager if the platform
     //     one were not installed yet.
@@ -720,7 +713,7 @@ ErrorOr<void> Application::initialize(Main::Arguments const& arguments)
         start_content_blocker_list_update(ContentBlockerListUpdateTrigger::Automatic);
     }
 
-    initialize_actions();
+    initialize_page_options();
 
     return {};
 }
@@ -925,7 +918,7 @@ void Application::start_next_content_blocker_list_update()
         return;
     }
     m_content_blocker_list_update_request = client.value()->start_request(
-        "GET"sv, update.url, *request_headers, {}, HTTP::CacheMode::NoStore,
+        "GET"sv, update.url, {}, *request_headers, {}, HTTP::CacheMode::NoStore,
         HTTP::Cookie::IncludeCredentials::No);
     if (!m_content_blocker_list_update_request) {
         warnln("Unable to start update request for {}", update.name);
@@ -950,7 +943,7 @@ void Application::start_next_content_blocker_list_update()
     timeout->start();
 
     m_content_blocker_list_update_request->set_unbuffered_request_callbacks(
-        [this](NonnullRefPtr<HTTP::HeaderList> headers, Optional<u32> response_code, Optional<String> const& reason_phrase, Optional<Core::ImmutableBytes>, Optional<u64>, Requests::CacheState) {
+        [this](NonnullRefPtr<HTTP::HeaderList> headers, Optional<u32> response_code, Optional<String> const& reason_phrase, Requests::CacheState) {
             if (m_content_blocker_list_update_cancelled)
                 return;
             if (response_code.has_value() && Web::Fetch::Infrastructure::is_redirect_status(*response_code)) {
@@ -1071,10 +1064,20 @@ void Application::remove_content_blocker_list(Badge<SettingsUI>, StringView iden
     (void)FileSystem::remove(content_blocker_list_path(identifier), FileSystem::RecursionMode::Disallowed);
 }
 
-void Application::open_url_in_new_tab(URL::URL const& url, Web::HTML::ActivateTab activate_tab) const
+void Application::open_url_in_new_tab(URL::URL const& url, Web::HTML::ActivateTab activate_tab, ViewImplementation const* source_view) const
 {
-    if (auto view = open_blank_new_tab(activate_tab); view.has_value())
+    if (auto view = open_blank_new_tab(activate_tab, source_view); view.has_value())
         view->load(url);
+}
+
+void Application::read_clipboard_text(ClipboardType type, Function<void(Utf16String)> on_read) const
+{
+    on_read(clipboard_text(type));
+}
+
+void Application::read_clipboard_item(Function<void(Web::Clipboard::SystemClipboardItem)> on_read) const
+{
+    on_read(clipboard_item());
 }
 
 void Application::activate_or_open_tab_with_url(URL::URL const& url) const
@@ -1085,9 +1088,9 @@ void Application::activate_or_open_tab_with_url(URL::URL const& url) const
         open_url_in_new_tab(url, Web::HTML::ActivateTab::Yes);
 }
 
-void Application::open_navigation_in_new_tab(Web::HTML::PreparedNavigationDescriptor navigation, Web::HTML::ActivateTab activate_tab) const
+void Application::open_navigation_in_new_tab(Web::HTML::PreparedNavigationDescriptor navigation, Web::HTML::ActivateTab activate_tab, ViewImplementation const* source_view) const
 {
-    if (auto view = open_blank_new_tab(activate_tab); view.has_value())
+    if (auto view = open_blank_new_tab(activate_tab, source_view); view.has_value())
         view->load(move(navigation));
 }
 
@@ -1097,69 +1100,10 @@ void Application::open_urls_in_new_tabs(ReadonlySpan<URL::URL> urls) const
         open_url_in_new_tab(url, Web::HTML::ActivateTab::No);
 }
 
-void Application::open_bookmark_in_new_tab(String const& bookmark_id, Web::HTML::ActivateTab activate_tab) const
-{
-    auto bookmark = m_bookmark_store->find_item_by_id(bookmark_id);
-    if (!bookmark.has_value() || !bookmark->is_bookmark())
-        return;
-
-    if (auto view = active_web_view(); view.has_value())
-        view->open_url_in_new_tab(bookmark->bookmark().url, activate_tab);
-    else
-        open_url_in_new_tab(bookmark->bookmark().url, activate_tab);
-}
-
-static void collect_bookmark_urls(BookmarkItem::Folder const& folder, Vector<URL::URL>& urls)
-{
-    for (auto const& child : folder.children) {
-        child.data.visit(
-            [&](BookmarkItem::Bookmark const& bookmark) {
-                urls.append(bookmark.url);
-            },
-            [&](BookmarkItem::Folder const& child_folder) {
-                collect_bookmark_urls(child_folder, urls);
-            });
-    }
-}
-
-void Application::open_bookmark_folder_in_new_tabs(String const& folder_id) const
-{
-    auto folder = m_bookmark_store->find_item_by_id(folder_id);
-    if (!folder.has_value() || !folder->is_folder())
-        return;
-
-    Vector<URL::URL> urls;
-    collect_bookmark_urls(folder->folder(), urls);
-
-    Vector<URL::URL> internal_urls;
-    auto active_view = active_web_view();
-    for (auto const& url : urls) {
-        if (active_view.has_value() && !is_url_handled_internally(url))
-            active_view->open_url_in_new_tab(url, Web::HTML::ActivateTab::No);
-        else
-            internal_urls.append(url);
-    }
-
-    open_urls_in_new_tabs(internal_urls);
-}
-
-void Application::open_bookmark_in_new_window(String const& bookmark_id, IsPrivate is_private)
-{
-    auto bookmark = m_bookmark_store->find_item_by_id(bookmark_id);
-    if (!bookmark.has_value() || !bookmark->is_bookmark())
-        return;
-
-    if (auto view = active_web_view(); view.has_value())
-        view->open_url_in_new_window(bookmark->bookmark().url, is_private);
-    else
-        open_url_in_new_window(bookmark->bookmark().url, is_private);
-}
-
 ErrorOr<NonnullRefPtr<WebContentClient>> Application::create_web_content_client(IsPrivate is_private, Web::PageId initial_page_id, Optional<Web::HTML::CrossProcessId> navigable_to_adopt, Optional<Web::HTML::CrossProcessId> initial_document_state_id, Vector<Web::HTML::RemoteNavigableDescriptor> remote_navigables, Optional<Web::HTML::SessionHistoryEntryDescriptor> canonical_initial_history_entry, Web::HTML::VisibilityState system_visibility_state)
 {
     // The client's WebContentClient picks up this same session when it is created.
     auto session = session_for_new_view(is_private);
-    auto image_decoder = TRY(launch_image_decoder_process());
 
     auto cross_process_id_allocator = allocate_cross_process_id_allocator();
     auto root_navigable_id = navigable_to_adopt.has_value() ? *navigable_to_adopt : cross_process_id_allocator.allocate();
@@ -1190,7 +1134,6 @@ ErrorOr<NonnullRefPtr<WebContentClient>> Application::create_web_content_client(
     client->async_set_site_compatibility_data(m_site_compatibility_data);
     // A process learns a site's permissions only when it shows that site and asks; at launch, just the defaults.
     client->async_set_permission_snapshot(client->session().permission_manager->snapshot_for({}));
-    connect_to_image_decoder(*client, move(image_decoder));
 
     // NB: A WebDriver BiDi session gives its state to every process hosting web content when it changes.
     if (auto* webdriver_bidi = WebDriverBiDi::the(); webdriver_bidi && webdriver_bidi->session_state().is_active)
@@ -1212,7 +1155,7 @@ ErrorOr<void> Application::reload_site_compatibility_data()
         client.async_set_site_compatibility_data(m_site_compatibility_data);
         return IterationDecision::Continue;
     });
-    WorkerProcessManager::the().update_site_compatibility_data(m_site_compatibility_data);
+    WorkerAgentManager::the().update_site_compatibility_data(m_site_compatibility_data);
     return {};
 }
 
@@ -1280,7 +1223,7 @@ bool Application::request_server_client_may_use_cookies_in(int client_id, URL::U
         return IterationDecision::Break;
     };
     WebContentClient::for_each_client([&](WebContentClient& client) { return check_bindings(client.request_server_site_bindings()); });
-    WorkerProcessManager::the().for_each_request_server_site_bindings([&](RequestServerSiteBindings& bindings) { return check_bindings(bindings); });
+    WorkerAgentManager::the().for_each_request_server_site_bindings([&](RequestServerSiteBindings& bindings) { return check_bindings(bindings); });
     return may_use_cookies;
 }
 
@@ -1304,12 +1247,6 @@ RefPtr<BrowsingSession> Application::session_for_request_server_client(int clien
 RefPtr<BrowsingSession> Application::existing_session(IsPrivate is_private)
 {
     return is_private == IsPrivate::Yes ? the().m_private_session.strong_ref() : the().m_default_session;
-}
-
-SessionStore* Application::session_store(IsPrivate is_private)
-{
-    auto session = existing_session(is_private);
-    return session ? session->session_store.ptr() : nullptr;
 }
 
 WebDriverBrowserConnection* Application::webdriver_browser_connection()
@@ -1394,16 +1331,10 @@ void Application::reset_private_browsing_session()
     // RequestServer answers our own private client with the cookies of the session it was created for, so the next
     // private request made by the UI process needs a client of the new session.
 
-    // Views pending deferred deletion may still push updates, and the replacement store reuses their ids.
-    ViewImplementation::for_each_view([](ViewImplementation& view) {
-        if (view.is_private() == IsPrivate::Yes)
-            view.clear_session_tab_id();
-        return IterationDecision::Continue;
-    });
-
     // NB: Those views own the session until they are deleted, so let go of it here. The private window opened next
     //     starts a new one rather than picking up what this was asked to clear.
     m_private_session.clear();
+    WorkerAgentManager::the().remove_private_workers_without_owners();
 }
 
 Web::CompositorContextId Application::allocate_compositor_context_id()
@@ -1457,7 +1388,7 @@ ErrorOr<IPC::TransportHandle> Application::connect_new_compositor_canvas_client(
         return Error::from_string_literal("Compositor process is not available");
 
     // The Compositor treats every renderer-side connection uniformly; canvas-only
-    // clients (worker processes) simply never register navigable contexts, so the
+    // clients (workers) simply never register navigable contexts, so the
     // returned connection id is not needed.
     auto response_or_error = m_compositor_client->try_connect_web_content();
     if (response_or_error.is_error())
@@ -1600,6 +1531,13 @@ void Application::crash_compositor_process()
     m_compositor_client->async_crash();
 }
 
+bool Application::same_origin_tabs_may_share_a_process() const
+{
+    // NB: Tests run side by side, and must not take each other's state with them.
+    return m_web_content_options.share_process_between_same_origin_tabs == ShareProcessBetweenSameOriginTabs::Yes
+        && m_web_content_options.is_test_mode == IsTestMode::No;
+}
+
 ErrorOr<NonnullRefPtr<WebContentPage>> Application::open_page_for_new_tab(IsPrivate is_private)
 {
     RefPtr<WebContentClient> web_content_client;
@@ -1613,6 +1551,11 @@ ErrorOr<NonnullRefPtr<WebContentPage>> Application::open_page_for_new_tab(IsPriv
         web_content_client = TRY(create_web_content_client(IsPrivate::No, allocate_page_id()));
     }
     return web_content_client->open_initial_page_for_new_top_level_traversable();
+}
+
+ErrorOr<NonnullRefPtr<WebContentClient>> Application::launch_web_content_process_without_page(IsPrivate is_private)
+{
+    return create_web_content_client(is_private, allocate_page_id());
 }
 
 ErrorOr<Application::ChildFrameWebContentProcess> Application::launch_child_frame_web_content_process(IsPrivate is_private, Vector<Web::HTML::RemoteNavigableDescriptor> remote_navigables, Web::HTML::CrossProcessId root_navigable_id, Web::HTML::SessionHistoryEntryDescriptor initial_history_entry, Web::HTML::VisibilityState system_visibility_state)
@@ -1731,7 +1674,6 @@ ErrorOr<void> Application::launch_services()
     schedule_permission_expiry();
 
     m_settings_observer = make<ApplicationSettingsObserver>();
-    m_bookmark_store_observer = make<ApplicationBookmarkStoreObserver>();
 
 #if defined(AK_OS_WINDOWS)
     m_handle_broker_server = IPC::HandleBrokerServer::create();
@@ -1741,18 +1683,9 @@ ErrorOr<void> Application::launch_services()
         process_did_exit(move(process), exit_status);
     };
 
-    Optional<ByteString> history_database_directory;
-    bool should_remove_unreferenced_favicons = false;
-
     if (m_browser_options.disable_sql_database == DisableSQLDatabase::No) {
         auto database_path = profile().paths().data;
-        history_database_directory = database_path;
-
         auto database = TRY(Database::Database::create(database_path, "Ladybird"sv));
-        auto history_database = TRY(Database::Database::create(database_path, "History"sv));
-
-        if (auto history_database_path = history_database->database_path(); history_database_path.has_value())
-            dbgln_if(WEBVIEW_HISTORY_DEBUG, "[History] SQL history is enabled, using {}", history_database_path->string());
 
         // The browsing database is shared by several stores, so the decision to fall back is
         // made for the file as a whole: if any store's schema is too new, none of them may
@@ -1809,92 +1742,33 @@ ErrorOr<void> Application::launch_services()
         else
             m_download_store = DownloadStore::create_disabled();
 
-        // The History database is shared by the favicon and history stores. Preflight both before applying either
-        // migration so a database that is too new remains untouched.
-        auto favicons_outcome = TRY(FaviconStore::migrate_schema(history_database, Database::MigrationMode::CheckOnly));
-        auto history_outcome = TRY(HistoryStore::migrate_schema(history_database, Database::MigrationMode::CheckOnly));
-
-        if (favicons_outcome == Database::MigrationOutcome::Success && history_outcome == Database::MigrationOutcome::Success) {
-            favicons_outcome = TRY(FaviconStore::migrate_schema(history_database));
-            history_outcome = favicons_outcome == Database::MigrationOutcome::Success
-                ? TRY(HistoryStore::migrate_schema(history_database))
-                : Database::MigrationOutcome::DatabaseTooNew;
-        }
-
-        if (favicons_outcome == Database::MigrationOutcome::Success && history_outcome == Database::MigrationOutcome::Success) {
-            m_default_session->favicon_store = TRY(FaviconStore::create(history_database));
-            m_default_session->history_store = TRY(HistoryStore::create(history_database));
-            should_remove_unreferenced_favicons = true;
-        } else {
-            dbgln("History database was created by a newer Ladybird version; favicons and history will not be persisted this session");
-            history_database_directory = {};
-            m_default_session->favicon_store = FaviconStore::create();
-            m_default_session->history_store = HistoryStore::create(*m_default_session->favicon_store);
-        }
-
-        // Fall back without modifying the existing Sessions database.
-        auto session_store = [&]() -> ErrorOr<NonnullOwnPtr<SessionStore>> {
-            // A headless run, a browser that WebDriver drives, and one that logs process statistics never join a browser
-            // already running on their profile. Yet startup recovery would still rewrite the saved session, reset the
-            // unclean-exit count, and demote the open windows of a browser running on this profile. So each gets a
-            // transient store instead, leaving the Sessions database as the last run left it.
-            if (m_browser_options.headless_mode.has_value() || m_browser_options.webdriver_browser_endpoint.has_value() || m_stats_log)
-                return SessionStore::create();
-
-            auto session_database = TRY(Database::Database::create(database_path, "Sessions"sv, { .foreign_keys = Database::Database::ForeignKeys::Yes }));
-            if (TRY(SessionStore::migrate_schema(session_database)) != Database::MigrationOutcome::Success)
-                return Error::from_string_literal("Sessions database was created by a newer Ladybird version");
-            return SessionStore::create(session_database, launch_restore_policy());
-        }();
-        if (session_store.is_error()) {
-            dbgln("Sessions will not be persisted this session: {}", session_store.error());
-            m_default_session->session_store = SessionStore::create();
-        } else {
-            m_default_session->session_store = session_store.release_value();
-        }
+        // A headless run, a browser that WebDriver drives, and one that logs process statistics never join a browser
+        // already running on their profile. Yet startup recovery would still rewrite the saved session, reset the
+        // unclean-exit count, and demote the open windows of a browser running on this profile. So none of them keeps
+        // its session, leaving the Sessions database as the last run left it.
+        m_persists_sessions = !m_browser_options.headless_mode.has_value() && !m_browser_options.webdriver_browser_endpoint.has_value() && !m_stats_log;
     } else {
-        dbgln_if(WEBVIEW_HISTORY_DEBUG, "[History] SQL history is disabled, disabling browsing history");
-
         m_default_session->cookie_jar = CookieJar::create();
-        m_default_session->favicon_store = FaviconStore::create();
-        m_default_session->history_store = HistoryStore::create_disabled();
         m_default_session->hsts_store = HSTSStore::create();
         m_default_session->storage_jar = StorageJar::create();
         m_download_store = DownloadStore::create_disabled();
-        m_default_session->session_store = SessionStore::create();
     }
 
     m_default_session->blob_url_store = make<BlobURLStore>();
 
-    if (should_remove_unreferenced_favicons) {
-        auto referenced_hashes = m_bookmark_store->favicon_hashes();
-        for (auto& hash : m_default_session->history_store->referenced_favicon_hashes())
-            referenced_hashes.set(move(hash));
-        m_default_session->favicon_store->remove_unreferenced_favicons(referenced_hashes);
-    }
-
     m_file_downloader.adopt_download_store({}, *m_download_store);
-
-    m_default_session->session_store->on_closed_units_changed = [this] {
-        on_recently_closed_entries_changed();
-    };
 
 #if !defined(AK_OS_WINDOWS)
     // A run stopped by SIGINT or SIGTERM ends like a quit, rather than like a crash: It saves the session, leaves its
     // windows for the next launch to recover, and records a clean exit.
-    if (m_default_session->session_store->is_persistent()) {
+    if (m_persists_sessions) {
         for (auto signal_number : { SIGINT, SIGTERM }) {
             m_session_signal_handlers.append(Core::EventLoop::register_signal(signal_number, [this](int) {
-                m_default_session->session_store->application_quitting();
-                m_event_loop->quit(0);
+                quit_for_signal();
             }));
         }
     }
 #endif
-
-    VERIFY(m_event_loop);
-    m_autocomplete_service = make<AutocompleteService>(*m_event_loop, move(history_database_directory));
-    m_autocomplete_service->update_bookmarks(autocomplete_bookmark_snapshot(*m_bookmark_store));
 
     // No need to monitor the system time zone if the TZ environment variable is set, as it overrides system preferences.
     if (!Core::Environment::has("TZ"sv)) {
@@ -1912,6 +1786,7 @@ ErrorOr<void> Application::launch_services()
         }
     }
 
+    m_image_decoder_manager = make<ImageDecoderManager>();
     TRY(launch_request_server());
     TRY(launch_compositor_process());
 
@@ -2105,21 +1980,21 @@ ErrorOr<void> Application::launch_request_server()
 
 void Application::configure_request_server_control_client(Requests::RequestControlClient& control_client)
 {
-    control_client.on_store_response_cookies_and_hsts_policy = [](int client_id, URL::URL const& url, Optional<HTTP::Cookie::PartitionContext> const& partition_context, Vector<HTTP::Cookie::ParsedCookie> const& cookies, Optional<HTTP::HSTS::ParsedHSTSPolicy> const& hsts_policy) {
+    control_client.on_store_response_cookies_and_hsts_policy = [](int client_id, URL::URL const& url, Optional<HTTP::Cookie::PartitionContext> const& partition_context, HTTP::Cookie::SameSiteContext same_site_context, Vector<HTTP::Cookie::ParsedCookie> const& cookies, Optional<HTTP::HSTS::ParsedHSTSPolicy> const& hsts_policy) {
         auto session = the().session_for_request_server_client(client_id);
         if (!session)
             return;
 
         if (the().request_server_client_may_use_cookies_in(client_id, url, partition_context)) {
             for (auto const& cookie : cookies)
-                session->cookie_jar->set_cookie(url, cookie, HTTP::Cookie::Source::Http, partition_context);
+                session->cookie_jar->set_cookie(url, cookie, HTTP::Cookie::Source::Http, partition_context, same_site_context);
         }
 
         if (hsts_policy.has_value() && url.host().has_value() && url.host()->is_domain())
             session->hsts_store->store_policy(url.host()->get<String>(), *hsts_policy);
     };
 
-    control_client.on_retrieve_http_cookie = [](int client_id, URL::URL const& url, Optional<HTTP::Cookie::PartitionContext> const& partition_context) -> String {
+    control_client.on_retrieve_http_cookie = [](int client_id, URL::URL const& url, Optional<HTTP::Cookie::PartitionContext> const& partition_context, HTTP::Cookie::SameSiteContext same_site_context) -> String {
         auto session = the().session_for_request_server_client(client_id);
         if (!session)
             return {};
@@ -2127,9 +2002,9 @@ void Application::configure_request_server_control_client(Requests::RequestContr
             return {};
         auto& cookie_jar = *session->cookie_jar;
         if constexpr (!REQUESTSERVER_WIRE_DEBUG)
-            return cookie_jar.get_cookie(url, HTTP::Cookie::Source::Http, partition_context);
+            return cookie_jar.get_cookie(url, HTTP::Cookie::Source::Http, partition_context, same_site_context);
         auto started_at = MonotonicTime::now();
-        auto cookie = cookie_jar.get_cookie(url, HTTP::Cookie::Source::Http, partition_context);
+        auto cookie = cookie_jar.get_cookie(url, HTTP::Cookie::Source::Http, partition_context, same_site_context);
         auto elapsed_ms = (MonotonicTime::now() - started_at).to_milliseconds();
         if (elapsed_ms > 5) {
             dbgln("UI wire-cookie: get_cookie({}) took {} ms ({} bytes returned)",
@@ -2139,11 +2014,6 @@ void Application::configure_request_server_control_client(Requests::RequestContr
     };
 
     TabPerformanceMonitor::configure(control_client);
-}
-
-void Application::set_image_decoder_exit_handler(u64 child_id, Function<void()> handler)
-{
-    m_image_decoder_exit_handlers.set(child_id, move(handler));
 }
 
 ErrorOr<void> Application::launch_devtools_server()
@@ -2239,7 +2109,12 @@ ErrorOr<int> Application::execute()
         auto theme_path = LexicalPath::join(WebView::s_ladybird_resource_root, "themes"sv, "Default.ini"sv);
         auto theme = TRY(Gfx::load_system_theme(theme_path.string()));
 
-        view = HeadlessWebView::create(move(theme), { m_browser_options.window_width, m_browser_options.window_height });
+#if !defined(AK_OS_WINDOWS)
+        if (*m_browser_options.headless_mode == HeadlessMode::Terminal)
+            view = TRY(TerminalWebView::create(move(theme), m_browser_options.device_pixel_ratio));
+        else
+#endif
+            view = HeadlessWebView::create(move(theme), { m_browser_options.window_width, m_browser_options.window_height });
 
         if (!m_browser_options.webdriver_browser_endpoint.has_value()) {
             if (m_browser_options.urls.size() != 1)
@@ -2256,6 +2131,7 @@ ErrorOr<int> Application::execute()
                 load_page_for_info_and_exit(*m_event_loop, *view, m_browser_options.urls.first(), WebView::PageInfoType::Text);
                 break;
             case HeadlessMode::Manual:
+            case HeadlessMode::Terminal:
                 load_page_and_exit_on_close(*m_event_loop, *view, m_browser_options.urls.first());
                 break;
             case HeadlessMode::Test:
@@ -2270,6 +2146,11 @@ ErrorOr<int> Application::execute()
 Core::EventLoop& Application::create_platform_event_loop()
 {
     return Core::EventLoop::initialize_for_current_thread();
+}
+
+NonnullOwnPtr<MicrophoneAuthorizer> Application::create_microphone_authorizer()
+{
+    return make<NoOpMicrophoneAuthorizer>();
 }
 
 ChildIdentity Application::add_child_process(WebView::Process&& process)
@@ -2307,10 +2188,11 @@ void Application::process_did_exit(Process&& process, Optional<int>)
     if (m_event_loop->was_exit_requested())
         return;
 
+    m_image_decoder_manager->process_did_exit(process.child_id());
+
     dbgln_if(WEBVIEW_PROCESS_DEBUG, "Process {} died, type: {}", process.pid(), process_name_from_type(process.type()));
 
     auto const& report_name = process.saved_crash_report_name();
-    auto crash_is_shown_in_tab = false;
 
     switch (process.type()) {
     case ProcessType::Compositor:
@@ -2320,8 +2202,7 @@ void Application::process_did_exit(Process&& process, Optional<int>)
         }
         break;
     case ProcessType::ImageDecoder:
-        if (auto handler = m_image_decoder_exit_handlers.take(process.child_id()); handler.has_value())
-            (*handler)();
+        // The processes it served ask for a new one when they next have an image to decode.
         break;
     case ProcessType::MediaServer:
         // The connection's holder launches a new MediaServer when it next connects a client.
@@ -2333,6 +2214,9 @@ void Application::process_did_exit(Process&& process, Optional<int>)
     case ProcessType::VideoDecoderServer:
         // The MediaServer it served asks for a new one once its decoders notice the loss.
         break;
+    case ProcessType::WebRTCClient:
+        // The WebContent process it served asks for a new one the next time it needs one.
+        break;
     case ProcessType::RequestServer:
         if (auto client = process.client<Requests::RequestControlClient>()) {
             dbgln_if(WEBVIEW_PROCESS_DEBUG, "Restart request server");
@@ -2343,45 +2227,23 @@ void Application::process_did_exit(Process&& process, Optional<int>)
     case ProcessType::WebContent:
         if (auto client = process.client<WebContentClient>()) {
             client->did_lose_process();
-            if (!report_name.is_empty()) {
+            if (!report_name.is_empty())
                 client->did_save_crash_report(report_name);
-                crash_is_shown_in_tab = client->has_crashed_views();
-            }
             m_web_content_clients.remove(client.release_nonnull());
         }
         break;
-    case ProcessType::WebWorker:
-        dbgln_if(WEBVIEW_PROCESS_DEBUG, "WebWorker {} died, not sure what to do.", process.pid());
-        break;
     case ProcessType::Browser:
-        dbgln("Invalid process type to be dying: Browser");
+    case ProcessType::UI:
+    case ProcessType::Hub:
+        dbgln("Invalid process type to be dying: {}", process_name_from_type(process.type()));
         VERIFY_NOT_REACHED();
     }
 
     if (report_name.is_empty())
         return;
 
-    // The tab's crash screen is this report's one automatic prompt, so it is not offered again. Every other crash is
-    // hidden from the user, so its report is offered right away.
-    if (!crash_is_shown_in_tab) {
-        offer_crash_report(report_name);
-    } else if (!browser_options().headless_mode.has_value()) {
-        if (auto result = CrashReportStore::the().mark_seen(report_name); result.is_error())
-            warnln("Could not mark crash report as seen: {}", result.error());
-    }
-}
-
-void Application::offer_newest_pending_crash_report()
-{
-    if (auto names = CrashReportStore::the().pending_report_names(); !names.is_error() && !names.value().is_empty())
-        offer_crash_report(names.value().first());
-}
-
-void Application::offer_crash_report(ByteString const& report_name)
-{
-    if (browser_options().headless_mode.has_value() || browser_options().webdriver_browser_endpoint.has_value())
-        return;
-    display_crash_report_notification(report_name);
+    // A report waits until it is answered, on a tab's crash screen or in the list of reports.
+    CrashReportOutbox::the().reports_changed();
 }
 
 static bool download_path_is_available(LexicalPath const& path)
@@ -2423,16 +2285,23 @@ ErrorOr<LexicalPath> Application::default_path_for_downloaded_file(ByteString co
     return unique_download_path(downloads_directory, Web::sanitize_suggested_download_filename(file));
 }
 
-ErrorOr<LexicalPath> Application::path_for_downloaded_file(ByteString const& file) const
+NonnullRefPtr<Core::Promise<LexicalPath>> Application::path_for_downloaded_file(ByteString const& file) const
 {
-    if (browser_options().headless_mode.has_value())
-        return default_path_for_downloaded_file(file);
+    if (browser_options().headless_mode.has_value()) {
+        auto download_path = default_path_for_downloaded_file(file);
+        if (download_path.is_error())
+            return Core::Promise<LexicalPath>::rejected(download_path.release_error());
+        return Core::Promise<LexicalPath>::resolved(download_path.release_value());
+    }
 
-    auto download_path = ask_user_for_download_path(Web::sanitize_suggested_download_filename(file));
-    if (!download_path.has_value())
-        return Error::from_errno(ECANCELED);
+    return ask_user_for_download_path(Web::sanitize_suggested_download_filename(file))->map<LexicalPath>([](auto& download_path) {
+        return LexicalPath { download_path };
+    });
+}
 
-    return LexicalPath { download_path.release_value() };
+NonnullRefPtr<Core::Promise<ByteString>> Application::ask_user_for_download_path(ByteString const&) const
+{
+    return Core::Promise<ByteString>::rejected(Error::from_errno(ECANCELED));
 }
 
 void Application::display_download_confirmation_dialog(StringView download_name, LexicalPath const& path) const
@@ -2445,31 +2314,6 @@ void Application::display_error_dialog(StringView error_message) const
     warnln("{}", error_message);
 }
 
-static ErrorOr<String> download_path_for_frontend_action(LexicalPath const& path)
-{
-    return String::from_utf8(path.string().view());
-}
-
-ErrorOr<String> Application::download_file_path_for_frontend_action(FileDownloader::Download const& download) const
-{
-    return download_path_for_frontend_action(download.destination);
-}
-
-ErrorOr<String> Application::download_directory_path_for_frontend_action(FileDownloader::Download const& download) const
-{
-    return download_path_for_frontend_action(LexicalPath { download.destination.dirname() });
-}
-
-void Application::open_download(FileDownloader::Download const& download) const
-{
-    outln("Open downloaded file: {}", download.destination);
-}
-
-void Application::show_download_in_folder(FileDownloader::Download const& download) const
-{
-    outln("Show downloaded file in folder: {}", download.destination);
-}
-
 bool Application::supports_clipboard_type(ClipboardType type) const
 {
     return type == ClipboardType::Text;
@@ -2478,6 +2322,11 @@ bool Application::supports_clipboard_type(ClipboardType type) const
 bool Application::supports_picture_in_picture() const
 {
     return browser_options().headless_mode.has_value();
+}
+
+NonnullOwnPtr<NotificationBackend> Application::create_notification_backend()
+{
+    return make<NoOpNotificationBackend>();
 }
 
 OwnPtr<PictureInPictureWindow> Application::create_picture_in_picture_window(WebContentPage& requesting_page, CanonicalTraversable& traversable, Gfx::IntSize video_size)
@@ -2562,13 +2411,9 @@ NonnullRefPtr<Core::Promise<Empty>> Application::clear_browsing_data(ClearBrowsi
     }
 
     if (options.delete_history == ClearBrowsingDataOptions::Delete::Yes) {
-        m_default_session->history_store->remove_entries_accessed_since(options.since);
-        if (auto result = m_default_session->session_store->remove_entries_accessed_since(options.since); result.is_error())
-            dbgln("Unable to remove closed session entries: {}", result.error());
-        if (auto private_session = m_private_session.strong_ref()) {
-            if (auto result = private_session->session_store->remove_entries_accessed_since(options.since); result.is_error())
-                dbgln("Unable to remove closed private session entries: {}", result.error());
-        }
+        if (auto result = CrashReportStore::the().remove_websites_saved_since(options.since); result.is_error())
+            dbgln("Unable to remove the websites of crash reports: {}", result.error());
+        CrashReportOutbox::the().reports_changed();
         did_change_history = true;
     }
 
@@ -2588,7 +2433,7 @@ NonnullRefPtr<Core::Promise<Empty>> Application::clear_browsing_data(ClearBrowsi
     }
 
     if (did_change_history)
-        on_recently_closed_entries_changed();
+        did_clear_history_since(options.since);
 
     if (!promise) {
         promise = Core::Promise<Empty>::construct();
@@ -2601,346 +2446,99 @@ NonnullRefPtr<Core::Promise<Empty>> Application::clear_browsing_data(ClearBrowsi
     return promise.release_nonnull();
 }
 
-void Application::initialize_actions()
+void Application::initialize_page_options()
 {
-    auto debug_request = [this](auto request) {
-        return [this, request]() {
-            if (auto view = active_web_view(); view.has_value())
-                view->debug_request(request);
-        };
-    };
-
-    auto check = [](auto& action, auto request) {
-        return [&action, request]() {
-            ViewImplementation::for_each_view([checked = action->checked(), request](ViewImplementation& view) {
-                view.debug_request(request, checked ? "on"sv : "off"sv);
-                return IterationDecision::Continue;
-            });
-        };
-    };
-
-    auto add_spoofed_value = [](auto& menu, auto name, auto value, auto& cached_value, auto request, auto notify_workers) {
-        auto action = Action::create_checkable(name, ActionID::SpoofUserAgent, [value, &cached_value, request, notify_workers]() {
-            cached_value = value;
-            // Workers take no debug requests; the worker process manager hands the new value to every live worker.
-            notify_workers();
-
-            ViewImplementation::for_each_view([&](ViewImplementation& view) {
-                view.debug_request(request, cached_value);
-                view.debug_request("clear-cache"sv); // Clear the cache to ensure requests are re-done with the new value.
-                return IterationDecision::Continue;
-            });
-        });
-
-        action->set_checked(value == cached_value);
-        menu->add_action(move(action));
-    };
-
-    m_reload_action = Action::create("Reload"sv, ActionID::Reload, [this]() {
-        if (auto view = active_web_view(); view.has_value())
-            view->reload();
-    });
-    m_reload_bypassing_cache_action = Action::create("Reload Without Cache"sv, ActionID::ReloadBypassingCache, [this]() {
-        if (auto view = active_web_view(); view.has_value())
-            view->reload(BypassCache::Yes);
-    });
-
-    m_undo_action = Action::create("Undo"sv, ActionID::Undo, [this]() {
-        if (auto view = active_web_view(); view.has_value())
-            view->undo();
-    });
-    m_redo_action = Action::create("Redo"sv, ActionID::Redo, [this]() {
-        if (auto view = active_web_view(); view.has_value())
-            view->redo();
-    });
-    update_editing_history_actions();
-    m_copy_selection_action = Action::create("Copy"sv, ActionID::CopySelection, [this]() {
-        if (auto view = active_web_view(); view.has_value())
-            view->selected_text()->when_resolved([this](auto& text) {
-                if (!text.is_empty())
-                    insert_clipboard_entry({ "text/plain"_string, text });
-            });
-    });
-    m_cut_selection_action = Action::create("Cut"sv, ActionID::CutSelection, [this]() {
-        if (auto view = active_web_view(); view.has_value())
-            view->cut_selected_text()->when_resolved([this](auto& text) {
-                if (!text.is_empty())
-                    insert_clipboard_entry({ "text/plain"_string, text });
-            });
-    });
-    m_paste_action = Action::create("Paste"sv, ActionID::Paste, [this]() {
-        if (auto view = active_web_view(); view.has_value())
-            view->paste_from_clipboard();
-    });
-    m_select_all_action = Action::create("Select All"sv, ActionID::SelectAll, [this]() {
-        if (auto view = active_web_view(); view.has_value())
-            view->select_all();
-    });
-
-    m_open_about_page_action = Action::create("About Ladybird"sv, ActionID::OpenAboutPage, [this]() {
-        activate_or_open_tab_with_url(URL::about_version());
-    });
-    m_open_downloads_page_action = Action::create("Downloads"sv, ActionID::ViewDownloads, [this]() {
-        activate_or_open_tab_with_url(URL::about_downloads());
-    });
-    m_open_settings_page_action = Action::create("Settings"sv, ActionID::OpenSettingsPage, [this]() {
-        activate_or_open_tab_with_url(URL::about_settings());
-    });
-
-    m_zoom_in_action = Action::create("Zoom In"sv, ActionID::ZoomIn, [this]() {
-        if (auto view = active_web_view(); view.has_value())
-            view->zoom_in();
-    });
-    m_zoom_out_action = Action::create("Zoom Out"sv, ActionID::ZoomOut, [this]() {
-        if (auto view = active_web_view(); view.has_value())
-            view->zoom_out();
-    });
-    m_reset_zoom_action = Action::create("Reset Zoom"sv, ActionID::ResetZoom, [this]() {
-        if (auto view = active_web_view(); view.has_value())
-            view->reset_zoom();
-    });
-
-    m_zoom_menu = Menu::create_group("Zoom"sv);
-    m_zoom_menu->add_action(zoom_in_action());
-    m_zoom_menu->add_action(zoom_out_action());
-    m_zoom_menu->add_action(reset_zoom_action());
-
-    auto set_website_color_scheme = [this](auto color_scheme) {
-        return [this, color_scheme]() {
-            auto appearance = m_settings->appearance();
-            appearance.website_color_scheme = color_scheme;
-            m_settings->set_appearance(appearance);
-        };
-    };
-
-    m_color_scheme_menu = Menu::create_group("Color Scheme"sv);
-    m_color_scheme_menu->add_action(Action::create_checkable("Auto"sv, ActionID::PreferredColorScheme, set_website_color_scheme(ThemePreference::System)));
-    m_color_scheme_menu->add_action(Action::create_checkable("Dark"sv, ActionID::PreferredColorScheme, set_website_color_scheme(ThemePreference::Dark)));
-    m_color_scheme_menu->add_action(Action::create_checkable("Light"sv, ActionID::PreferredColorScheme, set_website_color_scheme(ThemePreference::Light)));
+    m_user_agent_string = MUST(String::from_utf8(m_web_content_options.user_agent_preset.has_value()
+            ? *WebView::user_agents.get(*m_web_content_options.user_agent_preset)
+            : Web::default_user_agent));
+    m_scripting_enabled = m_browser_options.disable_scripting == DisableScripting::No;
+    m_blocks_pop_ups = m_browser_options.allow_popups == AllowPopups::No;
     update_website_color_scheme();
-
-    auto set_contrast = [this](auto contrast) {
-        return [this, contrast]() {
-            m_contrast = contrast;
-
-            ViewImplementation::for_each_view([&](ViewImplementation& view) {
-                view.set_preferred_contrast(m_contrast);
-                return IterationDecision::Continue;
-            });
-        };
-    };
-
-    m_contrast_menu = Menu::create_group("Contrast"sv);
-    m_contrast_menu->add_action(Action::create_checkable("Auto"sv, ActionID::PreferredContrast, set_contrast(Web::CSS::PreferredContrast::Auto)));
-    m_contrast_menu->add_action(Action::create_checkable("Less"sv, ActionID::PreferredContrast, set_contrast(Web::CSS::PreferredContrast::Less)));
-    m_contrast_menu->add_action(Action::create_checkable("More"sv, ActionID::PreferredContrast, set_contrast(Web::CSS::PreferredContrast::More)));
-    m_contrast_menu->add_action(Action::create_checkable("No Preference"sv, ActionID::PreferredContrast, set_contrast(Web::CSS::PreferredContrast::NoPreference)));
-    m_contrast_menu->items().first().get<NonnullRefPtr<Action>>()->set_checked(true);
-
-    auto set_motion = [this](auto motion) {
-        return [this, motion]() {
-            m_motion = motion;
-
-            ViewImplementation::for_each_view([&](ViewImplementation& view) {
-                view.set_preferred_motion(m_motion);
-                return IterationDecision::Continue;
-            });
-        };
-    };
-
-    m_motion_menu = Menu::create_group("Motion"sv);
-    m_motion_menu->add_action(Action::create_checkable("Auto"sv, ActionID::PreferredMotion, set_motion(Web::CSS::PreferredMotion::Auto)));
-    m_motion_menu->add_action(Action::create_checkable("Reduce"sv, ActionID::PreferredMotion, set_motion(Web::CSS::PreferredMotion::Reduce)));
-    m_motion_menu->add_action(Action::create_checkable("No Preference"sv, ActionID::PreferredMotion, set_motion(Web::CSS::PreferredMotion::NoPreference)));
-    m_motion_menu->items().first().get<NonnullRefPtr<Action>>()->set_checked(true);
-
-    m_toggle_vertical_tabs_expanded_action = Action::create("Toggle Vertical Tabs Expanded"sv, ActionID::ToggleVerticalTabsExpanded, [this]() {
-        auto tab_settings = m_settings->tab_settings();
-        tab_settings.vertical_tabs_expanded = !tab_settings.vertical_tabs_expanded;
-        m_settings->set_tab_settings(tab_settings);
-    });
-    update_vertical_tabs_action();
-
-    m_toggle_menu_bar_action = Action::create_checkable("Show Menu Bar"sv, ActionID::ToggleMenuBar, [this]() {
-        auto appearance = m_settings->appearance();
-        appearance.show_menu_bar = !appearance.show_menu_bar;
-        m_settings->set_appearance(appearance);
-    });
-    m_toggle_menu_bar_action->set_checked(m_settings->appearance().show_menu_bar);
-
-    m_bookmarks_menu = Menu::create("Bookmarks"sv);
-    m_bookmarks_menu->add_action(Action::create("Manage Bookmarks"sv, ActionID::ManageBookmarks, [this]() {
-        activate_or_open_tab_with_url(URL::about_bookmarks());
-    }));
-
-    auto add_show_bookmarks_bar_option = [&](auto name, auto value) {
-        auto action = Action::create_checkable(name, ActionID::ShowBookmarksBar, [this, value]() {
-            auto appearance = m_settings->appearance();
-            appearance.show_bookmarks_bar = value;
-            m_settings->set_appearance(appearance);
-        });
-
-        action->set_checked(m_settings->appearance().show_bookmarks_bar == value);
-        m_show_bookmarks_bar_menu->add_action(action);
-        return action;
-    };
-
-    m_show_bookmarks_bar_menu = Menu::create_group("Show Bookmarks Bar"sv);
-    m_show_bookmarks_bar_always_action = add_show_bookmarks_bar_option("Always"sv, ShowBookmarksBar::Always);
-    m_show_bookmarks_bar_never_action = add_show_bookmarks_bar_option("Never"sv, ShowBookmarksBar::Never);
-    m_show_bookmarks_bar_on_hover_action = add_show_bookmarks_bar_option("Only When Hovering the Navigation Toolbar"sv, ShowBookmarksBar::OnHover);
-    m_bookmarks_menu->add_submenu(*m_show_bookmarks_bar_menu);
-    m_bookmarks_menu->add_separator();
-
-    m_toggle_bookmark_action = Action::create("Toggle Bookmark"sv, ActionID::ToggleBookmark, [this]() {
-        auto view = active_web_view();
-        if (!view.has_value())
-            return;
-
-        toggle_bookmark_for_view(*view);
-    });
-    m_bookmarks_menu->add_action(*m_toggle_bookmark_action);
-    update_bookmark_action_for_current_web_view();
-
-    m_bookmarks_menu->add_action(Action::create("Bookmark All Tabs…"sv, ActionID::AddBookmarkAllTabs, [this]() {
-        auto bookmarks = bookmarks_for_all_tabs_in_current_window();
-        if (bookmarks.is_empty())
-            return;
-
-        auto default_title = MUST(UnixDateTime::now().to_string("Saved Tabs %Y-%m-%d"sv));
-        display_add_bookmark_folder_dialog(default_title)
-            ->when_resolved([this, bookmarks = move(bookmarks)](BookmarkDialogResult result) mutable {
-                auto& folder = result.data.get<BookmarkItem::Folder>();
-                auto folder_id = m_bookmark_store->add_folder(move(folder.title), result.target_folder_id);
-
-                for (auto& bookmark : bookmarks)
-                    m_bookmark_store->add_bookmark(move(bookmark.url), move(bookmark.title), move(bookmark.favicon_hash), folder_id);
-            });
-    }));
-
-    m_toggle_bookmark_bar_action = Action::create("Show Bookmarks Bar"sv, ActionID::ToggleBookmarksBar, [this]() {
-        auto appearance = m_settings->appearance();
-        appearance.show_bookmarks_bar = appearance.show_bookmarks_bar == WebView::ShowBookmarksBar::Always
-            ? WebView::ShowBookmarksBar::Never
-            : WebView::ShowBookmarksBar::Always;
-        m_settings->set_appearance(appearance);
-    });
-
-    m_bookmarks_menu->add_separator();
-    m_bookmarks_menu_static_size = m_bookmarks_menu->size();
-    create_bookmark_menu_items();
-
-    m_history_menu = Menu::create("History"sv);
-    m_history_menu->add_action(Action::create("View History"sv, ActionID::ViewHistory, [this]() {
-        activate_or_open_tab_with_url(URL::about_history());
-    }));
-    m_history_menu->add_separator();
-    m_history_menu->add_action(Action::create("Clear Browsing Data"sv, ActionID::ClearBrowsingData, [this]() {
-        auto url = URL::about_settings();
-        url.set_fragment("clearBrowsingData"sv);
-        activate_or_open_tab_with_url(url);
-    }));
-
-    m_inspect_menu = Menu::create("Inspect"sv);
-
-    m_view_source_action = Action::create("View Page Source"sv, ActionID::ViewSource, [this]() {
-        if (auto view = active_web_view(); view.has_value())
-            view->get_source();
-    });
-    m_inspect_menu->add_action(*m_view_source_action);
-
-    m_toggle_devtools_action = Action::create("Enable DevTools"sv, ActionID::ToggleDevTools, [this]() {
-        if (auto result = toggle_devtools_enabled(); result.is_error())
-            display_error_dialog(MUST(String::formatted("Unable to start DevTools: {}", result.error())));
-    });
-    m_inspect_menu->add_action(*m_toggle_devtools_action);
-
-    m_report_website_issue_action = Action::create("Report Website Issue…"sv, ActionID::ReportWebsiteIssue, [this]() {
-        if (auto view = active_web_view(); view.has_value())
-            view->report_website_issue();
-    });
-    m_report_website_issue_action->set_enabled(false);
-
-    m_debug_menu = Menu::create("Debug"sv);
-    m_debug_menu->set_visible(m_settings->config_variable_as_bool(ConfigVariableID::ShowAdvancedDebugMenu));
-    m_debug_menu->add_action(Action::create("Dump Session History Tree"sv, ActionID::DumpSessionHistoryTree, debug_request("dump-session-history"sv)));
-    m_debug_menu->add_action(Action::create("Dump DOM Tree"sv, ActionID::DumpDOMTree, debug_request("dump-dom-tree"sv)));
-    m_debug_menu->add_action(Action::create("Dump Layout Tree"sv, ActionID::DumpLayoutTree, debug_request("dump-layout-tree"sv)));
-    m_debug_menu->add_action(Action::create("Dump Stacking Context Tree"sv, ActionID::DumpStackingContextTree, debug_request("dump-stacking-context-tree"sv)));
-    m_debug_menu->add_action(Action::create("Dump Site Isolation Process Tree"sv, ActionID::DumpSiteIsolationProcessTree, debug_request("dump-site-isolation-process-tree"sv)));
-    m_debug_menu->add_action(Action::create("Dump Display List"sv, ActionID::DumpDisplayList, debug_request("dump-display-list"sv)));
-    m_debug_menu->add_action(Action::create("Dump Style Sheets"sv, ActionID::DumpStyleSheets, debug_request("dump-style-sheets"sv)));
-    m_debug_menu->add_action(Action::create("Dump All Resolved Styles"sv, ActionID::DumpStyles, debug_request("dump-all-resolved-styles"sv)));
-    m_debug_menu->add_action(Action::create("Dump CSS Errors"sv, ActionID::DumpCSSErrors, debug_request("dump-all-css-errors"sv)));
-    m_debug_menu->add_action(Action::create("Dump Cookies"sv, ActionID::DumpCookies, [this]() { m_default_session->cookie_jar->dump_cookies(); }));
-    m_debug_menu->add_action(Action::create("Dump Local Storage"sv, ActionID::DumpLocalStorage, debug_request("dump-local-storage"sv)));
-    m_debug_menu->add_action(Action::create("Dump Session Storage"sv, ActionID::DumpSessionStorage, debug_request("dump-session-storage"sv)));
-    m_debug_menu->add_action(Action::create("Dump GC Graph"sv, ActionID::DumpGCGraph, [this]() {
-        if (auto view = active_web_view(); view.has_value()) {
-            auto gc_graph_path = view->dump_gc_graph();
-            if (gc_graph_path.is_error()) {
-                warnln("\033[31;1mFailed to dump GC graph: {}\033[0m", gc_graph_path.error());
-            } else {
-                warnln("\033[33;1mDumped GC graph into {}\033[0m", gc_graph_path.value());
-                if (auto source_dir = Core::Environment::get("LADYBIRD_SOURCE_DIR"sv); source_dir.has_value())
-                    warnln("\033[33;1mGC graph explorer: file://{}/Meta/gc-heap-explorer.html?script=file://{}\033[0m", *source_dir, gc_graph_path.value());
-            }
-        }
-    }));
-    m_debug_menu->add_separator();
-
-    m_show_line_box_borders_action = Action::create_checkable("Show Line Box Borders"sv, ActionID::ShowLineBoxBorders, check(m_show_line_box_borders_action, "set-line-box-borders"sv));
-    m_debug_menu->add_action(*m_show_line_box_borders_action);
-
-    m_show_caret_hit_test_debug_overlay_action = Action::create_checkable("Show Caret Hit Test Debug Overlay"sv, ActionID::ShowCaretHitTestDebugOverlay, check(m_show_caret_hit_test_debug_overlay_action, "set-caret-hit-test-debug-overlay"sv));
-    m_debug_menu->add_action(*m_show_caret_hit_test_debug_overlay_action);
-    m_debug_menu->add_separator();
-
-    m_debug_menu->add_action(Action::create("Collect Garbage"sv, ActionID::CollectGarbage, debug_request("collect-garbage"sv)));
-    m_debug_menu->add_action(Action::create("Crash Current Page"sv, ActionID::CrashCurrentPage, debug_request("crash-current-page"sv)));
-    m_debug_menu->add_action(Action::create("Crash Compositor Process"sv, ActionID::CrashCompositorProcess, [this]() { crash_compositor_process(); }));
-    m_debug_menu->add_separator();
-
-    auto spoof_user_agent_menu = Menu::create_group("Spoof User Agent"sv);
-    m_user_agent_string = m_web_content_options.user_agent_preset.has_value()
-        ? *WebView::user_agents.get(*m_web_content_options.user_agent_preset)
-        : Web::default_user_agent;
-
-    auto notify_workers_of_user_agent = [this] { WorkerProcessManager::the().update_user_agent(user_agent_string()); };
-    add_spoofed_value(spoof_user_agent_menu, "Disabled"sv, Web::default_user_agent, m_user_agent_string, "spoof-user-agent"sv, notify_workers_of_user_agent);
-    for (auto const& user_agent : WebView::user_agents) {
-        add_spoofed_value(spoof_user_agent_menu, user_agent.key, user_agent.value, m_user_agent_string, "spoof-user-agent"sv, notify_workers_of_user_agent);
-    }
-
-    auto navigator_compatibility_mode_menu = Menu::create_group("Navigator Compatibility Mode"sv);
-    m_navigator_compatibility_mode = navigator_compatibility_mode_to_string(Web::default_navigator_compatibility_mode);
-
-    auto notify_workers_of_navigator_compatibility_mode = [this] { WorkerProcessManager::the().update_navigator_compatibility_mode(navigator_compatibility_mode()); };
-    auto add_navigator_compatibility_mode = [&](StringView name, Web::NavigatorCompatibilityMode mode) {
-        add_spoofed_value(navigator_compatibility_mode_menu, name, navigator_compatibility_mode_to_string(mode), m_navigator_compatibility_mode, "navigator-compatibility-mode"sv, notify_workers_of_navigator_compatibility_mode);
-    };
-    add_navigator_compatibility_mode("Chrome"sv, Web::NavigatorCompatibilityMode::Chrome);
-    add_navigator_compatibility_mode("Gecko"sv, Web::NavigatorCompatibilityMode::Gecko);
-    add_navigator_compatibility_mode("WebKit"sv, Web::NavigatorCompatibilityMode::WebKit);
-
-    m_debug_menu->add_submenu(move(spoof_user_agent_menu));
-    m_debug_menu->add_submenu(move(navigator_compatibility_mode_menu));
-    m_debug_menu->add_separator();
-
-    m_enable_scripting_action = Action::create_checkable("Enable Scripting"sv, ActionID::EnableScripting, check(m_enable_scripting_action, "scripting"sv));
-    m_enable_scripting_action->set_checked(m_browser_options.disable_scripting == WebView::DisableScripting::No);
-    m_debug_menu->add_action(*m_enable_scripting_action);
-
-    m_block_pop_ups_action = Action::create_checkable("Block Pop-ups"sv, ActionID::BlockPopUps, check(m_block_pop_ups_action, "block-pop-ups"sv));
-    m_block_pop_ups_action->set_checked(m_browser_options.allow_popups == AllowPopups::No);
-    m_debug_menu->add_action(*m_block_pop_ups_action);
 
     create_platform_actions();
 }
 
-bool Application::blocks_pop_ups() const
+void Application::set_preferred_contrast(Web::CSS::PreferredContrast contrast)
 {
-    return m_block_pop_ups_action->checked();
+    m_contrast = contrast;
+    ViewImplementation::for_each_view([&](ViewImplementation& view) {
+        view.set_preferred_contrast(m_contrast);
+        return IterationDecision::Continue;
+    });
+}
+
+void Application::set_preferred_motion(Web::CSS::PreferredMotion motion)
+{
+    m_motion = motion;
+    ViewImplementation::for_each_view([&](ViewImplementation& view) {
+        view.set_preferred_motion(m_motion);
+        return IterationDecision::Continue;
+    });
+}
+
+void Application::set_user_agent_string(String user_agent)
+{
+    m_user_agent_string = move(user_agent);
+
+    // Workers take no debug requests; the worker process manager hands the new value to every live worker.
+    WorkerAgentManager::the().update_user_agent(m_user_agent_string);
+
+    ViewImplementation::for_each_view([&](ViewImplementation& view) {
+        view.debug_request("spoof-user-agent"sv, m_user_agent_string.to_byte_string());
+        view.debug_request("clear-cache"sv); // Clear the cache to ensure requests are re-done with the new value.
+        return IterationDecision::Continue;
+    });
+}
+
+void Application::set_navigator_compatibility_mode(Web::NavigatorCompatibilityMode mode)
+{
+    m_navigator_compatibility_mode = mode;
+
+    // Workers take no debug requests; the worker process manager hands the new value to every live worker.
+    WorkerAgentManager::the().update_navigator_compatibility_mode(m_navigator_compatibility_mode);
+
+    ViewImplementation::for_each_view([&](ViewImplementation& view) {
+        view.debug_request("navigator-compatibility-mode"sv, navigator_compatibility_mode_to_string(m_navigator_compatibility_mode));
+        view.debug_request("clear-cache"sv); // Clear the cache to ensure requests are re-done with the new value.
+        return IterationDecision::Continue;
+    });
+}
+
+static void send_debug_switch_to_every_view(StringView request, bool on)
+{
+    ViewImplementation::for_each_view([&](ViewImplementation& view) {
+        view.debug_request(request, on ? "on"sv : "off"sv);
+        return IterationDecision::Continue;
+    });
+}
+
+void Application::set_scripting_enabled(bool enabled)
+{
+    m_scripting_enabled = enabled;
+    send_debug_switch_to_every_view("scripting"sv, enabled);
+}
+
+void Application::set_blocks_pop_ups(bool blocks)
+{
+    m_blocks_pop_ups = blocks;
+    send_debug_switch_to_every_view("block-pop-ups"sv, blocks);
+}
+
+void Application::set_shows_line_box_borders(bool shows)
+{
+    m_shows_line_box_borders = shows;
+    send_debug_switch_to_every_view("set-line-box-borders"sv, shows);
+}
+
+void Application::set_shows_caret_hit_test_debug_overlay(bool shows)
+{
+    m_shows_caret_hit_test_debug_overlay = shows;
+    send_debug_switch_to_every_view("set-caret-hit-test-debug-overlay"sv, shows);
+}
+
+void Application::dump_cookies() const
+{
+    m_default_session->cookie_jar->dump_cookies();
 }
 
 // The options every page hosting the tab's document runs with.
@@ -2952,18 +2550,19 @@ void Application::apply_view_options(Badge<ViewImplementation>, ViewImplementati
 
     apply_content_blocking_policy(page);
 
-    page.async_debug_request("set-line-box-borders"sv, m_show_line_box_borders_action->checked() ? "on"sv : "off"sv);
-    page.async_debug_request("set-caret-hit-test-debug-overlay"sv, m_show_caret_hit_test_debug_overlay_action->checked() ? "on"sv : "off"sv);
-    page.async_debug_request("scripting"sv, m_enable_scripting_action->checked() ? "on"sv : "off"sv);
-    page.async_debug_request("block-pop-ups"sv, m_block_pop_ups_action->checked() ? "on"sv : "off"sv);
+    page.async_debug_request("set-line-box-borders"sv, m_shows_line_box_borders ? "on"sv : "off"sv);
+    page.async_debug_request("set-caret-hit-test-debug-overlay"sv, m_shows_caret_hit_test_debug_overlay ? "on"sv : "off"sv);
+    page.async_debug_request("scripting"sv, m_scripting_enabled ? "on"sv : "off"sv);
+    page.async_debug_request("block-pop-ups"sv, m_blocks_pop_ups ? "on"sv : "off"sv);
     page.async_debug_request("spoof-user-agent"sv, m_user_agent_string);
-    page.async_debug_request("navigator-compatibility-mode"sv, m_navigator_compatibility_mode);
+    page.async_debug_request("navigator-compatibility-mode"sv, navigator_compatibility_mode_to_string(m_navigator_compatibility_mode));
 }
 
 bool Application::sites_can_ask_for_location() const
 {
-    // NB: Tests get their positions from emulation, so they need no provider.
-    auto has_location_source = Core::GeolocationProvider::is_available() || web_content_options().is_test_mode == IsTestMode::Yes;
+    // NB: Tests and WebDriver sessions get their positions from emulation, so they need no provider.
+    auto has_location_source = Core::GeolocationProvider::is_available() || web_content_options().is_test_mode == IsTestMode::Yes
+        || browser_options().webdriver_browser_endpoint.has_value();
     return settings().location_policy() == LocationPolicy::Ask && has_location_source;
 }
 
@@ -2987,7 +2586,7 @@ void Application::permissions_changed(Badge<ApplicationPermissionManagerObserver
             client.async_set_permission_snapshot(manager.snapshot_for(client.permission_origins()));
         return IterationDecision::Continue;
     });
-    WorkerProcessManager::the().update_permission_snapshot(manager);
+    WorkerAgentManager::the().update_permission_snapshot(manager);
 
     schedule_permission_expiry();
 }
@@ -3027,6 +2626,26 @@ void Application::location_policy_changed(Badge<ApplicationSettingsObserver>)
     update_permission_defaults();
 }
 
+bool Application::sites_can_ask_for_microphone() const
+{
+    return settings().microphone_policy() == MicrophonePolicy::Ask;
+}
+
+void Application::microphone_policy_changed(Badge<ApplicationSettingsObserver>)
+{
+    update_permission_defaults();
+}
+
+bool Application::sites_can_ask_for_notifications() const
+{
+    return settings().notifications_policy() == NotificationsPolicy::Ask;
+}
+
+void Application::notifications_policy_changed(Badge<ApplicationSettingsObserver>)
+{
+    update_permission_defaults();
+}
+
 void Application::update_os_location_authorization()
 {
     auto denied = m_geolocation_provider && m_geolocation_provider->authorization() == Core::GeolocationAuthorization::Denied;
@@ -3046,62 +2665,25 @@ Core::GeolocationAuthorization Application::geolocation_authorization()
 void Application::update_permission_defaults()
 {
     // NB: A private session reads its defaults from the ordinary one.
-    auto state = sites_can_ask_for_location() ? Web::Permissions::EffectiveState::Prompt : Web::Permissions::EffectiveState::Denied;
-    m_default_session->permission_manager->set_global_default(Web::Permissions::PermissionName::Geolocation, state);
+    auto state_for = [](bool sites_can_ask) { return sites_can_ask ? Web::Permissions::EffectiveState::Prompt : Web::Permissions::EffectiveState::Denied; };
+    m_default_session->permission_manager->set_global_default(Web::Permissions::PermissionName::Geolocation, state_for(sites_can_ask_for_location()));
+    m_default_session->permission_manager->set_global_default(Web::Permissions::PermissionName::Microphone, state_for(sites_can_ask_for_microphone()));
+    m_default_session->permission_manager->set_global_default(Web::Permissions::PermissionName::Notifications, state_for(sites_can_ask_for_notifications()));
 }
 
 void Application::languages_changed(Badge<ApplicationSettingsObserver>)
 {
-    WorkerProcessManager::the().update_preferred_languages(m_settings->languages());
+    WorkerAgentManager::the().update_preferred_languages(m_settings->languages());
 }
 
 String Application::user_agent_string() const
 {
-    return MUST(String::from_utf8(m_user_agent_string));
-}
-
-void Application::set_user_agent(String user_agent)
-{
-    if (user_agent.is_empty())
-        user_agent = MUST(String::from_utf8(Web::default_user_agent));
-
-    m_user_agent_storage = move(user_agent);
-    m_user_agent_string = m_user_agent_storage.bytes_as_string_view();
-
-    WorkerProcessManager::the().update_user_agent(m_user_agent_storage);
-
-    ViewImplementation::for_each_view([&](ViewImplementation& view) {
-        view.debug_request("spoof-user-agent"sv, m_user_agent_storage.to_byte_string());
-        // Requests already served under the previous value must be re-fetched under the new one.
-        view.debug_request("clear-cache"sv);
-        return IterationDecision::Continue;
-    });
+    return m_user_agent_string;
 }
 
 Web::NavigatorCompatibilityMode Application::navigator_compatibility_mode() const
 {
-    return navigator_compatibility_mode_from_string(m_navigator_compatibility_mode).value_or(Web::default_navigator_compatibility_mode);
-}
-
-void Application::set_navigator_compatibility_mode(Web::NavigatorCompatibilityMode mode)
-{
-    m_navigator_compatibility_mode = navigator_compatibility_mode_to_string(mode);
-
-    WorkerProcessManager::the().update_navigator_compatibility_mode(mode);
-
-    ViewImplementation::for_each_view([&](ViewImplementation& view) {
-        view.debug_request("navigator-compatibility-mode"sv, m_navigator_compatibility_mode);
-        view.debug_request("clear-cache"sv);
-        return IterationDecision::Continue;
-    });
-}
-
-void Application::update_vertical_tabs_action()
-{
-    auto const& settings = m_settings->tab_settings();
-    m_toggle_vertical_tabs_expanded_action->set_visible(settings.vertical_tabs_enabled);
-    m_toggle_vertical_tabs_expanded_action->set_engaged(settings.vertical_tabs_expanded);
-    m_toggle_vertical_tabs_expanded_action->set_tooltip(settings.vertical_tabs_expanded ? "Hide Sidebar"sv : "Show Sidebar"sv);
+    return m_navigator_compatibility_mode;
 }
 
 static Web::CSS::PreferredColorScheme preferred_color_scheme_for(ThemePreference preference)
@@ -3124,13 +2706,7 @@ Web::CSS::PreferredColorScheme Application::interface_color_scheme() const
 
 void Application::update_website_color_scheme()
 {
-    auto preference = m_settings->appearance().website_color_scheme;
-    auto actions = m_color_scheme_menu->items();
-    auto action_index = preference == ThemePreference::System ? 0 : preference == ThemePreference::Dark ? 1
-                                                                                                        : 2;
-    actions[action_index].get<NonnullRefPtr<Action>>()->set_checked(true);
-
-    auto color_scheme = preferred_color_scheme_for(preference);
+    auto color_scheme = preferred_color_scheme_for(m_settings->appearance().website_color_scheme);
     if (color_scheme == m_color_scheme)
         return;
     m_color_scheme = color_scheme;
@@ -3143,25 +2719,11 @@ void Application::update_website_color_scheme()
 
 void Application::appearance_changed(Badge<ApplicationSettingsObserver>)
 {
-    m_toggle_menu_bar_action->set_checked(m_settings->appearance().show_menu_bar);
     update_website_color_scheme();
-
-    switch (m_settings->appearance().show_bookmarks_bar) {
-    case ShowBookmarksBar::Always:
-        m_show_bookmarks_bar_always_action->set_checked(true);
-        break;
-    case ShowBookmarksBar::Never:
-        m_show_bookmarks_bar_never_action->set_checked(true);
-        break;
-    case ShowBookmarksBar::OnHover:
-        m_show_bookmarks_bar_on_hover_action->set_checked(true);
-        break;
-    }
 }
 
 void Application::tab_settings_changed(Badge<ApplicationSettingsObserver>)
 {
-    update_vertical_tabs_action();
     update_tabs_display();
 }
 
@@ -3243,49 +2805,30 @@ void Application::download_content_blocker_list_if_needed(Badge<Application, Set
     start_content_blocker_list_update(ContentBlockerListUpdateTrigger::UserInitiated, identifier);
 }
 
-void Application::update_bookmark_action_for_current_web_view()
-{
-    auto view = active_web_view();
-    auto is_bookmarked = view.has_value() && m_bookmark_store->is_bookmarked(view->url());
-
-    m_toggle_bookmark_action->set_text(is_bookmarked ? "Remove Bookmark"sv : "Add Bookmark"sv);
-    m_toggle_bookmark_action->set_engaged(is_bookmarked);
-}
-
 // The shared actions that depend on the page follow the active view, whichever tab or window made it the active one.
-void Application::update_actions_for_active_web_view()
-{
-    update_bookmark_action_for_current_web_view();
-    update_editing_history_actions();
-    update_report_website_issue_action();
-}
-
-void Application::bookmarks_changed(Badge<ApplicationBookmarkStoreObserver>)
-{
-    if (m_autocomplete_service)
-        m_autocomplete_service->update_bookmarks(autocomplete_bookmark_snapshot(*m_bookmark_store));
-    m_bookmarks_menu->shrink(m_bookmarks_menu_static_size);
-    create_bookmark_menu_items();
-    rebuild_bookmarks_menu();
-}
-
-void Application::toggle_bookmark_for_view(ViewImplementation& view)
-{
-    if (auto bookmark = m_bookmark_store->find_bookmark_by_url(view.url()); bookmark.has_value()) {
-        m_bookmark_store->remove_item(bookmark->id);
-        return;
-    }
-
-    display_add_bookmark_dialog()
-        ->when_resolved([this](BookmarkDialogResult result) {
-            auto& bookmark = result.data.get<BookmarkItem::Bookmark>();
-            m_bookmark_store->add_bookmark(move(bookmark.url), move(bookmark.title), move(bookmark.favicon_hash), result.target_folder_id);
-        });
-}
-
 void Application::set_spell_checker(OwnPtr<SpellChecker> spell_checker)
 {
     m_spell_checker = move(spell_checker);
+}
+
+void Application::set_translator(OwnPtr<Translator> translator)
+{
+    m_translator = move(translator);
+    if (!m_translator)
+        return;
+    m_translator->on_languages_changed = [] {
+        ViewImplementation::for_each_view([](ViewImplementation& view) {
+            view.page_translation().did_change_installed_languages();
+            return IterationDecision::Continue;
+        });
+    };
+}
+
+MicrophoneAuthorizer& Application::microphone_authorizer()
+{
+    if (!m_microphone_authorizer)
+        m_microphone_authorizer = create_microphone_authorizer();
+    return *m_microphone_authorizer;
 }
 
 ErrorOr<NonnullRawPtr<Core::GeolocationProvider>> Application::ensure_geolocation_provider()
@@ -3340,117 +2883,6 @@ void Application::stop_watching_geolocation_position(Core::GeolocationProvider::
     m_geolocation_provider->stop_watching_position(watch_id);
 }
 
-void Application::create_bookmark_menu_items(Optional<MenuData> data)
-{
-    auto const& [menu, items, target_folder_id] = data.ensure([&]() -> MenuData {
-        return {
-            .menu = *m_bookmarks_menu,
-            .items = m_bookmark_store->root_items(),
-            .target_folder_id = {},
-        };
-    });
-
-    for (auto const& item : items) {
-        item.data.visit(
-            [&](BookmarkItem::Bookmark const& bookmark) {
-                auto action = Action::create(bookmark.title.value_or({}), ActionID::BookmarkItem, [this, url = bookmark.url]() {
-                    if (auto view = active_web_view(); view.has_value())
-                        view->load_from_user_input(url);
-                    else
-                        open_url_in_new_tab(url, Web::HTML::ActivateTab::Yes);
-                });
-
-                action->set_png_icon(bookmark.favicon_hash.has_value()
-                        ? default_session().favicon_store->favicon_png(*bookmark.favicon_hash)
-                        : OptionalNone {});
-                action->set_tooltip(bookmark.url.serialize());
-
-                action->add_property("id"sv, item.id);
-                action->add_property("type"sv, "bookmark"_string);
-                if (target_folder_id.has_value()) {
-                    action->add_property("target_folder_id"sv, *target_folder_id);
-                    action->add_property("parent_folder_id"sv, *target_folder_id);
-                }
-
-                menu.add_action(move(action));
-            },
-            [&](BookmarkItem::Folder const& folder) {
-                auto submenu = folder.title.has_value()
-                    ? Menu::create_group(*folder.title)
-                    : Menu::create_group("(no title)"sv);
-
-                create_bookmark_menu_items(MenuData {
-                    .menu = submenu,
-                    .items = folder.children,
-                    .target_folder_id = item.id,
-                });
-
-                // A folder's menu ends with a way to open every bookmark in it at once.
-                size_t bookmark_count = 0;
-                for (auto const& child : folder.children)
-                    bookmark_count += child.is_bookmark() ? 1 : 0;
-                if (bookmark_count > 0) {
-                    submenu->add_separator();
-                    submenu->add_action(Action::create(MUST(String::formatted("Open All in Tabs ({})", bookmark_count)), ActionID::OpenAllBookmarksInTabs, [this, folder_id = item.id]() {
-                        open_bookmark_folder_in_new_tabs(folder_id);
-                    }));
-                }
-
-                submenu->add_property("id"sv, item.id);
-                submenu->add_property("type"sv, "folder"_string);
-                submenu->add_property("target_folder_id"sv, item.id);
-                if (target_folder_id.has_value())
-                    submenu->add_property("parent_folder_id"sv, *target_folder_id);
-
-                submenu->set_render_group_icon(true);
-                menu.add_submenu(move(submenu));
-            });
-    }
-}
-
-Vector<BookmarkItem::Bookmark> Application::bookmarks_for_all_tabs_in_current_window() const
-{
-    Vector<WebView::BookmarkItem::Bookmark> bookmarks;
-
-    for (auto& view : active_window_web_views()) {
-        bookmarks.append(WebView::BookmarkItem::Bookmark {
-            .url = view.url(),
-            .title = view.title().is_empty() ? Optional<String> {} : view.title().to_utf8(),
-            .favicon_hash = view.favicon_hash(),
-        });
-    }
-
-    return bookmarks;
-}
-
-template<typename T>
-static NonnullRefPtr<T> create_unsupported_rejection()
-{
-    auto promise = T::construct();
-    promise->reject(Error::from_errno(ENOTSUP));
-    return promise;
-}
-
-NonnullRefPtr<Application::BookmarkPromise> Application::display_add_bookmark_dialog(Optional<String const&>) const
-{
-    return create_unsupported_rejection<BookmarkPromise>();
-}
-
-NonnullRefPtr<Application::BookmarkPromise> Application::display_edit_bookmark_dialog(BookmarkItem const&, Optional<String const&>) const
-{
-    return create_unsupported_rejection<BookmarkPromise>();
-}
-
-NonnullRefPtr<Application::BookmarkPromise> Application::display_add_bookmark_folder_dialog(Optional<String const&>, Optional<String const&>) const
-{
-    return create_unsupported_rejection<BookmarkPromise>();
-}
-
-NonnullRefPtr<Application::BookmarkPromise> Application::display_edit_bookmark_folder_dialog(BookmarkItem const&, Optional<String const&>) const
-{
-    return create_unsupported_rejection<BookmarkPromise>();
-}
-
 ErrorOr<void> Application::toggle_devtools_enabled()
 {
     if (m_devtools) {
@@ -3462,16 +2894,6 @@ ErrorOr<void> Application::toggle_devtools_enabled()
     }
 
     return {};
-}
-
-void Application::on_devtools_enabled() const
-{
-    m_toggle_devtools_action->set_text("Disable DevTools"sv);
-}
-
-void Application::on_devtools_disabled() const
-{
-    m_toggle_devtools_action->set_text("Enable DevTools"sv);
 }
 
 void Application::refresh_tab_list()
@@ -3711,19 +3133,6 @@ void Application::inspect_indexed_database_objects(DevTools::TabDescription cons
     }
 
     view->inspect_indexed_database_objects(host, move(names), move(options), move(on_complete));
-}
-
-void Application::update_report_website_issue_action()
-{
-    auto view = active_web_view();
-    m_report_website_issue_action->set_enabled(view.has_value() && view->can_report_website_issue());
-}
-
-void Application::update_editing_history_actions()
-{
-    auto view = active_web_view();
-    m_undo_action->set_enabled(view.has_value() && view->can_undo());
-    m_redo_action->set_enabled(view.has_value() && view->can_redo());
 }
 
 void Application::delete_indexed_database(DevTools::TabDescription const& description, String const& host, String const& name, OnIndexedDBInspectionComplete on_complete) const
@@ -4333,6 +3742,15 @@ void Application::stop_listening_for_console_messages(DevTools::TabDescription c
         return;
 
     view->on_console_message = nullptr;
+}
+
+void Application::start_sending_console_output(DevTools::TabDescription const& description, bool messages, bool errors) const
+{
+    auto view = ViewImplementation::find_view_by_id(description.id);
+    if (!view.has_value())
+        return;
+
+    view->start_sending_console_output(messages, errors);
 }
 
 void Application::listen_for_network_events(DevTools::TabDescription const& description, OnNetworkRequestStarted on_request_started, OnNetworkResponseHeadersReceived on_response_headers, OnNetworkResponseBodyReceived on_response_body, OnNetworkRequestFinished on_request_finished) const

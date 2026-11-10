@@ -327,12 +327,14 @@ enum RecordingHold {
     Idle,
     Armed,
     Holding,
-    // A layout held is never handed to the StyleLayout thread until it goes, so that the thread runs the jobs of other
+    // A layout held is never handed to the Render thread until it goes, so that the thread runs the jobs of other
     // documents meanwhile, as one the collector finalizes asks of it.
     #[cfg(not(test))]
     HoldingLayout {
         _parked: ParkedJob,
     },
+    ArmedForStyle,
+    ArmedForClaim,
 }
 
 static RECORDING_HOLD: Mutex<RecordingHold> = Mutex::new(RecordingHold::Idle);
@@ -357,20 +359,45 @@ pub(crate) fn take_recording_hold_for_testing() -> bool {
     true
 }
 
-/// Submits `job`, the layout of a frame, to the StyleLayout thread, or parks it where the test hold is armed for it.
-/// Answers the flight and whether the hold took it.
+/// Submits `job`, the layout of a frame, to the Render thread, which claims it inside `claim_under`, so that the
+/// host may take it back until then, or parks it where the test hold is armed for it. Answers the flight and whether
+/// the hold took it.
 #[cfg(not(test))]
 pub(crate) fn submit_layout<R: Send + 'static>(
     job: impl FnOnce(&StopWord) -> R + Send + 'static,
+    claim_under: fn(&mut dyn FnMut()),
 ) -> (InFlight<R>, bool) {
-    let thread = crate::stage_thread::style_layout_thread();
+    let thread = crate::stage_thread::render_thread();
     let mut hold = recording_hold();
     if !matches!(*hold, RecordingHold::Armed) {
-        return (thread.submit(job), false);
+        return (thread.submit_reclaimable(job, claim_under), false);
     }
     let (flight, parked) = thread.park(job);
     *hold = RecordingHold::HoldingLayout { _parked: parked };
     (flight, true)
+}
+
+/// Whether the style update about to fly is the one the test hold is armed for, which then parks as a frame's
+/// layout does.
+#[cfg(not(test))]
+pub(crate) fn take_style_flight_hold_for_testing() -> bool {
+    let mut hold = recording_hold();
+    if !matches!(*hold, RecordingHold::ArmedForStyle) {
+        return false;
+    }
+    *hold = RecordingHold::Armed;
+    true
+}
+
+/// Whether the style update about to fly is the one the test hold is armed to keep the Render thread from claiming.
+#[cfg(not(test))]
+pub(crate) fn take_style_flight_claim_hold_for_testing() -> bool {
+    let mut hold = recording_hold();
+    if !matches!(*hold, RecordingHold::ArmedForClaim) {
+        return false;
+    }
+    *hold = RecordingHold::Holding;
+    true
 }
 
 pub(crate) fn wait_while_recording_is_held_for_testing() {
@@ -383,6 +410,19 @@ pub(crate) fn wait_while_recording_is_held_for_testing() {
 /// [`release_held_recording_for_testing`] or a wait for it.
 pub(crate) fn hold_next_recording_for_testing() {
     *recording_hold() = RecordingHold::Armed;
+}
+
+/// Holds the next style update that flies before it reads anything, until
+/// [`release_held_recording_for_testing`] or a wait for it, so that a test orders what it does beside the flight ahead
+/// of everything the transaction computes.
+pub(crate) fn hold_next_style_flight_for_testing() {
+    *recording_hold() = RecordingHold::ArmedForStyle;
+}
+
+/// Keeps the Render thread from claiming the next style update that flies until the host waits for it, which then takes
+/// it back, or until [`release_held_recording_for_testing`].
+pub(crate) fn hold_next_style_flight_claim_for_testing() {
+    *recording_hold() = RecordingHold::ArmedForClaim;
 }
 
 /// Lets the recording held for the test go, or disarms the hold no recording has taken yet.
@@ -409,24 +449,25 @@ pub(crate) fn record_frame(
         published_inputs,
     } = recorder;
     let source = PaintSource::new(&frame, absolute_rects);
-    let recording = crate::painting::record::traversal::record_display_list(
-        &source,
-        scratch,
-        paint_order_tree,
-        viewport,
-        &inputs,
-        published_recording.clone(),
-        published_hit_test_items.clone(),
-        trace_recordings,
-    );
+    let (recording, publishes_recording) = paint_order_tree.with_access(inputs.publishes_recording, |tree| {
+        crate::painting::record::traversal::record_display_list(
+            &source,
+            scratch,
+            tree,
+            viewport,
+            &inputs,
+            published_recording.clone(),
+            published_hit_test_items.clone(),
+            trace_recordings,
+        )
+    });
     let trace = trace_recordings.then_some(PendingRecordingTrace {
         viewport,
         should_paint_overlay: inputs.should_paint_overlay,
     });
     let svg_paint_resources = frame.svg_paint_resources().clone();
     drop(frame);
-    let publishes_recording = inputs.publishes_recording;
-    if publishes_recording {
+    if inputs.publishes_recording {
         *published_inputs = Some(inputs);
     }
     (
@@ -495,7 +536,7 @@ pub(crate) struct FrozenFrame {
 /// viewport has no box to paint.
 pub(crate) fn freeze_recording_frame(arena: &mut LayoutNodeArena, inputs: FrameInputs) -> Option<FrozenFrame> {
     // Recording reads overflow, and reading overflow never measures it.
-    arena.measure_scrollable_overflow();
+    arena.settle_scrollable_overflow();
     if !arena.paintable_row_is_populated(inputs.viewport) || arena.stacking_context_entries(inputs.viewport).is_none() {
         return None;
     }

@@ -4,7 +4,7 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-use crate::css::css_pixels::{CssPixelPoint, CssPixelRect};
+use crate::css::css_pixels::CssPixelRect;
 use crate::layout::LayoutNodeArena;
 use crate::layout::node_data::{DomPaintFact, NodeKind, NodeSlotId};
 use crate::layout::{formatting_context, fragment_tree, node_facts, used_values};
@@ -27,7 +27,6 @@ pub(crate) struct ReplacedCommittedFragmentLink {
 
 #[derive(Clone, Copy, Default)]
 pub(crate) struct LineDataChange {
-    pub(crate) has_pieces: bool,
     pub(crate) content_changed: bool,
     pub(crate) item_order_changed: bool,
 }
@@ -37,6 +36,20 @@ pub(crate) struct LineRootChanges {
     pub(crate) fragment_changed: bool,
     pub(crate) inline_content_changed: bool,
     pub(crate) inline_item_order_changed: bool,
+}
+
+impl LineRootChanges {
+    pub(crate) fn all() -> Self {
+        Self {
+            fragment_changed: true,
+            inline_content_changed: true,
+            inline_item_order_changed: true,
+        }
+    }
+
+    pub(crate) fn any(self) -> bool {
+        self.fragment_changed || self.inline_content_changed || self.inline_item_order_changed
+    }
 }
 
 fn same_inline_content(left: &fragment_tree::Fragment, right: &fragment_tree::Fragment) -> bool {
@@ -80,21 +93,16 @@ fn has_descendant_dependent_paint(arena: &LayoutNodeArena, node: NodeSlotId) -> 
 
 pub(crate) struct PaintableCommit<'a> {
     arena: &'a mut LayoutNodeArena,
-    is_full_layout: bool,
     committed_navigable_container_viewports: Vec<NodeSlotId>,
     row_reset_notifications: Vec<crate::painting::paintable_rows::PaintableRowReset>,
-    overflow_invalidated_boxes: crate::fast_hash::FastSet<NodeSlotId>,
 }
 
 impl<'a> PaintableCommit<'a> {
-    pub(crate) fn new(arena: &'a mut LayoutNodeArena, root: NodeSlotId) -> Self {
-        let is_full_layout = arena.data(root).kind.get() == NodeKind::Viewport;
+    pub(crate) fn new(arena: &'a mut LayoutNodeArena) -> Self {
         Self {
             arena,
-            is_full_layout,
             committed_navigable_container_viewports: Vec::new(),
             row_reset_notifications: Vec::new(),
-            overflow_invalidated_boxes: Default::default(),
         }
     }
 
@@ -112,6 +120,19 @@ impl<'a> PaintableCommit<'a> {
 
     pub(crate) fn begin_commit(&mut self) {
         self.arena_mut().clear_absolute_rect_memo();
+    }
+
+    /// Clears the committed link and row of a box the commit left without them.
+    pub(crate) fn clear_node(&mut self, node: formatting_context::Node) {
+        self.arena_mut().clear_committed_fragment_link(node);
+        if self.arena().paintable_rows().paintable_row_is_populated(node) {
+            let reset = self
+                .arena()
+                .prepare_paintable_row_cleared_reset(node)
+                .expect("live row for node could not be cleared");
+            self.row_reset_notifications.push(reset);
+            self.arena_mut().paintable_row_cleared(reset);
+        }
     }
 
     pub(crate) fn prepare_node(
@@ -134,17 +155,7 @@ impl<'a> PaintableCommit<'a> {
         let row_existed_before_this_commit = self.arena().paintable_rows().paintable_row_is_populated(node);
         let previous_offset = row_existed_before_this_commit.then(|| self.arena().live_paintable_data(node).offset);
         if !wants_paintable {
-            self.arena_mut().clear_committed_fragment_link(node);
-            if row_existed_before_this_commit {
-                let reset = {
-                    let arena = self.arena();
-                    arena
-                        .prepare_paintable_row_cleared_reset(node)
-                        .expect("live row for node could not be cleared")
-                };
-                self.row_reset_notifications.push(reset);
-                self.arena_mut().paintable_row_cleared(reset);
-            }
+            self.clear_node(node);
             return PreparedPaintable {
                 has_paintable_row: false,
                 row_existed_before_this_commit: false,
@@ -250,9 +261,11 @@ impl<'a> PaintableCommit<'a> {
         let mut inline_item_order_unchanged = false;
         let mut child_sequence_unchanged = false;
         let mut link_shows_box_the_same = true;
+        let mut old_scrollable_overflow = crate::layout::fragment_overflow::FragmentScrollableOverflow::default();
         let (old_identity, old_content_size) = self.arena().with_committed_fragment_link(node, |old_link| {
             old_link.map_or((0, used_values::FfiCssPixelSize::default()), |old_link| {
                 let previous = &old_link.fragment;
+                old_scrollable_overflow = previous.scrollable_overflow;
                 if previous.identity == fragment.identity {
                     own_paint_unchanged = true;
                     child_placements_unchanged = true;
@@ -284,9 +297,6 @@ impl<'a> PaintableCommit<'a> {
             })
         });
         if old_content_size != new_content_size {
-            if self.arena().data(node).kind.get() == NodeKind::Viewport {
-                self.arena_mut().set_needs_full_scrollable_overflow_recalculation();
-            }
             content_size_change = Some((old_content_size, new_content_size));
         }
         let committed_fragment_identity_changed = old_identity != fragment.identity;
@@ -310,9 +320,9 @@ impl<'a> PaintableCommit<'a> {
             && (enclosing_line_root_changes.inline_content_changed
                 || (enclosing_line_root_changes.fragment_changed
                     && has_descendant_dependent_paint(self.arena(), node)));
-        // Fragmented inline offsets are finalized from the line root's pieces after this
-        // commit. Comparing that final offset with the fragment's temporary one would dirty
-        // identical inlines on every relayout; their line content and box properties suffice.
+        // A fragmented inline's geometry is read from its line root's pieces. Comparing it with
+        // the fragment's temporary offset would dirty identical inlines on every relayout; their
+        // line content and box properties suffice.
         let paint_offset_unchanged = offset_unchanged || painted_geometry_lives_in_enclosing_line_root;
         // record_lines_hit_test_items() emits an EmptyEditable target only without paint
         // children. An out-of-flow child can change that eligibility without changing the
@@ -347,14 +357,15 @@ impl<'a> PaintableCommit<'a> {
             self.arena_mut()
                 .note_visual_context_box_dirty(node, VisualContextBoxDirtyKind::RecommittedInPlace);
         }
-        if !fragment_content_unchanged || !self.arena().committed_side_data(node).overflow_valid_across_recommits {
-            self.schedule_scrollable_overflow_recalculation(node);
-        } else if !offset_unchanged {
-            // NB: Moving an unchanged subtree preserves its overflow relative to its padding
-            //     box. Only its contribution to containing blocks needs to be measured again.
-            let containing_block = self.committed_containing_block(node, Some(link));
-            self.schedule_scrollable_overflow_recalculation(containing_block);
+        if old_scrollable_overflow != fragment.scrollable_overflow {
+            self.arena_mut().note_scrollable_overflow_change(
+                node,
+                old_scrollable_overflow.has_scrollable_overflow,
+                fragment.scrollable_overflow.has_scrollable_overflow,
+                false,
+            );
         }
+        self.arena_mut().note_scroll_offset_may_leave_range(node);
         {
             let arena = self.arena_mut();
             let mut paintable_rows = arena.paintable_rows_mut();
@@ -430,6 +441,29 @@ impl<'a> PaintableCommit<'a> {
         if identical {
             return;
         }
+        let (later_overflow_changed, later_fragments_had_scrollable_overflow) = {
+            let committed = self.arena().committed_side_data(slot).box_fragments();
+            (
+                committed.len() != later_fragments.len()
+                    || committed.iter().zip(later_fragments).any(|(committed, fragment)| {
+                        committed.link.fragment.scrollable_overflow != fragment.link.fragment.scrollable_overflow
+                    }),
+                committed
+                    .iter()
+                    .any(|committed| committed.link.fragment.scrollable_overflow.has_scrollable_overflow),
+            )
+        };
+        if later_overflow_changed {
+            let later_fragments_have_scrollable_overflow = later_fragments
+                .iter()
+                .any(|fragment| fragment.link.fragment.scrollable_overflow.has_scrollable_overflow);
+            self.arena_mut().note_scrollable_overflow_change(
+                slot,
+                later_fragments_had_scrollable_overflow,
+                later_fragments_have_scrollable_overflow,
+                false,
+            );
+        }
         {
             let mut side = self.arena_mut().committed_side_data_mut(slot);
             side.containing_block_fragment = containing_block_fragment;
@@ -458,7 +492,6 @@ impl<'a> PaintableCommit<'a> {
                 VisualContextBoxDirtyKind::RecommittedInPlace
             },
         );
-        self.schedule_scrollable_overflow_recalculation(slot);
     }
 
     pub(crate) fn set_line_data(
@@ -468,6 +501,7 @@ impl<'a> PaintableCommit<'a> {
         previous_fragmented_content: Option<std::sync::Arc<crate::layout::inline_content::InlineContent>>,
     ) -> LineDataChange {
         if !node_painting::has_lines(self.arena(), slot) {
+            self.clear_line_data(slot);
             return LineDataChange::default();
         }
         let writing_mode = line_data.writing_mode;
@@ -494,29 +528,15 @@ impl<'a> PaintableCommit<'a> {
             self.arena_mut().note_line_root_needs_fragment_ownership(slot);
         }
         LineDataChange {
-            has_pieces,
             content_changed,
             item_order_changed,
         }
     }
 
-    pub(crate) fn schedule_scrollable_overflow_recalculation(&mut self, mut node: NodeSlotId) {
-        // NB: Commit visits changed boxes before their descendants. Invalidate each containing
-        //     block once, including blocks outside the committed layout subtree.
-        while !node.is_invalid() && self.arena().slot_is_live(node) {
-            if !self.overflow_invalidated_boxes.insert(node) {
-                break;
-            }
-            let is_full_layout = self.is_full_layout;
-            let arena = self.arena_mut();
-            if arena.paintable_row_is_populated(node) {
-                arena.paintable_rows_mut().clear_cached_overflow_data(node);
-                // Commit queues are consumed immediately and are bounded by the committed tree.
-                if is_full_layout && !arena.needs_full_scrollable_overflow_recalculation {
-                    arena.boxes_needing_scrollable_overflow_recalculation.push(node);
-                }
-            }
-            node = arena.containing_block_by_walking_ancestors(node);
+    /// Clears the inline content of a row whose new fragment has none.
+    pub(crate) fn clear_line_data(&mut self, slot: NodeSlotId) {
+        if self.arena().committed_side_data(slot).inline_content.is_some() {
+            self.arena_mut().committed_side_data_mut(slot).inline_content = None;
         }
     }
 
@@ -557,123 +577,25 @@ impl<'a> PaintableCommit<'a> {
         }
     }
 
-    pub(crate) fn assign_inline_box_geometry(&mut self, slot: NodeSlotId) {
+    /// Notes that the inline boxes whose pieces the line root `slot` committed anew have geometry its new inline
+    /// content gives them.
+    pub(crate) fn note_inline_boxes_of_line_root_recommitted(&mut self, slot: NodeSlotId) {
+        let inline_boxes: Vec<NodeSlotId> = self
+            .arena()
+            .committed_side_data(slot)
+            .inline_content
+            .as_ref()
+            .map(|content| content.inline_boxes.boxes().map(|(node, _)| node).collect())
+            .unwrap_or_default();
         let arena = self.arena_mut();
         let mut paintable_rows = arena.paintable_rows_mut();
-        let mut piece_indices_by_node: Vec<(NodeSlotId, Vec<u32>)> = Vec::new();
-        for (piece_index, piece) in paintable_rows
-            .committed_side_data(slot)
-            .inline_box_pieces()
-            .iter()
-            .enumerate()
-        {
-            if piece.node.is_invalid() {
-                continue;
-            }
-            match piece_indices_by_node.iter_mut().find(|(node, _)| *node == piece.node) {
-                Some((_, indices)) => indices.push(piece_index as u32),
-                None => piece_indices_by_node.push((piece.node, vec![piece_index as u32])),
-            }
-        }
-        let root_positions = (crate::painting::paintable_geometry::fragment_count(&paintable_rows, slot) > 1)
-            .then(|| crate::painting::paintable_geometry::LineRootPositions::new(&paintable_rows, slot));
-        for (piece_node, piece_indices) in piece_indices_by_node {
-            if !paintable_rows.paintable_row_is_populated(piece_node)
-                || !node_painting::is_fragmented_inline(&paintable_rows, piece_node)
+        for inline_box in inline_boxes {
+            if paintable_rows.paintable_row_is_populated(inline_box)
+                && node_painting::is_fragmented_inline(&paintable_rows, inline_box)
             {
-                continue;
-            }
-            let origin = root_positions.as_ref().map(|positions| {
-                positions.of_fragment(paintable_rows.committed_side_data(piece_node).containing_block_fragment)
-            });
-            let padding_widths = crate::painting::paintable_geometry::committed_padding(&paintable_rows, piece_node);
-            let border_widths = crate::painting::paintable_geometry::committed_border(&paintable_rows, piece_node);
-            let mut content_union: Option<CssPixelRect> = None;
-            let mut padding_union: Option<CssPixelRect> = None;
-            let mut border_union: Option<CssPixelRect> = None;
-            let unite = |target: &mut Option<CssPixelRect>, rect: CssPixelRect| {
-                let Some(current) = target else {
-                    *target = Some(rect);
-                    return;
-                };
-                if rect.is_empty() {
-                    return;
-                }
-                if current.is_empty() {
-                    *current = rect;
-                } else {
-                    current.unite(rect);
-                }
-            };
-            for piece_index in &piece_indices {
-                let (piece, root_fragment_offset) = {
-                    let side = paintable_rows.committed_side_data(slot);
-                    let piece = side.inline_box_pieces()[*piece_index as usize];
-                    let offset = root_positions.as_ref().zip(origin).map_or_else(
-                        CssPixelPoint::default,
-                        |(positions, origin)| {
-                            let location = positions.of_line(side.lines(), piece.line_index as usize);
-                            CssPixelPoint {
-                                x: location.x - origin.x,
-                                y: location.y - origin.y,
-                            }
-                        },
-                    );
-                    (piece, offset)
-                };
-                let border_rect = CssPixelRect::from(piece.border_box_rect).translated_by(root_fragment_offset);
-                if piece.is_geometry_only_placeholder {
-                    let content_rect = border_rect;
-                    let padding_rect = content_rect.inflated(
-                        padding_widths.top,
-                        padding_widths.right,
-                        padding_widths.bottom,
-                        padding_widths.left,
-                    );
-                    let border_rect = padding_rect.inflated(
-                        border_widths.top,
-                        border_widths.right,
-                        border_widths.bottom,
-                        border_widths.left,
-                    );
-                    unite(&mut content_union, content_rect);
-                    unite(&mut padding_union, padding_rect);
-                    unite(&mut border_union, border_rect);
-                    continue;
-                }
-                let padding_rect = piece.shrunken_by_present_edges(border_rect, border_widths);
-                let content_rect = piece.shrunken_by_present_edges(padding_rect, padding_widths);
-                unite(&mut content_union, content_rect);
-                unite(&mut padding_union, padding_rect);
-                unite(&mut border_union, border_rect);
-            }
-            let Some(content_union) = content_union else {
-                continue;
-            };
-            let padding_union = padding_union.expect("padding union set alongside content union");
-            let border_union = border_union.expect("border union set alongside content union");
-            let inline_geometry_changed = {
-                let mut data = paintable_rows.paintable_data_mut(piece_node);
-                let new_offset = content_union.location().into();
-                let new_content_size = content_union.size().into();
-                let new_padding_box_union = padding_union.translated(-content_union.x, -content_union.y).into();
-                let new_border_box_union = border_union.translated(-content_union.x, -content_union.y).into();
-                let inline_geometry_changed = data.offset != new_offset
-                    || data.content_size != new_content_size
-                    || data.local_padding_box_union != new_padding_box_union
-                    || data.local_border_box_union != new_border_box_union;
-                data.offset = new_offset;
-                data.content_size = new_content_size;
-                data.local_padding_box_union = new_padding_box_union;
-                data.local_border_box_union = new_border_box_union;
-                inline_geometry_changed
-            };
-            if inline_geometry_changed {
                 paintable_rows
-                    .note_visual_context_box_dirty(piece_node, VisualContextBoxDirtyKind::InlineGeometryChanged);
+                    .note_visual_context_box_dirty(inline_box, VisualContextBoxDirtyKind::InlineGeometryChanged);
             }
-            // This box has at most one piece per line, so its piece indices are ordered by line.
-            paintable_rows.committed_side_data_mut(piece_node).piece_indices = Some(piece_indices.into());
         }
     }
 }

@@ -12,6 +12,8 @@
 #include <LibJS/Runtime/Agent.h>
 #include <LibWeb/Fetch/Infrastructure/FetchControllerRegistry.h>
 #include <LibWeb/Forward.h>
+#include <LibWeb/HTML/EventLoop/Task.h>
+#include <LibWeb/HTML/Scripting/ScriptAbortHandle.h>
 
 namespace JS {
 
@@ -36,7 +38,16 @@ struct WEB_API Agent : public JS::Agent {
 
     Fetch::Infrastructure::FetchControllerRegistry fetch_controller_registry;
 
+    // https://w3c.github.io/web-locks/#lock-task-queue
+    RefPtr<ParallelQueue> lock_task_queue;
+
     virtual void spin_event_loop_until(GC::Root<GC::Function<bool()>> goal_condition) override;
+
+    virtual bool is_similar_origin_window_agent() const { return false; }
+
+    // Only the agent's thread may call this, the first time at least. The handle is for other threads.
+    NonnullRefPtr<ScriptAbortHandle> script_abort_handle();
+    void detach_script_abort_handle();
 
 protected:
     using JS::Agent::Agent;
@@ -49,7 +60,12 @@ private:
     // windows in one WebContent process currently share the process's
     // SimilarOriginWindowAgent; proper agent-cluster separation is future work.
     mutable GC::Root<Bindings::WrapperWorld> m_main_world;
+
+    RefPtr<ScriptAbortHandle> m_script_abort_handle;
 };
+
+// The agent of the current thread, which has one if it runs any web code at all.
+WEB_API Agent& surrounding_agent();
 
 Agent& relevant_agent(JS::Object const&);
 Agent& relevant_agent(DOM::Node const&);

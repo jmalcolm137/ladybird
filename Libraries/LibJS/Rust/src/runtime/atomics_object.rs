@@ -8,7 +8,6 @@ use core::time::Duration;
 
 use libjs_runtime_macros::Trace;
 
-use crate::futex::AtomicWaitResult;
 use crate::gc::class::{GcCell, define_cell};
 use crate::interpreter::vm::Vm;
 use crate::layout::cell::Gc;
@@ -29,6 +28,7 @@ use crate::runtime::typed_array::{
     ContentType, Kind, TypedArrayBase, TypedArrayWithBufferWitness, is_typed_array_out_of_bounds,
     make_typed_array_with_buffer_witness_record, typed_array_from, typed_array_length, validate_typed_array,
 };
+use ak::waiter_list::AtomicWaitResult;
 
 #[repr(C)]
 #[derive(Trace)]
@@ -97,7 +97,7 @@ fn validate_atomic_access(
     let access_index = request_index.to_index(vm)? as usize;
 
     // 4. If accessIndex ≥ length, throw a RangeError exception.
-    if access_index >= length as usize {
+    if access_index >= length {
         return vm.throw_completion(
             ErrorKind::RangeError,
             ErrorType::IndexOutOfRange,
@@ -109,10 +109,10 @@ fn validate_atomic_access(
     let typed_array = typed_array_record.object;
 
     // 6. Let elementSize be TypedArrayElementSize(typedArray).
-    let element_size = typed_array.element_size() as usize;
+    let element_size = typed_array.element_size();
 
     // 7. Let offset be typedArray.[[ByteOffset]].
-    let offset = typed_array.byte_offset() as usize;
+    let offset = typed_array.byte_offset();
 
     // 8. Return (accessIndex × elementSize) + offset.
     Ok((access_index * element_size) + offset)
@@ -150,7 +150,7 @@ fn revalidate_atomic_access(
     }
 
     // 4. Assert: byteIndexInBuffer ≥ typedArray.[[ByteOffset]].
-    assert!(byte_index_in_buffer >= typed_array.byte_offset() as usize);
+    assert!(byte_index_in_buffer >= typed_array.byte_offset());
 
     // 5. If byteIndexInBuffer ≥ taRecord.[[CachedBufferByteLength]], throw a RangeError exception.
     // AD-HOC: The spec step strictly only bounds-checks the element's first byte. A length-tracking element whose start
@@ -160,7 +160,7 @@ fn revalidate_atomic_access(
     //         (The OOB access from #10759 isn’t reproducible in any of those engines.)
     //         https://github.com/tc39/ecma262/issues/3924
     let buffer_byte_length = typed_array_record.cached_buffer_byte_length.length();
-    if byte_index_in_buffer + typed_array.element_size() as usize > buffer_byte_length as usize {
+    if byte_index_in_buffer + typed_array.element_size() > buffer_byte_length {
         return vm.throw_completion(
             ErrorKind::RangeError,
             ErrorType::IndexOutOfRange,
@@ -229,9 +229,8 @@ fn do_wait(
     }
 
     // 11. Let block be buffer.[[ArrayBufferData]].
-    // 12-24. AD-HOC: Rather than maintaining the spec's WaiterList, we wait on the shared-memory word using an OS
-    //        futex. The word lives in memory mapped into every agent's process — so wait and notify coordinate across
-    //        processes. We don't yet implement Atomics.waitAsync (async mode).
+    // 12-24. AD-HOC: The WaiterLists of the process are in ak::waiter_list. We don't yet implement Atomics.waitAsync
+    //        (async mode).
     if mode == WaitMode::Async {
         return vm.throw_completion(
             ErrorKind::InternalError,
@@ -254,10 +253,12 @@ fn do_wait(
     let result = buffer.atomic_wait(
         byte_index_in_buffer,
         value as u64,
-        typed_array.element_size() as usize,
+        typed_array.element_size(),
         wait_timeout,
+        vm.agent_waiter(),
     );
     let result = match result {
+        AtomicWaitResult::Interrupted => return vm.throw_interrupt(),
         // 25. If waiterRecord.[[Result]] is "not-equal", return the String "not-equal".
         AtomicWaitResult::NotEqual => "not-equal",
         // 26. If waiterRecord.[[Result]] is "timed-out", return the String "timed-out".
@@ -311,7 +312,8 @@ impl AtomicsObject {
             base: Object::new_with_prototype(
                 vm,
                 Self::CLASS,
-                realm.object_prototype(),
+                realm,
+                Some(realm.object_prototype()),
                 MayInterfereWithIndexedPropertyAccess::No,
             ),
         })
@@ -502,7 +504,7 @@ impl AtomicsObject {
             return Ok(Value::from_i32(0));
         }
 
-        // 7-15. AD-HOC: Wake up to 'count' agents waiting on the shared-memory word via the OS futex (see do_wait).
+        // 7-15. AD-HOC: Wake up to 'count' agents on the WaiterList of the word (see do_wait).
         // count is >= 0 (step 3b). But a huge finite value would overflow size_t (UB on the cast). So, treat anything at or
         // beyond size_t's range (and non-finite counts) as "wake every waiter".
         let max_count = if count.is_finite() && count < usize::MAX as f64 {

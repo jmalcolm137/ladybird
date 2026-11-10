@@ -7,6 +7,7 @@
 #pragma once
 
 #include <AK/Utf16String.h>
+#include <LibGC/Cell.h>
 #include <LibGC/Ptr.h>
 #include <LibURL/URL.h>
 #include <LibWeb/Forward.h>
@@ -25,6 +26,8 @@ struct BlobURLEntry {
 
     // The token the user agent's blob URL store gave this entry.
     URL::BlobURLEntry::Token token { 0 };
+
+    void visit_edges(GC::Cell::Visitor&) const;
 };
 
 Utf16String generate_new_blob_url();
@@ -39,5 +42,11 @@ WEB_API Optional<SerializedBlobURLEntry> blob_url_entry_in_the_user_agent_store(
 Optional<BlobURLEntry const&> local_blob_url_entry(URL::URL const&);
 
 void run_unloading_cleanup_steps(GC::Ref<DOM::Document>);
+
+// The store is tied to the heap of the agent that goes away.
+void forget_blob_url_store_of_this_agent();
+
+// The steps of run_unloading_cleanup_steps() after the first, which a worker that closes runs for its own environment.
+WEB_API void remove_entries_of_environment(HTML::EnvironmentSettingsObject&, Page&);
 
 }

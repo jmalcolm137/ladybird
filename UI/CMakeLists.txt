@@ -22,8 +22,8 @@ function(create_ladybird_bundle target_name)
     set_target_properties(${target_name} PROPERTIES
         OUTPUT_NAME "Ladybird"
         MACOSX_BUNDLE_GUI_IDENTIFIER org.ladybird.Ladybird
-        MACOSX_BUNDLE_BUNDLE_VERSION ${LADYBIRD_BUNDLE_VERSION}
-        MACOSX_BUNDLE_SHORT_VERSION_STRING ${LADYBIRD_BUNDLE_VERSION}
+        MACOSX_BUNDLE_BUNDLE_VERSION ${LADYBIRD_BROWSER_VERSION}
+        MACOSX_BUNDLE_SHORT_VERSION_STRING ${LADYBIRD_BROWSER_VERSION}
         MACOSX_BUNDLE_INFO_PLIST "${LADYBIRD_SOURCE_DIR}/UI/Info.plist"
         MACOSX_BUNDLE TRUE
         WIN32_EXECUTABLE TRUE
@@ -118,7 +118,13 @@ else()
     set(LADYBIRD_TARGET ladybird PRIVATE)
 endif()
 
-set(LADYBIRD_LIBS AK LibCore LibGfx LibIPC LibMain LibWebView LibURL LibWakeLock)
+set(LADYBIRD_LIBS AK LibCore LibGfx LibIPC LibMain LibThreading LibWebView LibURL LibWakeLock LibGamepad hubipc)
+# NB: Where the Hub is a process of its own, the UI must not be able to reach into it.
+if (LINUX OR APPLE)
+    target_compile_definitions(${LADYBIRD_TARGET} LADYBIRD_HUB_IN_OWN_PROCESS)
+else()
+    list(APPEND LADYBIRD_LIBS hubservice)
+endif()
 target_link_libraries(${LADYBIRD_TARGET} ${LADYBIRD_LIBS})
 target_link_libraries(${LADYBIRD_TARGET} OpenSSL::Crypto OpenSSL::SSL)
 

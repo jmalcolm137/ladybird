@@ -20,7 +20,7 @@
 //! (`RuntimeInfo::dynamic_calls`). Calls the fast path cannot make take the
 //! generic path through `RuntimeInfo::jit_call`.
 //!
-//! Native calls (`Op::CallNative`): JIT code calls the single raw native
+//! Native calls (`Op::CallNative`): JIT code calls the single native
 //! function a `Call` instruction saw in the lightweight frame the
 //! interpreter's `Call` fast path builds for raw native functions, and lets
 //! the runtime unwind the frame if the function throws.
@@ -464,12 +464,15 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
             u32::from(layout.object_flag_is_ecmascript_function),
             fail,
         );
-        self.masm.load64(
-            scratch,
+        // OPTIMIZATION: The function's compressed shared data is the shared
+        //               data's compressed pointer exactly when it is that
+        //               shared data, so it is compared without decoding.
+        self.masm.branch32_memory_imm(
+            Condition::NotEqual,
             &Address::new(temp, layout.ecmascript_function_shared_data as i32),
+            shared_data.compressed() as i32,
+            fail,
         );
-        self.masm.move_imm64(temp, shared_data.0);
-        self.masm.branch64(Condition::NotEqual, scratch, temp, fail);
     }
 
     /// Branches to the dynamic call of `call` unless its callee is `target`,
@@ -607,16 +610,7 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
                 4,
                 u64::from(header.argument_count),
             ),
-            (
-                offsets.execution_context_script_or_module,
-                8,
-                fields.script_or_module[0],
-            ),
-            (
-                offsets.execution_context_script_or_module + 8,
-                8,
-                fields.script_or_module[1],
-            ),
+            (offsets.execution_context_script_or_module, 8, fields.script_or_module),
             (offsets.execution_context_lexical_environment, 8, fields.environment),
             (offsets.execution_context_variable_environment, 8, fields.environment),
             (
@@ -680,16 +674,12 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
                 }
             }
             self.masm.store64(&field(offsets.execution_context_function), aux);
-            self.masm
-                .load64(temp, &Address::new(aux, offsets.ecmascript_function_environment as i32));
+            self.emit_load_compressed_cell(temp, &Address::new(aux, offsets.ecmascript_function_environment as i32));
             self.masm
                 .store64(&field(offsets.execution_context_lexical_environment), temp);
             self.masm
                 .store64(&field(offsets.execution_context_variable_environment), temp);
-            self.masm.load64(
-                temp,
-                &Address::new(aux, offsets.ecmascript_function_private_environment as i32),
-            );
+            self.emit_load_function_private_environment(temp, aux);
             self.masm
                 .store64(&field(offsets.execution_context_private_environment), temp);
         }
@@ -940,7 +930,7 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
         if template.allocator == 0
             || template_bytes > u64::from(template.cell_size)
             || u64::from(template.binding_values_offset) + 8 > template_bytes
-            || u64::from(template.this_value_offset) + 8 > template_bytes
+            || (template.binds_this && u64::from(template.this_value_offset) + 8 > template_bytes)
         {
             return Err(CompileFailure::CodeGeneration);
         }
@@ -1042,7 +1032,7 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
         })?;
         let argument_bytes = (8 * i64::from(argument_count) + 15) & !15;
         if argument_bytes != 0 {
-            self.masm.sub64_imm(M::STACK_POINTER, M::STACK_POINTER, argument_bytes);
+            self.masm.allocate_stack(argument_bytes);
         }
         for (index, argument) in (0u32..).zip(arguments) {
             let address = Address::new(M::STACK_POINTER, super::checked_i32(8 * u64::from(index))?);
@@ -1071,7 +1061,7 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
         self.masm.branch_if_stack_pointer_below(&limit, slow);
     }
 
-    /// `CallNative`: calls the raw native function a `Call` instruction saw
+    /// `CallNative`: calls the native function a `Call` instruction saw
     /// the way the interpreter's `Call` fast path does: in a lightweight frame
     /// without an executable, linked to the calling frame, whose slots are
     /// the arguments. Other callees take the generic path.
@@ -1312,14 +1302,14 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
         self.masm.load64(temp, &field(temp, fields.weak_impl_value));
         self.masm.branch64(Condition::NotEqual, temp, receiver, call);
 
-        let not_null = self.masm.new_label();
-        self.masm
-            .load64(implementation, &field(implementation, fields.implementation_value));
-        self.masm.branch64_imm(Condition::NotEqual, implementation, 0, not_null);
-        self.masm.move_imm64(M::RETURN_GPRS[0], value::NULL);
-        self.masm.jump(done);
-
-        self.masm.bind(not_null);
+        let null = self.masm.new_label();
+        let value = field(implementation, fields.implementation_value);
+        if fields.implementation_value_is_compressed {
+            self.emit_load_compressed_cell_or_branch(implementation, &value, null);
+        } else {
+            self.masm.load64(implementation, &value);
+            self.masm.branch64_imm(Condition::Equal, implementation, 0, null);
+        }
         self.masm
             .load64(temp, &field(implementation, fields.main_world_wrapper));
         self.masm.branch64_imm(Condition::Equal, temp, 0, call);
@@ -1333,6 +1323,10 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
             call,
         );
         self.box_cell_with_tag(M::RETURN_GPRS[0], temp, value::OBJECT_TAG);
+        self.masm.jump(done);
+
+        self.masm.bind(null);
+        self.masm.move_imm64(M::RETURN_GPRS[0], value::NULL);
         self.masm.jump(done);
         self.masm.bind(call);
     }
@@ -1359,6 +1353,10 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
         slow: Option<Label>,
         [check, done]: [Label; 2],
     ) -> Result<(), CompileFailure> {
+        // NB: Without an entry, the function is one JIT code cannot call itself.
+        let entry = target
+            .entry
+            .ok_or(CompileFailure::MissingRuntimeHelper { opcode: None })?;
         let runtime = self.runtime;
         let offsets = runtime.offsets;
         let argument_count = u32::try_from(arguments.len()).map_err(|_| CompileFailure::InvalidBytecode {
@@ -1420,7 +1418,6 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
         let mut constants = self.new_frame_constants(false);
         constants.extend([
             (offsets.execution_context_script_or_module, 8, 0),
-            (offsets.execution_context_script_or_module + 8, 8, 0),
             (offsets.execution_context_executable, 8, 0),
             (offsets.execution_context_slot_count, 4, u64::from(argument_count)),
             (offsets.execution_context_argument_count, 4, u64::from(argument_count)),
@@ -1466,7 +1463,7 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
         // Call the native function: it returns a ThrowCompletionOr<Value>,
         // the value or exception in the first return register and whether it
         // is an exception in the low byte of the second.
-        self.masm.move_imm64(scratch, target.entry);
+        self.masm.move_imm64(scratch, entry.get());
         self.masm.move64(registers[0], vm);
         self.masm.call_register(scratch);
         let [value_register, variant] = [M::RETURN_GPRS[0], M::RETURN_GPRS[1]];
@@ -1544,7 +1541,6 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
             constants.extend([
                 (offsets.execution_context_function, 8, header.function.function.0),
                 (offsets.execution_context_script_or_module, 8, 0),
-                (offsets.execution_context_script_or_module + 8, 8, 0),
                 // NB: Frames get their id when the debugger first needs it.
                 (offsets.execution_context_frame_id, 8, 0),
             ]);
@@ -1556,16 +1552,7 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
             );
             constants.extend([
                 (offsets.execution_context_function, 8, header.function.function.0),
-                (
-                    offsets.execution_context_script_or_module,
-                    8,
-                    fields.script_or_module[0],
-                ),
-                (
-                    offsets.execution_context_script_or_module + 8,
-                    8,
-                    fields.script_or_module[1],
-                ),
+                (offsets.execution_context_script_or_module, 8, fields.script_or_module),
                 (offsets.execution_context_lexical_environment, 8, fields.environment),
                 (offsets.execution_context_variable_environment, 8, fields.environment),
                 (
@@ -1616,22 +1603,21 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
         self.masm
             .store64(&field(offsets.execution_context_function), function_register);
         let function_field = |offset: u32| Address::new(function_register, offset as i32);
-        for word in [0, 8] {
-            self.masm.load64(
-                temp,
-                &function_field(offsets.ecmascript_function_script_or_module + word),
-            );
-            self.masm
-                .store64(&field(offsets.execution_context_script_or_module + word), temp);
-        }
+        let shared_data_field = function_field(self.runtime.dynamic_calls.ecmascript_function_shared_data);
+        self.emit_load_compressed_cell(temp, &shared_data_field);
+        self.masm.load64(
+            temp,
+            &Address::new(temp, offsets.shared_function_script_or_module as i32),
+        );
         self.masm
-            .load64(temp, &function_field(offsets.ecmascript_function_environment));
+            .store64(&field(offsets.execution_context_script_or_module), temp);
+        // NB: ECMAScript functions always have an environment.
+        self.emit_load_compressed_cell(temp, &function_field(offsets.ecmascript_function_environment));
         self.masm
             .store64(&field(offsets.execution_context_lexical_environment), temp);
         self.masm
             .store64(&field(offsets.execution_context_variable_environment), temp);
-        self.masm
-            .load64(temp, &function_field(offsets.ecmascript_function_private_environment));
+        self.emit_load_function_private_environment(temp, function_register);
         self.masm
             .store64(&field(offsets.execution_context_private_environment), temp);
         // NB: Frames get their id when the debugger first needs it.

@@ -22,8 +22,9 @@ def run_case(binary, source, root, name, manual, timeout):
             (root / directory / kind).mkdir(parents=True)
     (root / "Crash").mkdir()
     (root / "TestConfig.ini").write_text("")
-    (root / "Fixtures").symlink_to(source / "Tests/LibWeb/Fixtures", target_is_directory=True)
-    (root / "test-web").symlink_to(source / "Tests/LibWeb/test-web", target_is_directory=True)
+    for file in ("Fixtures/http-test-server.py", "test-web/results-index.html"):
+        (root / file).parent.mkdir()
+        shutil.copyfile(source / "Tests/LibWeb" / file, root / file)
     (root / "Text/input/wpt-import").mkdir()
     shutil.copyfile(source / "Tests/LibWeb/Text/input/include.js", root / "Text/input/include.js")
     finish = "internals.setTestTimeout(100);" if timeout else 'println("armed"); done();'
@@ -33,7 +34,8 @@ def run_case(binary, source, root, name, manual, timeout):
         f"internals.setManualRenderingOpportunities({str(manual).lower()}); {finish}"
         "});</script>"
     )
-    (root / "Text/expected/poison.txt").write_text("" if timeout else "armed\n")
+    with (root / "Text/expected/poison.txt").open("w", newline="\n") as file:
+        file.write("" if timeout else "armed\n")
     # Text tests precede reference tests. At -j1 these two files use the same view, without relying on directory order.
     (root / "Ref/input/consumer.html").write_text(
         '<!doctype html><html class="reftest-wait">'
@@ -46,7 +48,6 @@ def run_case(binary, source, root, name, manual, timeout):
     (root / "Ref/expected/green.html").write_text("<!doctype html><style>html,body{margin:0;background:green}</style>")
     results = root / "results"
     env = os.environ.copy()
-    env["LADYBIRD_SOURCE_DIR"] = str(source)
     # The echo server imports its vendored tools even though these fixtures use only file URLs. Keep those tools
     # outside the private input tree so test discovery cannot collect their own HTML fixtures.
     wpt = source / "Tests/LibWeb/Text/input/wpt-import"
@@ -89,13 +90,13 @@ def run_case(binary, source, root, name, manual, timeout):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("test_web", type=Path)
-    parser.add_argument("source", type=Path)
     args = parser.parse_args()
+    source = Path(os.environ["LADYBIRD_SOURCE_DIR"]).resolve()
     with tempfile.TemporaryDirectory(prefix="test-web-manual-reset-") as temporary:
         root = Path(temporary)
-        run_case(args.test_web.resolve(), args.source.resolve(), root, "control", False, False)
-        run_case(args.test_web.resolve(), args.source.resolve(), root, "normal-completion", True, False)
-        run_case(args.test_web.resolve(), args.source.resolve(), root, "timeout", True, True)
+        run_case(args.test_web.resolve(), source, root, "control", False, False)
+        run_case(args.test_web.resolve(), source, root, "normal-completion", True, False)
+        run_case(args.test_web.resolve(), source, root, "timeout", True, True)
 
 
 if __name__ == "__main__":

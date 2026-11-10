@@ -8,6 +8,7 @@
 
 #include <AK/Function.h>
 #include <AK/Vector.h>
+#include <LibGC/Forward.h>
 #include <LibWeb/CSS/DescriptorNameAndID.h>
 #include <LibWeb/CSS/Parser/RuleContext.h>
 #include <LibWeb/CSS/RustDeclarationBlock.h>
@@ -52,10 +53,12 @@ private:
 inline ValueParserFFI::FfiUtf16View ffi_utf16_view(Utf16View view)
 {
     return {
-        .ascii = view.has_ascii_storage() ? reinterpret_cast<u8 const*>(view.ascii_span().data()) : nullptr,
-        .utf16 = view.has_ascii_storage() ? nullptr : reinterpret_cast<u16 const*>(view.utf16_span().data()),
+        .latin1 = view.has_latin1_storage() ? view.latin1_span().data() : nullptr,
+        .utf16 = view.has_latin1_storage() ? nullptr : reinterpret_cast<u16 const*>(view.utf16_span().data()),
         .length = view.length_in_code_units(),
     };
 }
 
 }
+
+GC_UNTRACED_CAPTURE(Web::CSS::Parser::RustStyleSheetParse);

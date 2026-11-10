@@ -73,11 +73,11 @@ ErrorOr<void> encode(Encoder& encoder, Utf16FlyString const& value)
 template<>
 ErrorOr<void> encode(Encoder& encoder, Utf16View const& value)
 {
-    TRY(encoder.encode(value.has_ascii_storage()));
+    TRY(encoder.encode(value.has_latin1_storage()));
     TRY(encoder.encode_size(value.length_in_code_units()));
 
-    if (value.has_ascii_storage()) {
-        TRY(encoder.append(value.bytes().data(), value.length_in_code_units()));
+    if (value.has_latin1_storage()) {
+        TRY(encoder.append(value.latin1_span().data(), value.length_in_code_units()));
     } else {
         VERIFY(!Checked<size_t>::multiplication_would_overflow(value.length_in_code_units(), sizeof(char16_t)));
         TRY(encoder.append(reinterpret_cast<u8 const*>(value.utf16_span().data()), value.length_in_code_units() * sizeof(char16_t)));

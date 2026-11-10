@@ -6,13 +6,15 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-#include <LibGC/ConservativeHashTable.h>
+#include <LibGC/RootHashTable.h>
 #include <LibGC/RootVector.h>
 #include <LibWeb/Bindings/HTMLSlotElement.h>
+#include <LibWeb/DOM/Document.h>
 #include <LibWeb/DOM/Element.h>
 #include <LibWeb/DOM/ShadowRoot.h>
 #include <LibWeb/DOM/Text.h>
 #include <LibWeb/HTML/HTMLSlotElement.h>
+#include <LibWeb/Page/Page.h>
 
 namespace Web::HTML {
 
@@ -111,10 +113,14 @@ void HTMLSlotElement::assign_slottables_if_needed() const
 }
 
 // https://html.spec.whatwg.org/multipage/scripting.html#dom-slot-assign
-void HTMLSlotElement::assign(GC::ConservativeVector<SlottableHandle> nodes)
+void HTMLSlotElement::assign(GC::RootVector<SlottableHandle> nodes)
 {
     // AD-HOC: Assigned nodes are recomputed lazily.
     assign_slottables_if_needed();
+
+    // A name that comes from content can come from the nodes assigned to a slot.
+    if (document().page().accessibility_interested())
+        document().invalidate_cached_accessibility_data(*this);
 
     // 1. For each node of this's manually assigned nodes, set node's manual slot assignment to null.
     for (auto& node : m_manually_assigned_nodes) {
@@ -124,8 +130,8 @@ void HTMLSlotElement::assign(GC::ConservativeVector<SlottableHandle> nodes)
     }
 
     // 2. Let nodesSet be a new ordered set.
-    GC::ConservativeVector<DOM::Slottable> nodes_set;
-    GC::ConservativeHashTable<GC::Ref<DOM::Node const>> nodes_in_nodes_set;
+    GC::RootVector<DOM::Slottable> nodes_set;
+    GC::RootHashTable<GC::Ref<DOM::Node const>> nodes_in_nodes_set;
 
     // INTEROP: The spec only assigns slottables for this's root below, so a slot in another tree that loses a node
     //          to this slot keeps it as an assigned node and fires no slotchange event. Browsers also assign

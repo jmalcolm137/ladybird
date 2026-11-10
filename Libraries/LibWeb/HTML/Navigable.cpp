@@ -40,6 +40,14 @@ GC::Ptr<NavigableContainer> Navigable::container() const
     return m_container;
 }
 
+// The name content attribute of this navigable's container, which another process reports when it holds the container.
+Optional<Utf16FlyString> Navigable::container_name() const
+{
+    if (auto container = this->container())
+        return container->name();
+    return container_state().name;
+}
+
 // https://html.spec.whatwg.org/multipage/document-sequences.html#nav-container-document
 GC::Ptr<DOM::Document> Navigable::container_document() const
 {
@@ -82,14 +90,18 @@ GC::Ptr<DOM::Node> Navigable::currently_focused_area_shown_by_focused_navigable(
 {
     if (!page().client().has_focus())
         return nullptr;
+    return focused_area_shown_by_focused_navigable_regardless_of_system_focus();
+}
 
+GC::Ptr<DOM::Node> Navigable::focused_area_shown_by_focused_navigable_regardless_of_system_focus()
+{
     auto focused_navigable = page().focused_navigable();
     if (!focused_navigable || (focused_navigable.ptr() != this && !is_ancestor_of(*focused_navigable)))
         return nullptr;
 
     for (auto navigable = focused_navigable; navigable; navigable = navigable->parent()) {
         if (auto* local_navigable = as_if<LocalNavigable>(*navigable))
-            return local_navigable->currently_focused_area();
+            return local_navigable->focused_area_regardless_of_system_focus();
         if (navigable.ptr() == this)
             return nullptr;
         if (auto container = navigable->container())

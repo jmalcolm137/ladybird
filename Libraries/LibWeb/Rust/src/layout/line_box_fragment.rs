@@ -25,6 +25,32 @@ pub(crate) struct GlyphData {
     pub(crate) width: f32,
     /// Whether the glyphs are set upright in vertical text, one em apart along the inline axis.
     pub(crate) is_upright: bool,
+    /// Where merging more glyphs into the run last left it.
+    pub(crate) derived_placements_end: Option<libgfx_rust::text_layout::DerivedPlacementsEnd>,
+}
+
+/// The glyphs of a text item and the font they are set in, which a line merges into a fragment or makes one of.
+pub(crate) struct ItemGlyphRun<'run> {
+    pub(crate) glyphs: std::borrow::Cow<'run, libgfx_rust::text_layout::GlyphBuffer>,
+    pub(crate) font: &'run libgfx_rust::font::FontHandle,
+    pub(crate) text_type: u8,
+    pub(crate) width: f32,
+    pub(crate) is_upright: bool,
+}
+
+impl ItemGlyphRun<'_> {
+    /// The glyph run of a fragment made of these glyphs alone, which shares them with the shape they came from until
+    /// merging more into it changes them.
+    pub(crate) fn into_glyph_data(self) -> GlyphData {
+        GlyphData {
+            glyphs: self.glyphs.into_owned(),
+            font: self.font.clone(),
+            text_type: self.text_type,
+            width: self.width,
+            is_upright: self.is_upright,
+            derived_placements_end: None,
+        }
+    }
 }
 
 // The advance of a run's trailing whitespace, recorded at shaping time so that trimming it subtracts exactly what
@@ -181,7 +207,7 @@ impl LineBoxFragmentData {
         }
     }
 
-    pub(crate) fn append_glyph_run(&mut self, run: GlyphData, run_inline_size: CssPixels, text_offset: usize) {
+    pub(crate) fn append_glyph_run(&mut self, run: &ItemGlyphRun<'_>, run_inline_size: CssPixels, text_offset: usize) {
         let text_offset = u32::try_from(text_offset).expect("text offset fits a shaping cluster index");
         match self.direction {
             direction::LTR => self.append_glyph_run_ltr(run, run_inline_size, text_offset),
@@ -190,7 +216,7 @@ impl LineBoxFragmentData {
         }
     }
 
-    fn append_glyph_run_ltr(&mut self, run: GlyphData, run_inline_size: CssPixels, text_offset: u32) {
+    fn append_glyph_run_ltr(&mut self, run: &ItemGlyphRun<'_>, run_inline_size: CssPixels, text_offset: u32) {
         let run_direction = self.resolve_glyph_run_direction(run.text_type);
         let inline_offset = self.inline_length.to_double() as f32;
 
@@ -201,32 +227,44 @@ impl LineBoxFragmentData {
             self.current_insert_direction = run_direction;
         }
 
-        let existing = self
-            .glyphs
-            .as_mut()
-            .expect("merged fragment must have a glyph run")
-            .glyphs
-            .to_mut();
+        let insert_position = self.insert_position;
+        let glyph_data = self.glyphs.as_mut().expect("merged fragment must have a glyph run");
+        if run_direction == direction::LTR
+            && glyph_data.glyphs.append_keeping_placements_derived(
+                &mut glyph_data.derived_placements_end,
+                &run.glyphs,
+                inline_offset,
+                text_offset,
+            )
+        {
+            self.inline_length += run_inline_size;
+            return;
+        }
+        let existing = &mut glyph_data.glyphs;
         existing.reserve(run.glyphs.len());
         match run_direction {
             direction::LTR => {
-                for mut glyph in run.glyphs.iter().copied() {
-                    glyph.x += inline_offset;
-                    glyph.cluster_start += text_offset;
-                    existing.push(glyph);
+                for placed in run.glyphs.placed() {
+                    existing.push_placed(libgfx_rust::text_layout::PlacedGlyph {
+                        x: placed.x + inline_offset,
+                        cluster_start: placed.cluster_start + text_offset,
+                        ..placed
+                    });
                 }
             }
             direction::RTL => {
                 let run_offset = run_inline_size.to_double() as f32;
-                for glyph in existing.iter_mut() {
-                    if glyph.x >= self.insert_position {
-                        glyph.x += run_offset;
+                existing.update_positions(|_, x, _| {
+                    if *x >= insert_position {
+                        *x += run_offset;
                     }
-                }
-                for mut glyph in run.glyphs.iter().copied() {
-                    glyph.x += self.insert_position;
-                    glyph.cluster_start += text_offset;
-                    existing.push(glyph);
+                });
+                for placed in run.glyphs.placed() {
+                    existing.push_placed(libgfx_rust::text_layout::PlacedGlyph {
+                        x: placed.x + insert_position,
+                        cluster_start: placed.cluster_start + text_offset,
+                        ..placed
+                    });
                 }
             }
             _ => unreachable!(),
@@ -234,7 +272,7 @@ impl LineBoxFragmentData {
         self.inline_length += run_inline_size;
     }
 
-    fn append_glyph_run_rtl(&mut self, run: GlyphData, run_inline_size: CssPixels, text_offset: u32) {
+    fn append_glyph_run_rtl(&mut self, run: &ItemGlyphRun<'_>, run_inline_size: CssPixels, text_offset: u32) {
         let run_direction = self.resolve_glyph_run_direction(run.text_type);
         let run_offset = run_inline_size.to_double() as f32;
 
@@ -245,35 +283,37 @@ impl LineBoxFragmentData {
             self.current_insert_direction = run_direction;
         }
 
-        let existing = self
+        let insert_position = self.insert_position;
+        let existing = &mut self
             .glyphs
             .as_mut()
             .expect("merged fragment must have a glyph run")
-            .glyphs
-            .to_mut();
+            .glyphs;
         existing.reserve(run.glyphs.len());
         match run_direction {
             direction::LTR => {
-                for glyph in existing.iter_mut() {
-                    if glyph.x >= self.insert_position {
-                        glyph.x += run_offset;
+                existing.update_positions(|_, x, _| {
+                    if *x >= insert_position {
+                        *x += run_offset;
                     }
-                }
-                for mut glyph in run.glyphs.iter().copied() {
-                    glyph.x += self.insert_position;
-                    glyph.cluster_start += text_offset;
-                    existing.push(glyph);
+                });
+                for placed in run.glyphs.placed() {
+                    existing.push_placed(libgfx_rust::text_layout::PlacedGlyph {
+                        x: placed.x + insert_position,
+                        cluster_start: placed.cluster_start + text_offset,
+                        ..placed
+                    });
                 }
             }
             direction::RTL => {
                 if run.text_type != GLYPH_TEXT_TYPE_END_PADDING {
-                    for glyph in existing.iter_mut() {
-                        glyph.x += run_offset;
-                    }
+                    existing.update_positions(|_, x, _| *x += run_offset);
                 }
-                for mut glyph in run.glyphs.iter().copied() {
-                    glyph.cluster_start += text_offset;
-                    existing.push(glyph);
+                for placed in run.glyphs.placed() {
+                    existing.push_placed(libgfx_rust::text_layout::PlacedGlyph {
+                        cluster_start: placed.cluster_start + text_offset,
+                        ..placed
+                    });
                 }
             }
             _ => unreachable!(),

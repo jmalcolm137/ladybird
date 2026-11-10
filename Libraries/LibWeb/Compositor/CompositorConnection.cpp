@@ -17,11 +17,14 @@
 #include <LibGfx/Bitmap.h>
 #include <LibIPC/Limits.h>
 #include <LibIPC/Transport.h>
+#include <LibIPC/TransportHandle.h>
 #include <LibMediaClient/Client.h>
 #include <LibWeb/Compositor/RenderClock.h>
 #include <LibWeb/HTML/HTMLCanvasElement.h>
 #include <LibWeb/HTML/LocalNavigable.h>
+#include <LibWeb/Page/EventHandler.h>
 #include <LibWeb/Page/Page.h>
+#include <LibWeb/Platform/ImageCodecPlugin.h>
 
 // The Paint stage presents frames, and only the connection hands it the sink it presents them through, and the
 // screenshots it asks for after them.
@@ -277,6 +280,65 @@ void CompositorConnection::hand_frame_sink_to_paint_thread()
     paint_stage_adopt_frame_sink(&sink.leak_ref());
 }
 
+// Gives the compositor a connection of its own to this process's image decoder, so that an animated image keeps getting
+// frames while the main thread is busy.
+void CompositorConnection::ensure_image_decoder_channel()
+{
+    auto& image_codec = Platform::ImageCodecPlugin::the();
+    if (m_image_decoder_channel_client_generation == image_codec.client_generation())
+        return;
+
+    auto channel_or_error = IPC::TransportHandle::create_pair();
+    if (channel_or_error.is_error()) {
+        dbgln("Failed to create an image decoder channel for the Compositor: {}", channel_or_error.error());
+        return;
+    }
+    auto channel = channel_or_error.release_value();
+    image_codec.connect_frame_client(move(channel.first));
+    async_connect_to_image_decoder(channel.second);
+    m_image_decoder_channel_client_generation = image_codec.client_generation();
+}
+
+void CompositorConnection::add_animated_image(u64 frame_id, AnimatedImageRegistration const& image)
+{
+    if (!can_send_message_to_compositor())
+        return;
+    ensure_image_decoder_channel();
+    // NB: Session ids start over with each decoder, so a session of a replaced decoder could name one of another image.
+    auto session_id = image.image_decoder_client_generation == Platform::ImageCodecPlugin::the().client_generation() ? image.session_id : 0;
+    async_add_animated_image(frame_id, session_id, image.size, image.color_space, image.frame_durations_in_milliseconds, image.loop_count);
+}
+
+void CompositorConnection::remove_animated_image(u64 frame_id)
+{
+    if (can_send_message_to_compositor())
+        async_remove_animated_image(frame_id);
+}
+
+void CompositorConnection::start_animated_image(u64 frame_id)
+{
+    if (can_send_message_to_compositor())
+        async_start_animated_image(frame_id);
+}
+
+void CompositorConnection::stop_animated_image(u64 frame_id)
+{
+    if (can_send_message_to_compositor())
+        async_stop_animated_image(frame_id);
+}
+
+AnimatedImageState CompositorConnection::animated_image_state_for_testing(u64 frame_id)
+{
+    if (!can_send_message_to_compositor())
+        return {};
+    auto response = send_sync_but_allow_failure<Messages::CompositorWebContentServer::AnimatedImageStateForTesting>(frame_id);
+    if (!response) {
+        did_lose_compositor();
+        return {};
+    }
+    return { .is_animating = response->is_animating(), .frame_index = response->frame_index(), .shown_frame_index = response->shown_frame_index(), .loops_completed = response->loops_completed() };
+}
+
 void CompositorConnection::add_video_sink(Media::VideoSinkHandle video_sink_handle, NonnullRefPtr<Compositing::VideoFramePresentationPage> presentation_page)
 {
     if (!can_send_message_to_compositor())
@@ -486,17 +548,37 @@ void CompositorConnection::invalidate_wheel_event_listener_state(Web::Compositor
     async_invalidate_wheel_event_listener_state(context_id, generation);
 }
 
-Compositing::AsyncScrollEnqueueResult CompositorConnection::async_scroll_by(Web::CompositorContextId context_id, Web::UniqueNodeID document_id, Gfx::FloatPoint position, Gfx::FloatPoint delta, Gfx::IntRect viewport_rect, Web::WheelDeltaPrecision wheel_delta_precision, Web::ScrollGesturePhase scroll_gesture_phase, u32 modifiers, Compositing::AsyncScrollOperationTracking operation_tracking, Compositing::WheelStepDispatch wheel_step_dispatch, u64 input_event_id)
+Compositing::WheelEventAnswer CompositorConnection::take_wheel_event_from_main_thread(Web::CompositorContextId context_id, Web::MouseEvent const& event, Compositing::AsyncScrollOperationTracking operation_tracking, Compositing::WheelEventRouting routing)
 {
     if (!can_send_message_to_compositor())
         return {};
 
-    auto response = send_sync_but_allow_failure<Messages::CompositorWebContentServer::AsyncScrollBy>(context_id, document_id, position, delta, viewport_rect, wheel_delta_precision, scroll_gesture_phase, modifiers, operation_tracking, wheel_step_dispatch, input_event_id);
+    auto response = send_sync_but_allow_failure<Messages::CompositorWebContentServer::TakeWheelEventFromMainThread>(context_id, event.clone_without_browser_data(), operation_tracking, routing);
     if (!response) {
         did_lose_compositor();
         return {};
     }
-    return response->take_result();
+    return response->take_answer();
+}
+
+Compositing::WheelEventAnswer CompositorConnection::wheel_event_let_through(Web::CompositorContextId context_id, Compositing::WheelStepLetThrough const& step, Compositing::AsyncScrollOperationTracking operation_tracking)
+{
+    if (!can_send_message_to_compositor())
+        return {};
+
+    auto response = send_sync_but_allow_failure<Messages::CompositorWebContentServer::WheelEventLetThrough>(context_id, step, operation_tracking);
+    if (!response) {
+        did_lose_compositor();
+        return {};
+    }
+    return response->take_answer();
+}
+
+void CompositorConnection::wheel_event_canceled(Web::CompositorContextId context_id, u64 wheel_gesture_id)
+{
+    if (!can_send_message_to_compositor())
+        return;
+    async_wheel_event_canceled(context_id, wheel_gesture_id);
 }
 
 String CompositorConnection::scroll_state_for_testing(Web::CompositorContextId context_id, Web::AsyncScrollNodeStableID stretched_scroller)
@@ -799,11 +881,11 @@ bool CompositorConnection::read_webgl_buffer_sub_data(Compositing::CanvasId canv
     return response->success();
 }
 
-void CompositorConnection::request_screenshot(Web::CompositorContextId context_id, NonnullRefPtr<Gfx::Bitmap> target_bitmap, Function<void()>&& callback)
+void CompositorConnection::request_screenshot(Web::CompositorContextId context_id, NonnullRefPtr<Gfx::Bitmap> target_bitmap, Function<void(ScreenshotResult)>&& callback)
 {
     if (!can_send_message_to_compositor()) {
         if (callback)
-            callback();
+            callback(ScreenshotResult::Failed);
         return;
     }
 
@@ -855,6 +937,16 @@ void CompositorConnection::rendering_opportunity(Web::CompositorContextId contex
     }
 }
 
+void CompositorConnection::animated_content_moved_under_pointer(Web::CompositorContextId context_id, i64 frame_time_nanoseconds)
+{
+    for (auto& navigable : Web::HTML::all_local_navigables()) {
+        if (!navigable->has_compositor_context() || navigable->compositor_context().id() != context_id)
+            continue;
+        navigable->event_handler().note_animated_content_moved_under_pointer(frame_time_nanoseconds);
+        return;
+    }
+}
+
 void CompositorConnection::overlay_scrollbar_visibilities_changed(Vector<Web::OverlayScrollbarVisibility> visibilities)
 {
     // Each scroller belongs to the active document of one of our navigables, which takes its scrollbar's visibility.
@@ -878,7 +970,7 @@ void CompositorConnection::did_complete_screenshot(Compositing::ScreenshotReques
         return;
 
     if (pending_screenshot->callback)
-        pending_screenshot->callback();
+        pending_screenshot->callback(ScreenshotResult::Taken);
 }
 
 void CompositorConnection::did_fail_screenshot(Compositing::ScreenshotRequestId request_id)
@@ -888,7 +980,7 @@ void CompositorConnection::did_fail_screenshot(Compositing::ScreenshotRequestId 
         return;
 
     if (pending_screenshot->callback)
-        pending_screenshot->callback();
+        pending_screenshot->callback(ScreenshotResult::Failed);
 }
 
 void CompositorConnection::did_lose_compositor()
@@ -900,7 +992,7 @@ void CompositorConnection::did_lose_compositor()
 
     for (auto& entry : m_screenshots) {
         if (entry.value.callback)
-            entry.value.callback();
+            entry.value.callback(ScreenshotResult::Failed);
     }
     m_screenshots.clear();
 

@@ -6,13 +6,16 @@
 
 //! The 2D canvas contexts, with the attributes and operations of each of their mixins in the module of its IDL file,
 //! the objects that they draw with, the images that they and WebGL read and write the pixels of, and the operations of
-//! a path that Path2D and the contexts share. The state that the contexts share is in crate::canvas_2d.
+//! a path that Path2D and the contexts share. The state that the contexts share is in crate::canvas_2d. The message
+//! ports and channels of web messaging, the broadcast channels and Web Storage are here as well.
 
 pub(crate) mod canvas_path;
 pub(crate) mod color_stops;
 pub(crate) mod predefined_color_space;
 
 // What follows runs on the JS runtime, which the tests of the crate do not link.
+#[cfg(not(test))]
+pub(crate) mod broadcast_channel;
 #[cfg(not(test))]
 pub(crate) mod canvas_compositing;
 #[cfg(not(test))]
@@ -58,10 +61,28 @@ pub(crate) mod image_bitmap;
 #[cfg(not(test))]
 pub(crate) mod image_data;
 #[cfg(not(test))]
+pub(crate) mod message_channel;
+#[cfg(not(test))]
+pub(crate) mod message_port;
+#[cfg(not(test))]
+pub(crate) mod numbers;
+#[cfg(not(test))]
+pub(crate) mod offscreen_canvas;
+#[cfg(not(test))]
 pub(crate) mod offscreen_canvas_rendering_context2d;
 #[cfg(not(test))]
 pub(crate) mod path2d;
 #[cfg(not(test))]
+pub(crate) mod port_channel;
+#[cfg(not(test))]
+pub(crate) mod storage;
+#[cfg(not(test))]
+pub(crate) mod storage_event;
+#[cfg(not(test))]
 pub(crate) mod structured_serialize;
 #[cfg(not(test))]
 pub(crate) mod text_metrics;
+#[cfg(not(test))]
+pub(crate) mod window;
+#[cfg(not(test))]
+pub(crate) mod window_or_worker_global_scope;

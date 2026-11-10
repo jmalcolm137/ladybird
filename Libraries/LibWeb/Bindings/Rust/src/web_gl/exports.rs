@@ -11,17 +11,21 @@ use core::ffi::c_void;
 use core::marker::PhantomData;
 use core::ptr::NonNull;
 
+use ak::Utf16String;
+
 use super::canvas::Canvas;
 use super::fingerprint::verify_that_rust_and_cpp_agree_on_layouts_and_constants;
 use super::host::CppTransport;
 use super::proxy::recorder::Proxy;
 use super::state::{
-    ContextParameters, ContextRef, ContextState, MAX_WEBGL_DRAWING_BUFFER_DIMENSION, RenderingContext, WebGL1, WebGL2,
-    WebGLVersion,
+    ContextParameters, ContextRef, ContextState, RenderingContext, WebGL1, WebGL2, WebGLVersion,
+    drawing_buffer_dimension,
 };
+use super::web_gl_context_event::{WebGLContextEvent, WebGLContextEventInit};
 use super::web_gl_rendering_context::WebGLPowerPreference;
 use super::web_gl_rendering_context_base::WebGLContextAttributes;
 use crate::bindings::interface::{Interface, allocate, cell_into_abi, realm_arguments};
+use crate::dom::event::EventInit;
 
 /// The bytes of the names of the extensions C++ lends.
 fn extension_names(names: ak::Span<'_, ak::Span<'_, u8>>) -> Vec<Vec<u8>> {
@@ -42,7 +46,6 @@ pub struct ContextAttributes {
     power_preference: u8,
     fail_if_major_performance_caveat: bool,
     desynchronized: bool,
-    xr_compatible: bool,
 }
 
 impl From<ContextAttributes> for WebGLContextAttributes {
@@ -62,7 +65,6 @@ impl From<ContextAttributes> for WebGLContextAttributes {
             },
             fail_if_major_performance_caveat: attributes.fail_if_major_performance_caveat,
             desynchronized: attributes.desynchronized,
-            xr_compatible: attributes.xr_compatible,
         }
     }
 }
@@ -83,7 +85,6 @@ impl From<WebGLContextAttributes> for ContextAttributes {
             },
             fail_if_major_performance_caveat: attributes.fail_if_major_performance_caveat,
             desynchronized: attributes.desynchronized,
-            xr_compatible: attributes.xr_compatible,
         }
     }
 }
@@ -182,11 +183,6 @@ pub extern "C" fn web_webgl_context_canvas_host(context: &ContextCell) -> *mut c
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn web_webgl_context_realm(context: &ContextCell) -> *mut c_void {
-    with_context(context, |context| context.realm().as_ptr().cast())
-}
-
-#[unsafe(no_mangle)]
 pub extern "C" fn web_webgl_context_is_webgl2(context: &ContextCell) -> bool {
     with_context(context, ContextState::is_webgl2)
 }
@@ -208,10 +204,9 @@ pub extern "C" fn web_webgl_context_canvas_id(context: &ContextCell, out_canvas_
 #[unsafe(no_mangle)]
 pub extern "C" fn web_webgl_context_set_size(context: &ContextCell, width: i32, height: i32) {
     with_context(context, |context| {
-        context.proxy.set_size(
-            width.clamp(1, MAX_WEBGL_DRAWING_BUFFER_DIMENSION),
-            height.clamp(1, MAX_WEBGL_DRAWING_BUFFER_DIMENSION),
-        );
+        context
+            .proxy
+            .set_size(drawing_buffer_dimension(width), drawing_buffer_dimension(height));
     });
 }
 
@@ -288,12 +283,28 @@ pub unsafe extern "C" fn web_webgl_context_restore(
     });
 }
 
+/// # Safety
+///
+/// `vm` must be the live VM, `realm` a live realm, and `type` a raw AK::Utf16String that the call takes over.
 #[unsafe(no_mangle)]
-pub extern "C" fn web_webgl_context_xr_compatible(context: &ContextCell) -> bool {
-    with_context(context, ContextState::xr_compatible)
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn web_webgl_context_set_xr_compatible(context: &ContextCell, xr_compatible: bool) {
-    with_context(context, |context| context.set_xr_compatible(xr_compatible));
+pub unsafe extern "C" fn web_webgl_context_event_create(
+    vm: *mut c_void,
+    realm: *mut c_void,
+    r#type: usize,
+) -> *mut c_void {
+    // SAFETY: The caller passes the live VM and a live realm.
+    let (vm, realm) = unsafe { realm_arguments(vm, realm) };
+    // SAFETY: The caller hands over the type.
+    let r#type = unsafe { Utf16String::from_raw_owned(r#type) };
+    let event_init = WebGLContextEventInit {
+        parent: EventInit {
+            bubbles: false,
+            cancelable: true,
+            composed: false,
+        },
+        status_message: Utf16String::from_utf8(""),
+    };
+    let event = WebGLContextEvent::create(vm, realm, &r#type, &event_init);
+    event.event().set_is_trusted(true);
+    event.event().as_ptr()
 }

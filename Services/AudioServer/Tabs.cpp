@@ -9,6 +9,7 @@
 #include <AudioServer/ControlConnection.h>
 #include <AudioServer/PlatformAudio.h>
 #include <AudioServer/Tabs.h>
+#include <LibAudio/AudioDevices.h>
 #include <LibAudio/NullPlaybackStream.h>
 #include <LibAudio/PlaybackStream.h>
 #include <LibAudio/RecordStream.h>
@@ -25,6 +26,14 @@ Tabs& Tabs::the()
 {
     static NeverDestroyed<Tabs> instance;
     return *instance;
+}
+
+Tabs::Tabs()
+    : m_capture_activity([this](u64 tab_id, Audio::PlaybackGroupId group, bool capturing) {
+        if (auto control_connection = m_control_connection.strong_ref())
+            control_connection->async_capture_activity_changed(tab_id, group, capturing);
+    })
+{
 }
 
 void Tabs::set_control_connection(ControlConnection& connection)
@@ -69,6 +78,37 @@ static NonnullRefPtr<Audio::PlaybackStream::CreatePromise> create_device_stream(
     return promise;
 }
 
+// The only input device of a headless AudioServer, which opens like any other and delivers nothing.
+class NullRecordStream final : public Audio::RecordStream {
+public:
+    explicit NullRecordStream(Audio::SampleSpecification const& specification)
+        : m_specification(specification)
+    {
+    }
+
+    virtual Audio::SampleSpecification const& sample_specification() const override { return m_specification; }
+
+private:
+    Audio::SampleSpecification m_specification;
+};
+
+void Tabs::set_audio_output(Audio::AudioOutput audio_output)
+{
+    m_audio_output = audio_output;
+    if (audio_output != Audio::AudioOutput::Null)
+        return;
+
+    Audio::AudioDeviceInfo null_input_device {
+        .dom_device_id = "null:input",
+        .label = "Null input",
+        .group_id = {},
+        .sample_rate_hz = 48000,
+        .channel_count = 1,
+        .is_default = true,
+    };
+    Audio::AudioDevices::the().report_device_list(Audio::AudioDeviceEnumeration { .inputs = { move(null_input_device) }, .outputs = {} });
+}
+
 Tabs::Tab& Tabs::tab_for(u64 tab_id)
 {
     return m_tabs.ensure(tab_id, [this, tab_id] {
@@ -96,7 +136,7 @@ Audio::CaptureDevices& Tabs::capture_devices()
     if (!m_capture_devices) {
         m_capture_devices = Audio::CaptureDevices::create([audio_output = m_audio_output](Audio::SampleSpecification const& specification, u32 fragment_size_bytes, StringView device_id, Audio::RecordStream::RecordCallback callback) {
             if (audio_output == Audio::AudioOutput::Null)
-                return Audio::RecordStream::CreatePromise::rejected(Error::from_string_literal("A headless AudioServer has no capture devices"));
+                return Audio::RecordStream::CreatePromise::resolved(adopt_ref<Audio::RecordStream>(*new NullRecordStream(specification)));
             return Audio::create_platform_record_stream(specification, fragment_size_bytes, device_id, move(callback));
         });
     }
@@ -110,15 +150,18 @@ ErrorOr<IPC::TransportHandle> Tabs::connect_client(u64 tab_id)
 
     auto& tab = tab_for(tab_id);
     auto client_id = m_next_client_id++;
-    auto device_enumeration = Audio::ServerConnection::DeviceEnumeration::Platform;
-    if (m_audio_output == Audio::AudioOutput::Null)
-        device_enumeration = Audio::ServerConnection::DeviceEnumeration::None;
-    auto connection = Audio::ServerConnection::construct(move(paired_transports.local), client_id, tab.mixer, device_enumeration, capture_devices(), [tab_id](ByteString const& device_id, Function<void(bool)> on_decided) {
-        Tabs::the().request_capture_permission(tab_id, device_id, move(on_decided));
+    auto connection = Audio::ServerConnection::construct(move(paired_transports.local), client_id, tab.mixer, capture_devices(), [tab_id](ByteString const& device_id, Audio::PlaybackGroupId group, Function<void(bool)> on_decided) {
+        Tabs::the().request_capture_permission(tab_id, device_id, group, move(on_decided));
     });
     connection->set_capture_permitted(m_tabs_with_capture_permission.contains(tab_id));
     connection->on_death = [tab_id, client_id] {
         Tabs::the().connection_died(tab_id, client_id);
+    };
+    connection->on_capture_started = [tab_id](Audio::PlaybackGroupId group) {
+        Tabs::the().m_capture_activity.stream_started(tab_id, group);
+    };
+    connection->on_capture_stopped = [tab_id](Audio::PlaybackGroupId group) {
+        Tabs::the().m_capture_activity.stream_stopped(tab_id, group);
     };
     tab.connections.set(client_id, move(connection));
     return handle;
@@ -175,7 +218,7 @@ void Tabs::set_playback_group_mute_state(u64 tab_id, Audio::PlaybackGroupId grou
         tab->mixer->set_group_mute_state(group, mute_state);
 }
 
-void Tabs::request_capture_permission(u64 tab_id, ByteString const& device_id, Function<void(bool)> on_decided)
+void Tabs::request_capture_permission(u64 tab_id, ByteString const& device_id, Audio::PlaybackGroupId group, Function<void(bool)> on_decided)
 {
     auto control_connection = m_control_connection.strong_ref();
     if (!control_connection) {
@@ -184,7 +227,7 @@ void Tabs::request_capture_permission(u64 tab_id, ByteString const& device_id, F
     }
     auto request_id = m_next_capture_request_id++;
     m_pending_capture_decisions.set(request_id, move(on_decided));
-    control_connection->async_capture_requested(tab_id, request_id, device_id);
+    control_connection->async_capture_requested(tab_id, request_id, device_id, group);
 }
 
 void Tabs::capture_decided(u64 request_id, bool allowed)

@@ -14,14 +14,8 @@ use core::cell::Cell;
 use std::alloc::{Layout, alloc, dealloc, handle_alloc_error};
 
 use super::visitor::{Trace, Visitor};
-use crate::layout::buffer::InterpreterBuffer;
-
-/// Whether a buffer owns its storage, which it then allocated itself.
-#[derive(PartialEq, Eq)]
-enum Ownership {
-    Owned,
-    Unowned,
-}
+use crate::layout::buffer::{BlockSlice, InterpreterBuffer, ThinSlice};
+use crate::slice_block::THIN_SLICE_HEADER_SIZE;
 
 /// Mirrors AK::Vector's growth policy.
 fn padded_capacity(capacity: usize) -> usize {
@@ -38,11 +32,21 @@ impl<T: Copy> InterpreterBuffer<T> {
     }
 
     pub fn size(&self) -> usize {
-        self.size.get()
+        self.size.get() as usize
     }
 
     pub fn capacity(&self) -> usize {
-        self.capacity.get()
+        self.capacity.get() as usize
+    }
+
+    fn set_size(&self, size: usize) {
+        self.size
+            .set(u32::try_from(size).expect("the size of a buffer fits in u32"));
+    }
+
+    fn set_capacity(&self, capacity: usize) {
+        self.capacity
+            .set(u32::try_from(capacity).expect("the capacity of a buffer fits in u32"));
     }
 
     pub fn is_empty(&self) -> bool {
@@ -76,7 +80,7 @@ impl<T: Copy> InterpreterBuffer<T> {
         }
         // SAFETY: The buffer has room for one more element.
         unsafe { self.data.get().add(size).write(value) };
-        self.size.set(size + 1);
+        self.set_size(size + 1);
     }
 
     /// Makes room for `needed_capacity` elements in total, exactly like AK::Vector::ensure_capacity.
@@ -98,36 +102,7 @@ impl<T: Copy> InterpreterBuffer<T> {
         self.reallocate(0);
     }
 
-    /// Makes room for `capacity` elements at `data`, which the buffer does not own, the storage of this buffer.
-    ///
-    /// # Safety
-    ///
-    /// The buffer must have no storage, and `data` must have room for `capacity` elements for as long as the buffer
-    /// uses it.
-    pub unsafe fn use_unowned_storage(&self, data: *mut T, capacity: usize) {
-        assert!(self.data.get().is_null());
-        self.data.set(data);
-        self.capacity.set(capacity);
-    }
-
-    /// Moves the elements from storage the buffer does not own to storage of its own, with room for at least
-    /// `needed_capacity` elements and as much more as append() would make.
-    pub fn move_to_owned_storage(&self, needed_capacity: usize) {
-        self.reallocate_from(needed_capacity.max(padded_capacity(self.size())), Ownership::Unowned);
-    }
-
-    /// Removes every element and forgets storage the buffer does not own.
-    pub fn forget_unowned_storage(&self) {
-        self.data.set(core::ptr::null_mut());
-        self.size.set(0);
-        self.capacity.set(0);
-    }
-
     fn reallocate(&self, new_capacity: usize) {
-        self.reallocate_from(new_capacity, Ownership::Owned);
-    }
-
-    fn reallocate_from(&self, new_capacity: usize, ownership: Ownership) {
         const { assert!(size_of::<T>() != 0) };
         let size = self.size();
         assert!(new_capacity >= size);
@@ -147,13 +122,13 @@ impl<T: Copy> InterpreterBuffer<T> {
             }
             new_data
         };
-        if !old_data.is_null() && ownership == Ownership::Owned {
+        if !old_data.is_null() {
             let old_layout = Layout::array::<T>(self.capacity()).expect("the buffer was allocated with this layout");
             // SAFETY: The old storage was allocated by this method with this layout.
             unsafe { dealloc(old_data.cast(), old_layout) };
         }
         self.data.set(new_data);
-        self.capacity.set(new_capacity);
+        self.set_capacity(new_capacity);
     }
 }
 
@@ -178,5 +153,143 @@ unsafe impl<T: Copy + Trace> Trace for InterpreterBuffer<T> {
         // SAFETY: The first `size` elements are initialized, and nothing writes them while they are visited.
         let elements = unsafe { ak::slice_from_raw_parts(self.data.get(), self.size()) };
         T::trace_slice(elements, visitor);
+    }
+}
+
+impl<T> ThinSlice<T> {
+    const fn layout_for(length: usize) -> Layout {
+        const { assert!(size_of::<T>() != 0 && align_of::<T>() <= THIN_SLICE_HEADER_SIZE) };
+        // SAFETY: The size fits in memory, since the caller holds that many elements, and the alignment is a power of
+        //         two.
+        unsafe {
+            Layout::from_size_align_unchecked(THIN_SLICE_HEADER_SIZE + length * size_of::<T>(), THIN_SLICE_HEADER_SIZE)
+        }
+    }
+
+    /// Room for `length` elements, which is not empty, with their length in front of them. The elements are up to the
+    /// caller.
+    fn allocate(length: usize) -> *mut T {
+        let layout = Self::layout_for(length);
+        // SAFETY: The layout has a non-zero size. The allocation has room for the length, aligned for it and for the
+        //         elements behind it.
+        unsafe {
+            let allocation = alloc(layout);
+            if allocation.is_null() {
+                handle_alloc_error(layout);
+            }
+            allocation.cast::<usize>().write(length);
+            allocation.add(THIN_SLICE_HEADER_SIZE).cast::<T>()
+        }
+    }
+
+    pub fn as_slice(&self) -> &[T] {
+        if self.data.is_null() {
+            return &[];
+        }
+        // SAFETY: A non-null slice has its length in front of its initialized elements, which it owns.
+        unsafe { ak::slice_from_raw_parts(self.data, self.data.cast::<usize>().sub(1).read()) }
+    }
+
+    pub fn as_mut_slice(&mut self) -> &mut [T] {
+        if self.data.is_null() {
+            return &mut [];
+        }
+        // SAFETY: A non-null slice has its length in front of its initialized elements, which it owns.
+        unsafe { ak::slice_from_raw_parts_mut(self.data, self.data.cast::<usize>().sub(1).read()) }
+    }
+}
+
+impl<T> From<Vec<T>> for ThinSlice<T> {
+    fn from(mut elements: Vec<T>) -> Self {
+        let length = elements.len();
+        if length == 0 {
+            return Self::empty();
+        }
+        let data = Self::allocate(length);
+        // SAFETY: The allocation has room for `length` elements, which move out of the vector.
+        unsafe {
+            core::ptr::copy_nonoverlapping(elements.as_ptr(), data, length);
+            elements.set_len(0);
+        }
+        Self::from_data(data)
+    }
+}
+
+impl<T> FromIterator<T> for ThinSlice<T> {
+    fn from_iter<I: IntoIterator<Item = T>>(iterator: I) -> Self {
+        let mut iterator = iterator.into_iter();
+        let (length, upper_bound) = iterator.size_hint();
+        if upper_bound != Some(length) {
+            return iterator.collect::<Vec<T>>().into();
+        }
+        if length == 0 {
+            return Self::empty();
+        }
+        let data = Self::allocate(length);
+        for index in 0..length {
+            let element = iterator.next().expect("an iterator yields what its size hint says");
+            // SAFETY: The allocation has room for `length` elements.
+            unsafe { data.add(index).write(element) };
+        }
+        Self::from_data(data)
+    }
+}
+
+impl<T: Clone> Clone for ThinSlice<T> {
+    fn clone(&self) -> Self {
+        self.as_slice().to_vec().into()
+    }
+}
+
+impl<T> core::ops::Deref for ThinSlice<T> {
+    type Target = [T];
+
+    fn deref(&self) -> &[T] {
+        self.as_slice()
+    }
+}
+
+impl<T> core::ops::DerefMut for ThinSlice<T> {
+    fn deref_mut(&mut self) -> &mut [T] {
+        self.as_mut_slice()
+    }
+}
+
+impl<'a, T> IntoIterator for &'a ThinSlice<T> {
+    type Item = &'a T;
+    type IntoIter = core::slice::Iter<'a, T>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.as_slice().iter()
+    }
+}
+
+impl<T> Drop for ThinSlice<T> {
+    fn drop(&mut self) {
+        if self.data.is_null() {
+            return;
+        }
+        let elements = core::ptr::from_mut(self.as_mut_slice());
+        let layout = Self::layout_for(elements.len());
+        // SAFETY: The elements are initialized and nothing uses them after this. The allocation starts at the length,
+        //         and From<Vec<T>> made it with this layout.
+        unsafe {
+            core::ptr::drop_in_place(elements);
+            dealloc(self.data.cast::<u8>().sub(THIN_SLICE_HEADER_SIZE), layout);
+        }
+    }
+}
+
+// SAFETY: Visits every element.
+unsafe impl<T: Trace> Trace for ThinSlice<T> {
+    fn trace(&self, visitor: &mut Visitor) {
+        T::trace_slice(self.as_slice(), visitor);
+    }
+}
+
+// SAFETY: Visits every element.
+unsafe impl<T: Trace> Trace for BlockSlice<T> {
+    fn trace(&self, visitor: &mut Visitor) {
+        T::trace_slice(self.as_slice(), visitor);
     }
 }

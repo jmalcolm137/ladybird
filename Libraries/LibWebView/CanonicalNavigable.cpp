@@ -860,6 +860,50 @@ void CanonicalNavigable::hand_pending_webdriver_commands_to(WebContentPage& new_
         view->move_pending_webdriver_commands_to_new_host({}, id(), *old_host, new_host);
 }
 
+static auto const serialized_file_origin = "file://"sv;
+
+// The serialized origin of a URL a document can be fetched from, or nothing for a URL that holds its own content.
+static Optional<String> serialized_origin_of_fetched_url(URL::URL const& url)
+{
+    if (url.scheme().is_one_of("http"sv, "https"sv))
+        return url.origin().serialize();
+    if (url.scheme() == "file"sv)
+        return String::from_utf8_without_validation(serialized_file_origin.bytes());
+    return {};
+}
+
+// The origin whose sandboxed documents a sandboxed document is hosted with: that of its URL when it was fetched, or
+// that of the nearest ancestor fetched so when it holds what its embedder gave it, as a srcdoc or data: URL iframe
+// does. Any other document stays with its initiator, as an about:blank document can, since nothing else can script it.
+static Optional<String> origin_of_sandboxed_document(CanonicalNavigable const& navigable, CanonicalDocument const& document)
+{
+    if (!document.origin().is_opaque() || !has_flag(document.active_sandboxing_flag_set(), Web::HTML::SandboxingFlagSet::SandboxedOrigin))
+        return {};
+
+    auto const& url = document.creation_url();
+    if (auto origin = serialized_origin_of_fetched_url(url); origin.has_value())
+        return origin;
+    if (!Web::HTML::url_matches_about_srcdoc(url) && url.scheme() != "data"sv)
+        return {};
+
+    for (auto const* ancestor = navigable.parent(); ancestor; ancestor = ancestor->parent()) {
+        if (auto origin = serialized_origin_of_fetched_url(ancestor->active_document().creation_url()); origin.has_value())
+            return origin;
+    }
+    return {};
+}
+
+static RefPtr<WebContentClient> lowest_process_hosting_only_tabs_like(CanonicalDocument const& document, BrowsingSession const& session)
+{
+    RefPtr<WebContentClient> process;
+    WebContentClient::for_each_client([&](WebContentClient& client) {
+        if (&client.session() == &session && client.is_open() && !client.has_requested_close() && client.has_hosted_only_tabs_like(document) && (!process || client.child_id() < process->child_id()))
+            process = client;
+        return IterationDecision::Continue;
+    });
+    return process;
+}
+
 RefPtr<WebContentClient> CanonicalNavigable::process_to_host_for_site_isolation(CanonicalDocument const& document, Optional<URL::Origin> const& initiator_origin) const
 {
     RefPtr<WebContentPage> page_holding_navigable = parent() ? reporting_page() : top_level_traversable().page_hosting(*this);
@@ -874,10 +918,33 @@ RefPtr<WebContentClient> CanonicalNavigable::process_to_host_for_site_isolation(
     if (mode == SiteIsolationMode::Disabled || (mode == SiteIsolationMode::TopLevel && parent()))
         return process_holding_navigable;
 
-    // An opaque origin keys an agent cluster of its own, which nothing but the documents it was created from can
+    // A sandboxed document stays out of its initiator's process, and the sandboxed documents of an origin share one
+    // process rather than having a process per agent cluster. A traversable's first document can still take the process
+    // its initial about:blank came with, below.
+    auto sandboxed_origin = origin_of_sandboxed_document(*this, document);
+    if (sandboxed_origin.has_value()) {
+        if (auto process = document.browsing_context().top_level_browsing_context().group()->process_hosting_sandboxed_documents_of_origin(*sandboxed_origin))
+            return process;
+        if (parent())
+            return nullptr;
+    }
+
+    // A tab goes to a process that has hosted only tabs of its origin that are origin-keyed just as it is, to share
+    // what the process holds. Nothing else can reach a browsing context group of one, whereas an opener could make a
+    // process it can connect to host the tab. A tab recovering from a crash gets a process of its own, so that it can't
+    // take the tabs it joins down with it again.
+    if (!parent() && process_holding_navigable && document.may_share_a_process_with_tabs_of_its_origin()
+        && document.browsing_context().top_level_browsing_context().group()->browsing_context_set().size() == 1
+        && !top_level_traversable().has_page_standing_in_for_lost_document()
+        && Application::the().same_origin_tabs_may_share_a_process()) {
+        if (auto process = lowest_process_hosting_only_tabs_like(document, process_holding_navigable->session()))
+            return process;
+    }
+
+    // Any other opaque origin keys an agent cluster of its own, which nothing but the documents it was created from can
     // address: it goes with the initiator's agent. A traversable's document of an opaque origin that no such agent
     // hosts, as a file's opened from the browser's UI is, keeps the process of a document of an opaque origin.
-    if (document.origin().is_opaque()) {
+    if (document.origin().is_opaque() && !sandboxed_origin.has_value()) {
         if (initiator_origin.has_value()) {
             if (auto initiator_agent = document.browsing_context().top_level_browsing_context().group()->similar_origin_window_agent_for(*initiator_origin)) {
                 if (auto process = initiator_agent->hosting_process())
@@ -890,9 +957,14 @@ RefPtr<WebContentClient> CanonicalNavigable::process_to_host_for_site_isolation(
 
     // A traversable's first document takes the process its initial about:blank came with, unless that document
     // inherited its creator's origin and shares the creator's process, or a browsing context group switch leaves the
-    // initial about:blank's group.
-    if (!parent() && active_document().is_initial_about_blank() && active_document().origin().is_opaque() && &document.browsing_context() == &active_browsing_context())
+    // initial about:blank's group. A noopener popup's initial about:blank came with the process of the document that
+    // opened it, which a document unlike the tabs of that process stays out of if the process hosts tabs of one
+    // origin.
+    if (!parent() && active_document().is_initial_about_blank() && active_document().origin().is_opaque() && !active_browsing_context().is_auxiliary() && &document.browsing_context() == &active_browsing_context()) {
+        if (process_holding_navigable && process_holding_navigable->has_hosted_only_tabs_unlike(document))
+            return nullptr;
         return process_holding_navigable;
+    }
 
     return nullptr;
 }
@@ -941,6 +1013,14 @@ RefPtr<WebContentClient> CanonicalNavigable::process_to_host(CanonicalDocument c
 ErrorOr<NonnullRefPtr<WebContentPage>> CanonicalNavigable::obtain_page_to_host(CanonicalDocument const& document, Optional<URL::Origin> const& initiator_origin)
 {
     auto page = TRY(obtain_page_to_host_in(process_to_host(document, initiator_origin)));
+    if (site_isolation_mode() == SiteIsolationMode::IFrame) {
+        if (auto origin = origin_of_sandboxed_document(*this, document); origin.has_value()) {
+            document.browsing_context().top_level_browsing_context().group()->set_process_hosting_sandboxed_documents_of_origin(*origin, page->client());
+            // NB: A sandboxed srcdoc or data: URL iframe of local file content loads files as that content can.
+            if (*origin == serialized_file_origin)
+                page->client().set_has_hosted_local_file_content();
+        }
+    }
     if (document.is_local_file_content())
         page->client().set_has_hosted_local_file_content();
     if (auto const& web_ui_host = document.web_ui_host(); web_ui_host.has_value()) {
@@ -1320,6 +1400,7 @@ Optional<Web::HTML::ReplicatedNavigableState> CanonicalNavigable::replicated_sta
         .target_name = target_name(),
         .active_document_url = active_document_url(),
         .active_document_origin = active_document().origin(),
+        .active_document_sandboxing_flag_set = active_document().active_sandboxing_flag_set(),
         .active_document_is_fully_active = hosted_state.active_document_is_fully_active,
         .top_level_creation_url = active_document().relevant_global_object().relevant_settings_object().top_level_creation_url().value(),
         .top_level_origin = traversable.active_document().origin(),
@@ -1357,8 +1438,14 @@ void CanonicalNavigable::did_set_opener_browsing_context(Optional<Web::HTML::Cro
     RefPtr<CanonicalBrowsingContext> opener_browsing_context;
     if (opener_navigable_id.has_value()) {
         if (auto* opener_traversable = CanonicalTraversable::traversable_containing(*opener_navigable_id)) {
-            if (auto opener = opener_traversable->find(*opener_navigable_id); opener.has_value())
+            if (auto opener = opener_traversable->find(*opener_navigable_id); opener.has_value()) {
+                // window.open() only finds navigables in the group of the source document's top-level browsing
+                // context, so the opener it sets is one of the group's.
+                auto group = top_level_traversable().active_browsing_context().group();
+                if (!group || opener_traversable->active_browsing_context().group() != group)
+                    return;
                 opener_browsing_context = opener->active_browsing_context();
+            }
         }
     }
     active_browsing_context().set_opener_browsing_context(opener_browsing_context);
@@ -1449,6 +1536,32 @@ bool CanonicalNavigable::current_session_history_entry_is(CanonicalSessionHistor
 bool CanonicalNavigable::active_document_is(CanonicalSessionHistoryEntry const& entry) const
 {
     return m_active_session_history_entry && entry.document_state->document == &active_document();
+}
+
+// https://html.spec.whatwg.org/multipage/browsing-the-web.html#create-navigation-params-by-fetching
+// NB: The fields of entry that populating its document changed, as the UI process's population request has them. A new
+//     document state replaces entry's, which then holds the document populated for the one it replaces.
+void CanonicalNavigable::apply_populated_history_entry(CanonicalSessionHistoryEntry& entry, Web::HTML::PendingSessionHistoryEntryDescriptor const& populated_entry)
+{
+    entry.url = populated_entry.url;
+    entry.directive_state_value = populated_entry.directive_state_value;
+    entry.classic_history_api_state = populated_entry.classic_history_api_state;
+    if (populated_entry.document_state.id == entry.document_state->id) {
+        entry.document_state->resource = populated_entry.document_state.resource;
+        return;
+    }
+
+    // NB: Fetching replaces entry's document state with a new one, which has no nested histories.
+    auto document_state_descriptor = populated_entry.document_state;
+    document_state_descriptor.nested_histories.clear();
+    auto document_state = CanonicalDocumentState::create_from_descriptor(document_state_descriptor);
+    // NB: For a reload, entry is the active entry, so the new document state holds the active document until the one
+    //     populated for it is activated.
+    document_state->document = exchange(entry.document_state->document, nullptr);
+    document_state->populated_document = exchange(entry.document_state->populated_document, {});
+    if (m_document_state_populated_by_history_job == entry.document_state)
+        m_document_state_populated_by_history_job = document_state;
+    entry.document_state = move(document_state);
 }
 
 void CanonicalNavigable::did_commit_navigation(CanonicalSessionHistoryEntry& entry, Web::HTML::HostedNavigableState hosted_state, u64 operation_sequence_number, Optional<Utf16String const&> navigation_id, RefPtr<WebContentPage> host)

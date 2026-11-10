@@ -51,6 +51,19 @@ inline fn box_object(object: Object) -> Value<Object> {
     value
 }
 
+# The field a direct getter returns is a compressed cell pointer for a GC::Member, and a full one otherwise.
+inline fn load_direct_getter_implementation_value(address: u64, is_compressed: u32) -> u64 {
+    if is_compressed != 0 {
+        let mut value: u64;
+        load_compressed_cell_ptr(value, [address]);
+        value
+    } else {
+        let mut value: u64;
+        load64(value, [address]);
+        value
+    }
+}
+
 inline fn load_direct_getter_value(
     function: Object,
     receiver_object: Object,
@@ -73,7 +86,11 @@ inline fn load_direct_getter_value(
     let receiver_pointer: u64 = alias(receiver_object);
     guard cached_receiver == receiver_pointer else failure;
 
-    let result_implementation = implementation_words[direct_getter.implementation_value_word_offset];
+    let result_implementation_address: u64 = implementation + alias(direct_getter.implementation_value_offset);
+    let result_implementation = load_direct_getter_implementation_value(
+        result_implementation_address,
+        direct_getter.implementation_value_is_compressed
+    );
     if result_implementation == 0 {
         let mut null_value: Value;
         mov(null_value, NULL_VALUE);
@@ -286,7 +303,7 @@ inline fn load_binding_flag(
     if binding_shape == 0 {
         environment.rare_data.binding_flags[binding_index]
     } else {
-        let shape_size = binding_shape.binding_flags_size;
+        let shape_size: u64 = alias(binding_shape.binding_flags_size);
         if shape_size <= alias(binding_index) {
             let local_index: u64 = alias(binding_index) - shape_size;
             environment.rare_data.binding_flags[local_index]
@@ -1232,8 +1249,8 @@ handler Enter() {
     if slot_index < alias(registers_and_locals_count) {
         values[slot_index] = empty_tag;
     }
-    let constant_count = executable.asm_constants_size;
-    let constant_data = executable.asm_constants_data;
+    let constant_count: u32 = executable.registers_and_locals_and_constants_count - registers_and_locals_count;
+    let constant_data = executable.constants_data;
     let mut write_index: u64 = alias(registers_and_locals_count);
     let mut constant_index: u64 = 0;
     while constant_index < alias(constant_count) {
@@ -1254,11 +1271,7 @@ handler Mov(
     dispatch_next;
 }
 
-specialize Mov() + Mov() as Mov2;
-specialize Mov() + Mov() + Mov() as Mov3;
 specialize Mov(src: Undefined);
-specialize Mov(src: Undefined) + Mov(src: Undefined) as MovUndefined2;
-specialize Mov(src: Undefined) + Mov(src: Undefined) + Mov(src: Undefined) as MovUndefined3;
 
 specialize Add(lhs: Int32);
 specialize Add(rhs: Int32);
@@ -1498,13 +1511,24 @@ handler ImportCall(
     options: Operand
 ) @cold = call_slow_path(import_call);
 
+handler GetClassFieldInitializerName(
+    dst: out Operand
+) @cold = call_slow_path(get_class_field_initializer_name);
+
+handler GetClassProtoParent(
+    dst: out Operand,
+    super_class: Operand
+) @cold = call_slow_path(get_class_proto_parent);
+
 handler NewClass(
     length: u32,
     dst: out Operand,
     super_class: Optional<Operand>,
+    proto_parent: Optional<Operand>,
     class_environment: Operand,
     class_blueprint_index: u32,
     lhs_name: Optional<IdentifierTableIndex>,
+    computed_name: Optional<Operand>,
     element_keys_count: u32,
     element_keys: Optional<Operand>[]
 ) @cold = call_slow_path(new_class);
@@ -2975,7 +2999,11 @@ handler PutByValue(
     let cached_offset = object.typed_array_cached_data_offset;
     guard cached_offset != TYPED_ARRAY_CACHED_DATA_OFFSET_INVALID else try_typed_array_slow;
     let elements = primitive_storage_cage_base();
-    guard index < object.typed_array_array_length else slow;
+    # NB: A negative key wraps to an index below a length of 2^32.
+    let signed_index = unbox_i32(key);
+    guard signed_index >= 0 else slow;
+    let element_index: u64 = alias(index);
+    guard element_index < object.typed_array_array_length else slow;
     let typed_array_kind = object.typed_array_kind;
     record_typed_array_keyed_feedback(elements, keyed_feedback, typed_array_kind);
     let source = load(src);
@@ -3200,7 +3228,7 @@ handler GetById(
         native_frame.private_environment = exec_ctx.private_environment;
         let receiver: Value = alias(box_object(receiver_object));
         native_frame.this_value = receiver;
-        native_frame.script_or_module = zeroed();
+        native_frame.script_or_module = 0;
         native_frame.executable = null;
         native_frame.program_counter = 0;
         native_frame.skip_when_determining_incumbent_counter = 0;
@@ -3520,7 +3548,11 @@ handler GetByValue(
     let cached_offset = object.typed_array_cached_data_offset;
     guard cached_offset != TYPED_ARRAY_CACHED_DATA_OFFSET_INVALID else try_typed_array_slow;
     let elements = primitive_storage_cage_base();
-    guard index < object.typed_array_array_length else try_typed_array_slow;
+    # NB: A negative key wraps to an index below a length of 2^32.
+    let signed_index = unbox_i32(key);
+    guard signed_index >= 0 else try_typed_array_slow;
+    let element_index: u64 = alias(index);
+    guard element_index < object.typed_array_array_length else try_typed_array_slow;
     let kind = object.typed_array_kind;
     record_typed_array_keyed_feedback(elements, keyed_feedback, kind);
 
@@ -3879,11 +3911,14 @@ handler Call(
     frame.function = function;
     frame.realm = realm;
     let lexical_environment = ecmascript_function.environment;
-    let private_environment = ecmascript_function.private_environment;
     assert(lexical_environment != 0);
     frame.lexical_environment = lexical_environment;
     frame.variable_environment = lexical_environment;
-    frame.private_environment = private_environment;
+    frame.private_environment = null;
+    let class_bits = function.class_bits;
+    if class_bits has ECMASCRIPT_FUNCTION_FLAG_HAS_RARE_DATA {
+        frame.private_environment = ecmascript_function.private_environment;
+    }
     frame.this_value = receiver;
     frame.executable = executable_pointer;
     let empty_tag: Value = Value<Empty>;
@@ -3892,7 +3927,8 @@ handler Call(
     frame.this_value_register = receiver;
     frame.return_value = empty_tag;
     frame.saved_lexical_environment = empty_tag;
-    frame.script_or_module = ecmascript_function.script_or_module;
+    let frame_shared_data = ecmascript_function.shared_data;
+    frame.script_or_module = frame_shared_data.script_or_module;
     frame.program_counter = 0;
     let frame_id_vm = current_vm();
     let frame_id = frame_id_vm.interpreter_stack_next_frame_id;
@@ -3991,7 +4027,7 @@ handler Call(
         native_frame.private_environment = private_environment;
         let receiver = load(this_value);
         native_frame.this_value = receiver;
-        native_frame.script_or_module = zeroed();
+        native_frame.script_or_module = 0;
         # Raw native frames deliberately have no executable.
         native_frame.executable = null;
         native_frame.program_counter = 0;
@@ -4129,7 +4165,7 @@ handler ObjectPropertyIteratorNext(
     guard let next_cursor_index = checked_add(cursor_index, 1) else slow;
     let cursor_wide: i64 = i64(cursor_index);
     let unsigned_cursor: u64 = alias(cursor_wide);
-    let property_value_count = cache.property_value_count;
+    let property_value_count: u64 = alias(cache.property_value_count);
     if unsigned_cursor < property_value_count {
         let property_values = cache.property_values;
         assert(property_values != 0);

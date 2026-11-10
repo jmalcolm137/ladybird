@@ -4,20 +4,44 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-//! The C ABI through which LibWeb's C++ creates and reads the ImageData and ImageBitmap objects that it handles,
-//! which Libraries/LibWeb/HTML/ImageData.cpp and Libraries/LibWeb/HTML/ImageBitmap.cpp declare. A cell is the cell of
-//! an object of the interface that the name of the function says.
+//! The C ABI through which LibWeb's C++ creates and reads the ImageData, ImageBitmap and MessagePort objects that it
+//! handles, which Libraries/LibWeb/HTML/ImageData.cpp, Libraries/LibWeb/HTML/ImageBitmap.cpp and
+//! Libraries/LibWeb/HTML/MessagePort.cpp declare. A cell is the cell of an object of the interface that the name of
+//! the function says. Libraries/LibWeb/HTML/BroadcastChannel.cpp hands the BroadcastChannel objects the messages that
+//! other processes post, and Libraries/LibWeb/HTML/Window.cpp runs the window post message steps.
 
-use core::ffi::c_void;
+use core::ffi::{c_int, c_void};
 use core::ptr::NonNull;
 
+use ak::Utf16String;
 use libgfx_rust::image_frame::ImageFrameHandle;
-use libjs_rust::api::{RawNativeFunctionResult, Value, Vm};
+use libjs_rust::api::{Gc, MarkedVec, Object, RawNativeFunctionResult, Value, Vm};
+use liburl_rust::FfiOrigin;
 
+use super::broadcast_channel::{BROADCAST_CHANNEL_MESSAGE_CLASS, BroadcastChannel, BroadcastChannelMessage};
 use super::image_bitmap::ImageBitmap;
 use super::image_data::ImageData;
+use super::message_port::MessagePort;
+use super::storage::{Storage, StorageType};
+use super::storage_event::{StorageEvent, StorageEventInit};
+use super::window::{PostedMessage, queue_posted_message, window_post_message_steps};
+use super::window_or_worker_global_scope::structured_clone;
 use crate::bindings::CallContext;
-use crate::bindings::interface::{Interface, Ref, cell_from_abi, cell_into_abi, realm_arguments};
+use crate::bindings::conversions::UsvString;
+use crate::bindings::cpp_cell::CppCell;
+use crate::bindings::environment_settings_object::relevant_settings_object;
+use crate::bindings::event_target::CppEventTarget;
+use crate::bindings::interface::{Interface, Ref, cell_from_abi, cell_into_abi, realm_arguments, wrap};
+use crate::bindings::structured_data::{TransferDataReader, TransferDataWriter, Transferable};
+use crate::dom::event::EventInit;
+use crate::html::port_channel::give_up_on_parked_end;
+use crate::html::structured_serialize::cpp::SerializedTransferRecord;
+use crate::html::structured_serialize::message_record::MessageRecord;
+use crate::html::structured_serialize::transfer_data_holder::{TransferDataHolder, TransferPayload};
+use crate::html::structured_serialize::transfer_record::TransferRecord;
+use crate::storage_api::storage_area_mirror::StorageEndpointType;
+use crate::storage_api::storage_bottle::{obtain_a_local_storage_bottle_map, obtain_a_session_storage_bottle_map};
+use crate::storage_api::storage_key::StorageKey;
 
 /// The implementation of the object whose cell C++ lends, for as long as C++ keeps the cell alive.
 ///
@@ -29,6 +53,18 @@ unsafe fn object_from_abi<'a, T: Interface>(cell: *mut c_void) -> &'a T {
     let object: Ref<T> = unsafe { cell_from_abi(cell) };
     // SAFETY: The caller keeps the cell alive for 'a.
     unsafe { &*object.as_ptr() }
+}
+
+/// # Safety
+///
+/// `objects` must point to `count` live objects.
+unsafe fn objects_from_abi(vm: &Vm, objects: *const *mut c_void, count: usize) -> MarkedVec<'_, Gc<Object>> {
+    let list = MarkedVec::with_capacity(vm, count);
+    // SAFETY: The caller passes `count` live objects.
+    for &object in unsafe { ak::slice_from_raw_parts(objects, count) } {
+        list.push(unsafe { Gc::from_non_null(NonNull::new(object.cast::<Object>()).expect("C++ passes objects")) });
+    }
+    list
 }
 
 /// Creates an ImageData of the size, with transparent black pixels and the sRGB color space, in the realm, and stores
@@ -183,4 +219,455 @@ pub unsafe extern "C" fn web_image_bitmap_set_origin_clean(image_bitmap: *mut c_
 pub unsafe extern "C" fn web_image_bitmap_frame(image_bitmap: *mut c_void) -> *const c_void {
     // SAFETY: The caller passes a live cell.
     unsafe { object_from_abi::<ImageBitmap>(image_bitmap) }.raw_frame()
+}
+
+/// # Safety
+///
+/// `vm` must be the live VM, and `realm` a live realm.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn web_rust_message_port_create(vm: *mut c_void, realm: *mut c_void) -> *mut c_void {
+    // SAFETY: The caller passes the live VM and a live realm.
+    let (vm, realm) = unsafe { realm_arguments(vm, realm) };
+    cell_into_abi(MessagePort::create(vm, realm))
+}
+
+/// Entangles the two ports, https://html.spec.whatwg.org/multipage/web-messaging.html#entangle
+///
+/// # Safety
+///
+/// `vm` must be the live VM, and `port` and `remote_port` live cells of MessagePorts.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn web_rust_message_port_entangle(vm: *mut c_void, port: *mut c_void, remote_port: *mut c_void) {
+    // SAFETY: The caller passes the live VM and live cells of MessagePorts.
+    let (vm, port, remote_port) = unsafe {
+        (
+            &*vm.cast::<Vm>(),
+            cell_from_abi::<MessagePort>(port),
+            cell_from_abi::<MessagePort>(remote_port),
+        )
+    };
+    MessagePort::entangle(vm, port, remote_port);
+}
+
+/// # Safety
+///
+/// `port` must be a live cell of a MessagePort.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn web_rust_message_port_entangled_port(port: *mut c_void) -> *mut c_void {
+    // SAFETY: The caller passes a live cell of a MessagePort.
+    let port = unsafe { cell_from_abi::<MessagePort>(port) };
+    port.entangled_port().map_or(core::ptr::null_mut(), cell_into_abi)
+}
+
+/// Sets the port's message event target, https://html.spec.whatwg.org/multipage/web-messaging.html#message-event-target
+///
+/// # Safety
+///
+/// `port` must be a live cell of a MessagePort, and `event_target` a live EventTarget.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn web_rust_message_port_set_message_event_target(port: *mut c_void, event_target: *mut c_void) {
+    // SAFETY: The caller passes a live cell of a MessagePort and a live EventTarget.
+    let (port, event_target) = unsafe {
+        (
+            cell_from_abi::<MessagePort>(port),
+            CppEventTarget::from_raw(event_target),
+        )
+    };
+    port.set_message_event_target(event_target);
+}
+
+/// postMessage(message, transfer) on the port, https://html.spec.whatwg.org/multipage/web-messaging.html#dom-messageport-postmessage
+///
+/// # Safety
+///
+/// `vm` must be the live VM, `realm` a live realm, and `port` a live cell of a MessagePort. The message must be live,
+/// and the transfer list `count` live objects.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn web_rust_message_port_post_message(
+    vm: *mut c_void,
+    realm: *mut c_void,
+    port: *mut c_void,
+    message: u64,
+    transfer: *const *mut c_void,
+    count: usize,
+) -> RawNativeFunctionResult {
+    // SAFETY: The caller passes the live VM and a live realm.
+    let (vm, realm) = unsafe { realm_arguments(vm, realm) };
+    let mut cx = CallContext::new(vm, realm);
+    // SAFETY: The caller passes a live cell of a MessagePort and a live value.
+    let (port, message) = unsafe { (cell_from_abi::<MessagePort>(port), Value::from_raw(message)) };
+    // SAFETY: The caller passes `count` live objects.
+    let transfer_list = unsafe { objects_from_abi(vm, transfer, count) };
+    let result = MessagePort::post_message(&port, &mut cx, message, transfer_list);
+    RawNativeFunctionResult::from_completion(
+        result
+            .map(|()| Value::UNDEFINED)
+            .map_err(|exception| exception.throw(&cx)),
+    )
+}
+
+/// # Safety
+///
+/// `vm` must be the live VM, and `port` a live cell of a MessagePort.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn web_rust_message_port_enable(vm: *mut c_void, port: *mut c_void) {
+    // SAFETY: The caller passes the live VM and a live cell of a MessagePort.
+    let (vm, port) = unsafe { (&*vm.cast::<Vm>(), cell_from_abi::<MessagePort>(port)) };
+    MessagePort::enable(port, vm);
+}
+
+/// The close() method steps of the port, https://html.spec.whatwg.org/multipage/web-messaging.html#dom-messageport-close
+///
+/// # Safety
+///
+/// `port` must be a live cell of a MessagePort.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn web_rust_message_port_close(port: *mut c_void) {
+    // SAFETY: The caller passes a live cell of a MessagePort.
+    unsafe { cell_from_abi::<MessagePort>(port) }.close_steps();
+}
+
+/// # Safety
+///
+/// `port` must be a live cell of a MessagePort.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn web_rust_message_port_discard_pending_messages(port: *mut c_void) {
+    // SAFETY: The caller passes a live cell of a MessagePort.
+    unsafe { cell_from_abi::<MessagePort>(port) }.discard_pending_messages();
+}
+
+/// # Safety
+///
+/// `port` must be a live cell of a MessagePort.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn web_rust_message_port_pending_outgoing_message_count(port: *mut c_void) -> usize {
+    // SAFETY: The caller passes a live cell of a MessagePort.
+    unsafe { cell_from_abi::<MessagePort>(port) }.pending_outgoing_message_count()
+}
+
+/// # Safety
+///
+/// `port` must be a live cell of a MessagePort.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn web_rust_message_port_fail_next_transfer_for_testing(port: *mut c_void) {
+    // SAFETY: The caller passes a live cell of a MessagePort.
+    unsafe { cell_from_abi::<MessagePort>(port) }.fail_next_transfer_for_testing();
+}
+
+/// The transfer steps of the MessagePort of a new channel to a worker, which C++ runs outside
+/// StructuredSerializeWithTransfer, into a data holder that holds no type, whose carrier it hands over. The data holder
+/// goes through the browser process, and the token in `out_parked_end_token` is for settling what became of it.
+///
+/// # Safety
+///
+/// `vm` must be the live VM, `realm` a live realm, and `port` a live cell of a MessagePort.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn web_rust_message_port_transfer_steps(
+    vm: *mut c_void,
+    realm: *mut c_void,
+    port: *mut c_void,
+    may_leave_process: bool,
+    out_data_holder: &mut *mut c_void,
+    out_parked_end_token: &mut u64,
+) -> RawNativeFunctionResult {
+    // SAFETY: The caller passes the live VM, a live realm and a live cell of a MessagePort.
+    let ((vm, realm), port) = unsafe { (realm_arguments(vm, realm), cell_from_abi::<MessagePort>(port)) };
+    let mut cx = CallContext::new(vm, realm);
+    let data_holder = TransferDataHolder::new();
+    let result = MessagePort::transfer_steps(&port, &mut cx, &mut TransferDataWriter::new(&data_holder, realm, None));
+    if result.is_ok() {
+        let mut payload = data_holder.finish();
+        *out_parked_end_token = payload.park_channel_end(may_leave_process);
+        *out_data_holder = payload.into_cpp();
+    }
+    RawNativeFunctionResult::from_completion(
+        result
+            .map(|()| Value::UNDEFINED)
+            .map_err(|exception| exception.throw(&cx)),
+    )
+}
+
+/// Tells that nobody in this process is going to claim the channel end of the token, unless somebody did.
+#[unsafe(no_mangle)]
+pub extern "C" fn web_rust_message_port_give_up_on_parked_end(token: u64) {
+    give_up_on_parked_end(token);
+}
+
+/// How the port reaches the port it is entangled with, as an ASCII string that lives forever, for tests.
+///
+/// # Safety
+///
+/// `port` must be a live cell of a MessagePort, and `out_kind` must be valid for a write.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn web_rust_message_port_entanglement_kind(
+    port: *mut c_void,
+    out_kind: *mut ak::Span<'static, u8>,
+) {
+    // SAFETY: The caller passes a live cell of a MessagePort.
+    let kind = unsafe { cell_from_abi::<MessagePort>(port) }.entanglement_kind();
+    // SAFETY: The caller passes a pointer that is valid for a write.
+    unsafe { out_kind.write(ak::Span::new(kind.as_bytes())) };
+}
+
+/// Whether the transport of the port closed, for tests.
+///
+/// # Safety
+///
+/// `port` must be a live cell of a MessagePort.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn web_rust_message_port_transport_is_closed_for_testing(port: *mut c_void) -> bool {
+    // SAFETY: The caller passes a live cell of a MessagePort.
+    unsafe { cell_from_abi::<MessagePort>(port) }.transport_is_closed_for_testing()
+}
+
+/// The transfer-receiving steps of a MessagePort that C++ runs outside StructuredDeserializeWithTransfer, which return
+/// the wrapper of the new MessagePort.
+///
+/// # Safety
+///
+/// `vm` must be the live VM, `realm` a live realm, and `data_holder` an HTML::TransferDataEncoder that C++ hands over.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn web_rust_message_port_transfer_receiving_steps(
+    vm: *mut c_void,
+    realm: *mut c_void,
+    data_holder: *mut c_void,
+) -> RawNativeFunctionResult {
+    // SAFETY: The caller passes the live VM and a live realm, and hands over the data holder.
+    let ((vm, realm), mut payload) = unsafe { (realm_arguments(vm, realm), TransferPayload::from_cpp(data_holder)) };
+    let mut cx = CallContext::new(vm, realm);
+    let mut data_holder = TransferDataReader::new(&mut payload, realm);
+    let result = MessagePort::transfer_receiving_steps(&mut cx, &mut data_holder);
+    RawNativeFunctionResult::from_completion(
+        result
+            .map(|port| Value::from_object(wrap(&cx, port)))
+            .map_err(|exception| exception.throw(&cx)),
+    )
+}
+
+/// # Safety
+///
+/// `vm` must be the live VM, and `realm` a live realm.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn web_rust_message_port_disentangle_ports_of_realm(vm: *mut c_void, realm: *mut c_void) {
+    // SAFETY: The caller passes the live VM and a live realm.
+    let (vm, realm) = unsafe { realm_arguments(vm, realm) };
+    MessagePort::disentangle_ports_of_realm(vm, realm);
+}
+
+/// Releases what the thread's agent keeps outside its heap, for an agent that goes away.
+///
+/// # Safety
+///
+/// `vm` must be the live VM of the thread, whose heap has to stay alive through the call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn web_rust_shut_down_agent(vm: *mut c_void) {
+    // SAFETY: The caller passes the live VM.
+    let vm = unsafe { &*vm.cast::<Vm>() };
+    MessagePort::shut_down_ports_of_agent(vm);
+    crate::html::broadcast_channel::forget_broadcast_channels_of_agent();
+    crate::web_assembly::Agent::shut_down();
+    crate::indexed_db::internal::storage::shut_down_storage();
+}
+
+/// Steps 6 to 9 of BroadcastChannel's postMessage(), for a message that another process posted, whose channel name
+/// C++ hands over.
+///
+/// # Safety
+///
+/// `vm` must be the live VM, the origins and the bytes lent, `channel_name` an owned AK::Utf16String, and
+/// `shared_store_lifeline` a descriptor that is open for the call, or negative.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn web_rust_broadcast_channel_deliver_message_locally(
+    vm: *mut c_void,
+    storage_key_origin: *const FfiOrigin,
+    channel_name: usize,
+    source_origin: *const FfiOrigin,
+    serialized_message: ak::Span<'_, u8>,
+    shared_store_lifeline: c_int,
+) {
+    // SAFETY: The caller passes the live VM, lends the origins and the descriptor, and hands over the name.
+    let (vm, storage_key, channel_name, source_origin) = unsafe {
+        (
+            &*vm.cast::<Vm>(),
+            StorageKey {
+                origin: (*storage_key_origin).to_origin(),
+            },
+            Utf16String::from_raw_owned(channel_name),
+            (*source_origin).to_origin(),
+        )
+    };
+    let message = BROADCAST_CHANNEL_MESSAGE_CLASS.allocate(vm, |defer_gc| BroadcastChannelMessage {
+        storage_key,
+        channel_name,
+        source_origin,
+        // SAFETY: The caller keeps the descriptor open for the call.
+        serialized: unsafe {
+            MessageRecord::received(defer_gc, serialized_message.as_slice(), &[], &[], shared_store_lifeline)
+        },
+    });
+    BroadcastChannel::deliver_message_locally(vm, message, None);
+}
+
+/// A new Storage object of the type, 0 for "local" and 1 for "session", for the Window of the realm, whose map is a new
+/// storage proxy map over the bottle for the realm's settings object: steps 2 to 4 of the localStorage and
+/// sessionStorage getters. Null when obtaining the bottle map fails.
+///
+/// # Safety
+///
+/// The pointers must be the live VM and the live realm of a Window.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn web_rust_html_create_storage(
+    vm: *mut c_void,
+    realm: *mut c_void,
+    storage_type: u8,
+) -> *mut c_void {
+    // SAFETY: The caller passes the live VM and a live realm.
+    let (vm, realm) = unsafe { realm_arguments(vm, realm) };
+    let storage_type = StorageType::from_abi(storage_type);
+    let environment = relevant_settings_object(realm.global_object());
+    let map = match storage_type {
+        StorageType::Local => obtain_a_local_storage_bottle_map(&environment, StorageEndpointType::LocalStorage),
+        StorageType::Session => obtain_a_session_storage_bottle_map(&environment, StorageEndpointType::SessionStorage),
+    };
+    map.map_or(core::ptr::null_mut(), |map| {
+        cell_into_abi(Storage::create(vm, realm, storage_type, map))
+    })
+}
+
+/// Loads the map of the Storage object now rather than on first access, so changes other processes make start
+/// arriving.
+///
+/// # Safety
+///
+/// `storage` must be the live cell of a Storage object.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn web_rust_html_storage_connect(storage: *mut c_void) {
+    // SAFETY: The caller passes a live Storage object.
+    unsafe { object_from_abi::<Storage>(storage) }.map().connect();
+}
+
+/// Calls `on_item` with each key of the map of the Storage object and its value, raw AK::Utf16Strings that Rust lends
+/// for the call.
+///
+/// # Safety
+///
+/// `storage` must be the live cell of a Storage object.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn web_rust_html_storage_for_each_item(
+    storage: *mut c_void,
+    ctx: *mut c_void,
+    on_item: unsafe extern "C" fn(*mut c_void, usize, usize),
+) {
+    // SAFETY: The caller passes a live Storage object.
+    let map = unsafe { object_from_abi::<Storage>(storage) }.map();
+    for key in map.keys() {
+        if let Some(value) = map.get(&key) {
+            // SAFETY: The strings outlive the call.
+            unsafe { on_item(ctx, key.raw_identity(), value.raw_identity()) };
+        }
+    }
+}
+
+/// The Event of a new StorageEvent in the realm whose type is the empty string and whose attributes are their
+/// defaults, for createEvent().
+///
+/// # Safety
+///
+/// The pointers must be the live VM and a live realm.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn web_rust_html_create_storage_event(vm: *mut c_void, realm: *mut c_void) -> *mut c_void {
+    // SAFETY: The caller passes the live VM and a live realm.
+    let (vm, realm) = unsafe { realm_arguments(vm, realm) };
+    let event_init = StorageEventInit {
+        parent: EventInit {
+            bubbles: false,
+            cancelable: false,
+            composed: false,
+        },
+        key: None,
+        old_value: None,
+        new_value: None,
+        url: UsvString::from_utf8(""),
+        storage_area: None,
+    };
+    StorageEvent::create(vm, realm, &Utf16String::from_utf8(""), event_init)
+        .event()
+        .as_ptr()
+}
+
+/// # Safety
+///
+/// The VM, the realm, the target and the transferred objects must be live, and the target must be a Window if remote
+/// is false and a RemoteNavigable otherwise. The target origin string is handed over, and the transfer list is lent.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn web_window_post_message(
+    vm: *mut c_void,
+    realm: *mut c_void,
+    target: *mut c_void,
+    remote: bool,
+    message: u64,
+    target_origin: usize,
+    transfer: *const *mut c_void,
+    count: usize,
+) -> RawNativeFunctionResult {
+    // SAFETY: The caller passes the live VM and a live realm.
+    let (vm, realm) = unsafe { realm_arguments(vm, realm) };
+    let cx = CallContext::new(vm, realm);
+    // SAFETY: The caller lends the live target, message and transferred objects, and hands over the string.
+    let (target, message, target_origin, transfer) = unsafe {
+        (
+            CppCell::from_raw(target),
+            Value::from_raw(message),
+            Utf16String::from_raw_owned(target_origin),
+            objects_from_abi(vm, transfer, count),
+        )
+    };
+    let result = window_post_message_steps(&cx, target, remote, message, &target_origin, &transfer.values());
+    RawNativeFunctionResult::from_completion(result.map(|()| Value::UNDEFINED).map_err(|error| error.throw(&cx)))
+}
+
+/// # Safety
+///
+/// The VM, the Window and the source, if any, must be live, and the record and the origins are lent for the call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn web_window_queue_posted_message(
+    vm: *mut c_void,
+    target_window: *mut c_void,
+    record: *mut c_void,
+    target_origin: *const FfiOrigin,
+    origin: *const FfiOrigin,
+    source: *mut c_void,
+) {
+    // SAFETY: The caller passes the live VM, and lends the Window, the source, the record and the origins.
+    unsafe {
+        let vm = &*vm.cast::<Vm>();
+        let posted_message = PostedMessage {
+            target_window: CppCell::from_raw(target_window),
+            serialize_with_transfer_result: TransferRecord::from_cpp(vm, SerializedTransferRecord::from_raw(record)),
+            target_origin: target_origin.as_ref().map(|origin| origin.to_origin()),
+            origin: (*origin).to_origin(),
+            source: NonNull::new(source).map(|source| CppCell::from_raw(source.as_ptr())),
+        };
+        queue_posted_message(vm, posted_message);
+    }
+}
+
+/// # Safety
+///
+/// The VM and the realm must be live, and `transfer` must point to `count` live objects.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn web_rust_structured_clone(
+    vm: *mut c_void,
+    realm: *mut c_void,
+    value: u64,
+    transfer: *const *mut c_void,
+    count: usize,
+) -> RawNativeFunctionResult {
+    // SAFETY: The caller passes the live VM and a live realm.
+    let (vm, realm) = unsafe { realm_arguments(vm, realm) };
+    let cx = CallContext::new(vm, realm);
+    // SAFETY: The caller passes a live value and `count` live objects.
+    let (value, transfer) = unsafe { (Value::from_raw(value), objects_from_abi(vm, transfer, count)) };
+    let result = structured_clone(&cx, value, &transfer.values());
+    RawNativeFunctionResult::from_completion(result.map_err(|exception| exception.throw(&cx)))
 }

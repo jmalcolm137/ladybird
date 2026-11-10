@@ -17,7 +17,7 @@
 #include <LibCompositing/DisplayList/DisplayListResourceIds.h>
 #include <LibCompositing/Video/VideoFrameHold.h>
 #include <LibCore/Forward.h>
-#include <LibGC/ActivityRoot.h>
+#include <LibGC/Function.h>
 #include <LibGC/RootVector.h>
 #include <LibGfx/Rect.h>
 #include <LibJS/Forward.h>
@@ -74,8 +74,7 @@ public:
         return meets_focusable_area_rendering_requirements();
     }
 
-    // NOTE: The function is wrapped in a GC::HeapFunction immediately.
-    void queue_a_media_element_task(Function<void(HTMLMediaElement&)>);
+    void queue_a_media_element_task(GC::Ref<GC::Function<void(HTMLMediaElement&)>>);
     Task::Source media_element_event_task_source() const { return m_media_element_event_task_source.source; }
 
     void cancel_the_fetching_process();
@@ -261,9 +260,9 @@ private:
     void select_resource_for_current_load();
     void promote_current_resource_selection_to_explicit();
 
-    void load_url_resource(URL::URL const&, ESCAPING Function<void(Utf16String)> failure_callback);
+    void load_url_resource(URL::URL const&, GC::Ref<GC::Function<void(Utf16String)>> failure_callback);
     void load_remote_resource(ByteRange const&);
-    void load_local_resource(MediaProvider const&, ESCAPING Function<void(Utf16String)> failure_callback);
+    void load_local_resource(MediaProvider const&, GC::Ref<GC::Function<void(Utf16String)>> failure_callback);
     bool preload_attribute_is_in_none_state() const;
     bool preload_attribute_is_in_automatic_state() const;
     bool should_suspend_the_download() const;
@@ -285,8 +284,8 @@ private:
     void handle_data_request(Optional<u64> offset);
 
     void set_up_playback_manager_for_remote();
-    void set_up_playback_manager_for_local(Function<void(Utf16String)> failure_callback);
-    void set_up_playback_manager_error_handler(Function<void(Utf16String)> failure_callback);
+    void set_up_playback_manager_for_local(GC::Ref<GC::Function<void(Utf16String)>> failure_callback);
+    void set_up_playback_manager_error_handler(GC::Ref<GC::Function<void(Utf16String)>> failure_callback);
     void handle_playback_manager_error(Media::DecoderError&&);
     enum class FetchingStatus : u8 {
         Ongoing,
@@ -344,7 +343,7 @@ private:
     void set_can_autoplay(bool);
     void set_delaying_the_load_event(bool);
     bool should_be_kept_alive() const;
-    void update_activity_root();
+    void update_pending_activity();
 
     enum class PlaybackDirection : u8 {
         Forwards,
@@ -475,8 +474,6 @@ private:
     // https://html.spec.whatwg.org/multipage/media.html#delaying-the-load-event-flag
     Optional<DOM::DocumentLoadEventDelayer> m_delaying_the_load_event;
 
-    GC::ActivityRoot m_activity_root;
-
     bool m_running_time_update_event_handler { false };
     Optional<MonotonicTime> m_last_time_update_event_time;
 
@@ -492,7 +489,8 @@ private:
     bool m_current_resource_selection_is_explicit { false };
 
     OwnPtr<MediaClient::RemotePlaybackManager> m_playback_manager;
-    Function<void(Utf16String)> m_playback_manager_failure_callback;
+    OwnPtr<MediaStreamPlayback> m_media_stream_playback;
+    GC::Ptr<GC::Function<void(Utf16String)>> m_playback_manager_failure_callback;
 
     RefPtr<Core::Timer> m_playback_position_update_timer;
     GC::Ptr<VideoTrack> m_selected_video_track;
@@ -510,6 +508,10 @@ private:
 };
 
 }
+
+GC_UNTRACED_CAPTURE(Web::HTML::HTMLMediaElement::EntireResource);
+
+GC_UNTRACED_CAPTURE(Web::HTML::HTMLMediaElement::UntilEnd);
 
 namespace Web::DOM {
 

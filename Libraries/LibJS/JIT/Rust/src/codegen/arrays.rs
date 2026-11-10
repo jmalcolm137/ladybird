@@ -16,6 +16,7 @@ use crate::asm::Label;
 use crate::asm::PortableMacroAssembler;
 use crate::asm::Scale;
 use crate::ir::NodeId;
+use crate::snapshot::CellId;
 
 impl<M: PortableMacroAssembler> Codegen<'_, M> {
     /// Calls the splice helper with the inserted values on the native
@@ -25,7 +26,7 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
         let count = self.graph.node(node).inputs.len() - 3;
         let bytes = ((count * 8 + 15) & !15) as i64;
         if bytes != 0 {
-            self.masm.sub64_imm(M::STACK_POINTER, M::STACK_POINTER, bytes);
+            self.masm.allocate_stack(bytes);
         }
         for index in 0..count {
             let address = Address::new(M::STACK_POINTER, (index * 8) as i32);
@@ -55,8 +56,13 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
         self.unbox_object_or_branch(array, receiver, exit);
         self.branch_unless_plain_array(array, prototype, exit);
         self.masm
-            .load8(scratch, &Address::new(array, layout.array_length_writable as i32));
-        self.masm.branch_test32(Condition::Zero, scratch, 0xFF, exit);
+            .load8(scratch, &Address::new(array, layout.array_flags as i32));
+        self.masm.branch_test32(
+            Condition::NonZero,
+            scratch,
+            u32::from(layout.array_flag_length_not_writable),
+            exit,
+        );
         // Packed indexed storage, or none yet.
         let known_kind = self.masm.new_label();
         self.masm
@@ -93,8 +99,13 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
         self.masm
             .branch32_imm(Condition::NotEqual, scratch, i32::from(flags), fail);
         self.masm
-            .load8(scratch, &Address::new(array, layout.array_is_proxy_target as i32));
-        self.masm.branch_test32(Condition::NonZero, scratch, 0xFF, fail);
+            .load8(scratch, &Address::new(array, layout.array_flags as i32));
+        self.masm.branch_test32(
+            Condition::NonZero,
+            scratch,
+            u32::from(layout.array_flag_is_proxy_target),
+            fail,
+        );
 
         // NB: %Object.prototype% is an immutable prototype exotic object,
         //     so the chain ends there.
@@ -160,14 +171,11 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
             u32::from(layout.object_flag_has_magical_length),
             fail,
         );
-        self.masm
-            .load64(shape, &Address::new(object, offsets.object_shape as i32));
-        self.masm
-            .load64(scratch, &Address::new(shape, layout.shape_prototype as i32));
-        self.masm.branch64_imm(
+        self.emit_load_compressed_cell(shape, &Address::new(object, offsets.object_shape as i32));
+        self.masm.branch32_memory_imm(
             Condition::NotEqual,
-            scratch,
-            self.runtime.array_prototype.0 as i64,
+            &Address::new(shape, layout.shape_prototype as i32),
+            self.runtime.array_prototype.compressed() as i32,
             fail,
         );
         self.masm
@@ -225,12 +233,14 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
         let scratch = self.pinned.scratch;
         let offsets = self.runtime.offsets;
         let layout = self.runtime.layout;
-        self.masm
-            .load64(scratch, &Address::new(object, offsets.object_shape as i32));
-        self.masm
-            .load64(scratch, &Address::new(scratch, layout.shape_prototype as i32));
+        self.emit_load_compressed_cell(scratch, &Address::new(object, offsets.object_shape as i32));
+        self.masm.branch32_memory_imm(
+            Condition::NotEqual,
+            &Address::new(scratch, layout.shape_prototype as i32),
+            CellId(expected).compressed() as i32,
+            fail,
+        );
         self.masm.move_imm64(dst, expected);
-        self.masm.branch64(Condition::NotEqual, scratch, dst, fail);
         self.masm.load32(
             scratch,
             &Address::new(dst, layout.object_indexed_array_like_size as i32),

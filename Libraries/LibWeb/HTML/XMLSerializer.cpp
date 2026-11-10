@@ -94,15 +94,29 @@ static Optional<Utf16FlyString> retrieve_a_preferred_prefix_string(Optional<Utf1
     VERIFY_NOT_REACHED();
 }
 
+static bool prefix_is_bound_in_prefix_map(Optional<Utf16FlyString> const& prefix, NamespacePrefixMap const& namespace_prefix_map)
+{
+    for (auto const& entry : namespace_prefix_map) {
+        if (entry.value.contains_slow(prefix))
+            return true;
+    }
+    return false;
+}
+
 // https://w3c.github.io/DOM-Parsing/#dfn-generating-a-prefix
 static Utf16FlyString generate_a_prefix(NamespacePrefixMap& namespace_prefix_map, Optional<Utf16FlyString> const& new_namespace, u64& prefix_index)
 {
-    // 1. Let generated prefix be the concatenation of the string "ns" and the current numerical value of prefix index.
-    auto generated_prefix_string = Utf16String::formatted("ns{}", prefix_index);
-    auto generated_prefix = Utf16FlyString::from_utf16(generated_prefix_string.utf16_view());
+    Utf16FlyString generated_prefix;
+    // AD-HOC: Generate prefixes until one is not already bound in map, so that its declaration doesn't conflict with
+    //         one in scope. See https://github.com/w3c/DOM-Parsing/issues/44.
+    do {
+        // 1. Let generated prefix be the concatenation of the string "ns" and the current numerical value of prefix index.
+        auto generated_prefix_string = Utf16String::formatted("ns{}", prefix_index);
+        generated_prefix = Utf16FlyString::from_utf16(generated_prefix_string.utf16_view());
 
-    // 2. Let the value of prefix index be incremented by one.
-    ++prefix_index;
+        // 2. Let the value of prefix index be incremented by one.
+        ++prefix_index;
+    } while (prefix_is_bound_in_prefix_map(generated_prefix, namespace_prefix_map));
 
     // 3. Add to map the generated prefix given the new namespace namespace.
     add_prefix_to_namespace_prefix_map(namespace_prefix_map, generated_prefix, new_namespace);
@@ -211,9 +225,8 @@ WebIDL::ExceptionOr<Utf16String> serialize_node_to_xml_string_impl(GC::Ref<DOM::
 
     // NOTE: CDATASection comes before Text since CDATASection is a subclass of Text.
     if (is<DOM::CDATASection>(*root)) {
-        // Note: Serialization of CDATASection nodes is not mentioned in the specification, but treating CDATASection nodes as
-        // text leads to incorrect serialization.
-        // Spec bug: https://github.com/w3c/DOM-Parsing/issues/38
+        // -> CDATASection
+        //    Run the algorithm for XML serializing a CDATASection node given node and require well-formed.
         return serialize_cdata_section(static_cast<DOM::CDATASection const&>(*root), require_well_formed);
     }
 
@@ -319,21 +332,45 @@ static WebIDL::ExceptionOr<Utf16String> serialize_an_attribute_value(Optional<Ut
     return serialize_an_attribute_value(attribute_value->view(), require_well_formed);
 }
 
+// https://w3c.github.io/DOM-Parsing/#dfn-serializing-an-attribute-value
 static WebIDL::ExceptionOr<Utf16String> serialize_an_attribute_value(Utf16View attribute_value, [[maybe_unused]] RequireWellFormed require_well_formed)
 {
-    // FIXME: If the require well-formed flag is set, reject characters that are not matched by the XML Char production.
+    // FIXME: 1. If require well-formed is true, and attribute value contains characters that are not matched by the XML Char production, then throw an exception.
+    //           The serialization of attribute value would not be well-formed.
+
+    // 3. Otherwise, return attribute value, first replacing any occurrences of the following:
     Utf16StringBuilder final_attribute_value;
     for (auto code_point : attribute_value) {
-        if (code_point == '&')
+        // - "&" with "&amp;"
+        if (code_point == '&') {
             final_attribute_value.append_ascii("&amp;"sv);
-        else if (code_point == '"')
+        }
+        // - """ with "&quot;"
+        else if (code_point == '"') {
             final_attribute_value.append_ascii("&quot;"sv);
-        else if (code_point == '<')
+        }
+        // - "<" with "&lt;"
+        else if (code_point == '<') {
             final_attribute_value.append_ascii("&lt;"sv);
-        else if (code_point == '>')
+        }
+        // AD-HOC: The spec's list leaves out ">", though its note says it is replaced, and all engines replace it.
+        else if (code_point == '>') {
             final_attribute_value.append_ascii("&gt;"sv);
-        else
+        }
+        // - U+0009 CHARACTER TABULATION with "&#9;"
+        else if (code_point == '\t') {
+            final_attribute_value.append_ascii("&#9;"sv);
+        }
+        // - U+000A LINE FEED (LF) with "&#xA;"
+        else if (code_point == '\n') {
+            final_attribute_value.append_ascii("&#xA;"sv);
+        }
+        // - U+000D CARRIAGE RETURN (CR) with "&#xD;"
+        else if (code_point == '\r') {
+            final_attribute_value.append_ascii("&#xD;"sv);
+        } else {
             final_attribute_value.append_code_point(code_point);
+        }
     }
 
     return final_attribute_value.to_string();
@@ -345,7 +382,7 @@ struct LocalNameSetEntry {
 };
 
 // https://w3c.github.io/DOM-Parsing/#dfn-xml-serialization-of-the-attributes
-static WebIDL::ExceptionOr<Utf16String> serialize_element_attributes(DOM::Element const& element, NamespacePrefixMap& namespace_prefix_map, u64& prefix_index, LocalPrefixesMap const& local_prefixes_map, bool ignore_namespace_definition_attribute, RequireWellFormed require_well_formed)
+static WebIDL::ExceptionOr<Utf16String> serialize_element_attributes(DOM::Element const& element, NamespacePrefixMap& namespace_prefix_map, u64& prefix_index, LocalPrefixesMap& local_prefixes_map, bool ignore_namespace_definition_attribute, RequireWellFormed require_well_formed)
 {
     // 1. Let result be the empty string.
     Utf16StringBuilder result;
@@ -400,26 +437,22 @@ static WebIDL::ExceptionOr<Utf16String> serialize_element_attributes(DOM::Elemen
                 if (attribute_value_namespace == namespace_uri_as_utf16(Namespace::XML))
                     continue;
 
-                // - the attr's prefix is null and the ignore namespace definition attribute flag is true (the Element's default namespace attribute should be skipped);
+                // - the attr's prefix is null and the ignore namespace definition attribute flag is true (the Element's default namespace attribute is to be skipped);
                 if (!attribute->prefix().has_value() && ignore_namespace_definition_attribute)
                     continue;
 
                 // - the attr's prefix is not null and either
                 if (attribute->prefix().has_value()) {
                     // - the attr's localName is not a key contained in the local prefixes map, or
-                    auto name_in_local_prefix_map_iterator = local_prefixes_map.find(attribute->local_name());
-                    if (name_in_local_prefix_map_iterator == local_prefixes_map.end())
-                        continue;
-
                     // - the attr's localName is present in the local prefixes map but the value of the key does not match attr's value
-                    if (name_in_local_prefix_map_iterator->value != attribute_value_namespace)
+                    auto name_in_local_prefix_map_iterator = local_prefixes_map.find(attribute->local_name());
+                    auto is_not_local_prefix_definition = name_in_local_prefix_map_iterator == local_prefixes_map.end() || name_in_local_prefix_map_iterator->value != attribute_value_namespace;
+
+                    // and furthermore that the attr's localName (as the prefix to find) is found in the namespace prefix map given the namespace consisting of the attr's value
+                    // (the current namespace prefix definition was exactly defined previously--on an ancestor element not the current element whose attributes are being processed).
+                    if (is_not_local_prefix_definition && prefix_is_in_prefix_map(attribute->local_name(), namespace_prefix_map, attribute_value_namespace))
                         continue;
                 }
-
-                // and furthermore that the attr's localName (as the prefix to find) is found in the namespace prefix map given the namespace consisting of the attr's value
-                // (the current namespace prefix definition was exactly defined previously--on an ancestor element not the current element whose attributes are being processed).
-                if (prefix_is_in_prefix_map(attribute->local_name(), namespace_prefix_map, attribute_value_namespace))
-                    continue;
 
                 // 2. If the require well-formed flag is set (its value is true), and the value of attr's value attribute matches the XMLNS namespace,
                 //    then throw an exception; the serialization of this attribute would produce invalid XML because the XMLNS namespace is reserved and cannot be applied as an element's namespace via XML parsing.
@@ -436,12 +469,30 @@ static WebIDL::ExceptionOr<Utf16String> serialize_element_attributes(DOM::Elemen
                     candidate_prefix = "xmlns"_utf16_fly_string;
             }
 
-            // 3. Otherwise, the attribute namespace in not the XMLNS namespace. Run these steps:
-            else {
-                // 1. Let candidate prefix be the result of generating a prefix providing map, attribute namespace, and prefix index as input.
-                candidate_prefix = generate_a_prefix(namespace_prefix_map, attribute_namespace_for_map, prefix_index);
+            // 3. Otherwise (attribute namespace is not the XMLNS namespace), if candidate prefix is null:
+            else if (!candidate_prefix.has_value()) {
+                // 1. If prefix is not null and local prefixes map does not contain prefix, set candidate prefix to prefix.
+                // AD-HOC: Nor if map binds prefix to a namespace, so that its declaration doesn't conflict with the
+                //         element's own prefix or shadow a binding that later attributes are serialized with.
+                if (attribute->prefix().has_value() && !local_prefixes_map.contains(*attribute->prefix()) && !prefix_is_bound_in_prefix_map(attribute->prefix(), namespace_prefix_map)) {
+                    candidate_prefix = attribute->prefix();
+                }
 
-                // 2. Append the following to result, in the order listed:
+                // 2. Otherwise, set candidate prefix to the result of generating a prefix given map, attribute namespace, and prefix index.
+                else {
+                    candidate_prefix = generate_a_prefix(namespace_prefix_map, attribute_namespace_for_map, prefix_index);
+                }
+
+                // 3. Add candidate prefix to map given attribute namespace.
+                add_prefix_to_namespace_prefix_map(namespace_prefix_map, candidate_prefix, attribute_namespace_for_map);
+
+                // 4. Let map value be the empty string if attribute namespace is null, and attribute namespace otherwise.
+                auto map_value = attribute_namespace_for_map.value_or(Utf16FlyString {});
+
+                // 5. Set local prefixes map[candidate prefix] to map value.
+                local_prefixes_map.set(*candidate_prefix, move(map_value));
+
+                // 6. Append the following to result, in the order listed:
                 // 1. " " (U+0020 SPACE);
                 // 2. The string "xmlns:";
                 result.append_ascii(" xmlns:"sv);
@@ -531,7 +582,7 @@ static WebIDL::ExceptionOr<Utf16String> serialize_element(DOM::Element const& el
     // NOTE: This is only used here.
     // To copy a namespace prefix map map means to copy the map's keys into a new empty namespace prefix map,
     // and to copy each of the values in the namespace prefix list associated with each keys' value into a new list
-    // which should be associated with the respective key in the new map.
+    // which is associated with the respective key in the new map.
     map.update(namespace_prefix_map);
 
     // 7. Let local prefixes map be an empty map. The map has unique Node prefix strings as its keys, with corresponding namespaceURI Node values
@@ -838,6 +889,20 @@ static WebIDL::ExceptionOr<Utf16String> serialize_document_fragment(DOM::Documen
     return markup.to_string();
 }
 
+// https://w3c.github.io/DOM-Parsing/#dfn-serialization-of-the-id
+static Utf16String serialization_of_the_id(Utf16View id)
+{
+    // 1. If id contains """ (U+0022 QUOTATION MARK), let q be "'" (U+0027 APOSTROPHE), and let q be """ (U+0022 QUOTATION MARK) otherwise.
+    auto q = id.contains(u'"') ? '\'' : '"';
+
+    // 2. Return the concatenation of q, id, and q.
+    Utf16StringBuilder result;
+    result.append_ascii(q);
+    result.append(id);
+    result.append_ascii(q);
+    return result.to_string();
+}
+
 // https://w3c.github.io/DOM-Parsing/#xml-serializing-a-documenttype-node
 static WebIDL::ExceptionOr<Utf16String> serialize_document_type(DOM::DocumentType const& document_type, RequireWellFormed require_well_formed)
 {
@@ -867,14 +932,10 @@ static WebIDL::ExceptionOr<Utf16String> serialize_document_type(DOM::DocumentTyp
         // 1. " " (U+0020 SPACE);
         // 2. The string "PUBLIC";
         // 3. " " (U+0020 SPACE);
-        // 4. """ (U+0022 QUOTATION MARK);
-        markup.append_ascii(" PUBLIC \""sv);
+        markup.append_ascii(" PUBLIC "sv);
 
-        // 5. The value of the node's publicId attribute;
-        markup.append(document_type.public_id().utf16_view());
-
-        // 6. """ (U+0022 QUOTATION MARK).
-        markup.append_ascii('"');
+        // 4. the serialization of the ID node's public ID.
+        markup.append(serialization_of_the_id(document_type.public_id().utf16_view()));
     }
 
     // 8. If the node's systemId is not the empty string and the node's publicId is set to the empty string, then append the following, in the order listed, to markup:
@@ -887,14 +948,10 @@ static WebIDL::ExceptionOr<Utf16String> serialize_document_type(DOM::DocumentTyp
     // 9. If the node's systemId is not the empty string then append the following, in the order listed, to markup:
     if (!document_type.system_id().is_empty()) {
         // 1. " " (U+0020 SPACE);
-        // 2. """ (U+0022 QUOTATION MARK);
-        markup.append_ascii(" \""sv);
+        markup.append_ascii(' ');
 
-        // 3. The value of the node's systemId attribute;
-        markup.append(document_type.system_id().utf16_view());
-
-        // 4. """ (U+0022 QUOTATION MARK).
-        markup.append_ascii('"');
+        // 2. the serialization of the ID node's system ID.
+        markup.append(serialization_of_the_id(document_type.system_id().utf16_view()));
     }
 
     // 10. Append ">" (U+003E GREATER-THAN SIGN) to markup.
@@ -945,17 +1002,20 @@ static WebIDL::ExceptionOr<Utf16String> serialize_processing_instruction(DOM::Pr
     return markup.to_string();
 }
 
-// FIXME: This is ad-hoc
+// https://w3c.github.io/DOM-Parsing/#xml-serializing-a-cdatasection-node
 static WebIDL::ExceptionOr<Utf16String> serialize_cdata_section(DOM::CDATASection const& cdata_section, RequireWellFormed require_well_formed)
 {
+    // AD-HOC: Data containing "]]>" would end the section early, so it isn't well-formed.
     if (require_well_formed == RequireWellFormed::Yes && cdata_section.data().contains("]]>"sv))
         return WebIDL::InvalidStateError::create("CDATA section data contains a CDATA section end delimiter"_utf16);
 
+    // 1. Let markup be the concatenation of "<![CDATA[", node's data, and "]]>".
     Utf16StringBuilder markup;
     markup.append_ascii("<![CDATA["sv);
     markup.append(cdata_section.data().utf16_view());
     markup.append_ascii("]]>"sv);
 
+    // 2. Return markup.
     return markup.to_string();
 }
 

@@ -1,0 +1,73 @@
+<!DOCTYPE html>
+<script src="include.js"></script>
+<style>
+    body {
+        font: 16px/20px SerenitySans;
+    }
+    .with-before::before {
+        content: "Before ";
+    }
+</style>
+<!-- After each change to what a name or description is computed from, the accessibility node data reflects it: text in
+     the element itself, in an element it points to with aria-labelledby or aria-describedby (even a hidden one), in a
+     label, in generated content, and in the value of a control embedded in the name. -->
+<div id="root">
+    <table>
+        <tr><td id="cell">cell text</td></tr>
+    </table>
+    <span id="hidden-label" hidden>hidden label</span>
+    <button id="labelled" aria-labelledby="hidden-label">button text</button>
+    <button id="from-content"><span id="inner">inner text</span></button>
+    <label for="field" id="field-label">field label</label>
+    <input id="field">
+    <p id="described" aria-describedby="description">described</p>
+    <span id="description">first description</span>
+    <button id="pending" aria-labelledby="not-yet">pending</button>
+    <button id="generated">generated</button>
+    <div role="button" id="embedding-select">pick <select id="embedded-select"><option>alpha</option><option id="embedded-beta">beta</option></select></div>
+    <div role="button" id="embedding-input">quantity <input id="embedded-input" value="1"></div>
+    <label>count <input id="labelled-with-input" value="3"> items</label>
+    <label for="target-a" id="retargeted-label">retargeted label</label>
+    <input id="target-a">
+    <input id="target-b">
+    <button id="visibility-button">shown <span id="visibility-span">sometimes</span></button>
+</div>
+<script>
+    test(() => {
+        internals.setAccessibilityInterested();
+        const root = document.getElementById("root");
+        const step = (label, change) => {
+            change();
+            // Printing adds to the DOM, so read everything before printing anything.
+            // The change tracker comes first, so that it builds the tree the way publishing does: before anything else
+            // keeps what changed.
+            const tracking = internals.accessibilityChangeTrackingMismatches();
+            const dump = internals.dumpAccessibilityNodeData(root);
+            const stale = internals.accessibilityCachedTextMismatches() + internals.accessibilityCachedRecordMismatches() + internals.accessibilityCachedGeometryMismatches() + tracking;
+            println(`== ${label}`);
+            println(dump);
+            if (stale)
+                println(`stale cached data:\n${stale}`);
+        };
+        step("initial", () => {});
+        step("cell textContent", () => document.getElementById("cell").textContent = "new cell text");
+        step("cell Text.data", () => document.getElementById("cell").firstChild.data = "edited cell text");
+        step("hidden aria-labelledby target", () => document.getElementById("hidden-label").textContent = "new hidden label");
+        step("name from content", () => document.getElementById("inner").textContent = "new inner text");
+        step("label text", () => document.getElementById("field-label").textContent = "new field label");
+        step("aria-label", () => document.getElementById("field").setAttribute("aria-label", "explicit label"));
+        step("aria-describedby target", () => document.getElementById("description").textContent = "second description");
+        step("id appears for a pending reference", () => document.getElementById("description").id = "not-yet");
+        step("referenced id removed", () => document.getElementById("not-yet").remove());
+        step("generated content", () => document.getElementById("generated").classList.add("with-before"));
+        step("embedded select value", () => document.getElementById("embedded-beta").selected = true);
+        step("embedded input value", () => document.getElementById("embedded-input").value = "2");
+        step("value of an input in its own label", () => document.getElementById("labelled-with-input").value = "4");
+        step("label for retargeted", () => document.getElementById("retargeted-label").htmlFor = "target-b");
+        step("labelled input id renamed", () => document.getElementById("target-b").id = "target-c");
+        step("unrelated text", () => document.getElementById("cell").firstChild.data = "unrelated edit");
+        // Through CSSOM, so that no attribute or child list changes: just the style.
+        step("visibility: hidden in a name from content", () => document.styleSheets[0].insertRule("#visibility-span { visibility: hidden }", 0));
+        step("visibility back", () => document.styleSheets[0].deleteRule(0));
+    });
+</script>

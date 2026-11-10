@@ -9,17 +9,24 @@
 #include <LibJS/Runtime/Realm.h>
 #include <LibURL/RustIntegration.h>
 #include <LibWeb/Bindings/DOMException.h>
+#include <LibWeb/Bindings/PrincipalHostDefined.h>
 #include <LibWeb/Bindings/RustInterface.h>
 #include <LibWeb/Bindings/RustSerialization.h>
 #include <LibWeb/Bindings/Wrappable.h>
 #include <LibWeb/Bindings/WrapperWorld.h>
+#include <LibWeb/DOM/Document.h>
+#include <LibWeb/HTML/CrossOrigin/AbstractOperations.h>
+#include <LibWeb/HTML/CustomElements/CustomElementReactions.h>
 #include <LibWeb/HTML/EventLoop/EventLoop.h>
 #include <LibWeb/HTML/Scripting/Agent.h>
 #include <LibWeb/HTML/Scripting/Environments.h>
+#include <LibWeb/HTML/Scripting/SimilarOriginWindowAgent.h>
 #include <LibWeb/HTML/Scripting/TemporaryExecutionContext.h>
 #include <LibWeb/HTML/StructuredSerialize.h>
 #include <LibWeb/HTML/Window.h>
 #include <LibWeb/HTML/WindowProxy.h>
+#include <LibWeb/HTML/WorkerGlobalScope.h>
+#include <LibWeb/Page/Page.h>
 #include <LibWeb/Platform/EventLoopPlugin.h>
 #include <LibWeb/WebIDL/AbstractOperations.h>
 #include <LibWeb/WebIDL/CallbackType.h>
@@ -47,14 +54,6 @@ GC::Ref<JS::HostObject> wrap_rust_interface_object(WrapperWorld& wrapper_world, 
 constexpr JSHostClass web_bindings_rust_interface_wrapper_host_class = JS::make_host_class(JS_HOST_CLASS_OBJECT, "RustInterface"sv,
     nullptr, nullptr, nullptr, JS_HOST_CLASS_IS_PLATFORM_OBJECT);
 
-RustInterfaceCell* rust_interface_cell_of_wrapper(JS::Object& object, JSHostClass const& wrapper_host_class)
-{
-    auto* wrapper = as_if<JS::HostObject>(object);
-    if (!wrapper || &wrapper->host_class() != &wrapper_host_class)
-        return nullptr;
-    return GC::static_cell_cast<RustInterfaceCell>(JS::host_data_of(object).ptr());
-}
-
 bool rust_interface_object_implements_interface(JS::Object const& object, StringView interface_name)
 {
     auto const* wrapper = as_if<JS::HostObject>(object);
@@ -76,55 +75,46 @@ JSCompletion completion_to_abi(JS::Realm& realm, WebIDL::ExceptionOr<JS::Value> 
     return JS::HostABI::completion_to_abi(JS::ThrowCompletionOr<JS::Value> { result.release_value() });
 }
 
-// A value of the type that the record of a structured deserialization holds next.
-template<typename T>
-static JSCompletion deserialize_plain_value(RustSerializationReader* reader, T* out_value)
-{
-    auto value = HTML::decode_or_throw_data_clone_error<T>(reader->realm, reader->serialized);
-    if (value.is_exception())
-        return completion_to_abi(reader->realm, value.exception());
-    *out_value = value.release_value();
-    return completion_to_abi(reader->realm, JS::js_undefined());
-}
-
 extern "C" {
 
 void* web_bindings_wrapper_world(void* realm, bool* is_main_world);
 JSObject* web_bindings_rust_wrapper_for(void* realm, void* cell);
 void web_bindings_set_rust_wrapper(void* realm, void* cell, JSObject* wrapper);
-JSObject* web_bindings_rejected_promise(void* current_realm, JSValue this_value, JSValue reason);
 void web_bindings_queue_a_microtask(void* realm, JSObject* function);
+void web_bindings_deferred_invoke(void* cell, void (*steps)(JSVM*, void*));
 void web_bindings_run_in_parallel(void* realm, void* cell, void (*steps)(JSVM*, void*));
 void web_bindings_queue_a_task(void* realm, u8 task_source, void* cell, void (*steps)(JSVM*, void*));
-u64 web_bindings_queue_a_global_task(void* realm, u8 task_source, void* cell, void (*steps)(JSVM*, void*));
+u64 web_bindings_queue_a_global_task(JSObject* global_object, u8 task_source, void* cell, void (*steps)(JSVM*, void*));
 void web_bindings_remove_tasks(void* realm, ReadonlySpan<u64> task_ids);
 u64 web_bindings_currently_running_task(void* realm);
 void* web_bindings_create_callback_function(JSObject* callable, bool returns_promise);
 JSCompletion web_bindings_invoke_callback_function(void* callback, bool has_this_value, JSValue this_value, ReadonlySpan<JSValue> arguments);
 void* web_bindings_invoke_promise_callback_function(void* callback, bool has_this_value, JSValue this_value, ReadonlySpan<JSValue> arguments);
+void web_bindings_push_element_queue();
+void web_bindings_pop_element_queue_and_invoke_reactions();
 bool web_bindings_realm_is_window(void* realm);
+bool web_bindings_realm_is_secure_context(void* realm);
+HTML::Window* web_bindings_window_from_global_object(JSObject* global_object);
+void web_bindings_for_each_active_window(void* ctx, void (*on_window)(void*, HTML::Window*));
+DOM::Document* web_bindings_window_associated_document(HTML::Window*);
+u64 web_bindings_window_page_id(HTML::Window*);
+DOM::EventTarget* web_bindings_window_as_event_target(HTML::Window*);
+bool web_bindings_document_has_navigable(DOM::Document*);
+bool web_bindings_document_is_fully_active(DOM::Document*);
+URL::FFI::RustUrl web_bindings_document_url(DOM::Document*);
+HTML::WorkerGlobalScope* web_bindings_worker_global_scope_from_global_object(JSObject* global_object);
+HTML::EnvironmentSettingsObject* web_bindings_relevant_settings_object(JSObject* global_object);
+JSObject* web_bindings_environment_settings_object_global_object(HTML::EnvironmentSettingsObject*);
+void web_bindings_environment_settings_object_id(HTML::EnvironmentSettingsObject*, void* ctx, void (*on_id)(void*, ReadonlyBytes));
+bool web_bindings_worker_global_scope_is_closing(HTML::WorkerGlobalScope*);
 void web_bindings_with_temporary_execution_context(void* realm, bool callbacks_enabled, void* context, void (*steps)(void*));
 bool web_bindings_object_implements_interface(JSObject* object, u16 interface_name);
 JSObject* web_bindings_create_dom_exception(void* realm, ReadonlyBytes name, FlatPtr message);
+JSCompletion web_bindings_perform_a_security_check(void* realm, JSValue platform_object, ReadonlyBytes identifier, u8 type);
 bool web_bindings_extract_an_origin(JSObject* object, void* ctx, void (*on_origin)(void*, URL::FFI::FfiOrigin const*));
-JSCompletion web_bindings_serialize_value(RustSerializationWriter*, JSValue);
-void web_bindings_serialize_u32(RustSerializationWriter*, u32);
-void web_bindings_serialize_f64(RustSerializationWriter*, double);
-void web_bindings_serialize_bool(RustSerializationWriter*, bool);
-void web_bindings_serialize_i64(RustSerializationWriter*, i64);
-void web_bindings_serialize_optional_u64(RustSerializationWriter*, bool has_value, u64);
-void web_bindings_serialize_utf16_string(RustSerializationWriter*, FlatPtr string);
-void web_bindings_serialize_bytes(RustSerializationWriter*, ReadonlyBytes);
-JSCompletion web_bindings_deserialize_value(RustSerializationReader*);
-JSCompletion web_bindings_deserialize_u32(RustSerializationReader*, u32* out_value);
-JSCompletion web_bindings_deserialize_f64(RustSerializationReader*, double* out_value);
-JSCompletion web_bindings_deserialize_bool(RustSerializationReader*, bool* out_value);
-JSCompletion web_bindings_deserialize_i64(RustSerializationReader*, i64* out_value);
-JSCompletion web_bindings_deserialize_optional_u64(RustSerializationReader*, bool* out_has_value, u64* out_value);
-JSCompletion web_bindings_deserialize_bytes(RustSerializationReader*, void* bytes, void (*append)(void*, u8 const*, size_t));
-JSCompletion web_bindings_deserialize_utf16_string(RustSerializationReader*, FlatPtr* out_string);
-void web_bindings_serialize_inline_object_header(RustSerializationWriter*, u16 interface_name);
-JSCompletion web_bindings_deserialize_inline_object_header(RustSerializationReader*, u16 interface_name);
+
+void* web_css_wrap_object(void* realm, void* cell);
+void* web_css_realm_document(void* realm);
 
 void* web_bindings_wrapper_world(void* realm, bool* is_main_world)
 {
@@ -146,9 +136,106 @@ void web_bindings_set_rust_wrapper(void* realm, void* cell, JSObject* wrapper)
     host_defined_wrapper_world(*static_cast<JS::Realm*>(realm)).set_rust_wrapper(*static_cast<RustInterfaceCell*>(cell), host_object);
 }
 
+void* web_css_wrap_object(void* realm, void* cell)
+{
+    auto& js_realm = *static_cast<JS::Realm*>(realm);
+    auto& wrappable = *static_cast<GCAllocatedWrappable*>(static_cast<GC::Cell*>(cell));
+    auto wrapper = wrap(host_defined_wrapper_world(js_realm), js_realm, GC::Ref<Wrappable> { wrappable });
+    return JS::HostABI::object_to_abi(wrapper.ptr());
+}
+
+void* web_css_realm_document(void* realm)
+{
+    return static_cast<GC::Cell*>(const_cast<DOM::Document*>(HTML::relevant_window(static_cast<JS::Realm*>(realm)->global_object()).document().ptr()));
+}
+
+bool web_bindings_realm_is_secure_context(void* realm)
+{
+    return HTML::is_secure_context(principal_host_defined_environment_settings_object(*static_cast<JS::Realm*>(realm)));
+}
+
+void web_bindings_push_element_queue()
+{
+    main_thread_similar_origin_window_agent().custom_element_reactions_stack.element_queue_stack.append({});
+}
+
+void web_bindings_pop_element_queue_and_invoke_reactions()
+{
+    auto queue = main_thread_similar_origin_window_agent().custom_element_reactions_stack.element_queue_stack.take_last();
+    HTML::invoke_custom_element_reactions(queue);
+}
+
 bool web_bindings_realm_is_window(void* realm)
 {
     return HTML::window_from_global_object(static_cast<JS::Realm*>(realm)->global_object());
+}
+
+HTML::Window* web_bindings_window_from_global_object(JSObject* global_object)
+{
+    return HTML::window_from_global_object(*JS::HostABI::object_from_abi(global_object));
+}
+
+void web_bindings_for_each_active_window(void* ctx, void (*on_window)(void*, HTML::Window*))
+{
+    HTML::Window::for_each_active([&](HTML::Window& window) {
+        on_window(ctx, &window);
+        return IterationDecision::Continue;
+    });
+}
+
+DOM::Document* web_bindings_window_associated_document(HTML::Window* window)
+{
+    return &window->associated_document();
+}
+
+u64 web_bindings_window_page_id(HTML::Window* window)
+{
+    return window->page().client().id().value();
+}
+
+DOM::EventTarget* web_bindings_window_as_event_target(HTML::Window* window)
+{
+    return window;
+}
+
+bool web_bindings_document_has_navigable(DOM::Document* document)
+{
+    return document->navigable() != nullptr;
+}
+
+bool web_bindings_document_is_fully_active(DOM::Document* document)
+{
+    return document->is_fully_active();
+}
+
+URL::FFI::RustUrl web_bindings_document_url(DOM::Document* document)
+{
+    return document->url().to_rust();
+}
+
+HTML::EnvironmentSettingsObject* web_bindings_relevant_settings_object(JSObject* global_object)
+{
+    return &HTML::relevant_settings_object(*JS::HostABI::object_from_abi(global_object));
+}
+
+JSObject* web_bindings_environment_settings_object_global_object(HTML::EnvironmentSettingsObject* settings_object)
+{
+    return JS::HostABI::object_to_abi(&settings_object->global_object());
+}
+
+void web_bindings_environment_settings_object_id(HTML::EnvironmentSettingsObject* settings_object, void* ctx, void (*on_id)(void*, ReadonlyBytes))
+{
+    on_id(ctx, settings_object->id.to_string().bytes());
+}
+
+HTML::WorkerGlobalScope* web_bindings_worker_global_scope_from_global_object(JSObject* global_object)
+{
+    return Bindings::worker_global_scope_from_global_object(*JS::HostABI::object_from_abi(global_object));
+}
+
+bool web_bindings_worker_global_scope_is_closing(HTML::WorkerGlobalScope* worker_global_scope)
+{
+    return worker_global_scope->is_closing();
 }
 
 void web_bindings_with_temporary_execution_context(void* realm, bool callbacks_enabled, void* context, void (*steps)(void*))
@@ -168,6 +255,16 @@ JSObject* web_bindings_create_dom_exception(void* realm, ReadonlyBytes name, Fla
     auto& js_realm = *static_cast<JS::Realm*>(realm);
     auto exception = WebIDL::DOMException::create(FlyString::from_utf8_without_validation(name), Utf16String::from_raw(message));
     return JS::HostABI::object_to_abi(wrap(host_defined_wrapper_world(js_realm), js_realm, exception).ptr());
+}
+
+JSCompletion web_bindings_perform_a_security_check(void* realm, JSValue platform_object, ReadonlyBytes identifier, u8 type)
+{
+    auto& vm = static_cast<JS::Realm*>(realm)->vm();
+    auto identifier_string = Utf16String::from_utf8_without_validation(StringView { identifier });
+    auto result = HTML::perform_a_security_check(vm, JS::HostABI::value_from_abi(platform_object), identifier_string.utf16_view(), static_cast<HTML::SecurityCheckType>(type));
+    if (result.is_error())
+        return JS::HostABI::throw_completion_to_abi(result.error().value());
+    return JS::HostABI::normal_completion_to_abi(JS::HostABI::value_to_abi(JS::js_undefined()));
 }
 
 // https://html.spec.whatwg.org/multipage/browsers.html#extract-an-origin
@@ -192,160 +289,33 @@ bool web_bindings_extract_an_origin(JSObject* object, void* ctx, void (*on_origi
     return true;
 }
 
-// StructuredSerializeInternal of a value that the serialized form of an object of an interface implemented in Rust
-// holds, https://html.spec.whatwg.org/multipage/structured-data.html#sub-serialization
-JSCompletion web_bindings_serialize_value(RustSerializationWriter* writer, JSValue value)
-{
-    auto result = HTML::structured_serialize_internal(writer->realm->vm(), writer->serialized, JS::HostABI::value_from_abi(value), writer->for_storage, writer->memory);
-    if (result.is_exception())
-        return completion_to_abi(writer->realm, result.exception());
-    return completion_to_abi(writer->realm, JS::js_undefined());
-}
-
-void web_bindings_serialize_u32(RustSerializationWriter* writer, u32 value)
-{
-    writer->serialized.encode(value);
-}
-
-void web_bindings_serialize_f64(RustSerializationWriter* writer, double value)
-{
-    writer->serialized.encode(value);
-}
-
-void web_bindings_serialize_bool(RustSerializationWriter* writer, bool value)
-{
-    writer->serialized.encode(value);
-}
-
-void web_bindings_serialize_i64(RustSerializationWriter* writer, i64 value)
-{
-    writer->serialized.encode(value);
-}
-
-void web_bindings_serialize_optional_u64(RustSerializationWriter* writer, bool has_value, u64 value)
-{
-    writer->serialized.encode(has_value ? Optional<u64> { value } : Optional<u64> {});
-}
-
-void web_bindings_serialize_utf16_string(RustSerializationWriter* writer, FlatPtr string)
-{
-    writer->serialized.encode(Utf16String::from_raw(string));
-}
-
-void web_bindings_serialize_bytes(RustSerializationWriter* writer, ReadonlyBytes bytes)
-{
-    writer->serialized.encode(bytes);
-}
-
-// StructuredDeserialize of a value that the serialized form of an object holds, https://html.spec.whatwg.org/multipage/structured-data.html#sub-deserialization
-JSCompletion web_bindings_deserialize_value(RustSerializationReader* reader)
-{
-    return completion_to_abi(reader->realm, HTML::structured_deserialize_internal(reader->realm->vm(), reader->serialized, reader->realm, reader->memory));
-}
-
-JSCompletion web_bindings_deserialize_u32(RustSerializationReader* reader, u32* out_value)
-{
-    return deserialize_plain_value(reader, out_value);
-}
-
-JSCompletion web_bindings_deserialize_f64(RustSerializationReader* reader, double* out_value)
-{
-    return deserialize_plain_value(reader, out_value);
-}
-
-JSCompletion web_bindings_deserialize_bool(RustSerializationReader* reader, bool* out_value)
-{
-    return deserialize_plain_value(reader, out_value);
-}
-
-JSCompletion web_bindings_deserialize_i64(RustSerializationReader* reader, i64* out_value)
-{
-    return deserialize_plain_value(reader, out_value);
-}
-
-JSCompletion web_bindings_deserialize_optional_u64(RustSerializationReader* reader, bool* out_has_value, u64* out_value)
-{
-    Optional<u64> value;
-    auto result = deserialize_plain_value(reader, &value);
-    *out_has_value = value.has_value();
-    *out_value = value.value_or(0);
-    return result;
-}
-
-JSCompletion web_bindings_deserialize_bytes(RustSerializationReader* reader, void* bytes, void (*append)(void*, u8 const*, size_t))
-{
-    ByteBuffer buffer;
-    auto result = deserialize_plain_value(reader, &buffer);
-    if (!buffer.is_empty())
-        append(bytes, buffer.data(), buffer.size());
-    return result;
-}
-
-JSCompletion web_bindings_deserialize_utf16_string(RustSerializationReader* reader, FlatPtr* out_string)
-{
-    Utf16String string;
-    auto result = deserialize_plain_value(reader, &string);
-    *out_string = move(string).into_raw();
-    return result;
-}
-
-// The record of a serializable object of the interface as StructuredSerializeInternal starts it, for an object that
-// steps serialize in place, without a position in the memory of the serialization.
-void web_bindings_serialize_inline_object_header(RustSerializationWriter* writer, u16 interface_name)
-{
-    writer->serialized.encode(to_underlying(HTML::ValueTag::SerializableObject));
-    writer->serialized.encode(static_cast<InterfaceName>(interface_name));
-    if (writer->serialized.type() == HTML::SerializationType::Storage)
-        writer->serialized.encode(HTML::serializable_payload_version);
-}
-
-// Reads what web_bindings_serialize_inline_object_header() writes, and throws a "DataCloneError" DOMException if it is
-// not the start of the record of a serializable object of the interface.
-JSCompletion web_bindings_deserialize_inline_object_header(RustSerializationReader* reader, u16 interface_name)
-{
-    auto result = [&]() -> WebIDL::ExceptionOr<JS::Value> {
-        auto tag = TRY(HTML::decode_or_throw_data_clone_error<u8>(reader->realm, reader->serialized));
-        auto name = TRY(HTML::decode_or_throw_data_clone_error<InterfaceName>(reader->realm, reader->serialized));
-        if (tag != to_underlying(HTML::ValueTag::SerializableObject) || name != static_cast<InterfaceName>(interface_name))
-            return WebIDL::DataCloneError::create(reader->realm, "Unexpected serializable object"_utf16);
-        if (reader->serialized.type() == HTML::SerializationType::Storage) {
-            auto version = TRY(HTML::decode_or_throw_data_clone_error<u64>(reader->realm, reader->serialized));
-            if (version != HTML::serializable_payload_version)
-                return WebIDL::DataCloneError::create(reader->realm, "Unsupported serializable payload version"_utf16);
-        }
-        return JS::js_undefined();
-    }();
-    return completion_to_abi(reader->realm, move(result));
-}
-
-JSObject* web_bindings_rejected_promise(void* current_realm, JSValue this_value, JSValue reason)
-{
-    auto& realm = *static_cast<JS::Realm*>(current_realm);
-    auto promise_realm_this_value = JS::HostABI::value_from_abi(this_value);
-    if (promise_realm_this_value.is_nullish())
-        promise_realm_this_value = &realm.global_object();
-    auto& promise_realm = this_value_realm(realm, promise_realm_this_value);
-    auto promise = WebIDL::create_rejected_promise(promise_realm, JS::HostABI::value_from_abi(reason));
-    return JS::HostABI::object_to_abi(promise->promise().ptr());
-}
-
 void web_bindings_queue_a_microtask(void* realm, JSObject* function)
 {
     GC::Ref<JS::Realm> js_realm = *static_cast<JS::Realm*>(realm);
     GC::Ref<JS::FunctionObject> steps = as<JS::FunctionObject>(*JS::HostABI::object_from_abi(function));
-    HTML::queue_a_microtask(nullptr, GC::create_function(GC::Heap::the(), [js_realm, steps] {
+    HTML::queue_a_microtask(nullptr, GC::create_function(GC::Heap::the(), GC::captures(js_realm, steps), [](auto& js_realm, auto& steps) {
         HTML::TemporaryExecutionContext execution_context { js_realm, HTML::TemporaryExecutionContext::CallbacksEnabled::Yes };
-        MUST(JS::call(steps->vm(), *steps, JS::js_undefined()));
+        // NB: The steps cannot fail, but they can run into the abort of the script that they call.
+        auto& vm = steps->vm();
+        auto result = JS::call(vm, *steps, JS::js_undefined());
+        VERIFY(!result.is_error() || vm.interrupt_requested());
+    }));
+}
+
+void web_bindings_deferred_invoke(void* cell, void (*steps)(JSVM*, void*))
+{
+    Platform::EventLoopPlugin::the().deferred_invoke(GC::create_function(GC::Heap::the(), GC::captures(GC::Ref { *static_cast<GC::Cell*>(cell) }, steps), [](auto& cell, auto& steps) {
+        steps(JS::HostABI::vm_to_abi(JS::VM::the()), cell.ptr());
     }));
 }
 
 void web_bindings_run_in_parallel(void* realm, void* cell, void (*steps)(JSVM*, void*))
 {
     GC::Ref<JS::Realm> js_realm = *static_cast<JS::Realm*>(realm);
-    // NB: The function's captures, which the collector scans, keep the cell alive until the steps run.
-    Platform::EventLoopPlugin::the().deferred_invoke(GC::create_function(GC::Heap::the(), [js_realm, cell, steps] {
+    // NB: The function's captures, which the collector traces, keep the cell alive until the steps run.
+    Platform::EventLoopPlugin::the().deferred_invoke(GC::create_function(GC::Heap::the(), GC::captures(js_realm, GC::Ref { *static_cast<GC::Cell*>(cell) }, steps), [](auto& js_realm, auto& cell, auto& steps) {
         HTML::TemporaryExecutionContext execution_context { js_realm, HTML::TemporaryExecutionContext::CallbacksEnabled::Yes };
-        steps(JS::HostABI::vm_to_abi(js_realm->vm()), cell);
+        steps(JS::HostABI::vm_to_abi(js_realm->vm()), cell.ptr());
     }));
 }
 
@@ -353,23 +323,25 @@ void web_bindings_run_in_parallel(void* realm, void* cell, void (*steps)(JSVM*, 
 static_assert(to_underlying(HTML::Task::Source::Unspecified) == 0);
 static_assert(to_underlying(HTML::Task::Source::Networking) == 3);
 static_assert(to_underlying(HTML::Task::Source::FileReading) == 13);
+static_assert(to_underlying(HTML::Task::Source::Crypto) == 27);
+static_assert(to_underlying(HTML::Task::Source::Storage) == 29);
 
 void web_bindings_queue_a_task(void* realm, u8 task_source, void* cell, void (*steps)(JSVM*, void*))
 {
     GC::Ref<JS::Realm> js_realm = *static_cast<JS::Realm*>(realm);
-    // NB: The task's captures, which the collector scans, keep the cell alive until the steps run.
-    HTML::queue_a_task(static_cast<HTML::Task::Source>(task_source), nullptr, nullptr, GC::create_function(GC::Heap::the(), [js_realm, cell, steps] {
+    // NB: The task's captures, which the collector traces, keep the cell alive until the steps run.
+    HTML::queue_a_task(static_cast<HTML::Task::Source>(task_source), nullptr, nullptr, GC::create_function(GC::Heap::the(), GC::captures(js_realm, GC::Ref { *static_cast<GC::Cell*>(cell) }, steps), [](auto& js_realm, auto& cell, auto& steps) {
         HTML::TemporaryExecutionContext execution_context { js_realm, HTML::TemporaryExecutionContext::CallbacksEnabled::Yes };
-        steps(JS::HostABI::vm_to_abi(js_realm->vm()), cell);
+        steps(JS::HostABI::vm_to_abi(js_realm->vm()), cell.ptr());
     }));
 }
 
-u64 web_bindings_queue_a_global_task(void* realm, u8 task_source, void* cell, void (*steps)(JSVM*, void*))
+u64 web_bindings_queue_a_global_task(JSObject* global_object, u8 task_source, void* cell, void (*steps)(JSVM*, void*))
 {
-    GC::Ref<JS::Realm> js_realm = *static_cast<JS::Realm*>(realm);
-    // NB: The task's captures, which the collector scans, keep the cell alive until the steps run.
-    auto task_id = HTML::queue_global_task(static_cast<HTML::Task::Source>(task_source), js_realm->global_object(), GC::create_function(GC::Heap::the(), [js_realm, cell, steps] {
-        steps(JS::HostABI::vm_to_abi(js_realm->vm()), cell);
+    auto& global = *JS::HostABI::object_from_abi(global_object);
+    // NB: The task's captures, which the collector traces, keep the cell alive until the steps run.
+    auto task_id = HTML::queue_global_task(static_cast<HTML::Task::Source>(task_source), global, GC::create_function(GC::Heap::the(), GC::captures(global, GC::Ref { *static_cast<GC::Cell*>(cell) }, steps), [](auto& global, auto& cell, auto& steps) {
+        steps(JS::HostABI::vm_to_abi(global.vm()), cell.ptr());
     }));
     return task_id.value();
 }

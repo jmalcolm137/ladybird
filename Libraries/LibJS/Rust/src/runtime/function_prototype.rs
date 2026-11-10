@@ -45,13 +45,15 @@ use crate::layout::function_object::RawNativeFunction;
 use crate::layout::object::Object;
 use crate::layout::value::Value;
 use crate::layout_forward::RawNativeFunctionPointer;
-use crate::runtime::abstract_operations::{call_function_object, length_of_array_like};
+use crate::runtime::abstract_operations::{call_function_object, length_of_array_like, throw_if_too_many_arguments};
 use crate::runtime::bound_function::{
     BOUND_FUNCTION_LENGTH_OFFSET, BOUND_FUNCTION_NAME_OFFSET, BoundFunction, LengthAndNameSlots,
 };
 use crate::runtime::class_field_definition::ClassElementName;
 use crate::runtime::completion::{Must, ThrowCompletionOr};
-use crate::runtime::ecmascript_function_object::as_ecmascript_function_object;
+use crate::runtime::ecmascript_function_object::{
+    EcmascriptFunctionObject, as_ecmascript_function_object, value_as_ecmascript_function_object,
+};
 use crate::runtime::error::ErrorKind;
 use crate::runtime::error_types::ErrorType;
 use crate::runtime::function_object::{FUNCTION_OBJECT_METHODS, FunctionObject};
@@ -63,6 +65,13 @@ use crate::runtime::property_key::PropertyKey;
 use crate::runtime::realm::Realm;
 use crate::runtime::value::ordinary_has_instance;
 use crate::utf16::{Utf16StringBuilder, Utf16View, concatenate};
+
+fn this_function_with_legacy_caller_and_arguments(vm: &Vm) -> ThrowCompletionOr<Gc<EcmascriptFunctionObject>> {
+    match value_as_ecmascript_function_object(vm.this_value()) {
+        Some(function) if function.supports_legacy_caller_or_arguments() => Ok(function),
+        _ => vm.throw_completion(ErrorKind::TypeError, ErrorType::LegacyCallerOrArgumentsReceiver, &[]),
+    }
+}
 
 /// %Function.prototype%, a function object that accepts any arguments and returns undefined.
 #[repr(C)]
@@ -83,7 +92,11 @@ define_object_class!(FunctionPrototype, extends: [FunctionObject, Object], metho
 pub(crate) static APPLY_FUNCTION: RawNativeFunctionPointer = raw_native!(FunctionPrototype::apply);
 pub(crate) static CALL_FUNCTION: RawNativeFunctionPointer = raw_native!(FunctionPrototype::call);
 
-fn is_native_function(vm: &Vm, function: &RawNativeFunction, native_function: RawNativeFunctionPointer) -> bool {
+pub(crate) fn is_native_function(
+    vm: &Vm,
+    function: &RawNativeFunction,
+    native_function: RawNativeFunctionPointer,
+) -> bool {
     let address = |pointer: RawNativeFunctionPointer| pointer.map(|pointer| pointer as usize);
     address(function.native_function(vm)) == address(native_function)
 }
@@ -104,7 +117,8 @@ impl FunctionPrototype {
             base: FunctionObject::new_with_prototype(
                 vm,
                 Self::CLASS,
-                realm.object_prototype(),
+                realm,
+                Some(realm.object_prototype()),
                 MayInterfereWithIndexedPropertyAccess::No,
             ),
         }
@@ -158,6 +172,39 @@ impl FunctionPrototype {
             Value::from_string(PrimitiveString::create(vm, Utf16String::default())),
             PropertyAttributes::new(Attribute::CONFIGURABLE),
         );
+
+        // INTEROP: The specification makes these accessors %ThrowTypeError%, and all major engines have them work for
+        //          sloppy functions. Being accessors here keeps them out of what functions report as their own
+        //          properties, which scripts that walk object graphs would otherwise follow out of the function.
+        object.define_native_accessor(
+            vm,
+            realm,
+            &names.caller,
+            raw_native!(FunctionPrototype::legacy_caller_getter),
+            raw_native!(FunctionPrototype::legacy_caller_or_arguments_setter),
+            PropertyAttributes::new(Attribute::CONFIGURABLE),
+        );
+        object.define_native_accessor(
+            vm,
+            realm,
+            &names.arguments,
+            raw_native!(FunctionPrototype::legacy_arguments_getter),
+            raw_native!(FunctionPrototype::legacy_caller_or_arguments_setter),
+            PropertyAttributes::new(Attribute::CONFIGURABLE),
+        );
+    }
+
+    fn legacy_caller_getter(vm: &Vm) -> ThrowCompletionOr<Value> {
+        Ok(this_function_with_legacy_caller_and_arguments(vm)?.legacy_caller(vm))
+    }
+
+    fn legacy_arguments_getter(vm: &Vm) -> ThrowCompletionOr<Value> {
+        Ok(this_function_with_legacy_caller_and_arguments(vm)?.legacy_arguments(vm))
+    }
+
+    fn legacy_caller_or_arguments_setter(vm: &Vm) -> ThrowCompletionOr<Value> {
+        this_function_with_legacy_caller_and_arguments(vm)?;
+        Ok(Value::UNDEFINED)
     }
 
     #[allow(clippy::unnecessary_wraps, reason = "[[Call]] can throw for other functions")]
@@ -201,6 +248,7 @@ impl FunctionPrototype {
 
         // 4. Let argList be ? CreateListFromArrayLike(argArray).
         let length = length_of_array_like(vm, &arg_array_object)?;
+        throw_if_too_many_arguments(vm, length)?;
         record_forwarded_call_from_native(
             vm,
             function_value.as_cell(),

@@ -28,7 +28,7 @@ use libgfx_rust::{
 };
 
 const SERIALIZED_TREE_MAGIC: u32 = 0x5443_5641;
-const SERIALIZED_TREE_FORMAT: u32 = 9;
+const SERIALIZED_TREE_FORMAT: u32 = 10;
 
 const SPATIAL_KIND_SCROLL: u8 = 0;
 const SPATIAL_KIND_STICKY: u8 = 1;
@@ -110,6 +110,12 @@ impl TreeByteWriter {
     fn point(&mut self, point: FloatPoint) {
         self.f32(point.x);
         self.f32(point.y);
+    }
+    fn rect(&mut self, rect: FloatRect) {
+        self.f32(rect.x);
+        self.f32(rect.y);
+        self.f32(rect.width);
+        self.f32(rect.height);
     }
     fn size(&mut self, size: FloatSize) {
         self.f32(size.width);
@@ -226,6 +232,14 @@ impl<'a> TreeByteReader<'a> {
             y: self.f32()?,
         })
     }
+    fn rect(&mut self) -> Option<FloatRect> {
+        Some(FloatRect {
+            x: self.f32()?,
+            y: self.f32()?,
+            width: self.f32()?,
+            height: self.f32()?,
+        })
+    }
     fn size(&mut self) -> Option<FloatSize> {
         Some(FloatSize {
             width: self.f32()?,
@@ -335,6 +349,7 @@ fn write_spatial_data(writer: &mut TreeByteWriter, data: &SpatialData) {
             writer.u8(transform.role as u8);
             writer.bool(transform.synthetic_plane);
             writer.bool(transform.establishes_sorting_context);
+            writer.rect(transform.bounds);
         }
         SpatialData::Perspective(perspective) => {
             writer.u8(SPATIAL_KIND_PERSPECTIVE);
@@ -362,7 +377,6 @@ fn read_spatial_data(reader: &mut TreeByteReader<'_>) -> Option<SpatialData> {
         SPATIAL_KIND_SCROLL => SpatialData::Scroll(ScrollData {
             state_slot: NO_SCROLL_STATE_SLOT,
             owner_paintable: NodeSlotId::INVALID,
-            registry_parent_node: VISUAL_VIEWPORT_NODE_INDEX,
         }),
         SPATIAL_KIND_STICKY => {
             let scroller = reader.spatial_index()?;
@@ -382,7 +396,6 @@ fn read_spatial_data(reader: &mut TreeByteReader<'_>) -> Option<SpatialData> {
                 inset_left: reader.optional_f32()?,
                 state_slot: NO_SCROLL_STATE_SLOT,
                 owner_paintable: NodeSlotId::INVALID,
-                registry_parent_node: parent_sticky.unwrap_or(scroller),
             })
         }
         SPATIAL_KIND_TRANSFORM => SpatialData::Transform(TransformData {
@@ -393,6 +406,7 @@ fn read_spatial_data(reader: &mut TreeByteReader<'_>) -> Option<SpatialData> {
             role: reader.transform_role()?,
             synthetic_plane: reader.bool()?,
             establishes_sorting_context: reader.bool()?,
+            bounds: reader.rect()?,
         }),
         SPATIAL_KIND_PERSPECTIVE => SpatialData::Perspective(PerspectiveData {
             matrix: reader.matrix()?,
@@ -953,6 +967,7 @@ mod tests {
             role: TransformDataRole::CssTransform,
             synthetic_plane: false,
             establishes_sorting_context: false,
+            bounds: FloatRect::default(),
         }
     }
 
@@ -963,7 +978,6 @@ mod tests {
             SpatialData::Scroll(ScrollData {
                 state_slot: NO_SCROLL_STATE_SLOT,
                 owner_paintable: NodeSlotId::INVALID,
-                registry_parent_node: VISUAL_VIEWPORT_NODE_INDEX,
             }),
             VISUAL_VIEWPORT_NODE_INDEX,
         );
@@ -1000,7 +1014,6 @@ mod tests {
                 inset_left: None,
                 state_slot: NO_SCROLL_STATE_SLOT,
                 owner_paintable: NodeSlotId::INVALID,
-                registry_parent_node: scroll_node,
             }),
             scroll_node,
         );
@@ -1026,7 +1039,6 @@ mod tests {
                 inset_left: Some(3.0),
                 state_slot: NO_SCROLL_STATE_SLOT,
                 owner_paintable: NodeSlotId::INVALID,
-                registry_parent_node: scroll_node,
             }),
             outer_sticky,
         );
@@ -1257,7 +1269,6 @@ mod tests {
                 StickyData {
                     state_slot: NO_SCROLL_STATE_SLOT,
                     owner_paintable: b.owner_paintable,
-                    registry_parent_node: b.registry_parent_node,
                     ..*a
                 } == *b
             }
@@ -1477,7 +1488,6 @@ mod tests {
                 SpatialData::Scroll(ScrollData {
                     state_slot: NO_SCROLL_STATE_SLOT,
                     owner_paintable: NodeSlotId::INVALID,
-                    registry_parent_node: VISUAL_VIEWPORT_NODE_INDEX,
                 }),
                 VISUAL_VIEWPORT_NODE_INDEX,
             );
@@ -1514,7 +1524,6 @@ mod tests {
                 None,
                 NO_SCROLL_STATE_SLOT,
                 NodeSlotId::INVALID,
-                target,
             ))
         });
         assert!(VisualContextTree::from_bytes(&encode_tree(&scroller)).is_none());
@@ -1645,7 +1654,6 @@ mod tests {
             SpatialData::Scroll(ScrollData {
                 state_slot: NO_SCROLL_STATE_SLOT,
                 owner_paintable: NodeSlotId::INVALID,
-                registry_parent_node: VISUAL_VIEWPORT_NODE_INDEX,
             }),
             VISUAL_VIEWPORT_NODE_INDEX,
         );
@@ -1655,7 +1663,6 @@ mod tests {
                 None,
                 NO_SCROLL_STATE_SLOT,
                 NodeSlotId::INVALID,
-                SpatialNodeIndex(1),
             )),
             SpatialNodeIndex(1),
         );
@@ -1753,7 +1760,6 @@ mod tests {
                 Some(SpatialNodeIndex(2)),
                 NO_SCROLL_STATE_SLOT,
                 NodeSlotId::INVALID,
-                VISUAL_VIEWPORT_NODE_INDEX,
             )),
             parent: VISUAL_VIEWPORT_NODE_INDEX,
         };
@@ -1763,7 +1769,6 @@ mod tests {
                 Some(SpatialNodeIndex(1)),
                 NO_SCROLL_STATE_SLOT,
                 NodeSlotId::INVALID,
-                VISUAL_VIEWPORT_NODE_INDEX,
             )),
             parent: VISUAL_VIEWPORT_NODE_INDEX,
         };
@@ -1784,7 +1789,6 @@ mod tests {
         root_is_not_a_transform.spatial_nodes[0].data = SpatialData::Scroll(ScrollData {
             state_slot: NO_SCROLL_STATE_SLOT,
             owner_paintable: NodeSlotId::INVALID,
-            registry_parent_node: VISUAL_VIEWPORT_NODE_INDEX,
         });
         assert!(VisualContextTree::from_bytes(&encode_tree(&root_is_not_a_transform)).is_none());
 
@@ -1808,7 +1812,6 @@ mod tests {
             Some(SpatialNodeIndex(1)),
             NO_SCROLL_STATE_SLOT,
             NodeSlotId::INVALID,
-            SpatialNodeIndex(1),
         ));
         assert!(VisualContextTree::from_bytes(&encode_tree(&sticky_parent_is_not_sticky)).is_none());
 

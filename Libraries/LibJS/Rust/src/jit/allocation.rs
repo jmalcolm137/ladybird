@@ -18,6 +18,7 @@ use libjs_jit::snapshot::{
     ArrayAllocationInfo, CellId, ClosureTemplateSnapshot, EnvironmentTemplateSnapshot, FunctionAllocationInfo,
     LexicalEnvironmentTemplateSnapshot, ObjectAllocationInfo, ObjectSizeClass, RopeAllocationInfo, StorageSizeClass,
 };
+use libjs_runtime_macros::{jit_abi, jit_function_address};
 
 use super::offset;
 use crate::bytecode::executable::Executable;
@@ -28,7 +29,8 @@ use crate::interpreter::vm::Vm;
 use crate::layout::cell::{CellHeader, Gc};
 use crate::layout::environment::{DeclarativeEnvironment, Environment, PrivateEnvironment};
 use crate::layout::function_object::{CallEnvironmentTemplate, EcmascriptFunctionObject, FUNCTION_ENVIRONMENT_WORDS};
-use crate::layout::object::{INLINE_NAMED_STORAGE_CAPACITY, Object};
+use crate::layout::member::NullableMember;
+use crate::layout::object::Object;
 use crate::layout::primitive_string::PrimitiveString;
 use crate::layout::realm::Realm;
 use crate::layout::shape::Shape;
@@ -69,6 +71,13 @@ fn cell_words<T>(cell: Gc<T>, size: usize) -> Vec<u64> {
     words
 }
 
+/// Clears the `size` bytes at `offset` of `words`, which may share their word with other fields.
+fn clear_bytes(words: &mut [u64], offset: usize, size: usize) {
+    for byte in offset..offset + size {
+        words[byte / 8] &= !(0xff << (8 * (byte % 8)));
+    }
+}
+
 /// What JIT code needs to allocate cells itself, for code of `realm`. The templates come from cells allocated here,
 /// so this may collect garbage.
 pub struct AllocationInfos<'d> {
@@ -105,20 +114,16 @@ pub fn allocation_infos<'d>(vm: &Vm, realm: Gc<Realm>, defer_gc: &'d DeferGc<'_>
         shape_offset: offset(core::mem::offset_of!(Object, shape)),
         named_properties_offset: offset(core::mem::offset_of!(Object, named_properties)),
         inline_storage_offset: offset(core::mem::offset_of!(Object, inline_named_storage)),
+        plain_inline_storage_offset: offset(core::mem::offset_of!(Object, indexed_elements)),
         inline_capacity_offset: offset(core::mem::offset_of!(Object, inline_named_capacity)),
-        slow_path: libjs_jit_allocate_object as *const () as u64,
+        slow_path: jit_function_address!(libjs_jit_allocate_object),
         ..ObjectAllocationInfo::default()
     };
     // NB: Free lists are only popped inline where the heap gives their addresses (not in AddressSanitizer builds).
-    if let Some(local_free_list) = heap.local_free_list_of(Object::CLASS) {
-        object.size_classes.push(ObjectSizeClass {
-            allocator: local_free_list.as_ptr() as u64,
-            cell_size: size(size_of::<Object>()),
-            inline_capacity: INLINE_NAMED_STORAGE_CAPACITY as u32,
-        });
+    if heap.local_free_list_of(Object::CLASS).is_some() {
         for (size_class, inline_capacity) in plain_object_size_classes(heap)
             .iter()
-            .zip(&PLAIN_OBJECT_INLINE_CAPACITIES[1..])
+            .zip(&PLAIN_OBJECT_INLINE_CAPACITIES)
         {
             object.size_classes.push(ObjectSizeClass {
                 allocator: address(size_class.local_free_list()),
@@ -152,7 +157,7 @@ pub fn allocation_infos<'d>(vm: &Vm, realm: Gc<Realm>, defer_gc: &'d DeferGc<'_>
         storage_template: value_storage::cell_header_template().to_vec(),
         storage_values_offset: offset(VALUES_OFFSET),
         storage_capacity_offset: offset(value_storage::CAPACITY_OFFSET),
-        slow_path: libjs_jit_allocate_array as *const () as u64,
+        slow_path: jit_function_address!(libjs_jit_allocate_array),
     };
 
     let rope_template = rope_template(vm);
@@ -164,13 +169,13 @@ pub fn allocation_infos<'d>(vm: &Vm, realm: Gc<Realm>, defer_gc: &'d DeferGc<'_>
         rhs_offset: offset(ROPE_STRING_RHS_OFFSET),
         length_offset: offset(core::mem::offset_of!(PrimitiveString, length_in_utf16_code_units)),
         min_length: ROPE_STRING_MIN_LENGTH,
-        slow_path: libjs_jit_create_rope_string as *const () as u64,
+        slow_path: jit_function_address!(libjs_jit_create_rope_string),
     };
 
     let function = FunctionAllocationInfo {
         allocator: address(heap.local_free_list_of(EcmascriptFunctionObject::CLASS)),
         cell_size: size(size_of::<EcmascriptFunctionObject>()),
-        slow_path: libjs_jit_clone_function as *const () as u64,
+        slow_path: jit_function_address!(libjs_jit_clone_function),
     };
 
     AllocationInfos {
@@ -192,19 +197,28 @@ fn rope_template(vm: &Vm) -> Vec<u64> {
     let rope = PrimitiveString::create_from_concatenation(vm, half, half).must();
     assert!(class_of(rope).is_subclass_of(RopeString::CLASS));
     let mut words = cell_words(rope, size_of::<RopeString>());
-    words[ROPE_STRING_LHS_OFFSET / 8] = 0;
-    words[ROPE_STRING_RHS_OFFSET / 8] = 0;
+    clear_bytes(&mut words, ROPE_STRING_LHS_OFFSET, 4);
+    clear_bytes(&mut words, ROPE_STRING_RHS_OFFSET, 4);
     words
 }
 
-/// The size class of function environments with room for `binding_count` binding values in their cells, as
-/// `FunctionEnvironmentFreeLists` numbers them: 0 for none, and the inline binding size class plus one otherwise.
-fn function_environment_size_class(binding_count: usize) -> Option<usize> {
-    match inline_binding_size_class(binding_count) {
-        Some(size_class) => Some(size_class + 1),
-        None if binding_count == 0 => Some(0),
-        None => None,
-    }
+/// The size class of the environments of calls with room for `binding_count` binding values in their cells, as
+/// `FunctionEnvironmentFreeLists` numbers them: 0 for none, and the inline binding size class plus one otherwise, past
+/// DECLARATIVE_CALL_ENVIRONMENT_SIZE_CLASSES for declarative environments.
+fn function_environment_size_class(has_function_fields: bool, binding_count: usize) -> Option<usize> {
+    let size_class = match inline_binding_size_class(binding_count) {
+        Some(size_class) => size_class + 1,
+        None if binding_count == 0 => 0,
+        None => return None,
+    };
+    Some(
+        size_class
+            + if has_function_fields {
+                0
+            } else {
+                DECLARATIVE_CALL_ENVIRONMENT_SIZE_CLASSES
+            },
+    )
 }
 
 /// The local free list function environments of a size class (see `function_environment_size_class()`) come from,
@@ -214,6 +228,18 @@ fn function_environment_size_class_allocator(
     size_class: usize,
 ) -> Option<(NonNull<*mut core::ffi::c_void>, u32)> {
     let heap = vm.heap();
+    if size_class >= DECLARATIVE_CALL_ENVIRONMENT_SIZE_CLASSES {
+        let size_class = size_class - DECLARATIVE_CALL_ENVIRONMENT_SIZE_CLASSES;
+        if size_class == 0 {
+            return Some((
+                heap.local_free_list_of(DeclarativeEnvironment::CLASS)?,
+                size(size_of::<DeclarativeEnvironment>()),
+            ));
+        }
+        let size_class =
+            heap.size_classes(DeclarativeEnvironment::CLASS, &DECLARATIVE_ENVIRONMENT_CELL_SIZES)[size_class - 1];
+        return Some((size_class.local_free_list()?, size_class.cell_size()));
+    }
     if size_class == 0 {
         return Some((
             heap.local_free_list_of(FunctionEnvironment::CLASS)?,
@@ -226,13 +252,21 @@ fn function_environment_size_class_allocator(
 
 /// The local free list function environments with room for `binding_count` binding values in their cells come from,
 /// and the size of their cells, if they have room for that many and the heap gives the address of the list.
-fn function_environment_allocator(vm: &Vm, binding_count: usize) -> Option<(NonNull<*mut core::ffi::c_void>, u32)> {
-    function_environment_size_class_allocator(vm, function_environment_size_class(binding_count)?)
+fn function_environment_allocator(
+    vm: &Vm,
+    has_function_fields: bool,
+    binding_count: usize,
+) -> Option<(NonNull<*mut core::ffi::c_void>, u32)> {
+    function_environment_size_class_allocator(vm, function_environment_size_class(has_function_fields, binding_count)?)
 }
 
 /// The number of entries of `FunctionEnvironmentFreeLists`, a power of two above the number of size classes.
-pub const FUNCTION_ENVIRONMENT_FREE_LIST_COUNT: usize = 16;
-const _: () = assert!(FUNCTION_ENVIRONMENT_CELL_SIZES.len() < FUNCTION_ENVIRONMENT_FREE_LIST_COUNT);
+pub const FUNCTION_ENVIRONMENT_FREE_LIST_COUNT: usize = 32;
+
+/// Where the size classes of declarative environments start in `FunctionEnvironmentFreeLists`.
+const DECLARATIVE_CALL_ENVIRONMENT_SIZE_CLASSES: usize = FUNCTION_ENVIRONMENT_FREE_LIST_COUNT / 2;
+const _: () = assert!(FUNCTION_ENVIRONMENT_CELL_SIZES.len() < DECLARATIVE_CALL_ENVIRONMENT_SIZE_CLASSES);
+const _: () = assert!(DECLARATIVE_ENVIRONMENT_CELL_SIZES.len() < DECLARATIVE_CALL_ENVIRONMENT_SIZE_CLASSES);
 
 /// A list that is always empty, for the size classes whose free lists JIT code does not pop. It is never written: JIT
 /// code only pops lists that are not empty.
@@ -254,7 +288,11 @@ impl Default for FunctionEnvironmentFreeLists {
 impl FunctionEnvironmentFreeLists {
     /// The address of the table, after filling it in from the VM's heap.
     pub fn address(&self, vm: &Vm) -> u64 {
-        for size_class in 0..=FUNCTION_ENVIRONMENT_CELL_SIZES.len() {
+        let size_classes = (0..=FUNCTION_ENVIRONMENT_CELL_SIZES.len()).chain(
+            DECLARATIVE_CALL_ENVIRONMENT_SIZE_CLASSES
+                ..=DECLARATIVE_CALL_ENVIRONMENT_SIZE_CLASSES + DECLARATIVE_ENVIRONMENT_CELL_SIZES.len(),
+        );
+        for size_class in size_classes {
             if let Some((allocator, _)) = function_environment_size_class_allocator(vm, size_class) {
                 self.0[size_class].set(allocator.as_ptr() as u64);
             }
@@ -268,49 +306,60 @@ impl FunctionEnvironmentFreeLists {
 /// of it, if they have none yet and JIT code can allocate them itself.
 pub fn make_call_environment_template(vm: &Vm, function: Gc<EcmascriptFunctionObject>, environment: Gc<Environment>) {
     let shared_data = function.shared_data();
-    // SAFETY: Nothing else refers to the template while this looks at whether there is one.
-    if unsafe { &*shared_data.call_environment_template.as_ptr() }.is_some() {
+    if !shared_data.call_environment_template.is_null() {
         return;
     }
-    let Some(environment) = environment.downcast::<FunctionEnvironment>() else {
+    let Some(environment) = environment.downcast::<DeclarativeEnvironment>() else {
         return;
     };
+    let has_function_fields = environment.downcast::<FunctionEnvironment>().is_some();
     let binding_count = shared_data.function_environment_bindings_count();
-    let Some(size_class) = function_environment_size_class(binding_count) else {
+    let Some(size_class) = function_environment_size_class(has_function_fields, binding_count) else {
         return;
     };
     let Some((_, cell_size)) = function_environment_size_class_allocator(vm, size_class) else {
         return;
     };
     let has_inline_binding_values = binding_count != 0;
-    if !environment.rare_data.get().is_null()
-        || environment.binding_values_are_inline.get() != has_inline_binding_values
-        || environment.binding_values.size() != 0
+    if !environment.rare_data.is_null()
+        || environment.binding_values_are_inline() != has_inline_binding_values
+        || environment.binding_count.get() != 0
         || (has_inline_binding_values && environment.shape.get().is_none())
     {
         return;
     }
-    let words = cell_words(environment, size_of::<FunctionEnvironment>());
+    let cell_bytes = if has_function_fields {
+        size_of::<FunctionEnvironment>()
+    } else {
+        size_of::<DeclarativeEnvironment>()
+    };
+    let words = cell_words(environment, cell_bytes);
     let mut template = CallEnvironmentTemplate {
         header: CellHeader::for_class(CallEnvironmentTemplate::CLASS),
         size_class: size_class as u64,
         cell_size: u64::from(cell_size),
         binding_values_offset: if has_inline_binding_values {
-            size_of::<FunctionEnvironment>() as u64
+            cell_bytes as u64
         } else {
             0
         },
         binds_this: u64::from(function.uses_this() && function.this_mode() != ThisMode::Lexical),
+        has_function_fields: u64::from(has_function_fields),
         words: [0; FUNCTION_ENVIRONMENT_WORDS],
     };
-    template.words.copy_from_slice(&words);
-    for offset in [
-        core::mem::offset_of!(DeclarativeEnvironment, binding_values.data),
-        core::mem::offset_of!(Environment, outer),
-        FUNCTION_ENVIRONMENT_FUNCTION_OBJECT_OFFSET,
-        FUNCTION_ENVIRONMENT_THIS_VALUE_OFFSET,
+    template.words[..words.len()].copy_from_slice(&words);
+    for (offset, size) in [
+        (core::mem::offset_of!(DeclarativeEnvironment, binding_values), 8),
+        (
+            core::mem::offset_of!(Environment, outer),
+            size_of::<NullableMember<Environment>>(),
+        ),
     ] {
-        template.words[offset / 8] = 0;
+        clear_bytes(&mut template.words, offset, size);
+    }
+    if has_function_fields {
+        clear_bytes(&mut template.words, FUNCTION_ENVIRONMENT_FUNCTION_OBJECT_OFFSET, 4);
+        clear_bytes(&mut template.words, FUNCTION_ENVIRONMENT_THIS_VALUE_OFFSET, 8);
     }
     shared_data
         .call_environment_template
@@ -332,16 +381,20 @@ pub fn function_environment_template(
     }
     let shared_data = function.shared_data();
     let binding_count = shared_data.function_environment_bindings_count();
-    let (allocator, cell_size) = function_environment_allocator(vm, binding_count)?;
+    let has_function_fields = shared_data.function_environment_has_this_binding();
+    let (allocator, cell_size) = function_environment_allocator(vm, has_function_fields, binding_count)?;
     let sample = function
         .inline_call_environment(vm, None)?
-        .downcast::<FunctionEnvironment>()?;
+        .downcast::<DeclarativeEnvironment>()?;
     // NB: Calls that bind `this` store it in the environment, as resolve_and_bind_this() does.
-    let binds_this = function.uses_this() && function.this_mode() != ThisMode::Lexical;
+    let binds_this = has_function_fields && function.uses_this() && function.this_mode() != ThisMode::Lexical;
     if binds_this {
-        sample.bind_this_value(vm, Value::UNDEFINED).must();
+        sample
+            .downcast::<FunctionEnvironment>()?
+            .bind_this_value(vm, Value::UNDEFINED)
+            .must();
     }
-    if !sample.rare_data.get().is_null() || sample.binding_values_are_inline.get() != (binding_count != 0) {
+    if !sample.rare_data.is_null() || sample.binding_values_are_inline() != (binding_count != 0) {
         return None;
     }
     let mut cells = Vec::new();
@@ -357,9 +410,16 @@ pub fn function_environment_template(
     Some(EnvironmentTemplateSnapshot {
         allocator: allocator.as_ptr() as u64,
         cell_size,
-        words: cell_words(sample, size_of::<FunctionEnvironment>()),
+        words: cell_words(
+            sample,
+            if has_function_fields {
+                size_of::<FunctionEnvironment>()
+            } else {
+                size_of::<DeclarativeEnvironment>()
+            },
+        ),
         inline_binding_values: binding_count != 0,
-        binding_values_offset: offset(core::mem::offset_of!(DeclarativeEnvironment, binding_values.data)),
+        binding_values_offset: offset(core::mem::offset_of!(DeclarativeEnvironment, binding_values)),
         binds_this,
         this_value_offset: offset(FUNCTION_ENVIRONMENT_THIS_VALUE_OFFSET),
         cells,
@@ -400,7 +460,7 @@ pub fn lexical_environment_templates(
                 u32::try_from(binding_count).ok()?,
                 false,
             );
-            if !sample.rare_data.get().is_null() || sample.binding_values_are_inline.get() != (binding_count != 0) {
+            if !sample.rare_data.is_null() || sample.binding_values_are_inline() != (binding_count != 0) {
                 return None;
             }
             Some(LexicalEnvironmentTemplateSnapshot {
@@ -409,7 +469,7 @@ pub fn lexical_environment_templates(
                 words: cell_words(sample, size_of::<DeclarativeEnvironment>()),
                 binding_count: u32::try_from(binding_count).ok()?,
                 inline_binding_values: binding_count != 0,
-                binding_values_offset: offset(core::mem::offset_of!(DeclarativeEnvironment, binding_values.data)),
+                binding_values_offset: offset(core::mem::offset_of!(DeclarativeEnvironment, binding_values)),
                 outer_offset: offset(core::mem::offset_of!(Environment, outer)),
                 shape: shape.map(|shape| cell(header_of(shape))),
             })
@@ -421,6 +481,7 @@ pub fn lexical_environment_templates(
 /// capacity)`: what CreateLexicalEnvironment without a catch environment creates, for JIT code.
 ///
 /// JIT code calls this with its VM, a live parent environment and the executable of its frame.
+#[jit_abi]
 pub extern "C" fn libjs_jit_create_lexical_environment(
     vm: &Vm,
     parent: Gc<Environment>,
@@ -482,8 +543,6 @@ fn closure_template(
         None,
         realm.function_prototype(),
     );
-    // NB: The closures of the function's frames belong to its script or module, the active one in them.
-    sample.script_or_module.set(function.script_or_module.get());
     if !sample.can_be_copied() {
         return None;
     }
@@ -513,6 +572,7 @@ pub fn closure_template_snapshots(
 /// undefined, with room for `reserve` properties inline if a size class has room for them.
 ///
 /// JIT code calls this with its VM and a live shape.
+#[jit_abi]
 pub extern "C" fn libjs_jit_allocate_object(vm: &Vm, shape: Gc<Shape>, reserve: u32) -> *mut Object {
     Object::create_with_premade_shape_and_reserve(vm, shape, reserve).as_ptr()
 }
@@ -522,6 +582,7 @@ pub extern "C" fn libjs_jit_allocate_object(vm: &Vm, shape: Gc<Shape>, reserve: 
 ///
 /// JIT code calls this with its VM and live non-empty strings, whose lengths add up to at least `ROPE_STRING_MIN_LENGTH`
 /// and less than `u32::MAX`.
+#[jit_abi]
 pub extern "C" fn libjs_jit_create_rope_string(
     vm: &Vm,
     lhs: Gc<PrimitiveString>,
@@ -534,6 +595,7 @@ pub extern "C" fn libjs_jit_create_rope_string(
 /// elements.
 ///
 /// JIT code calls this with its VM.
+#[jit_abi]
 pub extern "C" fn libjs_jit_allocate_array(vm: &Vm, count: u32) -> *mut Array {
     let realm = vm.current_realm().expect("JIT code runs in a realm");
     let array = Array::create(vm, realm, 0, None).must();
@@ -545,6 +607,7 @@ pub extern "C" fn libjs_jit_allocate_array(vm: &Vm, count: u32) -> *mut Array {
 /// PrivateEnvironment*)`: a closure like the sample of a closure template, with the given environments.
 ///
 /// JIT code calls this with its VM, a sample it embeds and live environments (or null private environment).
+#[jit_abi]
 pub extern "C" fn libjs_jit_clone_function(
     vm: &Vm,
     sample: Gc<EcmascriptFunctionObject>,
@@ -555,11 +618,10 @@ pub extern "C" fn libjs_jit_clone_function(
     let closure = EcmascriptFunctionObject::create_from_function_data_with_prototype(
         vm,
         realm,
-        sample.shared_data.get(),
+        sample.shared_data(),
         environment,
         private_environment,
         realm.function_prototype(),
     );
-    closure.script_or_module.set(sample.script_or_module.get());
     closure.as_ptr()
 }

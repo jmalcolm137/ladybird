@@ -69,6 +69,8 @@ QColor chrome_separator(QPalette const&);
 QColor chrome_window_outline(QPalette const&);
 QColor chrome_accent();
 QColor chrome_muted_text(QPalette const&);
+// The amber dot that tells of waiting crash reports.
+QColor crash_reports_dot_color(QPalette const&);
 QFont chrome_title_font(QFont);
 
 QString style_sheet_color(QColor const&);
@@ -80,7 +82,7 @@ QColor opaque_panel_edge();
 // antialiasing.
 bool shows_opaque_pixels_only(QWidget const&);
 
-QString application_style_sheet(QPalette const&);
+QString menu_zoom_row_style_sheet();
 QString toolbar_container_style_sheet(QPalette const&);
 QString menu_bar_style_sheet(QPalette const&);
 QString location_edit_style_sheet(QPalette const&);
@@ -98,6 +100,7 @@ QString autocomplete_popup_style_sheet(QPalette const&);
 QString downloads_popover_style_sheet(QPalette const&);
 QString message_popover_style_sheet(QPalette const&);
 QString site_settings_popover_style_sheet(QPalette const&);
+QString feedback_popover_style_sheet(QPalette const&);
 QString permission_prompt_style_sheet(QPalette const&);
 QString all_tabs_popover_style_sheet(QPalette const&);
 QString bookmark_popover_style_sheet(QPalette const&);
@@ -124,6 +127,8 @@ constexpr inline qreal CONTROL_FRAME_RADIUS = 6;
 // The colors of a button's frame in the button's current state, or nothing while it shows no frame.
 Optional<ControlFrameColors> control_frame_colors(QAbstractButton const&, ControlFrameStyle = ControlFrameStyle::InteractionOnly);
 void paint_control_frame(QPainter&, QAbstractButton const&, ControlFrameStyle = ControlFrameStyle::InteractionOnly);
+// The frame of a badge over a collapsed sidebar's tab that is not a button, as a button's frame looks at rest.
+void paint_tab_badge_frame(QPainter&, QWidget const&);
 void paint_focus_ring(QPainter&, QRectF const&, qreal radius);
 
 void paint_loading_ring(QPainter&, QPalette const&, QPointF center, LoadingRingSize, LoadingPhase = LoadingPhase::Receiving);

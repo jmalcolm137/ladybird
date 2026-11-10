@@ -1,0 +1,32 @@
+#include <LibHTTP/Cookie/Cookie.h>
+#include <LibHTTP/HSTS/ParsedHSTSPolicy.h>
+#include <LibIPC/File.h>
+#include <LibIPC/TransportHandle.h>
+#include <LibURL/URL.h>
+#include <LibWebCommon/FileAPI/SerializedBlobURLEntry.h>
+#include <LibWebCommon/HTML/BroadcastChannelMessage.h>
+#include <LibWebCommon/HTML/WorkerAgentForward.h>
+#include <LibWebCommon/HTML/WorkerAgentTypes.h>
+#include <LibWebCommon/Permissions/Permissions.h>
+
+endpoint WebWorkerClient {
+    did_add_blob_url_entry(Web::HTML::EnvironmentId environment_id, Utf16String url, Web::FileAPI::SerializedBlobURLEntry entry) => (URL::BlobURLEntry::Token token)
+    did_remove_blob_url_entries(Web::HTML::EnvironmentId environment_id, Vector<Utf16String> urls) => ()
+    did_request_blob_url_entry(Utf16String url, Optional<URL::BlobURLEntry::Token> token) => (Optional<Web::FileAPI::SerializedBlobURLEntry> entry)
+
+    did_close_worker() =|
+    did_close_shared_worker() => ()
+    did_finish_loading_worker_script(bool worker_is_secure_context) =|
+    did_fail_loading_worker_script() =|
+    did_report_outside_settings_content_security_policy_violation(u64 policy_index, String effective_directive, URL::URL resource) =|
+    did_request_cookie(URL::URL url, HTTP::Cookie::Source source) => (HTTP::Cookie::VersionedCookie cookie)
+    did_request_file(ByteString path, i32 request_id) =|
+    did_is_known_hsts_host(String domain) => (bool result)
+    did_request_permission_snapshot(URL::Origin top_level_origin) => (Web::Permissions::PermissionSnapshot snapshot)
+    request_media_server_connection() => (Optional<IPC::TransportHandle> handle)
+    request_image_decoder_connection() => (Optional<IPC::TransportHandle> handle)
+    request_compositor_connection() => (Optional<IPC::TransportHandle> handle)
+    did_release_image_decoder() =|
+    did_post_broadcast_channel_message(Web::HTML::PostedBroadcastChannelMessage message) =|
+    register_dedicated_worker(Web::HTML::WorkerAgentStartRequest request, IPC::TransportHandle worker_transport) =|
+}

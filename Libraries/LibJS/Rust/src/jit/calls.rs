@@ -12,6 +12,7 @@ use core::ptr::NonNull;
 
 use libjs_abi::register;
 use libjs_jit::ir::Float64Function;
+use libjs_runtime_macros::{jit_abi, jit_function_address};
 
 use super::code::EntryStatus;
 use super::entry_exit::{can_enter_jit_code, enter_jit_code};
@@ -33,11 +34,12 @@ use crate::interpreter::vm::Vm;
 use crate::layout::cell::Gc;
 use crate::layout::execution_context::ExecutionContext;
 use crate::layout::feedback::CallFeedbackForwarding;
-use crate::layout::function_object::{EcmascriptFunctionObject, RawNativeFunction};
+use crate::layout::function_object::{EcmascriptFunctionObject, NativeFunction, RawNativeFunction};
 use crate::layout::object::{IndexedStorageKind, Object};
 use crate::layout::value::Value;
 use crate::runtime::abstract_operations::{
-    create_unmapped_arguments_object, get_prototype_from_constructor, length_of_array_like,
+    call_function_object, create_unmapped_arguments_object, get_prototype_from_constructor, length_of_array_like,
+    throw_if_too_many_arguments,
 };
 use crate::runtime::array::Array;
 use crate::runtime::bound_function::BoundFunction;
@@ -204,7 +206,14 @@ fn construct_ecmascript_function_from_jit(
         // a. Let thisArgument be ? OrdinaryCreateFromConstructor(newTarget, "%Object.prototype%").
         // NB: With room for the properties the constructor is known to add.
         match get_prototype_from_constructor(vm, function.as_function_object_gc(), Intrinsics::object_prototype) {
-            Ok(prototype) => this_argument = Some(Object::create_for_construct(vm, prototype, function.shared_data())),
+            Ok(prototype) => {
+                this_argument = Some(Object::create_for_construct(
+                    vm,
+                    vm.current_realm().expect("a construction runs in a realm"),
+                    prototype,
+                    function.shared_data(),
+                ));
+            }
             Err(throw) => return handle_asm_exception(vm, site.pc, throw.value()),
         }
     }
@@ -386,6 +395,9 @@ fn call_other_function_from_jit(
                 Ok(length) => length,
                 Err(throw) => return Some(handle_asm_exception(vm, site.pc, throw.value())),
             };
+            if let Err(throw) = throw_if_too_many_arguments(vm, length) {
+                return Some(handle_asm_exception(vm, site.pc, throw.value()));
+            }
             if unwrap_depth == 0 {
                 record_forwarded_call(
                     vm,
@@ -401,7 +413,8 @@ fn call_other_function_from_jit(
                 && array_like.indexed_storage_kind() == IndexedStorageKind::Packed
                 && u64::from(array_like.indexed_packed_elements_span_size()) >= length
             {
-                let arguments = ArgumentStorage::filled(vm, length as usize, |slots| {
+                let mut arguments = ArgumentStorage::empty();
+                arguments.fill(vm, length as usize, |slots| {
                     array_like.copy_indexed_packed_elements(slots);
                 });
                 return Some(call_from_jit_or_generic(
@@ -429,8 +442,6 @@ fn call_other_function_from_jit(
                 unwrap_depth + 1,
             ));
         }
-
-        return None;
     }
 
     if let Some(bound_function) = callee_object.downcast::<BoundFunction>() {
@@ -458,7 +469,8 @@ fn call_other_function_from_jit(
                 unwrap_depth + 1,
             );
         }
-        let argument_list = ArgumentStorage::filled(vm, bound_argument_count + arguments.len(), |slots| {
+        let mut argument_list = ArgumentStorage::empty();
+        argument_list.fill(vm, bound_argument_count + arguments.len(), |slots| {
             let (bound_slots, argument_slots) = slots.split_at_mut(bound_argument_count);
             for (index, slot) in bound_slots.iter_mut().enumerate() {
                 *slot = bound_function.bound_argument(index);
@@ -472,6 +484,15 @@ fn call_other_function_from_jit(
             bound_function.bound_this(),
             &argument_list.values(),
             unwrap_depth + 1,
+        );
+    }
+
+    if let Some(function) = callee_object.downcast::<NativeFunction>() {
+        return Some(
+            match call_function_object(vm, function.upcast(), this_value, arguments) {
+                Ok(value) => site.store_result(value),
+                Err(throw) => handle_asm_exception(vm, site.pc, throw.value()),
+            },
         );
     }
 
@@ -520,36 +541,58 @@ struct ArgumentStorage<'vm> {
 impl<'vm> ArgumentStorage<'vm> {
     const INLINE_CAPACITY: usize = 16;
 
-    fn new(vm: &'vm Vm, values: impl ExactSizeIterator<Item = Value>) -> Self {
-        Self::filled(vm, values.len(), |slots| {
+    /// Storage without values, which `fill()` puts in. They go in where the storage is, and not into storage that is
+    /// moved there: a move leaves its source behind on the stack, where nothing clears it (see `drop()`).
+    fn empty() -> Self {
+        Self {
+            inline: [Value::UNDEFINED; Self::INLINE_CAPACITY],
+            count: 0,
+            rooted: None,
+        }
+    }
+
+    fn fill_from(&mut self, vm: &'vm Vm, values: impl ExactSizeIterator<Item = Value>) {
+        self.fill(vm, values.len(), |slots| {
             for (slot, value) in slots.iter_mut().zip(values) {
                 *slot = value;
             }
-        })
+        });
     }
 
-    /// `count` values, which `fill` writes into the slots it gets. Nothing may collect garbage while it does.
-    fn filled(vm: &'vm Vm, count: usize, fill: impl FnOnce(&mut [Value])) -> Self {
-        let mut storage = Self {
-            inline: [Value::UNDEFINED; Self::INLINE_CAPACITY],
-            count,
-            rooted: None,
-        };
+    /// Takes `count` values, which `fill` writes into the slots it gets. Nothing may collect garbage while it does.
+    fn fill(&mut self, vm: &'vm Vm, count: usize, fill: impl FnOnce(&mut [Value])) {
+        debug_assert!(self.count == 0 && self.rooted.is_none(), "the storage is filled once");
+        self.count = count;
         if count <= Self::INLINE_CAPACITY {
-            fill(&mut storage.inline[..count]);
+            fill(&mut self.inline[..count]);
         } else {
             let rooted = MarkedVec::with_capacity(vm, count);
             rooted.resize(count, Value::UNDEFINED);
             fill(&mut rooted.values_mut());
-            storage.rooted = Some(rooted);
+            self.rooted = Some(rooted);
         }
-        storage
     }
 
     fn values(&self) -> ArgumentValues<'_> {
         match &self.rooted {
             Some(rooted) => ArgumentValues::Rooted(rooted.values()),
             None => ArgumentValues::Inline(&self.inline[..self.count]),
+        }
+    }
+}
+
+impl Drop for ArgumentStorage<'_> {
+    /// Clears the values on the stack once the call is done with them. The garbage collector scans the stack
+    /// conservatively, and frames that do not initialize all of their slots come to lie over this one later: a value
+    /// left behind would keep its cell alive for as long as such a frame is there.
+    fn drop(&mut self) {
+        if self.rooted.is_some() {
+            return;
+        }
+        for slot in &mut self.inline[..self.count] {
+            // NB: The writes are volatile so that they are not taken for dead stores.
+            // SAFETY: The slot is a valid, aligned value of this storage.
+            unsafe { core::ptr::write_volatile(slot, Value::UNDEFINED) };
         }
     }
 }
@@ -596,6 +639,7 @@ fn finish_generic_call(vm: &Vm, site: &JitCallSite, control: SlowPathControl, re
 /// # Safety
 ///
 /// JIT code calls this with its VM, its frame and the pc of one of its executable's call instructions.
+#[jit_abi]
 pub unsafe extern "C" fn libjs_jit_call(vm: *const Vm, frame: *mut ExecutionContext, pc: u32) -> i64 {
     // SAFETY: JIT code passes live pointers.
     let vm = unsafe { &*vm };
@@ -625,7 +669,8 @@ pub unsafe extern "C" fn libjs_jit_call(vm: *const Vm, frame: *mut ExecutionCont
             let call = instruction!(Call);
             let site = site(call.dst, call.length());
             let operands = call.arguments();
-            let storage = ArgumentStorage::new(vm, operands.iter().map(|operand| load(*operand)));
+            let mut storage = ArgumentStorage::empty();
+            storage.fill_from(vm, operands.iter().map(|operand| load(*operand)));
             let arguments = storage.values();
             let callee = load(call.callee);
             let this_value = load(call.this_value);
@@ -645,7 +690,8 @@ pub unsafe extern "C" fn libjs_jit_call(vm: *const Vm, frame: *mut ExecutionCont
             let call = instruction!(CallConstruct);
             let site = site(call.dst, call.length());
             let operands = call.arguments();
-            let storage = ArgumentStorage::new(vm, operands.iter().map(|operand| load(*operand)));
+            let mut storage = ArgumentStorage::empty();
+            storage.fill_from(vm, operands.iter().map(|operand| load(*operand)));
             let arguments = storage.values();
             let callee = load(call.callee);
             if let Some(function) = value_as_ecmascript_function_object(callee)
@@ -667,7 +713,8 @@ pub unsafe extern "C" fn libjs_jit_call(vm: *const Vm, frame: *mut ExecutionCont
             let call = instruction!(CallDirectEval);
             let site = site(call.dst, call.length());
             let operands = call.arguments();
-            let storage = ArgumentStorage::new(vm, operands.iter().map(|operand| load(*operand)));
+            let mut storage = ArgumentStorage::empty();
+            storage.fill_from(vm, operands.iter().map(|operand| load(*operand)));
             let arguments = storage.values();
             let mut values = op::CallDirectEvalValues {
                 dst: Value::EMPTY,
@@ -775,6 +822,7 @@ fn call_spreading_arguments_from_jit(
 /// # Safety
 ///
 /// JIT code calls this with its VM, its frame and the pc of such an instruction.
+#[jit_abi]
 pub unsafe extern "C" fn libjs_jit_call_forwarding_arguments(
     vm: *const Vm,
     frame: *mut ExecutionContext,
@@ -824,7 +872,8 @@ pub unsafe extern "C" fn libjs_jit_call_forwarding_arguments(
             passed_argument_count,
         );
     }
-    let arguments = ArgumentStorage::new(
+    let mut arguments = ArgumentStorage::empty();
+    arguments.fill_from(
         vm,
         frame_ref.arguments()[..passed_argument_count]
             .iter()
@@ -842,6 +891,7 @@ pub unsafe extern "C" fn libjs_jit_call_forwarding_arguments(
 /// # Safety
 ///
 /// JIT code calls this with its VM and frame, and the pc of the Call instruction.
+#[jit_abi]
 pub unsafe extern "C" fn libjs_jit_finish_direct_call(
     vm: *const Vm,
     frame: *mut ExecutionContext,
@@ -884,6 +934,7 @@ pub struct CallEnvironment {
 /// # Safety
 ///
 /// JIT code calls this with its VM and an ECMAScript function that can be called inline.
+#[jit_abi]
 pub unsafe extern "C" fn libjs_jit_prepare_call_environment(
     vm: *const Vm,
     function: *const EcmascriptFunctionObject,
@@ -931,6 +982,7 @@ pub unsafe extern "C" fn libjs_jit_prepare_call_environment(
 /// append it to without any observable step, and returns the new length as a value.
 ///
 /// JIT code calls this with a live array whose elements are packed.
+#[jit_abi]
 pub extern "C" fn libjs_jit_array_push(array: &Array, value: u64) -> u64 {
     assert!(matches!(
         array.indexed_storage_kind(),
@@ -946,6 +998,7 @@ pub extern "C" fn libjs_jit_array_push(array: &Array, value: u64) -> u64 {
 ///
 /// JIT code calls this with a live array whose prototype chain is the realm's default one without indexed properties,
 /// so that the store runs no code.
+#[jit_abi]
 pub extern "C" fn libjs_jit_store_holey_element(object: &Object, index: u32, value: u64) {
     // NB: Branches on holey elements take packed ones too.
     assert!(matches!(
@@ -960,6 +1013,7 @@ pub extern "C" fn libjs_jit_store_holey_element(object: &Object, index: u32, val
 /// but the descriptive string of a symbol.
 ///
 /// JIT code calls this with its VM and a primitive.
+#[jit_abi]
 pub extern "C" fn libjs_jit_primitive_to_string(vm: &Vm, primitive: u64) -> u64 {
     let primitive = Value::from_bits(primitive);
     assert!(!primitive.is_object());
@@ -974,37 +1028,42 @@ pub extern "C" fn libjs_jit_primitive_to_string(vm: &Vm, primitive: u64) -> u64 
 /// The address of the runtime's `double (double...)` function that computes `function`, which JIT code calls with
 /// numbers (see `Op::CallFloat64Function`).
 pub fn float64_function_address(function: Float64Function) -> u64 {
-    let function: *const () = match function {
-        Float64Function::Exp => libjs_jit_math_exp as *const (),
-        Float64Function::Log => libjs_jit_math_log as *const (),
-        Float64Function::Sin => libjs_jit_math_sin as *const (),
-        Float64Function::Cos => libjs_jit_math_cos as *const (),
-        Float64Function::Tan => libjs_jit_math_tan as *const (),
-        Float64Function::Pow => libjs_jit_math_pow as *const (),
-    };
-    function as u64
+    match function {
+        Float64Function::Exp => jit_function_address!(libjs_jit_math_exp),
+        Float64Function::Log => jit_function_address!(libjs_jit_math_log),
+        Float64Function::Sin => jit_function_address!(libjs_jit_math_sin),
+        Float64Function::Cos => jit_function_address!(libjs_jit_math_cos),
+        Float64Function::Tan => jit_function_address!(libjs_jit_math_tan),
+        Float64Function::Pow => jit_function_address!(libjs_jit_math_pow),
+    }
 }
 
+#[jit_abi]
 extern "C" fn libjs_jit_math_exp(number: f64) -> f64 {
     math_object::exp_of_number(number)
 }
 
+#[jit_abi]
 extern "C" fn libjs_jit_math_log(number: f64) -> f64 {
     math_object::log_of_number(number)
 }
 
+#[jit_abi]
 extern "C" fn libjs_jit_math_sin(number: f64) -> f64 {
     math_object::sin_of_number(number)
 }
 
+#[jit_abi]
 extern "C" fn libjs_jit_math_cos(number: f64) -> f64 {
     math_object::cos_of_number(number)
 }
 
+#[jit_abi]
 extern "C" fn libjs_jit_math_tan(number: f64) -> f64 {
     math_object::tan_of_number(number)
 }
 
+#[jit_abi]
 extern "C" fn libjs_jit_math_pow(base: f64, exponent: f64) -> f64 {
     value_conversions::exp_double(base, exponent)
 }
@@ -1013,6 +1072,7 @@ extern "C" fn libjs_jit_math_pow(base: f64, exponent: f64) -> f64 {
 /// null, as the builtin function `function` makes it, or the empty value if that function is of another realm.
 ///
 /// JIT code calls this with its VM, a function object and such a primitive.
+#[jit_abi]
 pub extern "C" fn libjs_jit_to_object(vm: &Vm, primitive: u64, function: u64) -> u64 {
     let (function, primitive) = (Value::from_bits(function).as_object(), Value::from_bits(primitive));
     assert!(!primitive.is_object() && !primitive.is_nullish());
@@ -1027,6 +1087,7 @@ pub extern "C" fn libjs_jit_to_object(vm: &Vm, primitive: u64, function: u64) ->
 /// (the Array constructor) makes it, or the empty value if that function is of another realm.
 ///
 /// JIT code calls this with its VM, a length below 2^31 and a function object.
+#[jit_abi]
 pub extern "C" fn libjs_jit_array_create(vm: &Vm, length: u32, function: u64) -> u64 {
     let realm = Value::from_bits(function).as_object().shape().realm();
     if vm.current_realm() != Some(realm) {
@@ -1040,6 +1101,7 @@ pub extern "C" fn libjs_jit_array_create(vm: &Vm, length: u32, function: u64) ->
 /// start)` with the arguments object of the frame, which the code never created, as an array value.
 ///
 /// JIT code calls this with its VM and its frame.
+#[jit_abi]
 pub extern "C" fn libjs_jit_slice_arguments(vm: &Vm, frame: &ExecutionContext, start: i32) -> u64 {
     // 23.1.3.28 Array.prototype.slice ( start, end ), https://tc39.es/ecma262/#sec-array.prototype.slice
     // NB: The arguments object has every passed argument, and its length is their count.
@@ -1050,7 +1112,8 @@ pub extern "C" fn libjs_jit_slice_arguments(vm: &Vm, frame: &ExecutionContext, s
     } else {
         start.min(length)
     };
-    let arguments = ArgumentStorage::new(
+    let mut arguments = ArgumentStorage::empty();
+    arguments.fill_from(
         vm,
         frame.arguments()[first as usize..length as usize]
             .iter()

@@ -118,25 +118,25 @@ pub(crate) struct Token {
 
 #[derive(Clone, Copy)]
 pub(crate) enum TokenizerInput<'a> {
-    Ascii(&'a [u8]),
+    Latin1(&'a [u8]),
     Utf16(&'a [u16]),
 }
 
 impl Default for TokenizerInput<'_> {
     fn default() -> Self {
-        Self::Ascii(&[])
+        Self::Latin1(&[])
     }
 }
 
 impl TokenizerInput<'_> {
     /// # Safety
     /// Exactly one non-empty input pointer must identify `length` readable units.
-    pub(crate) unsafe fn from_raw_parts(ascii: *const u8, utf16: *const u16, length: usize) -> Option<Self> {
+    pub(crate) unsafe fn from_raw_parts(latin1: *const u8, utf16: *const u16, length: usize) -> Option<Self> {
         if length == 0 {
-            return Some(Self::Ascii(&[]));
+            return Some(Self::Latin1(&[]));
         }
-        match (ascii.is_null(), utf16.is_null()) {
-            (false, true) => Some(Self::Ascii(unsafe { ak::slice_from_raw_parts(ascii, length) })),
+        match (latin1.is_null(), utf16.is_null()) {
+            (false, true) => Some(Self::Latin1(unsafe { ak::slice_from_raw_parts(latin1, length) })),
             (true, false) => Some(Self::Utf16(unsafe { ak::slice_from_raw_parts(utf16, length) })),
             _ => None,
         }
@@ -144,7 +144,7 @@ impl TokenizerInput<'_> {
 
     pub(crate) fn len(self) -> usize {
         match self {
-            Self::Ascii(units) => units.len(),
+            Self::Latin1(units) => units.len(),
             Self::Utf16(units) => units.len(),
         }
     }
@@ -155,21 +155,21 @@ impl TokenizerInput<'_> {
 
     pub(crate) fn code_unit_at(self, index: usize) -> u16 {
         match self {
-            Self::Ascii(units) => u16::from(units[index]),
+            Self::Latin1(units) => u16::from(units[index]),
             Self::Utf16(units) => units[index],
         }
     }
 
     pub(crate) fn slice(self, range: Range<usize>) -> Self {
         match self {
-            Self::Ascii(units) => Self::Ascii(&units[range]),
+            Self::Latin1(units) => Self::Latin1(&units[range]),
             Self::Utf16(units) => Self::Utf16(&units[range]),
         }
     }
 
     pub(crate) fn append_to(self, output: &mut Vec<u16>) {
         match self {
-            Self::Ascii(units) => output.extend(units.iter().copied().map(u16::from)),
+            Self::Latin1(units) => output.extend(units.iter().copied().map(u16::from)),
             Self::Utf16(units) => output.extend_from_slice(units),
         }
     }
@@ -191,7 +191,7 @@ impl FilteredTokenizerInput<'_> {
 
 fn filter_code_points(input: TokenizerInput<'_>) -> FilteredTokenizerInput<'_> {
     let needs_filtering = match input {
-        TokenizerInput::Ascii(units) => units.iter().any(|unit| matches!(unit, b'\r' | b'\x0c' | b'\0')),
+        TokenizerInput::Latin1(units) => units.iter().any(|unit| matches!(unit, b'\r' | b'\x0c' | b'\0')),
         TokenizerInput::Utf16(units) => {
             let mut index = 0;
             let mut needs_filtering = false;
@@ -227,7 +227,7 @@ fn filter_code_points(input: TokenizerInput<'_>) -> FilteredTokenizerInput<'_> {
     let mut last_was_carriage_return = false;
     while index < input.len() {
         let (code_point, length) = match input {
-            TokenizerInput::Ascii(units) => (u32::from(units[index]), 1),
+            TokenizerInput::Latin1(units) => (u32::from(units[index]), 1),
             TokenizerInput::Utf16(units) => {
                 let first = units[index];
                 if (0xd800..=0xdbff).contains(&first)
@@ -286,7 +286,7 @@ fn filter_code_points(input: TokenizerInput<'_>) -> FilteredTokenizerInput<'_> {
 impl<'a> From<ak::Utf16StringUnits<'a>> for TokenizerInput<'a> {
     fn from(value: ak::Utf16StringUnits<'a>) -> Self {
         match value {
-            ak::Utf16StringUnits::Ascii(units) => Self::Ascii(units),
+            ak::Utf16StringUnits::Ascii(units) | ak::Utf16StringUnits::Latin1(units) => Self::Latin1(units),
             ak::Utf16StringUnits::Utf16(units) => Self::Utf16(units),
         }
     }
@@ -295,7 +295,7 @@ impl<'a> From<ak::Utf16StringUnits<'a>> for TokenizerInput<'a> {
 impl<'a> From<&'a [u8]> for TokenizerInput<'a> {
     fn from(value: &'a [u8]) -> Self {
         assert!(value.is_ascii());
-        Self::Ascii(value)
+        Self::Latin1(value)
     }
 }
 
@@ -503,21 +503,21 @@ pub(crate) enum ParserSource {
 
 #[derive(Debug)]
 pub(crate) enum SourceStorage {
-    Ascii(Box<[u8]>),
+    Latin1(Box<[u8]>),
     Utf16(Box<[u16]>),
 }
 
 impl SourceStorage {
     fn from_input(input: TokenizerInput<'_>) -> Self {
         match input {
-            TokenizerInput::Ascii(units) => Self::Ascii(units.into()),
+            TokenizerInput::Latin1(units) => Self::Latin1(units.into()),
             TokenizerInput::Utf16(units) => Self::Utf16(units.into()),
         }
     }
 
     fn as_input(&self) -> TokenizerInput<'_> {
         match self {
-            Self::Ascii(units) => TokenizerInput::Ascii(units),
+            Self::Latin1(units) => TokenizerInput::Latin1(units),
             Self::Utf16(units) => TokenizerInput::Utf16(units),
         }
     }
@@ -550,7 +550,7 @@ impl TextDetacher {
                 Arc::clone(storage)
             } else {
                 Arc::new(match storage.as_ref() {
-                    SourceStorage::Ascii(units) => SourceStorage::Ascii(units[span.clone()].into()),
+                    SourceStorage::Latin1(units) => SourceStorage::Latin1(units[span.clone()].into()),
                     SourceStorage::Utf16(units) => SourceStorage::Utf16(units[span.clone()].into()),
                 })
             });
@@ -660,7 +660,7 @@ impl ParserSource {
             Self::Empty => ParserSourceIter::Empty,
             Self::Owned(source) => ParserSourceIter::Owned(source.iter()),
             Self::Shared { storage, range } => match storage.as_ref() {
-                SourceStorage::Ascii(source) => ParserSourceIter::Ascii(source[range.clone()].iter()),
+                SourceStorage::Latin1(source) => ParserSourceIter::Ascii(source[range.clone()].iter()),
                 SourceStorage::Utf16(source) => ParserSourceIter::Utf16(source[range.clone()].iter()),
             },
         }
@@ -671,7 +671,7 @@ impl ParserSource {
             Self::Empty => {}
             Self::Owned(source) => target.extend_from_slice(source),
             Self::Shared { storage, range } => match storage.as_ref() {
-                SourceStorage::Ascii(source) => target.extend(source[range.clone()].iter().copied().map(u16::from)),
+                SourceStorage::Latin1(source) => target.extend(source[range.clone()].iter().copied().map(u16::from)),
                 SourceStorage::Utf16(source) => target.extend_from_slice(&source[range.clone()]),
             },
         }
@@ -693,10 +693,24 @@ impl PartialEq for ParserSource {
 impl Eq for ParserSource {}
 
 pub(crate) fn tokenize_for_parser<'a>(input: impl Into<TokenizerInput<'a>>) -> Vec<ParserToken> {
-    let input = input.into();
+    tokenize_for_parser_with_comments(input.into(), Comments::AsWhitespace)
+}
+
+/// The tokens of `input`, whose comments tokenize as `comments` says.
+pub(crate) fn tokenize_for_parser_with_comments(input: TokenizerInput<'_>, comments: Comments) -> Vec<ParserToken> {
     let mut tokens = Vec::with_capacity(input.len() / 3);
-    ParserTokenFeed::new(input).fill(&mut tokens, usize::MAX);
+    ParserTokenFeed::with_comments(input, comments).fill(&mut tokens, usize::MAX);
     tokens
+}
+
+/// What a comment between two tokens tokenizes as.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Comments {
+    /// A whitespace token, as in text an author wrote, for serializing custom properties as written.
+    AsWhitespace,
+    /// Nothing: in text the engine serialized from tokens, a comment only keeps two tokens apart
+    /// that would otherwise tokenize as one.
+    Separating,
 }
 
 pub(crate) fn tokenize_for_parser_without_source<'a>(input: impl Into<TokenizerInput<'a>>) -> SmallParserTokenList {
@@ -847,8 +861,14 @@ pub(crate) struct ParserTokenFeed {
 
 impl ParserTokenFeed {
     pub(crate) fn new(input: TokenizerInput<'_>) -> Self {
+        Self::with_comments(input, Comments::AsWhitespace)
+    }
+
+    fn with_comments(input: TokenizerInput<'_>, comments: Comments) -> Self {
         let source = Arc::new(SourceStorage::from_input(filter_code_points(input).as_input()));
-        let cursor = Tokenizer::new(source.as_input()).cursor();
+        let mut tokenizer = Tokenizer::new(source.as_input());
+        tokenizer.comments = comments;
+        let cursor = tokenizer.cursor();
         Self {
             source,
             cursor: Some(cursor),
@@ -1028,6 +1048,7 @@ struct Tokenizer<'a> {
     current_code_point: u32,
     position: SourcePosition,
     prev_position: SourcePosition,
+    comments: Comments,
 }
 
 // The state a tokenizer resumes from, at the start of its next token.
@@ -1038,14 +1059,11 @@ struct TokenizerCursor {
     current_code_point: u32,
     position: SourcePosition,
     prev_position: SourcePosition,
+    comments: Comments,
 }
 
 impl<'a> Tokenizer<'a> {
     fn new(input: TokenizerInput<'a>) -> Self {
-        // Checked once here, not per code point: that made debug builds quadratic in the input length.
-        if let TokenizerInput::Ascii(units) = input {
-            debug_assert!(units.is_ascii(), "an ASCII tokenizer input holds only ASCII bytes");
-        }
         Self {
             input,
             index: 0,
@@ -1053,6 +1071,7 @@ impl<'a> Tokenizer<'a> {
             current_code_point: TOKENIZER_EOF,
             position: SourcePosition::default(),
             prev_position: SourcePosition::default(),
+            comments: Comments::AsWhitespace,
         }
     }
 
@@ -1064,6 +1083,7 @@ impl<'a> Tokenizer<'a> {
             current_code_point: cursor.current_code_point,
             position: cursor.position,
             prev_position: cursor.prev_position,
+            comments: cursor.comments,
         }
     }
 
@@ -1074,6 +1094,7 @@ impl<'a> Tokenizer<'a> {
             current_code_point: self.current_code_point,
             position: self.position,
             prev_position: self.prev_position,
+            comments: self.comments,
         }
     }
 
@@ -1142,7 +1163,7 @@ impl<'a> Tokenizer<'a> {
 
     fn code_point_at(&self, index: usize) -> Option<(u32, usize)> {
         match self.input {
-            TokenizerInput::Ascii(units) => units.get(index).map(|unit| (u32::from(*unit), 1)),
+            TokenizerInput::Latin1(units) => units.get(index).map(|unit| (u32::from(*unit), 1)),
             TokenizerInput::Utf16(units) => {
                 let first = *units.get(index)?;
                 if (0xD800..=0xDBFF).contains(&first)
@@ -1716,7 +1737,7 @@ impl<'a> Tokenizer<'a> {
         // This section describes how to consume a token from a stream of code points.
         // It will return a single token of any type.
 
-        let start_byte_offset = self.current_byte_offset();
+        let mut start_byte_offset = self.current_byte_offset();
 
         // Consume comments.
         self.consume_comments();
@@ -1724,7 +1745,12 @@ impl<'a> Tokenizer<'a> {
         // AD-HOC: Preserve comments as whitespace tokens, for serializing custom properties.
         let after_comments_byte_offset = self.current_byte_offset();
         if after_comments_byte_offset != start_byte_offset {
-            return Token::create(TokenType::Whitespace, start_byte_offset..self.current_byte_offset());
+            match self.comments {
+                Comments::AsWhitespace => {
+                    return Token::create(TokenType::Whitespace, start_byte_offset..self.current_byte_offset());
+                }
+                Comments::Separating => start_byte_offset = after_comments_byte_offset,
+            }
         }
 
         // Consume the next input code point.
@@ -2258,7 +2284,7 @@ mod tests {
 
     fn debug_token(token: &Token, input: TokenizerInput<'_>) -> String {
         let source = match input {
-            TokenizerInput::Ascii(units) => units[token.original_source_range.clone()]
+            TokenizerInput::Latin1(units) => units[token.original_source_range.clone()]
                 .iter()
                 .copied()
                 .map(u16::from)
@@ -2436,8 +2462,8 @@ mod tests {
     #[test]
     fn clean_input_is_not_copied_by_code_point_filtering() {
         let input = b"color: red";
-        let FilteredTokenizerInput::Borrowed(TokenizerInput::Ascii(filtered)) =
-            filter_code_points(TokenizerInput::Ascii(input))
+        let FilteredTokenizerInput::Borrowed(TokenizerInput::Latin1(filtered)) =
+            filter_code_points(TokenizerInput::Latin1(input))
         else {
             panic!("clean input should remain borrowed");
         };
@@ -2460,7 +2486,7 @@ mod tests {
         let ParserSource::Shared { storage, range } = &ascii_tokens[0].source else {
             panic!("token source should use shared storage");
         };
-        assert!(matches!(storage.as_ref(), SourceStorage::Ascii(_)));
+        assert!(matches!(storage.as_ref(), SourceStorage::Latin1(_)));
         assert_eq!(range.clone(), 0..5);
 
         let utf16 = "café".encode_utf16().collect::<Vec<_>>();

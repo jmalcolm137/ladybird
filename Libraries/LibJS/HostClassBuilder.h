@@ -231,20 +231,20 @@ inline Utf16FlyString string_from_abi(u16 const* code_units, size_t length_in_co
     return Utf16FlyString::from_utf16(Utf16View { reinterpret_cast<char16_t const*>(code_units), length_in_code_units });
 }
 
-// Strings cross the ABI as 16-bit code units, which an ASCII string only has once widened.
+// Strings cross the ABI as 16-bit code units, which a Latin-1 string only has once widened.
 template<typename Callback>
 void with_string_as_abi(Utf16FlyString const& string, Callback callback)
 {
     auto view = string.view();
-    if (!view.has_ascii_storage()) {
+    if (!view.has_latin1_storage()) {
         auto code_units = view.utf16_span();
         callback(reinterpret_cast<u16 const*>(code_units.data()), code_units.size());
         return;
     }
     Vector<u16, 64> widened_code_units;
     widened_code_units.ensure_capacity(view.length_in_code_units());
-    for (auto ascii_character : view.ascii_span())
-        widened_code_units.unchecked_append(static_cast<u8>(ascii_character));
+    for (auto latin1_character : view.latin1_span())
+        widened_code_units.unchecked_append(latin1_character);
     callback(widened_code_units.data(), widened_code_units.size());
 }
 
@@ -567,6 +567,7 @@ consteval JSHostClass make_host_class(u8 kind, StringView name, JSHostClass cons
     constexpr u32 host_object_flags = JS_HOST_CLASS_IMMUTABLE_PROTOTYPE
         | JS_HOST_CLASS_NOT_CACHEABLE_FOR_PROPERTY_ABSENCE
         | JS_HOST_CLASS_NOT_CACHEABLE_FOR_INDEXED_PROPERTY_ABSENCE
+        | JS_HOST_CLASS_NOT_CACHEABLE_ACROSS_REALMS
         | JS_HOST_CLASS_NOT_ELIGIBLE_FOR_OWN_PROPERTY_ENUMERATION_FAST_PATH;
 
     u32 allowed_flags = JS_HOST_CLASS_SHARES_ALLOCATOR_WITH_PARENT;

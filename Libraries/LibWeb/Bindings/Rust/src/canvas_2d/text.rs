@@ -9,7 +9,7 @@
 
 use libgfx_rust::font::{EmojiPresentation, FontCascadeListHandle, FontHandle};
 use libgfx_rust::path::{GlyphRun, Path};
-use libgfx_rust::text_layout::{DrawGlyph, TextType, shape_text as shape_text_in_font};
+use libgfx_rust::text_layout::{GlyphBuffer, TextType, shape_text as shape_text_in_font};
 use libgfx_rust::{AffineTransform, FloatPoint};
 
 use super::context::multiply_transforms;
@@ -19,7 +19,7 @@ use crate::html::canvas_rendering_context2d::{CanvasTextAlign, CanvasTextBaselin
 /// A run of the text that one font of the cascade shapes.
 pub(crate) struct ShapedRun {
     pub(crate) font: FontHandle,
-    pub(crate) glyphs: Vec<DrawGlyph>,
+    pub(crate) glyphs: GlyphBuffer,
     pub(crate) width: f32,
 }
 
@@ -59,18 +59,19 @@ pub(crate) fn shape_text(
     let mut last_position = baseline_start;
     let mut add_run = |text: &[u16], font: &FontHandle| {
         let shaped = shape_text_in_font(font, text, TextType::Common, 0.0, letter_spacing, word_spacing);
-        let mut glyphs = shaped.glyphs().to_vec();
+        let width = shaped.width();
+        let mut glyphs = shaped.into_glyphs();
         if last_position.x != 0.0 || last_position.y != 0.0 {
-            for glyph in &mut glyphs {
-                glyph.x += last_position.x;
-                glyph.y += last_position.y;
-            }
+            glyphs.update_positions(|_, x, y| {
+                *x += last_position.x;
+                *y += last_position.y;
+            });
         }
-        last_position.x += shaped.width();
+        last_position.x += width;
         runs.push(ShapedRun {
             font: font.clone(),
             glyphs,
-            width: shaped.width(),
+            width,
         });
     };
 
@@ -106,17 +107,35 @@ pub(crate) fn path_of_runs(runs: &[ShapedRun]) -> Path {
     Path::from_glyph_runs(&glyph_runs)
 }
 
+/// How far the top of the font's em square is above the alphabetic baseline, and its bottom below it. The em square is
+/// as tall as the font size, and it's divided at the baseline in the same proportion as the font's ascent and descent.
+pub(crate) fn em_square_ascent_and_descent(font: &FontHandle) -> (f32, f32) {
+    let facts = font.facts();
+    let font_height = facts.ascent + facts.descent;
+    let ascent = if font_height > 0.0 {
+        facts.pixel_size * facts.ascent / font_height
+    } else {
+        facts.pixel_size / 2.0
+    };
+    (ascent, facts.pixel_size - ascent)
+}
+
 /// The distance from the alphabetic baseline down to the baseline that textBaseline names, in the metrics of the
 /// first font of the cascade, https://html.spec.whatwg.org/multipage/canvas.html#dom-context-2d-textbaseline
 pub(crate) fn baseline_offset(text_baseline: CanvasTextBaseline, first_font: &FontHandle) -> f32 {
     let ascent = first_font.facts().ascent;
     let descent = first_font.facts().descent;
+    let (em_ascent, em_descent) = em_square_ascent_and_descent(first_font);
     match text_baseline {
-        CanvasTextBaseline::Top => ascent,
+        // "The top of the em square"
+        CanvasTextBaseline::Top => em_ascent,
         CanvasTextBaseline::Hanging => ascent * 0.8,
-        CanvasTextBaseline::Middle => (ascent - descent) / 2.0,
+        // "The middle of the em square"
+        CanvasTextBaseline::Middle => (em_ascent - em_descent) / 2.0,
         CanvasTextBaseline::Alphabetic => 0.0,
-        CanvasTextBaseline::Ideographic | CanvasTextBaseline::Bottom => -descent,
+        CanvasTextBaseline::Ideographic => -descent,
+        // "The bottom of the em square"
+        CanvasTextBaseline::Bottom => -em_descent,
     }
 }
 

@@ -5,7 +5,7 @@
  */
 
 use super::LayoutNodeArena;
-use super::node_data::{GENERATED_FOR_FIRST_LETTER, NodeSlotId};
+use super::node_data::{GENERATED_FOR_FIRST_LETTER, NodeKind, NodeSlotId};
 use super::node_facts::{kind_is_box, kind_is_text, node_style_view};
 use super::rendered_text::{FfiTextSourceRange, RenderedTextBoundary, ensure_text_content};
 use crate::css::css_enums::{visibility, white_space_collapse};
@@ -70,6 +70,11 @@ impl MappedText {
         });
     }
 
+    /// Where the text appended last ends.
+    fn end(&self) -> Option<TextPosition> {
+        self.runs.last().map(|run| run.end)
+    }
+
     fn position(&self, offset: usize, boundary: RenderedTextBoundary) -> Option<TextPosition> {
         if offset > self.text.len() || self.runs.is_empty() {
             return None;
@@ -123,8 +128,7 @@ fn collapses_whitespace(rows: &impl PaintRead, node: NodeSlotId) -> bool {
         parent
             .and_then(|parent| rows.node_style_if_live(parent))
             .expect("text parent has style")
-            .inherited_text()
-            .white_space_collapse,
+            .white_space_collapse(),
         white_space_collapse::COLLAPSE | white_space_collapse::PRESERVE_BREAKS
     )
 }
@@ -254,6 +258,110 @@ pub(crate) fn text_word_range(
     }
 }
 
+/// The box whose inline content the text row `node` is part of.
+fn containing_box(arena: &LayoutNodeArena, node: NodeSlotId) -> NodeSlotId {
+    let mut current = arena.data(node).parent.get();
+    while !current.is_invalid() && !kind_is_box(arena.data(current).kind.get()) {
+        current = arena.data(current).parent.get();
+    }
+    current
+}
+
+/// The DOM range of the word at `dom_offset` in the text node whose primary row is `primary`, read across the inline
+/// boxes around it: A word runs on through inline elements, but not past a box, a line break or generated content
+/// within the same inline content. None where the word lies in that one text node anyway.
+pub(crate) fn inline_word_range(
+    arena: &mut LayoutNodeArena,
+    primary: NodeSlotId,
+    dom_offset: usize,
+) -> Option<FfiDomTextRange> {
+    if arena
+        .text_content(primary)
+        .is_some_and(|content| content.is_password_input())
+    {
+        return None;
+    }
+    let container = containing_box(arena, primary);
+    if container.is_invalid() {
+        return None;
+    }
+    // NB: The rows of the inline content, split into runs where something other than inline text and inline boxes
+    //     comes between them.
+    let mut nodes = Vec::new();
+    arena.for_each_node_in_layout_subtree_in_pre_order(container, |node| nodes.push(node));
+    let mut runs: Vec<Vec<NodeSlotId>> = vec![Vec::new()];
+    let mut primary_run = None;
+    for node in nodes {
+        if node == container {
+            continue;
+        }
+        let data = arena.data(node);
+        let kind = data.kind.get();
+        let pseudo = data.generated_for.get();
+        if node_style_view(data).is_some_and(|style| style.display().is_none()) {
+            continue;
+        }
+        let breaks_run = kind == NodeKind::BreakNode
+            || (kind_is_box(kind) && pseudo != GENERATED_FOR_FIRST_LETTER)
+            || (pseudo != 0 && pseudo != GENERATED_FOR_FIRST_LETTER);
+        if breaks_run {
+            if !runs.last().expect("there is always a run").is_empty() {
+                runs.push(Vec::new());
+            }
+            continue;
+        }
+        // NB: A ::first-letter row is read with the rest of its text node, through that node's primary row.
+        if kind != NodeKind::TextNode
+            || pseudo == GENERATED_FOR_FIRST_LETTER
+            || arena.node_style_node(node).is_none()
+            || containing_box(arena, node) != container
+        {
+            continue;
+        }
+        if node == primary {
+            primary_run = Some(runs.len() - 1);
+        }
+        runs.last_mut().expect("there is always a run").push(node);
+    }
+    let run = std::mem::take(&mut runs[primary_run?]);
+    if run.len() < 2 {
+        return None;
+    }
+
+    let mut text = MappedText::default();
+    let mut hit_offset = None;
+    for node in run {
+        ensure_text_fragments(arena, node);
+        for &fragment in arena.text_fragments(node).as_slice() {
+            let content = arena.text_content(fragment).expect("fragment was refreshed");
+            let dom_range = content.dom_range();
+            if node == primary && hit_offset.is_none() && dom_offset >= dom_range.start && dom_offset <= dom_range.end {
+                hit_offset = Some(text.text.len() + content.rendered_text_offset_for_dom_offset(dom_offset, Start));
+            }
+            text.append(
+                &content.text,
+                TextPosition {
+                    node: fragment,
+                    offset: 0,
+                },
+                TextPosition {
+                    node: fragment,
+                    offset: content.text.len(),
+                },
+            );
+        }
+    }
+    if text.text.is_empty() {
+        return None;
+    }
+    let range = super::text_chunker::word_boundaries(&text.text, hit_offset?);
+    let dom_range = text.dom_range(arena, range)?;
+    if dom_range.start_text_node == dom_range.end_text_node {
+        return None;
+    }
+    Some(dom_range)
+}
+
 #[derive(Default)]
 struct SearchTextBuilder {
     blocks: Vec<MappedText>,
@@ -267,6 +375,16 @@ impl SearchTextBuilder {
             self.blocks.push(std::mem::take(&mut self.current));
         }
         self.pending_space = None;
+    }
+
+    /// A line break separates the words around it as collapsible white space does, and collapses with the white space
+    /// next to it. The space it stands for covers no DOM text, at the end of the text before it.
+    fn break_line(&mut self) {
+        if self.pending_space.is_none()
+            && let Some(end) = self.current.end()
+        {
+            self.pending_space = Some((end, end));
+        }
     }
 
     fn append(&mut self, node: NodeSlotId, text: &[u16], collapse: bool) {
@@ -299,6 +417,7 @@ fn text_node_identity(arena: &LayoutNodeArena, node: NodeSlotId) -> u32 {
 enum SearchNode {
     Skip,
     Break,
+    LineBreak,
     Text(StyleNodeID),
 }
 
@@ -317,6 +436,9 @@ fn search_node(arena: &LayoutNodeArena, node: NodeSlotId) -> SearchNode {
     let data = arena.data(node);
     if node_style_view(data).is_some_and(|style| style.display().is_none()) {
         return SearchNode::Skip;
+    }
+    if data.kind.get() == NodeKind::BreakNode {
+        return SearchNode::LineBreak;
     }
     let pseudo = data.generated_for.get();
     if kind_is_box(data.kind.get()) || (pseudo != 0 && pseudo != GENERATED_FOR_FIRST_LETTER) {
@@ -361,6 +483,7 @@ fn ensure_searchable_text(
         match search_node(arena, node) {
             SearchNode::Skip => {}
             SearchNode::Break => builder.flush(),
+            SearchNode::LineBreak => builder.break_line(),
             SearchNode::Text(text) => {
                 if !is_searchable(text) {
                     continue;
@@ -372,7 +495,7 @@ fn ensure_searchable_text(
         }
     }
     builder.flush();
-    arena.searchable_text = Some(builder.blocks);
+    *arena.searchable_text = Some(builder.blocks);
 }
 
 /// A range in the DOM text the layout rows render, between the DOM text nodes the identities
@@ -458,10 +581,29 @@ pub extern "C" fn layout_text_word_range(
     })
 }
 
+/// The DOM range of the word at `dom_offset` in the text node whose primary row is `primary`, where the word runs on
+/// into the text of other DOM text nodes through inline elements. False, leaving `range` alone, where it doesn't.
+#[unsafe(no_mangle)]
+pub extern "C" fn layout_text_inline_word_range(
+    host: &crate::render_state::DocumentHost,
+    primary: NodeSlotId,
+    dom_offset: usize,
+    range: &mut FfiDomTextRange,
+) -> bool {
+    host.ask(node_read(), |state| {
+        match inline_word_range(state.arena_mut(), primary, dom_offset) {
+            Some(found) => {
+                *range = found;
+                true
+            }
+            None => false,
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::layout::node_data::NodeKind;
     use crate::layout::rendered_text::{RenderedTextEdit, TextContent};
 
     fn node(
@@ -567,10 +709,10 @@ mod tests {
         let mut builder = SearchTextBuilder::default();
         builder.append(text, &arena.text_content(text).unwrap().text, false);
         builder.flush();
-        arena.searchable_text = Some(builder.blocks);
+        *arena.searchable_text = Some(builder.blocks);
         arena.set_text_content(text, TextContent::for_test("world", 0, 5, Vec::new()));
         assert!(arena.searchable_text.is_none());
-        arena.searchable_text = Some(Vec::new());
+        *arena.searchable_text = Some(Vec::new());
         arena
             .free_subtree(text)
             .destroy_shells_and_invoke_callbacks(&crate::stage::MainThread::for_test());
@@ -584,7 +726,7 @@ mod tests {
         let mut builder = SearchTextBuilder::default();
         builder.append(text, &arena.text_content(text).unwrap().text, false);
         builder.flush();
-        arena.searchable_text = Some(builder.blocks);
+        *arena.searchable_text = Some(builder.blocks);
         let query: Vec<u16> = "foo".encode_utf16().collect();
         let offsets: Vec<_> = find_matching_text(&mut arena, text, &query, true, &[])
             .iter()

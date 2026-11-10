@@ -8,6 +8,7 @@ use super::formatting_context::{PixelFraction, ReplacedIntrinsicSize};
 use super::*;
 use crate::css::style::{NaturalSize, ReplacedContentInput};
 
+#[inline]
 pub(crate) fn node_may_have_replaced_content_facts(data: &NodeData) -> bool {
     kind_is_replaced_box(data.kind.get())
         || matches!(
@@ -342,15 +343,10 @@ fn auto_content_size(
 }
 
 /// The node's own computed style, read off the style container the node data points at. Callers inside a layout pass go
-/// through the pass callbacks instead; this is for the node-data entry points the C++ side calls directly.
+/// through the pass instead; this is for the node-data entry points the C++ side calls directly.
 pub(crate) fn node_style_view(data: &NodeData) -> Option<ComputedValuesView<'_>> {
-    if data.style.get().is_null() {
-        return None;
-    }
-    // SAFETY: A non-null style pointer addresses the container's group
-    // pointer array, which FfiStylePayloads mirrors exactly.
-    let payloads = unsafe { data.style.get().deref() };
-    Some(ComputedValuesView::new(&payloads.groups))
+    // SAFETY: The arena pins the style of each of its rows while the row holds it.
+    data.style.get().map(|style| unsafe { style.view() })
 }
 
 pub(crate) fn style_insets_use_anchor_functions(style: ComputedValuesView<'_>) -> bool {
@@ -399,14 +395,11 @@ pub(crate) fn node_is_positioned(data: &impl NodeShape, style: Option<ComputedVa
     };
     let box_values = style.box_values();
     let is_flex_or_grid_item = has_flag(data, NodeFlag::IsFlexItem) || has_flag(data, NodeFlag::IsGridItem);
-    box_values.position != crate::css::css_enums::positioning::STATIC
-        || (is_flex_or_grid_item && box_values.has_z_index)
+    style.position() != crate::css::css_enums::positioning::STATIC || (is_flex_or_grid_item && box_values.has_z_index)
 }
 
 pub(crate) fn node_position(style: Option<ComputedValuesView<'_>>) -> u8 {
-    style.map_or(crate::css::css_enums::positioning::STATIC, |style| {
-        style.box_values().position
-    })
+    style.map_or(crate::css::css_enums::positioning::STATIC, |style| style.position())
 }
 
 /// Flex items never float, whatever their computed float value says.
@@ -516,7 +509,7 @@ pub(crate) fn node_creates_block_formatting_context(
         if display.is_table_inside() || display.is_flex_inside() || display.is_grid_inside() {
             return false;
         }
-        let inside_is_laid_out_as_flow = display.is_flow_inside() || display.is_ruby_inside();
+        let inside_is_laid_out_as_flow = display.is_flow_inside();
         if (style.is_floating() && !has_flag(data, NodeFlag::IsFlexItem))
             || style.own_style_establishes_block_formatting_context()
         {
@@ -750,6 +743,7 @@ pub(crate) fn kind_is_block_container(kind: NodeKind) -> bool {
         kind,
         NodeKind::BlockContainer
             | NodeKind::FieldSetBox
+            | NodeKind::FrameSetBox
             | NodeKind::LegendBox
             | NodeKind::ListItemBox
             | NodeKind::ListItemMarkerBox
@@ -771,6 +765,7 @@ pub(crate) fn kind_is_non_devolvable_widget(kind: NodeKind) -> bool {
     matches!(kind, NodeKind::CheckBox | NodeKind::RadioButton)
 }
 
+#[inline]
 pub(crate) fn kind_is_replaced_box(kind: NodeKind) -> bool {
     matches!(
         kind,
@@ -814,38 +809,32 @@ pub(crate) fn kind_is_svg_box(kind: NodeKind) -> bool {
 /// Nothing is materialized per node, so every answer is as live as its source.
 #[derive(Clone, Copy)]
 pub(crate) struct NodeFacts<'pass> {
-    callbacks: LayoutPass<'pass>,
+    pass: LayoutPass<'pass>,
     node: Node,
     data: &'pass NodeData,
-    style_payloads: Option<&'pass FfiStylePayloads>,
+    style: Option<ComputedValuesView<'pass>>,
 }
 
 impl<'pass> NodeFacts<'pass> {
     #[inline]
-    pub(crate) fn new(callbacks: &LayoutPass<'pass>, node: Node) -> Self {
-        let data = callbacks.node_data(node);
-        let style_payloads = callbacks.style_payloads_if_styled(node);
-        Self {
-            callbacks: *callbacks,
-            node,
-            data,
-            style_payloads,
-        }
+    pub(crate) fn new(pass: &LayoutPass<'pass>, node: Node) -> Self {
+        let (data, style) = pass.row_and_style(node);
+        Self::from_lookups(pass, node, data, style)
     }
 
     /// The facts of `node`, from the node data and style payloads that [`Self::new`] looked up for it.
     #[inline]
     pub(super) fn from_lookups(
-        callbacks: &LayoutPass<'pass>,
+        pass: &LayoutPass<'pass>,
         node: Node,
         data: &'pass NodeData,
-        style_payloads: Option<&'pass FfiStylePayloads>,
+        style: Option<ComputedValuesView<'pass>>,
     ) -> Self {
         Self {
-            callbacks: *callbacks,
+            pass: *pass,
             node,
             data,
-            style_payloads,
+            style,
         }
     }
 
@@ -853,8 +842,8 @@ impl<'pass> NodeFacts<'pass> {
         self.data
     }
 
-    pub(super) fn style_payloads(&self) -> Option<&'pass FfiStylePayloads> {
-        self.style_payloads
+    pub(super) fn style_view(&self) -> Option<ComputedValuesView<'pass>> {
+        self.style
     }
 
     /// The writing mode of the box's parent box, which it lays out its contents in if it has another one.
@@ -866,21 +855,20 @@ impl<'pass> NodeFacts<'pass> {
 
     fn parent_data(&self) -> Option<&'pass NodeData> {
         let parent = self.data().parent.get();
-        (!parent.is_invalid()).then(|| self.callbacks.node_data(parent))
+        (!parent.is_invalid()).then(|| self.pass.node_data(parent))
     }
 
     pub(super) fn style(&self) -> StyleValues<'pass> {
         StyleValues::new(
-            self.style_payloads
+            self.style
                 .expect("styled node must publish its style container before layout"),
         )
         .for_kind(self.data().kind.get())
-        .in_frame(self.callbacks.frame)
+        .in_frame(self.pass.frame)
     }
 
     pub(super) fn computed_values_view_if_styled(&self) -> Option<ComputedValuesView<'pass>> {
-        self.style_payloads
-            .map(|payloads| ComputedValuesView::new(&payloads.groups))
+        self.style
     }
 
     pub(super) fn parent_computed_values_view_if_styled(&self) -> Option<ComputedValuesView<'pass>> {
@@ -888,14 +876,33 @@ impl<'pass> NodeFacts<'pass> {
         if parent.is_invalid() {
             return None;
         }
-        self.callbacks.computed_values_view_if_styled(parent)
+        self.pass.computed_values_view_if_styled(parent)
+    }
+
+    #[inline]
+    fn may_have_replaced_content_facts(&self) -> bool {
+        node_may_have_replaced_content_facts(self.data()) || self.pass.has_replaced_content_facts(self.node)
     }
 
     #[inline]
     /// The natural and default sizes of the box's replaced content, as width and height in the frame of the pass.
     fn replaced_content(&self) -> ReplacedContentFacts {
+        if !self.may_have_replaced_content_facts() {
+            // The style half of the enrollment predicate is debug-only because this is the steady state for
+            // ordinary boxes.
+            debug_assert!(
+                !node_may_have_replaced_content_facts_including_size_containment(self.data()),
+                "replaced content facts were not synced to the arena before layout"
+            );
+            return ReplacedContentFacts::default();
+        }
+        self.replaced_content_of_box_with_facts()
+    }
+
+    #[inline(never)]
+    fn replaced_content_of_box_with_facts(&self) -> ReplacedContentFacts {
         let facts = self.physical_replaced_content();
-        if self.callbacks.frame.is_transposed() {
+        if self.pass.frame.is_transposed() {
             facts.transposed()
         } else {
             facts
@@ -949,21 +956,9 @@ impl<'pass> NodeFacts<'pass> {
         if self.data().kind.get() == NodeKind::SVGSVGBox {
             return self.svg_root_replaced_content();
         }
-        let Some(facts) = self.callbacks.replaced_content_facts(self.node) else {
-            // The kind check is cheap enough for release builds; the style
-            // half of the enrollment predicate is debug-only because this
-            // miss path is the steady state for ordinary boxes.
-            assert!(
-                !node_may_have_replaced_content_facts(self.data()),
-                "replaced content facts were not synced to the arena before layout"
-            );
-            debug_assert!(
-                !node_may_have_replaced_content_facts_including_size_containment(self.data()),
-                "replaced content facts were not synced to the arena before layout"
-            );
-            return ReplacedContentFacts::default();
-        };
-        facts
+        self.pass
+            .replaced_content_facts(self.node)
+            .expect("replaced content facts were not synced to the arena before layout")
     }
 
     /// An <svg> root's natural size resolves the lengths its element published against its style and the
@@ -971,14 +966,13 @@ impl<'pass> NodeFacts<'pass> {
     #[cold]
     fn svg_root_replaced_content(&self) -> ReplacedContentFacts {
         let mut facts = derived_replaced_content_facts(self.data(), ReplacedContentInput::None);
-        let arena = self.callbacks.arena();
+        let arena = self.pass.arena();
         let is_document_element_box = arena.is_document_svg_root_box(self.node);
         let size_contained = self.node_has_size_containment();
         if size_contained && !is_document_element_box {
             return facts;
         }
-        let (width, height, aspect_ratio) =
-            super::svg_formatting_context::svg_root_natural_size(&self.callbacks, self.node);
+        let (width, height, aspect_ratio) = super::svg_formatting_context::svg_root_natural_size(&self.pass, self.node);
         // An <object> showing the document is sized from what its <svg> document element would be
         // without size containment.
         if is_document_element_box {
@@ -988,7 +982,7 @@ impl<'pass> NodeFacts<'pass> {
                 aspect_ratio: aspect_ratio
                     .map(|(numerator, denominator)| (numerator.raw_value(), denominator.raw_value())),
             };
-            self.callbacks.note_host_findings(|findings| {
+            self.pass.note_host_findings(|findings| {
                 findings.document_svg_root_natural_size = Some((self.node, natural_size));
             });
         }
@@ -1020,6 +1014,13 @@ impl<'pass> NodeFacts<'pass> {
 
     pub(crate) fn is_replaced_box(&self) -> bool {
         kind_is_replaced_box(self.data().kind.get())
+    }
+
+    /// https://drafts.csswg.org/css-sizing-3/#min-content-zero
+    /// A box whose cyclic percentage width resolves against zero for its min-content contribution: a replaced box, or a
+    /// compressible text control (a text entry input or a textarea).
+    pub(crate) fn resolves_cyclic_percentages_like_replaced_box(&self) -> bool {
+        self.is_replaced_box() || self.is_text_input() || self.data().kind.get() == NodeKind::TextAreaBox
     }
 
     pub(crate) fn is_range_input_box(&self) -> bool {
@@ -1252,7 +1253,7 @@ impl<'pass> NodeFacts<'pass> {
 
     /// Whether the box is generated for a MathML element whose tag name selects a MathML layout algorithm.
     pub(crate) fn uses_math_layout(&self) -> bool {
-        self.callbacks.arena().math_layout_kind(self.node).uses_math_layout()
+        self.pass.arena().math_layout_kind(self.node).uses_math_layout()
     }
 
     // https://drafts.csswg.org/css2/#propdef-vertical-align
@@ -1291,9 +1292,9 @@ impl<'pass> NodeFacts<'pass> {
         }
         let mut child = data.first_child.get();
         while !child.is_invalid() {
-            let child_data = self.callbacks.node_data(child);
+            let child_data = self.pass.node_data(child);
             if child_data.kind.get() == NodeKind::LegendBox
-                && !node_is_out_of_flow(child_data, self.callbacks.computed_values_view_if_styled(child))
+                && !node_is_out_of_flow(child_data, self.pass.computed_values_view_if_styled(child))
             {
                 return child;
             }
@@ -1308,15 +1309,15 @@ impl<'pass> NodeFacts<'pass> {
             && !self.has_fieldset_content_wrapper()
     }
 
-    fn has_fieldset_content_wrapper(&self) -> bool {
+    pub(crate) fn has_fieldset_content_wrapper(&self) -> bool {
         let data = self.data();
         if data.kind.get() != NodeKind::FieldSetBox {
             return false;
         }
         let mut child = data.first_child.get();
         while !child.is_invalid() {
-            let child_data = self.callbacks.node_data(child);
-            if node_is_fieldset_content_wrapper(child_data, self.callbacks.computed_values_view_if_styled(child)) {
+            let child_data = self.pass.node_data(child);
+            if node_is_fieldset_content_wrapper(child_data, self.pass.computed_values_view_if_styled(child)) {
                 return true;
             }
             child = child_data.next_sibling.get();
@@ -1333,7 +1334,7 @@ impl<'pass> NodeFacts<'pass> {
         // Walk those wrappers, but not nested authored or generated list items.
         let mut candidate = self.data().first_child.get();
         while !candidate.is_invalid() {
-            let data = self.callbacks.node_data(candidate);
+            let data = self.pass.node_data(candidate);
             if data.kind.get() == NodeKind::ListItemMarkerBox {
                 return candidate;
             }
@@ -1354,7 +1355,7 @@ impl<'pass> NodeFacts<'pass> {
                 if current_data.parent.get() == self.node {
                     return Node::INVALID;
                 }
-                current_data = self.callbacks.node_data(current_data.parent.get());
+                current_data = self.pass.node_data(current_data.parent.get());
             }
         }
         Node::INVALID
@@ -1364,6 +1365,7 @@ impl<'pass> NodeFacts<'pass> {
         has_flag(self.data(), NodeFlag::ListMarkerIsInside)
     }
 
+    #[inline]
     pub(crate) fn auto_content_size(&self) -> ReplacedIntrinsicSize {
         self.replaced_content().auto_content_size
     }
@@ -1383,13 +1385,15 @@ impl<'pass> NodeFacts<'pass> {
         style_has_inline_size_containment(*self.style())
     }
 
+    #[inline]
     pub(crate) fn has_preferred_aspect_ratio(&self) -> bool {
         self.preferred_aspect_ratio().is_some()
     }
 
     pub(crate) fn preferred_aspect_ratio(&self) -> Option<formatting_context::PixelFraction> {
         let style = self.style();
-        if !self.node_has_size_containment()
+        if self.may_have_replaced_content_facts()
+            && !self.node_has_size_containment()
             && style.aspect_ratio_uses_natural_when_available()
             && let Some(aspect_ratio) = self.auto_content_size().aspect_ratio
         {
@@ -1399,16 +1403,18 @@ impl<'pass> NodeFacts<'pass> {
         aspect_ratio_of(numerator, denominator)
     }
 
+    #[inline]
     pub(crate) fn default_preferred_width(&self) -> Option<CssPixels> {
         self.replaced_content().default_preferred_width
     }
 
+    #[inline]
     pub(crate) fn default_preferred_height(&self) -> Option<CssPixels> {
         self.replaced_content().default_preferred_height
     }
 
     pub(crate) fn initial_containing_block_inline_size(&self) -> crate::layout::CssPixels {
-        self.callbacks.initial_containing_block_inline_size
+        self.pass.initial_containing_block_inline_size
     }
 
     pub(crate) fn is_scroll_container(&self) -> bool {
@@ -1416,7 +1422,7 @@ impl<'pass> NodeFacts<'pass> {
     }
 
     pub(crate) fn display(&self) -> crate::layout::FfiDisplay {
-        if self.data().style.get().is_null() {
+        if self.data().style.get().is_none() {
             return crate::layout::FfiDisplay::block();
         }
         self.style().display()
@@ -1479,7 +1485,7 @@ impl<'pass> NodeFacts<'pass> {
     }
 
     pub(crate) fn document_in_quirks_mode(&self) -> bool {
-        self.callbacks.document_in_quirks_mode
+        self.pass.document_in_quirks_mode
     }
 
     pub(crate) fn is_in_user_agent_shadow_tree(&self) -> bool {

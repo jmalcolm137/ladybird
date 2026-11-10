@@ -40,6 +40,8 @@ trap cleanup EXIT
 
 env -u WAYLAND_DISPLAY -u DISPLAY \
     WLR_BACKENDS=headless WLR_HEADLESS_OUTPUTS=1 \
+    XDG_DATA_HOME="$RUNTIME/data" \
+    XDG_CONFIG_HOME="$RUNTIME/config" \
     SDE_WM_PORTAL_PATH="$RUNTIME/wm" \
     SERENITY_RES_ROOT="$SERENITY/Base/res" \
     LD_LIBRARY_PATH="$LAGOM/lib" \
@@ -66,7 +68,7 @@ for _ in $(seq 1 150); do
 done
 # The window maps before the renderer has prepared the location bar and its
 # default bookmarks; give it the extra time so the clicks below are reliable.
-sleep 3
+sleep 5
 
 # Click the location bar and clear its about:newtab text, then type "lady".
 env WAYLAND_DISPLAY="$SOCK" "$VI" --extent 1280 720 \

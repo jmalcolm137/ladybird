@@ -6,10 +6,11 @@
 
 use core::cell::Cell;
 
-use super::cell::{CellHeader, Gc};
+use super::cell::{CellHeader, CellKind, CellState};
+use super::member::Member;
 use super::shape::Shape;
 use super::value::Value;
-use crate::layout_forward::{PrivateElements, TypedArrayBaseStorage};
+use crate::layout_forward::TypedArrayBaseStorage;
 
 pub mod object_flag {
     pub const IS_EXTENSIBLE: u16 = 1 << 0;
@@ -42,43 +43,60 @@ pub enum IndexedStorageKind {
     Dictionary,
 }
 
+/// The bits of Object::class_bits of an array.
+pub mod array_flags {
+    pub const LENGTH_NOT_WRITABLE: u8 = 1 << 0;
+    pub const IS_PROXY_TARGET: u8 = 1 << 1;
+}
+
 /// Packed and holey indexed storage keeps its capacity in a header right in front of the first element.
 pub const INDEXED_ELEMENTS_HEADER_SIZE: usize = 8;
 
-pub const INLINE_NAMED_STORAGE_CAPACITY: usize = 2;
-
+/// An object starts with the shape and the array-like size in the first word of its cell header, which LibGC leaves
+/// to the cell, followed by the rest of the header.
 #[repr(C)]
 pub struct Object {
-    pub header: CellHeader,
-    pub flags: Cell<u16>,
-    pub indexed_storage_kind: Cell<IndexedStorageKind>,
-    /// How many named property values the inline storage holds. It ends the object, and only plain objects and
-    /// mapped arguments objects have cells with room for more than INLINE_NAMED_STORAGE_CAPACITY.
-    pub inline_named_capacity: Cell<u8>,
+    pub shape: Member<Shape>,
     pub indexed_array_like_size: Cell<u32>,
-    pub shape: Cell<Gc<Shape>>,
-    /// Points at `inline_named_storage` until the object needs more room.
+    pub mark: Cell<bool>,
+    pub state: Cell<CellState>,
+    pub kind: CellKind,
+    pub indexed_storage_kind: Cell<IndexedStorageKind>,
+    pub flags: Cell<u16>,
+    /// How many named property values the inline storage holds. It comes right after the object, in the cells of the
+    /// classes that make room for it.
+    pub inline_named_capacity: Cell<u8>,
+    /// What a class keeps in the object: the builtin of a function object plus one (zero for none),
+    /// ecmascript_function_flags for an ECMAScript function object, which have the highest bit set, or array_flags for
+    /// an array. Zero for other objects.
+    pub class_bits: Cell<u8>,
+    /// Points at the inline storage until the object needs more room.
     pub named_properties: Cell<*mut Value>,
+    /// The packed or holey elements. A plain object has its inline storage start here instead, as long as
+    /// `named_properties` points at this word, and moves it out of the way for its first indexed property. Nothing may
+    /// read this word without knowing that the object has packed, holey or dictionary indexed storage.
     pub indexed_elements: Cell<*mut Value>,
-    pub private_elements: PrivateElements,
-    pub inline_named_storage: [Cell<Value>; INLINE_NAMED_STORAGE_CAPACITY],
+    pub inline_named_storage: [Cell<Value>; 0],
 }
 
-// NB: The inline capacity fits in the padding in front of the array-like size, and the inline storage ends the object.
-const _: () = assert!(size_of::<Object>() == 72);
-const _: () = assert!(
-    core::mem::offset_of!(Object, inline_named_storage) + INLINE_NAMED_STORAGE_CAPACITY * size_of::<Value>()
-        == size_of::<Object>()
-);
+const _: () = {
+    use core::mem::offset_of;
+    assert!(offset_of!(Object, mark) == offset_of!(CellHeader, mark));
+    assert!(offset_of!(Object, state) == offset_of!(CellHeader, state));
+    assert!(offset_of!(Object, kind) == offset_of!(CellHeader, kind));
+};
 
-/// Mirrors the Variant<Auto, Detached, u32> the interpreter reads: the length first, then the alternative's index.
+const _: () = assert!(size_of::<Object>() == 32);
+const _: () = assert!(core::mem::offset_of!(Object, inline_named_storage) == size_of::<Object>());
+
+/// Mirrors the Variant<Auto, Detached, size_t> the interpreter reads: the length first, then the alternative's index.
 #[repr(C)]
 pub struct ByteLengthSlot {
-    pub length: Cell<u32>,
+    pub length: Cell<usize>,
     pub alternative_index: Cell<u8>,
 }
 
-pub const BYTE_LENGTH_U32_INDEX: u8 = 2;
+pub const BYTE_LENGTH_LENGTH_INDEX: u8 = 2;
 
 /// Mirrors JS::TypedArrayBase::Kind, in the order of JS_ENUMERATE_TYPED_ARRAYS.
 pub mod typed_array_kind {
@@ -104,7 +122,7 @@ pub struct TypedArrayBase {
     pub kind: Cell<u8>,
     pub element_size: Cell<u8>,
     pub array_length: ByteLengthSlot,
-    pub byte_offset: Cell<u32>,
+    pub byte_offset: Cell<usize>,
     pub cached_data_offset: Cell<usize>,
     pub storage: TypedArrayBaseStorage,
 }

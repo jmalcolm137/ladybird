@@ -41,15 +41,16 @@
 #include <LibWebCommon/UIEvents/KeyCode.h>
 #include <LibWebCommon/UIEvents/MouseButton.h>
 #include <LibWebView/Application.h>
+#include <LibWebView/AutocompleteRanker.h>
 #include <LibWebView/Utilities.h>
-#include <LibWebView/BookmarkStore.h>
+#include <UI/Qt/BookmarkStore.h>
 #include <LibWebView/CrashReportStore.h>
 #include <LibWebView/HeadlessWebView.h>
 #include <LibWebView/HistoryStore.h>
-#include <LibWebView/Menu.h>
 #include <LibWebView/ProcessSnapshot.h>
 #include <LibWebView/RequestServerManager.h>
 #include <LibWebView/UserAgent.h>
+#include <LibWebView/URL.h>
 #include <LibWebView/ViewImplementation.h>
 #include <Shared/EngineProtocol.h>
 #include <LibCore/Process.h>
@@ -71,6 +72,9 @@ class EngineHeadlessWebView final : public WebView::HeadlessWebView {
     AK_ALLOC_WITH_KMALLOC;
 
 public:
+    Function<void(WebView::ContextMenuRequest)> on_context_menu_request;
+    Function<void(WebView::SessionHistorySnapshot const&, URL::URL const&)> on_session_history_change;
+
     static NonnullOwnPtr<EngineHeadlessWebView> create(Core::AnonymousBuffer theme, Web::DevicePixelSize viewport_size, WebView::IsPrivate is_private)
     {
         auto view = adopt_own(*new EngineHeadlessWebView(move(theme), viewport_size, is_private));
@@ -85,6 +89,18 @@ protected:
     }
 
     virtual WebView::ViewImplementation* create_view_for_new_tab_or_window(WebView::IsPrivate) override { return nullptr; }
+
+    virtual void did_request_context_menu(WebView::ContextMenuRequest request) override
+    {
+        if (on_context_menu_request)
+            on_context_menu_request(move(request));
+    }
+
+    virtual void did_change_session_history(WebView::SessionHistorySnapshot const& history, URL::URL const& url) override
+    {
+        if (on_session_history_change)
+            on_session_history_change(history, url);
+    }
 };
 
 EngineServer::EngineServer(NonnullOwnPtr<Core::LocalSocket> socket, ByteString frame_directory, Core::AnonymousBuffer theme)
@@ -114,6 +130,82 @@ EngineServer::~EngineServer()
         auto favicon_path = ByteString::formatted("{}/favicon-{}.png", m_frame_directory, id);
         (void)Core::System::unlink(favicon_path.view());
     }
+}
+
+static StringView website_color_scheme_to_string(WebView::ThemePreference preference)
+{
+    switch (preference) {
+    case WebView::ThemePreference::System:
+        return "auto"sv;
+    case WebView::ThemePreference::Light:
+        return "light"sv;
+    case WebView::ThemePreference::Dark:
+        return "dark"sv;
+    }
+    VERIFY_NOT_REACHED();
+}
+
+static Optional<WebView::ThemePreference> website_color_scheme_from_string(StringView value)
+{
+    if (value == "auto"sv)
+        return WebView::ThemePreference::System;
+    if (value == "light"sv)
+        return WebView::ThemePreference::Light;
+    if (value == "dark"sv)
+        return WebView::ThemePreference::Dark;
+    return {};
+}
+
+static StringView preferred_contrast_to_string(Web::CSS::PreferredContrast contrast)
+{
+    switch (contrast) {
+    case Web::CSS::PreferredContrast::Auto:
+        return "auto"sv;
+    case Web::CSS::PreferredContrast::Less:
+        return "less"sv;
+    case Web::CSS::PreferredContrast::More:
+        return "more"sv;
+    case Web::CSS::PreferredContrast::NoPreference:
+        return "no-preference"sv;
+    }
+    VERIFY_NOT_REACHED();
+}
+
+static Optional<Web::CSS::PreferredContrast> preferred_contrast_from_string(StringView value)
+{
+    if (value == "auto"sv)
+        return Web::CSS::PreferredContrast::Auto;
+    if (value == "less"sv)
+        return Web::CSS::PreferredContrast::Less;
+    if (value == "more"sv)
+        return Web::CSS::PreferredContrast::More;
+    if (value == "no-preference"sv)
+        return Web::CSS::PreferredContrast::NoPreference;
+    return {};
+}
+
+static StringView preferred_motion_to_string(Web::CSS::PreferredMotion motion)
+{
+    switch (motion) {
+    case Web::CSS::PreferredMotion::Auto:
+        return "auto"sv;
+    case Web::CSS::PreferredMotion::NoPreference:
+        return "no-preference"sv;
+    case Web::CSS::PreferredMotion::Reduce:
+        return "reduce"sv;
+    }
+    VERIFY_NOT_REACHED();
+}
+
+static Optional<Web::CSS::PreferredMotion> preferred_motion_from_string(StringView value)
+{
+    if (value == "auto"sv)
+        return Web::CSS::PreferredMotion::Auto;
+    if (value == "no-preference"sv)
+        return Web::CSS::PreferredMotion::NoPreference;
+    if (value == "reduce"sv)
+        return Web::CSS::PreferredMotion::Reduce;
+    return {};
 }
 
 ErrorOr<void> EngineServer::start()
@@ -190,9 +282,8 @@ ErrorOr<void> EngineServer::start()
     navigator_modes_event.set("modes"sv, move(navigator_modes));
     send_event(move(navigator_modes_event));
 
-    EngineApplication::the().set_crash_report_handler([this](ByteString const& report_name) {
-        send_crash_report_available(report_name);
-    });
+    send_view_preferences();
+
     check_crash_reports();
 
     // DevTools may already be running: the frontend asked the engine to start it with --devtools, before the
@@ -263,6 +354,7 @@ void EngineServer::quit(int status)
     if (m_quitting)
         return;
     m_quitting = true;
+    EngineApplication::the().flush_session_store();
     Core::EventLoop::current().quit(status);
 }
 
@@ -352,6 +444,12 @@ void EngineServer::dispatch_command(JsonObject const& command)
         handle_set_user_agent(command);
     } else if (*type == "set_navigator_compatibility_mode"sv) {
         handle_set_navigator_compatibility_mode(command);
+    } else if (*type == "set_website_color_scheme"sv) {
+        handle_set_website_color_scheme(command);
+    } else if (*type == "set_preferred_contrast"sv) {
+        handle_set_preferred_contrast(command);
+    } else if (*type == "set_preferred_motion"sv) {
+        handle_set_preferred_motion(command);
     } else if (*type == "request_processes"sv) {
         send_processes();
     } else if (*type == "end_process"sv) {
@@ -563,7 +661,7 @@ EngineServer::Tab& EngineServer::create_child_tab(Tab& parent, WebView::Canonica
 void EngineServer::wire_autocomplete(Tab& tab)
 {
     auto is_private = tab.view->is_private() == WebView::IsPrivate::Yes;
-    tab.autocomplete = new WebView::Autocomplete(is_private ? WebView::IsPrivate::Yes : WebView::IsPrivate::No);
+    tab.autocomplete = new WebView::Autocomplete(EngineApplication::the(), is_private ? WebView::IsPrivate::Yes : WebView::IsPrivate::No);
 
     auto tab_id = tab.id;
     tab.autocomplete->on_autocomplete_query_complete = [this, tab_id](WebView::AutocompleteQueryID query_id, Vector<WebView::AutocompleteSuggestion> suggestions, WebView::AutocompleteResultKind kind) {
@@ -613,7 +711,9 @@ void EngineServer::wire_tab(Tab& tab)
             send_loading_state(*tab, loading);
     };
 
-    tab.view->on_audibility_changed = [this, tab_id](Audio::Audibility) {
+    tab.view->on_tab_indicator_change = [this, tab_id](WebView::TabIndicator indicator, bool) {
+        if (indicator != WebView::TabIndicator::PlayingAudio)
+            return;
         if (auto* tab = tab_for_id(tab_id))
             send_audio_state(*tab);
     };
@@ -750,19 +850,17 @@ void EngineServer::wire_tab(Tab& tab)
             send_simple_event("tab_crashed"sv, tab_id);
     };
 
-    auto wire_context_menu = [this, tab_id](WebView::Menu& menu, StringView kind) {
-        auto* menu_pointer = &menu;
-        auto kind_string = ByteString { kind };
-        menu.on_activation = [this, tab_id, menu_pointer, kind_string](Gfx::IntPoint position) {
-            if (auto* tab = tab_for_id(tab_id))
-                send_context_menu(*tab, kind_string.view(), position, *menu_pointer);
-        };
+    static_cast<EngineHeadlessWebView&>(*tab.view).on_context_menu_request = [this, tab_id](WebView::ContextMenuRequest request) {
+        handle_context_menu_request(tab_id, move(request));
     };
-    wire_context_menu(tab.view->page_context_menu(), "page"sv);
-    wire_context_menu(tab.view->link_context_menu(), "link"sv);
-    wire_context_menu(tab.view->selected_text_link_context_menu(), "link"sv);
-    wire_context_menu(tab.view->image_context_menu(), "image"sv);
-    wire_context_menu(tab.view->media_context_menu(), "media"sv);
+
+    static_cast<EngineHeadlessWebView&>(*tab.view).on_session_history_change = [this, tab_id](WebView::SessionHistorySnapshot const& history, URL::URL const& url) {
+        auto* tab = tab_for_id(tab_id);
+        if (!tab || !tab->session_tab_id.has_value())
+            return;
+        if (auto* store = EngineApplication::the().session_store(WebView::IsPrivate::No))
+            store->update_tab_state({ .tab_id = *tab->session_tab_id, .history = history, .url = url });
+    };
 
     tab.view->on_input_method_state_change = [this, tab_id] {
         auto* tab = tab_for_id(tab_id);
@@ -877,16 +975,15 @@ void EngineServer::handle_create_tab(JsonObject const& command)
 
     auto& tab = create_tab({ max(static_cast<int>(width), 1), max(static_cast<int>(height), 1) }, is_private, request_id, 0, window_id, device_pixel_ratio);
 
-    auto* store = WebView::Application::session_store(WebView::IsPrivate::No);
+    auto* store = EngineApplication::the().session_store(WebView::IsPrivate::No);
 
     if (session_window.has_value() && *session_window != 0)
-        m_session_windows.set(window_id, static_cast<WebView::SessionWindowId>(*session_window));
+        m_session_windows.set(window_id, static_cast<Ladybird::SessionWindowId>(*session_window));
 
     if (!is_private && store && !Core::Environment::has("LADYBIRD_SDE_DISABLE_SESSION_RESTORE"sv)) {
         if (session_tab.has_value() && *session_tab != 0) {
-            auto tab_id = static_cast<WebView::SessionTabId>(*session_tab);
+            auto tab_id = static_cast<Ladybird::SessionTabId>(*session_tab);
             tab.session_tab_id = tab_id;
-            tab.view->set_session_tab_id(tab_id);
         } else {
             auto initial_url = WebView::Application::settings().new_tab_page_url();
             if (auto url = command.get_string("url"sv); url.has_value() && !url->is_empty()) {
@@ -898,25 +995,39 @@ void EngineServer::handle_create_tab(JsonObject const& command)
                 .window_id = session_window_id,
                 .initial_url = move(initial_url),
                 .insertion_index = {},
-                .is_active = WebView::SessionStore::IsActive::No,
+                .is_active = Ladybird::SessionStore::IsActive::No,
             });
             if (!tab_id.is_error()) {
                 tab.session_tab_id = tab_id.value();
-                tab.view->set_session_tab_id(tab_id.value());
             }
         }
     }
 
+    if (tab.session_tab_id.has_value())
+        tab.view->set_reports_session_history(true);
+
     if (tab.session_tab_id.has_value() && store) {
         auto history = store->load_tab_history(*tab.session_tab_id);
-        if (history.has_value() && !tab.view->restore_session_history_from_snapshot(history.release_value()).is_error())
+        if (history.has_value() && !tab.view->restore_session_history_from_snapshot(history.release_value()).is_error()) {
+            // The snapshot's current entry is authoritative for back/forward history, but the session tab's active URL
+            // is the page the user last saw. A snapshot written just before a navigation can lag it by one entry.
+            if (auto requested = command.get_string("url"sv); requested.has_value() && !requested->is_empty()) {
+                if (auto parsed = URL::Parser::basic_parse(requested->bytes_as_string_view()); parsed.has_value() && tab.view->url() != *parsed)
+                    tab.view->load(*parsed);
+            }
             return;
+        }
     }
 
-    if (auto url = command.get_string("url"sv); url.has_value() && !url->is_empty())
-        tab.view->load_from_user_input(url->bytes_as_string_view());
-    else
+    if (auto url = command.get_string("url"sv); url.has_value() && !url->is_empty()) {
+        auto settings = WebView::Application::settings().search_engine_settings();
+        if (auto parsed = WebView::sanitize_url(url->bytes_as_string_view(), settings.engine); parsed.has_value())
+            tab.view->load(*parsed);
+        else
+            tab.view->load(WebView::Application::settings().new_tab_page_url());
+    } else {
         tab.view->load(WebView::Application::settings().new_tab_page_url());
+    }
 }
 
 void EngineServer::handle_close_window(JsonObject const& command)
@@ -925,8 +1036,8 @@ void EngineServer::handle_close_window(JsonObject const& command)
     if (!session_window.has_value() || *session_window == 0)
         return;
 
-    auto window_id = static_cast<WebView::SessionWindowId>(*session_window);
-    if (auto* store = WebView::Application::session_store(WebView::IsPrivate::No)) {
+    auto window_id = static_cast<Ladybird::SessionWindowId>(*session_window);
+    if (auto* store = EngineApplication::the().session_store(WebView::IsPrivate::No)) {
         auto active_tab = static_cast<i64>(command.get_u64("active"sv).value_or(0));
         (void)store->window_closing({
             .window_id = window_id,
@@ -950,12 +1061,12 @@ void EngineServer::handle_window_geometry(JsonObject const& command)
     if (!session_window.has_value() || *session_window == 0)
         return;
 
-    auto* store = WebView::Application::session_store(WebView::IsPrivate::No);
+    auto* store = EngineApplication::the().session_store(WebView::IsPrivate::No);
     if (!store)
         return;
 
     store->window_geometry_changed(
-        static_cast<WebView::SessionWindowId>(*session_window),
+        static_cast<Ladybird::SessionWindowId>(*session_window),
         {
             .x = static_cast<i32>(command.get_i64("x"sv).value_or(0)),
             .y = static_cast<i32>(command.get_i64("y"sv).value_or(0)),
@@ -967,7 +1078,7 @@ void EngineServer::handle_window_geometry(JsonObject const& command)
 
 void EngineServer::handle_register_session_tab(JsonObject const& command)
 {
-    auto* store = WebView::Application::session_store(WebView::IsPrivate::No);
+    auto* store = EngineApplication::the().session_store(WebView::IsPrivate::No);
     auto session_window = command.get_u64("session_window"sv);
     auto request = command.get_u64("request"sv);
     auto window = command.get_u64("window"sv).value_or(0);
@@ -980,10 +1091,10 @@ void EngineServer::handle_register_session_tab(JsonObject const& command)
         return;
 
     auto tab_id = store->tab_opened({
-        .window_id = static_cast<WebView::SessionWindowId>(*session_window),
+        .window_id = static_cast<Ladybird::SessionWindowId>(*session_window),
         .initial_url = parsed.release_value(),
         .insertion_index = {},
-        .is_active = WebView::SessionStore::IsActive::No,
+        .is_active = Ladybird::SessionStore::IsActive::No,
     });
     if (tab_id.is_error())
         return;
@@ -996,7 +1107,7 @@ void EngineServer::handle_register_session_tab(JsonObject const& command)
     send_event(move(event));
 }
 
-WebView::SessionWindowId EngineServer::session_window_for(u64 frontend_window_id, bool create)
+Ladybird::SessionWindowId EngineServer::session_window_for(u64 frontend_window_id, bool create)
 {
     if (auto it = m_session_windows.find(frontend_window_id); it != m_session_windows.end())
         return it->value;
@@ -1004,7 +1115,7 @@ WebView::SessionWindowId EngineServer::session_window_for(u64 frontend_window_id
     if (!create)
         return 0;
 
-    auto* store = WebView::Application::session_store(WebView::IsPrivate::No);
+    auto* store = EngineApplication::the().session_store(WebView::IsPrivate::No);
     if (!store)
         return 0;
 
@@ -1036,7 +1147,7 @@ void EngineServer::handle_activate_tab(u64 tab_id, JsonObject const& command)
     }
     m_active_tab_id = tab_id;
     if (tab->session_tab_id.has_value()) {
-        if (auto* store = WebView::Application::session_store(WebView::IsPrivate::No))
+        if (auto* store = EngineApplication::the().session_store(WebView::IsPrivate::No))
             store->active_tab_changed(*tab->session_tab_id);
     }
 
@@ -1082,10 +1193,15 @@ void EngineServer::perform_navigation(Tab& tab, String const& url, bool user_inp
         return;
     }
 
-    if (user_input)
-        tab.view->load_from_user_input(url.bytes_as_string_view());
-    else if (auto parsed = URL::Parser::basic_parse(url.bytes_as_string_view()); parsed.has_value())
+    if (user_input) {
+        auto settings = WebView::Application::settings().search_engine_settings();
+        if (auto parsed = WebView::sanitize_url(url.bytes_as_string_view(), settings.engine); parsed.has_value())
+            tab.view->load(*parsed);
+        else
+            tab.view->load(WebView::Application::settings().new_tab_page_url());
+    } else if (auto parsed = URL::Parser::basic_parse(url.bytes_as_string_view()); parsed.has_value()) {
         tab.view->load(*parsed);
+    }
 }
 
 void EngineServer::flush_pending_navigation(Tab& tab)
@@ -1115,7 +1231,35 @@ void EngineServer::handle_autocomplete(u64 tab_id, JsonObject const& command)
         return;
     }
 
-    tab->autocomplete->query_autocomplete_engine(*request_id, *query);
+    Vector<WebView::AutocompleteBookmark> bookmarks;
+    Function<void(Vector<Ladybird::BookmarkItem> const&, Optional<String>)> append_bookmarks = [&](Vector<Ladybird::BookmarkItem> const& items, Optional<String> folder) {
+        for (auto const& item : items) {
+            if (item.is_folder()) {
+                auto next_folder = folder;
+                if (item.folder().title.has_value() && !item.folder().title->is_empty()) {
+                    next_folder = folder.has_value()
+                        ? MUST(String::formatted("{} / {}", *folder, *item.folder().title))
+                        : *item.folder().title;
+                }
+                append_bookmarks(item.folder().children, move(next_folder));
+            } else {
+                bookmarks.append({
+                    .url = item.bookmark().url.to_string(),
+                    .title = item.bookmark().title,
+                    .folder = folder,
+                    .favicon_png = {},
+                });
+            }
+        }
+    };
+    append_bookmarks(EngineApplication::the().bookmark_store().root_items(), {});
+
+    auto suggestions = WebView::rank_bookmark_suggestions(
+        query->bytes_as_string_view(),
+        bookmarks,
+        WebView::autocomplete_preliminary_limit(WebView::default_autocomplete_suggestion_limit));
+
+    tab->autocomplete->query_autocomplete_engine(*request_id, *query, WebView::default_autocomplete_suggestion_limit, move(suggestions));
 }
 
 void EngineServer::handle_resize(u64 tab_id, JsonObject const& command)
@@ -1306,11 +1450,11 @@ void EngineServer::handle_close_tab(u64 tab_id)
         return;
 
     if (tab->view->is_private() == WebView::IsPrivate::No && tab->session_tab_id.has_value()) {
-        if (auto* store = WebView::Application::session_store(WebView::IsPrivate::No)) {
+        if (auto* store = EngineApplication::the().session_store(WebView::IsPrivate::No)) {
             (void)store->tab_closed({
                 .tab_id = *tab->session_tab_id,
                 .closed_at = UnixDateTime::now(),
-                .keep_for_reopening = WebView::SessionStore::KeepForReopening::Yes,
+                .keep_for_reopening = Ladybird::SessionStore::KeepForReopening::Yes,
             });
         }
     }
@@ -1456,7 +1600,14 @@ void EngineServer::handle_toggle_bookmark(u64 tab_id)
     if (!tab)
         return;
 
-    WebView::Application::the().toggle_bookmark_for_view(*tab->view);
+    auto& store = EngineApplication::the().bookmark_store();
+    auto url = tab->view->url();
+    if (auto bookmark = store.find_bookmark_by_url(url); bookmark.has_value()) {
+        store.remove_item(bookmark->id);
+    } else {
+        store.add_bookmark(url, tab->view->title().to_utf8(), {});
+    }
+
     send_url(*tab);
     send_bookmarks();
 }
@@ -1543,13 +1694,12 @@ void EngineServer::handle_history_recent(JsonObject const& command)
     auto limit = static_cast<size_t>(min<u64>(command.get_u64("limit"sv).value_or(10), 50));
 
     JsonArray items;
-    if (auto* store = WebView::Application::default_session().history_store.ptr()) {
-        for (auto const& entry : store->list_entries({}, 0, limit)) {
-            JsonObject item;
-            item.set("url"sv, entry.url);
-            item.set("title"sv, entry.title.value_or(entry.url));
-            items.must_append(move(item));
-        }
+    auto& store = EngineApplication::the().history_store();
+    for (auto const& entry : store.list_entries({}, 0, limit)) {
+        JsonObject item;
+        item.set("url"sv, entry.url);
+        item.set("title"sv, entry.title.value_or(entry.url));
+        items.must_append(move(item));
     }
 
     JsonObject event;
@@ -1560,8 +1710,7 @@ void EngineServer::handle_history_recent(JsonObject const& command)
 
 void EngineServer::handle_history_clear()
 {
-    if (auto* store = WebView::Application::default_session().history_store.ptr())
-        store->remove_entries_accessed_since(UnixDateTime::earliest());
+    EngineApplication::the().history_store().remove_entries_accessed_since(UnixDateTime::earliest());
 
     JsonObject event;
     event.set("type"sv, "history_recent"sv);
@@ -1587,9 +1736,9 @@ void EngineServer::handle_add_bookmark(JsonObject const& command)
         parent = *text;
 
     if (parent.has_value())
-        WebView::Application::bookmark_store().add_bookmark(url.release_value(), move(title), {}, *parent);
+        EngineApplication::the().bookmark_store().add_bookmark(url.release_value(), move(title), {}, *parent);
     else
-        WebView::Application::bookmark_store().add_bookmark(url.release_value(), move(title), {});
+        EngineApplication::the().bookmark_store().add_bookmark(url.release_value(), move(title), {});
     send_bookmarks();
     if (auto tab_id = command.get_u64("tab"sv); tab_id.has_value()) {
         if (auto* tab = tab_for_id(*tab_id))
@@ -1610,7 +1759,7 @@ void EngineServer::handle_edit_bookmark(JsonObject const& command)
     Optional<String> title;
     if (auto text = command.get_string("title"sv); text.has_value())
         title = *text;
-    WebView::Application::bookmark_store().edit_bookmark(*id, url.release_value(), move(title));
+    EngineApplication::the().bookmark_store().edit_bookmark(*id, url.release_value(), move(title));
     send_bookmarks();
     if (auto tab_id = command.get_u64("tab"sv); tab_id.has_value()) {
         if (auto* tab = tab_for_id(*tab_id))
@@ -1624,7 +1773,7 @@ void EngineServer::handle_remove_bookmark(JsonObject const& command)
     if (!id.has_value())
         return;
 
-    WebView::Application::bookmark_store().remove_item(*id);
+    EngineApplication::the().bookmark_store().remove_item(*id);
     send_bookmarks();
     if (auto tab_id = command.get_u64("tab"sv); tab_id.has_value()) {
         if (auto* tab = tab_for_id(*tab_id))
@@ -1640,13 +1789,12 @@ void EngineServer::handle_history_search(JsonObject const& command)
     auto limit = static_cast<size_t>(min<u64>(command.get_u64("limit"sv).value_or(50), 200));
 
     JsonArray items;
-    if (auto* store = WebView::Application::default_session().history_store.ptr()) {
-        for (auto const& entry : store->list_entries(query.bytes_as_string_view(), 0, limit)) {
-            JsonObject item;
-            item.set("url"sv, entry.url);
-            item.set("title"sv, entry.title.value_or(entry.url));
-            items.must_append(move(item));
-        }
+    auto& store = EngineApplication::the().history_store();
+    for (auto const& entry : store.list_entries(query.bytes_as_string_view(), 0, limit)) {
+        JsonObject item;
+        item.set("url"sv, entry.url);
+        item.set("title"sv, entry.title.value_or(entry.url));
+        items.must_append(move(item));
     }
 
     JsonObject event;
@@ -1665,9 +1813,9 @@ void EngineServer::handle_add_folder(JsonObject const& command)
     auto parent_text = command.get_string("parent"sv);
     if (parent_text.has_value() && !parent_text->is_empty()) {
         String parent = *parent_text;
-        WebView::Application::bookmark_store().add_folder(move(title), parent);
+        EngineApplication::the().bookmark_store().add_folder(move(title), parent);
     } else {
-        WebView::Application::bookmark_store().add_folder(move(title), {});
+        EngineApplication::the().bookmark_store().add_folder(move(title), {});
     }
     send_bookmarks();
 }
@@ -1682,7 +1830,7 @@ void EngineServer::handle_edit_folder(JsonObject const& command)
     if (auto text = command.get_string("title"sv); text.has_value())
         title = *text;
 
-    WebView::Application::bookmark_store().edit_folder(*id, move(title));
+    EngineApplication::the().bookmark_store().edit_folder(*id, move(title));
     send_bookmarks();
 }
 
@@ -1696,9 +1844,9 @@ void EngineServer::handle_move_bookmark(JsonObject const& command)
     auto parent_text = command.get_string("parent"sv);
     if (parent_text.has_value() && !parent_text->is_empty()) {
         String parent = *parent_text;
-        WebView::Application::bookmark_store().move_item(*id, parent, index);
+        EngineApplication::the().bookmark_store().move_item(*id, parent, index);
     } else {
-        WebView::Application::bookmark_store().move_item(*id, {}, index);
+        EngineApplication::the().bookmark_store().move_item(*id, {}, index);
     }
     send_bookmarks();
 }
@@ -1709,7 +1857,7 @@ void EngineServer::handle_pin_tab(u64 tab_id, JsonObject const& command)
     if (!tab || !tab->session_tab_id.has_value())
         return;
 
-    if (auto* store = WebView::Application::session_store(WebView::IsPrivate::No))
+    if (auto* store = EngineApplication::the().session_store(WebView::IsPrivate::No))
         (void)store->tab_pinned_changed(*tab->session_tab_id, command.get_bool("pinned"sv).value_or(false));
 }
 
@@ -2049,6 +2197,7 @@ void EngineServer::handle_certificate_info(u64 tab_id, JsonObject const&)
     auto request = client.value()->start_request(
         "HEAD"sv,
         url,
+        HTTP::Cookie::SameSiteContext::same_site(),
         {},
         {},
         HTTP::CacheMode::NoStore,
@@ -2068,7 +2217,7 @@ void EngineServer::handle_certificate_info(u64 tab_id, JsonObject const&)
     m_certificate_requests.set(tab_id, *request);
 
     request->set_unbuffered_request_callbacks(
-        [this, tab_id, weak_request](auto&&, auto&&, auto&&, auto&&, auto&&, auto&&) {
+        [this, tab_id, weak_request](auto&&, auto&&, auto&&, auto&&) {
             auto request = weak_request.strong_ref();
             if (!request)
                 return;
@@ -2140,7 +2289,7 @@ void EngineServer::send_audio_state(Tab& tab)
     JsonObject event;
     event.set("type"sv, "audio"sv);
     event.set("tab"sv, tab.id);
-    event.set("playing"sv, tab.view->audibility() == Audio::Audibility::Audible);
+    event.set("playing"sv, tab.view->is_playing_audio());
     event.set("muted"sv, tab.view->page_mute_state() == Web::HTML::MuteState::Muted);
     send_event(move(event));
 }
@@ -2179,7 +2328,7 @@ void EngineServer::handle_paste(u64 tab_id, JsonObject const& command)
         return;
     }
 
-    tab->view->paste_from_clipboard();
+    tab->view->paste_from_clipboard(Web::Clipboard::PasteMode::AllMimeTypes);
 }
 
 void EngineServer::handle_clipboard_changed(JsonObject const& command)
@@ -2240,7 +2389,18 @@ void EngineServer::send_crash_report_ready(WebView::CrashReportReview::Report co
     event.set("type"sv, "crash_report_ready"sv);
     event.set("name"sv, report.name.view());
     event.set("fields"sv, move(fields));
-    event.set("has_next"sv, m_crash_report && m_crash_report->has_next_report());
+
+    auto names = WebView::CrashReportStore::the().pending_report_names();
+    bool has_next = false;
+    if (!names.is_error()) {
+        for (auto const& name : names.value()) {
+            if (name != report.name) {
+                has_next = true;
+                break;
+            }
+        }
+    }
+    event.set("has_next"sv, has_next);
     send_event(move(event));
 }
 
@@ -2289,7 +2449,16 @@ void EngineServer::handle_crash_report_open(JsonObject const& command)
     if (auto requested = command.get_string("name"sv); requested.has_value() && !requested->is_empty())
         name = requested->to_byte_string();
 
-    auto report = m_crash_report->open(name);
+    if (!name.has_value()) {
+        auto pending = WebView::CrashReportStore::the().pending_report_names();
+        if (pending.is_error() || pending.value().is_empty()) {
+            send_crash_report_failure("open"sv, "There are no saved crash reports."_string);
+            return;
+        }
+        name = pending.value().first();
+    }
+
+    auto report = m_crash_report->open(*name);
     if (report.is_error()) {
         send_crash_report_failure("open"sv, String::from_utf8(report.error().string_literal()).release_value());
         return;
@@ -2299,7 +2468,27 @@ void EngineServer::handle_crash_report_open(JsonObject const& command)
 
 void EngineServer::handle_crash_report_next()
 {
-    handle_crash_report_open({});
+    if (!m_crash_report) {
+        handle_crash_report_open({});
+        return;
+    }
+
+    auto current = m_crash_report->report_name();
+    auto pending = WebView::CrashReportStore::the().pending_report_names();
+    if (!pending.is_error()) {
+        for (auto const& name : pending.value()) {
+            if (name == current)
+                continue;
+            JsonObject command;
+            command.set("name"sv, name.view());
+            handle_crash_report_open(command);
+            return;
+        }
+    }
+
+    JsonObject event;
+    event.set("type"sv, "crash_report_dismissed"sv);
+    send_event(move(event));
 }
 
 void EngineServer::handle_crash_report_text()
@@ -2348,12 +2537,26 @@ void EngineServer::handle_crash_report_close()
 
 void EngineServer::handle_crash_report_dismiss()
 {
-    if (auto result = WebView::CrashReportStore::the().mark_all_seen(); result.is_error())
-        warnln("Could not mark crash reports as seen: {}", result.error());
+    if (auto names = WebView::CrashReportStore::the().pending_report_names(); !names.is_error()) {
+        for (auto const& name : names.value()) {
+            if (auto result = WebView::CrashReportStore::the().mark_seen(name); result.is_error())
+                warnln("Could not mark crash report as seen: {}", result.error());
+        }
+    }
     m_offered_crash_reports.clear();
     m_crash_report.clear();
     JsonObject event;
     event.set("type"sv, "crash_report_dismissed"sv);
+    send_event(move(event));
+}
+
+void EngineServer::send_view_preferences()
+{
+    JsonObject event;
+    event.set("type"sv, "view_preferences"sv);
+    event.set("color_scheme"sv, website_color_scheme_to_string(WebView::Application::settings().appearance().website_color_scheme));
+    event.set("contrast"sv, preferred_contrast_to_string(EngineApplication::the().preferred_contrast()));
+    event.set("motion"sv, preferred_motion_to_string(EngineApplication::the().preferred_motion()));
     send_event(move(event));
 }
 
@@ -2392,7 +2595,7 @@ void EngineServer::send_processes()
             tabs.must_append(move(entry));
         }
         item.set("tabs"sv, move(tabs));
-        item.set("frames"sv, static_cast<u64>(process.frame_count));
+        item.set("frames"sv, static_cast<u64>(process.frames.size()));
         items.must_append(move(item));
     }
 
@@ -2426,7 +2629,7 @@ void EngineServer::handle_set_user_agent(JsonObject const& command)
     if (!value.has_value())
         return;
 
-    EngineApplication::the().set_user_agent(*value);
+    EngineApplication::the().set_user_agent_string(*value);
 
     JsonObject event;
     event.set("type"sv, "user_agent_changed"sv);
@@ -2450,6 +2653,50 @@ void EngineServer::handle_set_navigator_compatibility_mode(JsonObject const& com
     event.set("type"sv, "navigator_compatibility_mode_changed"sv);
     event.set("value"sv, WebView::navigator_compatibility_mode_to_string(*mode));
     send_event(move(event));
+}
+
+void EngineServer::handle_set_website_color_scheme(JsonObject const& command)
+{
+    auto value = command.get_string("value"sv);
+    if (!value.has_value())
+        return;
+
+    auto preference = website_color_scheme_from_string(*value);
+    if (!preference.has_value())
+        return;
+
+    auto appearance = WebView::Application::settings().appearance();
+    appearance.website_color_scheme = *preference;
+    WebView::Application::settings().set_appearance(appearance);
+    send_view_preferences();
+}
+
+void EngineServer::handle_set_preferred_contrast(JsonObject const& command)
+{
+    auto value = command.get_string("value"sv);
+    if (!value.has_value())
+        return;
+
+    auto contrast = preferred_contrast_from_string(*value);
+    if (!contrast.has_value())
+        return;
+
+    EngineApplication::the().set_preferred_contrast(*contrast);
+    send_view_preferences();
+}
+
+void EngineServer::handle_set_preferred_motion(JsonObject const& command)
+{
+    auto value = command.get_string("value"sv);
+    if (!value.has_value())
+        return;
+
+    auto motion = preferred_motion_from_string(*value);
+    if (!motion.has_value())
+        return;
+
+    EngineApplication::the().set_preferred_motion(*motion);
+    send_view_preferences();
 }
 
 void EngineServer::handle_toggle_devtools()
@@ -2966,7 +3213,7 @@ void EngineServer::send_url(Tab& tab)
     event.set("type"sv, "url"sv);
     event.set("tab"sv, tab.id);
     event.set("url"sv, tab.view->url().to_string());
-    event.set("bookmarked"sv, WebView::Application::bookmark_store().is_bookmarked(tab.view->url()));
+    event.set("bookmarked"sv, EngineApplication::the().bookmark_store().is_bookmarked(tab.view->url()));
     send_event(move(event));
 }
 
@@ -3031,8 +3278,8 @@ void EngineServer::send_history_state(Tab& tab)
     JsonObject event;
     event.set("type"sv, "history"sv);
     event.set("tab"sv, tab.id);
-    event.set("can_go_back"sv, tab.view->navigate_back_action().enabled());
-    event.set("can_go_forward"sv, tab.view->navigate_forward_action().enabled());
+    event.set("can_go_back"sv, tab.view->can_navigate_back());
+    event.set("can_go_forward"sv, tab.view->can_navigate_forward());
     send_event(move(event));
 }
 
@@ -3047,7 +3294,7 @@ void EngineServer::send_dialog(Tab& tab, StringView kind, StringView message, St
     send_event(move(event));
 }
 
-static void append_bookmark_items(JsonArray& items, Vector<WebView::BookmarkItem> const& source)
+static void append_bookmark_items(JsonArray& items, Vector<Ladybird::BookmarkItem> const& source)
 {
     for (auto const& item : source) {
         JsonObject entry;
@@ -3075,7 +3322,7 @@ static void append_bookmark_items(JsonArray& items, Vector<WebView::BookmarkItem
 void EngineServer::send_bookmarks()
 {
     JsonArray items;
-    append_bookmark_items(items, WebView::Application::bookmark_store().root_items());
+    append_bookmark_items(items, EngineApplication::the().bookmark_store().root_items());
 
     JsonObject event;
     event.set("type"sv, "bookmarks"sv);
@@ -3113,58 +3360,194 @@ static StringView download_status_to_string(WebView::FileDownloader::DownloadSta
     return "unknown"sv;
 }
 
-void EngineServer::send_context_menu(Tab& tab, StringView kind, Gfx::IntPoint position, WebView::Menu& menu)
+static StringView context_menu_kind_to_string(WebView::ContextMenuKind kind)
 {
-    auto scale = max(tab.device_pixel_ratio, 1);
-    position = { position.x() / scale, position.y() / scale };
+    switch (kind) {
+    case WebView::ContextMenuKind::Page:
+        return "page"sv;
+    case WebView::ContextMenuKind::Link:
+        return "link"sv;
+    case WebView::ContextMenuKind::Image:
+        return "image"sv;
+    case WebView::ContextMenuKind::Media:
+        return "media"sv;
+    }
+    VERIFY_NOT_REACHED();
+}
+
+void EngineServer::handle_context_menu_request(u64 tab_id, WebView::ContextMenuRequest request)
+{
+    auto* tab = tab_for_id(tab_id);
+    if (!tab)
+        return;
+
+    send_context_menu(*tab, move(request));
+}
+
+void EngineServer::send_context_menu(Tab& tab, WebView::ContextMenuRequest request)
+{
+    auto position = request.widget_position;
     tab.context_menu_actions.clear();
 
     JsonArray items;
-    size_t next_action = 0;
-
-    Function<void(WebView::Menu&, JsonArray&)> append_menu = [&](WebView::Menu& current_menu, JsonArray& destination) {
-        for (auto& item : current_menu.items()) {
-            item.visit(
-                [&](NonnullRefPtr<WebView::Action>& action) {
-                    if (!action->visible())
-                        return;
-
-                    JsonObject entry;
-                    entry.set("text"sv, action->text());
-                    entry.set("action"sv, static_cast<u64>(next_action++));
-                    entry.set("enabled"sv, action->enabled());
-                    entry.set("checkable"sv, action->is_checkable());
-                    if (action->is_checkable())
-                        entry.set("checked"sv, action->checked());
-
-                    tab.context_menu_actions.append(action);
-                    destination.must_append(move(entry));
-                },
-                [&](NonnullRefPtr<WebView::Menu>& submenu) {
-                    if (!submenu->visible())
-                        return;
-
-                    JsonObject entry;
-                    entry.set("title"sv, submenu->title());
-                    JsonArray submenu_items;
-                    append_menu(*submenu, submenu_items);
-                    entry.set("items"sv, move(submenu_items));
-                    destination.must_append(move(entry));
-                },
-                [&](WebView::Separator) {
-                    JsonObject entry;
-                    entry.set("separator"sv, true);
-                    destination.must_append(move(entry));
-                });
-        }
+    auto add = [&](String text, Function<void()> on_activate, bool enabled = true) {
+        JsonObject entry;
+        entry.set("text"sv, text);
+        entry.set("action"sv, static_cast<u64>(tab.context_menu_actions.size()));
+        entry.set("enabled"sv, enabled);
+        items.must_append(move(entry));
+        tab.context_menu_actions.append({ move(text), enabled, false, false, move(on_activate) });
+    };
+    auto add_checkable = [&](String text, bool checked, Function<void()> on_activate) {
+        JsonObject entry;
+        entry.set("text"sv, text);
+        entry.set("action"sv, static_cast<u64>(tab.context_menu_actions.size()));
+        entry.set("enabled"sv, true);
+        entry.set("checkable"sv, true);
+        entry.set("checked"sv, checked);
+        items.must_append(move(entry));
+        tab.context_menu_actions.append({ move(text), true, true, checked, move(on_activate) });
+    };
+    auto add_separator = [&] {
+        JsonObject entry;
+        entry.set("separator"sv, true);
+        items.must_append(move(entry));
     };
 
-    append_menu(menu, items);
+    auto on_tab = [this, tab_id = tab.id](Function<void(Tab&)> callback) {
+        return [this, tab_id, callback = move(callback)]() mutable {
+            if (auto* tab = tab_for_id(tab_id))
+                callback(*tab);
+        };
+    };
+    auto copy_text = [](String const& text) {
+        if (text.is_empty())
+            return;
+        EngineApplication::the().insert_clipboard_item({ { { "text/plain"_string, text.to_byte_string() } } });
+    };
+
+    auto& view = *tab.view;
+
+    switch (request.kind) {
+    case WebView::ContextMenuKind::Page:
+        if (request.is_editable) {
+            add("Undo"_string, on_tab([](Tab& tab) { tab.view->undo(); }));
+            add("Redo"_string, on_tab([](Tab& tab) { tab.view->redo(); }));
+            add_separator();
+            add("Cut"_string, on_tab([this](Tab& tab) { handle_clipboard_copy(tab.id, true); }));
+            add("Copy"_string, on_tab([this](Tab& tab) { handle_clipboard_copy(tab.id, false); }));
+            add("Paste"_string, on_tab([](Tab& tab) { tab.view->paste_from_clipboard(Web::Clipboard::PasteMode::AllMimeTypes); }));
+            add_separator();
+            add("Select All"_string, on_tab([](Tab& tab) { tab.view->select_all(); }));
+        } else {
+            add("Back"_string, on_tab([](Tab& tab) { tab.view->traverse_the_history_by_delta(-1); }), view.can_navigate_back());
+            add("Forward"_string, on_tab([](Tab& tab) { tab.view->traverse_the_history_by_delta(+1); }), view.can_navigate_forward());
+            add("Reload"_string, on_tab([](Tab& tab) { tab.view->reload(); }));
+            add_separator();
+            if (request.selected_text.has_value())
+                add("Copy"_string, on_tab([this](Tab& tab) { handle_clipboard_copy(tab.id, false); }));
+            add("Paste"_string, on_tab([](Tab& tab) { tab.view->paste_from_clipboard(Web::Clipboard::PasteMode::AllMimeTypes); }));
+            add("Select All"_string, on_tab([](Tab& tab) { tab.view->select_all(); }));
+        }
+        if (view.can_view_source()) {
+            add_separator();
+            add("View Page Source"_string, on_tab([](Tab& tab) { tab.view->get_source(); }));
+        }
+        if (request.can_inspect_element) {
+            add_separator();
+            add("Inspect Element"_string, on_tab([](Tab& tab) { tab.view->inspect_context_menu_element(); }));
+        }
+        break;
+
+    case WebView::ContextMenuKind::Link:
+        if (request.link_navigation.has_value()) {
+            auto navigation = *request.link_navigation;
+            add("Open Link"_string, on_tab([navigation](Tab& tab) { tab.view->load(navigation); }));
+            add("Open Link in New Tab"_string, on_tab([navigation](Tab& tab) {
+                tab.view->open_url_in_new_tab(navigation.url, Web::HTML::ActivateTab::No);
+            }));
+            add_separator();
+            add("Copy Link Address"_string, [copy_text, url = navigation.url.to_string()] { copy_text(url); });
+            add("Download Linked File"_string, on_tab([navigation](Tab& tab) {
+                tab.view->download_url(navigation.url, WebView::ViewImplementation::PromptForPath::Yes);
+            }));
+        }
+        if (request.can_inspect_element) {
+            add_separator();
+            add("Inspect Element"_string, on_tab([](Tab& tab) { tab.view->inspect_context_menu_element(); }));
+        }
+        break;
+
+    case WebView::ContextMenuKind::Image:
+        if (request.link_navigation.has_value()) {
+            auto navigation = *request.link_navigation;
+            add("Open Link"_string, on_tab([navigation](Tab& tab) { tab.view->load(navigation); }));
+            add("Open Link in New Tab"_string, on_tab([navigation](Tab& tab) {
+                tab.view->open_url_in_new_tab(navigation.url, Web::HTML::ActivateTab::No);
+            }));
+            add_separator();
+        }
+        if (request.navigation.has_value()) {
+            auto navigation = *request.navigation;
+            add("Open Image"_string, on_tab([navigation](Tab& tab) { tab.view->load(navigation); }));
+            add("Open Image in New Tab"_string, on_tab([navigation](Tab& tab) {
+                tab.view->open_url_in_new_tab(navigation.url, Web::HTML::ActivateTab::No);
+            }));
+            add_separator();
+            add("Copy Image Address"_string, [copy_text, url = navigation.url.to_string()] { copy_text(url); });
+            add("Save Image As…"_string, on_tab([navigation, mime = request.image_mime_type](Tab& tab) {
+                tab.view->download_url(navigation.url, WebView::ViewImplementation::PromptForPath::Yes, mime);
+            }));
+        }
+        add("Copy Image"_string, [bitmap = request.image_bitmap] {
+            if (!bitmap.has_value() || !bitmap->is_valid())
+                return;
+            auto encoded = Gfx::PNGWriter::encode(*bitmap->bitmap());
+            if (encoded.is_error())
+                return;
+            EngineApplication::the().insert_clipboard_item({ { { "image/png"_string, ByteString { encoded.value().bytes() } } } });
+        }, request.image_bitmap.has_value() && request.image_bitmap->is_valid());
+        if (request.can_inspect_element) {
+            add_separator();
+            add("Inspect Element"_string, on_tab([](Tab& tab) { tab.view->inspect_context_menu_element(); }));
+        }
+        break;
+
+    case WebView::ContextMenuKind::Media:
+        if (request.media.has_value()) {
+            auto const& media = *request.media;
+            auto send_media_action = [on_tab](WebView::ContextMenuMediaAction action) {
+                return on_tab([action](Tab& tab) { tab.view->do_context_menu_media_action(action); });
+            };
+
+            add(media.is_playing ? "Pause"_string : "Play"_string, send_media_action(WebView::ContextMenuMediaAction::TogglePlay));
+            add(media.is_muted ? "Unmute"_string : "Mute"_string, send_media_action(WebView::ContextMenuMediaAction::ToggleMute));
+            add(media.has_user_agent_controls ? "Hide Controls"_string : "Show Controls"_string, send_media_action(WebView::ContextMenuMediaAction::ToggleControls));
+            add_checkable("Loop"_string, media.is_looping, send_media_action(WebView::ContextMenuMediaAction::ToggleLoop));
+            add_separator();
+            if (media.is_picture_in_picture || media.can_enter_picture_in_picture)
+                add(media.is_picture_in_picture ? "Exit Picture in Picture"_string : "Picture in Picture"_string, send_media_action(WebView::ContextMenuMediaAction::TogglePictureInPicture));
+            if (media.is_video)
+                add(media.is_fullscreen ? "Exit Full Screen"_string : "Full Screen"_string, send_media_action(WebView::ContextMenuMediaAction::ToggleFullscreen));
+            if (media.media_url.has_value()) {
+                add_separator();
+                add(media.is_video ? "Open Video in New Tab"_string : "Open Audio in New Tab"_string, on_tab([url = *media.media_url](Tab& tab) {
+                    tab.view->open_url_in_new_tab(url, Web::HTML::ActivateTab::No);
+                }));
+                add(media.is_video ? "Copy Video Address"_string : "Copy Audio Address"_string, [copy_text, url = media.media_url->to_string()] { copy_text(url); });
+            }
+        }
+        if (request.can_inspect_element) {
+            add_separator();
+            add("Inspect Element"_string, on_tab([](Tab& tab) { tab.view->inspect_context_menu_element(); }));
+        }
+        break;
+    }
 
     JsonObject event;
     event.set("type"sv, "context_menu"sv);
     event.set("tab"sv, tab.id);
-    event.set("kind"sv, kind);
+    event.set("kind"sv, context_menu_kind_to_string(request.kind));
     event.set("x"sv, position.x());
     event.set("y"sv, position.y());
     event.set("items"sv, move(items));
@@ -3185,7 +3568,8 @@ void EngineServer::handle_context_menu_action(u64 tab_id, JsonObject const& comm
     if (*action_index >= actions.size())
         return;
 
-    actions[*action_index]->activate();
+    if (actions[*action_index].on_activate)
+        actions[*action_index].on_activate();
 }
 
 void EngineServer::send_drag_start(u64 tab_id, Web::DragData drag_data)
@@ -3394,7 +3778,7 @@ void EngineServer::send_session_plan()
     JsonArray windows;
 
     if (!Core::Environment::has("LADYBIRD_SDE_DISABLE_SESSION_RESTORE"sv) && WebView::Application::settings().restore_previous_session()) {
-        if (auto* store = WebView::Application::session_store(WebView::IsPrivate::No)) {
+        if (auto* store = EngineApplication::the().session_store(WebView::IsPrivate::No)) {
             for (auto const& restored_window : store->take_launch_plan()) {
                 JsonArray tabs;
                 for (auto const& tab : restored_window.tabs) {
@@ -3476,9 +3860,9 @@ void EngineServer::handle_download_action(JsonObject const& command)
     } else if (action_name == "resume"sv) {
         downloader.resume_download(*download_id);
     } else if (action_name == "open"sv) {
-        WebView::Application::the().open_download(*download);
+        EngineApplication::the().open_download(*download);
     } else if (action_name == "show_in_folder"sv) {
-        WebView::Application::the().show_download_in_folder(*download);
+        EngineApplication::the().show_download_in_folder(*download);
     }
 }
 

@@ -125,10 +125,10 @@ GC::Ptr<HTMLOptionsCollection> const& HTMLSelectElement::options() const
     // The options IDL attribute must return an HTMLOptionsCollection rooted at the select node,
     // whose filter matches the elements in the list of options.
     if (!m_options) {
-        m_options = HTMLOptionsCollection::create(const_cast<HTMLSelectElement&>(*this), [this](DOM::Element const& element) {
+        m_options = HTMLOptionsCollection::create(const_cast<HTMLSelectElement&>(*this), GC::create_function(heap(), GC::captures(*this), [](HTMLSelectElement const& select, DOM::Element const& element) {
             auto const* maybe_option = as_if<HTML::HTMLOptionElement>(element);
-            return maybe_option && maybe_option->nearest_select_element().ptr() == this;
-        });
+            return maybe_option && maybe_option->nearest_select_element().ptr() == &select;
+        }));
     }
     return m_options;
 }
@@ -200,14 +200,14 @@ GC::Ref<DOM::HTMLCollection> HTMLSelectElement::selected_options()
     // The selectedOptions IDL attribute must return an HTMLCollection rooted at the select node,
     // whose filter matches the elements in the list of options that have their selectedness set to true.
     if (!m_selected_options) {
-        auto filter = [this](Element const& element) {
+        auto filter = GC::create_function(heap(), GC::captures(*this), [](HTMLSelectElement const& select, Element const& element) {
             auto const* maybe_option = as_if<HTML::HTMLOptionElement>(element);
-            if (maybe_option && maybe_option->nearest_select_element().ptr() == this) {
+            if (maybe_option && maybe_option->nearest_select_element().ptr() == &select) {
                 return maybe_option->selected();
             }
             return false;
-        };
-        m_selected_options = DOM::HTMLCollection::create(*this, DOM::HTMLCollection::Scope::Descendants, move(filter), DOM::HTMLCollection::AttributeInvalidationType::None, nullptr, DOM::HTMLCollection::Kind::SelectedOptions);
+        });
+        m_selected_options = DOM::HTMLCollection::create(*this, DOM::HTMLCollection::Scope::Descendants, filter, DOM::HTMLCollection::AttributeInvalidationType::None, nullptr, DOM::HTMLCollection::Kind::SelectedOptions);
     }
     return *m_selected_options;
 }
@@ -1118,14 +1118,14 @@ void HTMLSelectElement::create_list_box_shadow_tree(DOM::ShadowRoot& shadow_root
     MUST(shadow_root.append_child(*m_list_box_element));
 
     auto mousedown_function = JS::NativeFunction::create(
-        HTML::relevant_realm(*this), [this](JS::VM& vm) {
+        HTML::relevant_realm(*this), GC::create_function<JS::ThrowCompletionOr<JS::Value>(JS::VM&)>(GC::Heap::the(), GC::captures(*this), [](auto& self, JS::VM& vm) {
             auto event = vm.argument(0).is_object()
                 ? Bindings::impl_from<UIEvents::MouseEvent>(&vm.argument(0).as_object())
                 : nullptr;
             if (event)
-                handle_list_box_mousedown(*event);
+                self.handle_list_box_mousedown(*event);
             return JS::js_undefined();
-        },
+        }),
         1, Utf16FlyString {}, &HTML::relevant_realm(*this));
     auto mousedown_callback = GC::Heap::the().allocate<WebIDL::CallbackType>(*mousedown_function, HTML::relevant_realm(*this));
     m_list_box_element->add_event_listener_without_options(UIEvents::EventNames::mousedown, DOM::IDLEventListener::create(mousedown_callback));
@@ -1140,11 +1140,11 @@ void HTMLSelectElement::list_box_options_did_change()
     if (!m_list_box_element || m_list_box_update_queued)
         return;
     m_list_box_update_queued = true;
-    queue_an_element_task(HTML::Task::Source::DOMManipulation, [this] {
-        m_list_box_update_queued = false;
-        if (m_list_box_element)
-            update_list_box();
-    });
+    queue_an_element_task(HTML::Task::Source::DOMManipulation, GC::create_function(GC::Heap::the(), GC::captures(*this), [](auto& self) {
+        self.m_list_box_update_queued = false;
+        if (self.m_list_box_element)
+            self.update_list_box();
+    }));
 }
 
 void HTMLSelectElement::update_list_box_row_styles()

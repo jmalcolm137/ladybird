@@ -10,8 +10,9 @@
 #include <AK/HashMap.h>
 #include <AK/Utf16View.h>
 #include <AK/Vector.h>
-#include <LibGC/ConservativeVector.h>
+#include <LibGC/Function.h>
 #include <LibGC/Root.h>
+#include <LibGC/RootVector.h>
 #include <LibGC/WeakHashSet.h>
 #include <LibJS/Breakpoint.h>
 #include <LibJS/Export.h>
@@ -70,17 +71,19 @@ public:
         Utf16FlyString name;
         Value value;
         bool is_mutable { true };
+
+        void visit_edges(GC::Cell::Visitor& visitor) { visitor.visit(value); }
     };
 
     // The callback must call continue_execution() before it returns. It may evaluate JavaScript,
     // in which case any pause triggered by that evaluation is ignored.
-    void set_pause_callback(Function<void(PauseInfo const&)> callback);
+    void set_pause_callback(GC::Ptr<GC::Function<void(PauseInfo const&)>> callback);
 
     void continue_execution(ResumeMode = ResumeMode::Continue);
     // Continue after the host filters out a pause without cancelling an active step operation.
     void continue_execution_preserving_step_state();
     bool is_paused() const;
-    GC::ConservativeVector<FrameBinding> bindings_for_frame(ExecutionContext const&) const;
+    GC::RootVector<FrameBinding> bindings_for_frame(ExecutionContext const&) const;
     ThrowCompletionOr<Value> evaluate_in_frame(ExecutionContext&, Utf16View source_text, UpdateOriginalBindings = UpdateOriginalBindings::Yes);
 
     void request_pause_on_next_bytecode_execution();

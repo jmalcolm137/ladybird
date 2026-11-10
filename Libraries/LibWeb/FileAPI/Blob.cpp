@@ -65,7 +65,6 @@ void* web_blob_get_stream(void* realm, ReadonlyBytes);
 WebIDL::Promise* web_blob_text(void* realm, ReadonlyBytes);
 WebIDL::Promise* web_blob_array_buffer(void* realm, ReadonlyBytes);
 WebIDL::Promise* web_blob_bytes(void* realm, ReadonlyBytes);
-JSCompletion web_blob_deserialize_byte_sequence(Bindings::RustSerializationReader*, BlobBytesABI* out_bytes);
 }
 
 GC::Ref<Blob> Blob::create(ByteBuffer bytes, Utf16String type)
@@ -150,7 +149,7 @@ static GC::Ref<Streams::ReadableStream> get_stream(JS::Realm& realm, ReadonlyByt
             auto bytes = MUST(ByteBuffer::copy(blob_bytes));
 
             // 2. Queue a global task on the file reading task source given blob’s relevant global object to perform the following steps:
-            HTML::queue_global_task(HTML::Task::Source::FileReading, realm.global_object(), GC::create_function(GC::Heap::the(), [&realm, stream, bytes = move(bytes)]() {
+            HTML::queue_global_task(HTML::Task::Source::FileReading, realm.global_object(), GC::create_function(GC::Heap::the(), GC::captures(realm, stream, move(bytes)), [](auto& realm, auto& stream, auto& bytes) {
                 HTML::TemporaryExecutionContext const execution_context { realm, HTML::TemporaryExecutionContext::CallbacksEnabled::Yes };
 
                 // 1. If bytes is failure, then error stream with a failure reason and abort these steps.
@@ -205,10 +204,10 @@ void* web_blob_get_stream(void* realm, ReadonlyBytes blob_bytes)
 WebIDL::Promise* web_blob_text(void* realm, ReadonlyBytes blob_bytes)
 {
     auto& js_realm = *static_cast<JS::Realm*>(realm);
-    auto& vm = js_realm.vm();
 
     auto promise = read_all_blob_bytes(js_realm, blob_bytes);
-    promise = WebIDL::upon_fulfillment(*promise, GC::create_function(GC::Heap::the(), [&vm](JS::Value first_argument) -> WebIDL::ExceptionOr<JS::Value> {
+    promise = WebIDL::upon_fulfillment(*promise, GC::create_function(GC::Heap::the(), GC::captures(js_realm), [](auto& js_realm, JS::Value first_argument) -> WebIDL::ExceptionOr<JS::Value> {
+        JS::VM& vm = js_realm.vm();
         auto const& object = first_argument.as_object();
         VERIFY(is<JS::ArrayBuffer>(object));
         auto const& array_buffer = static_cast<JS::ArrayBuffer const&>(object);
@@ -225,7 +224,7 @@ WebIDL::Promise* web_blob_array_buffer(void* realm, ReadonlyBytes blob_bytes)
     auto& js_realm = *static_cast<JS::Realm*>(realm);
 
     auto promise = read_all_blob_bytes(js_realm, blob_bytes);
-    promise = WebIDL::upon_fulfillment(*promise, GC::create_function(GC::Heap::the(), [&js_realm](JS::Value first_argument) -> WebIDL::ExceptionOr<JS::Value> {
+    promise = WebIDL::upon_fulfillment(*promise, GC::create_function(GC::Heap::the(), GC::captures(js_realm), [](auto& js_realm, JS::Value first_argument) -> WebIDL::ExceptionOr<JS::Value> {
         auto const& object = first_argument.as_object();
         VERIFY(is<JS::ArrayBuffer>(object));
         auto const& array_buffer = static_cast<JS::ArrayBuffer const&>(object);
@@ -241,7 +240,7 @@ WebIDL::Promise* web_blob_bytes(void* realm, ReadonlyBytes blob_bytes)
     auto& js_realm = *static_cast<JS::Realm*>(realm);
 
     auto promise = read_all_blob_bytes(js_realm, blob_bytes);
-    promise = WebIDL::upon_fulfillment(*promise, GC::create_function(GC::Heap::the(), [&js_realm](JS::Value first_argument) -> WebIDL::ExceptionOr<JS::Value> {
+    promise = WebIDL::upon_fulfillment(*promise, GC::create_function(GC::Heap::the(), GC::captures(js_realm), [](auto& js_realm, JS::Value first_argument) -> WebIDL::ExceptionOr<JS::Value> {
         auto& object = first_argument.as_object();
         VERIFY(is<JS::ArrayBuffer>(object));
         auto& array_buffer = static_cast<JS::ArrayBuffer&>(object);
@@ -253,15 +252,6 @@ WebIDL::Promise* web_blob_bytes(void* realm, ReadonlyBytes blob_bytes)
 void web_blob_bytes_destroy(BlobBytes* bytes)
 {
     delete bytes;
-}
-
-JSCompletion web_blob_deserialize_byte_sequence(Bindings::RustSerializationReader* reader, BlobBytesABI* out_bytes)
-{
-    auto bytes = HTML::decode_or_throw_data_clone_error<ByteBuffer>(reader->realm, reader->serialized);
-    if (bytes.is_exception())
-        return Bindings::completion_to_abi(reader->realm, bytes.exception());
-    *out_bytes = hand_over(bytes.release_value());
-    return Bindings::completion_to_abi(reader->realm, JS::js_undefined());
 }
 
 }

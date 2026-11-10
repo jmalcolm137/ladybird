@@ -4,29 +4,81 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <AK/Hex.h>
 #include <LibCore/ArgsParser.h>
+#include <LibCore/Environment.h>
+#include <LibCore/EventLoop.h>
+#include <LibCore/GeolocationProvider.h>
+#include <LibCore/Process.h>
+#include <LibCore/Socket.h>
+#include <LibCore/System.h>
+#include <LibDatabase/Database.h>
+#include <LibHTTP/HeaderList.h>
+#include <LibIPC/Encoder.h>
+#include <LibIPC/Transport.h>
 #include <LibURL/InternalURLs.h>
 #include <LibURL/URL.h>
-#include <LibWebView/SessionStore.h>
+#include <LibWebCommon/WebView/Utilities.h>
+#include <LibWebView/AutocompleteService.h>
+#include <LibWebView/CanonicalTraversable.h>
+#include <LibWebView/CrashReportStore.h>
+#include <LibWebView/FaviconStore.h>
+#include <LibWebView/HistoryStore.h>
+#include <LibWebView/NotificationBackend.h>
+#include <LibWebView/PageTranslation.h>
+#include <LibWebView/PictureInPictureManager.h>
+#include <LibWebView/ReportSubmission.h>
+#include <UI/Qt/SystemAppearance.h>
+#if defined(AK_OS_MACOS)
+#    include <AK/AtomicRefCounted.h>
+#    include <LibCore/MachPort.h>
+#    include <LibIPC/MachBootstrapListener.h>
+#    include <LibIPC/TransportBootstrapMach.h>
+#    include <LibIPC/TransportMachPort.h>
+#    include <LibThreading/Thread.h>
+#    include <LibWebView/NotificationBackendMacOS.h>
+#    include <mach/mach.h>
+#    include <sys/wait.h>
+#elif defined(AK_OS_LINUX) || defined(AK_OS_FREEBSD)
+#    include <LibWebView/NotificationBackendFreedesktop.h>
+#endif
+#include <LibWebView/NoOpNotificationBackend.h>
+#include <LibWebView/Translator.h>
 #include <LibWebView/URL.h>
 #include <LibWebView/Utilities.h>
+#include <LibWebView/WebContentPage.h>
 #include <UI/Qt/Application.h>
 #include <UI/Qt/BookmarkDialog.h>
+#include <UI/Qt/Bookmarks.h>
 #include <UI/Qt/ChromeLayout.h>
-#include <UI/Qt/ChromeStyle.h>
+#include <UI/Qt/DownloadsPage.h>
 #include <UI/Qt/EventLoopImplementationQt.h>
 #include <UI/Qt/ExternalURLHandler.h>
+#include <UI/Qt/HistoryPage.h>
 #include <UI/Qt/Menu.h>
 #include <UI/Qt/PictureInPictureWindow.h>
+#include <UI/Qt/PlainText.h>
 #include <UI/Qt/ProcessManagerWindow.h>
+#include <UI/Qt/RemoteDownloads.h>
+#include <UI/Qt/SessionStore.h>
 #include <UI/Qt/StringUtils.h>
 #include <UI/Qt/Tab.h>
 #include <UI/Qt/Theme.h>
+#include <UI/Qt/VersionPage.h>
 #include <UI/Qt/WebContentView.h>
+#include <UI/Qt/WebUIPage.h>
 
 #if defined(AK_OS_MACOS)
+#    include <UI/Qt/ApplicationIcon.h>
+#    include <UI/Qt/LaunchURLsMacOS.h>
 #    include <UI/Qt/MacWindow.h>
+#    include <UI/Qt/MicrophoneAuthorizerMacOS.h>
 #    include <UI/Qt/ScrollbarPreferencesMac.h>
+#    include <UI/Qt/SpellCheckerMac.h>
+#endif
+
+#if defined(LADYBIRD_HAS_TRANSLATOR)
+#    include <UI/Qt/TranslatorMac.h>
 #endif
 
 #if defined(AK_OS_LINUX)
@@ -56,9 +108,16 @@
 #include <QStandardPaths>
 #include <QTimer>
 
+#if defined(AK_OS_MACOS)
+#    include <QUtiMimeConverter>
+#endif
+
+#if defined(AK_OS_MACOS) || defined(AK_OS_WINDOWS)
+#    include <LibCore/TimeZoneWatcher.h>
+#endif
+
 #if defined(AK_OS_WINDOWS)
 #    include <AK/Windows.h>
-#    include <LibCore/TimeZoneWatcher.h>
 #    include <QAbstractNativeEventFilter>
 #endif
 
@@ -225,7 +284,7 @@ public:
         setQuitOnLastWindowClosed(false);
         install_appkit_event_capture();
 #endif
-        update_chrome_style();
+        installEventFilter(&m_plain_text_event_filter);
 
         // Suppress some warnings that end up flooding the console when Orca is in use. QSpiAccessibleBridge logs both
         // (1) one-time at startup, a couple warnings for some AT-SPI2 methods it doesn't implement, and (2) for *every*
@@ -237,12 +296,12 @@ public:
 
     virtual bool event(QEvent* event) override
     {
-        auto& application = static_cast<Application&>(WebView::Application::the());
+        auto& application = Application::the();
         auto const event_type = event->type();
 
 #if defined(AK_OS_WINDOWS)
         static Optional<NativeWindowsTimeChangeEventFilter> time_change_event_filter {};
-        if (auto time_zone_watcher = application.time_zone_watcher(); !time_change_event_filter.has_value() && time_zone_watcher.has_value()) {
+        if (auto time_zone_watcher = Application::hub().time_zone_watcher(); !time_change_event_filter.has_value() && time_zone_watcher.has_value()) {
             time_change_event_filter.emplace(time_zone_watcher.value());
             installNativeEventFilter(&time_change_event_filter.value());
         }
@@ -285,8 +344,6 @@ public:
         }
 
         auto handled = QApplication::event(event);
-        if (event_type == QEvent::ApplicationPaletteChange || event_type == QEvent::ThemeChange)
-            update_chrome_style();
 
 #if defined(AK_OS_MACOS)
         if (event_type == QEvent::ApplicationActivate && !has_visible_browser_window())
@@ -298,7 +355,7 @@ public:
 
     void create_application_actions()
     {
-        auto& application = WebView::Application::the();
+        auto& application = ApplicationActions::the();
 
         auto make_action = [&](QString const& text) {
             auto* action = new QAction(text, m_application_widget);
@@ -347,6 +404,7 @@ public:
 #if defined(AK_OS_MACOS)
             QKeySequence(Qt::META | Qt::Key_Tab),
             QKeySequence(Qt::CTRL | Qt::SHIFT | Qt::Key_BracketRight),
+            QKeySequence(Qt::CTRL | Qt::ALT | Qt::Key_Right),
 #endif
         });
         QObject::connect(m_open_next_tab_action, &QAction::triggered, this, []() {
@@ -361,6 +419,7 @@ public:
 #if defined(AK_OS_MACOS)
             QKeySequence(Qt::META | Qt::SHIFT | Qt::Key_Tab),
             QKeySequence(Qt::CTRL | Qt::SHIFT | Qt::Key_BracketLeft),
+            QKeySequence(Qt::CTRL | Qt::ALT | Qt::Key_Left),
 #endif
         });
         QObject::connect(m_open_previous_tab_action, &QAction::triggered, this, []() {
@@ -386,16 +445,51 @@ public:
         m_open_file_action->setShortcut(QKeySequence(QKeySequence::StandardKey::Open));
         QObject::connect(m_open_file_action, &QAction::triggered, this, []() { Application::the().open_file(); });
 
+        m_open_location_action = make_action("Open &Location…");
+        m_open_location_action->setShortcuts({ QKeySequence(Qt::CTRL | Qt::Key_L), QKeySequence(Qt::ALT | Qt::Key_D) });
+        QObject::connect(m_open_location_action, &QAction::triggered, this, []() {
+            if (auto* tab = Application::the().active_tab())
+                tab->focus_location_editor();
+        });
+
         m_open_settings_action = create_application_action(*m_application_widget, application.open_settings_page_action(), IncludeActionIcon::No);
         m_open_downloads_action = create_application_action(*m_application_widget, application.open_downloads_page_action(), IncludeActionIcon::No);
 
-        m_toggle_bookmark_bar_action = create_application_action(*m_application_widget, application.toggle_bookmark_bar_action(), IncludeActionIcon::No);
+        m_toggle_bookmark_bar_action = create_application_action(*m_application_widget, Application::bookmarks().toggle_bookmark_bar_action(), IncludeActionIcon::No);
+        m_toggle_sidebar_action = create_application_action(*m_application_widget, application.toggle_vertical_tabs_expanded_action(), IncludeActionIcon::No);
+
+        m_reload_action = create_application_action(*m_application_widget, application.reload_action(), IncludeActionIcon::No);
+        m_reload_bypassing_cache_action = create_application_action(*m_application_widget, application.reload_bypassing_cache_action(), IncludeActionIcon::No);
+
+        // NB: Esc only labels the item. The page view stops a load on Esc itself, after the node picker has had its
+        //     chance at the key, so it isn't a window-wide shortcut that would take Esc from every widget.
+        m_stop_action = make_action("&Stop");
+        m_stop_action->setShortcut(QKeySequence(Qt::Key_Escape));
+        m_stop_action->setShortcutContext(Qt::WidgetShortcut);
+        QObject::connect(m_stop_action, &QAction::triggered, this, []() {
+            if (auto* tab = Application::the().active_tab(); tab && tab->view().is_loading())
+                tab->view().stop_loading();
+        });
 
         m_find_in_page_action = make_action("&Find in Page…");
         m_find_in_page_action->setShortcuts(QKeySequence::keyBindings(QKeySequence::StandardKey::Find));
         QObject::connect(m_find_in_page_action, &QAction::triggered, this, []() {
             if (auto* window = Application::the().active_window_if_any())
                 window->show_find_in_page();
+        });
+
+        m_find_next_action = make_action("Find &Next");
+        m_find_next_action->setShortcuts(QKeySequence::keyBindings(QKeySequence::StandardKey::FindNext));
+        QObject::connect(m_find_next_action, &QAction::triggered, this, []() {
+            if (auto* tab = Application::the().active_tab())
+                tab->find_next();
+        });
+
+        m_find_previous_action = make_action("Find Pre&vious");
+        m_find_previous_action->setShortcuts(QKeySequence::keyBindings(QKeySequence::StandardKey::FindPrevious));
+        QObject::connect(m_find_previous_action, &QAction::triggered, this, []() {
+            if (auto* tab = Application::the().active_tab())
+                tab->find_previous();
         });
 
         m_zoom_in_action = create_application_action(*m_application_widget, application.zoom_in_action(), IncludeActionIcon::No);
@@ -414,7 +508,7 @@ public:
         });
 #endif
 
-        m_bookmarks_menu = create_application_menu(*m_application_widget, application.bookmarks_menu());
+        m_bookmarks_menu = create_application_menu(*m_application_widget, Application::bookmarks().menu());
 
         m_history_menu = create_application_menu(*m_application_widget, application.history_menu());
         QObject::connect(m_history_menu, &QMenu::aboutToShow, this, [this]() {
@@ -458,14 +552,14 @@ public:
 
         m_reopen_recently_closed_tab_action->setText("&Reopen Closed Tab");
         auto* active_window = Application::the().active_window_if_any();
-        auto& session = active_window ? active_window->session() : WebView::Application::default_session();
-        m_reopen_recently_closed_tab_action->setEnabled(session.session_store->has_closed_units());
+        auto& session = active_window ? active_window->session() : Application::session_store(WebView::IsPrivate::No);
+        m_reopen_recently_closed_tab_action->setEnabled(session.has_closed_units());
     }
 
     void rebuild_bookmarks_menu()
     {
         if (m_bookmarks_menu)
-            repopulate_application_menu(*m_bookmarks_menu, *m_application_widget, WebView::Application::the().bookmarks_menu());
+            repopulate_application_menu(*m_bookmarks_menu, Application::bookmarks().menu());
     }
 
 private:
@@ -521,14 +615,11 @@ private:
     }
 #endif
 
-    void update_chrome_style()
-    {
-        setStyleSheet(ChromeStyle::application_style_sheet(palette()));
-    }
-
     // The application actions require a QWidget owner, which we don't have at the time of creation. We use this dummy
     // widget instead, which we also can't properly parent as it would need a QWidget owner as well.
     OwnPtr<QWidget> m_application_widget { nullptr };
+
+    PlainTextEventFilter m_plain_text_event_filter;
 
 #if defined(AK_OS_MACOS)
     QMenuBar* m_menu_bar { nullptr };
@@ -554,6 +645,13 @@ private:
     QAction* m_open_settings_action { nullptr };
     QAction* m_open_downloads_action { nullptr };
     QAction* m_toggle_bookmark_bar_action { nullptr };
+    QAction* m_toggle_sidebar_action { nullptr };
+    QAction* m_open_location_action { nullptr };
+    QAction* m_reload_action { nullptr };
+    QAction* m_reload_bypassing_cache_action { nullptr };
+    QAction* m_stop_action { nullptr };
+    QAction* m_find_next_action { nullptr };
+    QAction* m_find_previous_action { nullptr };
     QAction* m_find_in_page_action { nullptr };
     QAction* m_zoom_in_action { nullptr };
     QAction* m_zoom_out_action { nullptr };
@@ -561,9 +659,373 @@ private:
     QAction* m_quit_action { nullptr };
 };
 
-Application::Application() = default;
+#if defined(AK_OS_MACOS)
+// Qt stores a MIME type it has no converter for under a private type that only Qt applications can read. This puts PNG
+// data on the pasteboard as public.png, for other applications to paste. The bytes pass through undecoded, as they may
+// come from a page.
+class PNGMimeConverter final : public QUtiMimeConverter {
+public:
+    virtual QString utiForMime(QString const& mime) const override
+    {
+        return mime == "image/png" ? QStringLiteral("public.png") : QString {};
+    }
+
+    virtual QString mimeForUti(QString const& uti) const override
+    {
+        return uti == "public.png" ? QStringLiteral("image/png") : QString {};
+    }
+
+    virtual QVariant convertToMime(QString const&, QList<QByteArray> const& data, QString const&) const override
+    {
+        return data.isEmpty() ? QVariant {} : QVariant { data.first() };
+    }
+
+    virtual QList<QByteArray> convertFromMime(QString const&, QVariant const& data, QString const&) const override
+    {
+        return { data.toByteArray() };
+    }
+};
+#endif
+
+Application* Application::s_the = nullptr;
+
+ErrorOr<NonnullOwnPtr<Application>> Application::create(Main::Arguments const& arguments)
+{
+    auto application = adopt_own(*new Application);
+    application->m_command_line = MUST(String::join(' ', arguments.strings));
+
+#ifdef LADYBIRD_HUB_IN_OWN_PROCESS
+    WebView::platform_init();
+    application->m_arguments_for_qt = arguments;
+    application->will_create_event_loop(application->m_arguments_for_qt);
+    application->m_event_loop = &Core::EventLoop::initialize_for_current_thread();
+    application->did_create_event_loop(*application->m_event_loop);
+    TRY(application->connect_to_hub(arguments));
+#else
+    application->m_hub = TRY(Hub::Application::create(arguments, static_cast<Hub::ApplicationHost*>(application.ptr())));
+
+    // Headless mode has no UI to connect to the Hub.
+    if (browser_options().headless_mode.has_value())
+        return application;
+
+    auto transports = TRY(IPC::TransportHandle::create_pair());
+    application->m_connection_from_ui = Hub::ConnectionFromUI::construct(TRY(transports.first.create_transport()));
+    application->m_hub_connection = adopt_ref(*new HubConnection(TRY(transports.second.create_transport())));
+#endif
+    return application;
+}
+
+#ifdef LADYBIRD_HUB_IN_OWN_PROCESS
+#    if defined(AK_OS_MACOS)
+// What the Hub gets its end of the connection from. The thread that watches for the Hub to end can outlive connecting.
+struct HubBootstrap : public AtomicRefCounted<HubBootstrap> {
+    IPC::TransportBootstrapMachServer server;
+};
+#    endif
+
+ErrorOr<ByteString> Application::hub_executable_path()
+{
+    for (auto const& path : TRY(WebView::get_paths_for_helper_process("Hub"sv))) {
+        if (!Core::System::access(path, X_OK).is_error())
+            return path;
+    }
+    return Error::from_string_literal("Unable to find the Hub");
+}
+
+Hub::UIInfo Application::current_ui_info() const
+{
+    Hub::UIInfo info;
+    info.ui_font_family = ui_font_family();
+    info.system_font_family = system_font_family();
+    info.interface_color_scheme = interface_color_scheme();
+    info.supports_picture_in_picture = supports_picture_in_picture();
+    info.has_location_source = Core::GeolocationProvider::is_available();
+    // NB: The Hub reads this before it first asks for a position, which is long before the UI's provider could tell it.
+    if (info.has_location_source) {
+        if (auto provider = Core::GeolocationProvider::create(); !provider.is_error())
+            info.location_authorization = provider.value()->authorization();
+    }
+    info.has_translator = has_translator();
+    info.has_spell_checker = m_spell_checker != nullptr;
+    info.spell_checker_learns_for_every_tag = m_spell_checker && m_spell_checker->learns_for_every_tag();
+    info.spell_checker_can_suggest = m_spell_checker && m_spell_checker->can_suggest();
+    if (m_microphone_authorizer)
+        info.microphone_authorization = m_microphone_authorizer->authorization();
+    info.supports_selection_clipboard = supports_clipboard_type(ClipboardType::Selection);
+    info.supports_system_menu_bar = supports_system_menu_bar();
+    info.supports_vertical_tabs = supports_vertical_tabs();
+    info.supports_private_browsing_windows = supports_private_browsing_windows();
+    info.supports_client_side_window_decorations = supports_client_side_window_decorations();
+    info.reports_scroll_momentum = platform_reports_scroll_momentum();
+    info.scrolls_elastically = platform_scrolls_elastically();
+    info.scrollbar_track_press_jumps = platform_scrollbar_track_press_jumps();
+    info.preferred_languages = platform_preferred_languages();
+    info.presentation_gpu_device = platform_presentation_gpu_device();
+    info.presentation_drm_format_modifiers = platform_presentation_drm_format_modifiers();
+    return info;
+}
+
+ErrorOr<void> Application::connect_to_hub(Main::Arguments const& arguments)
+{
+    auto hub_path = TRY(hub_executable_path());
+
+#    if defined(LADYBIRD_HAS_TRANSLATOR)
+    m_translator = create_platform_translator();
+    // The Hub decides what to offer for each page, so it hears whenever a language's download starts or finishes.
+    if (m_translator) {
+        m_translator->on_languages_changed = [] {
+            if (auto* hub = HubConnection::the_if_connected())
+                hub->async_translator_languages_changed();
+        };
+    }
+#    endif
+#    if defined(AK_OS_MACOS)
+    m_spell_checker = create_platform_spell_checker();
+    m_microphone_authorizer = make<MicrophoneAuthorizerMacOS>();
+#    endif
+
+    IPC::MessageBuffer ui_info_buffer;
+    IPC::Encoder encoder { ui_info_buffer };
+    TRY(encoder.encode(current_ui_info()));
+
+    Vector<ByteString> hub_arguments;
+    for (auto argument : arguments.strings.slice(1))
+        hub_arguments.append(argument);
+#    if defined(AK_OS_MACOS)
+    // NB: When macOS launches the browser to open a URL or a file, such as a link clicked in another app, the URL is in a
+    //     launch Apple event to this process, never in argv. The Hub opens it like a URL from the command line, and
+    //     hands it to the browser already running for the profile, if there is one.
+    hub_arguments.extend(take_urls_from_launch_apple_events());
+#    endif
+    hub_arguments.append(ByteString::formatted("--ui-info={}", encode_hex(ui_info_buffer.data().span())));
+
+    Core::ProcessSpawnOptions spawn_options {
+        .name = "Hub"sv,
+        .executable = hub_path,
+        .arguments = hub_arguments,
+    };
+
+#    if defined(AK_OS_MACOS)
+    // NB: This must answer while the main thread waits for the Hub to initialize, so it answers on its own thread.
+    auto hub_bootstrap = adopt_ref(*new HubBootstrap);
+    IPC::MachBootstrapListener bootstrap_listener { WebView::mach_server_name_for_process("Ladybird-UI"sv, Core::System::getpid()) };
+    if (!bootstrap_listener.is_initialized())
+        return Error::from_string_literal("Unable to start the Mach server for the Hub");
+    bootstrap_listener.on_bootstrap_request = [hub_bootstrap](IPC::MachBootstrapListener::BootstrapRequest request) {
+        if (auto result = hub_bootstrap->server.handle_bootstrap_request(request.pid, move(request.reply_port)); result.is_error())
+            dbgln("Unable to bootstrap the Hub: {}", result.error());
+    };
+    hub_arguments.append(ByteString::formatted("--ui-mach-server={}", bootstrap_listener.server_port_name()));
+    spawn_options.arguments = hub_arguments;
+
+    auto port_a_recv = TRY(Core::MachPort::create_with_right(Core::MachPort::PortRight::Receive));
+    auto port_a_send = TRY(port_a_recv.insert_right(Core::MachPort::MessageRight::MakeSend));
+    auto port_b_recv = TRY(Core::MachPort::create_with_right(Core::MachPort::PortRight::Receive));
+    auto port_b_send = TRY(port_b_recv.insert_right(Core::MachPort::MessageRight::MakeSend));
+
+    // The Hub may receive startup messages before it has constructed its transport.
+    IPC::TransportMachPort::raise_receive_queue_limit(port_b_recv);
+
+    Optional<Core::Process> spawned_process;
+    {
+        MutexLocker child_registration_locker(hub_bootstrap->server.child_registration_lock());
+        spawned_process = TRY(Core::Process::spawn(spawn_options));
+        hub_bootstrap->server.register_child_transport(spawned_process->pid(), IPC::TransportBootstrapMachPorts { move(port_b_recv), move(port_a_send) });
+    }
+    auto process = spawned_process.release_value();
+
+    // NB: Until the Hub takes its ports, we hold them ourselves, so nothing would tell us of a Hub that ended before
+    //     that. Letting go of them then closes the connection, as a socket does when its peer ends.
+    auto hub_exit_watcher = Threading::Thread::construct("HubExitWatcher"sv, [hub_bootstrap, pid = process.pid()]() -> intptr_t {
+        siginfo_t info {};
+        while (waitid(P_PID, pid, &info, WEXITED | WNOWAIT) < 0 && errno == EINTR)
+            ;
+        hub_bootstrap->server.unregister_child_transport(pid);
+        return 0;
+    });
+    hub_exit_watcher->start();
+    hub_exit_watcher->detach();
+
+    auto transport = make<IPC::Transport>(move(port_a_recv), move(port_b_send));
+#    else
+    int socket_fds[2] {};
+    TRY(Core::System::socketpair(AF_LOCAL, SOCK_STREAM | SOCK_CLOEXEC, 0, socket_fds));
+
+    spawn_options.file_actions.append(Core::FileAction::DupFd { .write_fd = socket_fds[1], .fd = socket_fds[1] });
+    TRY(Core::Environment::set("SOCKET_TAKEOVER"sv, ByteString::formatted("ipc:{}", socket_fds[1]), Core::Environment::Overwrite::Yes));
+    auto process = TRY(Core::Process::spawn(spawn_options));
+    TRY(Core::Environment::unset("SOCKET_TAKEOVER"sv));
+    TRY(Core::System::close(socket_fds[1]));
+
+    auto ipc_socket = TRY(Core::LocalSocket::adopt_fd(socket_fds[0]));
+    TRY(ipc_socket->set_blocking(true));
+    auto transport = make<IPC::Transport>(move(ipc_socket));
+#    endif
+    m_hub_connection = adopt_ref(*new HubConnection(move(transport)));
+
+    // The Hub can find that there is nothing for us to do, as when another process has this profile and takes our URLs,
+    // or when asked for its usage. It ends right away then, and how it ended is how we end.
+    auto initial_state = m_hub_connection->try_initialize();
+    if (initial_state.is_error()) {
+        m_exit_status_if_done = TRY(process.wait_for_termination());
+        return {};
+    }
+    auto state = initial_state.release_value();
+    m_hub_connection->did_initialize();
+
+    m_settings = make<WebView::Settings>(WebView::Settings::create_from_json(TRY(JsonValue::from_string(state.settings_json))));
+    m_bookmark_store = make<BookmarkStore>(BookmarkStore::create(LexicalPath::join(state.config_directory, "Bookmarks.json"sv).string()));
+    create_session_store(state.data_directory, state.persists_sessions);
+    create_history_store(state.data_directory, state.uses_sql_database);
+    // NB: Reports stay in files, which both of us read. This process keeps its own for when it crashes, and the next
+    //     launch recovers that the same as one of the Hub's.
+    auto& crash_report_store = WebView::CrashReportStore::the();
+    crash_report_store.set_directory(move(state.crash_report_directory));
+    if (auto result = crash_report_store.initialize_browser_crash_handler(); result.is_error())
+        warnln("Could not prepare UI crash reporting: {}", result.error());
+
+    m_browser_options.urls = move(state.urls);
+    m_browser_options.raw_urls = move(state.raw_urls);
+    m_browser_options.devtools_port = state.devtools_port;
+#    if defined(AK_OS_MACOS)
+    set_profile_application_icon(state.profile_identifier, state.profile_identity, state.profile_is_temporary);
+#    endif
+    m_application_actions = make<ApplicationActions>(ApplicationActions::PageOptions {
+        .user_agent = move(state.user_agent),
+        .navigator_compatibility_mode = state.navigator_compatibility_mode,
+        .scripting_enabled = state.scripting_enabled,
+        .blocks_pop_ups = state.blocks_pop_ups,
+        .devtools_enabled = state.devtools_enabled,
+    });
+    RemoteDownloads::the().set_downloads(state.downloads);
+
+    create_platform_actions();
+
+    WebView::ReportSubmission::set_post_function([](auto const& url, auto headers, auto body, auto on_response) -> Function<void()> {
+        auto request_id = HubConnection::the().post_report(url, move(headers), move(body), [on_response = move(on_response)](auto response) {
+            on_response({ .had_network_error = response.had_network_error, .response_code = response.response_code, .headers = move(response.headers), .body = move(response.body) });
+        });
+        return [request_id] {
+            if (auto* hub = HubConnection::the_if_connected())
+                hub->stop_request(request_id);
+        };
+    });
+
+#    if defined(AK_OS_MACOS)
+    // NB: The system tells of this through the run loop, and only this process has one.
+    if (!Core::Environment::has("TZ"sv)) {
+        m_time_zone_watcher = TRY(Core::TimeZoneWatcher::create());
+        m_time_zone_watcher->on_time_zone_changed = [] {
+            if (auto* hub = HubConnection::the_if_connected())
+                hub->async_system_time_zone_changed();
+        };
+    }
+#    endif
+
+    // NB: The user can give the browser the microphone in the system settings at any time, and comes back to the browser
+    //     after doing it.
+    if (m_microphone_authorizer) {
+        QObject::connect(qGuiApp, &QGuiApplication::applicationStateChanged, [this](Qt::ApplicationState state) {
+            if (state != Qt::ApplicationActive)
+                return;
+            if (auto* hub = HubConnection::the_if_connected())
+                hub->async_microphone_authorization_changed(m_microphone_authorizer->authorization());
+        });
+    }
+
+    QObject::connect(&SystemAppearance::the(), &SystemAppearance::changed, [this] {
+        if (auto* hub = HubConnection::the_if_connected())
+            hub->async_ui_info_changed(current_ui_info());
+    });
+    return {};
+}
+
+Vector<WebView::ProcessSnapshot> Application::process_snapshots()
+{
+    auto snapshots = HubConnection::the().process_snapshots();
+
+    // NB: The Hub knows the processes that it launched. Only this one can always tell how it is doing itself.
+    if (m_ui_process_statistics.processes.is_empty()) {
+        auto process_info = make<Core::Platform::ProcessInfo>(Core::System::getpid());
+#    if defined(AK_OS_MACH)
+        mach_port_t task_name_port = MACH_PORT_NULL;
+        VERIFY(task_get_special_port(mach_task_self(), TASK_NAME_PORT, &task_name_port) == KERN_SUCCESS);
+        process_info->task_name_port = Core::MachPort::adopt_right(task_name_port, Core::MachPort::PortRight::Send);
+#    endif
+        m_ui_process_statistics.processes.append(move(process_info));
+    }
+    if (auto result = Core::Platform::update_process_statistics(m_ui_process_statistics); result.is_error())
+        dbgln("Unable to update the UI's process statistics: {}", result.error());
+
+    auto const& statistics = *m_ui_process_statistics.processes.first();
+    WebView::ProcessSnapshot snapshot;
+    snapshot.child_id = NumericLimits<u64>::max();
+    snapshot.pid = statistics.pid;
+    snapshot.type = WebView::ProcessType::UI;
+    snapshot.cpu_percent = statistics.cpu_percent;
+    snapshot.memory_usage_bytes = statistics.memory_usage_bytes;
+    snapshots.append(move(snapshot));
+    return snapshots;
+}
+
+bool Application::has_translator() const { return m_translator != nullptr; }
+Optional<int> Application::exit_status_if_done() const { return m_exit_status_if_done; }
+
+ErrorOr<int> Application::execute()
+{
+    return m_event_loop->exec();
+}
+#else
+bool Application::has_translator() const { return WebView::Application::the().translator() != nullptr; }
+Optional<int> Application::exit_status_if_done() const
+{
+    if (!hub().should_exit_after_profile_coordination())
+        return {};
+    outln("Opening in existing process");
+    return 0;
+}
+ErrorOr<int> Application::execute() { return hub().execute(); }
+#endif
+
+Application::Application()
+{
+    s_the = this;
+}
+
 Application::~Application()
 {
+    // NB: The application tears down its processes as it goes, which must happen after the QApplication is gone, and
+    //     with nothing left here to call back into.
+    ScopeGuard tear_down_hub = [this] {
+#if !defined(AK_OS_WINDOWS)
+        // No event loop runs the handlers during teardown, so a signal from here on takes its default action again.
+        for (auto handler : m_session_signal_handlers)
+            Core::EventLoop::unregister_signal(handler);
+#endif
+
+        // Only a normal exit gets this far, after every window is gone. A crash, or the Hub going away, ends this
+        // process at once, so it never records a clean exit.
+        if (m_session_store) {
+            m_session_store->flush_dirty_state();
+            m_session_store->mark_clean_exit();
+        }
+
+        // NB: The views go along with the windows that showed them, and their timers need the QApplication.
+#ifndef LADYBIRD_HUB_IN_OWN_PROCESS
+        if (m_hub)
+            m_hub->destroy_all_views();
+#endif
+        m_application = nullptr;
+        m_hub_connection = nullptr;
+#ifndef LADYBIRD_HUB_IN_OWN_PROCESS
+        m_connection_from_ui = nullptr;
+        if (m_hub)
+            m_hub->detach_from_host();
+        m_hub = nullptr;
+#endif
+        s_the = nullptr;
+    };
+
     // NB: A run stopped by a signal leaves its windows open for the next launch to recover. Their pages must still go
     //     before the QApplication does, since the processes torn down after it end their navigations, which updates
     //     their widgets.
@@ -576,12 +1038,33 @@ Application::~Application()
     }
     for (auto& window : windows)
         delete window.data();
+
+    // A Picture-in-Picture window is a widget too, so it must also go before the QApplication does.
+    m_picture_in_picture_windows.clear();
 }
 
 void Application::show_process_manager()
 {
     if (!m_process_manager_window) {
-        m_process_manager_window = make<ProcessManagerWindow>(process_manager());
+        m_process_manager_window = make<ProcessManagerWindow>(ProcessManagerWindow::Source {
+#ifdef LADYBIRD_HUB_IN_OWN_PROCESS
+            .take_snapshots = [this] { return process_snapshots(); },
+            .end_process = [](u64 child_id) { return HubConnection::the().terminate_process(child_id); },
+#else
+            .take_snapshots = [] { return WebView::process_snapshots(WebView::Application::process_manager()); },
+            .end_process = [](u64 child_id) { return WebView::end_process(WebView::Application::process_manager(), child_id); },
+#endif
+            .favicon_hash = [](WebView::ProcessPageSnapshot const& page) -> Optional<String> {
+                if (auto* view = RemoteView::find(page.view_id))
+                    return view->favicon_hash();
+                return {};
+            },
+            .favicon_png = [](String const& favicon_hash) {
+                // NB: A private window's favicons are in a store of their own, which the hash finds as well.
+                if (auto png = favicon_store(WebView::IsPrivate::No).favicon_png(favicon_hash); png.has_value())
+                    return png;
+                return favicon_store(WebView::IsPrivate::Yes).favicon_png(favicon_hash); },
+        });
 #if defined(AK_OS_MACOS)
         // The traffic lights are centered in the Task Manager's title bar, which is 52 px tall.
         m_process_manager_window->on_title_bar_change = [window = m_process_manager_window.ptr()] {
@@ -600,9 +1083,43 @@ void Application::show_process_manager()
 
 void Application::create_platform_actions()
 {
-    WebView::Application::inspect_menu().add_action(WebView::Action::create("Open Task Manager"sv, WebView::ActionID::OpenTaskManager, [this]() {
+#ifndef LADYBIRD_HUB_IN_OWN_PROCESS
+    m_settings = make<WebView::Settings>(WebView::Settings::create_from_json(WebView::Application::settings().serialize_json()));
+    m_bookmark_store = make<BookmarkStore>(BookmarkStore::create(LexicalPath::join(WebView::Application::profile().paths().config, "Bookmarks.json"sv).string()));
+    auto& hub = WebView::Application::the();
+    create_session_store(WebView::Application::profile().paths().data, hub.persists_sessions());
+    create_history_store(WebView::Application::profile().paths().data, WebView::Application::browser_options().disable_sql_database == WebView::DisableSQLDatabase::No);
+    m_application_actions = make<ApplicationActions>(ApplicationActions::PageOptions {
+        .user_agent = hub.user_agent_string(),
+        .navigator_compatibility_mode = hub.navigator_compatibility_mode(),
+        .scripting_enabled = hub.scripting_enabled(),
+        .blocks_pop_ups = hub.blocks_pop_ups(),
+        .devtools_enabled = hub.devtools_enabled(),
+    });
+    RemoteDownloads::the().set_downloads(Hub::ConnectionFromUI::downloads());
+#endif
+    if (auto* hub = HubConnection::the_if_connected())
+        hub->set_settings_from_hub(m_settings->serialize_json());
+    m_settings->on_persist = [](JsonValue const& settings) {
+        if (auto* hub = HubConnection::the_if_connected())
+            hub->send_settings_changes(settings);
+    };
+    m_web_ui_pages = make<WebUIPages>();
+    m_bookmarks = make<Bookmarks>(*m_bookmark_store);
+    m_web_ui_pages->register_page("history"_string, "History"_string, [](u64 web_ui_id, WebView::IsPrivate is_private) -> NonnullOwnPtr<WebUIPage> {
+        return make<HistoryPage>(web_ui_id, is_private);
+    });
+    m_web_ui_pages->register_page("downloads"_string, "Downloads"_string, [](u64 web_ui_id, WebView::IsPrivate is_private) -> NonnullOwnPtr<WebUIPage> {
+        return make<DownloadsPage>(web_ui_id, is_private);
+    });
+    m_web_ui_pages->register_page("version"_string, "Version"_string, [](u64 web_ui_id, WebView::IsPrivate) -> NonnullOwnPtr<WebUIPage> {
+        return make<VersionPage>(web_ui_id);
+    });
+
+    m_open_task_manager_action = Action::create("Open Task Manager"sv, ActionID::OpenTaskManager, [this]() {
         show_process_manager();
-    }));
+    });
+    m_application_actions->inspect_menu().add_action(*m_open_task_manager_action);
 
     if (m_application) {
         auto& qapplication = static_cast<LadybirdQApplication&>(*m_application);
@@ -614,47 +1131,47 @@ void Application::create_platform_actions()
     }
 }
 
-Core::EventLoop& Application::create_platform_event_loop()
+void Application::will_create_event_loop(Main::Arguments& arguments)
 {
-    if (!browser_options().headless_mode.has_value()) {
-        Core::EventLoopManager::install(*new EventLoopManagerQt);
+    Core::EventLoopManager::install(*new EventLoopManagerQt);
 #if !defined(Q_OS_MACOS) && !defined(Q_OS_WIN)
-        // Prevent any competing AT-SPI2 bridge from attaching to our process. On GNOME/Fedora, Qt loads the libqgtk3
-        // platform-theme plugin by default — which pulls in libgtk-3 via DT_NEEDED. Once libgtk-3 is loaded, its init
-        // calls atk_bridge_adaptor_init(). And that registers an ATK app on the shared AT-SPI2 bus under *our* D-Bus
-        // name, hijacking it from QSpiAccessibleBridge. AT clients then see a GTK app with zero accessible children
-        // (because ATK has no widgets to expose in a Qt app) — and our entire accessibility tree is unreachable.
-        //
-        // So, we set NO_AT_BRIDGE=1 here — before libgtk-3 is loaded – to tell GTK's init code to skip the atk-bridge
-        // registration. The library is still linked, but the hijack doesn't happen; AT-SPI2 queries reach Qt's bridge
-        // (and therefore our WebContentViewAccessible) normally. Firefox's toolkit/xre/nsAppRunner.cpp does the same.
-        qputenv("NO_AT_BRIDGE", "1");
+    // Prevent any competing AT-SPI2 bridge from attaching to our process. On GNOME/Fedora, Qt loads the libqgtk3
+    // platform-theme plugin by default — which pulls in libgtk-3 via DT_NEEDED. Once libgtk-3 is loaded, its init
+    // calls atk_bridge_adaptor_init(). And that registers an ATK app on the shared AT-SPI2 bus under *our* D-Bus
+    // name, hijacking it from QSpiAccessibleBridge. AT clients then see a GTK app with zero accessible children
+    // (because ATK has no widgets to expose in a Qt app) — and our entire accessibility tree is unreachable.
+    //
+    // So, we set NO_AT_BRIDGE=1 here — before libgtk-3 is loaded – to tell GTK's init code to skip the atk-bridge
+    // registration. The library is still linked, but the hijack doesn't happen; AT-SPI2 queries reach Qt's bridge
+    // (and therefore our WebContentViewAccessible) normally. Firefox's toolkit/xre/nsAppRunner.cpp does the same.
+    qputenv("NO_AT_BRIDGE", "1");
 #endif
-        m_application = make<LadybirdQApplication>(arguments());
+    m_application = make<LadybirdQApplication>(arguments);
+#if defined(AK_OS_MACOS)
+    // NB: Qt owns its converters, and deletes them along with the QApplication.
+    new PNGMimeConverter;
+#endif
 #if defined(AK_OS_LINUX)
-        QGuiApplication::setDesktopFileName(QStringLiteral("org.ladybird.Ladybird"));
-        Ladybird::clip_translucent_windows_that_cannot_blend();
+    QGuiApplication::setDesktopFileName(QStringLiteral("org.ladybird.Ladybird"));
+    Ladybird::clip_translucent_windows_that_cannot_blend();
 #endif
 #if !defined(Q_OS_MACOS) && !defined(Q_OS_WIN)
-        install_orca_scripts();
+    install_orca_scripts();
 #endif
-    }
+}
 
-    auto& event_loop = WebView::Application::create_platform_event_loop();
-
-    if (!browser_options().headless_mode.has_value()) {
+void Application::did_create_event_loop(Core::EventLoop& event_loop)
+{
 #if defined(AK_OS_LINUX)
-        Ladybird::initialize_external_url_handler(event_loop);
+    Ladybird::initialize_external_url_handler(event_loop);
 #endif
 #if defined(AK_OS_MACOS)
-        Ladybird::on_scrollbar_track_press_behavior_change([this] {
-            platform_scrollbar_track_press_behavior_changed();
-        });
+    Ladybird::on_scrollbar_track_press_behavior_change([] {
+        if (auto* hub = HubConnection::the_if_connected())
+            hub->async_ui_info_changed(Application::the().current_ui_info());
+    });
 #endif
-        static_cast<EventLoopImplementationQt&>(event_loop.impl()).set_main_loop();
-    }
-
-    return event_loop;
+    static_cast<EventLoopImplementationQt&>(event_loop.impl()).set_main_loop();
 }
 
 Optional<String> Application::ui_font_family() const
@@ -671,13 +1188,10 @@ Web::CSS::PreferredColorScheme Application::interface_color_scheme() const
 }
 
 // Bookmarking the page from the menu or its shortcut does what the star in the address field does.
-void Application::toggle_bookmark_for_view(WebView::ViewImplementation& view)
+void Application::show_bookmark_popover()
 {
-    if (auto* tab = active_tab(); tab && &tab->view() == &view) {
+    if (auto* tab = active_tab())
         tab->show_bookmark_popover();
-        return;
-    }
-    WebView::Application::toggle_bookmark_for_view(view);
 }
 
 bool Application::platform_reports_scroll_momentum() const
@@ -734,19 +1248,21 @@ Vector<u64> Application::platform_presentation_drm_format_modifiers() const
 #endif
 }
 
-#if !defined(AK_OS_MACOS)
 // On macOS, WebContent resolves system-ui with CoreText, so the system font family is not sent there.
 Optional<String> Application::system_font_family() const
 {
+#if defined(AK_OS_MACOS)
+    return {};
+#else
     return ui_font_family();
-}
 #endif
+}
 
-BrowserWindow& Application::new_window(Vector<URL::URL> const& initial_urls, WindowConfiguration const& configuration, BrowserWindow::IsPopupWindow is_popup_window, WebView::IsPrivate is_private, Tab* parent_tab, Optional<WebView::CanonicalTraversable&> traversable, ShowWindow show_window, Optional<Web::HTML::PreparedNavigationDescriptor> initial_navigation)
+BrowserWindow& Application::new_window(Vector<URL::URL> const& initial_urls, WindowConfiguration const& configuration, BrowserWindow::IsPopupWindow is_popup_window, WebView::IsPrivate is_private, Optional<u64> hub_view_id, ShowWindow show_window, Optional<Web::HTML::PreparedNavigationDescriptor> initial_navigation)
 {
-    auto* window = new BrowserWindow(initial_urls, is_popup_window, is_private, parent_tab, traversable);
+    auto* window = new BrowserWindow(initial_urls, is_popup_window, is_private, hub_view_id);
 
-    auto should_focus_location_editor = initial_urls.size() == 1 && initial_urls.first() == WebView::Application::settings().new_tab_page_url();
+    auto should_focus_location_editor = initial_urls.size() == 1 && initial_urls.first() == Application::settings().new_tab_page_url();
     if (should_focus_location_editor) {
         if (auto* tab = window->current_tab())
             tab->set_url_is_hidden(true);
@@ -793,15 +1309,173 @@ void Application::present_window(BrowserWindow& window, WindowConfiguration cons
     }
 }
 
-WebView::SessionLaunchPolicy Application::launch_restore_policy() const
+SessionLaunchPolicy Application::launch_restore_policy() const
 {
     // Without the setting, only pinned tabs come back; with it, every window and tab does.
-    if (WebView::Application::settings().restore_previous_session())
-        return WebView::SessionLaunchPolicy::Everything;
-    return WebView::SessionLaunchPolicy::PinnedOnly;
+    if (Application::settings().restore_previous_session())
+        return SessionLaunchPolicy::Everything;
+    return SessionLaunchPolicy::PinnedOnly;
 }
 
-static WindowConfiguration window_configuration_for(WebView::SessionWindowGeometry const& geometry)
+void Application::create_session_store(ByteString const& data_directory, bool persists_sessions)
+{
+    auto session_store = [&]() -> ErrorOr<NonnullOwnPtr<SessionStore>> {
+        if (!persists_sessions)
+            return SessionStore::create();
+
+        // Fall back without modifying the existing Sessions database.
+        auto session_database = TRY(Database::Database::create(data_directory, "Sessions"sv, { .foreign_keys = Database::Database::ForeignKeys::Yes }));
+        if (TRY(SessionStore::migrate_schema(session_database)) != Database::MigrationOutcome::Success)
+            return Error::from_string_literal("Sessions database was created by a newer Ladybird version");
+        return SessionStore::create(session_database, launch_restore_policy());
+    }();
+    if (session_store.is_error()) {
+        dbgln("Sessions will not be persisted this session: {}", session_store.error());
+        m_session_store = SessionStore::create();
+    } else {
+        m_session_store = session_store.release_value();
+    }
+
+    m_session_store->on_closed_units_changed = [this] {
+        on_recently_closed_entries_changed();
+    };
+
+#if !defined(AK_OS_WINDOWS) && defined(LADYBIRD_HUB_IN_OWN_PROCESS)
+    // A run stopped by SIGINT or SIGTERM ends like a quit, rather than like a crash: It saves the session, leaves its
+    // windows for the next launch to recover, and records a clean exit. The Hub hears of a signal sent to it alone, and
+    // passes it on.
+    if (m_session_store->is_persistent()) {
+        for (auto signal_number : { SIGINT, SIGTERM }) {
+            m_session_signal_handlers.append(Core::EventLoop::register_signal(signal_number, [this](int) {
+                quit_for_signal();
+            }));
+        }
+    }
+#endif
+}
+
+void Application::create_history_store(ByteString const& data_directory, bool uses_sql_database)
+{
+    auto create_autocomplete_service = [&](Optional<ByteString> history_database_directory) {
+        m_autocomplete_service = make<WebView::AutocompleteService>(Core::EventLoop::current(), move(history_database_directory));
+    };
+
+    if (!uses_sql_database) {
+        m_favicon_store = WebView::FaviconStore::create();
+        m_history_store = WebView::HistoryStore::create_disabled();
+        create_autocomplete_service({});
+        return;
+    }
+
+    auto created = [&]() -> ErrorOr<bool> {
+        // The History database is shared by the favicon and history stores. Preflight both before applying either
+        // migration so a database that is too new remains untouched.
+        auto database = TRY(Database::Database::create(data_directory, "History"sv));
+        auto favicons_outcome = TRY(WebView::FaviconStore::migrate_schema(database, Database::MigrationMode::CheckOnly));
+        auto history_outcome = TRY(WebView::HistoryStore::migrate_schema(database, Database::MigrationMode::CheckOnly));
+        if (favicons_outcome != Database::MigrationOutcome::Success || history_outcome != Database::MigrationOutcome::Success)
+            return false;
+        if (TRY(WebView::FaviconStore::migrate_schema(database)) != Database::MigrationOutcome::Success)
+            return false;
+        if (TRY(WebView::HistoryStore::migrate_schema(database)) != Database::MigrationOutcome::Success)
+            return false;
+        m_favicon_store = TRY(WebView::FaviconStore::create(database));
+        m_history_store = TRY(WebView::HistoryStore::create(database));
+        return true;
+    }();
+    if (!created.is_error() && created.value()) {
+        m_should_remove_unreferenced_favicons = true;
+        // NB: The omnibox reads the history on a thread of its own, with a connection of its own.
+        create_autocomplete_service(data_directory);
+        return;
+    }
+
+    if (created.is_error())
+        dbgln("Unable to open the History database: {}", created.error());
+    else
+        dbgln("History database was created by a newer Ladybird version; favicons and history will not be persisted this session");
+    m_favicon_store = WebView::FaviconStore::create();
+    m_history_store = WebView::HistoryStore::create(*m_favicon_store);
+    create_autocomplete_service({});
+}
+
+Function<void()> Application::fetch_remote_suggestions(WebView::SearchEngine const& engine, String const& query, WebView::IsPrivate is_private, Function<void(RemoteResponse)> on_response)
+{
+    auto request_id = HubConnection::the().fetch_search_suggestions(engine.name, query, is_private,
+        [on_response = move(on_response)](HubConnection::RequestResponse response) {
+            auto content_type = HTTP::HeaderList::create(move(response.headers))->get("Content-Type"sv);
+            on_response({
+                .had_network_error = response.had_network_error,
+                .response_code = response.response_code,
+                .content_type = move(content_type),
+                .body = MUST(ByteBuffer::copy(response.body.bytes())),
+            });
+        });
+    return [request_id] {
+        if (auto* hub = HubConnection::the_if_connected())
+            hub->stop_request(request_id);
+    };
+}
+
+WebView::FaviconStore& Application::favicon_store(WebView::IsPrivate is_private)
+{
+    if (is_private == WebView::IsPrivate::No)
+        return *s_the->m_favicon_store;
+    if (!s_the->m_private_favicon_store)
+        s_the->m_private_favicon_store = WebView::FaviconStore::create();
+    return *s_the->m_private_favicon_store;
+}
+
+// NB: The favicons of history and of bookmarks share a store, so it is only once the bookmarks are read that the
+//     ones nothing uses any more are known.
+void Application::remove_unreferenced_favicons(HashTable<String> referenced_hashes)
+{
+    if (!m_should_remove_unreferenced_favicons)
+        return;
+    m_should_remove_unreferenced_favicons = false;
+
+    for (auto& hash : m_history_store->referenced_favicon_hashes())
+        referenced_hashes.set(move(hash));
+    m_favicon_store->remove_unreferenced_favicons(referenced_hashes);
+}
+
+SessionStore& Application::session_store(WebView::IsPrivate is_private)
+{
+    if (is_private == WebView::IsPrivate::No)
+        return *s_the->m_session_store;
+
+    // NB: Private windows keep nothing for the next run, and the next private session starts with nothing.
+    if (!s_the->m_private_session_store)
+        s_the->m_private_session_store = SessionStore::create();
+    return *s_the->m_private_session_store;
+}
+
+void Application::did_clear_history_since(UnixDateTime since)
+{
+    m_history_store->remove_entries_accessed_since(since);
+    for (auto* store : { m_session_store.ptr(), m_private_session_store.ptr() }) {
+        if (!store)
+            continue;
+        if (auto result = store->remove_entries_accessed_since(since); result.is_error())
+            dbgln("Unable to remove closed session entries: {}", result.error());
+    }
+    on_recently_closed_entries_changed();
+}
+
+void Application::quit_for_signal()
+{
+    if (m_quit_is_finishing)
+        return;
+
+    // The windows stay open in the session store, for the next launch to recover.
+    // NB: QApplication::quit() would ask the windows to close first, which their pages may refuse. A signal does not
+    //     wait for them, so this ends the event loop directly.
+    m_quit_is_finishing = true;
+    session_store(WebView::IsPrivate::No).application_quitting();
+    Core::EventLoop::current().quit(0);
+}
+
+static WindowConfiguration window_configuration_for(SessionWindowGeometry const& geometry)
 {
     QRect rect { geometry.x, geometry.y, geometry.width, geometry.height };
 
@@ -827,7 +1501,7 @@ static WindowConfiguration window_configuration_for(WebView::SessionWindowGeomet
 
 BrowserWindow* Application::restore_previous_session(WindowConfiguration const& frontmost_window_configuration)
 {
-    auto plan = WebView::Application::default_session().session_store->take_launch_plan();
+    auto plan = session_store(WebView::IsPrivate::No).take_launch_plan();
 
     BrowserWindow* frontmost_window = nullptr;
     for (size_t i = 0; i < plan.size(); ++i) {
@@ -837,7 +1511,7 @@ BrowserWindow* Application::restore_previous_session(WindowConfiguration const& 
             ? window_configuration_for(*restored.geometry)
             : (i == plan.size() - 1 ? frontmost_window_configuration : configuration_for_new_window());
 
-        auto* window = new BrowserWindow({}, BrowserWindow::IsPopupWindow::No, WebView::IsPrivate::No, nullptr, {}, restored.window_id);
+        auto* window = new BrowserWindow({}, BrowserWindow::IsPopupWindow::No, WebView::IsPrivate::No, {}, restored.window_id);
         window->restore_tabs(restored.tabs, restored.active_tab_index);
         present_window(*window, configuration, ShowWindow::Yes);
         frontmost_window = window;
@@ -847,13 +1521,13 @@ BrowserWindow* Application::restore_previous_session(WindowConfiguration const& 
 
 void Application::offer_to_restore_unexpectedly_closed_tabs(BrowserWindow& window)
 {
-    auto& session_store = *WebView::Application::default_session().session_store;
-    if (session_store.consecutive_unclean_exits() == 0)
+    auto& store = session_store(WebView::IsPrivate::No);
+    if (store.consecutive_unclean_exits() == 0)
         return;
 
-    Vector<WebView::SessionWindowId> unit_ids;
+    Vector<SessionWindowId> unit_ids;
     size_t tab_count = 0;
-    for (auto const& unit : session_store.recently_closed_units(NumericLimits<size_t>::max())) {
+    for (auto const& unit : store.recently_closed_units(NumericLimits<size_t>::max())) {
         if (!unit.from_startup_recovery)
             continue;
         unit_ids.append(unit.id);
@@ -867,7 +1541,7 @@ void Application::offer_to_restore_unexpectedly_closed_tabs(BrowserWindow& windo
         QPointer<Tab> new_tab_page;
         if (window && window->tab_count() == 1) {
             auto* tab = window->tab_at(0);
-            if (tab->view().url() == WebView::Application::settings().new_tab_page_url() && !tab->view().navigate_back_action().enabled())
+            if (tab->view().url() == Application::settings().new_tab_page_url() && !tab->view().navigate_back_action().enabled())
                 new_tab_page = tab;
         }
 
@@ -884,7 +1558,7 @@ void Application::offer_to_restore_unexpectedly_closed_tabs(BrowserWindow& windo
 
 void Application::open_startup_tabs(BrowserWindow& window, Vector<URL::URL> const& urls)
 {
-    auto const& new_tab_page_url = WebView::Application::settings().new_tab_page_url();
+    auto const& new_tab_page_url = Application::settings().new_tab_page_url();
     for (size_t i = 0; i < urls.size(); ++i) {
         auto& tab = window.new_tab_from_url(urls[i], i == 0 ? Web::HTML::ActivateTab::Yes : Web::HTML::ActivateTab::No, BrowserWindow::TabLocation::end());
         if (urls.size() == 1 && urls[i] == new_tab_page_url) {
@@ -922,7 +1596,7 @@ WindowConfiguration Application::configuration_for_new_window() const
         };
     }
 
-    auto const& window_settings = WebView::Application::settings().window_settings();
+    auto const& window_settings = Application::settings().window_settings();
     WindowConfiguration configuration {
         .width = window_settings.size.width(),
         .height = window_settings.size.height(),
@@ -938,7 +1612,7 @@ WindowConfiguration Application::configuration_for_new_window() const
 void Application::open_new_tab()
 {
     if (!m_active_window) {
-        new_window({ WebView::Application::settings().new_tab_page_url() });
+        new_window({ Application::settings().new_tab_page_url() });
         return;
     }
 
@@ -948,7 +1622,7 @@ void Application::open_new_tab()
 void Application::open_new_window(WebView::IsPrivate is_private)
 {
     // FIXME: Create a new tab page specific to private windows.
-    new_window({ WebView::Application::settings().new_tab_page_url() }, configuration_for_new_window(), BrowserWindow::IsPopupWindow::No, is_private);
+    new_window({ Application::settings().new_tab_page_url() }, configuration_for_new_window(), BrowserWindow::IsPopupWindow::No, is_private);
 }
 
 void Application::restart_private_browsing_session()
@@ -1008,7 +1682,15 @@ void Application::finish_private_session_restart()
         windows.append(window);
     }
 
-    WebView::Application::the().reset_private_browsing_session();
+    HubConnection::the().async_reset_private_browsing_session();
+
+    // Views pending deferred deletion may still report their history, and the replacement store reuses their ids.
+    RemoteView::for_each([](RemoteView& view) {
+        if (view.is_private() == WebView::IsPrivate::Yes)
+            view.clear_session_tab_id();
+    });
+    m_private_session_store = nullptr;
+    m_private_favicon_store = nullptr;
     open_new_window(WebView::IsPrivate::Yes);
 
     for (auto const& window : windows) {
@@ -1035,7 +1717,7 @@ void Application::cancel_private_session_restart()
 void Application::focus_location_editor()
 {
     if (!m_active_window) {
-        new_window({ WebView::Application::settings().new_tab_page_url() });
+        new_window({ Application::settings().new_tab_page_url() });
         return;
     }
 
@@ -1043,11 +1725,11 @@ void Application::focus_location_editor()
         tab->focus_location_editor();
 }
 
-void Application::reopen_recently_closed_tab(BrowserWindow* target_window, Optional<WebView::SessionWindowId> unit_id, ReopenClosedWindow reopen_closed_window)
+void Application::reopen_recently_closed_tab(BrowserWindow* target_window, Optional<SessionWindowId> unit_id, ReopenClosedWindow reopen_closed_window)
 {
     auto is_private = target_window ? target_window->is_private() : WebView::IsPrivate::No;
-    auto& session = target_window ? target_window->session() : WebView::Application::default_session();
-    auto closed_unit = unit_id.has_value() ? session.session_store->take_closed_unit(*unit_id) : session.session_store->take_most_recently_closed();
+    auto& session = target_window ? target_window->session() : session_store(WebView::IsPrivate::No);
+    auto closed_unit = unit_id.has_value() ? session.take_closed_unit(*unit_id) : session.take_most_recently_closed();
     if (closed_unit.is_error()) {
         dbgln("Unable to reopen the most recently closed session unit: {}", closed_unit.error());
         return;
@@ -1111,21 +1793,17 @@ void Application::reopen_recently_closed_tab(BrowserWindow* target_window, Optio
     update_reopen_recently_closed_actions();
 }
 
-void Application::display_crash_report_notification(ByteString const& report_name)
+void Application::crash_reports_changed()
 {
-    m_crash_report_notifier.offer(report_name);
+    update_feedback_buttons();
 }
 
-void Application::review_crash_report(ByteString const& report_name)
+void Application::update_feedback_buttons()
 {
-    if (!m_active_window)
-        return;
-
-    // The tab is blank, so no web content runs behind the review, and it closes once the review is left.
-    auto* current_tab = m_active_window->current_tab();
-    auto& tab = m_active_window->new_tab_from_url(URL::about_blank(), Web::HTML::ActivateTab::Yes, BrowserWindow::TabLocation::after_current_tab());
-    tab.view().review_hidden_crash_report(report_name);
-    tab.enter_report_review(current_tab);
+    for (auto* widget : QApplication::topLevelWidgets()) {
+        if (auto* window = as_if<BrowserWindow>(widget))
+            window->toolbar().update_feedback_button();
+    }
 }
 
 void Application::open_file()
@@ -1226,7 +1904,7 @@ void Application::finish_quit()
     // The session store hears of the quit only once every window has agreed, so a canceled quit never reaches it. In
     // quitting mode, it keeps each window that closes as an open one, for the next launch to recover.
     m_quit_is_finishing = true;
-    WebView::Application::default_session().session_store->application_quitting();
+    session_store(WebView::IsPrivate::No).application_quitting();
 
     // Each window's pages agreed, so it closes at once; the active window goes last, so no close activates another.
     auto windows = visible_browser_windows_active_first(m_active_window);
@@ -1255,7 +1933,7 @@ void Application::cancel_quit()
 
 bool Application::confirm_stop_active_downloads(QWidget* parent)
 {
-    auto& downloader = file_downloader();
+    auto& downloader = RemoteDownloads::the();
 
     if (downloader.has_unresumable_downloads()) {
         QMessageBox dialog(parent ? parent : active_window_if_any());
@@ -1278,32 +1956,124 @@ bool Application::confirm_stop_active_downloads(QWidget* parent)
     return true;
 }
 
-OwnPtr<WebView::PictureInPictureWindow> Application::create_picture_in_picture_window(WebView::WebContentPage& requesting_page, WebView::CanonicalTraversable& traversable, Gfx::IntSize video_size)
+void Application::open_picture_in_picture_window(u64 view_id, u64 owner_view_id, Gfx::IntSize video_size)
 {
-    if (browser_options().headless_mode.has_value())
-        return WebView::Application::create_picture_in_picture_window(requesting_page, traversable, video_size);
-    return Ladybird::create_picture_in_picture_window(traversable, requesting_page.view(), video_size);
+    auto* owner_view = RemoteView::find(owner_view_id);
+    if (!owner_view) {
+        // NB: The owner went away before this arrived. The Hub must still hear that the window closed, or it would keep
+        //     the window and its view.
+        if (auto* hub = HubConnection::the_if_connected())
+            hub->async_pip_did_close(view_id, false);
+        return;
+    }
+    auto window = Ladybird::create_picture_in_picture_window(*owner_view, view_id, video_size);
+    window->on_resize = [view_id](Gfx::IntSize size) {
+        if (auto* hub = HubConnection::the_if_connected())
+            hub->async_pip_did_resize(view_id, size);
+    };
+    window->on_close = [view_id](auto video_keeps_playing) {
+        if (auto* hub = HubConnection::the_if_connected())
+            hub->async_pip_did_close(view_id, video_keeps_playing == WebView::PictureInPictureWindow::VideoKeepsPlaying::Yes);
+    };
+    m_picture_in_picture_windows.set(view_id, move(window));
 }
 
-Optional<WebView::ViewImplementation&> Application::active_web_view() const
+void Application::hide_picture_in_picture_window(u64 view_id)
 {
-    if (auto* active_tab = this->active_tab())
-        return active_tab->view();
+    if (auto* window = m_picture_in_picture_windows.get(view_id).value_or(nullptr))
+        window->hide();
+}
+
+void Application::set_picture_in_picture_video_size(u64 view_id, Gfx::IntSize video_size)
+{
+    if (auto* window = m_picture_in_picture_windows.get(view_id).value_or(nullptr))
+        window->set_video_size(video_size);
+}
+
+void Application::close_picture_in_picture_window(u64 view_id)
+{
+    // NB: A window holds the view, which lets the Hub's view go as it goes. With no window, nothing here ever held it.
+    if (m_picture_in_picture_windows.remove(view_id))
+        return;
+    if (auto* hub = HubConnection::the_if_connected())
+        hub->async_destroy_view(view_id);
+}
+
+// The window that shows this view in one of its tabs, if any.
+static BrowserWindow* window_for_view(RemoteView const& view)
+{
+    for (auto* widget : QApplication::topLevelWidgets()) {
+        if (auto* window = as_if<BrowserWindow>(widget); window && window->tab_for_view(view))
+            return window;
+    }
+    return nullptr;
+}
+
+OwnPtr<WebView::NotificationBackend> Application::create_notification_backend()
+{
+#if defined(AK_OS_MACOS)
+    return make<WebView::NotificationBackendMacOS>();
+#elif defined(AK_OS_LINUX) || defined(AK_OS_FREEBSD)
+    return make<WebView::NotificationBackendFreedesktop>();
+#else
     return {};
+#endif
 }
 
-Vector<WebView::BookmarkItem::Bookmark> Application::bookmarks_for_all_tabs_in_current_window() const
+void Application::focus_view_from_notification(u64 view_id)
 {
-    if (!m_active_window)
+    auto* view = RemoteView::find(view_id);
+    if (!view)
+        return;
+    auto* window = window_for_view(*view);
+    if (!window)
+        return;
+    window->activate_tab(window->tab_index(window->tab_for_view(*view)));
+    window->bring_to_front();
+}
+
+void Application::open_url_in_new_tab_from_notification(URL::URL const& url, Optional<u64> view_id, WebView::IsPrivate is_private)
+{
+    BrowserWindow* window = nullptr;
+    if (view_id.has_value()) {
+        if (auto* view = RemoteView::find(*view_id))
+            window = window_for_view(*view);
+    }
+    // The site opens in the notification's own session: a private window's notification never lands in a normal
+    // window, nor a normal one in a private window.
+    if (window && window->is_private() != is_private)
+        window = nullptr;
+    if (!window && m_active_window && m_active_window->is_private() == is_private)
+        window = m_active_window;
+    if (!window) {
+        for (auto* widget : QApplication::topLevelWidgets()) {
+            if (auto* candidate = qobject_cast<BrowserWindow*>(widget); candidate && candidate->is_private() == is_private) {
+                window = candidate;
+                break;
+            }
+        }
+    }
+    if (!window) {
+        new_window({ url }, configuration_for_new_window(), BrowserWindow::IsPopupWindow::No, is_private);
+        return;
+    }
+    window->new_tab_from_url(url, Web::HTML::ActivateTab::Yes, BrowserWindow::TabLocation::end());
+    window->bring_to_front();
+}
+
+Vector<BookmarkItem::Bookmark> Application::bookmarks_for_all_tabs_in_active_window() const
+{
+    auto* window = m_active_window;
+    if (!window)
         return {};
 
     // Every tab gets a bookmark, so this walks the tabs directly: for_each_tab() skips the ones that haven't loaded.
-    Vector<WebView::BookmarkItem::Bookmark> bookmarks;
-    for (int i = 0; i < m_active_window->tab_count(); ++i) {
-        auto& tab = *m_active_window->tab_at(i);
+    Vector<BookmarkItem::Bookmark> bookmarks;
+    for (int i = 0; i < window->tab_count(); ++i) {
+        auto& tab = *window->tab_at(i);
         if (tab.is_loaded()) {
             auto const& view = tab.view();
-            bookmarks.append(WebView::BookmarkItem::Bookmark {
+            bookmarks.append(BookmarkItem::Bookmark {
                 .url = view.url(),
                 .title = view.title().is_empty() ? Optional<String> {} : view.title().to_utf8(),
                 .favicon_hash = view.favicon_hash(),
@@ -1316,7 +2086,7 @@ Vector<WebView::BookmarkItem::Bookmark> Application::bookmarks_for_all_tabs_in_c
         auto url = tab.url();
         auto title = tab.title();
         auto has_title = !title.isEmpty() && title != qstring_from_ak_string(url.serialize());
-        bookmarks.append(WebView::BookmarkItem::Bookmark {
+        bookmarks.append(BookmarkItem::Bookmark {
             .url = url,
             .title = has_title ? ak_string_from_qstring(title) : Optional<String> {},
             .favicon_hash = {},
@@ -1325,7 +2095,7 @@ Vector<WebView::BookmarkItem::Bookmark> Application::bookmarks_for_all_tabs_in_c
     return bookmarks;
 }
 
-Optional<WebView::ViewImplementation&> Application::activate_tab_with_url(URL::URL const& url, URL::ExcludeFragment exclude_fragment) const
+Tab* Application::activate_tab_with_url(URL::URL const& url, URL::ExcludeFragment exclude_fragment) const
 {
     auto is_private = m_active_window ? m_active_window->is_private() : WebView::IsPrivate::No;
     for (auto* window : visible_browser_windows_active_first(m_active_window)) {
@@ -1340,32 +2110,64 @@ Optional<WebView::ViewImplementation&> Application::activate_tab_with_url(URL::U
             window->setWindowState(window->windowState() & ~Qt::WindowMinimized);
         window->raise();
         window->activateWindow();
-        return tab->view();
+        return tab;
     }
-    return {};
+    return nullptr;
 }
 
-Optional<WebView::ViewImplementation&> Application::open_blank_new_tab(Web::HTML::ActivateTab activate_tab) const
+void Application::activate_or_open_tab_with_url(URL::URL const& url)
 {
-    if (!m_active_window) {
-        auto& window = const_cast<Application&>(*this).new_window({ WebView::Application::settings().new_tab_page_url() });
-        if (auto* tab = window.current_tab())
-            return tab->view();
-        return {};
-    }
-
-    auto& tab = active_window().create_new_tab(activate_tab, BrowserWindow::TabLocation::end());
-    return tab.view();
+    if (auto* tab = activate_tab_with_url(url, URL::ExcludeFragment::Yes))
+        tab->view().load(url);
+    else
+        open_url_in_new_tab(url, Web::HTML::ActivateTab::Yes, {}, m_active_window ? m_active_window->is_private() : WebView::IsPrivate::No);
 }
 
-void Application::open_url_in_new_tab(URL::URL const& url, Web::HTML::ActivateTab activate_tab) const
+BrowserWindow* Application::window_of_view(u64 view_id) const
 {
-    if (!m_active_window) {
-        const_cast<Application&>(*this).new_window({ url });
+    auto* view = RemoteView::find(view_id);
+    if (!view)
+        return nullptr;
+    for (auto* window : visible_browser_windows_active_first(m_active_window)) {
+        if (window->tab_for_view(*view))
+            return window;
+    }
+    return nullptr;
+}
+
+// NB: The window that is active now may not be the one the Hub saw. The new tab belongs with the page that opened it,
+//     and if that window is gone, in a window of the same privacy: a view keeps the cookies and history it was made
+//     with, whatever the window shows, and a URL from a private page must not end up in a normal session.
+BrowserWindow* Application::window_for_new_tab(Optional<u64> source_view_id, WebView::IsPrivate is_private) const
+{
+    if (source_view_id.has_value()) {
+        if (auto* window = window_of_view(*source_view_id); window && window->is_private() == is_private)
+            return window;
+    }
+    for (auto* window : visible_browser_windows_active_first(m_active_window)) {
+        if (window->is_private() == is_private)
+            return window;
+    }
+    return nullptr;
+}
+
+void Application::open_view_in_new_tab(u64 view_id, Optional<u64> source_view_id, WebView::IsPrivate is_private, Web::HTML::ActivateTab activate_tab)
+{
+    if (auto* window = window_for_new_tab(source_view_id, is_private))
+        window->create_new_tab(activate_tab, view_id);
+    else
+        new_window({}, configuration_for_new_window(), BrowserWindow::IsPopupWindow::No, is_private, view_id);
+}
+
+void Application::open_url_in_new_tab(URL::URL const& url, Web::HTML::ActivateTab activate_tab, Optional<u64> source_view_id, WebView::IsPrivate is_private) const
+{
+    auto* window = window_for_new_tab(source_view_id, is_private);
+    if (!window) {
+        const_cast<Application&>(*this).new_window({ url }, {}, BrowserWindow::IsPopupWindow::No, is_private);
         return;
     }
 
-    active_window().new_tab_from_url(url, activate_tab, BrowserWindow::TabLocation::after_current_tab());
+    window->new_tab_from_url(url, activate_tab, BrowserWindow::TabLocation::after_current_tab());
 }
 
 void Application::open_urls_in_new_tabs(ReadonlySpan<URL::URL> urls) const
@@ -1399,96 +2201,82 @@ void Application::open_url_in_new_window(URL::URL const& url, WebView::IsPrivate
     new_window({ url }, configuration_for_new_window(), BrowserWindow::IsPopupWindow::No, is_private);
 }
 
-void Application::open_navigation_in_new_tab(Web::HTML::PreparedNavigationDescriptor navigation, Web::HTML::ActivateTab activate_tab) const
+void Application::open_navigation_in_new_tab(Web::HTML::PreparedNavigationDescriptor navigation, Web::HTML::ActivateTab activate_tab, Optional<u64> source_view_id, WebView::IsPrivate is_private) const
 {
-    if (!m_active_window) {
+    auto* window = window_for_new_tab(source_view_id, is_private);
+    if (!window) {
         auto url = navigation.url;
-        const_cast<Application&>(*this).new_window({ move(url) }, {}, BrowserWindow::IsPopupWindow::No, WebView::IsPrivate::No, nullptr, {}, ShowWindow::Yes, move(navigation));
+        const_cast<Application&>(*this).new_window({ move(url) }, {}, BrowserWindow::IsPopupWindow::No, is_private, {}, ShowWindow::Yes, move(navigation));
         return;
     }
 
-    auto& tab = active_window().create_new_tab(activate_tab, BrowserWindow::TabLocation::after_current_tab());
+    auto& tab = window->create_new_tab(activate_tab, BrowserWindow::TabLocation::after_current_tab());
     tab.view().load(move(navigation));
 }
 
 void Application::open_navigation_in_new_window(Web::HTML::PreparedNavigationDescriptor navigation, WebView::IsPrivate is_private)
 {
     auto url = navigation.url;
-    new_window({ move(url) }, configuration_for_new_window(), BrowserWindow::IsPopupWindow::No, is_private, nullptr, {}, ShowWindow::Yes, move(navigation));
+    new_window({ move(url) }, configuration_for_new_window(), BrowserWindow::IsPopupWindow::No, is_private, {}, ShowWindow::Yes, move(navigation));
 }
 
-Optional<ByteString> Application::ask_user_for_download_path(ByteString const& file) const
+void Application::ask_user_for_download_path(u64 request_id, ByteString const& file) const
 {
-    auto default_path = QStandardPaths::writableLocation(QStandardPaths::DownloadLocation);
+    auto* dialog = new QFileDialog(nullptr, "Select save location", QStandardPaths::writableLocation(QStandardPaths::DownloadLocation));
+    dialog->setAttribute(Qt::WA_DeleteOnClose);
+    dialog->setAcceptMode(QFileDialog::AcceptSave);
+    dialog->selectFile(qstring_from_ak_string(file.view()));
 
-    if (default_path.isNull() || default_path.isEmpty())
-        default_path = qstring_from_ak_string(file.view());
-    else
-        default_path = QDir { default_path }.filePath(qstring_from_ak_string(file.view()));
+    QObject::connect(dialog, &QDialog::finished, [request_id, dialog = QPointer { dialog }](auto result) {
+        Optional<ByteString> path;
+        if (result == QDialog::Accepted && dialog && !dialog->selectedFiles().isEmpty())
+            path = ak_byte_string_from_qstring(dialog->selectedFiles().first());
+        if (auto* hub = HubConnection::the_if_connected())
+            hub->async_answer_download_path(request_id, move(path));
+    });
 
-    auto path = QFileDialog::getSaveFileName(nullptr, "Select save location", default_path);
-    if (path.isNull())
-        return {};
-
-    return ak_byte_string_from_qstring(path);
+    dialog->open();
 }
 
-void Application::display_download_confirmation_dialog(StringView download_name, LexicalPath const& path) const
+static QMessageBox* create_message_box(QMessageBox::Icon icon, StringView text, QWidget* parent)
+{
+    auto* dialog = new QMessageBox(parent);
+    dialog->setAttribute(Qt::WA_DeleteOnClose);
+    dialog->setWindowTitle("Ladybird");
+    dialog->setIcon(icon);
+    dialog->setTextFormat(Qt::PlainText);
+    dialog->setText(qstring_from_ak_string(text));
+    dialog->addButton(QMessageBox::Ok);
+    return dialog;
+}
+
+void Application::display_download_confirmation_dialog(StringView download_name, ByteString const& path) const
 {
     auto message = MUST(String::formatted("{} saved to: {}", download_name, path));
 
-    QMessageBox dialog(active_tab());
-    dialog.setWindowTitle("Ladybird");
-    dialog.setIcon(QMessageBox::Information);
-    dialog.setText(qstring_from_ak_string(message));
-    dialog.addButton(QMessageBox::Ok);
-    dialog.addButton(QMessageBox::Open)->setText("Open folder");
+    auto* dialog = create_message_box(QMessageBox::Information, message, active_window_if_any());
 
-    if (dialog.exec() == QMessageBox::Open) {
-        auto path_url = QUrl::fromLocalFile(qstring_from_ak_string(path.dirname()));
+    auto* open_folder_button = dialog->addButton(QMessageBox::Open);
+    open_folder_button->setText("Open folder");
+    QObject::connect(open_folder_button, &QAbstractButton::clicked, [path_url = QUrl::fromLocalFile(qstring_from_ak_string(LexicalPath { path }.dirname()))] {
         QDesktopServices::openUrl(path_url);
-    }
+    });
+
+    dialog->open();
 }
 
 void Application::display_error_dialog(StringView error_message) const
 {
-    if (browser_options().headless_mode.has_value()) {
-        WebView::Application::display_error_dialog(error_message);
-        return;
-    }
-
-    QMessageBox::warning(active_tab(), "Ladybird", qstring_from_ak_string(error_message));
+    create_message_box(QMessageBox::Warning, error_message, active_window_if_any())->open();
 }
 
-void Application::open_download(WebView::FileDownloader::Download const& download) const
+void Application::open_file(String const& path) const
 {
-    auto path = download_file_path_for_frontend_action(download);
-    if (path.is_error()) {
-        display_error_dialog("Unable to open downloaded file: path cannot be represented by this frontend"sv);
-        return;
-    }
-
-    QDesktopServices::openUrl(QUrl::fromLocalFile(qstring_from_ak_string(path.release_value())));
-}
-
-void Application::show_download_in_folder(WebView::FileDownloader::Download const& download) const
-{
-    auto path = download_directory_path_for_frontend_action(download);
-    if (path.is_error()) {
-        display_error_dialog("Unable to show downloaded file: path cannot be represented by this frontend"sv);
-        return;
-    }
-
-    QDesktopServices::openUrl(QUrl::fromLocalFile(qstring_from_ak_string(path.release_value())));
+    QDesktopServices::openUrl(QUrl::fromLocalFile(qstring_from_ak_string(path)));
 }
 
 void Application::resolve_external_url_handler(URL::URL const& url, WebView::ExternalURLHandlerCallback callback) const
 {
-    if (browser_options().headless_mode.has_value()) {
-        WebView::Application::resolve_external_url_handler(url, move(callback));
-        return;
-    }
-
 #if defined(AK_OS_LINUX)
     Ladybird::resolve_external_url_handler(url, ak_string_from_qstring(QGuiApplication::desktopFileName()), move(callback));
 #elif defined(AK_OS_MACOS)
@@ -1512,9 +2300,6 @@ static QClipboard::Mode clipboard_mode(QClipboard const& clipboard, Application:
 
 bool Application::supports_clipboard_type(ClipboardType type) const
 {
-    if (browser_options().headless_mode.has_value())
-        return WebView::Application::supports_clipboard_type(type);
-
     switch (type) {
     case WebView::Application::ClipboardType::Text:
         return true;
@@ -1526,9 +2311,6 @@ bool Application::supports_clipboard_type(ClipboardType type) const
 
 Utf16String Application::clipboard_text(ClipboardType type) const
 {
-    if (browser_options().headless_mode.has_value())
-        return WebView::Application::clipboard_text(type);
-
     auto const* clipboard = QGuiApplication::clipboard();
     auto mode = clipboard_mode(*clipboard, type);
 
@@ -1537,11 +2319,6 @@ Utf16String Application::clipboard_text(ClipboardType type) const
 
 void Application::set_clipboard_text(String text, ClipboardType type)
 {
-    if (browser_options().headless_mode.has_value()) {
-        WebView::Application::set_clipboard_text(text, type);
-        return;
-    }
-
     auto* clipboard = QGuiApplication::clipboard();
     auto mode = clipboard_mode(*clipboard, type);
 
@@ -1550,9 +2327,6 @@ void Application::set_clipboard_text(String text, ClipboardType type)
 
 Web::Clipboard::SystemClipboardItem Application::clipboard_item() const
 {
-    if (browser_options().headless_mode.has_value())
-        return WebView::Application::clipboard_item();
-
     Vector<Web::Clipboard::SystemClipboardRepresentation> representations;
     auto const* clipboard = QGuiApplication::clipboard();
 
@@ -1594,11 +2368,6 @@ Web::Clipboard::SystemClipboardItem Application::clipboard_item() const
 
 void Application::insert_clipboard_item(Web::Clipboard::SystemClipboardItem item)
 {
-    if (browser_options().headless_mode.has_value()) {
-        WebView::Application::insert_clipboard_item(move(item));
-        return;
-    }
-
     auto* mime_data = new QMimeData();
     for (auto const& entry : item.system_clipboard_representations) {
         if (auto const* data = entry.data.get_pointer<ByteString>())
@@ -1639,30 +2408,15 @@ void Application::update_reopen_recently_closed_actions() const
         static_cast<LadybirdQApplication*>(m_application.ptr())->update_reopen_recently_closed_action();
 }
 
-void Application::show_bookmark_context_menu(Gfx::IntPoint content_position, Optional<WebView::BookmarkItem const&> item, Optional<String const&> target_folder_id, Optional<String const&> parent_folder_id)
+void Application::show_bookmark_context_menu(Gfx::IntPoint content_position, Optional<BookmarkItem const&> item, Optional<String const&> target_folder_id, Optional<String const&> parent_folder_id)
 {
-    if (auto* active_tab = this->active_tab()) {
+    if (auto* active_tab = this->active_tab(); active_tab && m_active_window) {
         auto position = active_tab->view().mapToGlobal(QPoint { content_position.x(), content_position.y() });
-        active_tab->bookmarks_bar().show_context_menu(position, item, target_folder_id, parent_folder_id);
+        m_active_window->bookmarks_bar().show_context_menu(position, item, target_folder_id, parent_folder_id);
     }
 }
 
-Optional<Application::BookmarkID> Application::bookmark_item_id_for_context_menu() const
-{
-    if (auto* active_tab = this->active_tab()) {
-        auto const& bookmarks_bar = active_tab->bookmarks_bar();
-
-        return Application::BookmarkID {
-            .id = bookmarks_bar.selected_bookmark_menu_item_id(),
-            .target_folder_id = bookmarks_bar.selected_bookmark_menu_target_folder_id(),
-            .parent_folder_id = bookmarks_bar.selected_bookmark_menu_parent_folder_id(),
-        };
-    }
-
-    return {};
-}
-
-static NonnullRefPtr<WebView::Application::BookmarkPromise> display_add_or_edit_bookmark_dialog(
+static NonnullRefPtr<Application::BookmarkPromise> display_add_or_edit_bookmark_dialog(
     QWidget* parent,
     BookmarkDialog::Type dialog_type,
     Optional<URL::URL const&> current_url,
@@ -1670,10 +2424,10 @@ static NonnullRefPtr<WebView::Application::BookmarkPromise> display_add_or_edit_
     Optional<String> current_favicon_hash,
     Optional<String const&> selected_folder_id = {})
 {
-    auto const& folders = WebView::Application::bookmark_store().root_items();
+    auto const& folders = Application::bookmark_store().root_items();
 
     auto* dialog = new BookmarkDialog(parent, dialog_type, current_url, current_title, selected_folder_id, folders);
-    auto promise = WebView::Application::BookmarkPromise::construct();
+    auto promise = Application::BookmarkPromise::construct();
 
     QObject::connect(dialog, &QDialog::finished, [promise, current_favicon_hash = move(current_favicon_hash), dialog = QPointer { dialog }](auto result) mutable {
         if (result != QDialog::Accepted || !dialog) {
@@ -1695,8 +2449,8 @@ static NonnullRefPtr<WebView::Application::BookmarkPromise> display_add_or_edit_
         if (auto target_folder_id_text = ak_string_from_qstring(dialog->selected_folder_id()); !target_folder_id_text.is_empty())
             target_folder_id = move(target_folder_id_text);
 
-        promise->resolve(WebView::Application::BookmarkDialogResult {
-            .data = WebView::BookmarkItem::Bookmark {
+        promise->resolve(Application::BookmarkDialogResult {
+            .data = BookmarkItem::Bookmark {
                 .url = url.release_value(),
                 .title = move(title),
                 .favicon_hash = move(current_favicon_hash),
@@ -1715,29 +2469,30 @@ NonnullRefPtr<Application::BookmarkPromise> Application::display_add_bookmark_di
     Optional<String> current_title;
     Optional<String> current_favicon_hash;
 
-    if (auto view = active_web_view(); view.has_value()) {
-        current_url = view->displayed_url();
-        current_title = view->title().to_utf8();
-        current_favicon_hash = view->favicon_hash();
+    if (auto* tab = active_tab(); tab && tab->is_loaded()) {
+        auto const& view = tab->view();
+        current_url = view.displayed_url();
+        current_title = view.title().to_utf8();
+        current_favicon_hash = view.favicon_hash();
     }
 
     return display_add_or_edit_bookmark_dialog(active_tab(), BookmarkDialog::Type::AddBookmark, current_url, current_title, current_favicon_hash, target_folder_id);
 }
 
-NonnullRefPtr<Application::BookmarkPromise> Application::display_edit_bookmark_dialog(WebView::BookmarkItem const& current_bookmark, Optional<String const&> parent_folder_id) const
+NonnullRefPtr<Application::BookmarkPromise> Application::display_edit_bookmark_dialog(BookmarkItem const& current_bookmark, Optional<String const&> parent_folder_id) const
 {
     return display_add_or_edit_bookmark_dialog(active_tab(), BookmarkDialog::Type::EditBookmark, current_bookmark.bookmark().url, current_bookmark.bookmark().title, current_bookmark.bookmark().favicon_hash, parent_folder_id);
 }
 
-static NonnullRefPtr<WebView::Application::BookmarkPromise> display_add_or_edit_bookmark_folder_dialog(
+static NonnullRefPtr<Application::BookmarkPromise> display_add_or_edit_bookmark_folder_dialog(
     QWidget* parent,
     BookmarkDialog::Type dialog_type,
     Optional<String const&> current_title,
     Optional<String const&> selected_folder_id,
     Optional<String const&> excluded_folder_id = {})
 {
-    auto* dialog = new BookmarkDialog(parent, dialog_type, {}, current_title, selected_folder_id, WebView::Application::bookmark_store().root_items(), excluded_folder_id);
-    auto promise = WebView::Application::BookmarkPromise::construct();
+    auto* dialog = new BookmarkDialog(parent, dialog_type, {}, current_title, selected_folder_id, Application::bookmark_store().root_items(), excluded_folder_id);
+    auto promise = Application::BookmarkPromise::construct();
 
     QObject::connect(dialog, &QDialog::finished, [promise, dialog = QPointer { dialog }](auto result) {
         if (result != QDialog::Accepted || !dialog) {
@@ -1753,8 +2508,8 @@ static NonnullRefPtr<WebView::Application::BookmarkPromise> display_add_or_edit_
         if (auto target_folder_id_text = ak_string_from_qstring(dialog->selected_folder_id()); !target_folder_id_text.is_empty())
             target_folder_id = move(target_folder_id_text);
 
-        promise->resolve(WebView::Application::BookmarkDialogResult {
-            .data = WebView::BookmarkItem::Folder {
+        promise->resolve(Application::BookmarkDialogResult {
+            .data = BookmarkItem::Folder {
                 .title = move(title),
                 .children = {},
             },
@@ -1771,23 +2526,98 @@ NonnullRefPtr<Application::BookmarkPromise> Application::display_add_bookmark_fo
     return display_add_or_edit_bookmark_folder_dialog(active_tab(), BookmarkDialog::Type::AddFolder, default_title, target_folder_id);
 }
 
-NonnullRefPtr<Application::BookmarkPromise> Application::display_edit_bookmark_folder_dialog(WebView::BookmarkItem const& current_folder, Optional<String const&> parent_folder_id) const
+NonnullRefPtr<Application::BookmarkPromise> Application::display_edit_bookmark_folder_dialog(BookmarkItem const& current_folder, Optional<String const&> parent_folder_id) const
 {
     return display_add_or_edit_bookmark_folder_dialog(active_tab(), BookmarkDialog::Type::EditFolder, current_folder.folder().title, parent_folder_id, current_folder.id);
 }
 
-void Application::on_devtools_enabled() const
+WebView::NotificationBackend& Application::notification_backend()
 {
-    WebView::Application::on_devtools_enabled();
+    if (m_notification_backend)
+        return *m_notification_backend;
 
+    m_notification_backend = create_notification_backend();
+    if (!m_notification_backend)
+        m_notification_backend = make<WebView::NoOpNotificationBackend>();
+    m_notification_backend->on_shown = [](u64 id) {
+        if (auto* hub = HubConnection::the_if_connected())
+            hub->async_notification_shown(id);
+    };
+    m_notification_backend->on_failed = [](u64 id) {
+        if (auto* hub = HubConnection::the_if_connected())
+            hub->async_notification_failed(id);
+    };
+    m_notification_backend->on_clicked = [](u64 id) {
+        if (auto* hub = HubConnection::the_if_connected())
+            hub->async_notification_clicked(id);
+    };
+    m_notification_backend->on_closed = [](u64 id, WebView::NotificationBackend::ByUser by_user) {
+        if (auto* hub = HubConnection::the_if_connected())
+            hub->async_notification_closed(id, by_user == WebView::NotificationBackend::ByUser::Yes);
+    };
+    return *m_notification_backend;
+}
+
+void Application::resolve_external_url_handler_for_hub(u64 request_id, URL::URL const& url)
+{
+    resolve_external_url_handler(url, [this, request_id](RefPtr<WebView::ExternalURLHandler> handler) {
+        auto* hub = HubConnection::the_if_connected();
+        if (!hub)
+            return;
+        if (!handler) {
+            hub->async_external_url_handler_resolved(request_id, Optional<u64> {}, String {}, false);
+            return;
+        }
+        auto handler_id = m_next_external_url_handler_id++;
+        auto application_name = handler->application_name();
+        auto is_ladybird = handler->is_ladybird();
+        m_external_url_handlers.set(handler_id, handler.release_nonnull());
+        hub->async_external_url_handler_resolved(request_id, handler_id, move(application_name), is_ladybird);
+    });
+}
+
+void Application::launch_external_url(u64 handler_id, u64 request_id, URL::URL const& url)
+{
+    auto handler = m_external_url_handlers.get(handler_id);
+    if (!handler.has_value()) {
+        HubConnection::the().async_external_url_launched(request_id, false);
+        return;
+    }
+    (*handler)->launch(url, [request_id](bool launched) {
+        if (auto* hub = HubConnection::the_if_connected())
+            hub->async_external_url_launched(request_id, launched);
+    });
+}
+
+void Application::release_external_url_handler(u64 handler_id)
+{
+    m_external_url_handlers.remove(handler_id);
+}
+
+void Application::report_active_view() const
+{
+    if (m_bookmarks)
+        m_bookmarks->update_toggle_bookmark_action();
+    if (m_application_actions)
+        m_application_actions->update_for_active_view();
+
+    auto* hub = HubConnection::the_if_connected();
+    if (!hub)
+        return;
+    auto* tab = active_tab();
+    hub->async_active_view_changed(tab && tab->is_loaded() ? Optional<u64> { tab->view().view_id() } : Optional<u64> {});
+}
+
+void Application::did_enable_devtools() const
+{
+    m_application_actions->devtools_enabled_changed(true);
     if (m_active_window)
         m_active_window->on_devtools_enabled();
 }
 
-void Application::on_devtools_disabled() const
+void Application::did_disable_devtools() const
 {
-    WebView::Application::on_devtools_disabled();
-
+    m_application_actions->devtools_enabled_changed(false);
     if (m_active_window)
         m_active_window->on_devtools_disabled();
 }
@@ -1799,7 +2629,7 @@ void Application::on_recently_closed_entries_changed() const
 
 QMenuBar* Application::create_application_menu_bar(ForBrowserWindow for_browser_window)
 {
-    auto& application = WebView::Application::the();
+    auto& application = ApplicationActions::the();
     auto* menu_bar = new QMenuBar();
 
     auto* file_menu = menu_bar->addMenu("&File");
@@ -1811,6 +2641,8 @@ QMenuBar* Application::create_application_menu_bar(ForBrowserWindow for_browser_
         file_menu->addAction(close_current_tab_action());
     file_menu->addSeparator();
     file_menu->addAction(open_file_action());
+    if (for_browser_window == ForBrowserWindow::Yes)
+        file_menu->addAction(open_location_action());
     file_menu->addAction(open_downloads_action());
     file_menu->addSeparator();
     file_menu->addAction(quit_action());
@@ -1824,10 +2656,13 @@ QMenuBar* Application::create_application_menu_bar(ForBrowserWindow for_browser_
     edit_menu->addAction(create_application_action(*menu_bar, application.cut_selection_action(), IncludeActionIcon::No));
     edit_menu->addAction(create_application_action(*menu_bar, application.copy_selection_action(), IncludeActionIcon::No));
     edit_menu->addAction(create_application_action(*menu_bar, application.paste_action(), IncludeActionIcon::No));
+    edit_menu->addAction(create_application_action(*menu_bar, application.paste_and_match_style_action(), IncludeActionIcon::No));
     edit_menu->addAction(create_application_action(*menu_bar, application.select_all_action(), IncludeActionIcon::No));
     edit_menu->addSeparator();
     if (for_browser_window == ForBrowserWindow::Yes) {
         edit_menu->addAction(find_in_page_action());
+        edit_menu->addAction(find_next_action());
+        edit_menu->addAction(find_previous_action());
         edit_menu->addSeparator();
     }
     edit_menu->addAction(open_settings_action());
@@ -1839,13 +2674,41 @@ QMenuBar* Application::create_application_menu_bar(ForBrowserWindow for_browser_
         view_menu->addAction(search_tabs_action());
         view_menu->addSeparator();
 
+        view_menu->addAction(toggle_sidebar_action());
+        view_menu->addSeparator();
+
+        view_menu->addAction(reload_action());
+        view_menu->addAction(reload_bypassing_cache_action());
+        view_menu->addAction(stop_action());
+        // The menu stops the load of the tab it was opened over, so it's only enabled while that tab is loading.
+        QObject::connect(view_menu, &QMenu::aboutToShow, view_menu, [] {
+            auto* tab = Application::the().active_tab();
+            Application::the().stop_action()->setEnabled(tab && tab->view().is_loading());
+        });
+        view_menu->addSeparator();
+
+        view_menu->addAction(move_focus_action());
+        view_menu->addSeparator();
+
         auto* zoom_menu = view_menu->addMenu("&Zoom");
         zoom_menu->addAction(zoom_in_action());
         zoom_menu->addAction(zoom_out_action());
         zoom_menu->addAction(reset_zoom_action());
+
+        // The translation menu is the active tab's, so it's filled in as it opens.
+        if (Application::the().has_translator()) {
+            auto* translation_menu = view_menu->addMenu("&Translation");
+            QObject::connect(translation_menu, &QMenu::aboutToShow, translation_menu, [translation_menu] {
+                if (auto* tab = Application::the().active_tab())
+                    repopulate_application_menu(*translation_menu, tab->view().translation_menu());
+                else
+                    translation_menu->clear();
+            });
+        }
         view_menu->addSeparator();
     }
     view_menu->addMenu(create_application_menu(*view_menu, application.color_scheme_menu()));
+    view_menu->addAction(create_application_action(*view_menu, application.force_dark_action(), IncludeActionIcon::No));
     view_menu->addMenu(create_application_menu(*view_menu, application.contrast_menu()));
     view_menu->addMenu(create_application_menu(*view_menu, application.motion_menu()));
 
@@ -1859,6 +2722,11 @@ QMenuBar* Application::create_application_menu_bar(ForBrowserWindow for_browser_
     if (for_browser_window == ForBrowserWindow::Yes) {
         menu_bar->addMenu(inspect_menu());
         menu_bar->addMenu(debug_menu());
+    } else {
+        // NB: The Task Manager needs no browser window, so it can be opened while none is focused, such as right after
+        //     it was closed.
+        auto* inspect_menu = menu_bar->addMenu("&Inspect");
+        inspect_menu->addAction(create_application_action(*inspect_menu, *m_open_task_manager_action, IncludeActionIcon::No));
     }
     menu_bar->addMenu(help_menu());
 
@@ -1891,6 +2759,13 @@ DEFINE_APP_MENU_GETTER(QAction, open_file_action);
 DEFINE_APP_MENU_GETTER(QAction, open_settings_action);
 DEFINE_APP_MENU_GETTER(QAction, open_downloads_action);
 DEFINE_APP_MENU_GETTER(QAction, toggle_bookmark_bar_action);
+DEFINE_APP_MENU_GETTER(QAction, toggle_sidebar_action);
+DEFINE_APP_MENU_GETTER(QAction, open_location_action);
+DEFINE_APP_MENU_GETTER(QAction, reload_action);
+DEFINE_APP_MENU_GETTER(QAction, reload_bypassing_cache_action);
+DEFINE_APP_MENU_GETTER(QAction, stop_action);
+DEFINE_APP_MENU_GETTER(QAction, find_next_action);
+DEFINE_APP_MENU_GETTER(QAction, find_previous_action);
 DEFINE_APP_MENU_GETTER(QAction, find_in_page_action);
 DEFINE_APP_MENU_GETTER(QAction, zoom_in_action);
 DEFINE_APP_MENU_GETTER(QAction, zoom_out_action);

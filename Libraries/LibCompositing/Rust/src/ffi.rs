@@ -61,6 +61,9 @@ pub unsafe extern "C" fn display_list_compute_damage(
     canvases_with_new_content_len: usize,
     video_sinks_with_new_frames: *const crate::display_list::commands::VideoSinkResourceId,
     video_sinks_with_new_frames_len: usize,
+    image_frames_with_new_pixels: *const crate::display_list::commands::ImageFrameResourceId,
+    image_frames_with_new_pixels_len: usize,
+    forced_damage_rect: libgfx_rust::IntRect,
     out_damage_rect: *mut libgfx_rust::IntRect,
 ) -> bool {
     // SAFETY: The caller guarantees live handles and valid slices for the duration of the call.
@@ -79,6 +82,8 @@ pub unsafe extern "C" fn display_list_compute_damage(
         crate::display_list::damage::LiveContentChanges {
             canvases: ak::slice_from_raw_parts(canvases_with_new_content, canvases_with_new_content_len),
             video_sinks: ak::slice_from_raw_parts(video_sinks_with_new_frames, video_sinks_with_new_frames_len),
+            image_frames: ak::slice_from_raw_parts(image_frames_with_new_pixels, image_frames_with_new_pixels_len),
+            forced_damage_rect,
         }
     };
     let damage = crate::display_list::damage::compute_display_list_damage(
@@ -196,7 +201,9 @@ pub unsafe extern "C" fn display_list_replay_records(
     };
     // SAFETY: The caller guarantees `callbacks` is live for the call.
     let mut painter = unsafe { *callbacks };
-    crate::display_list::replay::replay_records(records, scroll_offsets, &mut painter);
+    // NB: Nested records share the context of the command they are nested in, and none of their inline clips has a
+    //     space of its own.
+    crate::display_list::replay::replay_records(records, scroll_offsets, &|_| None, &mut painter);
 }
 
 /// # Safety
@@ -380,23 +387,6 @@ pub unsafe extern "C" fn visual_context_tree_transform_rect_to_viewport(
 ///
 /// `tree` must be a live retained tree handle; `scroll_offsets` must address `scroll_offsets_len` points.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn visual_context_tree_cumulative_scroll_chain_offset(
-    tree: *const c_void,
-    spatial: SpatialNodeIndex,
-    scroll_offsets: *const libgfx_rust::FloatPoint,
-    scroll_offsets_len: usize,
-    out: &mut libgfx_rust::FloatPoint,
-) {
-    let tree = unsafe { tree_from_handle(tree) };
-    // SAFETY: The caller guarantees the offsets address `scroll_offsets_len` points.
-    let scroll_offsets = unsafe { ak::slice_from_raw_parts(scroll_offsets, scroll_offsets_len) };
-    *out = tree.cumulative_scroll_chain_offset(spatial, scroll_offsets);
-}
-
-/// # Safety
-///
-/// `tree` must be a live retained tree handle; `scroll_offsets` must address `scroll_offsets_len` points.
-#[unsafe(no_mangle)]
 pub unsafe extern "C" fn visual_context_tree_accumulated_matrix(
     tree: *const c_void,
     spatial: SpatialNodeIndex,
@@ -499,11 +489,39 @@ pub unsafe extern "C" fn visual_context_tree_has_visual_animations(tree: *const 
 ///
 /// `tree` must be a live retained tree handle.
 #[unsafe(no_mangle)]
+pub unsafe extern "C" fn visual_context_tree_can_snap_composited_context_origin(
+    tree: *const c_void,
+    spatial_node_index: SpatialNodeIndex,
+) -> bool {
+    unsafe { tree_from_handle(tree) }.can_snap_composited_context_origin(spatial_node_index)
+}
+
+/// # Safety
+///
+/// `tree` must be a live retained tree handle.
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn visual_context_tree_has_active_visual_animation_at(
     tree: *const c_void,
     sample_time_ns: i64,
 ) -> bool {
     unsafe { tree_from_handle(tree) }.has_active_visual_animation_at(sample_time_ns)
+}
+
+/// # Safety
+///
+/// `tree` must be a live retained tree handle, and `scroll_offsets` must address `scroll_offsets_len` points.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn visual_context_tree_running_transform_animation_covers_point(
+    tree: *const c_void,
+    sample_time_ns: i64,
+    screen_point: libgfx_rust::FloatPoint,
+    scroll_offsets: *const libgfx_rust::FloatPoint,
+    scroll_offsets_len: usize,
+) -> bool {
+    let tree = unsafe { tree_from_handle(tree) };
+    // SAFETY: The caller guarantees the offsets address `scroll_offsets_len` points.
+    let scroll_offsets = unsafe { ak::slice_from_raw_parts(scroll_offsets, scroll_offsets_len) };
+    tree.running_transform_animation_covers_point(sample_time_ns, screen_point, scroll_offsets)
 }
 
 /// # Safety
@@ -591,6 +609,7 @@ pub unsafe extern "C" fn visual_context_tree_test_builder_create() -> *mut c_voi
         role: crate::visual_context::TransformDataRole::CssTransform,
         synthetic_plane: false,
         establishes_sorting_context: false,
+        bounds: libgfx_rust::FloatRect::default(),
     });
     Box::into_raw(Box::new(tree)).cast()
 }
@@ -623,6 +642,7 @@ pub unsafe extern "C" fn visual_context_tree_test_builder_append_transform(
             role: crate::visual_context::TransformDataRole::CssTransform,
             synthetic_plane: false,
             establishes_sorting_context: false,
+            bounds: libgfx_rust::FloatRect::default(),
         }),
         SpatialNodeIndex(parent),
     )
@@ -639,7 +659,6 @@ pub unsafe extern "C" fn visual_context_tree_test_builder_append_scroll(builder:
         crate::visual_context::SpatialData::Scroll(crate::visual_context::ScrollData {
             state_slot: crate::visual_context::scroll_state::NO_SCROLL_STATE_SLOT,
             owner_paintable: NodeSlotId::INVALID,
-            registry_parent_node: SpatialNodeIndex(parent),
         }),
         SpatialNodeIndex(parent),
     )
@@ -675,11 +694,6 @@ pub unsafe extern "C" fn visual_context_tree_test_builder_append_sticky(
             inset_left: inset(constraints.inset_left),
             state_slot: crate::visual_context::scroll_state::NO_SCROLL_STATE_SLOT,
             owner_paintable: NodeSlotId::INVALID,
-            registry_parent_node: if constraints.has_parent_sticky {
-                SpatialNodeIndex(constraints.parent_sticky)
-            } else {
-                SpatialNodeIndex(constraints.scroller)
-            },
         }),
         SpatialNodeIndex(parent),
     )

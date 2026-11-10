@@ -30,10 +30,13 @@ import sys
 # or a stub in a test binary.
 ALLOWED = {
     "Libraries/LibGfx/Rust/src/text_layout.rs:SHAPING_CACHE": "per-thread memo of a pure function; a second copy costs memory, never an answer",
+    "AK/Rust/src/waiter_list.rs:LISTS": "only libjs_rust and libwasm_engine use it, which are in one library of a process, so they share a copy; a caller in another library needs the state moved to C++",
     "Libraries/LibCompositing/Rust/src/test_stubs.rs:NEXT": "test stub for LibGfx's C++ counters, in the cargo test binary that has no C++ side",
     "Libraries/LibCompositing/Rust/src/display_list/replay.rs:WARM_REPLAY_SCRATCH_STORAGE": "per-thread replay scratch; a second copy costs memory, never an answer",
     "Libraries/LibJS/Flap/src/low_ir/lowering.rs:LABELS": "per-thread scratch buffer; a second copy costs memory, never an answer",
     "Libraries/LibJS/JIT/Rust/src/asm/x86_64/sse.rs:FEATURES": "immutable CPU/OS feature cache; each copy computes the same supported instructions",
+    "Libraries/LibJS/JIT/Rust/src/codegen/tests.rs:REGION": "the fake heap region of JIT unit tests, in the cargo test binary that has no runtime",
+    "Libraries/LibRegex/Rust/src/vm.rs:INTERRUPT_FLAG": "per-thread, and only libjs_rust's copy sets it; the copy of LibURL's crate has no VM to interrupt, so it only ever sees null",
     "Libraries/LibWeb/HTML/Parser/Rust/src/token.rs:SPARE_ATTRIBUTE_LISTS": "per-thread allocation pool; a second copy costs memory, never an answer",
     "Libraries/LibWeb/HTML/Parser/Rust/src/token.rs:SPARE_ATTRIBUTE_VALUES": "per-thread allocation pool; a second copy costs memory, never an answer",
 }
@@ -62,7 +65,6 @@ IN_ONE_LIBRARY = {
 # libweb_rust: `file:name` -> why the state is fine on a thread other than the document's.
 RENDER_STATE_CRATE = "Libraries/LibWeb/Rust"
 
-STYLE_POOL = "style interning pool behind a mutex; becomes per-engine state before style runs on another thread"
 SCRATCH = "per-thread allocation pool; a thread without one only allocates more"
 DIAGNOSTIC = "counter diagnostics; off unless an environment variable turns them on"
 ENVIRONMENT_SWITCH = "read-once environment switch; every thread sees the same answer"
@@ -78,22 +80,9 @@ def render_state_entries(reason, entries):
 
 RENDER_STATE_ALLOWED = {
     **render_state_entries(
-        STYLE_POOL,
-        [
-            "css/style/matching.rs:DISPATCH_POOLS",
-            "css/style/native_rules/targets.rs:TARGET_PAGES",
-            "css/style/program.rs:RULE_DECLARATIONS",
-            "css/style/program/rule_records.rs:RULE_RECORD_PAGES",
-            "css/style/program/rule_versions.rs:RULE_VERSION_PAGES",
-            "css/style/selector.rs:ROUTING_POOLS",
-            "css/style/selector.rs:SELECTOR_PROGRAM_POOLS",
-        ],
-    ),
-    **render_state_entries(
         SCRATCH,
         [
             "css/cascaded_properties.rs:STORE_POOL",
-            "css/style/column.rs:STAMPED_INDEX_POOL",
         ],
     ),
     **render_state_entries(
@@ -101,22 +90,16 @@ RENDER_STATE_ALLOWED = {
         [
             "css/ffi_stats.rs:COMPLETE_STYLE_UPDATE_STATE",
             "css/ffi_stats.rs:COUNTERS_ENABLED",
-            "css/ffi_stats.rs:COUNTER_CONTEXT",
+            "css/ffi_stats.rs:COUNTS",
             "css/ffi_stats.rs:CPP_CALLBACK_COUNT",
-            "css/ffi_stats.rs:REGISTRY",
             "css/ffi_stats.rs:THREAD_UNSAFE_CPP_CALLBACK_COUNT",
         ],
     ),
     **render_state_entries(
         ENVIRONMENT_SWITCH,
         [
-            "css/style/flush.rs:ENABLED",
-            "css/style/mod.rs:CASCADE_WINNERS",
-            "css/style/mod.rs:PREFIX_RELATION",
-            "css/style/mod.rs:PUBLISHED_STYLE_TRANSACTION",
-            "css/style/mod.rs:SELECTOR_TRUTH_DERIVATION",
-            "css/style/mod.rs:STYLE_ANSWER_PATCH",
-            "css/style/mod.rs:STYLE_PLAN_PROVENANCE",
+            "layout/parallel_layout.rs:FORK_SETTINGS",
+            "layout/parallel_layout.rs:SUBTREE_LEASES_ARE_VERIFIED",
             "layout/run_repeatability.rs:ENABLED",
             "layout/run_repeatability.rs:VERIFICATION",
             "render_state/clock/hover.rs:LOGS",
@@ -125,13 +108,11 @@ RENDER_STATE_ALLOWED = {
     **render_state_entries(
         IDENTITY,
         [
+            "cow_column.rs:NEXT",
             "css/declaration_block.rs:NEXT_DECLARATION_BLOCK_IDENTITY",
             "css/rule.rs:NEXT_RULE_IDENTITY",
-            "css/style/index.rs:NEXT",
-            "css/style/prefix.rs:NEXT",
-            "css/style/selector.rs:NEXT",
             "css/style_sheet.rs:NEXT_SHEET_IDENTITY",
-            "layout/fragment_tree.rs:NEXT_IDENTITY",
+            "layout/fragment_tree.rs:NEXT_UNRESERVED_IDENTITY",
             "render_state/owner.rs:NEXT",
         ],
     ),
@@ -148,37 +129,35 @@ RENDER_STATE_ALLOWED = {
         ["render_state/owner.rs:DROPPED_AFTER_HOLD"],
     ),
     f"{RENDER_STATE_CRATE}/src/render_state.rs:STACK_BASE": "per-thread cache of the thread's own stack bounds",
+    f"{RENDER_STATE_CRATE}/src/layout/parallel_layout.rs:SUBTREE_LEASE_OF_THIS_THREAD": "per-thread lease of the subtree the layout task running on the thread may write, held only while LIBWEB_VERIFY_LAYOUT_FORK_SCOPE checks it and only for that task",
+    f"{RENDER_STATE_CRATE}/src/layout/layout_pass.rs:WORKER_SCRATCH_OF_THIS_THREAD": "per-thread spare layout buffers and the fragment identities the thread reserved; a thread without one only allocates more and reserves another range",
     f"{RENDER_STATE_CRATE}/src/stage_thread.rs:UNFINISHED_HANDED": "per-thread count of the jobs the thread made for each stage thread that have yet to run",
     **render_state_entries(
         BUILT_ONCE,
         [
-            "css/computed_values.rs:DEFAULTS",
-            "css/computed_values.rs:MASKS",
             "css/counter_representation.rs:DECIMAL",
             "css/css_string.rs:EMPTY",
             "css/custom_properties.rs:EMPTY",
             "css/parser/stylesheet_cache.rs:HASHER",
             "css/parser/stylesheet_cache.rs:KEYS",
             "css/property_metadata.rs:SHORTHAND_LEAVES",
-            "css/style/publication.rs:REMAINING",
+            "css/style_compute.rs:DIRECT",
             "css/style_compute.rs:FONT_ORDER",
+            "css/style_compute.rs:FONT_PHASES",
             "css/style_compute.rs:KINDS",
-            "css/style_compute.rs:LONGHANDS",
             "css/style_compute.rs:PHASE_BOUNDARIES",
             "css/style_compute.rs:PX",
+            "css/style_compute.rs:RANKS",
             "css/style_compute.rs:REMAINING_ORDER",
             "css/style_compute.rs:TABLE",
+            "style_layout_pool.rs:THREAD_COUNT",
+            "web_audio/rendering/render_nodes.rs:COEFFICIENTS",
         ],
     ),
     **render_state_entries(
         LOCKED,
         [
-            "css/parser/arbitrary_substitution.rs:ATTR_NAMES_READ",
-            "css/parser/arbitrary_substitution.rs:ATTR_NAMES_READ_GENERATION",
             "css/parser/stylesheet_cache.rs:CACHE",
-            "css/style/atoms.rs:GLOBAL_ATOMS",
-            "css/style/inputs.rs:CUSTOM_PROPERTY_DATA_LET_GO_BESIDE_THE_HOST",
-            "css/style/user_agent_selectors.rs:PROGRAMS",
         ],
     ),
     **render_state_entries(
@@ -188,14 +167,21 @@ RENDER_STATE_ALLOWED = {
             "css/declaration_block.rs:DECLARATION_OWNER_ALLOCATIONS",
             "css/descriptor_block.rs:DESCRIPTOR_OWNER_ALLOCATIONS",
             "css/rule.rs:RULE_OWNER_ALLOCATIONS",
-            "css/style/atoms.rs:GLOBAL_ATOM_TEST_LOCK",
             "css/style/font_resolution.rs:RESOLVES",
-            "css/style/mod.rs:SELECTOR_TRUTH_DERIVATION_OVERRIDE",
-            "css/style_compute.rs:FLY_STRINGS",
-            "css/style_compute.rs:FONT_CASCADE_LIST_UNREFS",
-            "css/style_compute.rs:NEXT",
+            "css/style/pipeline/allocation_count.rs:ALLOCATIONS",
+            "css/style/pipeline/allocation_count.rs:COUNTING",
+            "css/style/pipeline/allocation_count.rs:LIVE_BYTES",
+            "css/style/pipeline/allocation_count.rs:PRINTS_BACKTRACES",
+            "css/style/pipeline/allocation_count.rs:PRINTS_BACKTRACES_CACHE",
+            "css/style/pipeline/allocation_count.rs:STYLE_ALLOCATIONS",
+            "css/style/pipeline/allocation_count.rs:STYLE_SECTION_DEPTH",
+            "css/style/pipeline/test_support.rs:NAMES",
+            "css/style_compute/ffi_test_stubs.rs:FLY_STRINGS",
+            "css/style_compute/ffi_test_stubs.rs:FONT_CASCADE_LIST_UNREFS",
+            "css/style_compute/ffi_test_stubs.rs:NEXT",
         ],
     ),
+    f"{RENDER_STATE_CRATE}/src/css/custom_properties.rs:COMPARED_STORES": "per-thread memo of comparing immutable stores; a thread without one only walks their values again",
     f"{RENDER_STATE_CRATE}/src/css/parser/stylesheet_cache.rs:PARSE_DEPENDENCIES": "per-thread record of the parse running on this thread; scoped to that parse",
     f"{RENDER_STATE_CRATE}/src/css/style_value.rs:VALUES": "built-once keyword values, and a replay-only table of the same name",
     f"{RENDER_STATE_CRATE}/src/css/parser/value_parser.rs:LISTS": "built-once immutable lists of initial background values",
@@ -203,7 +189,7 @@ RENDER_STATE_ALLOWED = {
     f"{RENDER_STATE_CRATE}/src/painting/recording_slot.rs:RECORDING_HOLD_RELEASED": "wakes the recording a test held once it lets it go",
     f"{RENDER_STATE_CRATE}/src/stage_thread.rs:THREAD_SETUP": "set once before the first stage thread starts, which runs it; read-only after",
     f"{RENDER_STATE_CRATE}/src/stage_thread.rs:FLIGHT_FINISHED": "set once before the first job is submitted, which a stage thread calls when one finishes; read-only after",
-    f"{RENDER_STATE_CRATE}/src/stage_thread.rs:STYLE_LAYOUT_THREAD": "the process's one StyleLayout thread, which every thread hands its jobs to",
+    f"{RENDER_STATE_CRATE}/src/stage_thread.rs:RENDER_THREAD": "the process's one Render thread, which every thread hands its jobs to",
     f"{RENDER_STATE_CRATE}/src/paint_stage.rs:PAINT_THREAD": "the process's one Paint thread, which every thread hands its jobs to, and the stage only its own jobs reach",
     f"{RENDER_STATE_CRATE}/src/stage_thread.rs:THREAD": "test only",
 }

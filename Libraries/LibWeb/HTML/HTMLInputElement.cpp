@@ -25,6 +25,7 @@
 #include <LibWeb/CSS/ElementBoxKind.h>
 #include <LibWeb/CSS/Invalidation/ElementStateInvalidator.h>
 #include <LibWeb/CSS/Invalidation/FormControlInvalidator.h>
+#include <LibWeb/CSS/Invalidation/PseudoClassInvalidator.h>
 #include <LibWeb/CSS/Parser/Parser.h>
 #include <LibWeb/CSS/PropertyID.h>
 #include <LibWeb/CSS/SelectorMatching.h>
@@ -212,6 +213,9 @@ void HTMLInputElement::set_checked(bool checked)
         return;
 
     m_checked = checked;
+    // The accessibility tree reports this state, with nothing else about the element changing.
+    if (document().page().accessibility_interested())
+        document().invalidate_cached_accessibility_data(*this);
 
     CSS::Invalidation::invalidate_style_after_checked_state_change(*this);
 
@@ -257,6 +261,9 @@ void HTMLInputElement::set_indeterminate(bool value)
         return;
     m_indeterminateness = value;
     CSS::Invalidation::invalidate_style_after_indeterminate_state_change(*this, value);
+    // The accessibility tree reports this state, with nothing else about the element changing.
+    if (document().page().accessibility_interested())
+        document().invalidate_cached_accessibility_data(*this);
     Painting::push_form_control_paint_facts(*this);
     set_needs_repaint(InvalidateDisplayList::PaintCommands);
 }
@@ -643,9 +650,9 @@ void HTMLInputElement::did_select_files(Span<SelectedFile> selected_files, Multi
     //    interaction task source given element to fire an event named cancel at element, with the bubbles attribute
     //    initialized to true.
     if (selected_files.is_empty()) {
-        queue_an_element_task(HTML::Task::Source::UserInteraction, [this]() {
-            dispatch_event(create_event_for_element(*this, HTML::EventNames::cancel, { .bubbles = true }));
-        });
+        queue_an_element_task(HTML::Task::Source::UserInteraction, GC::create_function(GC::Heap::the(), GC::captures(*this), [](auto& self) {
+            self.dispatch_event(create_event_for_element(self, HTML::EventNames::cancel, { .bubbles = true }));
+        }));
 
         return;
     }
@@ -806,7 +813,7 @@ WebIDL::ExceptionOr<void> HTMLInputElement::set_value(Utf16View value)
             relevant_value_was_changed();
 
             if (selection_or_range_applies())
-                set_the_selection_range(m_value.length_in_code_units(), m_value.length_in_code_units());
+                set_the_selection_range(m_value.length_in_code_units(), m_value.length_in_code_units(), SelectionDirection::None, SelectionSource::ValueChange);
 
             update_shadow_tree();
         } else if (!m_date_time_fields.is_empty()) {
@@ -1333,20 +1340,20 @@ void HTMLInputElement::create_text_input_shadow_tree()
         MUST(stepper_container->append_child(*m_up_button_element));
 
         auto mouseup_callback_function = JS::NativeFunction::create(
-            HTML::relevant_realm(*this), [this](JS::VM&) {
-                commit_pending_changes();
+            HTML::relevant_realm(*this), GC::create_function<JS::ThrowCompletionOr<JS::Value>(JS::VM&)>(GC::Heap::the(), GC::captures(*this), [](auto& self, JS::VM&) {
+                self.commit_pending_changes();
                 return JS::js_undefined();
-            },
+            }),
             0, Utf16FlyString {}, &HTML::relevant_realm(*this));
         auto mouseup_callback = GC::Heap::the().allocate<WebIDL::CallbackType>(*mouseup_callback_function, HTML::relevant_realm(*this));
         DOM::EventTarget::AddEventListenerOptions mouseup_listener_options;
         mouseup_listener_options.once = true;
 
         auto up_callback_function = JS::NativeFunction::create(
-            HTML::relevant_realm(*this), [this](JS::VM&) {
-                step_for_user_interaction(StepDirection::Up, CommitChange::No);
+            HTML::relevant_realm(*this), GC::create_function<JS::ThrowCompletionOr<JS::Value>(JS::VM&)>(GC::Heap::the(), GC::captures(*this), [](auto& self, JS::VM&) {
+                self.step_for_user_interaction(StepDirection::Up, CommitChange::No);
                 return JS::js_undefined();
-            },
+            }),
             0, Utf16FlyString {}, &HTML::relevant_realm(*this));
         auto step_up_callback = GC::Heap::the().allocate<WebIDL::CallbackType>(*up_callback_function, HTML::relevant_realm(*this));
         m_up_button_element->add_event_listener_without_options(UIEvents::EventNames::mousedown, DOM::IDLEventListener::create(step_up_callback));
@@ -1370,10 +1377,10 @@ void HTMLInputElement::create_text_input_shadow_tree()
         MUST(stepper_container->append_child(*m_down_button_element));
 
         auto down_callback_function = JS::NativeFunction::create(
-            HTML::relevant_realm(*this), [this](JS::VM&) {
-                step_for_user_interaction(StepDirection::Down, CommitChange::No);
+            HTML::relevant_realm(*this), GC::create_function<JS::ThrowCompletionOr<JS::Value>(JS::VM&)>(GC::Heap::the(), GC::captures(*this), [](auto& self, JS::VM&) {
+                self.step_for_user_interaction(StepDirection::Down, CommitChange::No);
                 return JS::js_undefined();
-            },
+            }),
             0, Utf16FlyString {}, &HTML::relevant_realm(*this));
         auto step_down_callback = GC::Heap::the().allocate<WebIDL::CallbackType>(*down_callback_function, HTML::relevant_realm(*this));
         m_down_button_element->add_event_listener_without_options(UIEvents::EventNames::mousedown, DOM::IDLEventListener::create(step_down_callback));
@@ -1401,10 +1408,10 @@ void HTMLInputElement::create_text_input_shadow_tree()
         MUST(icon->append_child(icon_path));
 
         auto open_picker_function = JS::NativeFunction::create(
-            HTML::relevant_realm(*this), [this](JS::VM&) {
-                show_the_picker_if_applicable(*this);
+            HTML::relevant_realm(*this), GC::create_function<JS::ThrowCompletionOr<JS::Value>(JS::VM&)>(GC::Heap::the(), GC::captures(*this), [](auto& self, JS::VM&) {
+                show_the_picker_if_applicable(self);
                 return JS::js_undefined();
-            },
+            }),
             0, Utf16FlyString {}, &HTML::relevant_realm(*this));
         auto open_picker_callback = GC::Heap::the().allocate<WebIDL::CallbackType>(*open_picker_function, HTML::relevant_realm(*this));
         picker_indicator->add_event_listener_without_options(UIEvents::EventNames::click, DOM::IDLEventListener::create(open_picker_callback));
@@ -1421,25 +1428,16 @@ void HTMLInputElement::create_color_input_shadow_tree()
 
     auto color = value_sanitization_algorithm(m_value);
 
+    // NB: The default stylesheet styles the wrapper and the swatch through their pseudo-elements, so that author styles
+    //     can override it.
     auto swatch_wrapper = DOM::create_element(document(), HTML::TagNames::div, Namespace::HTML).release_value_but_fixme_should_propagate_errors();
-    swatch_wrapper->set_attribute_value(HTML::AttributeNames::style, R"~~~(
-        display: flex;
-        width: 100%;
-        height: 100%;
-        padding: 4px 2px;
-        box-sizing: border-box;
-)~~~"_utf16);
+    MUST(shadow_root->append_child(swatch_wrapper));
+    swatch_wrapper->set_associated_shadow_host_pseudo_element(CSS::PseudoElement::WebkitColorSwatchWrapper);
 
     m_color_well_element = DOM::create_element(document(), HTML::TagNames::div, Namespace::HTML).release_value_but_fixme_should_propagate_errors();
-    m_color_well_element->set_attribute_value(HTML::AttributeNames::style, R"~~~(
-        flex: 1;
-        min-width: 0;
-        border: 1px solid #777777;
-)~~~"_utf16);
     MUST(m_color_well_element->style()->set_property(CSS::PropertyID::BackgroundColor, color.utf16_view()));
-
     MUST(swatch_wrapper->append_child(*m_color_well_element));
-    MUST(shadow_root->append_child(swatch_wrapper));
+    m_color_well_element->set_associated_shadow_host_pseudo_element(CSS::PseudoElement::ColorSwatch);
 }
 
 void HTMLInputElement::update_color_well_element()
@@ -1463,13 +1461,13 @@ void HTMLInputElement::create_file_input_shadow_tree()
     m_file_label = DOM::create_element(document(), HTML::TagNames::label, Namespace::HTML).release_value_but_fixme_should_propagate_errors();
     m_file_label->set_attribute_value(HTML::AttributeNames::style, "padding-left: 4px;"_utf16);
 
-    auto on_button_click = [this](JS::VM&) {
-        show_the_picker_if_applicable(*this);
+    auto on_button_click = GC::create_function<JS::ThrowCompletionOr<JS::Value>(JS::VM&)>(GC::Heap::the(), GC::captures(*this), [](auto& self, JS::VM&) {
+        show_the_picker_if_applicable(self);
         return JS::js_undefined();
-    };
+    });
 
     auto& realm = HTML::relevant_realm(*this);
-    auto on_button_click_function = JS::NativeFunction::create(realm, move(on_button_click), 0, Utf16FlyString {}, &realm);
+    auto on_button_click_function = JS::NativeFunction::create(realm, on_button_click, 0, Utf16FlyString {}, &realm);
     auto on_button_click_callback = GC::Heap::the().allocate<WebIDL::CallbackType>(on_button_click_function, realm);
     m_file_button->add_event_listener_without_options(UIEvents::EventNames::click, DOM::IDLEventListener::create(on_button_click_callback));
 
@@ -1528,10 +1526,10 @@ void HTMLInputElement::create_range_input_shadow_tree()
     update_slider_shadow_tree_elements();
 
     auto keydown_callback_function = JS::NativeFunction::create(
-        HTML::relevant_realm(*this), [this](JS::VM& vm) {
-            if (type_state() != TypeAttributeState::Range)
+        HTML::relevant_realm(*this), GC::create_function<JS::ThrowCompletionOr<JS::Value>(JS::VM&)>(GC::Heap::the(), GC::captures(*this), [](HTMLInputElement& self, JS::VM& vm) {
+            if (self.type_state() != TypeAttributeState::Range)
                 return JS::js_undefined();
-            if (!allowed_value_step().has_value())
+            if (!self.allowed_value_step().has_value())
                 return JS::js_undefined();
             auto key_value = MUST(vm.argument(0).get(vm, "key"_utf16_fly_string));
             if (!key_value.is_string())
@@ -1539,45 +1537,45 @@ void HTMLInputElement::create_range_input_shadow_tree()
             auto key = key_value.as_string().utf16_string_view();
 
             if (key == u"ArrowLeft"sv || key == u"ArrowDown"sv)
-                MUST(step_down());
+                MUST(self.step_down());
             if (key == u"PageDown"sv)
-                MUST(step_down(10));
+                MUST(self.step_down(10));
 
             if (key == u"ArrowRight"sv || key == u"ArrowUp"sv)
-                MUST(step_up());
+                MUST(self.step_up());
             if (key == u"PageUp"sv)
-                MUST(step_up(10));
+                MUST(self.step_up(10));
 
-            user_interaction_did_change_input_value();
+            self.user_interaction_did_change_input_value();
             return JS::js_undefined();
-        },
+        }),
         0, Utf16FlyString {}, &HTML::relevant_realm(*this));
     auto keydown_callback = GC::Heap::the().allocate<WebIDL::CallbackType>(*keydown_callback_function, HTML::relevant_realm(*this));
     add_event_listener_without_options(UIEvents::EventNames::keydown, DOM::IDLEventListener::create(keydown_callback));
 
     auto wheel_callback_function = JS::NativeFunction::create(
-        HTML::relevant_realm(*this), [this](JS::VM& vm) {
-            if (type_state() != TypeAttributeState::Range)
+        HTML::relevant_realm(*this), GC::create_function<JS::ThrowCompletionOr<JS::Value>(JS::VM&)>(GC::Heap::the(), GC::captures(*this), [](HTMLInputElement& self, JS::VM& vm) {
+            if (self.type_state() != TypeAttributeState::Range)
                 return JS::js_undefined();
-            if (!allowed_value_step().has_value())
+            if (!self.allowed_value_step().has_value())
                 return JS::js_undefined();
             auto delta_y_value = MUST(vm.argument(0).get(vm, "deltaY"_utf16_fly_string));
             if (!delta_y_value.is_finite_number())
                 return JS::js_undefined();
             if (delta_y_value.as_double() > 0) {
-                MUST(step_down());
+                MUST(self.step_down());
             } else {
-                MUST(step_up());
+                MUST(self.step_up());
             }
-            user_interaction_did_change_input_value();
+            self.user_interaction_did_change_input_value();
             return JS::js_undefined();
-        },
+        }),
         0, Utf16FlyString {}, &HTML::relevant_realm(*this));
     auto wheel_callback = GC::Heap::the().allocate<WebIDL::CallbackType>(*wheel_callback_function, HTML::relevant_realm(*this));
     add_event_listener_without_options(UIEvents::EventNames::wheel, DOM::IDLEventListener::create(wheel_callback));
 
-    auto update_slider_by_mouse = [this](JS::VM& vm) {
-        if (type_state() != TypeAttributeState::Range)
+    auto update_slider_by_mouse = GC::create_function<void(JS::VM&)>(GC::Heap::the(), GC::captures(*this), [](HTMLInputElement& self, JS::VM& vm) {
+        if (self.type_state() != TypeAttributeState::Range)
             return;
         auto event = vm.argument(0).is_object()
             ? Bindings::impl_from<UIEvents::MouseEvent>(&vm.argument(0).as_object())
@@ -1587,47 +1585,47 @@ void HTMLInputElement::create_range_input_shadow_tree()
         auto client_x = event->client_x();
         if (!isfinite(client_x))
             return;
-        auto rect = get_bounding_client_rect().to_type<double>();
+        auto rect = self.get_bounding_client_rect().to_type<double>();
         if (rect.width() <= 0)
             return;
-        double minimum = *min();
-        double maximum = *max();
+        double minimum = *self.min();
+        double maximum = *self.max();
         if (minimum > maximum)
             return;
         auto relative_x = client_x - rect.left();
-        MUST(set_value_as_number(mix(minimum, maximum, relative_x / rect.width())));
-        user_interaction_did_change_input_value();
-    };
+        MUST(self.set_value_as_number(mix(minimum, maximum, relative_x / rect.width())));
+        self.user_interaction_did_change_input_value();
+    });
 
     auto mousedown_callback_function = JS::NativeFunction::create(
-        HTML::relevant_realm(*this), [this, update_slider_by_mouse](JS::VM& vm) {
-            update_slider_by_mouse(vm);
+        HTML::relevant_realm(*this), GC::create_function<JS::ThrowCompletionOr<JS::Value>(JS::VM&)>(GC::Heap::the(), GC::captures(*this, update_slider_by_mouse), [](HTMLInputElement& self, auto& update_slider_by_mouse, JS::VM& vm) {
+            update_slider_by_mouse->function()(vm);
 
             auto mousemove_callback_function = JS::NativeFunction::create(
-                HTML::relevant_realm(*this), [update_slider_by_mouse](JS::VM& vm) {
-                    update_slider_by_mouse(vm);
+                HTML::relevant_realm(self), GC::create_function<JS::ThrowCompletionOr<JS::Value>(JS::VM&)>(GC::Heap::the(), GC::captures(update_slider_by_mouse), [](auto& update_slider_by_mouse, JS::VM& vm) {
+                    update_slider_by_mouse->function()(vm);
                     return JS::js_undefined();
-                },
-                0, Utf16FlyString {}, &HTML::relevant_realm(*this));
-            auto mousemove_callback = GC::Heap::the().allocate<WebIDL::CallbackType>(*mousemove_callback_function, HTML::relevant_realm(*this));
+                }),
+                0, Utf16FlyString {}, &HTML::relevant_realm(self));
+            auto mousemove_callback = GC::Heap::the().allocate<WebIDL::CallbackType>(*mousemove_callback_function, HTML::relevant_realm(self));
             auto mousemove_listener = DOM::IDLEventListener::create(mousemove_callback);
-            auto& window = relevant_window(*this);
+            auto& window = relevant_window(self);
             window.add_event_listener_without_options(UIEvents::EventNames::mousemove, mousemove_listener);
 
             auto mouseup_callback_function = JS::NativeFunction::create(
-                HTML::relevant_realm(*this), [this, mousemove_listener](JS::VM&) {
-                    auto& window = relevant_window(*this);
+                HTML::relevant_realm(self), GC::create_function<JS::ThrowCompletionOr<JS::Value>(JS::VM&)>(GC::Heap::the(), GC::captures(self, mousemove_listener), [](HTMLInputElement& self, auto& mousemove_listener, JS::VM&) {
+                    auto& window = relevant_window(self);
                     window.remove_event_listener_without_options(UIEvents::EventNames::mousemove, mousemove_listener);
                     return JS::js_undefined();
-                },
-                0, Utf16FlyString {}, &HTML::relevant_realm(*this));
-            auto mouseup_callback = GC::Heap::the().allocate<WebIDL::CallbackType>(*mouseup_callback_function, HTML::relevant_realm(*this));
+                }),
+                0, Utf16FlyString {}, &HTML::relevant_realm(self));
+            auto mouseup_callback = GC::Heap::the().allocate<WebIDL::CallbackType>(*mouseup_callback_function, HTML::relevant_realm(self));
             DOM::EventTarget::AddEventListenerOptions mouseup_listener_options;
             mouseup_listener_options.once = true;
             window.add_event_listener(UIEvents::EventNames::mouseup, DOM::IDLEventListener::create(mouseup_callback), mouseup_listener_options);
 
             return JS::js_undefined();
-        },
+        }),
         0, Utf16FlyString {}, &HTML::relevant_realm(*this));
     auto mousedown_callback = GC::Heap::the().allocate<WebIDL::CallbackType>(*mousedown_callback_function, HTML::relevant_realm(*this));
     add_event_listener_without_options(UIEvents::EventNames::mousedown, DOM::IDLEventListener::create(mousedown_callback));
@@ -1950,6 +1948,8 @@ void HTMLInputElement::type_attribute_changed(TypeAttributeState old_state, Type
 
     // 4. Update the element's rendering and behavior to the new state's.
     m_type = new_state;
+    // NB: Which box the element gets depends on its state.
+    set_needs_layout_tree_update(true, DOM::SetNeedsLayoutTreeUpdateReason::HTMLInputElementTypeAttribute);
     // Only the Image Button state maps align, border, width, height, hspace and vspace to hints,
     // so entering or leaving it changes the element's hints without any attribute changing.
     if ((old_state == TypeAttributeState::ImageButton) != (new_state == TypeAttributeState::ImageButton))
@@ -1962,6 +1962,7 @@ void HTMLInputElement::type_attribute_changed(TypeAttributeState old_state, Type
         CSS::Invalidation::invalidate_style_after_default_state_change(*this, was_default);
     }
     CSS::Invalidation::invalidate_style_after_read_write_state_change(*this, was_read_write);
+    CSS::Invalidation::invalidate_style_after_focused_element_keyboard_input_change(document());
     clear_element_reference_pseudo_elements();
     auto should_materialize_shadow_tree = shadow_root() || has_style();
     set_shadow_root(nullptr);
@@ -2059,39 +2060,39 @@ WebIDL::ExceptionOr<void> HTMLInputElement::handle_src_attribute(Utf16View value
     m_resource_request = SharedResourceRequest::get_or_create(document(), *request);
     CSS::record_element_replaced_content_input(*this);
     m_resource_request->add_callbacks(
-        [this]() {
-            CSS::record_element_replaced_content_input(*this);
+        GC::create_function(GC::Heap::the(), GC::captures(*this), [](auto& self) {
+            CSS::record_element_replaced_content_input(self);
             // 1. If the download was successful and the image is available, queue an element task on the user interaction
             //    task source given the input element to fire an event named load at the input element.
-            queue_an_element_task(HTML::Task::Source::UserInteraction, [this]() {
-                dispatch_event(DOM::Event::create(HTML::EventNames::load,
-                    HighResolutionTime::current_high_resolution_time(HTML::relevant_global_object(*this))));
-            });
+            self.queue_an_element_task(HTML::Task::Source::UserInteraction, GC::create_function(GC::Heap::the(), GC::captures(self), [](auto& self) {
+                self.dispatch_event(DOM::Event::create(HTML::EventNames::load,
+                    HighResolutionTime::current_high_resolution_time(HTML::relevant_global_object(self))));
+            }));
 
-            m_load_event_delayer.clear();
-            update_image_button_alt_text_shadow_tree();
-            set_needs_layout_tree_update(true, DOM::SetNeedsLayoutTreeUpdateReason::HTMLInputElementSrcAttribute);
-        },
-        [this]() {
+            self.m_load_event_delayer.clear();
+            self.update_image_button_alt_text_shadow_tree();
+            self.set_needs_layout_tree_update(true, DOM::SetNeedsLayoutTreeUpdateReason::HTMLInputElementSrcAttribute);
+        }),
+        GC::create_function(GC::Heap::the(), GC::captures(*this), [](auto& self) {
             // 2. Otherwise, if the fetching process fails without a response from the remote server, or completes but the
             //    image is not a valid or supported image, then queue an element task on the user interaction task source
             //    given the input element to fire an event named error on the input element.
-            queue_an_element_task(HTML::Task::Source::UserInteraction, [this]() {
-                dispatch_event(DOM::Event::create(HTML::EventNames::error,
-                    HighResolutionTime::current_high_resolution_time(HTML::relevant_global_object(*this))));
-            });
+            self.queue_an_element_task(HTML::Task::Source::UserInteraction, GC::create_function(GC::Heap::the(), GC::captures(self), [](auto& self) {
+                self.dispatch_event(DOM::Event::create(HTML::EventNames::error,
+                    HighResolutionTime::current_high_resolution_time(HTML::relevant_global_object(self))));
+            }));
 
-            m_load_event_delayer.clear();
-            CSS::record_element_replaced_content_input(*this);
+            self.m_load_event_delayer.clear();
+            CSS::record_element_replaced_content_input(self);
 
             // NB: The element may have been rendering as blank space while the load was pending;
             //     now that the load failed it renders its alt text instead.
-            update_image_button_alt_text_shadow_tree();
-            set_needs_layout_tree_update(true, DOM::SetNeedsLayoutTreeUpdateReason::HTMLInputElementSrcAttribute);
-        },
-        [this]() {
-            m_load_event_delayer.clear();
-        });
+            self.update_image_button_alt_text_shadow_tree();
+            self.set_needs_layout_tree_update(true, DOM::SetNeedsLayoutTreeUpdateReason::HTMLInputElementSrcAttribute);
+        }),
+        GC::create_function(GC::Heap::the(), GC::captures(*this), [](auto& self) {
+            self.m_load_event_delayer.clear();
+        }));
 
     if (m_resource_request->needs_fetching()) {
         m_resource_request->fetch_resource(request);
@@ -3196,7 +3197,7 @@ Utf16String HTMLInputElement::convert_number_to_string(double input) const
 }
 
 // https://html.spec.whatwg.org/multipage/input.html#concept-input-value-string-date
-WebIDL::ExceptionOr<Optional<double>> HTMLInputElement::convert_string_to_date(StringView input) const
+WebIDL::ExceptionOr<Optional<double>> HTMLInputElement::convert_string_to_date(Utf16View input) const
 {
     // https://html.spec.whatwg.org/multipage/input.html#date-state-(type=date):concept-input-value-string-date
     if (type_state() == TypeAttributeState::Date) {
@@ -3252,7 +3253,7 @@ WebIDL::ExceptionOr<Optional<double>> HTMLInputElement::convert_string_to_date(U
     // FIXME: Implement a UTF-16 GenericLexer.
     if (!input.has_ascii_storage())
         return Optional<double> {};
-    return convert_string_to_date(input.ascii_view());
+    return convert_string_to_date(input.utf16_view());
 }
 
 // https://html.spec.whatwg.org/multipage/input.html#concept-input-value-date-string

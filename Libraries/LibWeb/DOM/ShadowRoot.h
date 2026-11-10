@@ -149,7 +149,6 @@ private:
     ShadowRoot(Document&, Element& host, ShadowRootMode);
 
     // ^Node
-    virtual Utf16FlyString node_name() const override { return "#shadow-root"_utf16_fly_string; }
     virtual bool is_shadow_root() const final { return true; }
     virtual void adopted_from(Document&) override;
 
@@ -182,11 +181,12 @@ private:
     OwnPtr<SlotRegistry> m_slot_registry;
     Vector<GC::Ref<HTML::HTMLSlotElement>> m_slots_needing_assignment;
 
-    GC::Ptr<CSS::StyleSheetList> m_style_sheets;
-    mutable GC::Ptr<WebIDL::ObservableArray> m_adopted_style_sheets;
+    GC::Member<CSS::StyleSheetList> m_style_sheets;
+    mutable GC::Member<WebIDL::ObservableArray> m_adopted_style_sheets;
 
     IntrusiveListNode<ShadowRoot> m_list_node;
     IntrusiveListNode<ShadowRoot> m_slot_assignment_list_node;
+    IntrusiveListNode<ShadowRoot> m_counter_style_settle_list_node;
 
     CSS::StyleScope m_style_scope;
 
@@ -194,16 +194,17 @@ private:
     mutable Optional<u64> m_dom_tree_version_when_calculated_part_element_map;
 
     // https://dom.spec.whatwg.org/#shadowroot-custom-element-registry
-    GC::Ptr<HTML::CustomElementRegistry> m_custom_element_registry;
+    GC::Member<HTML::CustomElementRegistry> m_custom_element_registry;
 
     // https://dom.spec.whatwg.org/#shadowroot-keep-custom-element-registry-null
     bool m_keep_custom_element_registry_null { false };
 
-    GC::Ptr<HTML::RadioButtonGroupRegistry> m_radio_button_group_registry;
+    GC::Member<HTML::RadioButtonGroupRegistry> m_radio_button_group_registry;
 
 public:
     using DocumentShadowRootList = IntrusiveList<&ShadowRoot::m_list_node>;
     using DocumentSlotAssignmentList = IntrusiveList<&ShadowRoot::m_slot_assignment_list_node>;
+    using DocumentCounterStyleSettleList = IntrusiveList<&ShadowRoot::m_counter_style_settle_list_node>;
 };
 
 template<>

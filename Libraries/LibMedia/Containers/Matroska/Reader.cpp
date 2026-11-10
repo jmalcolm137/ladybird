@@ -23,6 +23,7 @@
 #include <LibMediaCodecs/Codecs/AV1.h>
 #include <LibMediaCodecs/Codecs/H264.h>
 #include <LibMediaCodecs/Codecs/H265.h>
+#include <LibMediaCodecs/Limits.h>
 
 #include "Reader.h"
 
@@ -546,7 +547,10 @@ DecoderErrorOr<NonnullRefPtr<TrackEntry>> Reader::parse_track_entry(Streamer& st
             dbgln_if(MATROSKA_TRACE_DEBUG, "Read Track's CodecID attribute: {}", track_entry->codec_id());
             break;
         case TRACK_CODEC_PRIVATE_ID: {
-            auto codec_private_data = TRY(streamer.read_raw_octets(TRY(streamer.read_variable_size_integer())));
+            auto codec_private_size = TRY(streamer.read_variable_size_integer());
+            if (codec_private_size > MAX_CODEC_CONFIGURATION_SIZE)
+                return DecoderError::corrupted("Track's CodecPrivate element is too large"sv);
+            auto codec_private_data = TRY(streamer.read_raw_octets(codec_private_size));
             track_entry->set_codec_private_data(move(codec_private_data));
             dbgln_if(MATROSKA_TRACE_DEBUG, "Read Track's CodecPrivateData element");
             break;
@@ -1383,9 +1387,14 @@ Vector<BufferedRangesScan> Reader::buffered_time_ranges_by_track(NonnullRefPtr<M
             auto& iterator = cached_range.iterator;
 
             while (iterator->position() < byte_range.end) {
+                auto iterator_before_block = iterator.value();
                 auto block_or_error = iterator->next_block();
                 if (block_or_error.is_error())
                     break;
+                if (iterator->position() > byte_range.end) {
+                    iterator = move(iterator_before_block);
+                    break;
+                }
                 auto block = block_or_error.release_value();
                 if (block.timestamp().has_value()) {
                     auto block_end = block.timestamp().value() + block.duration().value_or(AK::Duration::zero());

@@ -13,6 +13,7 @@
 #include <LibGfx/ColorSpace.h>
 #include <LibGfx/DecodedImageFrame.h>
 #include <LibGfx/InterpolationColorSpace.h>
+#include <LibGfx/PathData.h>
 #include <LibGfx/RustFFI.h>
 #include <core/SkBitmap.h>
 #include <core/SkBlender.h>
@@ -38,9 +39,19 @@ static_assert(to_underlying(PathVerb::Close) == to_underlying(SkPathVerb::kClose
 static_assert(sizeof(PathVerb) == sizeof(SkPathVerb));
 static_assert(sizeof(FloatPoint) == sizeof(SkPoint));
 
-SkPath to_skia_path(Path const& path)
+SkMatrix to_skia_matrix(AffineTransform const& affine_transform)
 {
-    return to_skia_path(path.data());
+    SkScalar affine[6];
+    affine[0] = affine_transform.a();
+    affine[1] = affine_transform.b();
+    affine[2] = affine_transform.c();
+    affine[3] = affine_transform.d();
+    affine[4] = affine_transform.e();
+    affine[5] = affine_transform.f();
+
+    SkMatrix matrix;
+    matrix.setAffine(affine);
+    return matrix;
 }
 
 SkPath to_skia_path(PathData const& data)
@@ -52,16 +63,26 @@ SkPath to_skia_path(PathData const& data)
         to_skia_path_fill_type(data.winding_rule));
 }
 
+SkPath skia_path_from_serialized_bytes(ReadonlyBytes serialized_path)
+{
+    SkPath path;
+    with_contours_of_serialized_path(serialized_path, [&](PathData const& data) {
+        path = to_skia_path(data);
+    });
+    return path;
+}
+
 namespace {
 
 // Reads a serialized filter graph node by node and builds the SkImageFilter tree as it goes. The
 // layout is defined by the filter module of libgfx_rust, whose codec is the other reader of it.
 class SkiaFilterReader {
 public:
-    SkiaFilterReader(ReadonlyBytes bytes, Function<DecodedImageFrame const&(u64)> const& image_frame)
+    SkiaFilterReader(ReadonlyBytes bytes, Function<DecodedImageFrame const&(u64)> const& image_frame, Optional<FloatRect> blur_edge)
         : m_bytes(bytes)
         , m_stream(bytes)
         , m_image_frame(image_frame)
+        , m_blur_edge(blur_edge)
     {
     }
 
@@ -123,6 +144,7 @@ private:
     ReadonlyBytes m_bytes;
     FixedMemoryStream m_stream;
     Function<DecodedImageFrame const&(u64)> const& m_image_frame;
+    Optional<FloatRect> m_blur_edge;
 };
 
 sk_sp<SkImageFilter> SkiaFilterReader::filter()
@@ -200,7 +222,10 @@ sk_sp<SkImageFilter> SkiaFilterReader::filter()
     case FilterOperationType::Blur: {
         auto radius_x = value<float>();
         auto radius_y = value<float>();
+        auto mirrors_at_backdrop_edge = value<bool>();
         auto input = optional_filter();
+        if (mirrors_at_backdrop_edge && m_blur_edge.has_value())
+            input = SkImageFilters::Crop(to_skia_rect(*m_blur_edge), SkTileMode::kMirror, move(input));
         return SkImageFilters::Blur(radius_x, radius_y, input);
     }
     case FilterOperationType::ColorFilter: {
@@ -327,8 +352,8 @@ sk_sp<SkImageFilter> SkiaFilterReader::filter()
         auto angle_degrees = value<float>();
         auto input = optional_filter();
         float radians = AK::to_radians(angle_degrees);
-        auto cosA = cos(radians);
-        auto sinA = sin(radians);
+        auto cosA = AK::cos(radians);
+        auto sinA = AK::sin(radians);
 
         auto a00 = 0.213f + cosA * 0.787f - sinA * 0.213f;
         auto a01 = 0.715f - cosA * 0.715f - sinA * 0.715f;
@@ -424,9 +449,9 @@ sk_sp<SkImageFilter> SkiaFilterReader::filter()
 
 }
 
-sk_sp<SkImageFilter> to_skia_image_filter(ReadonlyBytes serialized_filter, Function<DecodedImageFrame const&(u64)> const& image_frame)
+sk_sp<SkImageFilter> to_skia_image_filter(ReadonlyBytes serialized_filter, Function<DecodedImageFrame const&(u64)> const& image_frame, Optional<FloatRect> blur_edge)
 {
-    return SkiaFilterReader { serialized_filter, image_frame }.read_graph();
+    return SkiaFilterReader { serialized_filter, image_frame, blur_edge }.read_graph();
 }
 
 sk_sp<SkImage> sk_image_from_bitmap(Bitmap const& bitmap, ColorSpace const& color_space)

@@ -172,6 +172,52 @@ test("using 'arguments' via indirect eval throws at runtime instead of parse tim
     }).toThrowWithMessage(ReferenceError, "'arguments' is not defined");
 });
 
+test("anonymous function initializer is named by a literal key", () => {
+    class A {
+        static 0x10 = function () {};
+        static 0x20n = function () {};
+        static "a string" = () => {};
+    }
+
+    expect(A[16].name).toBe("16");
+    expect(A[32].name).toBe("32");
+    expect(A["a string"].name).toBe("a string");
+});
+
+test("anonymous function initializer is named by a computed key", () => {
+    const key = "named";
+    const symbol = Symbol("description");
+    class A {
+        static [key] = function () {};
+        static [`${key}Class`] = class {
+            static seenName = this.name;
+        };
+        static [symbol] = () => {};
+        [key] = () => {};
+        static [(0, "notAnonymous")] = (0, function () {});
+    }
+
+    expect(A.named.name).toBe("named");
+    expect(A.namedClass.name).toBe("namedClass");
+    expect(A.namedClass.seenName).toBe("namedClass");
+    expect(A[symbol].name).toBe("[description]");
+    expect(new A().named.name).toBe("named");
+    expect(A.notAnonymous.name).toBe("");
+});
+
+test("each evaluation of a class names initializers by its own computed keys", () => {
+    function makeClass(key) {
+        return class {
+            [key] = function () {};
+        };
+    }
+
+    const First = makeClass("first");
+    const Second = makeClass("second");
+    expect(new First().first.name).toBe("first");
+    expect(new Second().second.name).toBe("second");
+});
+
 test("regex field initializer", () => {
     class A {
         pattern = /hello/;

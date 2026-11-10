@@ -5,7 +5,10 @@
  */
 
 #include <AK/Badge.h>
+#include <AK/HashMap.h>
+#include <AK/Mutex.h>
 #include <AK/NeverDestroyed.h>
+#include <AK/Vector.h>
 #include <LibGC/BlockAllocator.h>
 #include <LibGC/CellAllocator.h>
 #include <LibGC/Heap.h>
@@ -13,15 +16,73 @@
 
 namespace GC {
 
-BlockAllocator& CellAllocator::shared_block_allocator()
+struct BlockPoolKey {
+    void const* type { nullptr };
+    size_t cell_size { 0 };
+
+    bool operator==(BlockPoolKey const&) const = default;
+};
+
+}
+
+template<>
+struct AK::Traits<GC::BlockPoolKey> : public DefaultTraits<GC::BlockPoolKey> {
+    static unsigned hash(GC::BlockPoolKey const& key) { return pair_int_hash(ptr_hash(key.type), u64_hash(key.cell_size)); }
+};
+
+namespace GC {
+
+// Descriptors are shared by the heaps of all threads, so they keep no per-heap state. Each has an index instead, which
+// keeps the tables of the heaps dense: the indices of descriptors that went away are used again.
+struct DescriptorIndices {
+    Mutex mutex;
+    size_t next_index { 0 };
+    Vector<size_t> free_indices;
+};
+
+static DescriptorIndices& descriptor_indices()
 {
-    static AK::NeverDestroyed<BlockAllocator> allocator;
-    return *allocator;
+    static AK::NeverDestroyed<DescriptorIndices> indices;
+    return *indices;
+}
+
+CellAllocatorDescriptorBase::CellAllocatorDescriptorBase(CellTypeInfo const& type_info, StringView class_name, void const* foreign_type)
+    : m_type_info(type_info)
+    , m_class_name(class_name)
+    , m_foreign_type(foreign_type)
+{
+    auto& indices = descriptor_indices();
+    MutexLocker locker { indices.mutex };
+    m_index = indices.free_indices.is_empty() ? indices.next_index++ : indices.free_indices.take_last();
+}
+
+void CellAllocatorDescriptorBase::release_index()
+{
+    auto& indices = descriptor_indices();
+    MutexLocker locker { indices.mutex };
+    indices.free_indices.append(m_index);
+}
+
+// A block that was used for a type stays with that type for as long as the process lives, whichever heap had it. So a
+// stale pointer into the region can only ever find a cell of the type it was made for, at the same offsets. Heaps die
+// while the process lives, so this has to hold across heaps: the pools outlive them, and a new heap reuses the blocks.
+//
+// A foreign type names the type for the whole process, while its descriptors come and go with the heaps. A descriptor
+// without one lives as long as the process, as C++ ones do, so its own address does. The cell size tells the size
+// classes of a foreign type apart, whose blocks do not fit each other.
+BlockAllocator& CellAllocatorDescriptorBase::block_allocator() const
+{
+    static AK::NeverDestroyed<Mutex> mutex;
+    static AK::NeverDestroyed<HashMap<BlockPoolKey, NonnullOwnPtr<BlockAllocator>>> pools;
+
+    BlockPoolKey key { m_foreign_type ? m_foreign_type : this, cell_size() };
+    MutexLocker locker { *mutex };
+    return *pools->ensure(key, [] { return make<BlockAllocator>(); });
 }
 
 CellAllocator::CellAllocator(CellAllocatorDescriptorBase& descriptor)
     : m_descriptor(descriptor)
-    , m_block_allocator(shared_block_allocator())
+    , m_block_allocator(descriptor.block_allocator())
 {
     m_local.cell_size = cell_size();
 }
@@ -33,21 +94,14 @@ CellAllocator::~CellAllocator()
     auto reclaim_all = [this](BlockList& blocks) {
         while (auto* block = blocks.take_first()) {
             block->~HeapBlock();
-            m_block_allocator.deallocate_block(block, DeferDecommit::Yes);
+            m_block_allocator.deallocate_block(block, DeferDecommit::No);
         }
     };
     reclaim_all(m_full_blocks);
     reclaim_all(m_usable_blocks);
-}
 
-CellAllocator& CellAllocatorDescriptorBase::for_heap(Heap& heap)
-{
-    if (m_last_heap == &heap) [[likely]]
-        return *m_last_allocator;
-    auto& allocator = heap.cell_allocator_for({}, *this);
-    m_last_heap = &heap;
-    m_last_allocator = &allocator;
-    return allocator;
+    // NB: This heap is gone, and another one may not come along to use the blocks of this type for a long time.
+    m_block_allocator.return_freed_blocks_to_system();
 }
 
 Cell* CellAllocator::allocate_cell_slow(Heap& heap)

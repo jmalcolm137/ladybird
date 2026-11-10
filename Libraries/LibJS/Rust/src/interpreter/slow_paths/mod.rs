@@ -1155,6 +1155,24 @@ impl RuntimeFunctions for Runtime {
         calls::get_super_constructor(vm, pc, values)
     }
 
+    fn get_class_field_initializer_name(
+        vm: &Vm,
+        pc: u32,
+        _instruction: &op::GetClassFieldInitializerName,
+        values: &mut op::GetClassFieldInitializerNameValues,
+    ) -> SlowPathControl {
+        calls::get_class_field_initializer_name(vm, pc, values)
+    }
+
+    fn get_class_proto_parent(
+        vm: &Vm,
+        pc: u32,
+        _instruction: &op::GetClassProtoParent,
+        values: &mut op::GetClassProtoParentValues,
+    ) -> SlowPathControl {
+        calls::get_class_proto_parent(vm, pc, values)
+    }
+
     fn new_class(
         vm: &Vm,
         pc: u32,
@@ -1278,8 +1296,8 @@ impl RuntimeFunctions for Runtime {
         control::debugger_check_breakpoint(vm, pc);
     }
 
-    fn fallback_handler(_vm: &Vm, pc: u32, _instruction: *const u8) -> SlowPathControl {
-        control::fallback_handler(pc)
+    fn fallback_handler(vm: &Vm, pc: u32, _instruction: *const u8) -> SlowPathControl {
+        control::fallback_handler(vm, pc)
     }
 
     fn new_array(
@@ -1464,6 +1482,8 @@ impl RuntimeFunctions for Runtime {
     }
 
     fn throw(vm: &Vm, pc: u32, _instruction: &op::Throw, values: &mut op::ThrowValues) -> SlowPathControl {
+        // A throw statement throws its value anew, even one that was thrown before and never caught by a catch clause.
+        vm.did_throw(values.src, pc);
         handle_asm_exception(vm, pc, values.src)
     }
 

@@ -6,10 +6,19 @@
 
 #pragma once
 
+#include <AK/Types.h>
+
 #include <QColor>
 #include <QPalette>
 
 class QWidget;
+
+namespace WebView {
+
+enum class ColorTheme : u8;
+enum class ThemePreference : u8;
+
+}
 
 namespace Ladybird::Theme {
 
@@ -62,6 +71,13 @@ struct PanelColors {
 bool is_dark();
 bool has_increased_contrast();
 
+// The interface theme decides the appearance, as Qt's color scheme only follows it where the platform theme honors the
+// request.
+void set_interface_theme(WebView::ThemePreference);
+
+// The chrome and panel colors, and the accent, are derived from the color theme's base colors.
+void set_color_theme(WebView::ColorTheme);
+
 ChromeColors const& chrome();
 
 // A private window's chrome is violet-dark in either appearance, so it never looks like a normal window. The chrome
@@ -75,8 +91,8 @@ bool is_dark(QPalette const&);
 bool is_dark(QWidget const&);
 PanelColors const& panel();
 
-// The system's accent color, adjusted so it stays clear on the chrome in light and dark appearances. It is used only
-// for focus rings, selection and load progress.
+// The color theme's accent, or the system's accent color if the theme has none, adjusted so it stays clear on the chrome
+// in light and dark appearances. It is used only for focus rings, selection and load progress.
 QColor accent();
 // A focus ring is a fine line of the focus edge color right outside the focused control, in a wider, fainter halo.
 QColor focus_edge();
@@ -88,7 +104,8 @@ QColor primary();
 // The fill of the selected row of a menu or a list navigated with the keyboard.
 QColor selected_row();
 
-// Ladybird purple, used for the default profile's tile and brand accents.
-QColor brand();
+// The color of Ladybird's logomark on the chrome: Ladybird purple in the neutral theme, and a tinted theme's base color,
+// so the window shows a single hue.
+QColor logomark();
 
 }

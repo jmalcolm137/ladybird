@@ -7,6 +7,7 @@
 #include <AK/Base64.h>
 #include <AK/GenericLexer.h>
 #include <AK/JsonArray.h>
+#include <AK/NeverDestroyed.h>
 #include <AK/Random.h>
 #include <AK/StringBuilder.h>
 #include <AK/Time.h>
@@ -30,13 +31,13 @@ using Response = Fetch::Infrastructure::Response;
 GC_DEFINE_ALLOCATOR(NetworkContinuation);
 
 NetworkContinuation::NetworkContinuation(Callback callback)
-    : m_callback(move(callback))
+    : m_callback(callback)
 {
 }
 
 GC::Ref<NetworkContinuation> NetworkContinuation::create(GC::Heap& heap, Callback callback)
 {
-    return heap.allocate<NetworkContinuation>(move(callback));
+    return heap.allocate<NetworkContinuation>(callback);
 }
 
 void NetworkContinuation::finalize()
@@ -50,17 +51,27 @@ void NetworkContinuation::visit_edges(JS::Cell::Visitor& visitor)
 {
     Base::visit_edges(visitor);
     visitor.visit(controller);
-    visitor.visit_possible_values(m_callback.raw_capture_range());
+    visitor.visit(m_callback);
 }
 
 void NetworkContinuation::invoke(NetworkContinuationAction action, RefPtr<Response> response)
 {
-    m_callback(action, response);
+    (*m_callback)(action, response);
     m_callback = nullptr;
 }
 
-bool g_network_events_enabled { false };
-bool g_network_configuration_enabled { false };
+static thread_local bool g_network_events_enabled { false };
+static thread_local bool g_network_configuration_enabled { false };
+
+bool network_events_enabled()
+{
+    return g_network_events_enabled;
+}
+
+bool network_configuration_enabled()
+{
+    return g_network_configuration_enabled;
+}
 
 void NetworkContinuation::clear_blocked_state()
 {
@@ -75,8 +86,8 @@ void NetworkContinuation::clear_blocked_state()
 
 static HashMap<String, GC::Root<NetworkContinuation>>& blocked_requests()
 {
-    static auto& requests = *new HashMap<String, GC::Root<NetworkContinuation>>;
-    return requests;
+    static thread_local NeverDestroyed<HashMap<String, GC::Root<NetworkContinuation>>> requests;
+    return *requests;
 }
 
 static GC::Ptr<NetworkContinuation> blocked_request(Request const& request)

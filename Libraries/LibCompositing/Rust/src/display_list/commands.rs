@@ -53,11 +53,10 @@ pub enum DisplayListCommandType {
     PaintScrollBar,
     CompositorSnapContainer,
     CompositorSnapArea,
-    CompositorScrollChainingBarrier,
     CompositorNestedContextWheelRegion,
     Canvas2DFillPath,
     Canvas2DStrokePath,
-    Canvas2DDrawGlyphRun,
+    Canvas2DDrawGlyphRuns,
     Canvas2DClearRect,
     Canvas2DDrawImageFrame,
     Canvas2DDrawCanvas,
@@ -95,7 +94,6 @@ impl DisplayListCommandType {
                 | Self::CompositorBlockingWheelEventRegion
                 | Self::CompositorSnapContainer
                 | Self::CompositorSnapArea
-                | Self::CompositorScrollChainingBarrier
                 | Self::CompositorNestedContextWheelRegion
         )
     }
@@ -109,7 +107,7 @@ impl DisplayListCommandType {
             self,
             Self::Canvas2DFillPath
                 | Self::Canvas2DStrokePath
-                | Self::Canvas2DDrawGlyphRun
+                | Self::Canvas2DDrawGlyphRuns
                 | Self::Canvas2DClearRect
                 | Self::Canvas2DDrawImageFrame
                 | Self::Canvas2DDrawCanvas
@@ -163,11 +161,10 @@ impl DisplayListCommandType {
             Self::PaintScrollBar => "PaintScrollBar",
             Self::CompositorSnapContainer => "CompositorSnapContainer",
             Self::CompositorSnapArea => "CompositorSnapArea",
-            Self::CompositorScrollChainingBarrier => "CompositorScrollChainingBarrier",
             Self::CompositorNestedContextWheelRegion => "CompositorNestedContextWheelRegion",
             Self::Canvas2DFillPath => "Canvas2DFillPath",
             Self::Canvas2DStrokePath => "Canvas2DStrokePath",
-            Self::Canvas2DDrawGlyphRun => "Canvas2DDrawGlyphRun",
+            Self::Canvas2DDrawGlyphRuns => "Canvas2DDrawGlyphRuns",
             Self::Canvas2DClearRect => "Canvas2DClearRect",
             Self::Canvas2DDrawImageFrame => "Canvas2DDrawImageFrame",
             Self::Canvas2DDrawCanvas => "Canvas2DDrawCanvas",
@@ -265,6 +262,9 @@ pub struct ReplayLayer {
     pub backdrop_corner_radii: CornerRadii,
     /// The color the backdrop is read over, transparent unless the parent layer is the root isolation layer.
     pub backdrop_base_color: Color,
+    /// Where a blur() in the backdrop filter mirrors: the region as the clips around the box leave it, in the
+    /// effect's space. None when the filter holds no such blur.
+    pub backdrop_blur_edge: OptionalFloatRect,
     pub effect: EffectNodeIndex,
     /// Bounds of everything replay draws into the layer, in the effect's space, when known.
     pub content_bounds: OptionalFloatRect,
@@ -567,11 +567,14 @@ pub struct DisplayListGlyph {
 }
 ffi_bytes_fields!(DisplayListGlyph { position, glyph_id });
 
-impl From<&text_layout::DrawGlyph> for DisplayListGlyph {
-    fn from(glyph: &text_layout::DrawGlyph) -> Self {
+impl From<text_layout::PlacedGlyph> for DisplayListGlyph {
+    fn from(placed: text_layout::PlacedGlyph) -> Self {
         Self {
-            position: FloatPoint { x: glyph.x, y: glyph.y },
-            glyph_id: glyph.glyph_id,
+            position: FloatPoint {
+                x: placed.x,
+                y: placed.y,
+            },
+            glyph_id: u32::from(placed.glyph.glyph_id),
         }
     }
 }
@@ -910,11 +913,15 @@ pub struct DrawCompositedContext {
     pub dst_rect: FloatRect,
     pub child_context_id: CompositorContextId,
     pub scaling_mode: ScalingMode,
+    pub spatial_node_index: SpatialNodeIndex,
+    pub snap_origin_if_untransformed: bool,
 }
 ffi_bytes_fields!(DrawCompositedContext {
     dst_rect,
     child_context_id,
-    scaling_mode
+    scaling_mode,
+    spatial_node_index,
+    snap_origin_if_untransformed
 });
 
 impl DisplayListCommand for DrawCompositedContext {
@@ -1487,7 +1494,6 @@ impl DisplayListCommand for DeclareMaskContent {
 #[derive(Clone, Copy, Debug, PartialEq)]
 #[repr(C)]
 pub struct CompositorScrollNode {
-    pub document_id: UniqueNodeId,
     pub scrollable_node_id: UniqueNodeId,
     pub scroll_node_index: SpatialNodeIndex,
     pub parent_scroll_node_index: SpatialNodeIndex,
@@ -1507,7 +1513,6 @@ pub struct CompositorScrollNode {
     pub shows_overscroll_effect_vertically: bool,
 }
 ffi_bytes_fields!(CompositorScrollNode {
-    document_id,
     scrollable_node_id,
     scroll_node_index,
     parent_scroll_node_index,
@@ -1534,7 +1539,6 @@ impl DisplayListCommand for CompositorScrollNode {
 #[derive(Clone, Copy, Debug, PartialEq)]
 #[repr(C)]
 pub struct CompositorSnapContainer {
-    pub document_id: UniqueNodeId,
     pub scroll_node_index: SpatialNodeIndex,
     pub snapport: FfiCssPixelRect,
     pub min_scroll_offset: FfiCssPixelPoint,
@@ -1545,7 +1549,6 @@ pub struct CompositorSnapContainer {
     pub horizontal_writing_mode: bool,
 }
 ffi_bytes_fields!(CompositorSnapContainer {
-    document_id,
     scroll_node_index,
     snapport,
     min_scroll_offset,
@@ -1565,7 +1568,6 @@ impl DisplayListCommand for CompositorSnapContainer {
 #[derive(Clone, Copy, Debug, PartialEq)]
 #[repr(C)]
 pub struct CompositorSnapArea {
-    pub document_id: UniqueNodeId,
     pub scroll_node_index: SpatialNodeIndex,
     pub area_node_id: UniqueNodeId,
     pub pseudo_element_type: u8,
@@ -1575,7 +1577,6 @@ pub struct CompositorSnapArea {
     pub always_stop: bool,
 }
 ffi_bytes_fields!(CompositorSnapArea {
-    document_id,
     scroll_node_index,
     area_node_id,
     pseudo_element_type,
@@ -1603,12 +1604,10 @@ impl DisplayListCommand for CompositorBlockingWheelEventRegion {
 #[derive(Clone, Copy, Debug, PartialEq)]
 #[repr(C)]
 pub struct CompositorWheelHitTestTarget {
-    pub document_id: UniqueNodeId,
     pub target_scroll_node_index: SpatialNodeIndex,
     pub rect: FloatRect,
 }
 ffi_bytes_fields!(CompositorWheelHitTestTarget {
-    document_id,
     target_scroll_node_index,
     rect
 });
@@ -1620,13 +1619,11 @@ impl DisplayListCommand for CompositorWheelHitTestTarget {
 #[derive(Clone, Copy, Debug, PartialEq)]
 #[repr(C)]
 pub struct CompositorWheelHitTestTargetWithCornerRadii {
-    pub document_id: UniqueNodeId,
     pub target_scroll_node_index: SpatialNodeIndex,
     pub rect: FloatRect,
     pub corner_radii: CornerRadii,
 }
 ffi_bytes_fields!(CompositorWheelHitTestTargetWithCornerRadii {
-    document_id,
     target_scroll_node_index,
     rect,
     corner_radii
@@ -1634,29 +1631,6 @@ ffi_bytes_fields!(CompositorWheelHitTestTargetWithCornerRadii {
 
 impl DisplayListCommand for CompositorWheelHitTestTargetWithCornerRadii {
     const COMMAND_TYPE: DisplayListCommandType = DisplayListCommandType::CompositorWheelHitTestTargetWithCornerRadii;
-}
-
-/// A scroll container that has no scroll node, because a wheel can scroll nothing in it, and that keeps the scrolls
-/// along an axis to itself all the same: a wheel inside `rect` is not passed on to the scroll node above it.
-#[derive(Clone, Copy, Debug, PartialEq)]
-#[repr(C)]
-pub struct CompositorScrollChainingBarrier {
-    pub document_id: UniqueNodeId,
-    pub scroll_node_index_above_barrier: SpatialNodeIndex,
-    pub rect: FloatRect,
-    pub keeps_horizontal_scrolls: bool,
-    pub keeps_vertical_scrolls: bool,
-}
-ffi_bytes_fields!(CompositorScrollChainingBarrier {
-    document_id,
-    scroll_node_index_above_barrier,
-    rect,
-    keeps_horizontal_scrolls,
-    keeps_vertical_scrolls
-});
-
-impl DisplayListCommand for CompositorScrollChainingBarrier {
-    const COMMAND_TYPE: DisplayListCommandType = DisplayListCommandType::CompositorScrollChainingBarrier;
 }
 
 /// Where a nested context is painted: its content box, clipped to the rounded padding edge. The compositor can hand a
@@ -1692,7 +1666,6 @@ impl DisplayListCommand for CompositorMainThreadWheelEventRegion {
 #[derive(Clone, Copy, Debug, PartialEq)]
 #[repr(C)]
 pub struct CompositorScrollbar {
-    pub document_id: UniqueNodeId,
     pub scroll_node_index: SpatialNodeIndex,
     pub gutter_rect: IntRect,
     pub thumb_rect: IntRect,
@@ -1704,12 +1677,12 @@ pub struct CompositorScrollbar {
     pub min_scroll_offset: f32,
     pub max_scroll_offset: f32,
     pub thumb_color: Color,
+    pub thumb_outline_color: Color,
     pub track_color: Color,
     pub vertical: bool,
     pub is_painted_by_compositor: bool,
 }
 ffi_bytes_fields!(CompositorScrollbar {
-    document_id,
     scroll_node_index,
     gutter_rect,
     thumb_rect,
@@ -1721,6 +1694,7 @@ ffi_bytes_fields!(CompositorScrollbar {
     min_scroll_offset,
     max_scroll_offset,
     thumb_color,
+    thumb_outline_color,
     track_color,
     vertical,
     is_painted_by_compositor
@@ -1741,6 +1715,7 @@ pub struct PaintScrollBar {
     pub expanded_gutter_rect: IntRect,
     pub scroll_size: f64,
     pub thumb_color: Color,
+    pub thumb_outline_color: Color,
     pub track_color: Color,
     pub vertical: bool,
 }
@@ -1752,6 +1727,7 @@ ffi_bytes_fields!(PaintScrollBar {
     expanded_gutter_rect,
     scroll_size,
     thumb_color,
+    thumb_outline_color,
     track_color,
     vertical
 });
@@ -1779,7 +1755,6 @@ pub enum Canvas2DPaintKind {
 }
 ffi_enum_bytes!(Canvas2DPaintKind as u8);
 
-// The values of Gfx::CanvasPatternPaintStyle::Repetition.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[repr(u8)]
 pub enum Canvas2DPatternRepetition {
@@ -1912,26 +1887,39 @@ impl DisplayListCommand for Canvas2DStrokePath {
     const COMMAND_TYPE: DisplayListCommandType = DisplayListCommandType::Canvas2DStrokePath;
 }
 
-// The glyphs of one font, positioned relative to the translation, with the top of the line box at the glyph position.
+// A font and how many of the next glyphs of a Canvas2DDrawGlyphRuns it draws.
 #[derive(Clone, Copy, Debug, PartialEq)]
 #[repr(C)]
-pub struct Canvas2DDrawGlyphRun {
+pub struct Canvas2DGlyphRun {
     pub font_id: FontResourceId,
+    pub glyph_count: u64,
+}
+ffi_bytes_fields!(Canvas2DGlyphRun { font_id, glyph_count });
+
+// The glyphs of a text, positioned relative to the translation, with the top of the line box at the glyph position.
+// The text is a single draw, so that its runs of different fonts share one shadow and one composite. The horizontal
+// scale condenses the glyphs and their positions towards the translation.
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[repr(C)]
+pub struct Canvas2DDrawGlyphRuns {
+    pub runs: DisplayListDataSpan,
     pub glyphs: DisplayListDataSpan,
     pub translation: FloatPoint,
+    pub horizontal_scale: f32,
     pub paint: Canvas2DPaint,
     pub compositing: Canvas2DCompositing,
 }
-ffi_bytes_fields!(Canvas2DDrawGlyphRun {
-    font_id,
+ffi_bytes_fields!(Canvas2DDrawGlyphRuns {
+    runs,
     glyphs,
     translation,
+    horizontal_scale,
     paint,
     compositing
 });
 
-impl DisplayListCommand for Canvas2DDrawGlyphRun {
-    const COMMAND_TYPE: DisplayListCommandType = DisplayListCommandType::Canvas2DDrawGlyphRun;
+impl DisplayListCommand for Canvas2DDrawGlyphRuns {
+    const COMMAND_TYPE: DisplayListCommandType = DisplayListCommandType::Canvas2DDrawGlyphRuns;
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]

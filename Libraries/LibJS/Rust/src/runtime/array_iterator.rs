@@ -75,7 +75,8 @@ impl ArrayIterator {
             base: Object::new_with_prototype(
                 vm,
                 Self::CLASS,
-                realm.intrinsics().array_iterator_prototype(),
+                realm,
+                Some(realm.intrinsics().array_iterator_prototype()),
                 MayInterfereWithIndexedPropertyAccess::No,
             ),
             array: Cell::new(array),
@@ -149,8 +150,7 @@ impl ArrayIterator {
         self.index.set(index + 1);
 
         // 12. Let indexNumber be 𝔽(index).
-        // NB: The index is made an i32, which wraps for indices past 2^31 - 1.
-        let index_number = Value::from_i32(index as i32);
+        let index_number = Value::from_f64(index as f64);
 
         // 13. If kind is KEY, then
         let result = if kind == PropertyKind::Key {
@@ -200,7 +200,7 @@ pub fn iterated_array_like_length(vm: &Vm, array: &Object) -> ThrowCompletionOr<
         }
 
         // c. Let len be TypedArrayLength(taRecord).
-        return Ok(u64::from(typed_array_length(&typed_array_record)));
+        return Ok(typed_array_length(&typed_array_record) as u64);
     }
 
     // 9. Else,

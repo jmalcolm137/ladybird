@@ -5,9 +5,10 @@
  */
 
 #include <AK/HashMap.h>
+#include <LibWebCommon/HTML/SandboxingFlagSet.h>
 #include <LibWebView/Application.h>
+#include <LibWebView/CanonicalDocument.h>
 #include <LibWebView/CanonicalTraversable.h>
-#include <LibWebView/FaviconStore.h>
 #include <LibWebView/ProcessManager.h>
 #include <LibWebView/ProcessSnapshot.h>
 #include <LibWebView/ViewImplementation.h>
@@ -25,7 +26,7 @@ Vector<ProcessSnapshot> process_snapshots(ProcessManager& manager)
     };
     HashMap<u64, ProcessPage> process_pages;
     HashMap<u64, Vector<ProcessTabSnapshot>> process_tabs;
-    HashMap<u64, size_t> process_frame_counts;
+    HashMap<u64, Vector<ProcessFrameSnapshot>> process_frames;
     // NB: The Application is only asked once there is a view, so that a ProcessManager without one can be described.
     bool did_look_up_active_view = false;
     Optional<ViewImplementation&> active_view;
@@ -57,15 +58,18 @@ Vector<ProcessSnapshot> process_snapshots(ProcessManager& manager)
                 .view_id = view.view_id(),
                 .url = view.url(),
                 .kind = ProcessPageKind::TopLevel,
-                .favicon_hash = view.favicon_hash(),
             },
         });
         view.traversable().for_each_in_subtree([&](auto const& navigable) {
             if (navigable.has_remote_host() && navigable.replicated_state().has_value()) {
                 auto child_id = navigable.remote_host().client().child_id();
                 add_page(child_id, navigable.replicated_state()->active_document_url, ProcessPageKind::Frame);
-                if (child_id != top_level_child_id)
-                    ++process_frame_counts.ensure(child_id);
+                if (child_id != top_level_child_id) {
+                    process_frames.ensure(child_id).append({
+                        .url = navigable.replicated_state()->active_document_url,
+                        .is_sandboxed = has_flag(navigable.active_document().active_sandboxing_flag_set(), Web::HTML::SandboxingFlagSet::SandboxedOrigin),
+                    });
+                }
             }
             return IterationDecision::Continue;
         });
@@ -86,7 +90,7 @@ Vector<ProcessSnapshot> process_snapshots(ProcessManager& manager)
             .memory_usage_bytes = statistics.memory_usage_bytes,
             .page = {},
             .tabs = process_tabs.get(process.child_id()).value_or({}),
-            .frame_count = process_frame_counts.get(process.child_id()).value_or(0),
+            .frames = process_frames.get(process.child_id()).value_or({}),
         };
         if (auto page = process_pages.get(process.child_id()); page.has_value()) {
             snapshot.site_url = page->url;
@@ -94,8 +98,6 @@ Vector<ProcessSnapshot> process_snapshots(ProcessManager& manager)
                 .view_id = page->view->view_id(),
                 .url = page->url,
                 .kind = page->kind,
-                // NB: The view's favicon is its top-level page's, which an embedded frame of another site does not share.
-                .favicon_hash = page->kind == ProcessPageKind::TopLevel ? page->view->favicon_hash() : Optional<String> {},
             };
         }
         snapshots.append(move(snapshot));
@@ -103,14 +105,10 @@ Vector<ProcessSnapshot> process_snapshots(ProcessManager& manager)
     return snapshots;
 }
 
-Optional<ByteBuffer> favicon_png_for_page(ProcessPageSnapshot const& page)
+bool end_process(ProcessManager& process_manager, u64 child_id)
 {
-    if (!page.favicon_hash.has_value())
-        return {};
-    auto view = ViewImplementation::find_view_by_id(page.view_id);
-    if (!view.has_value())
-        return {};
-    return view->session().favicon_store->favicon_png(*page.favicon_hash);
+    auto result = process_manager.terminate_child(child_id, Core::Process::TerminationMode::Forceful);
+    return !result.is_error() || (result.error().is_errno() && result.error().code() == ESRCH);
 }
 
 }

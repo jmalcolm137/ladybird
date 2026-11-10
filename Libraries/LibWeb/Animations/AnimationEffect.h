@@ -10,14 +10,14 @@
 #include <AK/Optional.h>
 #include <AK/Utf16String.h>
 #include <AK/Variant.h>
-#include <LibGC/ConservativeHashMap.h>
+#include <LibGC/RootHashMap.h>
 #include <LibGC/RootVector.h>
 #include <LibWeb/Animations/TimeValue.h>
 #include <LibWeb/Bindings/AnimationEffect.h>
 #include <LibWeb/Bindings/Wrappable.h>
 #include <LibWeb/CSS/EasingFunction.h>
+#include <LibWeb/CSS/InstalledStyle.h>
 #include <LibWeb/CSS/PropertyNameAndID.h>
-#include <LibWeb/CSS/StyleRecordID.h>
 
 namespace Web::Animations {
 
@@ -41,19 +41,17 @@ Bindings::OptionalEffectTiming to_optional_effect_timing(Bindings::EffectTiming 
 struct AnimationUpdateContext {
     struct ElementData {
         ElementData();
-        ElementData(CSS::StyleRecordID, RefPtr<CSS::ComputedStyleWorkingSet>);
+        ElementData(CSS::InstalledStyle, RefPtr<CSS::ComputedStyleWorkingSet>);
         ElementData(ElementData&&);
         ElementData& operator=(ElementData&&);
         ~ElementData();
 
-        CSS::StyleRecordID style_record_before_update;
+        CSS::InstalledStyle style_before_update;
         RefPtr<CSS::ComputedStyleWorkingSet> target_style;
         GC::RootVector<GC::Ref<KeyframeEffect>> effects;
         // Whether the record the update samples over was computed by this style update, so that the base
         // adjustments the sampled values feed into were made over the values the element holds now.
         bool base_is_current { false };
-        // NB: The enclosing style reaction propagates inherited changes after its final composition is installed.
-        bool inherited_style_update_owned_by_reaction { false };
     };
 
     AnimationUpdateContext();
@@ -65,7 +63,7 @@ struct AnimationUpdateContext {
     void publish();
 
     // NOTE: This is lazily populated by KeyframeEffects as their respective animations are applied to an element.
-    GC::ConservativeHashMap<DOM::AbstractElement, ElementData> elements;
+    GC::RootHashMap<DOM::AbstractElement, ElementData> elements;
 };
 
 // https://www.w3.org/TR/web-animations-1/#the-animationeffect-interface

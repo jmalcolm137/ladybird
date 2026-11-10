@@ -21,16 +21,15 @@ use crate::runtime::realm::Realm;
 
 #[cfg(unix)]
 use {
-    crate::contrib::test262::agents::{self, AgentFailure, AgentRole, BroadcastNumber},
+    crate::contrib::test262::agents::{self, AgentFailure, AgentRole, Broadcast, BroadcastNumber},
     crate::runtime::abstract_operations::call,
     crate::runtime::array_buffer::{ArrayBuffer, DataBlockStorage},
     crate::runtime::big_int::{BigInt, SignedBigInteger},
     crate::runtime::error::ErrorKind,
-    crate::runtime::error_types::ErrorType,
     crate::runtime::primitive_string::PrimitiveString,
     crate::utf16::{Utf16View, utf16_from_wtf8},
     ak::Utf16String,
-    std::os::fd::AsFd,
+    std::sync::Arc,
 };
 
 #[repr(C)]
@@ -67,7 +66,6 @@ impl AgentObject {
         define("monotonicNow", raw_native!(AgentObject::monotonic_now), 0);
         define("sleep", raw_native!(AgentObject::sleep), 1);
 
-        // Agents run in processes of their own, which only Unix hosts set up.
         #[cfg(unix)]
         match agents::role() {
             AgentRole::Test => {
@@ -135,26 +133,17 @@ impl AgentObject {
             BroadcastNumber::Number(number.to_number(vm)?.as_f64())
         };
 
-        let shared_memory = shared_array_buffer.with_data_block(|block| match &block.byte_buffer {
-            DataBlockStorage::Shared(store) => store
-                .shared_memory()
-                .try_clone_to_owned()
-                .ok()
-                .map(|shared_memory| (shared_memory, store.object_id())),
+        let store = shared_array_buffer.with_data_block(|block| match &block.byte_buffer {
+            DataBlockStorage::Shared(store) => Some(Arc::clone(store)),
             _ => None,
         });
-        let Some((shared_memory, object_id)) = shared_memory else {
+        let Some(store) = store else {
             return vm.throw_completion_with_message(
                 ErrorKind::TypeError,
-                "Agents cannot map a SharedArrayBuffer that is not in shared memory".to_string(),
+                "Agents cannot share a SharedArrayBuffer that is not in a shared store".to_string(),
             );
         };
-        agents::broadcast(
-            shared_memory.as_fd(),
-            shared_array_buffer.byte_length(),
-            object_id,
-            &number,
-        );
+        agents::broadcast(&Broadcast { store, number });
         Ok(Value::UNDEFINED)
     }
 
@@ -175,7 +164,6 @@ impl AgentObject {
             Err(AgentFailure::UncaughtException { name, message }) => {
                 vm.throw_completion_with_message(ErrorKind::Error, format!("An agent threw {name}: {message}"))
             }
-            Err(AgentFailure::Panic(message) | AgentFailure::Exited(message)) => panic!("{message}"),
         }
     }
 
@@ -188,23 +176,13 @@ impl AgentObject {
             );
         }
 
-        let broadcast = agents::receive_broadcast();
+        let Some(broadcast) = agents::receive_broadcast() else {
+            return vm.throw_interrupt();
+        };
         let realm = vm
             .current_realm()
             .expect("$262.agent.receiveBroadcast() runs in a realm");
-        let Ok(shared_array_buffer) = ArrayBuffer::create_from_shared_memory(
-            vm,
-            realm,
-            broadcast.shared_memory.as_fd(),
-            broadcast.byte_length,
-            broadcast.object_id,
-        ) else {
-            return vm.throw_completion(
-                ErrorKind::RangeError,
-                ErrorType::NotEnoughMemoryToAllocate,
-                &[&broadcast.byte_length],
-            );
-        };
+        let shared_array_buffer = ArrayBuffer::create_from_shared_store(vm, realm, broadcast.store);
         let number = match broadcast.number {
             BroadcastNumber::Undefined => Value::UNDEFINED,
             BroadcastNumber::Number(number) => Value::from_f64(number),

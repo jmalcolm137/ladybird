@@ -26,6 +26,20 @@ use crate::code::ExitKind;
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct CellId(pub u64);
 
+/// How far a cell's address is shifted right to compress it: cells store
+/// pointers to other cells as the low 32 bits of the shifted address (their
+/// offset into the 32 GiB heap region, which is aligned to its size, in units
+/// of the 8-byte cell alignment), and 0 for null.
+pub const COMPRESSED_POINTER_SHIFT: u8 = 3;
+
+impl CellId {
+    /// The cell's compressed pointer, which a field that holds the cell
+    /// compares equal to without decoding.
+    pub fn compressed(self) -> u32 {
+        (self.0 >> COMPRESSED_POINTER_SHIFT) as u32
+    }
+}
+
 /// One bytecode executable: the function being compiled (index 0) or an
 /// inlining candidate.
 ///
@@ -407,7 +421,8 @@ pub struct CallFeedbackSnapshot {
     pub inline_executable: Option<u32>,
     /// `target`, if JIT code can call it directly.
     pub direct_call: Option<DirectCallTarget>,
-    /// `target`, if it is a raw native function JIT code can call directly.
+    /// `target`, if it is a raw native function. JIT code can call it directly if it has an `entry`, and can replace
+    /// a call of it with an intrinsic either way.
     pub native_call: Option<NativeCallTarget>,
     /// How `target` forwarded the calls of this site, if it always forwarded
     /// them the same way to the same function.
@@ -533,7 +548,7 @@ pub struct LexicalEnvironmentTemplateSnapshot {
     pub shape: Option<CellId>,
 }
 
-/// A `FunctionEnvironment` like the ones calls of a function get (see
+/// A `FunctionEnvironment` or `DeclarativeEnvironment` like the ones calls of a function get (see
 /// `ECMAScriptFunctionObject::inline_call_environment()`), with its final
 /// shape and room for its binding values in the cell, as JIT code allocates
 /// it: from the local free list at `allocator` (like
@@ -564,23 +579,21 @@ pub struct EnvironmentTemplateSnapshot {
 /// what they point to lives as long as the function.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct FunctionFrameFields {
-    pub script_or_module: [u64; 2],
+    pub script_or_module: u64,
     pub environment: u64,
     pub private_environment: u64,
 }
 
 impl FunctionFrameFields {
-    /// Whether the functions have the same `[[ScriptOrModule]]`: the tag in
-    /// the low byte of the first word (whose other bytes are padding) and
-    /// the record in the second.
+    /// Whether the functions have the same `[[ScriptOrModule]]`.
     pub fn has_script_or_module_of(&self, other: &FunctionFrameFields) -> bool {
-        self.script_or_module[0] as u8 == other.script_or_module[0] as u8
-            && self.script_or_module[1] == other.script_or_module[1]
+        self.script_or_module == other.script_or_module
     }
 }
 
-/// A raw native function that JIT code calls directly, in the lightweight
+/// A native function that JIT code calls directly, in the lightweight
 /// frame the interpreter's call fast path builds for raw native functions.
+/// Capturing native functions use an entry that reads the function from that frame.
 /// The compiled code must list `function` and `realm` in
 /// `CompiledCode::embedded_cells`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -588,8 +601,10 @@ pub struct NativeCallTarget {
     pub function: CellId,
     /// The function's realm, the frame's realm.
     pub realm: CellId,
-    /// `ThrowCompletionOr<Value> (*)(VM&)`: the native function.
-    pub entry: u64,
+    /// `ThrowCompletionOr<Value> (*)(VM&)`: the native function, or None
+    /// where native functions do not return their completion in two
+    /// registers, and JIT code leaves calls of them to the runtime.
+    pub entry: Option<core::num::NonZeroU64>,
     /// Where the function, a getter of a platform object attribute backed by
     /// a field, finds the wrapper it would return, if it is one and the
     /// interpreter validated the cache entry for it (see
@@ -601,11 +616,14 @@ pub struct NativeCallTarget {
 /// wrapper, the field of the implementation the attribute returns, the weak
 /// reference of an implementation to its main world wrapper, and the cell of
 /// that weak reference. The getter returns the main world wrapper of the
-/// field's implementation, or null for a null field.
+/// field's implementation, or null for a null field. The field holds a
+/// compressed cell pointer if `implementation_value_is_compressed`, and a
+/// full one otherwise.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DirectGetterFields {
     pub wrapper_implementation: u32,
     pub implementation_value: u32,
+    pub implementation_value_is_compressed: bool,
     pub main_world_wrapper: u32,
     pub weak_impl_value: u32,
 }
@@ -1214,6 +1232,7 @@ pub struct DynamicCallLayout {
     pub call_environment_template_cell_size: u32,
     pub call_environment_template_binding_values_offset: u32,
     pub call_environment_template_binds_this: u32,
+    pub call_environment_template_has_function_fields: u32,
     pub call_environment_template_words: u32,
     /// The address of a table of the addresses of the local free lists of
     /// the function environment size classes, which the stub pops the cell
@@ -1223,6 +1242,8 @@ pub struct DynamicCallLayout {
     pub function_environment_size_class_mask: u32,
     /// The number of words of a `FunctionEnvironment`.
     pub function_environment_words: u32,
+    /// The number of words of a `DeclarativeEnvironment`, which the first words of a `FunctionEnvironment` are.
+    pub declarative_environment_words: u32,
     /// `FunctionEnvironment` fields: the pointer to its binding values, its
     /// outer environment, its function object and its this value.
     pub function_environment_binding_values: u32,
@@ -1271,9 +1292,9 @@ pub struct DynamicCallLayout {
 /// 6. Copy `template` (`8 * template.len()` bytes, the start of every cell) to
 ///    `cell`. Then store `inline_capacity` (a u8) at
 ///    `cell + inline_capacity_offset`, the shape at `cell + shape_offset`,
-///    `cell + inline_storage_offset` (the address) at
+///    `cell + plain_inline_storage_offset` (the address) at
 ///    `cell + named_properties_offset`, and at
-///    `cell + inline_storage_offset + 8 * index` the value of each named
+///    `cell + plain_inline_storage_offset + 8 * index` the value of each named
 ///    property (in shape order; NaN-boxed `undefined` for the ones not
 ///    initialized yet) followed by NaN-boxed `undefined` up to
 ///    `inline_capacity` values.
@@ -1308,7 +1329,10 @@ pub struct ObjectAllocationInfo {
     pub template: Vec<u64>,
     pub shape_offset: u32,
     pub named_properties_offset: u32,
+    /// Where the inline named storage of the objects of other classes starts.
     pub inline_storage_offset: u32,
+    /// Where the inline named storage of plain objects starts, which is below `inline_storage_offset`.
+    pub plain_inline_storage_offset: u32,
     /// `Object::inline_named_capacity` (u8).
     pub inline_capacity_offset: u32,
     /// `Object* libjs_jit_allocate_object(VM*, Shape*, u32 reserve)`.
@@ -1490,7 +1514,7 @@ pub struct RuntimeOffsets {
     pub execution_context_function: u32,
     /// `ExecutionContext::realm` (cell pointer).
     pub execution_context_realm: u32,
-    /// `ExecutionContext::script_or_module` (16 bytes).
+    /// `ExecutionContext::script_or_module` (8 bytes).
     pub execution_context_script_or_module: u32,
     /// `ExecutionContext::variable_environment` (cell pointer).
     pub execution_context_variable_environment: u32,
@@ -1526,10 +1550,16 @@ pub struct RuntimeOffsets {
     pub execution_context_runs_jit_code: u32,
     /// `EcmascriptFunctionObject::environment` (cell pointer).
     pub ecmascript_function_environment: u32,
-    /// `EcmascriptFunctionObject::private_environment` (cell pointer).
+    /// `EcmascriptFunctionObjectWithRareData::private_environment` (cell
+    /// pointer), of functions with the flag for it.
     pub ecmascript_function_private_environment: u32,
-    /// `EcmascriptFunctionObject::script_or_module` (16 bytes, as in `ExecutionContext`).
-    pub ecmascript_function_script_or_module: u32,
+    /// `SharedFunctionInstanceData::script_or_module` (8 bytes, as in `ExecutionContext`).
+    pub shared_function_script_or_module: u32,
+    /// `Object::class_bits` (u8).
+    pub object_class_bits: u32,
+    /// The bit of `Object::class_bits` of an ECMAScript function that has
+    /// a private environment field.
+    pub ecmascript_function_flag_has_rare_data: u32,
     /// `VmHead::execution_generation` (u32).
     pub vm_execution_generation: u32,
 }
@@ -1646,15 +1676,18 @@ pub struct RuntimeLayout {
     pub object_flag_is_extensible: u16,
     /// `Object::Flag::HasMagicalLengthProperty`, which only arrays have.
     pub object_flag_has_magical_length: u16,
-    /// The classes (pointers) of `StringObject`s and of `%String.prototype%`,
-    /// which start their cells.
+    /// The classes (pointers) of plain objects, of `StringObject`s and of
+    /// `%String.prototype%`.
+    pub object_class: u64,
     pub string_object_class: u64,
     pub string_prototype_class: u64,
     /// `Object::Flag::MayInterfereWithIndexedPropertyAccess`.
     pub object_flag_may_interfere: u16,
-    /// `Array::length_writable` and `Array::is_proxy_target` (bools).
-    pub array_length_writable: u32,
-    pub array_is_proxy_target: u32,
+    /// Where an array keeps its flags (u8), and the bits of them that say that its length is not writable and that it
+    /// is the target of a proxy.
+    pub array_flags: u32,
+    pub array_flag_length_not_writable: u8,
+    pub array_flag_is_proxy_target: u8,
     /// `Shape::prototype`.
     pub shape_prototype: u32,
     /// `Object::Flag::IsTypedArray`.
@@ -1676,7 +1709,7 @@ pub struct RuntimeLayout {
     /// `typed_array_cached_data_offset_invalid`.
     pub typed_array_cached_data_offset: u32,
     pub typed_array_cached_data_offset_invalid: u64,
-    /// `TypedArrayBase::array_length.length`, as a u32.
+    /// `TypedArrayBase::array_length.length` (u64).
     pub typed_array_array_length: u32,
     /// `TypedArrayBase::kind` (u8).
     pub typed_array_kind: u32,
@@ -1727,10 +1760,9 @@ pub struct RuntimeLayout {
     /// The address of the VM's array of the strings of the 128 ASCII
     /// characters (cell pointers), or 0 for code without one.
     pub single_ascii_character_strings: u64,
-    /// `FunctionObject::builtin` (u8), the builtin a function is, if
-    /// `FunctionObject::has_builtin` (bool).
+    /// `Object::class_bits` (u8): the builtin a function is plus one, if
+    /// it is one.
     pub function_object_builtin: u32,
-    pub function_object_has_builtin: u32,
     /// `Builtin` values.
     pub builtin_string_prototype_char_code_at: u8,
     pub builtin_string_prototype_char_at: u8,
@@ -1800,20 +1832,20 @@ pub struct RuntimeLayout {
     /// `GeneratorObject::pending_completion_type` (u32): the type of that
     /// completion, as `GetCompletionFields` writes it.
     pub generator_object_pending_completion_type: u32,
-    /// `DeclarativeEnvironment::binding_values.size` (u64).
+    /// `DeclarativeEnvironment::binding_count` (u32).
     pub declarative_environment_binding_values_size: u32,
-    /// The capacity (u64) of `DeclarativeEnvironment::binding_values`.
-    pub declarative_environment_binding_values_capacity: u32,
+    /// `Environment::inline_binding_capacity` (u8), zero if the binding values are not in the cell.
+    pub declarative_environment_inline_binding_capacity: u32,
     /// The pointer to the first binding name (a `Utf16FlyString`, one
     /// word) of an `EnvironmentShape`.
     pub environment_shape_binding_names: u32,
     /// `EnvironmentShape::has_unique_binding_names` (bool).
     pub environment_shape_has_unique_binding_names: u32,
-    /// `DeclarativeEnvironment::binding_values.data`, the pointer to the first `Value`.
+    /// `DeclarativeEnvironment::binding_values`, the pointer to the first `Value`.
     pub declarative_environment_binding_values: u32,
     /// `DeclarativeEnvironment::shape` (cell pointer, may be null).
     pub declarative_environment_shape: u32,
-    /// `DeclarativeEnvironment::rare_data` (pointer).
+    /// `DeclarativeEnvironment::rare_data` (compressed pointer).
     pub declarative_environment_rare_data: u32,
     /// `DeclarativeEnvironmentRareData::binding_flags.data`, the pointer to the first flag byte.
     pub rare_data_binding_flags: u32,
@@ -1897,8 +1929,17 @@ pub struct RuntimeLayout {
     pub property_lookup_cache_entry_type_get_own_property: u32,
     /// `PropertyLookupCache::Entry::Type::ChangeOwnProperty`.
     pub property_lookup_cache_entry_type_change_own_property: u32,
-    /// `Class::object_methods`, of the class every cell starts with, or 0 if
-    /// JIT code does not walk prototype chains.
+    /// The mask that rounds the address of a cell down to its block, and
+    /// where the block holds the class of its cells. A block of an allocator
+    /// that classes share holds that class with `block_class_tail_tag` set,
+    /// and each cell keeps its own class right after the
+    /// `Class::type_info.cell_size` bytes of that class.
+    pub cell_block_mask: u64,
+    pub block_class_offset: u32,
+    pub block_class_tail_tag: u64,
+    pub class_cell_size: u32,
+    /// `Class::object_methods`, or 0 if JIT code does not walk prototype
+    /// chains.
     pub class_object_methods: u32,
     /// `ObjectMethods::internal_get_prototype_of`, which is null for objects
     /// whose prototype is the prototype of their shape.

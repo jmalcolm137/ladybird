@@ -6,7 +6,7 @@
 
 //! Declarations of Libraries/LibGC/CAPI.h.
 
-use core::ffi::{c_char, c_int, c_void};
+use core::ffi::{c_char, c_void};
 
 use super::class::CellTypeInfo;
 
@@ -38,11 +38,6 @@ pub struct GCWeakImpl {
     _private: [u8; 0],
 }
 
-#[repr(C)]
-pub struct GCSharedMemoryViewOutsideCage {
-    _private: [u8; 0],
-}
-
 pub const GC_COLLECTION_TYPE_COLLECT_GARBAGE: i32 = 0;
 pub const GC_COLLECTION_TYPE_COLLECT_EVERYTHING: i32 = 1;
 
@@ -65,6 +60,8 @@ pub struct GCLayout {
     pub heap_allocated_bytes_since_last_gc_offset: u32,
     pub heap_gc_bytes_threshold_offset: u32,
     pub heap_total_allocated_bytes_offset: u32,
+    pub block_size: u32,
+    pub block_foreign_type_offset: u32,
     pub heap_region_offset_mask: u64,
     pub primitive_storage_cage_offset_mask: u64,
 }
@@ -93,7 +90,7 @@ unsafe extern "C" {
     pub fn gc_heap_create(
         gather_roots: GCGatherRootsCallback,
         context: *mut c_void,
-        become_process_default: bool,
+        become_thread_default: bool,
     ) -> *mut GCHeap;
     pub fn gc_heap_destroy(heap: *mut GCHeap);
     // NB: The functions that take a reference to the heap have no other preconditions.
@@ -119,6 +116,7 @@ unsafe extern "C" {
         type_info: *const CellTypeInfo,
         name: *const c_char,
         name_length: usize,
+        foreign_type: *const c_void,
     ) -> *mut GCAllocator;
     pub fn gc_allocator_destroy(allocator: *mut GCAllocator);
     pub fn gc_heap_allocate_cell(heap: *mut GCHeap, allocator: *mut GCAllocator, must_mark: *mut bool) -> *mut c_void;
@@ -144,7 +142,6 @@ unsafe extern "C" {
     pub fn gc_visitor_visit_cells(visitor: *mut GCVisitor, cells: *const *mut c_void, count: usize);
     pub fn gc_visitor_visit_values(visitor: *mut GCVisitor, values: *const u64, count: usize);
     pub fn gc_visitor_visit_ephemeron(visitor: *mut GCVisitor, key: *mut c_void, value: *const u64);
-    pub fn gc_visitor_visit_possible_values(visitor: *mut GCVisitor, data: *const u8, size: usize);
 
     pub fn gc_primitive_storage_allocate(
         size: usize,
@@ -157,12 +154,6 @@ unsafe extern "C" {
         capacity: usize,
         zero_fill: bool,
         guard_size: usize,
-        out_handle: *mut GCPrimitiveStorageHandle,
-        out_layout: *mut GCPrimitiveStorageLayout,
-    ) -> bool;
-    pub fn gc_primitive_storage_adopt_shared_fd(
-        fd: c_int,
-        size: usize,
         out_handle: *mut GCPrimitiveStorageHandle,
         out_layout: *mut GCPrimitiveStorageLayout,
     ) -> bool;
@@ -192,11 +183,6 @@ unsafe extern "C" {
     pub safe fn gc_primitive_storage_capacity(handle: GCPrimitiveStorageHandle) -> usize;
     pub safe fn gc_primitive_storage_committed_size(handle: GCPrimitiveStorageHandle) -> usize;
     pub fn gc_primitive_storage_data(handle: GCPrimitiveStorageHandle) -> *mut u8;
-
-    pub fn gc_shared_memory_create(size: usize, out_fd: *mut c_int) -> bool;
-    pub fn gc_shared_memory_view_outside_cage_create(fd: c_int, size: usize) -> *mut GCSharedMemoryViewOutsideCage;
-    pub fn gc_shared_memory_view_outside_cage_data(view: *mut GCSharedMemoryViewOutsideCage) -> *mut u8;
-    pub fn gc_shared_memory_view_outside_cage_destroy(view: *mut GCSharedMemoryViewOutsideCage);
 }
 
 // On Windows, a variable that a DLL exports is only reachable through the DLL's import table, which the reference has

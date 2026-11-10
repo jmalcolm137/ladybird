@@ -174,7 +174,7 @@ stop_frontend() {
 
 new_profile() {
     local profile="$1"
-    rm -rf "$HOME/.local/share/Ladybird/Profiles/$profile" "$HOME/.config/Ladybird/Profiles/$profile"
+    rm -rf "$HOME/.local/share/Ladybird/Profiles/$profile" "$HOME/.config/Ladybird/Profiles/$profile" "$HOME/.cache/Ladybird/Profiles/$profile"
     mkdir -p "$HOME/.local/share/Ladybird/Profiles/$profile" "$HOME/.config/Ladybird/Profiles/$profile"
     if [[ -f "$HOME/.config/Ladybird/Profiles/libgui/Settings.json" ]]; then
         cp "$HOME/.config/Ladybird/Profiles/libgui/Settings.json" "$HOME/.config/Ladybird/Profiles/$profile/Settings.json"

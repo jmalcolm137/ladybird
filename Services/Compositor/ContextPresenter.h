@@ -129,6 +129,7 @@ private:
         Gfx::IntSize viewport_size;
         HashMap<Compositing::CanvasId, u64> canvas_content_generations;
         HashMap<Compositing::VideoSinkResourceId, Optional<u64>> video_frame_ids;
+        HashMap<u64, u64> image_frame_pixel_generations;
     };
 
     enum class PaintUIOverlay : u8 {
@@ -142,7 +143,7 @@ private:
     Gfx::IntSize raster_size() const;
     Gfx::IntRect raster_damage_rect(Gfx::IntRect) const;
     Gfx::IntRect frame_damage_for(PendingFrame const&, FrameContent const&);
-    Gfx::IntRect damage_since_last_raster(Gfx::IntSize viewport_size, FrameContent const&);
+    Gfx::IntRect damage_since_last_raster(Gfx::IntSize viewport_size, FrameContent const&, Gfx::IntRect forced_damage_rect);
     void remember_rasterized_frame(Gfx::IntSize viewport_size, Compositing::ScrollStateSnapshot const& presented_scroll_state_snapshot);
     Optional<u64> current_video_frame_id(Compositing::VideoSinkResourceId);
     void stop_backing_store_shrink_timer();

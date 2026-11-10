@@ -111,6 +111,8 @@ private:
         void seek_to_resubmit_while_locked();
         bool is_within_available_range_while_locked(AK::Duration) const;
         void re_emit_last_frame_if_at_end_of_stream_while_locked();
+        void note_frame_passed_by_decoder(AK::Duration timestamp, AK::Duration earliest_target_reachable_without_moving_demuxer);
+        bool decoder_has_passed_a_frame_needed_for(AK::Duration target) const;
         void push_data_and_decode_some_frames();
 
         void enter_halting_state(PipelineStatus, Optional<DecoderError>);
@@ -161,11 +163,14 @@ private:
         NonReferenceFrameDetector m_non_reference_frame_detector;
         bool m_decoder_needs_keyframe_next_seek { false };
         bool m_decoder_is_draining_before_unavailable_data { false };
+        struct FramePassedByDecoder {
+            AK::Duration timestamp;
+            AK::Duration earliest_target_reachable_without_moving_demuxer;
+        };
+        Optional<FramePassedByDecoder> m_latest_frame_passed_by_decoder;
 
         FrameQueue m_queue;
         RefPtr<VideoFrame> m_last_queued_frame;
-        AK::Duration m_earliest_available_timestamp;
-        AK::Duration m_latest_available_timestamp;
         ErrorHandler m_error_handler;
         ReadBlockedChangeHandler m_read_blocked_change_handler;
         PipelineStatus m_current_halting_status { PipelineStatus::Pending };

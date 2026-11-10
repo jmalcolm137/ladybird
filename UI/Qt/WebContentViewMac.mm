@@ -4,9 +4,12 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <AK/ScopeGuard.h>
 #include <LibGfx/SharedImageBuffer.h>
+#include <UI/Qt/ChromeStyle.h>
 #include <UI/Qt/WebContentView.h>
 
+#include <QChildEvent>
 #include <QWindow>
 #include <qpa/qplatformwindow_p.h>
 
@@ -60,6 +63,7 @@ bool WebContentView::ensure_iosurface_layer_attached_to_native_view()
     update_iosurface_layer_background_color();
     // Overlays are child widgets that Qt paints into the content layer, underneath this one.
     layer.hidden = is_page_covered_by_overlay();
+    update_whether_qt_paints_view();
     return true;
 }
 
@@ -67,9 +71,14 @@ void WebContentView::present_current_paintable_as_layer_contents()
 {
     if (!ensure_iosurface_layer_attached_to_native_view())
         return;
-
     auto* layer = as_layer(m_iosurface_layer);
-    layer.contentsScale = m_device_pixel_ratio;
+    ScopeGuard update_for_new_contents = [this, layer, had_contents = layer.contents != nil] {
+        if ((layer.contents != nil) != had_contents)
+            update_iosurface_layer_background_color();
+        update_whether_qt_paints_view();
+    };
+
+    layer.contentsScale = device_pixel_ratio();
 
     auto paintable = current_paintable();
     if (!paintable.has_value()) {
@@ -95,7 +104,7 @@ void WebContentView::present_current_paintable_as_layer_contents()
     // and the unit rectangle upside down.
     bool y_axis_points_down = [layer contentsAreFlipped];
     auto top_left_gravity = y_axis_points_down ? kCAGravityBottomLeft : kCAGravityTopLeft;
-    layer.contentsGravity = m_scales_frames_to_fit ? kCAGravityResizeAspect : top_left_gravity;
+    layer.contentsGravity = scales_frames_to_fit() ? kCAGravityResizeAspect : top_left_gravity;
     layer.contentsRect = y_axis_points_down
         ? CGRectMake(0, 0, painted_unit_width, painted_unit_height)
         : CGRectMake(0, 1 - painted_unit_height, painted_unit_width, painted_unit_height);
@@ -153,9 +162,12 @@ void WebContentView::update_iosurface_layer_background_color()
 {
     if (!m_iosurface_layer)
         return;
-    auto color = page_background_color();
-    auto* background_color = CGColorCreateSRGB(color.red() / 255.0, color.green() / 255.0, color.blue() / 255.0, 1.0);
-    as_layer(m_iosurface_layer).backgroundColor = background_color;
+    auto* layer = as_layer(m_iosurface_layer);
+    // Before its first frame, the view shows the chrome's color.
+    auto page_color = page_background_color();
+    auto color = layer.contents != nil ? QColor(page_color.red(), page_color.green(), page_color.blue()) : ChromeStyle::chrome_background(window()->palette());
+    auto* background_color = CGColorCreateSRGB(color.redF(), color.greenF(), color.blueF(), 1.0);
+    layer.backgroundColor = background_color;
     CGColorRelease(background_color);
 }
 
@@ -163,6 +175,46 @@ void WebContentView::detach_iosurface_layer_from_native_view()
 {
     if (m_iosurface_layer)
         [as_layer(m_iosurface_layer) removeFromSuperlayer];
+    update_whether_qt_paints_view();
+}
+
+// While the page layer covers the view, the view paints on screen, so Qt neither paints it into the window's backing
+// store nor copies it into a backing store of the view's own native view. All of that would lie under the layer, and
+// on every step of a window resize it is a fill and a copy of the whole view into freshly allocated surfaces. Once made,
+// that backing store of the native view stays for as long as the view, so Qt must not paint the view before it has a
+// frame either: until then the layer shows the color Qt would paint. Qt paints the view only while the layer is not
+// attached yet, and while an overlay, which Qt paints into the view, hides the layer.
+void WebContentView::update_whether_qt_paints_view()
+{
+    auto* layer = as_layer(m_iosurface_layer);
+    bool page_layer_covers_view = layer.superlayer != nil && !layer.hidden;
+    if (testAttribute(Qt::WA_PaintOnScreen) == page_layer_covers_view)
+        return;
+    setAttribute(Qt::WA_PaintOnScreen, page_layer_covers_view);
+    // What Qt last painted of the view is from before the layer covered it. Painting now puts the view as it is into
+    // the same window update in which the layer stops covering it.
+    if (!page_layer_covers_view)
+        repaint();
+}
+
+// The view paints nothing on screen. QWidget's own version returns no engine either, but warns.
+QPaintEngine* WebContentView::paintEngine() const
+{
+    return nullptr;
+}
+
+// Qt gives each child of a widget that paints on screen a native view of its own, which would stack the overlays and
+// the dialog above the page layer, showing whatever lies under them in the window's backing store. They stay painted
+// into this view's native view instead, as while Qt paints the view. A child that wants a native view asks for one in
+// its own constructor, after this.
+void WebContentView::childEvent(QChildEvent* event)
+{
+    WebContentViewBase::childEvent(event);
+    if (!event->added() || !testAttribute(Qt::WA_PaintOnScreen) || !event->child()->isWidgetType())
+        return;
+    auto* child = static_cast<QWidget*>(event->child());
+    if (!child->isWindow() && !child->testAttribute(Qt::WA_WState_Created))
+        child->setAttribute(Qt::WA_NativeWindow, false);
 }
 
 void WebContentView::destroy_iosurface_layer()

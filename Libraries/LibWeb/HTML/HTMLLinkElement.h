@@ -191,7 +191,7 @@ private:
     bool stylesheet_linked_resource_fetch_setup_steps(Fetch::Infrastructure::Request&);
 
     static void preconnect(LinkProcessingOptions const&);
-    static void preload(LinkProcessingOptions&, Function<void(Fetch::Infrastructure::Response&)> process_response = {});
+    static void preload(LinkProcessingOptions&, GC::Ptr<GC::Function<void(Fetch::Infrastructure::Response&)>> process_response = {});
     static void modulepreload(LinkProcessingOptions const&);
 
     void process_linked_resource(bool success, Fetch::Infrastructure::ResponseView const&, CSS::StyleScope::OriginClean, Core::ImmutableBytes const*);
@@ -227,6 +227,10 @@ private:
 
     RefPtr<Gfx::Bitmap const> m_loaded_icon;
     RefPtr<CSS::StyleSheetState> m_loaded_style_sheet;
+    // The style sheet the link had when it was disabled, and the fetch generation then: enabling the link again before
+    // it starts another fetch puts the sheet back.
+    RefPtr<CSS::StyleSheetState> m_style_sheet_kept_while_disabled;
+    u64 m_style_sheet_kept_while_disabled_fetch_generation { 0 };
 
     GC::Ptr<DOM::DOMTokenList> m_rel_list;
     GC::Ptr<DOM::DOMTokenList> m_sizes;
@@ -240,8 +244,6 @@ private:
     bool m_explicitly_enabled { false };
 
     bool m_was_enabled_when_created_by_parser { false };
-
-    Optional<Utf16String> m_mime_type;
 
     SourceSet m_source_set;
 

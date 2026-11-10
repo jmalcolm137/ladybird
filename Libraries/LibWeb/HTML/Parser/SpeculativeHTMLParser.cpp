@@ -79,9 +79,8 @@ void SpeculativeHTMLParser::run()
 
     auto scripting_enabled = m_scripting_mode != ParserScriptingMode::Disabled;
     auto input = m_input.utf16_view();
-    if (input.has_ascii_storage()) {
-        auto bytes = input.bytes();
-        rust_html_preload_scanner_scan(bytes, scripting_enabled, this, scanner_callback);
+    if (input.has_latin1_storage()) {
+        rust_html_preload_scanner_scan_latin1(input.latin1_span(), scripting_enabled, this, scanner_callback);
     } else {
         auto code_units = input.utf16_span();
         rust_html_preload_scanner_scan_utf16({ reinterpret_cast<u16 const*>(code_units.data()), code_units.size() }, scripting_enabled, this, scanner_callback);
@@ -146,7 +145,7 @@ void issue_speculative_fetch(JS::Realm& realm, DOM::Document& document, URL::URL
     //         speculative fetch succeeds, offer its response to the normal parser's fetch the way a preload is, through
     //         the document's map of preloaded resources. That fetch still runs main fetch's checks before using it.
     Fetch::Infrastructure::FetchAlgorithms::Input fetch_algorithms_input { Fetch::Engine::BodyIntent::ConsumeForCallback };
-    fetch_algorithms_input.process_response_consume_body = [document = GC::Ref { document }, parser = GC::Weak { document.active_parser() }, request](GC::Ref<Fetch::Infrastructure::ResponseView> response_view, Fetch::Infrastructure::FetchAlgorithms::BodyBytes body_bytes) {
+    fetch_algorithms_input.process_response_consume_body = GC::create_function(GC::Heap::the(), GC::captures(GC::Ref { document }, GC::Weak { document.active_parser() }, request), [](GC::Ref<DOM::Document>& document, GC::Weak<HTMLParser>& parser, NonnullRefPtr<Fetch::Infrastructure::Request>& request, GC::Ref<Fetch::Infrastructure::ResponseView> response_view, Fetch::Infrastructure::FetchAlgorithms::BodyBytes body_bytes) {
         auto response = response_view->record();
         auto* byte_sequence = body_bytes.get_pointer<Core::ImmutableBytes>();
         if (response->is_network_error() || !byte_sequence)
@@ -181,7 +180,7 @@ void issue_speculative_fetch(JS::Realm& realm, DOM::Document& document, URL::URL
         entry->response = move(preloaded_response);
         entry->is_speculative = true;
         document->map_of_preloaded_resources().set(key, entry);
-    };
+    });
 
     // The fetch stays alive via ResourceLoader's GC::Root callbacks for the duration of the
     // network request, so we don't need to retain the FetchController.

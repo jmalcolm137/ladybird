@@ -1,0 +1,3 @@
+in a flex container: block
+in a block: inline
+what follows starts a line: false

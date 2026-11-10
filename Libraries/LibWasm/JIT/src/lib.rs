@@ -99,6 +99,9 @@ pub struct CompileRequest {
     /// The function, counting imports.
     pub function: u32,
     pub runtime: RuntimeInfo,
+    /// The address of the store's `ExecutionContext::stack_limit`, which stays the same for as long as the store lives
+    /// (each store has its own code).
+    pub stack_limit: u64,
     pub options: Options,
     /// For an OSR compile, the module offset of the loop that it continues an interpreter frame at, in any number of
     /// other loops. Its code takes the frame's fp as its only argument and returns the function's results.
@@ -206,6 +209,7 @@ pub fn compile(context: &mut CompileContext, request: &CompileRequest) -> Result
         );
     }
     passes::cleanup::cleanup(&mut context.func, &mut context.liveliness);
+    passes::interrupt_checks::run(&context.func, &mut context.liveliness);
     // NB: The loop an OSR compile enters has two ways in, so it has no preheader to hoist into.
     let no_licm = request.options.no_licm || request.osr.is_some();
     if no_licm {
@@ -246,7 +250,12 @@ pub fn compile(context: &mut CompileContext, request: &CompileRequest) -> Result
             regalloc::verify::dump(&context.func, &context.allocation)
         );
     }
-    let generated = codegen::target::generate(&context.func, &context.allocation, &request.runtime)?;
+    let generated = codegen::target::generate(
+        &context.func,
+        &context.allocation,
+        &request.runtime,
+        request.stack_limit,
+    )?;
     lap(4, &mut stats);
     stats.nodes = context.func.nodes.len() as u32;
     stats.slots = context.allocation.slot_count;

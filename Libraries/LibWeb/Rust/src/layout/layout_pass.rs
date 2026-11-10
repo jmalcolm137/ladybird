@@ -33,15 +33,71 @@ pub(crate) struct LayoutPass<'arena> {
     /// searches from inside the run stop. Invalid outside any run.
     innermost_run: (Node, Node),
     /// What the run this pass view was handed to found out for the host so far, or the pass outside any run.
-    host_findings: &'arena RefCell<super::run_state::HostFindings>,
+    host_findings: &'arena super::run_state::HostFindingsSink,
     /// The intrinsic sizes the runs this pass view reaches read and measure into: those passes measured, kept for the
     /// passes after them, or inside a run whose result is discarded, that run's own.
     intrinsic_size_caches: &'arena super::layout_node_arena::IntrinsicSizeCaches,
     /// Whether this pass view is inside a run whose result is discarded, which reads no memoized layout from before it
-    /// and keeps none: the run cache, the in-flow block cache, inline item stashes and intrinsic sizes.
+    /// and keeps none: the run cache, the in-flow block cache, prepared inline content and intrinsic sizes.
     reads_no_memoized_layout: bool,
     /// The innermost of the position options the boxes this pass view lays out are laid out with.
     position_option_styles: Option<&'arena PositionOptionStyle<'arena>>,
+    records_trace: bool,
+    forks_runs: bool,
+    worker_scratch: WorkerScratchOfThisThread,
+}
+
+const _: () = {
+    const fn assert_send_and_sync<T: Send + Sync>() {}
+    assert_send_and_sync::<LayoutPass<'static>>();
+};
+
+#[derive(Default)]
+pub(crate) struct WorkerScratch {
+    pub(super) spare_fragment_builder_buffers: std::cell::RefCell<Vec<super::fragment_tree::FragmentBuilderBuffers>>,
+    pub(super) reserved_unique_identities: std::cell::Cell<std::ops::Range<u64>>,
+    inline_content_preparation_buffers:
+        std::cell::Cell<super::prepared_inline_content::InlineContentPreparationBuffers>,
+}
+
+thread_local! {
+    static WORKER_SCRATCH_OF_THIS_THREAD: WorkerScratch = WorkerScratch::default();
+}
+
+#[derive(Clone, Copy)]
+struct WorkerScratchOfThisThread {
+    scratch: std::ptr::NonNull<WorkerScratch>,
+    #[cfg(debug_assertions)]
+    thread: std::thread::ThreadId,
+}
+
+// SAFETY: A pass view reaches the worker scratch of the thread it was pointed at only on that thread: a pass view
+// handed to a task on another thread is first pointed at the scratch of that thread (debug builds check the thread on
+// every use).
+unsafe impl Send for WorkerScratchOfThisThread {}
+// SAFETY: As above.
+unsafe impl Sync for WorkerScratchOfThisThread {}
+
+impl WorkerScratchOfThisThread {
+    fn get() -> Self {
+        WORKER_SCRATCH_OF_THIS_THREAD.with(|scratch| Self {
+            scratch: std::ptr::NonNull::from(scratch),
+            #[cfg(debug_assertions)]
+            thread: std::thread::current().id(),
+        })
+    }
+
+    #[inline]
+    fn scratch(&self) -> &WorkerScratch {
+        #[cfg(debug_assertions)]
+        assert_eq!(
+            self.thread,
+            std::thread::current().id(),
+            "a pass view reaches the worker scratch of another thread"
+        );
+        // SAFETY: The scratch lives as long as its thread, on which alone it is reached (see the Send impl).
+        unsafe { self.scratch.as_ref() }
+    }
 }
 
 /// The style a box is laid out with in place of the style of its row: that of one of its position options. It links to
@@ -49,14 +105,17 @@ pub(crate) struct LayoutPass<'arena> {
 /// https://drafts.csswg.org/css-anchor-position-1/#apply-a-position-option
 struct PositionOptionStyle<'pass> {
     node: Node,
-    style: super::node_data::StylePayloadsRef,
+    style: super::node_data::LayoutStyleRef,
     enclosing: Option<&'pass PositionOptionStyle<'pass>>,
 }
 
 impl<'arena> LayoutPass<'arena> {
+    /// A pass over `arena` and `scratch`, which notes what it finds out for the host outside any run in
+    /// `host_findings_outside_runs`.
     pub(crate) fn new(
         arena: &'arena LayoutNodeArena,
         scratch: &'arena super::run_state::LayoutScratch,
+        host_findings_outside_runs: &'arena super::run_state::HostFindingsSink,
         stage: super::formatting_context::LayoutStageFacts,
     ) -> Self {
         Self {
@@ -67,19 +126,61 @@ impl<'arena> LayoutPass<'arena> {
             document_in_quirks_mode: stage.document_in_quirks_mode,
             frame: super::geometry::Frame::PHYSICAL,
             innermost_run: (NodeSlotId::INVALID, NodeSlotId::INVALID),
-            host_findings: &scratch.host_findings_outside_runs,
+            host_findings: host_findings_outside_runs,
             intrinsic_size_caches: &scratch.intrinsic_size_caches,
             reads_no_memoized_layout: false,
             position_option_styles: None,
+            records_trace: scratch.layout_trace.is_recording(),
+            forks_runs: false,
+            worker_scratch: WorkerScratchOfThisThread::get(),
         }
+    }
+
+    pub(super) fn on_this_thread(self) -> Self {
+        Self {
+            worker_scratch: WorkerScratchOfThisThread::get(),
+            ..self
+        }
+    }
+
+    #[inline]
+    pub(super) fn worker_scratch(&self) -> &WorkerScratch {
+        self.worker_scratch.scratch()
+    }
+
+    pub(crate) fn forking_runs(self) -> Self {
+        Self {
+            forks_runs: true,
+            ..self
+        }
+    }
+
+    pub(super) fn forks_runs(&self) -> bool {
+        self.forks_runs && !self.reads_no_memoized_layout && !self.records_trace
+    }
+
+    pub(super) fn noting_host_findings_in<'findings>(
+        self,
+        host_findings: &'findings super::run_state::HostFindingsSink,
+    ) -> LayoutPass<'findings>
+    where
+        'arena: 'findings,
+    {
+        let pass: LayoutPass<'findings> = self;
+        LayoutPass { host_findings, ..pass }
     }
 
     /// A pass over `arena` and `scratch` with no viewport, in no-quirks mode.
     #[cfg(test)]
-    pub(crate) fn for_test(arena: &'arena LayoutNodeArena, scratch: &'arena super::run_state::LayoutScratch) -> Self {
+    pub(crate) fn for_test(
+        arena: &'arena LayoutNodeArena,
+        scratch: &'arena super::run_state::LayoutScratch,
+        host_findings_outside_runs: &'arena super::run_state::HostFindingsSink,
+    ) -> Self {
         Self::new(
             arena,
             scratch,
+            host_findings_outside_runs,
             super::formatting_context::LayoutStageFacts {
                 viewport_inline_size: CssPixels::default(),
                 viewport_block_size: CssPixels::default(),
@@ -94,7 +195,7 @@ impl<'arena> LayoutPass<'arena> {
         self,
         root: Node,
         root_containing_block: Node,
-        host_findings: &'run RefCell<super::run_state::HostFindings>,
+        host_findings: &'run super::run_state::HostFindingsSink,
     ) -> LayoutPass<'run>
     where
         'arena: 'run,
@@ -123,7 +224,8 @@ impl<'arena> LayoutPass<'arena> {
     /// before it and keeps none, so that it computes everything afresh and leaves nothing for the runs after it. It
     /// measures intrinsic sizes into caches of its own, which start empty and are dropped when it returns.
     pub(crate) fn lay_out_discarded_run<R>(self, run: impl for<'discarded> FnOnce(LayoutPass<'discarded>) -> R) -> R {
-        let intrinsic_size_caches = super::layout_node_arena::IntrinsicSizeCaches::default();
+        let mut intrinsic_size_caches = super::layout_node_arena::IntrinsicSizeCaches::default();
+        intrinsic_size_caches.cover_slots(self.arena.slot_capacity());
         let pass: LayoutPass<'_> = self;
         run(LayoutPass {
             intrinsic_size_caches: &intrinsic_size_caches,
@@ -132,13 +234,17 @@ impl<'arena> LayoutPass<'arena> {
         })
     }
 
+    pub(crate) fn lays_out_with_position_option(&self) -> bool {
+        self.position_option_styles.is_some()
+    }
+
     /// Runs `run` with this pass as it lays out `node` with `style`, the style of one of its position options, which
     /// the style reads of `node` see in place of the style of its row. The payloads `style` names must stay alive
     /// until `run` returns.
     pub(crate) fn with_position_option_style<R>(
         self,
         node: Node,
-        style: super::node_data::StylePayloadsRef,
+        style: super::node_data::LayoutStyleRef,
         run: impl for<'option> FnOnce(LayoutPass<'option>) -> R,
     ) -> R {
         let position_option_style = PositionOptionStyle {
@@ -155,7 +261,7 @@ impl<'arena> LayoutPass<'arena> {
 
     /// The style the style reads of `node` see in place of the style of its row, if any.
     #[inline]
-    fn position_option_style(&self, node: Node) -> Option<super::node_data::StylePayloadsRef> {
+    fn position_option_style(&self, node: Node) -> Option<super::node_data::LayoutStyleRef> {
         let mut position_option_style = self.position_option_styles;
         while let Some(option) = position_option_style {
             if option.node == node {
@@ -166,14 +272,22 @@ impl<'arena> LayoutPass<'arena> {
         None
     }
 
-    /// The document's layout trace, which records what the pass does while the document traces its layout.
-    pub(crate) fn layout_trace(&self) -> &'arena super::trace::LayoutTrace {
-        &self.scratch.layout_trace
+    /// Where this pass view records what its runs do while the document traces its layout: the document's layout trace,
+    /// or nowhere inside a run whose result is discarded.
+    pub(crate) fn layout_trace(&self) -> super::trace::LayoutTraceTarget<'arena> {
+        if self.reads_no_memoized_layout || !self.records_trace {
+            return super::trace::LayoutTraceTarget::recording_nothing();
+        }
+        super::trace::LayoutTraceTarget::recording_into(&self.scratch.layout_trace)
     }
 
     /// The results of formatting context runs, kept for the runs and passes after them.
     pub(crate) fn fc_run_cache_store(&self) -> &'arena super::fc_run_cache::FcRunCacheStore {
         self.scratch.fc_run_cache_store()
+    }
+
+    pub(crate) fn fragment_builder_scratch(&self) -> &'arena super::fragment_tree::FragmentBuilderScratch {
+        self.scratch.fragment_builder_scratch()
     }
 
     /// The layouts of in-flow blocks, kept for the passes after the one that laid them out.
@@ -187,34 +301,13 @@ impl<'arena> LayoutPass<'arena> {
         self.reads_no_memoized_layout
     }
 
-    /// The inline items a block container generated earlier in the pass, which a run whose result is discarded does not
-    /// read.
-    pub(crate) fn inline_item_stash(
-        &self,
-        block_container: Node,
-    ) -> Option<super::inline_level_iterator::StashedInlineItems> {
-        if self.reads_no_memoized_layout {
-            return None;
-        }
-        self.scratch.inline_item_stash(block_container)
-    }
-
-    /// Keeps the inline items `block_container` generated for its later runs in the pass, unless this pass view is
-    /// inside a run whose result is discarded.
-    pub(crate) fn store_inline_item_stash(
-        &self,
-        block_container: Node,
-        stash: super::inline_level_iterator::StashedInlineItems,
-    ) {
-        if self.reads_no_memoized_layout {
-            return;
-        }
-        self.scratch.store_inline_item_stash(block_container, stash);
-    }
-
     /// Notes what the run this pass view was handed to found out for the host, or the pass outside any run.
     pub(crate) fn note_host_findings(&self, note: impl FnOnce(&mut super::run_state::HostFindings)) {
-        note(&mut self.host_findings.borrow_mut());
+        self.host_findings.note(note);
+    }
+
+    pub(crate) fn host_findings_noted_so_far(&self) -> u64 {
+        self.host_findings.notes_so_far()
     }
 
     /// Hands what a finished run found out to the run this pass view was handed to, which used its result.
@@ -247,11 +340,34 @@ impl<'arena> LayoutPass<'arena> {
         &self,
         node: Node,
         key: &super::rendered_text::TextChunkCacheKey,
-        compute: impl FnOnce() -> Vec<super::text_chunker::TextChunk>,
+        compute: impl FnOnce() -> super::text_chunker::ChunkedText,
     ) -> std::sync::Arc<super::rendered_text::CachedTextChunks> {
-        self.scratch
-            .text_memos()
-            .text_chunks(node, self.text_content(node).rendered(), key, compute)
+        super::parallel_layout::check_row_reached_by_forked_task(node.slot_index() as usize, true);
+        self.scratch.text_memos().text_chunks(
+            self.text_state_index(node),
+            self.text_content(node).rendered(),
+            key,
+            compute,
+        )
+    }
+
+    pub(crate) fn prepared_inline_content_memos(
+        &self,
+    ) -> &'arena super::prepared_inline_content::PreparedInlineContentMemos {
+        self.scratch.prepared_inline_content_memos()
+    }
+
+    pub(crate) fn take_inline_content_preparation_buffers(
+        &self,
+    ) -> super::prepared_inline_content::InlineContentPreparationBuffers {
+        self.worker_scratch().inline_content_preparation_buffers.take()
+    }
+
+    pub(crate) fn return_inline_content_preparation_buffers(
+        &self,
+        buffers: super::prepared_inline_content::InlineContentPreparationBuffers,
+    ) {
+        self.worker_scratch().inline_content_preparation_buffers.set(buffers);
     }
 
     /// Runs `read` with the grapheme segmenter of the text row `node`.
@@ -260,34 +376,51 @@ impl<'arena> LayoutPass<'arena> {
         node: Node,
         read: impl FnOnce(&super::text_chunker::GraphemeSegmenter) -> R,
     ) -> R {
-        self.scratch
-            .text_memos()
-            .with_grapheme_segmenter(node, self.text_content(node).rendered(), read)
+        super::parallel_layout::check_row_reached_by_forked_task(node.slot_index() as usize, true);
+        self.scratch.text_memos().with_grapheme_segmenter(
+            self.text_state_index(node),
+            self.text_content(node).rendered(),
+            read,
+        )
+    }
+
+    fn text_state_index(&self, node: Node) -> u32 {
+        self.arena
+            .text_state_index(node)
+            .expect("a text row holds its text in a text state")
     }
 
     #[inline]
-    pub(crate) fn style_payloads(&self, node: Node) -> &'arena FfiStylePayloads {
-        self.style_payloads_if_styled(node)
+    pub(crate) fn style_view(&self, node: Node) -> ComputedValuesView<'arena> {
+        self.computed_values_view_if_styled(node)
             .expect("styled node must publish its style container before layout")
-    }
-
-    /// The style of `node`: that of its row, or the position option it is being laid out with.
-    #[inline]
-    pub(crate) fn style_payloads_if_styled(&self, node: Node) -> Option<&'arena FfiStylePayloads> {
-        if let Some(style) = self.position_option_style(node) {
-            // SAFETY: A position option's style stays alive while a box is laid out with it.
-            return unsafe { super::node_data::style_payloads(style) };
-        }
-        self.arena.style_payloads(node)
     }
 
     pub(crate) fn replaced_content_facts(&self, node: Node) -> Option<ReplacedContentFacts> {
         self.arena.replaced_content_facts(node)
     }
 
+    #[inline]
+    pub(crate) fn has_replaced_content_facts(&self, node: Node) -> bool {
+        self.arena.has_replaced_content_facts(node)
+    }
+
+    /// The style of `node`: that of its row, or the position option it is being laid out with.
+    #[inline]
     pub(crate) fn computed_values_view_if_styled(&self, node: Node) -> Option<ComputedValuesView<'arena>> {
-        self.style_payloads_if_styled(node)
-            .map(|payloads| ComputedValuesView::new(&payloads.groups))
+        self.row_and_style(node).1
+    }
+
+    /// The row of `node` together with its style as [`Self::computed_values_view_if_styled`] answers it, from one
+    /// lookup of the row.
+    #[inline]
+    pub(crate) fn row_and_style(&self, node: Node) -> (&'arena NodeData, Option<ComputedValuesView<'arena>>) {
+        let data = self.node_data(node);
+        if let Some(style) = self.position_option_style(node) {
+            // SAFETY: A position option's style stays alive while a box is laid out with it.
+            return (data, Some(unsafe { style.view() }));
+        }
+        (data, node_facts::node_style_view(data))
     }
 
     pub(crate) fn can_skip_is_anonymous_text_run(&self, node: Node) -> bool {
@@ -310,17 +443,17 @@ impl<'arena> LayoutPass<'arena> {
     }
 
     pub(crate) fn is_before(&self, node: Node, other: Node) -> bool {
-        self.arena().is_before(self.node_data(node), self.node_data(other))
+        self.arena().is_before(node, other)
     }
 
     pub(crate) fn saved_abspos_layout_inputs(&self, node: Node) -> Option<abspos_inputs::AbsposLayoutInputs> {
         let data = self.node_data(node);
         assert!(node_facts::kind_is_box(data.kind.get()));
-        self.arena().saved_abspos_layout_inputs(data)
+        self.arena().saved_abspos_layout_inputs(node)
     }
 
     pub(crate) fn committed_fragment_link(&self, node: Node) -> Option<FragmentLink> {
-        self.arena().committed_fragment_link(self.node_data(node))
+        self.arena().committed_fragment_link(node)
     }
 
     #[inline]

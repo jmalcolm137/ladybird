@@ -91,6 +91,7 @@ class TestConnection final : public IPC::ConnectionBase {
 public:
     using ConnectionBase::drain_messages_from_peer;
     using ConnectionBase::handle_messages;
+    using ConnectionBase::MayCancel;
     using ConnectionBase::PeerEOF;
     using ConnectionBase::post_sync_request;
     using ConnectionBase::wait_for_transport_to_become_readable;
@@ -103,9 +104,9 @@ public:
         m_unprocessed_messages.append(move(message));
     }
 
-    OwnPtr<IPC::Message> call_wait_for_specific_endpoint_message_impl(u32 endpoint_magic, int message_id)
+    OwnPtr<IPC::Message> call_wait_for_specific_endpoint_message_impl(u32 endpoint_magic, int message_id, MayCancel may_cancel = MayCancel::No)
     {
-        return wait_for_specific_endpoint_message_impl(endpoint_magic, message_id);
+        return wait_for_specific_endpoint_message_impl(endpoint_magic, message_id, may_cancel);
     }
 
 protected:
@@ -240,6 +241,58 @@ TEST_CASE(taking_unprocessed_messages_preserves_nested_batch_order_and_unrelated
     EXPECT(connection->take_unprocessed_messages(TEST_MAGIC, TARGET_MESSAGE_ID).is_empty());
 }
 
+TEST_CASE(shutdown_stops_current_dispatch_batch)
+{
+    Core::EventLoop loop;
+    auto pair = TRY_OR_FAIL(IPC::Transport::create_paired());
+    CountingStub stub;
+    auto connection = TestConnection::construct(stub, move(pair.local));
+    stub.on_message = [&](IPC::Message const& message) {
+        if (message.message_id() == OTHER_MESSAGE_ID)
+            connection->shutdown();
+    };
+
+    connection->inject_unprocessed_message(make<TestMessage>(OTHER_MESSAGE_ID));
+    connection->inject_unprocessed_message(make<TestMessage>(TARGET_MESSAGE_ID));
+    connection->handle_messages();
+
+    EXPECT_EQ(stub.handle_count(), 1u);
+    EXPECT_EQ(connection->die_count(), 1u);
+    EXPECT(!connection->is_open());
+}
+
+TEST_CASE(shutdown_discards_pending_messages_from_all_batches)
+{
+    Core::EventLoop loop;
+    auto pair = TRY_OR_FAIL(IPC::Transport::create_paired());
+    CountingStub stub;
+    auto connection = TestConnection::construct(stub, move(pair.local));
+
+    constexpr int shutdown_message_id = 3;
+    constexpr u32 response_endpoint_magic = TEST_MAGIC + 1;
+    Vector<int> dispatched;
+    stub.on_message = [&](IPC::Message const& message) {
+        dispatched.append(message.message_id());
+        if (message.message_id() == OTHER_MESSAGE_ID) {
+            connection->inject_unprocessed_message(make<TestMessage>(shutdown_message_id));
+            connection->inject_unprocessed_message(make<TestMessage>(TARGET_MESSAGE_ID));
+            connection->handle_messages();
+        } else if (message.message_id() == shutdown_message_id) {
+            connection->inject_unprocessed_message(make<TestMessage>(TARGET_MESSAGE_ID));
+            connection->inject_unprocessed_message(make<TestMessage>(TARGET_MESSAGE_ID, 0, response_endpoint_magic));
+            connection->shutdown();
+            EXPECT(connection->take_unprocessed_messages(TEST_MAGIC, TARGET_MESSAGE_ID).is_empty());
+            EXPECT(!connection->call_wait_for_specific_endpoint_message_impl(response_endpoint_magic, TARGET_MESSAGE_ID));
+        }
+    };
+
+    connection->inject_unprocessed_message(make<TestMessage>(OTHER_MESSAGE_ID));
+    connection->inject_unprocessed_message(make<TestMessage>(TARGET_MESSAGE_ID));
+    connection->handle_messages();
+
+    EXPECT_EQ(dispatched, (Vector<int> { OTHER_MESSAGE_ID, shutdown_message_id }));
+}
+
 TEST_CASE(anonymous_buffer_size_uses_64_bits)
 {
     constexpr size_t buffer_size = 4096;
@@ -313,6 +366,8 @@ TEST_CASE(sync_wait_failure_does_not_dispatch_queued_messages)
     auto connection = TestConnection::construct(stub, move(pair.local));
 
     connection->inject_unprocessed_message(make<TestMessage>(OTHER_MESSAGE_ID));
+    // Queue a deferred dispatch before the transport can observe EOF.
+    EXPECT_EQ(connection->drain_messages_from_peer(), TestConnection::PeerEOF::No);
 
     // Hang up the peer before waiting for the response.
     {
@@ -324,10 +379,44 @@ TEST_CASE(sync_wait_failure_does_not_dispatch_queued_messages)
     EXPECT(!response);
     EXPECT_EQ(stub.handle_count(), 0u);
 
-    // Drain the deferred invocations queued by the EOF drain; the thread's event queue outlives this
-    // test's scope, and the stub must not be dispatched to after it is destroyed.
+    // The wait may not shut down if EOF was seen before it started.
+    connection->shutdown();
     while (loop.pump(Core::EventLoop::WaitMode::PollForEvents) != 0)
         ;
+    EXPECT_EQ(stub.handle_count(), 0u);
+}
+
+TEST_CASE(cancelled_thread_does_not_take_a_late_response)
+{
+    // NB: A canceller stays on its thread until that thread ends.
+    auto thread = Threading::Thread::construct("Cancelled"sv, [] -> intptr_t {
+        Core::EventLoop loop;
+
+        auto pair = MUST(IPC::Transport::create_paired());
+
+        CountingStub stub;
+        auto connection = TestConnection::construct(stub, move(pair.local));
+
+        auto canceller = IPC::SyncRequestCanceller::create();
+        EXPECT(!IPC::SyncRequestCanceller::is_installed_on_this_thread());
+        canceller->install_on_this_thread();
+        EXPECT(IPC::SyncRequestCanceller::is_installed_on_this_thread());
+        canceller->cancel();
+
+        // The response to the wait that was cancelled comes in, and the thread then makes a request of the same type.
+        connection->inject_unprocessed_message(make<TestMessage>(TARGET_MESSAGE_ID, 0, TEST_MAGIC + 1));
+        EXPECT(!connection->call_wait_for_specific_endpoint_message_impl(TEST_MAGIC + 1, TARGET_MESSAGE_ID, TestConnection::MayCancel::Yes));
+
+        connection->handle_messages();
+        EXPECT_EQ(stub.handle_count(), 0u);
+
+        connection->shutdown();
+        while (loop.pump(Core::EventLoop::WaitMode::PollForEvents) != 0)
+            ;
+        return 0;
+    });
+    thread->start();
+    TRY_OR_FAIL(thread->join());
 }
 
 TEST_CASE(async_posts_from_many_threads_all_arrive)

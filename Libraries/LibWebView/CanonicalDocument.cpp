@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <LibURL/Site.h>
 #include <LibWebView/BlobURLStore.h>
 #include <LibWebView/CanonicalBrowsingContext.h>
 #include <LibWebView/CanonicalBrowsingContextGroup.h>
@@ -43,7 +44,7 @@ CanonicalDocument::CanonicalDocument(Web::HTML::CrossProcessId id, URL::URL crea
     , m_is_initial_about_blank(is_initial_about_blank)
 {
     if (m_creation_url.scheme() == "about"sv && m_creation_url.path_segment_count() == 1) {
-        if (auto page = WebUI::page_for_host(m_creation_url.path_segments().first()); page.has_value() && page->type == WebUI::PageType::Dynamic)
+        if (auto page = WebUI::page_for_host(m_creation_url.path_segments().first()); page.has_value() && page->type != WebUI::PageType::Static)
             m_web_ui_host = MUST(String::from_utf8(page->host));
     }
 }
@@ -67,6 +68,25 @@ Optional<URL::Origin> CanonicalDocument::top_level_origin() const
     return top_level_browsing_context.active_document()->origin();
 }
 
+bool CanonicalDocument::is_top_level() const
+{
+    return &m_browsing_context->top_level_browsing_context() == m_browsing_context.ptr();
+}
+
+bool CanonicalDocument::may_share_a_process_with_tabs_of_its_origin() const
+{
+    if (!is_top_level() || m_origin.is_opaque() || m_web_ui_host.has_value() || m_is_local_file_content)
+        return false;
+
+    auto const& scheme = m_origin.scheme();
+    if (!scheme.has_value() || !scheme->is_one_of("http"sv, "https"sv))
+        return false;
+
+    auto const& agent = m_relevant_global_object->agent();
+    return agent.agent_cluster_cross_origin_isolation_mode() == Web::HTML::CrossOriginIsolationMode::None
+        && m_opener_policy.value != Web::HTML::OpenerPolicyValue::SameOriginPlusCOEP;
+}
+
 void CanonicalDocument::set_host(RefPtr<WebContentPage> host)
 {
     m_host = move(host);
@@ -74,6 +94,12 @@ void CanonicalDocument::set_host(RefPtr<WebContentPage> host)
         m_relevant_global_object->agent().set_hosting_process_if_unset(m_host->client());
         // The process makes the document's requests through the RequestServer of the document's top-level site.
         m_host->client().request_server_site_bindings().bind_sites_of(*this);
+        // NB: The PDF viewer has an origin of its own, but it only ever replaces a document in the process of the PDF's
+        //     site, so it brings no second site along.
+        auto is_pdf_viewer = !m_origin.is_opaque() && m_origin.scheme() == "resource"sv;
+        if (auto site = URL::Site::serialize_for_partitioning(m_origin); site.has_value() && !is_pdf_viewer)
+            m_host->client().did_host_document_of_site(site.release_value());
+        m_host->client().note_hosted_document(*this);
     }
 }
 

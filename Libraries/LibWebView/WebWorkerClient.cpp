@@ -4,7 +4,6 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-#include <LibCore/Process.h>
 #include <LibWebView/Application.h>
 #include <LibWebView/AudioServerControlClient.h>
 #include <LibWebView/BlobURLStore.h>
@@ -13,9 +12,12 @@
 #include <LibWebView/CookieJar.h>
 #include <LibWebView/HSTSStore.h>
 #include <LibWebView/HelperProcess.h>
+#include <LibWebView/ImageDecoderManager.h>
 #include <LibWebView/PermissionManager.h>
+#include <LibWebView/Utilities.h>
+#include <LibWebView/WebContentClient.h>
 #include <LibWebView/WebWorkerClient.h>
-#include <LibWebView/WorkerProcessManager.h>
+#include <LibWebView/WorkerAgentManager.h>
 
 namespace WebView {
 
@@ -37,54 +39,60 @@ WebWorkerClient::~WebWorkerClient()
     remove_blob_url_entries();
 }
 
-void WebWorkerClient::did_misbehave(StringView message_name, StringView reason)
+void WebWorkerClient::set_host(WebContentClient& host)
 {
-    dbgln("WebWorkerClient: terminating helper process {}: {} rejected: {}", pid(), message_name, reason);
-    terminate_process();
-    shutdown();
+    m_host = host;
+    m_host_child_id = host.child_id();
 }
 
-void WebWorkerClient::terminate_process()
+void WebWorkerClient::did_misbehave(StringView message_name, StringView reason)
 {
-    (void)Application::process_manager().terminate_child(child_id(), Core::Process::TerminationMode::Forceful);
+    // NB: A worker on a thread is one trust domain with its process, so all of that goes.
+    if (auto host = m_host.strong_ref()) {
+        host->did_misbehave(message_name, reason);
+        shutdown();
+        return;
+    }
+    shutdown();
 }
 
 void WebWorkerClient::die()
 {
     remove_blob_url_entries();
-    WorkerProcessManager::the().worker_did_die(m_agent_id);
+    WorkerAgentManager::the().worker_did_die(m_agent_id);
 
-    // NB: A worker whose connection is gone does no more work, so a process that outlives its connection is ended.
-    terminate_process();
-    WorkerProcessManager::the().worker_process_did_exit(*this);
+    // NB: The process of a worker on a thread goes on, and so may its use of the decoder.
+    if (m_image_decoder_client_generation.has_value())
+        ImageDecoderManager::the().process_did_release_decoder(child_id(), *m_image_decoder_client_generation);
 
-    // Otherwise nested workers we own would outlive us, in violation of the HTML spec.
-    WorkerProcessManager::the().remove_web_worker_owner(*this);
+    WorkerAgentManager::the().worker_thread_did_exit(*this);
 }
 
 void WebWorkerClient::did_close_worker()
 {
-    WorkerProcessManager::the().worker_did_close(m_agent_id);
+    forget_inside_settings_of_closing_worker();
+    WorkerAgentManager::the().worker_did_close(m_agent_id);
+}
+
+void WebWorkerClient::did_close_shared_worker()
+{
+    WorkerAgentManager::the().shared_worker_did_close(m_agent_id);
 }
 
 void WebWorkerClient::did_finish_loading_worker_script(bool worker_is_secure_context)
 {
-    WorkerProcessManager::the().worker_did_finish_loading_script(m_agent_id, worker_is_secure_context);
+    m_script_blob_url = {};
+    WorkerAgentManager::the().worker_did_finish_loading_script(m_agent_id, worker_is_secure_context);
 }
 
 void WebWorkerClient::did_fail_loading_worker_script()
 {
-    WorkerProcessManager::the().worker_did_fail_loading_script(m_agent_id);
-}
-
-void WebWorkerClient::did_report_worker_exception(Utf16String message, Utf16String filename, u32 lineno, u32 colno)
-{
-    WorkerProcessManager::the().worker_did_report_exception(m_agent_id, move(message), move(filename), lineno, colno);
+    WorkerAgentManager::the().worker_did_fail_loading_script(m_agent_id);
 }
 
 void WebWorkerClient::did_report_outside_settings_content_security_policy_violation(u64 policy_index, String effective_directive, URL::URL resource)
 {
-    WorkerProcessManager::the().worker_did_report_outside_settings_content_security_policy_violation(m_agent_id, policy_index, move(effective_directive), move(resource));
+    WorkerAgentManager::the().worker_did_report_outside_settings_content_security_policy_violation(m_agent_id, policy_index, move(effective_directive), move(resource));
 }
 
 void WebWorkerClient::remove_blob_url_entries()
@@ -93,13 +101,25 @@ void WebWorkerClient::remove_blob_url_entries()
         session->blob_url_store->remove_entries_added_by(WeakPtr<WebWorkerClient> { *this });
 }
 
-// The environment a worker process names is its worker's.
+void WebWorkerClient::set_inside_settings(NonnullOwnPtr<CanonicalWorkerEnvironmentSettingsObject> inside_settings, bool may_read_local_files)
+{
+    m_top_level_origin = inside_settings->top_level_origin();
+    m_inside_settings = move(inside_settings);
+    m_may_read_local_files = may_read_local_files;
+}
+
+void WebWorkerClient::forget_inside_settings_of_closing_worker()
+{
+    m_inside_settings = nullptr;
+    m_script_blob_url = {};
+}
+
+// The environment a worker names is its own.
 Optional<CanonicalEnvironmentSettingsObject const&> WebWorkerClient::hosted_environment(Web::HTML::EnvironmentId const& environment_id) const
 {
-    auto inside_settings = WorkerProcessManager::the().inside_settings(m_agent_id);
-    if (!inside_settings.has_value() || inside_settings->id() != environment_id)
+    if (!m_inside_settings || m_inside_settings->id() != environment_id)
         return {};
-    return *inside_settings;
+    return *m_inside_settings;
 }
 
 // A worker may learn the permissions only of its own top-level site; asking about any other gets just the defaults.
@@ -109,7 +129,7 @@ Messages::WebWorkerClient::DidRequestPermissionSnapshotResponse WebWorkerClient:
     if (!session)
         return Web::Permissions::PermissionSnapshot {};
 
-    auto worker_top_level_origin = WorkerProcessManager::the().top_level_origin(m_agent_id);
+    auto worker_top_level_origin = m_inside_settings ? m_inside_settings->top_level_origin() : Optional<URL::Origin> {};
     if (worker_top_level_origin.has_value() && worker_top_level_origin->is_same_origin(top_level_origin) && !top_level_origin.is_opaque() && !m_permission_origins.contains_slow(top_level_origin))
         m_permission_origins.append(top_level_origin);
     return session->permission_manager->snapshot_for(m_permission_origins);
@@ -123,18 +143,17 @@ Messages::WebWorkerClient::DidRequestCookieResponse WebWorkerClient::did_request
         return HTTP::Cookie::VersionedCookie {};
     }
 
-    auto inside_settings = WorkerProcessManager::the().inside_settings(m_agent_id);
-    if (!inside_settings.has_value() || !inside_settings->may_use_cookies_of(url))
+    if (!m_inside_settings || !m_inside_settings->may_use_cookies_of(url))
         return HTTP::Cookie::VersionedCookie {};
 
-    auto top_level_site = network_isolation_top_level_site(*inside_settings);
+    auto top_level_site = network_isolation_top_level_site(*m_inside_settings);
     if (!top_level_site.has_value())
         return HTTP::Cookie::VersionedCookie {};
 
-    HTTP::Cookie::PartitionContext partition_context { top_level_site.release_value(), inside_settings->has_cross_site_ancestor() };
+    HTTP::Cookie::PartitionContext partition_context { top_level_site.release_value(), m_inside_settings->has_cross_site_ancestor() };
     HTTP::Cookie::VersionedCookie cookie;
     if (auto session = m_session.strong_ref())
-        cookie.cookie = session->cookie_jar->get_cookie(url, source, partition_context);
+        cookie.cookie = session->cookie_jar->get_cookie(url, source, partition_context, HTTP::Cookie::non_http_same_site_context(partition_context));
     return cookie;
 }
 
@@ -167,7 +186,20 @@ Messages::WebWorkerClient::DidRequestBlobUrlEntryResponse WebWorkerClient::did_r
 
 void WebWorkerClient::did_request_file(ByteString path, i32 request_id)
 {
-    WorkerProcessManager::the().worker_did_request_file(m_agent_id, move(path), request_id);
+    if (!m_inside_settings)
+        return;
+
+    // NB: As a page, a worker reads a local file only through this broker, and only local file content may.
+    if (!m_may_read_local_files) {
+        async_handle_file_return(EACCES, {}, request_id);
+        return;
+    }
+
+    auto file = open_local_file_for_renderer(path);
+    if (file.is_error())
+        async_handle_file_return(file.error().code(), {}, request_id);
+    else
+        async_handle_file_return(0, file.release_value(), request_id);
 }
 
 Messages::WebWorkerClient::DidIsKnownHstsHostResponse WebWorkerClient::did_is_known_hsts_host(String domain)
@@ -181,7 +213,7 @@ Messages::WebWorkerClient::RequestMediaServerConnectionResponse WebWorkerClient:
     auto connection = connect_new_media_server_client(m_media_server_client, child_id(), [weak_self = make_weak_ptr<WebWorkerClient>()]() -> ErrorOr<IPC::TransportHandle> {
         auto self = weak_self.strong_ref();
         if (!self)
-            return Error::from_string_literal("The worker process is gone");
+            return Error::from_string_literal("The worker is gone");
         TRY(ensure_audio_server_is_running(self->m_audio_server_client, self->child_id()));
         return connect_new_audio_server_client(*self->m_audio_server_client, self->m_audio_tab_id);
     });
@@ -192,21 +224,41 @@ Messages::WebWorkerClient::RequestMediaServerConnectionResponse WebWorkerClient:
     return move(connection.value().handle);
 }
 
+Messages::WebWorkerClient::RequestImageDecoderConnectionResponse WebWorkerClient::request_image_decoder_connection()
+{
+    // NB: A thread is part of its process, and what the decoder of a process may see goes by all that the process hosts.
+    auto host = m_host.strong_ref();
+    if (!host)
+        return Optional<IPC::TransportHandle> {};
+    return host->connect_new_image_decoder_client(m_image_decoder_client_generation);
+}
+
+void WebWorkerClient::did_release_image_decoder()
+{
+    if (auto generation = exchange(m_image_decoder_client_generation, {}); generation.has_value())
+        ImageDecoderManager::the().process_did_release_decoder(child_id(), *generation);
+}
+
+Messages::WebWorkerClient::RequestCompositorConnectionResponse WebWorkerClient::request_compositor_connection()
+{
+    auto handle = Application::the().connect_new_compositor_canvas_client();
+    if (handle.is_error()) {
+        warnln("Unable to connect a worker to the compositor: {}", handle.error());
+        return Optional<IPC::TransportHandle> {};
+    }
+    return handle.release_value();
+}
+
 void WebWorkerClient::did_post_broadcast_channel_message(Web::HTML::PostedBroadcastChannelMessage message)
 {
     if (auto settings = hosted_environment(message.environment_id); settings.has_value())
-        WorkerProcessManager::the().post_broadcast_channel_message(move(message), *settings, pid(), m_is_private);
+        WorkerAgentManager::the().post_broadcast_channel_message(move(message), *settings, *this, m_is_private);
 }
 
-Messages::WebWorkerClient::StartWorkerAgentResponse WebWorkerClient::start_worker_agent(Web::HTML::WorkerAgentStartRequest request)
+void WebWorkerClient::register_dedicated_worker(Web::HTML::WorkerAgentStartRequest request, IPC::TransportHandle worker_transport)
 {
     auto outside_settings = hosted_environment(request.outside_settings.id);
-    return WorkerProcessManager::the().start_worker_agent(*this, outside_settings, move(request));
-}
-
-void WebWorkerClient::close_worker_agent(Web::HTML::WorkerAgentId agent_id, Web::HTML::WorkerAgentOwnerToken owner_token)
-{
-    WorkerProcessManager::the().close_worker_agent(*this, agent_id, owner_token);
+    WorkerAgentManager::the().register_dedicated_worker(*this, outside_settings, move(request), move(worker_transport));
 }
 
 }

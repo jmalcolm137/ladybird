@@ -1,11 +1,7 @@
 add_subdirectory("test-web")
 
 if (BUILD_TESTING AND NOT WIN32)
-    add_test(
-        NAME TestWebDriverHTTPErrorResponses
-        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-webdriver-http-error-responses.py $<TARGET_FILE:WebDriver>
-    )
-    set_tests_properties(TestWebDriverHTTPErrorResponses PROPERTIES TIMEOUT 120)
+    ladybird_python_test(test-webdriver-http-error-responses.py ARGS $<TARGET_FILE:WebDriver>)
 endif()
 
 if (BUILD_BROWSER_TESTS_ONLY)
@@ -16,16 +12,11 @@ ladybird_test_suite(LibWeb)
 
 set(TEST_SOURCES
     BenchmarkDisplayListRecording.cpp
-    TestAudioWorkletPipe.cpp
     TestBlobBytes.cpp
     TestContentBlocker.cpp
-    TestControlMessageQueue.cpp
     TestCSSDecodeBytes.cpp
     TestCSSIDSpeed.cpp
-    TestCSSInheritedProperty.cpp
     TestCSSPropertyList.cpp
-    TestDownloadReader.cpp
-    TestDump.cpp
     TestEventLoop.cpp
     TestFaviconDecoding.cpp
     TestFetchAlgorithms.cpp
@@ -42,10 +33,8 @@ set(TEST_SOURCES
     TestHighResolutionTime.cpp
     TestHTMLTokenizer.cpp
     TestImageData.cpp
-    TestInitialLoadTracker.cpp
     TestInlineStyle.cpp
     TestLoaderConfig.cpp
-    TestMicrosyntax.cpp
     TestMimeSniff.cpp
     TestNumbers.cpp
     TestSecureContexts.cpp
@@ -53,7 +42,6 @@ set(TEST_SOURCES
     TestSharedCompiledStyleSheet.cpp
     TestSimpleRealm.cpp
     TestSourceHighlighter.cpp
-    TestStorageAreaMirror.cpp
     TestStructuredSerializeCorpus.cpp
     TestStructuredSerializeDurability.cpp
     TestStructuredSerializeFormat.cpp
@@ -72,8 +60,6 @@ if (NOT WIN32)
         TestCSSSyntaxParser.cpp
         TestLengthAbsolutizeParity.cpp
         TestStylePropertyMetadataParity.cpp
-        TestStyleStructRef.cpp
-        TestStyleValueEquality.cpp
     )
 endif()
 
@@ -84,18 +70,20 @@ target_sources(TestLibWeb PRIVATE
 )
 target_link_libraries(TestLibWeb PRIVATE LibCompositing LibCrypto LibGC LibGfx LibHTTP LibIPC LibJS LibRequests LibThreading LibURL LibWeb LibWebCommon LibWebView)
 
+# NB: This one needs a process of its own: its agents must not share one with the persistent main-thread VM of the suite.
+ladybird_test(TestAgentThreads.cpp LibWeb LIBS LibCore LibGC LibGfx LibIPC LibJS LibThreading LibURL LibWeb LibWebCommon)
+
 # The check reads the symbols of the build's objects with nm, which can't see into an LTO build's bitcode objects and
 # isn't the toolchain's symbol reader on Windows.
 if (BUILD_TESTING AND NOT WIN32 AND NOT CMAKE_INTERPROCEDURAL_OPTIMIZATION)
-    add_test(
+    ladybird_python_test("${LADYBIRD_SOURCE_DIR}/Meta/check-dead-rust-exports.py"
         NAME TestDeadRustExports
-        COMMAND ${Python3_EXECUTABLE} ${LADYBIRD_SOURCE_DIR}/Meta/check-dead-rust-exports.py
+        ARGS
             --nm ${CMAKE_NM}
             --compile-commands ${CMAKE_BINARY_DIR}/compile_commands.json
             --source-root ${LADYBIRD_SOURCE_DIR}
             $<TARGET_FILE:libweb_bindings_rust>
-            $<TARGET_FILE:libweb_content_blocker_rust>
-    )
+            $<TARGET_FILE:libweb_content_blocker_rust>)
 endif()
 
 

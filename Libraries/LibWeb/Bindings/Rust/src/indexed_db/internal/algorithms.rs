@@ -30,9 +30,8 @@ use crate::bindings::{CallContext, Exception, MustNotThrow, WebIdlResult};
 use crate::dom::event::EventInit;
 use crate::file_api::blob::{AnyBlob, Blob};
 use crate::file_api::file::File;
-use crate::indexed_db::cpp::{
-    DomException, create_dom_string_list, structured_deserialize, structured_serialize_for_storage,
-};
+use crate::html::structured_serialize::{structured_deserialize_for_storage, structured_serialize_for_storage};
+use crate::indexed_db::cpp::{DomException, create_dom_string_list};
 use crate::indexed_db::idb_cursor::{AnyIDBCursor, IDBCursorDirection};
 use crate::indexed_db::idb_database::{ConnectionState, IDBDatabase, IDBTransactionDurability};
 use crate::indexed_db::idb_key_range::{IDBKeyRange, key_range_from_value};
@@ -48,7 +47,8 @@ use crate::indexed_db::internal::function::{
 use crate::indexed_db::internal::index::{Index, IndexRef};
 use crate::indexed_db::internal::key::{Key, KeyType, code_unit_order};
 use crate::indexed_db::internal::object_store::{ObjectStore, ObjectStoreRef};
-use crate::indexed_db::internal::storage::{ConnectionQueueRef, StorageKey, storage};
+use crate::indexed_db::internal::storage::{ConnectionQueueRef, storage};
+use crate::storage_api::storage_key::StorageKey;
 
 /// A key path, https://w3c.github.io/IndexedDB/#key-path-construct: a string or a list of strings.
 #[derive(Clone)]
@@ -358,6 +358,7 @@ pub(crate) fn fire_a_version_change_event(
     // 1. Let event be the result of creating an event using IDBVersionChangeEvent.
     // 2. Set event’s type attribute to e.
     let event = IDBVersionChangeEvent::create(vm, realm, &Utf16String::from_utf8(event_name), &event_init);
+    event.event().set_is_trusted(true);
 
     // 6. Let legacyOutputDidListenersThrowFlag be false.
     // 7. Dispatch event at target with legacyOutputDidListenersThrowFlag.
@@ -1220,7 +1221,7 @@ pub(crate) fn clone_in_realm(cx: &CallContext, value: Value, transaction: Ref<ID
         let serialized = structured_serialize_for_storage(cx, value)?;
 
         // 4. Let clone be ? StructuredDeserialize(serialized, targetRealm).
-        let clone = structured_deserialize(cx, &serialized)?;
+        let clone = structured_deserialize_for_storage(cx, &serialized)?;
 
         // 5. Set transaction’s state to active.
         // NB: This is handled by the scope guard after step 2.
@@ -1956,7 +1957,7 @@ pub(crate) fn store_a_record_into_an_object_store(
     //    The record is stored in the object store’s list of records such that the list is sorted according to the key of the records in ascending order.
     let record = ObjectStoreRecord {
         key: key.clone(),
-        value: structured_serialize_for_storage(cx, value).must(),
+        value: Rc::from(structured_serialize_for_storage(cx, value).must()),
     };
     store.store_a_record(vm, record);
 
@@ -1978,7 +1979,7 @@ pub(crate) fn store_a_record_into_an_object_store(
 //         corrupt or written by a newer format version, so treat failure as the "error occurs while
 //         reading the value from the underlying storage" case: a "NotReadableError" DOMException.
 fn deserialize_a_stored_record(cx: &CallContext, serialized: &StorageSerializationRecord) -> WebIdlResult<Value> {
-    structured_deserialize(cx, serialized).map_err(|_| {
+    structured_deserialize_for_storage(cx, serialized).map_err(|_| {
         Exception::Dom(
             "NotReadableError",
             Utf16String::from_utf8("Stored value could not be read"),

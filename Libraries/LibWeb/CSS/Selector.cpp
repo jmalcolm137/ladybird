@@ -50,16 +50,6 @@ Selector::~Selector()
     SelectorFFI::rust_selector_destroy(m_rust_selector);
 }
 
-bool Selector::contains_the_nesting_selector() const
-{
-    return SelectorFFI::rust_selector_contains_nesting(m_rust_selector);
-}
-
-bool Selector::contains_pseudo_class(PseudoClass pseudo_class) const
-{
-    return SelectorFFI::rust_selector_contains_pseudo_class(m_rust_selector, to_underlying(pseudo_class));
-}
-
 bool Selector::contains_named_namespace() const
 {
     return SelectorFFI::rust_selector_contains_named_namespace(m_rust_selector);
@@ -83,8 +73,8 @@ Optional<SelectorList> parse_selector_list_in_rust(Utf16View input, RustNamespac
 {
     auto* parsed = SelectorFFI::rust_selector_parse_with_namespace_context(
         {
-            .ascii = input.has_ascii_storage() ? reinterpret_cast<u8 const*>(input.ascii_span().data()) : nullptr,
-            .utf16 = input.has_ascii_storage() ? nullptr : reinterpret_cast<u16 const*>(input.utf16_span().data()),
+            .latin1 = input.has_latin1_storage() ? input.latin1_span().data() : nullptr,
+            .utf16 = input.has_latin1_storage() ? nullptr : reinterpret_cast<u16 const*>(input.utf16_span().data()),
             .length = input.length_in_code_units(),
         },
         namespaces.handle(), is_relative, is_forgiving);

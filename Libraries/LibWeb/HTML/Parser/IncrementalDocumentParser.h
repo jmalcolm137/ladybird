@@ -18,6 +18,7 @@
 #include <LibURL/URL.h>
 #include <LibWeb/Export.h>
 #include <LibWeb/Forward.h>
+#include <LibWeb/HTML/Parser/HTMLEncodingDetection.h>
 #include <LibWeb/HTML/Parser/HTMLParser.h>
 #include <LibWebCommon/MimeSniff/MimeType.h>
 
@@ -39,6 +40,8 @@ private:
     virtual void visit_edges(Cell::Visitor&) override;
 
     void initialize_parser(ReadonlyBytes sniff_bytes);
+    void continue_prescan(bool input_complete);
+    void set_encoding(StringView encoding, EncodingConfidence);
     void start_incremental_read();
     void process_body_chunk(ByteBuffer);
     void process_end_of_body();
@@ -47,6 +50,7 @@ private:
     ErrorOr<bool> change_encoding(StringView);
 
     void feed_parser();
+    void queue_task_to_feed_parser();
     void finish_body();
     void decode_and_process(size_t length);
     void release_encoding_change_buffers();
@@ -76,7 +80,14 @@ private:
     size_t m_decoded_byte_count { 0 };
     Utf16StringBuilder m_source;
     bool m_body_is_exhausted { false };
+    bool m_has_queued_task_to_feed_parser { false };
+    u32 m_times_yielded_to_event_loop { 0 };
     bool m_processed_implied_eof { false };
+
+    // Finds an encoding declaration in m_input_bytes, as far as m_prescanned_byte_count, before the parser starts.
+    OwnPtr<EncodingDeclarationPrescan> m_prescan;
+    size_t m_prescanned_byte_count { 0 };
+    ByteBuffer m_sniff_bytes;
 };
 
 }

@@ -22,15 +22,15 @@ set(SOURCES
     Font/WOFF/Loader.cpp
     Font/WOFF2/Loader.cpp
     FontCascadeList.cpp
+    GlyphOutlines.cpp
     GpuDeviceIdentity.cpp
     LinuxDmaBufHandle.cpp
     DecodedImageFrame.cpp
     RustProcessState.cpp
     ImageFormats/JPEGWriter.cpp
     ImageFormats/PNGWriter.cpp
-    PaintStyle.cpp
     Palette.cpp
-    Path.cpp
+    PathData.cpp
     Point.cpp
     Rect.cpp
     SharedImage.cpp

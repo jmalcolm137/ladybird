@@ -9,6 +9,7 @@
 #include <AK/Optional.h>
 #include <AK/String.h>
 #include <AK/Utf16String.h>
+#include <LibGC/Forward.h>
 #include <LibIPC/Forward.h>
 #include <LibWebCommon/Bindings/Navigation.h>
 #include <LibWebCommon/ContentSecurityPolicy/Directives/NavigationType.h>
@@ -68,6 +69,7 @@ struct NavigationPopulationResult {
     Optional<StorageSerializationRecord> classic_history_api_state;
     Optional<SessionHistoryDocumentStateDescriptor> replacement_document_state;
     bool resource_cleared { false };
+    Optional<HTTP::Cookie::SameSiteStatus> navigation_same_site_status {};
     // The origin the UI process gives a document created for inline content in place of the response.
     Optional<URL::Origin> inline_content_origin {};
     Optional<CrossProcessId> document_id {};
@@ -110,3 +112,5 @@ template<>
 WEBCOMMON_API ErrorOr<Web::HTML::HistoryNavigationPopulation> decode(Decoder&);
 
 }
+
+GC_UNTRACED_CAPTURE(Web::HTML::NavigationPopulationRequest);

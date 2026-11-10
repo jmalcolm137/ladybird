@@ -9,6 +9,7 @@
 #include <AK/TypeCasts.h>
 #include <LibHTTP/HTTP.h>
 #include <LibHTTP/HeaderList.h>
+#include <LibJS/HostClassBuilder.h>
 #include <LibJS/Runtime/ArrayBuffer.h>
 #include <LibJS/Runtime/PrimitiveString.h>
 #include <LibJS/Runtime/TypedArray.h>
@@ -31,6 +32,8 @@
 
 namespace Web::Fetch {
 
+extern "C" void* web_rust_body_text_stream(JSVM*, void* realm, void* stream);
+
 // convertBytesToJSValue is an algorithm that takes a byte sequence and returns a JavaScript value or throws an exception
 using ConvertBytesToJSValueCallback = GC::Ref<GC::Function<WebIDL::ExceptionOr<JS::Value>(ByteBuffer bytes)>>;
 
@@ -46,7 +49,7 @@ static void consume_body(BodyMixin const& object, GC::Ref<WebIDL::Promise> promi
 
     // 3. Let errorSteps given error be to reject promise with error.
     // NOTE: `promise` and `realm` is protected by GC::HeapFunction.
-    auto error_steps = GC::create_function(GC::Heap::the(), [promise, &realm](JS::Value error) {
+    auto error_steps = GC::create_function(GC::Heap::the(), GC::captures(promise, realm), [](auto& promise, auto& realm, JS::Value error) {
         // AD-HOC: An execution context is required for Promise's reject function.
         HTML::TemporaryExecutionContext execution_context { realm };
         WebIDL::reject_promise(promise, error);
@@ -55,7 +58,7 @@ static void consume_body(BodyMixin const& object, GC::Ref<WebIDL::Promise> promi
     // 4. Let successSteps given a byte sequence data be to resolve promise with the result of running convertBytesToJSValue
     //    with data. If that threw an exception, then run errorSteps with that exception.
     // NOTE: `promise`, `realm` and `object` is protected by GC::HeapFunction.
-    auto success_steps = GC::create_function(GC::Heap::the(), [promise, &realm, convert_bytes_to_js_value](ByteBuffer data) {
+    auto success_steps = GC::create_function(GC::Heap::the(), GC::captures(promise, realm, convert_bytes_to_js_value), [](auto& promise, auto& realm, auto& convert_bytes_to_js_value, ByteBuffer data) {
         auto& vm = realm.vm();
 
         // AD-HOC: An execution context is required for Promise's reject function and JSON.parse.
@@ -118,7 +121,7 @@ void BodyMixin::array_buffer(GC::Ref<WebIDL::Promise> promise) const
     auto& realm = WebIDL::promise_realm(*promise);
     // The arrayBuffer() method steps are to return the result of running consume body with this and
     // the following step given a byte sequence bytes:
-    consume_body(*this, promise, GC::create_function(GC::Heap::the(), [&realm](ByteBuffer bytes) -> WebIDL::ExceptionOr<JS::Value> {
+    consume_body(*this, promise, GC::create_function(GC::Heap::the(), GC::captures(realm), [](auto& realm, ByteBuffer bytes) -> WebIDL::ExceptionOr<JS::Value> {
         // return the result of creating an ArrayBuffer from bytes in this’s relevant realm.
         // NOTE: The above method can reject with a RangeError.
         return JS::ArrayBuffer::create(realm, move(bytes));
@@ -131,10 +134,10 @@ void BodyMixin::blob(GC::Ref<WebIDL::Promise> promise) const
     auto& realm = WebIDL::promise_realm(*promise);
     // The blob() method steps are to return the result of running consume body with this and
     // the following step given a byte sequence bytes:
-    consume_body(*this, promise, GC::create_function(GC::Heap::the(), [&realm, this](ByteBuffer bytes) -> WebIDL::ExceptionOr<JS::Value> {
+    consume_body(*this, promise, GC::create_function(GC::Heap::the(), GC::captures(realm, this_impl()), [](auto& realm, auto& object, ByteBuffer bytes) -> WebIDL::ExceptionOr<JS::Value> {
         // return a Blob whose contents are bytes and whose type attribute is the result of get the MIME type with this.
         // NOTE: If extracting the mime type returns failure, other browsers set it to an empty string - not sure if that's spec'd.
-        auto mime_type = mime_type_impl();
+        auto mime_type = as<BodyMixin>(object).mime_type_impl();
         auto mime_type_string = mime_type.has_value() ? mime_type->serialized() : String {};
         auto blob = FileAPI::Blob::create(move(bytes), move(mime_type_string));
         return Bindings::wrap(Bindings::host_defined_wrapper_world(realm), realm, blob);
@@ -147,7 +150,7 @@ void BodyMixin::bytes(GC::Ref<WebIDL::Promise> promise) const
     auto& realm = WebIDL::promise_realm(*promise);
     // The bytes() method steps are to return the result of running consume body with this and
     // the following step given a byte sequence bytes:
-    consume_body(*this, promise, GC::create_function(GC::Heap::the(), [&realm](ByteBuffer bytes) -> WebIDL::ExceptionOr<JS::Value> {
+    consume_body(*this, promise, GC::create_function(GC::Heap::the(), GC::captures(realm), [](auto& realm, ByteBuffer bytes) -> WebIDL::ExceptionOr<JS::Value> {
         // return the result of creating a Uint8Array from bytes in this’s relevant realm.
         // NOTE: The above method can reject with a RangeError.
         auto bytes_length = bytes.size();
@@ -162,9 +165,9 @@ void BodyMixin::form_data(GC::Ref<WebIDL::Promise> promise) const
     auto& realm = WebIDL::promise_realm(*promise);
     // The formData() method steps are to return the result of running consume body with this and
     // the following steps given a byte sequence bytes:
-    consume_body(*this, promise, GC::create_function(GC::Heap::the(), [&realm, this](ByteBuffer bytes) -> WebIDL::ExceptionOr<JS::Value> {
+    consume_body(*this, promise, GC::create_function(GC::Heap::the(), GC::captures(realm, this_impl()), [](auto& realm, auto& object, ByteBuffer bytes) -> WebIDL::ExceptionOr<JS::Value> {
         // 1. Let mimeType be the result of get the MIME type with this.
-        auto mime_type = mime_type_impl();
+        auto mime_type = as<BodyMixin>(object).mime_type_impl();
 
         // 2. If mimeType is non-null, then switch on mimeType’s essence and run the corresponding steps:
         if (mime_type.has_value()) {
@@ -203,7 +206,7 @@ void BodyMixin::json(GC::Ref<WebIDL::Promise> promise) const
     auto& realm = WebIDL::promise_realm(*promise);
     // The json() method steps are to return the result of running consume body with this and parse JSON from bytes.
     // NOTE: The above method can reject with a SyntaxError.
-    consume_body(*this, promise, GC::create_function(GC::Heap::the(), [&realm](ByteBuffer bytes) -> WebIDL::ExceptionOr<JS::Value> {
+    consume_body(*this, promise, GC::create_function(GC::Heap::the(), GC::captures(realm), [](auto& realm, ByteBuffer bytes) -> WebIDL::ExceptionOr<JS::Value> {
         return Infra::parse_json_bytes_to_javascript_value(realm, bytes);
     }));
 }
@@ -213,10 +216,20 @@ void BodyMixin::text(GC::Ref<WebIDL::Promise> promise) const
 {
     auto& realm = WebIDL::promise_realm(*promise);
     // The text() method steps are to return the result of running consume body with this and UTF-8 decode.
-    consume_body(*this, promise, GC::create_function(GC::Heap::the(), [&realm](ByteBuffer bytes) -> WebIDL::ExceptionOr<JS::Value> {
+    consume_body(*this, promise, GC::create_function(GC::Heap::the(), GC::captures(realm), [](auto& realm, ByteBuffer bytes) -> WebIDL::ExceptionOr<JS::Value> {
         auto text = MUST(TextCodec::utf8_decode_to_utf16(bytes));
         return JS::PrimitiveString::create(realm.vm(), move(text));
     }));
+}
+
+// https://fetch.spec.whatwg.org/#dom-body-textstream
+WebIDL::ExceptionOr<GC::Ref<Streams::ReadableStream>> BodyMixin::text_stream(JS::Realm& realm) const
+{
+    // 1. If this is unusable, then throw a TypeError.
+    if (is_unusable())
+        return WebIDL::SimpleException { WebIDL::SimpleExceptionType::TypeError, "Body is unusable"_utf16 };
+
+    return GC::Ref { *static_cast<Streams::ReadableStream*>(web_rust_body_text_stream(JS::HostABI::vm_to_abi(realm.vm()), &realm, body().ptr())) };
 }
 
 // https://andreubotella.github.io/multipart-form-data/#parse-a-multipart-form-data-name
@@ -354,7 +367,7 @@ static MultipartParsingErrorOr<MultiPartFormDataHeader> parse_multipart_form_dat
 }
 
 // https://andreubotella.github.io/multipart-form-data/#multipart-form-data-parser
-MultipartParsingErrorOr<GC::ConservativeVector<XHR::FormDataEntry>> parse_multipart_form_data(StringView input, MimeSniff::MimeType const& mime_type)
+MultipartParsingErrorOr<GC::RootVector<XHR::FormDataEntry>> parse_multipart_form_data(StringView input, MimeSniff::MimeType const& mime_type)
 {
     // 1. Assert: mimeType’s essence is "multipart/form-data".
     VERIFY(mime_type.essence() == "multipart/form-data"sv);
@@ -366,7 +379,7 @@ MultipartParsingErrorOr<GC::ConservativeVector<XHR::FormDataEntry>> parse_multip
     auto boundary = maybe_boundary.release_value();
 
     // 3. Let entry list be an empty entry list.
-    GC::ConservativeVector<XHR::FormDataEntry> entry_list;
+    GC::RootVector<XHR::FormDataEntry> entry_list;
 
     // 4. Let position be a pointer to a byte in input, initially pointing at the first byte.
     GenericLexer lexer(input);

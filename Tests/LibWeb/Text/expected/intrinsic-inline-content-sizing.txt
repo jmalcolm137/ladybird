@@ -1,15 +1,15 @@
 words: 160x20, 50x60, 160x20, 120x40
 collapsed whitespace: 100x20, 50x40, 100x20, 100x20
 inline edges: 178x20, 59x60, 178x20, 120x40
-adjacent inline edges: 111x20, 61x40, 111x20, 111x20
+adjacent inline edges: 114x20, 64x40, 114x20, 114x20
 inline edges before break: 50x40, 50x40, 50x40, 50x40
-inline edges before absolute: 50x20, 50x20, 50x20, 50x20
+inline edges before absolute: 56x20, 56x20, 56x20, 56x20
 nowrap: 160x20, 160x20, 160x20, 160x20
 pre: 135x40, 135x40, 135x40, 135x40
 pre-wrap: 140x40, 50x100, 140x40, 120x60
 pre-line: 100x40, 50x60, 100x40, 100x40
 break-spaces: 130x40, 60x60, 130x40, 120x40
-mixed whitespace: 230x40, 110x40, 230x40, 120x40
+mixed whitespace: 230x20, 110x40, 230x20, 120x40
 forced breaks: 100x60, 50x80, 100x60, 100x60
 indent: 173x20, 63x60, 173x20, 120x40
 negative indent: 147x20, 50x60, 147x20, 120x40
@@ -21,8 +21,8 @@ nested blocks: 160x40, 50x80, 160x40, 120x60
 block interruption: 110x60, 110x60, 110x60, 110x60
 atomic constraints: 156x78, 96x98, 156x78, 120x98
 atomic percentages: 160x82.75, 50x67, 160x82.75, 120x77.5625
-negative margins: 112x20, 62x40, 112x20, 112x20
-saturated advances: 80x20, 80x20, 80x20, 80x20
+negative margins: 112x20, 42x60, 112x20, 112x20
+saturated advances: 80x20, 50x40, 80x20, 80x20
 floats: 200x20, 50x80, 200x20, 120x40
 float clearance: 90x40, 50x60, 90x40, 90x40
 absolute: 100x20, 50x40, 100x20, 100x20
@@ -36,7 +36,7 @@ aspect ratio: 130x40, 80x60, 130x40, 120x60
 percentage aspect ratio: 100x50, 50x50, 100x50, 120x100
 inline flex: 210x20, 100x60, 210x20, 120x60
 inline grid: 210x20, 100x60, 210x20, 120x60
-inline table: 210x20, 100x40, 210x20, 120x40
+inline table: 210x20, 100x60, 210x20, 120x60
 containment: 35x25, 35x25, 35x25, 35x25
 scroll container: 160x20, 50x60, 160x20, 120x40
 hanging indent: 160x20, 63x60, 160x20, 120x40
@@ -104,8 +104,8 @@ floating table: 152x22, 52x62, 152x22, 120x42
 floating table with collapsed borders: 166x30, 116x50, 166x30, 120x50
 percentage height table cell: 102x80, 52x80, 102x80, 102x80
 row flex: 161x20, 111x40, 161x20, 120x40
-row flex with flex factors: 185x20, 110x40, 185x20, 120x40
-row flex with item constraints: 190x40, 190x40, 190x40, 190x40
+row flex with flex factors: 150x40, 100x40, 150x40, 120x40
+row flex with item constraints: 170x40, 170x40, 170x40, 170x40
 row flex with a scroll container item: 140x20, 140x20, 140x20, 140x20
 row flex with a percentage gap: 90x20, 90x20, 90x20, 90x20
 wrapping row flex: 208x20, 50x88, 208x20, 120x44
@@ -161,9 +161,9 @@ vertical alignment, fit-content: [100,70,20,5,40,20]
 mixed line heights, min-content: [120,90,20,10,80,40]
 mixed line heights, max-content: [140,60,20,10,80,40]
 mixed line heights, fit-content: [140,60,20,10,80,40]
-tabs, min-content: [80,60]
-tabs, max-content: [160,30]
-tabs, fit-content: [160,30]
+tabs, min-content: [160,60]
+tabs, max-content: [240,30]
+tabs, fit-content: [240,30]
 decorated inline, min-content: [87,60,20,-2,67,34,0,28,27,34]
 decorated inline, max-content: [154,30,20,-2,94,34]
 decorated inline, fit-content: [154,30,20,-2,94,34]

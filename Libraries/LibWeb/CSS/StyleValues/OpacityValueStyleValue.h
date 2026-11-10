@@ -13,13 +13,7 @@ namespace Web::CSS {
 
 class OpacityValueStyleValue final : public StyleValueWithDefaultOperators<OpacityValueStyleValue> {
 public:
-    static ValueComparingNonnullRefPtr<OpacityValueStyleValue const> create(ValueComparingNonnullRefPtr<StyleValue const> value)
-    {
-        return adopt_ref(*new (nothrow) OpacityValueStyleValue(StyleValueFFI::rust_style_value_create_opacity_value(StyleValueFFI::rust_style_value_retain(value->rust_style_value_data()))));
-    }
     virtual ~OpacityValueStyleValue() override = default;
-
-    GC::Ref<CSSStyleValue> reify(Utf16FlyString const& associated_property) const;
 
 private:
     friend class StyleValue;

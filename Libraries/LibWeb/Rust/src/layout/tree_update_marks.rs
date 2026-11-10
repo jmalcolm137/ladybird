@@ -83,9 +83,9 @@ impl LayoutTreeUpdateMarks {
         node.text_index().is_none() && self.get(node) & CHILD_NEEDS != 0
     }
 
-    /// Fold one mark into the node's, answering whether its own bit changed. That answer is what
-    /// tells the mark site it has a transition to widen from. Once a reason that forbids reuse
-    /// arrives, a later one cannot narrow it back.
+    /// Fold one mark into the node's, answering whether its own bit changed, or the box it marked for a narrower rebuild
+    /// no longer stays. That answer is what tells the mark site it has a transition to widen from. Once a reason that
+    /// forbids reuse arrives, a later one cannot narrow it back.
     pub(crate) fn merge(&mut self, node: StyleNodeID, value: bool, reuse_reason: u8) -> bool {
         let reuse_reason = reuse_reason & layout_tree_update_reuse_reason::ALL;
         let mut changed = false;
@@ -94,6 +94,7 @@ impl LayoutTreeUpdateMarks {
             let rest = marks & !(NEEDS | layout_tree_update_reuse_reason::ALL);
             if (marks & NEEDS != 0) == value {
                 let merged = if reuse_reason == 0 || reasons == 0 {
+                    changed = value && reasons != 0;
                     0
                 } else {
                     reasons | reuse_reason
@@ -317,8 +318,7 @@ impl LayoutNodeArena {
         let Some(style_node) = node.or(document) else {
             return;
         };
-        if mark.is_child_list_insertion
-            && let Some(element) = node
+        if let Some(element) = node
             && let Some(owner) = self.first_letter_owner_covering(element)
             && owner != element
         {
@@ -384,7 +384,7 @@ impl LayoutNodeArena {
     }
 
     /// The `::first-letter` owner on or above the element `element` whose first letter its box holds, or that has no
-    /// first-letter box, whose rebuild an insertion under `element` reaches. See
+    /// first-letter box, whose rebuild a rebuild of `element` reaches: it alone finds the letter again. See
     /// `DOM::Node::first_letter_owner_for_layout_subtree_from`.
     fn first_letter_owner_covering(&self, element: StyleNodeID) -> Option<StyleNodeID> {
         let layout_node = self.bound_row(element);
@@ -404,10 +404,7 @@ impl LayoutNodeArena {
                         return Some(current);
                     }
                 }
-                ancestor = engine
-                    .tree()
-                    .parent(current)
-                    .map(|parent| engine.tree().host_of(parent).unwrap_or(parent));
+                ancestor = engine.parent_element_or_host(current);
             }
             None
         })
@@ -433,9 +430,8 @@ pub extern "C" fn render_state_apply_layout_tree_update_mark(
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 pub struct FfiBoxMarks {
-    /// The box lays out again, and its ancestors with it where `layout_update_through_ancestors`.
+    /// The box lays out again, and its ancestors with it.
     pub layout_update: bool,
-    pub layout_update_through_ancestors: bool,
     /// The box paints again, and is hit-tested again where `repaint_hit_testing`. A text box repaints its containing
     /// block.
     pub repaint: bool,
@@ -501,7 +497,6 @@ impl FfiBoxMarks {
     /// later DOM paint facts replace the earlier ones.
     pub(crate) fn merge(&mut self, later: Self) {
         self.layout_update |= later.layout_update;
-        self.layout_update_through_ancestors |= later.layout_update_through_ancestors;
         self.repaint |= later.repaint;
         self.repaint_hit_testing |= later.repaint_hit_testing;
         self.repaint_subtree |= later.repaint_subtree;
@@ -533,7 +528,6 @@ impl FfiBoxMarks {
     pub(crate) fn is_empty(&self) -> bool {
         let Self {
             layout_update,
-            layout_update_through_ancestors: _,
             repaint,
             repaint_hit_testing,
             repaint_subtree,
@@ -605,7 +599,7 @@ impl FfiBoxMarks {
             }
         }
         if self.layout_update {
-            arena.set_needs_layout_update(row, self.layout_update_through_ancestors);
+            arena.set_needs_layout_update(row, true);
         }
         if self.has_dom_paint_facts {
             arena.set_node_dom_paint_facts(row, self.dom_paint_facts);
@@ -664,7 +658,7 @@ fn repaint_subtree(arena: &mut LayoutNodeArena, row: NodeSlotId) {
 }
 
 /// The row paints again, and the root's with it where the root paints the body's propagated background.
-fn repaint(arena: &mut LayoutNodeArena, row: NodeSlotId, includes_hit_testing: bool) {
+pub(crate) fn repaint(arena: &mut LayoutNodeArena, row: NodeSlotId, includes_hit_testing: bool) {
     if !arena.paintable_row_is_populated(row) {
         return;
     }
@@ -736,8 +730,10 @@ mod tests {
             marks.reuse_reasons(element),
             CHILD_LIST_INSERTION | PSEUDO_ELEMENT_CHANGE
         );
-        assert!(!marks.merge(element, true, 0));
+        // NB: The box the marks kept goes now, which what the mark site widens from has to hear of.
+        assert!(marks.merge(element, true, 0));
         assert_eq!(marks.reuse_reasons(element), 0);
+        assert!(!marks.merge(element, true, 0));
         assert!(!marks.merge(element, true, CHILD_LIST_INSERTION));
         assert_eq!(marks.reuse_reasons(element), 0);
         assert!(marks.needs(element));

@@ -29,6 +29,10 @@ interface Internals {
     DOMString setTimeZone(DOMString timeZone);
 
     undefined gc();
+
+    // How many worker agents are alive in this process. One that a worker's owner let go of still counts until its
+    // thread has shut it down.
+    unsigned long workerAgentCount();
     [CreatesPromise] Promise<undefined> gcAsync();
     // Discards every decoded image frame that can be decoded again, and returns how many were discarded.
     unsigned long long discardDecodedImageFrames();
@@ -36,11 +40,15 @@ interface Internals {
     // This does not work for values stored only in optimized locals or registers.
     undefined markAsGarbage(DOMString variableName);
     boolean wrapperIsPreserved(object object);
-    boolean hasActivityRoot(object object);
+    // Asks the global of the given document, or else the global of the object's realm.
+    boolean hasPendingActivity(object object, optional Document document);
     unsigned long long messagePortPendingOutgoingMessageCount(MessagePort port);
     unsigned long long htmlCollectionCacheGeneration(HTMLCollection collection);
     undefined failNextMessagePortTransfer(MessagePort port);
     boolean messagePortsAreDirectlyEntangled(MessagePort first, MessagePort second);
+    DOMString messagePortEntanglementKind(MessagePort port);
+    // True once the transport of the port closed, as it does when the port sees that its peer went.
+    boolean messagePortTransportIsClosed(MessagePort port);
     XMLHttpRequest createXMLHttpRequestForDocument(Document document);
     [ImplementedAs=hit_test_result] object hitTest(double x, double y);
     object? takeContextMenuRequest();
@@ -52,6 +60,10 @@ interface Internals {
     DOMString spellingErrorRanges(Node node);
     Promise<DOMString> checkSpellingForTesting(DOMString text);
     Promise<undefined> spellCheckSettled();
+
+    // Translation
+    undefined translatePage(DOMString targetLanguage);
+    Promise<undefined> translationSettled();
 
     // Writing suggestions
     Promise<DOMString> requestWritingSuggestionForTesting(DOMString text, unsigned long caretOffset);
@@ -102,14 +114,16 @@ interface Internals {
     undefined clickAndHold(double x, double y, optional unsigned short clickCount = 1, optional unsigned short button = 0, optional unsigned short modifiers = 0);
     [CreatesPromise] Promise<undefined> wheel(double x, double y, double deltaX, double deltaY, optional boolean precise = false, optional ScrollGesturePhase scrollGesturePhase = "none", optional WheelTicks ticks = {});
     // The scrolling state the compositor has installed from the frames rendered so far, its wheel routing admission,
-    // and how far, in CSS pixels, it presents the scroller past the edges of its scroll range. The scroller is the
-    // viewport if none is given.
+    // and where, in CSS pixels, it presents the scroller and how far past the edges of its scroll range. The scroller
+    // is the viewport if none is given.
     object compositorScrollState(optional Element? scroller = null);
     undefined pinch(double x, double y, double scaleDelta, optional unsigned short modifiers = 0);
     // Sends a pinch through the UI process as it sends the user's, so that the compositor zooms for it if it can.
-    undefined pinchThroughUIProcess(double x, double y, double scaleDelta);
+    undefined pinchThroughUIProcess(double x, double y, double scaleDelta, optional boolean continuesGesture = false);
     undefined resetZoom();
 
+    // The URL of the link the page asks its client to show as hovered, or null when it shows none.
+    DOMString? hoveredLink();
     DOMString currentCursor();
     // The color of one pixel of the current image cursor's bitmap, or null when the cursor is no image.
     DOMString? currentCursorPixel(long x, long y);
@@ -129,6 +143,9 @@ interface Internals {
     DOMString? generateTextFragmentURL(Range range, USVString currentURL);
     DOMString devtoolsGrip(any value);
     DOMString devtoolsProperties(any value);
+    DOMString devtoolsLog(sequence<any> arguments);
+    DOMString devtoolsLoggedProperties(unsigned long long objectId);
+    DOMString devtoolsLogTable(object tableData);
     sequence<DOMString>? completeConsoleInput(DOMString input);
 
     // Drive marked/preedit-text composition via the same path platform input methods use. setMarkedTextFromInputMethod
@@ -167,6 +184,10 @@ interface Internals {
     boolean hasCookieForURL(DOMString url, ByteString name, ByteString value);
 
     boolean setHttpMemoryCacheEnabled(boolean enabled);
+    // Whether two functions run the same compiled code, which compiles them if they did not run yet.
+    boolean functionsShareCode(any a, any b);
+    // Whether a classic script from the given URL is in the compiled script cache for this window's partition.
+    boolean compiledScriptCacheContains(DOMString url);
     boolean setDiskCacheEnabledForNavigations(boolean enabled);
     undefined simulateRequestServerConnectionLoss();
     undefined simulateWorkerRequestServerConnectionLoss();
@@ -201,6 +222,7 @@ interface Internals {
     DOMString getComputedLabel(Element element);
     DOMString getComputedAriaLevel(Element element);
     undefined setAccessibilityFocusTarget(Element element);
+    undefined setAccessibilityInterested();
     unsigned short getEchoServerPort();
     unsigned short getHttpsEchoServerPort();
 
@@ -222,23 +244,42 @@ interface Internals {
 
     DOMString dumpDisplayList();
     DOMString dumpAccessibilityTree();
+    // The per-character offsets that the accessibility tree reports for a text node, as space-separated "x,y" pairs.
+    DOMString accessibilityCharacterOffsets(Node node);
+    // The accessibility node data the UI process receives for a node and its exposed descendants, one line per node.
+    DOMString dumpAccessibilityNodeData(Node node);
+    // Each accessible name or description kept between builds of the accessibility tree that differs from what
+    // computing it again gives, one per line. Empty when every one is current.
+    DOMString accessibilityCachedTextMismatches();
+    // Each node whose accessibility data kept between builds of the tree differs from what computing it again gives,
+    // one per line. Empty when all of it is current.
+    DOMString accessibilityCachedRecordMismatches();
+    DOMString accessibilityCachedGeometryMismatches();
+    DOMString accessibilityChangeTrackingMismatches();
+    DOMString accessibilityLastChangeSize();
     DOMString dumpLayoutTree(Node node);
     DOMString dumpStackingContextTree();
     DOMString stackingContextStructureVerificationReport();
     DOMString dumpGCGraph();
+    DOMString heapCensus();
     DOMString dumpSessionHistory();
     DOMString dumpUIProcessSessionHistory();
     DOMString dumpUIProcessSessionHistoryWithoutUpdate();
     boolean captureSessionHistorySnapshot();
     boolean restoreCapturedSessionHistorySnapshot();
-    boolean registerSessionStoreTab();
-    DOMString dumpSessionStoreTabState();
+    boolean recordReportedSessionHistory();
+    DOMString dumpReportedSessionHistory();
     DOMString dumpSiteIsolationProcessTree();
     // Reports if the browser process has created a document for the iframe that it hasn't made active yet.
     boolean hasPopulatedDocument(HTMLIFrameElement iframe);
     // Whether the canvas drew content that it has not presented to the compositor yet.
     boolean canvasHasUnpresentedContent(HTMLCanvasElement canvas);
     undefined crashRemoteFrameProcesses();
+    long webContentProcessId();
+    // The documents this process has not collected yet, whether or not they are still displayed.
+    unsigned long documentCountInThisProcess();
+    // Closes this tab as the browser's close button does when it has no beforeunload check to run.
+    undefined closeTabThroughUIProcess();
     // Stops loading and reloads as the browser's Stop and Reload buttons do.
     undefined stopLoadingThroughUIProcess();
     undefined reloadThroughUIProcess();
@@ -247,6 +288,9 @@ interface Internals {
     // Traverses the history by a delta as the browser's Back and Forward buttons do, with no source document.
     undefined traverseHistoryThroughUIProcess(long delta);
     Promise<undefined> flushSessionHistoryTraversalQueue();
+    // Uses up this navigable's navigations and history updates until the state reset between tests, as if the page had
+    // just made as many as the rate limit allows.
+    undefined exhaustNavigationRateLimit();
 
     boolean hasHTMLParserEndState(Document document);
     boolean htmlParserBodyIsExhausted(Document document);
@@ -265,9 +309,24 @@ interface Internals {
     Promise<DOMString> requestPermission(DOMString name);
     Promise<undefined> setPermission(DOMString name, DOMString state);
     undefined setNextPermissionPromptOutcome(DOMString name, DOMString outcome, optional boolean held = false);
+    undefined setSystemMicrophoneAuthorization(DOMString authorization, optional DOMString answer = "authorized", optional boolean held = false);
+    undefined releaseSystemMicrophoneAnswer();
+    DOMString microphoneState();
+    // Whether this process has a capture waiting on the AudioServer for its device.
+    boolean audioCaptureIsPending();
     undefined releaseHeldPermissionPrompt(optional unsigned long waiters = 1);
     Promise<undefined> advancePermissionClock(unsigned long long milliseconds);
     sequence<DOMString> permissionCacheOrigins();
+
+    // What the UI process's recording notification backend has seen, as JSON: the notifications shown (with the
+    // browser's id of each), the ids closed, the pages focused by a click, and the URLs opened by a click on a
+    // notification whose page was gone. "{}" outside test-web.
+    DOMString notificationsStateForTesting();
+    // Acts on a shown notification as the user would: by its Notification object, or by the browser's id, for a
+    // notification whose page is gone.
+    undefined clickNotificationForTesting(Notification notification);
+    undefined clickNotificationByIdForTesting(unsigned long long browserNotificationId);
+    undefined dismissNotificationForTesting(Notification notification);
 
     InternalGamepad connectVirtualGamepad();
 
@@ -290,10 +349,18 @@ interface Internals {
     // Hands the clock lanes of the current document a tick at the given time, and waits until it has run.
     // With a viewport scroll offset, the compositor had scrolled the viewport down to it at the tick.
     undefined injectClockTick(double frameTimeMs, optional double viewportScrollY);
+    // As injectClockTick(), with the compositor having scrolled the given element to the given offset, in CSS pixels.
+    undefined injectClockTickScrollingElement(double frameTimeMs, Element scroller, double x, double y);
     // Hands the clock lanes of the current document a pointer move to the given point in CSS pixels as the compositor
     // would, beside the mouse event with the given input event id, if any, and waits until the tick that hovers what is
     // under it has run, at the given frame time, or now.
-    undefined injectHoverPointer(double x, double y, optional double frameTimeMs, optional unsigned long long inputEventId);
+    undefined injectHoverPointer(double x, double y, optional double frameTimeMs, optional unsigned long long inputEventId, optional unsigned long buttons = 0);
+    // Hands the clock lanes of the current document the pointer leaving it, and waits as injectHoverPointer() does.
+    undefined injectHoverPointerLeft(double frameTimeMs);
+    // Reports to the current document's navigable, as the compositor would, that a frame of a transform animation it
+    // runs moved content under the pointer at rest, or away from it, as of the given frame time.
+    undefined noteAnimatedContentMovedUnderPointer(double frameTimeMs);
+    undefined injectPointerRestsOnMovingContent(double frameTimeMs);
     // Queues a mouse move to the given point in CSS pixels, with the given mouse buttons held, as the UI process would
     // send it, which the next rendering update handles, and answers its input event id.
     unsigned long long queueMouseMove(double x, double y, optional unsigned long buttons = 0);
@@ -310,6 +377,12 @@ interface Internals {
     // The color, as a CSS color string, that the box of the element, or of its "::before", "::after" or "::marker"
     // pseudo-element, showed in the last frame a tick of a clock lane presented where the tick restyled it, or null.
     DOMString? presentedColor(Element element, optional DOMString pseudoElement);
+    // The text and elements the selection highlights in the fork of the document's clock lane, joined by " | ", each
+    // with the colors its ::selection styles give it, if any.
+    DOMString presentedSelection();
+    // The text and elements the selection highlights in what the host paints, joined by " | ", each with the colors its
+    // ::selection styles give it, if any.
+    DOMString paintedSelection();
     // The border box of the element in the last frame a clock tick presented.
     DOMRect? presentedBorderBox(Element element);
     // How many compositor animations drove the box of the element in the last frame a clock tick presented, or null
@@ -328,7 +401,9 @@ interface Internals {
     undefined synchronizeCompositor();
     // Keeps the next recording that flies in flight, before it reads its frame, until releaseHeldFrame(), or until a
     // read waits for it. With "layout", only the next rendering update's layout that flies, or recording, is held,
-    // before it reads anything.
+    // before it reads anything. With "style", the next style update that flies is held, before it reads anything.
+    // With "claim", the Render thread does not begin the next style update that flies, which the read that waits for it
+    // takes back and runs itself, and the event loop treats its rendering update as it treats any other.
     undefined holdNextFrame(optional DOMString hold = "");
     // What presented the last frame of the document's navigable: "commit" for a frame a rendering update committed,
     // "clock" for a tick of the document's clock lane, or "none" before the first frame.
@@ -361,11 +436,15 @@ interface Internals {
     // operation, counting calls into the Rust style core and callbacks it makes into C++.
     object styleFfiCounters();
     object styleEngineCounters();
+    // What the document's style engine holds on the heap, by owner, with the C++ style state its elements hold:
+    // { owners: { name: bytes }, elements, styledElements }.
+    object styleMemoryReport();
+    // What the style engines of the document and the documents in its frames hold on the heap, each allocation counted
+    // once however many of them share it.
+    unsigned long long styleMemoryOfFrames();
     unsigned long long styleRecordIdentity(Element element);
+    unsigned long long customPropertyEnvironmentIdentity(Element element);
     unsigned long long layoutStyleRecordIdentity(Element element);
-    unsigned long long beforeStyleRecordIdentity(Element element);
-    unsigned long long beforeLayoutStyleRecordIdentity(Element element);
-    unsigned long long paintStyleRecordIdentity(Element element);
     // Stable for the lifetime of a layout node, and zero when the DOM node has no principal
     // layout node. Useful for asserting that incremental tree builds preserve unaffected nodes.
     unsigned long long layoutNodeIdentity(Node node);
@@ -373,10 +452,27 @@ interface Internals {
     // Makes the document's render state panic answering this call, which waits for it: the WebContent process crashes.
     undefined panicRenderStateForTesting();
     unsigned long long layoutArenaShellCount();
-    double styleEngineMatchDocument();
+    // Styles the whole document from scratch in a cold pass, without installing anything, and reports what it measured
+    // and how its answers compared with the records installed.
+    object styleColdPass(optional boolean verify = true, optional unsigned long threads = 0);
+    // Reports what live style measured since it started, checking the records it holds against the records installed
+    // when asked to.
+    object styleLiveReport(optional boolean verify = true);
+    // Reports what live style did since the counters were last reset, on the render state the
+    // host writes. Keys: passes, fullPasses, styledElements, changedElements, hintedElements,
+    // hintedSubtrees, invalidationVisits, invalidationTests, coldPasses, sharedElements,
+    // reusedElements, indexBuilds, indexedEntries, compiledSelectors, userAgentIndexBuilds (see
+    // StyleCounter in pipeline/counters.rs).
+    object styleCounters();
+    // Zeroes the counters styleCounters() reports and forgets the last pass.
+    undefined resetStyleCounters();
+    // Reports the most recent pass of live style, with the passes after it that restyled what it
+    // left waiting on fonts, as { fullPass, styled, changed }: whether it restyled every element,
+    // the elements it styled, and those whose records it changed, each as its id, or its tag name
+    // without one, in tree order.
+    object styleLastPass();
     // Reports a snapshot of StyleEngine's matched rules for the whole document.
     DOMString styleEngineMatchedRules();
-    object styleEngineTransactionReactions();
     undefined resetStyleFfiCounters();
     // Returns, for each ComputedValues style value group of the given element, whether the
     // group payload is shared with the parent element, whether it is the default payload,
@@ -407,8 +503,26 @@ interface Internals {
     boolean mediaElementIsFetching(HTMLMediaElement element);
     boolean mediaElementIsPlayingAudio(HTMLMediaElement element);
     boolean documentIsPlayingAudio(Document document);
-    // Whether the UI process shows this window's tab as playing audio, which the AudioServer decides by what it hears.
+    // Whether the UI process shows this window's tab as playing audio: while the AudioServer has recently heard the tab,
+    // and for a while after.
     boolean tabIsPlayingAudio();
+    // Whether the AudioServer has recently heard this window's tab, whatever the tab shows.
+    boolean tabIsHeardPlayingAudio();
+    // Whether the UI process shows this window's tab as using the microphone: while the AudioServer holds a capture stream
+    // for the tab, and for a while after.
+    boolean tabIsUsingMicrophone();
+    // Whether the AudioServer holds a capture stream for this window's tab, whatever the tab shows.
+    boolean tabIsCapturingAudio();
+    // Has the UI process hear of a capture stream of this process whose label names none of its pages.
+    undefined reportAudioCaptureOfUnknownPage(boolean capturing);
+    // The ID of the page that shows this page's Picture-in-Picture window.
+    unsigned long long pictureInPictureWindowPageId();
+    // Has the UI process hear of a capture stream of this process labelled for the page, as this process chose to.
+    undefined reportAudioCaptureOfPage(unsigned long long pageId, boolean capturing);
+    // Has the UI process retire this page's Picture-in-Picture window, as if this process went on to ignore that.
+    undefined retirePictureInPictureWindow();
+    // How many streams this process's tracks hold of the capture sources it has open.
+    unsigned long long audioCaptureStreamCount();
     // How many times the UI process has changed whether this window's tab is shown as playing audio.
     unsigned long long tabAudibilityChangeCount();
     boolean mediaElementVideoSinkIsTicking(HTMLMediaElement element);

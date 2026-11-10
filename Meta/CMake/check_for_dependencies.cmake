@@ -12,6 +12,7 @@ find_package(mimalloc CONFIG REQUIRED)
 find_package(Backtrace)
 find_package(cpptrace CONFIG)
 find_package(FastFloat CONFIG REQUIRED)
+find_path(LLVM_LIBC_INCLUDE_DIR NAMES llvm-libc/shared/math.h REQUIRED)
 find_package(simdutf REQUIRED)
 find_package(zmij CONFIG REQUIRED)
 
@@ -20,6 +21,7 @@ find_package(harfbuzz REQUIRED)
 find_package(JPEG REQUIRED)
 find_package(LIBAVIF REQUIRED)
 find_package(PNG REQUIRED)
+find_package(PDFJS QUIET)
 find_package(WebP REQUIRED)
 find_path(WUFFS_INCLUDE_DIR NAMES wuffs/wuffs-v0.3.c REQUIRED)
 
@@ -143,4 +145,20 @@ if (WIN32)
     endif()
 else()
     set(HAS_DIRECTX OFF CACHE BOOL "" FORCE)
+endif()
+
+if (ENABLE_GUI_TARGETS AND NOT (ANDROID OR VCPKG_TARGET_ANDROID))
+    set(LADYBIRD_QT_COMPONENTS Core Gui Widgets)
+    if (NOT APPLE)
+        list(APPEND LADYBIRD_QT_COMPONENTS Positioning)
+    endif()
+
+    if (APPLE OR (LINUX AND NOT ANDROID) OR HAS_DIRECTX)
+        # The native presentation paths use platform GPU buffer handles directly instead of copying frames through CPU
+        # memory. Wayland activation also uses Qt platform APIs.
+        list(APPEND LADYBIRD_QT_COMPONENTS GuiPrivate)
+        set(QT_NO_PRIVATE_MODULE_WARNING ON)
+    endif()
+
+    find_package(Qt6 6.10 REQUIRED COMPONENTS ${LADYBIRD_QT_COMPONENTS})
 endif()

@@ -13,7 +13,7 @@ use encoding_rs::Encoding;
 use libjs_rust::api::{EmbedderClass, EmbedderValue, PrimitiveString, Trace, Value};
 use libtextcodec_rust::{DecodingFailed, StreamingDecoder, encoding_for_label};
 
-use crate::bindings::conversions::{UsvString, buffer_source_type_of};
+use crate::bindings::conversions::{BufferSourceRules, UsvString, to_buffer_source};
 use crate::bindings::interface::Ref;
 use crate::bindings::interface::Wrappable;
 use crate::bindings::{CallContext, Exception, WebIdlResult};
@@ -146,15 +146,16 @@ impl EmbedderValue for Decoder {
 }
 
 /// Enqueues the output of the decoder in the transform as a string, unless it is the empty string.
-fn enqueue_output_chunk(cx: &CallContext, transform: Ref<TransformStream>, output: &[u16]) {
+fn enqueue_output_chunk(cx: &CallContext, transform: Ref<TransformStream>, output: &[u16]) -> WebIdlResult<()> {
     let output_chunk = UsvString::from_utf16_replacing_lone_surrogates(output).into_utf16_string();
     if !output_chunk.is_empty() {
         TransformStream::enqueue(
             transform,
             cx.vm(),
             Value::from_string(PrimitiveString::create(cx.vm(), output_chunk)),
-        );
+        )?;
     }
+    Ok(())
 }
 
 fn decoding_failed(_: DecodingFailed) -> Exception {
@@ -165,11 +166,11 @@ impl TransformSteps for Decoder {
     // https://encoding.spec.whatwg.org/#decode-and-enqueue-a-chunk
     fn transform(&self, cx: &CallContext, transform: Ref<TransformStream>, chunk: Value) -> WebIdlResult<()> {
         // 1. Let bufferSource be the result of converting chunk to an AllowSharedBufferSource.
-        let Some(buffer_source) = buffer_source_type_of(chunk) else {
-            return Err(Exception::TypeError(Utf16String::from_ascii(
-                b"Chunk is not a BufferSource",
-            )));
+        let rules = BufferSourceRules {
+            allow_shared: true,
+            allow_resizable: false,
         };
+        let buffer_source = to_buffer_source(cx.vm(), chunk, &rules)?;
 
         // 2. Push a copy of bufferSource to decoder's I/O queue.
         // 3. Let output be the I/O queue of scalar values « end-of-queue ».
@@ -188,8 +189,7 @@ impl TransformSteps for Decoder {
         //         the chunk while its bytes are read.
         let output =
             unsafe { buffer_source.with_bytes(|bytes| decoder.decode(bytes, true)) }.map_err(decoding_failed)?;
-        enqueue_output_chunk(cx, transform, &output);
-        Ok(())
+        enqueue_output_chunk(cx, transform, &output)
     }
 
     // https://encoding.spec.whatwg.org/#flush-and-enqueue
@@ -206,7 +206,6 @@ impl TransformSteps for Decoder {
         //     4. Otherwise, if result is error, throw a TypeError.
         // NB: The decoder's I/O queue holds no more bytes, so the decoder decodes the end of the input.
         let output = self.decoder.borrow_mut().decode(&[], false).map_err(decoding_failed)?;
-        enqueue_output_chunk(cx, transform, &output);
-        Ok(())
+        enqueue_output_chunk(cx, transform, &output)
     }
 }

@@ -22,6 +22,7 @@ namespace HTTP {
 static constexpr u32 INDEX_SCHEMA_BASELINE_VERSION = 1u;
 static constexpr u32 INDEX_SCHEMA_PARTITIONED_CACHE_KEYS_VERSION = 2u;
 static constexpr u32 INDEX_SCHEMA_VARY_KEY_VERSION = 3u;
+static constexpr u32 INDEX_SCHEMA_RESPONSES_ONLY_VERSION = 4u;
 
 // Persist full-range hashes as signed bit patterns; keys are only compared for equality.
 static i64 encode_cache_key_for_database(u64 key)
@@ -71,8 +72,6 @@ static NonnullRefPtr<HeaderList> deserialize_headers(StringView serialized_heade
 static void remove_cache_entry_files(LexicalPath const& cache_directory, u64 cache_key, u64 vary_key)
 {
     (void)FileSystem::remove(path_for_cache_entry(cache_directory, cache_key, vary_key).string(), FileSystem::RecursionMode::Disallowed);
-    for (auto associated_data : CACHE_ENTRY_ASSOCIATED_DATA_TYPES)
-        (void)FileSystem::remove(path_for_cache_entry_associated_data(cache_directory, cache_key, vary_key, associated_data).string(), FileSystem::RecursionMode::Disallowed);
 }
 
 template<typename Callback>
@@ -114,9 +113,9 @@ static void log_orphaned_disk_cache_entries(Database::Database& database)
         }
 
         bool has_entry = false;
-        database.execute_statement(check_entry, [&](auto) -> ErrorOr<void> { has_entry = true; return {}; }, encode_cache_key_for_database(cache_entry_data->cache_key), encode_cache_key_for_database(cache_entry_data->vary_key));
+        auto result = database.try_execute_statement(check_entry, [&](auto) -> ErrorOr<void> { has_entry = true; return {}; }, encode_cache_key_for_database(cache_entry_data->cache_key), encode_cache_key_for_database(cache_entry_data->vary_key));
 
-        if (!has_entry)
+        if (!result.is_error() && !has_entry)
             dbgln("Cache file missing from cache index: {}", cache_entry);
     });
 }
@@ -173,6 +172,19 @@ ErrorOr<Database::MigrationOutcome> CacheIndex::migrate_schema(Database::Databas
                 return {};
             },
         },
+        {
+            // The cache now holds responses only. Stored responses stay valid, but the JavaScript bytecode files beside
+            // them, and any such file left half-written, are no longer read or accounted for.
+            .version = INDEX_SCHEMA_RESPONSES_ONLY_VERSION,
+            .sql = "ALTER TABLE CacheIndex DROP COLUMN associated_data_size;"sv,
+            .backfill = [](Database::Database& database) -> ErrorOr<void> {
+                for_each_cache_entry_file(database, [](LexicalPath const& cache_entry) {
+                    if (cache_entry.basename().contains('.'))
+                        (void)FileSystem::remove(cache_entry.string(), FileSystem::RecursionMode::Disallowed);
+                });
+                return {};
+            },
+        },
     });
 
     return database.migrate("CacheIndex"sv, migrations, mode);
@@ -185,29 +197,28 @@ ErrorOr<CacheIndex> CacheIndex::create(Database::Database& database, LexicalPath
 #endif
 
     Statements statements {};
-    statements.insert_entry = TRY(database.prepare_statement("INSERT OR REPLACE INTO CacheIndex (cache_key, vary_key, url, request_headers, response_headers, data_size, associated_data_size, request_time, response_time, last_access_time) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);"sv));
+    statements.insert_entry = TRY(database.prepare_statement("INSERT OR REPLACE INTO CacheIndex (cache_key, vary_key, url, request_headers, response_headers, data_size, request_time, response_time, last_access_time) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);"sv));
     statements.remove_entry = TRY(database.prepare_statement(R"#(
         DELETE FROM CacheIndex
         WHERE cache_key = ? AND vary_key = ?
-        RETURNING MAX(data_size, 0) + MAX(associated_data_size, 0) + OCTET_LENGTH(request_headers) + OCTET_LENGTH(response_headers);
+        RETURNING MAX(data_size, 0) + OCTET_LENGTH(request_headers) + OCTET_LENGTH(response_headers);
     )#"sv));
     statements.remove_entries_accessed_since = TRY(database.prepare_statement(R"#(
         DELETE FROM CacheIndex
         WHERE last_access_time >= ?
-        RETURNING cache_key, vary_key, MAX(data_size, 0) + MAX(associated_data_size, 0) + OCTET_LENGTH(request_headers) + OCTET_LENGTH(response_headers);
+        RETURNING cache_key, vary_key, MAX(data_size, 0) + OCTET_LENGTH(request_headers) + OCTET_LENGTH(response_headers);
     )#"sv));
     statements.remove_entries_accessed_before = TRY(database.prepare_statement(R"#(
         DELETE FROM CacheIndex
         WHERE last_access_time < ?
-        RETURNING cache_key, vary_key, MAX(data_size, 0) + MAX(associated_data_size, 0) + OCTET_LENGTH(request_headers) + OCTET_LENGTH(response_headers);
+        RETURNING cache_key, vary_key, MAX(data_size, 0) + OCTET_LENGTH(request_headers) + OCTET_LENGTH(response_headers);
     )#"sv));
     statements.remove_all_entries = TRY(database.prepare_statement(R"#(
         DELETE FROM CacheIndex
         RETURNING cache_key, vary_key;
     )#"sv));
-    statements.select_entries = TRY(database.prepare_statement("SELECT vary_key, url, request_headers, response_headers, data_size, associated_data_size, request_time, response_time, last_access_time FROM CacheIndex WHERE cache_key = ?;"sv));
+    statements.select_entries = TRY(database.prepare_statement("SELECT vary_key, url, request_headers, response_headers, data_size, request_time, response_time, last_access_time FROM CacheIndex WHERE cache_key = ?;"sv));
     statements.update_response_headers = TRY(database.prepare_statement("UPDATE CacheIndex SET response_headers = ?, last_access_time = ? WHERE cache_key = ? AND vary_key = ?;"sv));
-    statements.update_associated_data_size = TRY(database.prepare_statement("UPDATE CacheIndex SET associated_data_size = ? WHERE cache_key = ? AND vary_key = ?;"sv));
     statements.update_last_access_time = TRY(database.prepare_statement("UPDATE CacheIndex SET last_access_time = ? WHERE cache_key = ? AND vary_key = ?;"sv));
 
     statements.remove_entries_exceeding_cache_limit = TRY(database.prepare_statement(R"#(
@@ -215,7 +226,7 @@ ErrorOr<CacheIndex> CacheIndex::create(Database::Database& database, LexicalPath
             SELECT
                 cache_key,
                 vary_key,
-                SUM(MAX(data_size, 0) + MAX(associated_data_size, 0) + OCTET_LENGTH(request_headers) + OCTET_LENGTH(response_headers))
+                SUM(MAX(data_size, 0) + OCTET_LENGTH(request_headers) + OCTET_LENGTH(response_headers))
                     OVER (ORDER BY last_access_time DESC)
                     AS cumulative_estimated_size
             FROM CacheIndex
@@ -226,22 +237,22 @@ ErrorOr<CacheIndex> CacheIndex::create(Database::Database& database, LexicalPath
             FROM RankedCacheIndex
             WHERE cumulative_estimated_size > ?
         )
-        RETURNING cache_key, vary_key, MAX(data_size, 0) + MAX(associated_data_size, 0) + OCTET_LENGTH(request_headers) + OCTET_LENGTH(response_headers);
+        RETURNING cache_key, vary_key, MAX(data_size, 0) + OCTET_LENGTH(request_headers) + OCTET_LENGTH(response_headers);
     )#"sv));
 
     statements.estimate_cache_size_accessed_since = TRY(database.prepare_statement(R"#(
-        SELECT COALESCE(SUM(MAX(data_size, 0) + MAX(associated_data_size, 0) + OCTET_LENGTH(request_headers) + OCTET_LENGTH(response_headers)), 0)
+        SELECT COALESCE(SUM(MAX(data_size, 0) + OCTET_LENGTH(request_headers) + OCTET_LENGTH(response_headers)), 0)
         FROM CacheIndex
         WHERE last_access_time >= ?;
     )#"sv));
 
     statements.select_total_estimated_size = TRY(database.prepare_statement(R"#(
-        SELECT COALESCE(SUM(MAX(data_size, 0) + MAX(associated_data_size, 0) + OCTET_LENGTH(request_headers) + OCTET_LENGTH(response_headers)), 0)
+        SELECT COALESCE(SUM(MAX(data_size, 0) + OCTET_LENGTH(request_headers) + OCTET_LENGTH(response_headers)), 0)
         FROM CacheIndex;
     )#"sv));
 
     statements.select_access_profile = TRY(database.prepare_statement(R"#(
-        SELECT last_access_time / ?1 * ?1 AS bucket, SUM(MAX(data_size, 0) + MAX(associated_data_size, 0) + OCTET_LENGTH(request_headers) + OCTET_LENGTH(response_headers))
+        SELECT last_access_time / ?1 * ?1 AS bucket, SUM(MAX(data_size, 0) + OCTET_LENGTH(request_headers) + OCTET_LENGTH(response_headers))
         FROM CacheIndex
         GROUP BY bucket
         ORDER BY bucket DESC;
@@ -260,9 +271,8 @@ ErrorOr<CacheIndex> CacheIndex::create(Database::Database& database, LexicalPath
         DELETE FROM CacheIndex
         WHERE typeof(cache_key) != 'integer' OR typeof(vary_key) != 'integer' OR typeof(url) != 'text'
             OR typeof(request_headers) != 'blob' OR typeof(response_headers) != 'blob'
-            OR typeof(data_size) != 'integer' OR typeof(associated_data_size) != 'integer'
-            OR typeof(request_time) != 'integer' OR typeof(response_time) != 'integer' OR typeof(last_access_time) != 'integer'
-            OR data_size NOT BETWEEN 0 AND ?1 OR associated_data_size NOT BETWEEN 0 AND ?1
+            OR typeof(data_size) != 'integer' OR typeof(request_time) != 'integer' OR typeof(response_time) != 'integer' OR typeof(last_access_time) != 'integer'
+            OR data_size NOT BETWEEN 0 AND ?1
         RETURNING cache_key, vary_key;
     )#"sv));
 
@@ -324,7 +334,6 @@ ErrorOr<void> CacheIndex::create_entry(u64 cache_key, u64 vary_key, String url, 
         .request_headers = move(request_headers),
         .response_headers = move(response_headers),
         .data_size = data_size,
-        .associated_data_size = 0,
         .serialized_request_headers_size = static_cast<u64>(serialized_request_headers.length()),
         .serialized_response_headers_size = static_cast<u64>(serialized_response_headers.length()),
         .request_time = request_time,
@@ -332,7 +341,6 @@ ErrorOr<void> CacheIndex::create_entry(u64 cache_key, u64 vary_key, String url, 
         .last_access_time = now,
     };
     Checked<u64> checked_entry_size = entry.data_size;
-    checked_entry_size += entry.associated_data_size;
     checked_entry_size += entry.serialized_request_headers_size;
     checked_entry_size += entry.serialized_response_headers_size;
 
@@ -340,7 +348,7 @@ ErrorOr<void> CacheIndex::create_entry(u64 cache_key, u64 vary_key, String url, 
         return Error::from_string_literal("Cache entry size exceeds allowed maximum");
     auto entry_size = checked_entry_size.value();
 
-    m_database->execute_statement(
+    TRY(m_database->try_execute_statement(
         m_statements.remove_entry,
         [&](auto statement_id) -> ErrorOr<void> {
             auto removed_size = m_database->result_column<i64>(statement_id, 0);
@@ -348,14 +356,18 @@ ErrorOr<void> CacheIndex::create_entry(u64 cache_key, u64 vary_key, String url, 
             return {};
         },
         encode_cache_key_for_database(cache_key),
-        encode_cache_key_for_database(vary_key));
+        encode_cache_key_for_database(vary_key)));
 
     auto& entries = entries_for_cache_key(cache_key);
     auto existing_entry_index = entries.find_first_index_if([&](auto const& existing_entry) {
         return existing_entry.vary_key == vary_key;
     });
 
-    m_database->execute_statement(m_statements.insert_entry, {}, encode_cache_key_for_database(cache_key), encode_cache_key_for_database(vary_key), entry.url, serialized_request_headers, serialized_response_headers, static_cast<i64>(entry.data_size), static_cast<i64>(entry.associated_data_size), entry.request_time, entry.response_time, entry.last_access_time);
+    if (auto result = m_database->try_execute_statement(m_statements.insert_entry, {}, encode_cache_key_for_database(cache_key), encode_cache_key_for_database(vary_key), entry.url, serialized_request_headers, serialized_response_headers, static_cast<i64>(entry.data_size), entry.request_time, entry.response_time, entry.last_access_time); result.is_error()) {
+        // The row of the entry this one replaces is gone already, so the index no longer holds that entry either.
+        delete_entry(cache_key, vary_key);
+        return result.release_error();
+    }
 
     if (existing_entry_index.has_value())
         entries[*existing_entry_index] = move(entry);
@@ -369,7 +381,7 @@ ErrorOr<void> CacheIndex::create_entry(u64 cache_key, u64 vary_key, String url, 
 
 void CacheIndex::remove_entry(u64 cache_key, u64 vary_key)
 {
-    m_database->execute_statement(
+    auto result = m_database->try_execute_statement(
         m_statements.remove_entry,
         [&](auto statement_id) -> ErrorOr<void> {
             auto removed_size = m_database->result_column<i64>(statement_id, 0);
@@ -378,6 +390,8 @@ void CacheIndex::remove_entry(u64 cache_key, u64 vary_key)
         },
         encode_cache_key_for_database(cache_key),
         encode_cache_key_for_database(vary_key));
+    if (result.is_error())
+        dbgln_if(HTTP_DISK_CACHE_DEBUG, "\033[36m[disk]\033[0m \033[31;1m{}:\033[0m {}", "Unable to remove cache entry"sv, result.error());
 
     delete_entry(cache_key, vary_key);
 }
@@ -432,7 +446,7 @@ void CacheIndex::remove_entries_accessed_since(UnixDateTime since, Function<void
 {
     // Removing every entry must not depend on what their rows contain.
     if (since == UnixDateTime::earliest()) {
-        m_database->execute_statement(
+        auto result = m_database->try_execute_statement(
             m_statements.remove_all_entries,
             [&](auto statement_id) -> ErrorOr<void> {
                 auto cache_key = m_database->result_i64_checked(statement_id, 0);
@@ -444,6 +458,11 @@ void CacheIndex::remove_entries_accessed_since(UnixDateTime since, Function<void
                     on_entry_removed(decode_cache_key_from_database(cache_key.value()), decode_cache_key_from_database(vary_key.value()));
                 return {};
             });
+        // The entries stay, as their rows do.
+        if (result.is_error()) {
+            dbgln_if(HTTP_DISK_CACHE_DEBUG, "\033[36m[disk]\033[0m \033[31;1m{}:\033[0m {}", "Unable to remove cache entries"sv, result.error());
+            return;
+        }
 
         m_entries.clear();
         m_total_estimated_size = 0;
@@ -452,7 +471,7 @@ void CacheIndex::remove_entries_accessed_since(UnixDateTime since, Function<void
         return;
     }
 
-    m_database->execute_statement(
+    auto result = m_database->try_execute_statement(
         m_statements.remove_entries_accessed_since,
         [&](auto statement_id) -> ErrorOr<void> {
             auto cache_key = decode_cache_key_from_database(m_database->result_column<i64>(statement_id, 0));
@@ -466,11 +485,13 @@ void CacheIndex::remove_entries_accessed_since(UnixDateTime since, Function<void
             return {};
         },
         since);
+    if (result.is_error())
+        dbgln_if(HTTP_DISK_CACHE_DEBUG, "\033[36m[disk]\033[0m \033[31;1m{}:\033[0m {}", "Unable to remove cache entries"sv, result.error());
 }
 
 void CacheIndex::remove_entries_accessed_before(UnixDateTime before, Function<void(u64 cache_key, u64 vary_key)> on_entry_removed)
 {
-    m_database->execute_statement(
+    auto result = m_database->try_execute_statement(
         m_statements.remove_entries_accessed_before,
         [&](auto statement_id) -> ErrorOr<void> {
             auto cache_key = decode_cache_key_from_database(m_database->result_column<i64>(statement_id, 0));
@@ -484,6 +505,8 @@ void CacheIndex::remove_entries_accessed_before(UnixDateTime before, Function<vo
             return {};
         },
         before);
+    if (result.is_error())
+        dbgln_if(HTTP_DISK_CACHE_DEBUG, "\033[36m[disk]\033[0m \033[31;1m{}:\033[0m {}", "Unable to remove cache entries"sv, result.error());
 }
 
 void CacheIndex::remove_entries_for_cache_key(u64 cache_key, Function<void(u64 cache_key, u64 vary_key)> on_entry_removed)
@@ -510,7 +533,6 @@ ErrorOr<void> CacheIndex::update_response_headers(u64 cache_key, u64 vary_key, N
     auto serialized_response_headers_size = static_cast<u64>(serialized_response_headers.length());
 
     Checked<u64> checked_entry_size = entry->data_size;
-    checked_entry_size += entry->associated_data_size;
     checked_entry_size += entry->serialized_request_headers_size;
     checked_entry_size += serialized_response_headers_size;
 
@@ -519,30 +541,13 @@ ErrorOr<void> CacheIndex::update_response_headers(u64 cache_key, u64 vary_key, N
 
     auto now = UnixDateTime::now();
 
-    m_database->execute_statement(m_statements.update_response_headers, {}, serialized_response_headers, now, encode_cache_key_for_database(cache_key), encode_cache_key_for_database(vary_key));
+    TRY(m_database->try_execute_statement(m_statements.update_response_headers, {}, serialized_response_headers, now, encode_cache_key_for_database(cache_key), encode_cache_key_for_database(vary_key)));
 
     adjust_total_estimated_size(-static_cast<i64>(entry->serialized_response_headers_size));
     adjust_total_estimated_size(static_cast<i64>(serialized_response_headers_size));
     entry->response_headers = move(response_headers);
     entry->serialized_response_headers_size = serialized_response_headers_size;
     entry->last_access_time = now;
-    return {};
-}
-
-ErrorOr<void> CacheIndex::update_associated_data_size(u64 cache_key, u64 vary_key, u64 associated_data_size)
-{
-    auto entry = get_entry(cache_key, vary_key);
-    if (!entry.has_value())
-        return {};
-
-    if (associated_data_size > static_cast<u64>(NumericLimits<i64>::max()))
-        return Error::from_string_literal("Associated data size exceeds the representable maximum");
-
-    m_database->execute_statement(m_statements.update_associated_data_size, {}, static_cast<i64>(associated_data_size), encode_cache_key_for_database(cache_key), encode_cache_key_for_database(vary_key));
-
-    adjust_total_estimated_size(-static_cast<i64>(entry->associated_data_size));
-    adjust_total_estimated_size(static_cast<i64>(associated_data_size));
-    entry->associated_data_size = associated_data_size;
     return {};
 }
 
@@ -554,7 +559,10 @@ void CacheIndex::update_last_access_time(u64 cache_key, u64 vary_key)
 
     auto now = UnixDateTime::now();
 
-    m_database->execute_statement(m_statements.update_last_access_time, {}, now, encode_cache_key_for_database(cache_key), encode_cache_key_for_database(vary_key));
+    if (auto result = m_database->try_execute_statement(m_statements.update_last_access_time, {}, now, encode_cache_key_for_database(cache_key), encode_cache_key_for_database(vary_key)); result.is_error()) {
+        dbgln_if(HTTP_DISK_CACHE_DEBUG, "\033[36m[disk]\033[0m \033[31;1m{}:\033[0m {}", "Unable to update cache entry access time"sv, result.error());
+        return;
+    }
     entry->last_access_time = now;
 }
 
@@ -585,7 +593,7 @@ Vector<CacheIndex::Entry>& CacheIndex::entries_for_cache_key(u64 cache_key)
     return m_entries.ensure(cache_key, [&]() {
         Vector<Entry> entries;
 
-        m_database->execute_statement(
+        auto result = m_database->try_execute_statement(
             m_statements.select_entries,
             [&](auto statement_id) -> ErrorOr<void> {
                 int column = 0;
@@ -595,18 +603,22 @@ Vector<CacheIndex::Entry>& CacheIndex::entries_for_cache_key(u64 cache_key)
                 auto request_headers = m_database->result_column<ByteString>(statement_id, column++);
                 auto response_headers = m_database->result_column<ByteString>(statement_id, column++);
                 auto data_size = m_database->result_column<i64>(statement_id, column++);
-                auto associated_data_size = m_database->result_column<i64>(statement_id, column++);
                 auto request_time = m_database->result_column<UnixDateTime>(statement_id, column++);
                 auto response_time = m_database->result_column<UnixDateTime>(statement_id, column++);
                 auto last_access_time = m_database->result_column<UnixDateTime>(statement_id, column++);
 
-                if (data_size < 0 || associated_data_size < 0)
+                if (data_size < 0)
                     return {};
 
-                entries.empend(vary_key, move(url), deserialize_headers(request_headers), deserialize_headers(response_headers), static_cast<u64>(data_size), static_cast<u64>(associated_data_size), request_headers.length(), response_headers.length(), request_time, response_time, last_access_time);
+                entries.empend(vary_key, move(url), deserialize_headers(request_headers), deserialize_headers(response_headers), static_cast<u64>(data_size), request_headers.length(), response_headers.length(), request_time, response_time, last_access_time);
                 return {};
             },
             encode_cache_key_for_database(cache_key));
+        // Entries that can't be read are missed, rather than served partly read.
+        if (result.is_error()) {
+            dbgln_if(HTTP_DISK_CACHE_DEBUG, "\033[36m[disk]\033[0m \033[31;1m{}:\033[0m {}", "Unable to read cache entries"sv, result.error());
+            entries.clear();
+        }
 
         return entries;
     });

@@ -11,6 +11,7 @@
 #include <AK/String.h>
 #include <AK/StringView.h>
 #include <AK/Vector.h>
+#include <LibCore/BrowserVersion.h>
 #include <LibWebCommon/Loader/NavigatorCompatibilityMode.h>
 
 namespace Web {
@@ -62,12 +63,11 @@ namespace Web {
 #endif
 
 #define BROWSER_NAME "Ladybird"
-#define BROWSER_VERSION "1.0"
 
 // NB: Some web servers treat us very badly unless we pretend to be one of the major browsers.
 //     This token is appended to the User-Agent string to improve compatibility.
 //     We will need to update this periodically to match a somewhat recent version.
-#define SAD_COMPATIBILITY_HACK "Chrome/153.0.0.0 AppleWebKit/537.36 Safari/537.36"
+#define SAD_COMPATIBILITY_HACK "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/153.0.0.0 Safari/537.36"
 
 // NB: Servers sniff the parenthesized platform token of the User-Agent string and only recognize
 //     the frozen tokens sent by major browsers. Reporting the actual OS and CPU here gets us

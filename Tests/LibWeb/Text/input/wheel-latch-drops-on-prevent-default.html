@@ -17,23 +17,28 @@
 <div id="scroller"><div></div></div>
 <script>
     promiseTest(async () => {
-        let wheelEvents = 0;
+        const cancelable = [];
         scroller.addEventListener("wheel", event => {
-            if (++wheelEvents == 2)
+            cancelable.push(event.cancelable);
+            if (cancelable.length == 1)
                 event.preventDefault();
         }, { passive: false });
         await animationFrame();
         await animationFrame();
 
-        await internals.wheel(50, 50, 0, 100);
-        println(`scroller.scrollTop after the first tick: ${scroller.scrollTop}`);
+        // NB: These steps belong to one gesture for as long as its fingers rest, however long the test takes to reach the
+        //     next one. Wheel ticks with no phase stop belonging to it once enough time has passed between them.
+        await internals.wheel(50, 50, 0, 100, true, "ongoing");
+        println(`scroller.scrollTop after the cancelled step: ${scroller.scrollTop}`);
 
-        await internals.wheel(50, 50, 0, 100);
-        println(`window.scrollY after the cancelled tick: ${window.scrollY}`);
+        // The cancelled event ended the gesture the scroller was latched for, so the page sees this step first again,
+        // and it is routed afresh.
+        await internals.wheel(50, 50, 0, 100, true, "ongoing");
+        println(`scroller.scrollTop after the step following the cancelled one: ${scroller.scrollTop}`);
 
-        // The cancelled event ended the gesture the scroller was latched for, so this tick is routed afresh, and
-        // the scroller at its extent leaves it to the page.
-        await internals.wheel(50, 50, 0, 100);
-        println(`window.scrollY after the tick following the cancelled one: ${window.scrollY}`);
+        // The page let the gesture through, so this step does not wait for it, and the scroller at its extent keeps it.
+        await internals.wheel(50, 50, 0, 100, true, "ongoing");
+        println(`window.scrollY after the last step: ${window.scrollY}`);
+        println(`cancelable: ${cancelable.join(",")}`);
     });
 </script>

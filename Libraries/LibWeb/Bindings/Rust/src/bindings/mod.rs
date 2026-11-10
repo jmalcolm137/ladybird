@@ -22,14 +22,19 @@ pub(crate) mod async_iterable;
 pub(crate) mod callback;
 pub(crate) mod conversions;
 pub(crate) mod cpp_cell;
+pub(crate) mod environment_settings_object;
 pub(crate) mod event_target;
 #[cfg(web_idl_bindings)]
 pub(crate) mod generated;
+pub(crate) mod global_object;
 pub(crate) mod interface;
 pub(crate) mod iterable;
+pub(crate) mod maplike;
+pub(crate) mod new_global_object;
 pub(crate) mod promise;
 pub(crate) mod realm_data;
 pub(crate) mod services;
+pub(crate) mod setlike;
 pub(crate) mod structured_data;
 
 use core::ptr::NonNull;
@@ -37,7 +42,35 @@ use core::ptr::NonNull;
 use ak::Utf16String;
 use libjs_rust::api::{ErrorKind, Gc, Object, Realm, Throw, ThrowCompletionOr, Value, Vm};
 
-use crate::bindings::services::web_bindings_create_dom_exception;
+use crate::bindings::services::{
+    web_bindings_create_dom_exception, web_bindings_pop_element_queue_and_invoke_reactions,
+    web_bindings_push_element_queue,
+};
+
+/// Runs the steps of a [CEReactions] construct, https://html.spec.whatwg.org/multipage/custom-elements.html#cereactions
+/// An exception of the steps is in the result, which the caller rethrows after the reactions ran.
+#[cfg_attr(
+    not(web_idl_bindings),
+    allow(dead_code, reason = "only the generated bindings use the function")
+)]
+pub(crate) fn with_custom_element_reactions<R>(original_steps: impl FnOnce() -> R) -> R {
+    // 1. Push a new element queue onto this object's relevant agent's custom element reactions stack.
+    // SAFETY: The bindings run on the main thread.
+    unsafe { web_bindings_push_element_queue() };
+
+    // 2. Run the originally-specified steps for this construct, catching any exceptions. If the steps return a value,
+    //    let value be the returned value. If they throw an exception, let exception be the thrown exception.
+    let value_or_exception = original_steps();
+
+    // 3. Let queue be the result of popping from this object's relevant agent's custom element reactions stack.
+    // 4. Invoke custom element reactions in queue.
+    // SAFETY: The bindings run on the main thread, and the queue is the one this function pushed.
+    unsafe { web_bindings_pop_element_queue_and_invoke_reactions() };
+
+    // 5. If an exception exception was thrown by the original steps, rethrow exception.
+    // 6. If a value value was returned from the original steps, return value.
+    value_or_exception
+}
 
 /// What the bindings pass the implementation of an interface: the VM, and the realm that the implementation creates
 /// its results in. For an attribute or an operation, that is the realm of the object it runs on; for a constructor,
@@ -68,9 +101,7 @@ pub(crate) enum Exception {
     /// A simple exception with the message, which the bindings create in the current realm.
     TypeError(Utf16String),
     RangeError(Utf16String),
-    /// A DOMException with the name, one of https://webidl.spec.whatwg.org/#dfn-error-names-table, and the message,
-    /// which the bindings create in the realm of the call context, as the C++ bindings create the DOMExceptions of
-    /// the implementations they call.
+    /// A DOMException with the name, one of https://webidl.spec.whatwg.org/#dfn-error-names-table, and the message.
     Dom(&'static str, Utf16String),
 }
 
@@ -95,6 +126,12 @@ impl Exception {
 
     pub(crate) fn syntax_error(message: Utf16String) -> Self {
         Self::Dom("SyntaxError", message)
+    }
+
+    /// https://webidl.spec.whatwg.org/#es-exceptions
+    pub(crate) fn throw_in_current_realm(self, vm: &Vm) -> Throw {
+        let realm = vm.current_realm().expect("a native function runs in a realm");
+        self.throw(&CallContext::new(vm, realm))
     }
 
     pub(crate) fn throw(self, cx: &CallContext) -> Throw {

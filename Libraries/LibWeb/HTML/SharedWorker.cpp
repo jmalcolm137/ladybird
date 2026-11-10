@@ -63,7 +63,7 @@ WebIDL::ExceptionOr<GC::Ref<SharedWorker>> SharedWorker::create(WindowOrWorkerGl
         return WebIDL::SyntaxError::create("SharedWorker constructed with invalid URL"_utf16);
 
     // 6. Let outsidePort be a new MessagePort in outsideSettings's realm.
-    auto outside_port = MessagePort::create(global_scope.this_impl());
+    auto outside_port = MessagePort::create(outside_settings.realm());
 
     // 10. Let worker be this.
     // AD-HOC: We do this first so that we can use `this`.
@@ -77,7 +77,7 @@ WebIDL::ExceptionOr<GC::Ref<SharedWorker>> SharedWorker::create(WindowOrWorkerGl
 
     // 11. Enqueue the following steps to the shared worker manager:
     // The actual shared worker manager is owned by the UI process. It will either start a new
-    // WebWorker agent or transfer this port to an existing same-key SharedWorkerGlobalScope.
+    // worker agent or transfer this port to an existing same-key SharedWorkerGlobalScope.
     run_a_worker(worker, worker->m_script_url, outside_settings, outside_port, worker->m_options);
 
     return worker;

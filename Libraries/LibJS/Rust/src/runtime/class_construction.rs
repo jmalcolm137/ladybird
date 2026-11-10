@@ -78,6 +78,43 @@ fn resolve_element_key(
     Ok(ClassElementName::PropertyKey(key))
 }
 
+/// The values of the class heritage of a class being defined.
+pub struct ClassHeritage {
+    pub super_class: Value,
+    pub proto_parent: Value,
+}
+
+/// https://tc39.es/ecma262/#sec-runtime-semantics-classdefinitionevaluation
+pub fn class_proto_parent(vm: &Vm, super_class: Value) -> ThrowCompletionOr<Value> {
+    // 8. Else,
+    // f. If superclass is null, then
+    if super_class.is_null() {
+        // i. Let protoParent be null.
+        return Ok(Value::NULL);
+    }
+    // g. Else if IsConstructor(superclass) is false, then
+    if !super_class.is_constructor() {
+        // i. Throw a TypeError exception.
+        return vm.throw_completion(
+            ErrorKind::TypeError,
+            ErrorType::ClassExtendsValueNotAConstructorOrNull,
+            &[&super_class],
+        );
+    }
+    // h. Else,
+    // i. Let protoParent be ? Get(superclass, "prototype").
+    let proto_parent = super_class.get(vm, &vm.names.prototype)?;
+    // ii. If protoParent is not an Object and protoParent is not null, throw a TypeError exception.
+    if !proto_parent.is_object() && !proto_parent.is_null() {
+        return vm.throw_completion(
+            ErrorKind::TypeError,
+            ErrorType::ClassExtendsValueInvalidPrototype,
+            &[&proto_parent],
+        );
+    }
+    Ok(proto_parent)
+}
+
 #[derive(Clone, Trace)]
 enum StaticElement {
     Field(ClassFieldDefinition),
@@ -92,10 +129,10 @@ pub fn construct_class(
     executable: Gc<Executable>,
     class_environment: Option<Gc<Environment>>,
     outer_environment: Option<Gc<Environment>>,
-    super_class: Value,
+    heritage: Option<ClassHeritage>,
     element_keys: &[Value],
     binding_name: Option<&Utf16FlyString>,
-    class_name: &Utf16FlyString,
+    class_name: &ClassElementName,
 ) -> ThrowCompletionOr<Gc<EcmascriptFunctionObject>> {
     let realm = vm.current_realm().expect("there is a current realm");
 
@@ -112,32 +149,16 @@ pub fn construct_class(
     let mut proto_parent = Some(realm.object_prototype());
     let mut constructor_parent = realm.function_prototype();
 
-    if blueprint.has_super_class {
-        if super_class.is_null() {
+    assert_eq!(heritage.is_some(), blueprint.has_super_class);
+    if let Some(heritage) = heritage {
+        // NB: The bytecode performs the steps that check the heritage, before evaluating the class elements.
+        if heritage.proto_parent.is_null() {
             proto_parent = None;
-        } else if !super_class.is_constructor() {
-            return vm.throw_completion(
-                ErrorKind::TypeError,
-                ErrorType::ClassExtendsValueNotAConstructorOrNull,
-                &[&super_class],
-            );
         } else {
-            let super_class_prototype = super_class.get(vm, &vm.names.prototype)?;
-            if !super_class_prototype.is_null() && !super_class_prototype.is_object() {
-                return vm.throw_completion(
-                    ErrorKind::TypeError,
-                    ErrorType::ClassExtendsValueInvalidPrototype,
-                    &[&super_class_prototype],
-                );
-            }
-
-            if super_class_prototype.is_null() {
-                proto_parent = None;
-            } else {
-                proto_parent = Some(super_class_prototype.as_object());
-            }
-
-            constructor_parent = super_class.as_object();
+            proto_parent = Some(heritage.proto_parent.as_object());
+        }
+        if !heritage.super_class.is_null() {
+            constructor_parent = heritage.super_class.as_object();
         }
     }
 
@@ -145,6 +166,7 @@ pub fn construct_class(
 
     // FIXME: Step 14.a is done in the parser. By using a synthetic super(...args) which does not call @@iterator of %Array.prototype%
     let constructor_shared_data = executable.shared_function_data(blueprint.constructor_shared_function_data_index);
+    constructor_shared_data.set_is_class_constructor();
     let class_constructor = EcmascriptFunctionObject::create_from_function_data(
         vm,
         realm,
@@ -153,9 +175,8 @@ pub fn construct_class(
         running_execution_context(vm).private_environment.get(),
     );
 
-    class_constructor.set_name(vm, class_name);
-    class_constructor.set_home_object(Some(prototype));
-    class_constructor.set_is_class_constructor();
+    class_constructor.set_inferred_name(vm, class_name, None);
+    class_constructor.set_home_object_of_class_constructor(prototype);
     class_constructor.define_direct_property(
         vm,
         &vm.names.prototype,
@@ -196,16 +217,17 @@ pub fn construct_class(
                         .shared_function_data_index
                         .expect("a method has shared function data"),
                 );
-                let method_function = EcmascriptFunctionObject::create_from_function_data(
+                let method_function = EcmascriptFunctionObject::create_method(
                     vm,
                     realm,
                     shared_data,
                     vm.lexical_environment(),
                     running_execution_context(vm).private_environment.get(),
+                    home_object,
+                    realm.function_prototype(),
                 );
 
                 let method_value = Value::from_object(method_function);
-                method_function.make_method(home_object);
 
                 match &element_name {
                     ClassElementName::PropertyKey(property_key) => match descriptor.kind {
@@ -324,32 +346,29 @@ pub fn construct_class(
                                 .shared_function_data_index
                                 .expect("a field initializer has shared function data"),
                         );
+                        let has_computed_name = matches!(
+                            shared_data.class_field_initializer_name(),
+                            ClassFieldInitializerName::Empty
+                        );
 
-                        // Set class_field_initializer_name at runtime for computed keys.
-                        if !descriptor.is_private
-                            && matches!(
-                                shared_data.class_field_initializer_name(),
-                                ClassFieldInitializerName::Empty
-                            )
-                        {
-                            shared_data.set_class_field_initializer_name(match &element_name {
-                                ClassElementName::PropertyKey(key) => {
-                                    ClassFieldInitializerName::PropertyKey(key.clone())
-                                }
-                                ClassElementName::PrivateName(name) => {
-                                    ClassFieldInitializerName::PrivateName(name.clone())
-                                }
-                            });
-                        }
-
-                        let function = EcmascriptFunctionObject::create_from_function_data(
+                        let function = EcmascriptFunctionObject::create_method(
                             vm,
                             realm,
                             shared_data,
                             vm.lexical_environment(),
                             running_execution_context(vm).private_environment.get(),
+                            home_object,
+                            realm.function_prototype(),
                         );
-                        function.make_method(home_object);
+                        if has_computed_name {
+                            let ClassElementName::PropertyKey(key) = &element_name else {
+                                unreachable!("a private name is never computed");
+                            };
+                            function.set_class_field_initializer_name(
+                                vm,
+                                ClassFieldInitializerName::PropertyKey(key.clone()),
+                            );
+                        }
                         initializer = ClassFieldInitializer::Function(function);
                     }
                 }
@@ -372,14 +391,15 @@ pub fn construct_class(
                         .shared_function_data_index
                         .expect("a static initializer has shared function data"),
                 );
-                let body_function = EcmascriptFunctionObject::create_from_function_data(
+                let body_function = EcmascriptFunctionObject::create_method(
                     vm,
                     realm,
                     shared_data,
                     vm.lexical_environment(),
                     running_execution_context(vm).private_environment.get(),
+                    home_object,
+                    realm.function_prototype(),
                 );
-                body_function.make_method(home_object);
                 static_elements.push(StaticElement::Block(body_function));
             }
         }

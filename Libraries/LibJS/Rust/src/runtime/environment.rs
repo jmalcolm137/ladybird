@@ -22,9 +22,10 @@ use crate::gc::class::{Class, Extends, GcCell, class_of, define_cell};
 use crate::gc::class_id::ClassId;
 use crate::gc::visitor::{Trace, Visitor};
 use crate::interpreter::vm::Vm;
-use crate::layout::cell::{CellHeader, Gc};
+use crate::layout::cell::{CellHeaderTail, Gc};
 use crate::layout::environment::DeclarativeEnvironment;
 pub use crate::layout::environment::Environment;
+use crate::layout::member::NullableMember;
 use crate::layout::object::Object;
 use crate::layout::value::Value;
 use crate::runtime::completion::ThrowCompletionOr;
@@ -111,10 +112,11 @@ pub const ENVIRONMENT_METHODS: EnvironmentMethods = EnvironmentMethods {
 
 define_cell!(Environment, Other);
 
-// SAFETY: The outer environment is the only cell an Environment holds.
+// SAFETY: The outer environment and the shape of a declarative environment are the cells an Environment holds.
 unsafe impl Trace for Environment {
     fn trace(&self, visitor: &mut Visitor) {
         self.outer.trace(visitor);
+        self.shape.trace(visitor);
     }
 }
 
@@ -122,22 +124,23 @@ impl Environment {
     /// The Environment part of a new environment of `class`.
     pub fn new(class: &'static Class, outer_environment: Option<Gc<Environment>>, is_declarative: bool) -> Self {
         Self {
-            header: CellHeader::for_class(class),
+            outer: NullableMember::new(outer_environment),
+            shape: NullableMember::null(),
+            header: CellHeaderTail::for_class(class),
             this_binding_status: (ThisBindingStatus::Uninitialized as u8).into(),
             permanently_screwed_by_eval: false.into(),
             declarative: is_declarative.into(),
-            binding_values_are_inline: false.into(),
-            outer: outer_environment.into(),
+            inline_binding_capacity: 0.into(),
         }
     }
 
     pub fn class(&self) -> &'static Class {
-        self.header.class
+        class_of(Gc::from_ref(self))
     }
 
     fn methods(&self) -> &'static EnvironmentMethods {
         match self.class().id {
-            ClassId::DeclarativeEnvironment => &DECLARATIVE_ENVIRONMENT_METHODS,
+            ClassId::DeclarativeEnvironment | ClassId::GlobalDeclarativeEnvironment => &DECLARATIVE_ENVIRONMENT_METHODS,
             ClassId::FunctionEnvironment => &FUNCTION_ENVIRONMENT_METHODS,
             ClassId::ModuleEnvironment => &MODULE_ENVIRONMENT_METHODS,
             ClassId::GlobalEnvironment => &GLOBAL_ENVIRONMENT_METHODS,
@@ -279,7 +282,7 @@ impl Value {
     /// The environment the value holds, which must be one.
     pub fn as_environment(self) -> Gc<Environment> {
         assert!(self.is_cell());
-        // SAFETY: The value holds a cell, and every cell starts with its class, which is checked below.
+        // SAFETY: The value holds a cell, whose block holds its class, which is checked below.
         let environment = unsafe { self.cell::<Environment>() };
         assert!(
             class_of(environment).is_subclass_of(Environment::CLASS),

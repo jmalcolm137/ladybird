@@ -5,6 +5,7 @@
  */
 
 #include "HeadlessTest.h"
+#include <AK/Array.h>
 #include <AK/ByteString.h>
 #include <AK/Mutex.h>
 #include <AK/ScopeGuard.h>
@@ -14,16 +15,22 @@
 #include <LibCore/File.h>
 #include <LibCore/System.h>
 #include <LibCore/Timer.h>
+#include <LibHTTP/Cookie/ParsedCookie.h>
 #include <LibRequests/Request.h>
 #include <LibRequests/RequestClient.h>
 #include <LibTest/TestCase.h>
 #include <LibThreading/Thread.h>
 #include <LibURL/Parser.h>
 #include <LibWebView/Application.h>
+#include <LibWebView/CookieJar.h>
 #include <LibWebView/FileDownloader.h>
 #include <signal.h>
 #include <stdlib.h>
 #include <sys/socket.h>
+
+#if defined(AK_OS_MACOS)
+#    include <sys/xattr.h>
+#endif
 
 namespace {
 
@@ -72,6 +79,8 @@ public:
 
         MUST(Core::System::bind(m_socket, reinterpret_cast<sockaddr*>(&address), sizeof(address)));
         MUST(Core::System::listen(m_socket, 16));
+        // accept() must not block when a connection that poll() reported is gone by then.
+        MUST(Core::System::fcntl(m_socket, F_SETFL, O_NONBLOCK));
 
         socklen_t address_size = sizeof(address);
         VERIFY(::getsockname(m_socket, reinterpret_cast<sockaddr*>(&address), &address_size) == 0);
@@ -87,7 +96,6 @@ public:
     ~TestHttpServer()
     {
         m_shutting_down.store(true);
-        wake_server();
         (void)m_thread->join();
         for (auto& thread : m_stalled_connection_threads)
             (void)thread->join();
@@ -108,6 +116,12 @@ public:
         return m_request_count;
     }
 
+    Vector<ByteString> request_cookies()
+    {
+        MutexLocker locker { m_mutex };
+        return m_request_cookies;
+    }
+
     size_t refused_count()
     {
         MutexLocker locker { m_mutex };
@@ -115,31 +129,29 @@ public:
     }
 
 private:
+    // A connection made to wake accept() can be lost to a signal, so poll and recheck for shutdown instead.
     void run()
     {
         while (!m_shutting_down.load()) {
-            auto client = ::accept(m_socket, nullptr, nullptr);
-            if (client < 0)
+            pollfd poll_fd { .fd = m_socket, .events = POLLIN, .revents = 0 };
+            auto ready = Core::System::poll({ &poll_fd, 1 }, 100);
+            if (ready.is_error() && ready.error().code() != EINTR)
                 return;
+            if (ready.is_error() || ready.value() == 0)
+                continue;
+
+            auto client = ::accept(m_socket, nullptr, nullptr);
+            if (client < 0) {
+                if (errno == EAGAIN || errno == ECONNABORTED)
+                    continue;
+                return;
+            }
+            // Accepted sockets inherit O_NONBLOCK on some platforms.
+            MUST(Core::System::fcntl(client, F_SETFL, 0));
 
             if (handle_connection(client))
                 (void)Core::System::close(client);
         }
-    }
-
-    void wake_server()
-    {
-        auto socket = Core::System::socket(AF_INET, SOCK_STREAM, 0);
-        if (socket.is_error())
-            return;
-
-        sockaddr_in address {};
-        address.sin_family = AF_INET;
-        address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-        address.sin_port = htons(m_port);
-
-        (void)::connect(socket.value(), reinterpret_cast<sockaddr*>(&address), sizeof(address));
-        (void)Core::System::close(socket.value());
     }
 
     // Returns whether the caller still owns the client socket and should close it.
@@ -156,9 +168,12 @@ private:
         }
 
         Optional<ByteString> range_header;
+        ByteString cookie_header;
         for (auto line : request.string_view().split_view("\r\n"sv)) {
             if (line.starts_with("Range:"sv, CaseSensitivity::CaseInsensitive))
                 range_header = line.substring_view(6).trim_whitespace();
+            else if (line.starts_with("Cookie:"sv, CaseSensitivity::CaseInsensitive))
+                cookie_header = line.substring_view(7).trim_whitespace();
         }
 
         {
@@ -166,6 +181,7 @@ private:
             ++m_request_count;
             if (range_header.has_value())
                 m_range_requests.append(*range_header);
+            m_request_cookies.append(move(cookie_header));
         }
 
         if (range_header.has_value() && m_range_request_behavior != RangeRequestBehavior::Serve) {
@@ -287,6 +303,7 @@ private:
 
     Mutex m_mutex;
     Vector<ByteString> m_range_requests;
+    Vector<ByteString> m_request_cookies;
     size_t m_request_count { 0 };
     size_t m_refused_count { 0 };
 };
@@ -338,7 +355,7 @@ ByteBuffer make_body(size_t size)
     return body;
 }
 
-ByteString run_download(TestHttpServer& server, StringView destination_directory, StringView file_name, Function<void(u64, DownloadWatcher&)> during_download = {})
+ByteString run_download(TestHttpServer& server, StringView destination_directory, StringView file_name, Function<void(u64, DownloadWatcher&)> during_download = {}, WebView::IsPrivate is_private = WebView::IsPrivate::No)
 {
     auto& downloader = WebView::Application::the().file_downloader();
 
@@ -347,7 +364,7 @@ ByteString run_download(TestHttpServer& server, StringView destination_directory
     auto url = URL::Parser::basic_parse(ByteString::formatted("http://127.0.0.1:{}/file", server.port()));
     VERIFY(url.has_value());
 
-    auto download_id = downloader.download_file(WebView::IsPrivate::No, *url, destination);
+    auto download_id = downloader.download_file(is_private, *url, destination);
     watcher.watch(download_id);
 
     if (during_download)
@@ -370,12 +387,36 @@ void expect_file_matches(StringView path, ReadonlyBytes expected)
     VERIFY(contents.bytes() == expected);
 }
 
+#if defined(AK_OS_MACOS)
+enum class QuarantineEvent : u8 {
+    No,
+    Yes,
+};
+
+void expect_file_is_quarantined(ByteString const& path, QuarantineEvent event)
+{
+    Array<char, 256> value {};
+    auto size = getxattr(path.characters(), "com.apple.quarantine", value.data(), value.size(), 0, 0);
+    VERIFY(size > 0);
+
+    // The fields are the flags, the time, the agent and the identifier of the quarantine event.
+    auto fields = StringView { value.data(), static_cast<size_t>(size) }.split_view(';', SplitBehavior::KeepEmpty);
+    VERIFY(fields.size() == 4);
+    VERIFY(fields[3].is_empty() == (event == QuarantineEvent::No));
+
+    // With a quarantine event the system picks the agent, which is the quarantine identifier of this process if it
+    // inherited one from whatever launched it.
+    if (event == QuarantineEvent::No)
+        VERIFY(fields[2] == "Ladybird"sv);
+}
+#endif
+
 void expect_request_can_be_released_from_finish_callback(TestHttpServer& server, size_t expected_body_size)
 {
     auto url = URL::Parser::basic_parse(ByteString::formatted("http://127.0.0.1:{}/file", server.port()));
     VERIFY(url.has_value());
 
-    auto request = MUST(WebView::Application::request_server_client())->start_request("GET"sv, *url);
+    auto request = MUST(WebView::Application::request_server_client())->start_request("GET"sv, *url, HTTP::Cookie::SameSiteContext::same_site());
     VERIFY(request);
 
     size_t delivered_size = 0;
@@ -383,7 +424,7 @@ void expect_request_can_be_released_from_finish_callback(TestHttpServer& server,
 
     request->set_body_delivery_paused(true);
     request->set_unbuffered_request_callbacks(
-        [](NonnullRefPtr<HTTP::HeaderList>, Optional<u32>, Optional<String> const&, Optional<Core::ImmutableBytes>, Optional<u64>, Requests::CacheState) {
+        [](NonnullRefPtr<HTTP::HeaderList>, Optional<u32>, Optional<String> const&, Requests::CacheState) {
         },
         [&](Requests::ResponseData data) {
             delivered_size += data.bytes().size();
@@ -412,19 +453,19 @@ void expect_request_can_be_exported_from_headers_callback(TestHttpServer& server
     auto url = URL::Parser::basic_parse(ByteString::formatted("http://127.0.0.1:{}/file", server.port()));
     VERIFY(url.has_value());
 
-    auto request = request_client.start_request("GET"sv, *url, {}, {}, HTTP::CacheMode::Default, HTTP::Cookie::IncludeCredentials::Yes, Requests::RequestClient::TransferLease::Yes);
+    auto request = request_client.start_request("GET"sv, *url, HTTP::Cookie::SameSiteContext::same_site(), {}, {}, HTTP::CacheMode::Default, HTTP::Cookie::IncludeCredentials::Yes, Requests::RequestClient::TransferLease::Yes);
     VERIFY(request);
 
     size_t delivered_size = 0;
     bool finished = false;
     request->set_body_delivery_paused(true);
     request->set_unbuffered_request_callbacks(
-        [&](NonnullRefPtr<HTTP::HeaderList>, Optional<u32>, Optional<String> const&, Optional<Core::ImmutableBytes>, Optional<u64>, Requests::CacheState) {
+        [&](NonnullRefPtr<HTTP::HeaderList>, Optional<u32>, Optional<String> const&, Requests::CacheState) {
             auto exported = MUST(request_client.export_request(*request));
             request = request_client.import_request(move(exported));
             VERIFY(request);
             request->set_unbuffered_request_callbacks(
-                [](NonnullRefPtr<HTTP::HeaderList>, Optional<u32>, Optional<String> const&, Optional<Core::ImmutableBytes>, Optional<u64>, Requests::CacheState) {
+                [](NonnullRefPtr<HTTP::HeaderList>, Optional<u32>, Optional<String> const&, Requests::CacheState) {
                 },
                 [&](Requests::ResponseData data) {
                     delivered_size += data.bytes().size();
@@ -461,7 +502,7 @@ void expect_leased_request_is_torn_down_when_transferred_after_finishing(TestHtt
     auto url = URL::Parser::basic_parse(ByteString::formatted("http://127.0.0.1:{}/file", server.port()));
     VERIFY(url.has_value());
 
-    auto request = request_client.start_request("GET"sv, *url, {}, {}, HTTP::CacheMode::Default, HTTP::Cookie::IncludeCredentials::Yes, Requests::RequestClient::TransferLease::Yes);
+    auto request = request_client.start_request("GET"sv, *url, HTTP::Cookie::SameSiteContext::same_site(), {}, {}, HTTP::CacheMode::Default, HTTP::Cookie::IncludeCredentials::Yes, Requests::RequestClient::TransferLease::Yes);
     VERIFY(request);
 
     bool finished = false;
@@ -469,7 +510,7 @@ void expect_leased_request_is_torn_down_when_transferred_after_finishing(TestHtt
 
     request->set_body_delivery_paused(true);
     request->set_unbuffered_request_callbacks(
-        [](NonnullRefPtr<HTTP::HeaderList>, Optional<u32>, Optional<String> const&, Optional<Core::ImmutableBytes>, Optional<u64>, Requests::CacheState) {
+        [](NonnullRefPtr<HTTP::HeaderList>, Optional<u32>, Optional<String> const&, Requests::CacheState) {
         },
         [](Requests::ResponseData) {
         },
@@ -502,7 +543,7 @@ void expect_leased_request_is_torn_down_when_transferred_after_finishing(TestHtt
     bool adopted_request_finished = false;
 
     adopted_request->set_unbuffered_request_callbacks(
-        [](NonnullRefPtr<HTTP::HeaderList>, Optional<u32>, Optional<String> const&, Optional<Core::ImmutableBytes>, Optional<u64>, Requests::CacheState) {
+        [](NonnullRefPtr<HTTP::HeaderList>, Optional<u32>, Optional<String> const&, Requests::CacheState) {
         },
         [&](Requests::ResponseData data) {
             delivered_size += data.bytes().size();
@@ -525,6 +566,48 @@ void expect_leased_request_is_torn_down_when_transferred_after_finishing(TestHtt
     VERIFY(delivered_size == expected_body_size);
 }
 
+ByteString run_adopted_cross_site_download(TestHttpServer& server, StringView destination_directory, ByteBuffer const& body)
+{
+    auto& request_client = *MUST(WebView::Application::request_server_client());
+    auto url = URL::Parser::basic_parse(ByteString::formatted("http://127.0.0.1:{}/file", server.port()));
+    VERIFY(url.has_value());
+
+    auto& cookie_jar = *WebView::Application::default_session().cookie_jar;
+    for (auto cookie_string : { "strict=1; SameSite=Strict"sv, "lax=1; SameSite=Lax"sv }) {
+        auto cookie = HTTP::Cookie::parse_cookie(*url, cookie_string);
+        VERIFY(cookie.has_value());
+        cookie_jar.set_cookie(*url, *cookie, HTTP::Cookie::Source::Http, {}, HTTP::Cookie::SameSiteContext::same_site());
+    }
+
+    HTTP::Cookie::SameSiteContext cross_site_navigation { .status = HTTP::Cookie::SameSiteStatus::CrossSite, .is_top_level_navigation = true, .is_safe_method = true };
+    auto request = request_client.start_request("GET"sv, *url, cross_site_navigation, {}, {}, HTTP::CacheMode::Default, HTTP::Cookie::IncludeCredentials::Yes, Requests::RequestClient::TransferLease::Yes);
+    VERIFY(request);
+
+    bool received_headers = false;
+    request->set_body_delivery_paused(true);
+    request->set_unbuffered_request_callbacks(
+        [&](NonnullRefPtr<HTTP::HeaderList>, Optional<u32>, Optional<String> const&, Requests::CacheState) {
+            received_headers = true;
+        },
+        [](Requests::ResponseData) {
+        },
+        [](Core::ImmutableBytes) {
+        },
+        [](u64, Requests::RequestTimingInfo const&, Optional<Requests::NetworkError>) {
+        });
+    Core::EventLoop::current().spin_until([&] { return received_headers; });
+
+    DownloadWatcher watcher;
+    auto destination = LexicalPath::join(destination_directory, "adopted-cross-site.bin"sv);
+    auto download_id = WebView::Application::the().file_downloader().adopt_download(WebView::IsPrivate::No, *url, destination, body.size(), cross_site_navigation, request_client.request_server_client_id(), request->id());
+    watcher.watch(download_id);
+
+    Core::EventLoop::current().spin_until([&] { return watcher.is_finished(); });
+    VERIFY(watcher.status() == WebView::FileDownloader::DownloadStatus::Completed);
+
+    return destination.string();
+}
+
 }
 
 TEST_CASE(file_downloader)
@@ -544,6 +627,20 @@ TEST_CASE(file_downloader)
         expect_request_can_be_released_from_finish_callback(server, response_body.size());
         outln("release request from finish callback");
     }
+
+#if defined(AK_OS_MACOS)
+    {
+        auto response_body = make_body(4 * KiB);
+        TestHttpServer server { response_body, RangeSupport::No };
+
+        expect_file_is_quarantined(run_download(server, test_directory, "quarantined.bin"sv), QuarantineEvent::Yes);
+        outln("quarantine as web download");
+
+        auto private_path = run_download(server, test_directory, "quarantined-private.bin"sv, {}, WebView::IsPrivate::Yes);
+        expect_file_is_quarantined(private_path, QuarantineEvent::No);
+        outln("quarantine private download without an event");
+    }
+#endif
 
     {
         auto response_body = make_body(4 * KiB);
@@ -719,6 +816,20 @@ TEST_CASE(file_downloader)
         VERIFY(server.refused_count() >= 1);
 
         VERIFY(server.request_count() <= 8);
+    }
+
+    {
+        TestHttpServer server { body, RangeSupport::Yes };
+
+        auto path = run_adopted_cross_site_download(server, test_directory, body);
+        expect_file_matches(path, body.bytes());
+
+        // Requests the downloader makes itself send what the cross-site navigation sent.
+        auto request_cookies = server.request_cookies();
+        outln("adopted cross-site: {} requests, {} of them ranged", request_cookies.size(), server.range_requests().size());
+        VERIFY(!server.range_requests().is_empty());
+        for (auto const& cookies : request_cookies)
+            VERIFY(cookies == "lax=1"sv);
     }
 
     {

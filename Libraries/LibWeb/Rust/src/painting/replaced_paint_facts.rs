@@ -54,10 +54,25 @@ impl VideoPaintFacts {
     }
 }
 
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) struct ImagePaintFacts {
     pub natural: SizeWithAspectRatio,
     pub content: ImageContent,
+    /// How an SVG image element fits the image into its rectangle, in the encoding of its `preserveAspectRatio`
+    /// attribute facts.
+    pub preserve_aspect_ratio_align: u8,
+    pub preserve_aspect_ratio_meet_or_slice: u8,
+}
+
+impl Default for ImagePaintFacts {
+    fn default() -> Self {
+        Self {
+            natural: SizeWithAspectRatio::default(),
+            content: ImageContent::default(),
+            preserve_aspect_ratio_align: crate::layout::svg_formatting_context::PRESERVE_ASPECT_RATIO_X_MID_Y_MID,
+            preserve_aspect_ratio_meet_or_slice: crate::layout::svg_formatting_context::MEET_OR_SLICE_MEET,
+        }
+    }
 }
 
 impl ImagePaintFacts {
@@ -68,6 +83,8 @@ impl ImagePaintFacts {
         Self {
             natural: SizeWithAspectRatio::from_ffi(&facts.natural),
             content: unsafe { ImageContent::from_ffi(&facts.content) },
+            preserve_aspect_ratio_align: facts.preserve_aspect_ratio_align,
+            preserve_aspect_ratio_meet_or_slice: facts.preserve_aspect_ratio_meet_or_slice,
         }
     }
 }
@@ -75,7 +92,7 @@ impl ImagePaintFacts {
 /// Each replaced row's paint facts. A publication shares the table, so a write copies it only while
 /// a publication still holds it.
 pub(crate) type ReplacedPaintFactsTable =
-    crate::css::style::fast_hash::FastMap<crate::layout::node_data::NodeSlotId, ReplacedPaintFacts>;
+    crate::cow_map::CowMap<crate::layout::node_data::NodeSlotId, ReplacedPaintFacts>;
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum ReplacedPaintFacts {
@@ -84,6 +101,7 @@ pub(crate) enum ReplacedPaintFacts {
     NavigableContainer(FfiNavigableContainerPaintFacts),
     Image(ImagePaintFacts),
     Video(VideoPaintFacts),
+    FrameSet(std::sync::Arc<crate::css::style::tree::FrameSetLayout>),
 }
 
 impl ReplacedPaintFacts {
@@ -95,7 +113,14 @@ impl ReplacedPaintFacts {
             Self::FormControl(_) => PaintDamage::DRAW_FOREGROUND,
             Self::Canvas(_) => PaintDamage::ALL_DRAW | PaintDamage::ALL_HIT,
             Self::NavigableContainer(_) => PaintDamage::ALL_DRAW | PaintDamage::ALL_HIT | PaintDamage::SCROLL_METADATA,
-            Self::Image(_) | Self::Video(_) => PaintDamage::ALL_DRAW,
+            Self::Image(_) | Self::Video(_) | Self::FrameSet(_) => PaintDamage::ALL_DRAW,
+        }
+    }
+
+    pub(crate) fn frameset(self) -> Option<std::sync::Arc<crate::css::style::tree::FrameSetLayout>> {
+        match self {
+            Self::FrameSet(layout) => Some(layout),
+            _ => None,
         }
     }
 

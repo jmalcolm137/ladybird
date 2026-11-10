@@ -111,7 +111,7 @@ enum DueHostCall {
     ShellStyleChanged {
         facts: crate::layout::host_tables::ShellFacts,
         record: u64,
-        payloads: crate::layout::node_data::StylePayloadsRef,
+        payloads: Option<crate::layout::node_data::LayoutStyleRef>,
         derived: bool,
         attach_resources: bool,
     },
@@ -135,6 +135,46 @@ impl HostWorkDue {
     /// Whether the host is owed nothing.
     pub(crate) fn is_empty(&self) -> bool {
         self.box_presence.is_empty() && self.calls.is_empty()
+    }
+
+    /// Takes out of the work what it tells layout nodes of their rows' styles, which a frame's layout round pays as the
+    /// frame lands, ahead of what is left, which waits for the host's layout update.
+    pub(crate) fn take_shell_style_changes(&mut self) -> Self {
+        let (changes, rest) = std::mem::take(&mut self.calls)
+            .into_iter()
+            .partition(|call| matches!(call, DueHostCall::ShellStyleChanged { .. }));
+        self.calls = rest;
+        Self {
+            box_presence: Default::default(),
+            calls: changes,
+        }
+    }
+
+    /// Has what the work tells layout nodes of their rows' styles read as `arena` does as the job or frame that owes it
+    /// ends, which is when the host pays it. A row may have moved on since the work came to owe it and let go of the
+    /// record it held then, while the record it holds now stays alive until a later job writes the row, which the host
+    /// pays for in turn. A row that has gone is owed nothing.
+    pub(crate) fn follow_rows(&mut self, arena: &LayoutNodeArena) {
+        self.calls.retain_mut(|call| {
+            let DueHostCall::ShellStyleChanged {
+                facts,
+                record,
+                payloads,
+                derived,
+                ..
+            } = call
+            else {
+                return true;
+            };
+            let Some(kind) = arena.node_kind_if_live(facts.id) else {
+                return false;
+            };
+            facts.kind = kind;
+            *record = arena.node_style_record(facts.id);
+            *payloads = arena.data(facts.id).style.get();
+            *derived = arena.node_style_record_is_derived(facts.id);
+            true
+        });
     }
 
     /// Makes the host calls owed.
@@ -167,7 +207,7 @@ fn tell_shell_of_style_change(
     main_thread: &MainThread,
     facts: crate::layout::host_tables::ShellFacts,
     record: u64,
-    payloads: crate::layout::node_data::StylePayloadsRef,
+    payloads: Option<crate::layout::node_data::LayoutStyleRef>,
     derived: bool,
     attach_resources: bool,
 ) {
@@ -197,7 +237,7 @@ fn tell_shell_of_style_change(
             callbacks.context,
             shell.as_ptr(),
             record,
-            payloads.as_ptr().cast(),
+            payloads.map_or(std::ptr::null(), |payloads| payloads.as_ptr()),
             derived,
             attach_resources,
         );
@@ -347,10 +387,10 @@ mod ffi_test_stubs {
 
 #[cfg(test)]
 mod tests {
-    use super::UnplacedLayoutNode;
+    use super::{DueHostCall, HostCalls, HostWorkDue, MainThread, OwedHostWork, UnplacedLayoutNode};
     use crate::layout::LayoutNodeArena;
     use crate::layout::layout_node_arena::NodeAllocation;
-    use crate::layout::node_data::{NodeKind, NodeSlotId};
+    use crate::layout::node_data::NodeSlotId;
 
     struct Links {
         parent: NodeSlotId,
@@ -522,32 +562,6 @@ mod tests {
         free(&mut arena, grandparent);
     }
 
-    #[test]
-    fn a_structural_change_clears_the_overflow_validity_of_box_ancestors_only() {
-        let mut arena = LayoutNodeArena::new();
-        let grandparent = arena.allocate_for_test();
-        let parent = arena.allocate_for_test();
-        let child = arena.allocate_for_test();
-        arena.write_shape(grandparent.slot).set_kind(NodeKind::BlockContainer);
-        arena.write_shape(parent.slot).set_kind(NodeKind::InlineNode);
-        arena.attach_child(grandparent.slot, owned(parent.slot), NodeSlotId::INVALID);
-        for node in [grandparent.slot, parent.slot] {
-            arena.populate_paintable_row(node);
-            arena.committed_side_data_mut(node).overflow_valid_across_recommits = true;
-        }
-
-        arena.attach_child(parent.slot, owned(child.slot), NodeSlotId::INVALID);
-
-        assert!(
-            !arena
-                .committed_side_data(grandparent.slot)
-                .overflow_valid_across_recommits
-        );
-        assert!(arena.committed_side_data(parent.slot).overflow_valid_across_recommits);
-
-        free(&mut arena, grandparent);
-    }
-
     #[cfg(debug_assertions)]
     #[test]
     #[should_panic(expected = "leaked without being attached or freed")]
@@ -555,5 +569,68 @@ mod tests {
         let mut arena = LayoutNodeArena::new();
         let node = arena.allocate_for_test();
         let _ = UnplacedLayoutNode::new(node.slot);
+    }
+
+    /// The rows and records `due` tells layout nodes of.
+    fn shell_styles(due: &HostWorkDue) -> Vec<(NodeSlotId, u64)> {
+        due.calls
+            .iter()
+            .filter_map(|call| match call {
+                DueHostCall::ShellStyleChanged { facts, record, .. } => Some((facts.id, *record)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_layout_node_hears_of_the_style_its_row_holds_as_the_job_ends() {
+        let main_thread = MainThread::for_test();
+        let mut arena = LayoutNodeArena::new();
+        let moved = arena.allocate_for_test().slot;
+        let freed = arena.allocate_for_test().slot;
+        arena.set_node_style(moved, 7, None);
+        arena.set_node_style(freed, 7, None);
+
+        let work = OwedHostWork::default();
+        arena.queue_box_presence();
+        HostCalls(&work).shell_style_changed(moved, false);
+        HostCalls(&work).shell_style_changed(freed, false);
+        let mut due = work.resolve(&mut arena);
+        assert_eq!(shell_styles(&due), [(moved, 7), (freed, 7)]);
+
+        // A later write of the same job moves one row on, and frees the other.
+        arena.set_node_style(moved, 9, None);
+        arena
+            .free_subtree(freed)
+            .destroy_shells_and_invoke_callbacks(&main_thread);
+        due.follow_rows(&arena);
+        assert_eq!(shell_styles(&due), [(moved, 9)]);
+
+        arena
+            .free_subtree(moved)
+            .destroy_shells_and_invoke_callbacks(&main_thread);
+    }
+
+    #[test]
+    fn a_rounds_shell_style_changes_leave_the_rest_of_what_it_owes() {
+        let main_thread = MainThread::for_test();
+        let mut arena = LayoutNodeArena::new();
+        let row = arena.allocate_for_test().slot;
+        arena.set_node_style(row, 7, None);
+
+        let work = OwedHostWork::default();
+        arena.queue_box_presence();
+        HostCalls(&work).shell_style_changed(row, false);
+        HostCalls(&work).shell_style_damaged(row, 1);
+        let mut due = work.resolve(&mut arena);
+        let changes = due.take_shell_style_changes();
+        assert_eq!(shell_styles(&changes), [(row, 7)]);
+        assert_eq!(changes.calls.len(), 1);
+        assert!(shell_styles(&due).is_empty());
+        assert_eq!(due.calls.len(), 1);
+
+        arena
+            .free_subtree(row)
+            .destroy_shells_and_invoke_callbacks(&main_thread);
     }
 }

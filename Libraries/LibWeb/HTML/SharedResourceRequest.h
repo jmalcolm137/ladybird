@@ -23,11 +23,12 @@ class SharedResourceRequest final : public JS::Cell {
     GC_DECLARE_ALLOCATOR(SharedResourceRequest);
 
 public:
-    // NB: Only requests with the same CORS mode, credentials mode, integrity metadata and referrer policy share a
+    // NB: Only requests with the same mode, credentials mode, integrity metadata and referrer policy share a
     //     resource. The origin is the same for every request of a document.
     struct Key {
         URL::URL url;
-        CORSSettingAttribute cors_setting { CORSSettingAttribute::NoCORS };
+        Fetch::Infrastructure::Request::Mode mode;
+        Fetch::Infrastructure::Request::CredentialsMode credentials_mode;
         Utf16String integrity_metadata;
         ReferrerPolicy::ReferrerPolicy referrer_policy { ReferrerPolicy::ReferrerPolicy::EmptyString };
 
@@ -37,9 +38,17 @@ public:
     [[nodiscard]] static GC::Ref<SharedResourceRequest> get_or_create(DOM::Document&, URL::URL const&, CORSSettingAttribute);
     [[nodiscard]] static GC::Ref<SharedResourceRequest> get_or_create(DOM::Document&, Fetch::Infrastructure::Request const&);
 
+    // Creates a request that loads the resource from the body of the response that the document was navigated to,
+    // instead of fetching it. No fetch checks this resource against the policies of the document, so it is only for
+    // the element that presents it, and get_or_create() never returns it.
+    // Calls on_body_read once reading the body has ended, whether or not that succeeded.
+    [[nodiscard]] static GC::Ref<SharedResourceRequest> create_from_navigation_response_body(DOM::Document&, Fetch::Infrastructure::Body const&, GC::Ref<GC::Function<void()>> on_body_read);
+
     virtual ~SharedResourceRequest() override;
 
     URL::URL const& url() const { return m_key.url; }
+    Optional<String> const& image_mime_type() const { return m_image_mime_type; }
+    [[nodiscard]] bool can_be_shared() const { return m_can_be_shared; }
 
     [[nodiscard]] GC::Ptr<DecodedImageData> image_data() const;
     [[nodiscard]] bool can_be_pruned_from_memory_cache() const;
@@ -51,7 +60,10 @@ public:
 
     void fetch_resource(NonnullRefPtr<Fetch::Infrastructure::Request>);
 
-    void add_callbacks(Function<void()> on_finish, Function<void()> on_fail, Function<void()> on_stop = {});
+    // Records a user that waits for the fetch without callbacks, so that the fetch delays the load event for it.
+    void wait_without_callbacks();
+
+    void add_callbacks(GC::Ptr<GC::Function<void()>> on_finish, GC::Ptr<GC::Function<void()>> on_fail, GC::Ptr<GC::Function<void()>> on_stop = {});
 
     enum class DelaysLoadEvent : u8 {
         No,
@@ -59,7 +71,7 @@ public:
     };
 
     // Returns an ID for remove_callbacks(), or nothing if the callbacks already ran.
-    Optional<u64> add_removable_callbacks(Function<void()> on_finish, Function<void()> on_fail, Function<void()> on_stop = {}, DelaysLoadEvent = DelaysLoadEvent::Yes);
+    Optional<u64> add_removable_callbacks(GC::Ptr<GC::Function<void()>> on_finish, GC::Ptr<GC::Function<void()>> on_fail, GC::Ptr<GC::Function<void()>> on_stop = {}, DelaysLoadEvent = DelaysLoadEvent::Yes);
     void remove_callbacks(u64 id);
 
     bool is_fetching() const;
@@ -93,6 +105,7 @@ private:
     };
 
     State m_state { State::New };
+    Optional<String> m_image_mime_type;
 
     GC::Ref<Page> m_page;
 
@@ -107,10 +120,11 @@ private:
     Vector<Callbacks> m_callbacks;
     u64 m_next_callbacks_id { 1 };
 
-    // NB: Set when the fetch was started for a user that waits for it without callbacks.
+    // NB: Set once a user waits for the fetch without callbacks.
     bool m_fetch_has_user_without_callbacks { false };
 
     Key m_key;
+    bool m_can_be_shared { true };
     GC::Ptr<DecodedImageData> m_image_data;
     GC::Ptr<Fetch::Infrastructure::FetchController> m_fetch_controller;
     u64 m_cache_touch_serial { 0 };
@@ -128,7 +142,8 @@ template<>
 struct Traits<Web::HTML::SharedResourceRequest::Key> : public DefaultTraits<Web::HTML::SharedResourceRequest::Key> {
     static unsigned hash(Web::HTML::SharedResourceRequest::Key const& key)
     {
-        auto hash = pair_int_hash(Traits<URL::URL>::hash(key.url), to_underlying(key.cors_setting));
+        auto hash = pair_int_hash(Traits<URL::URL>::hash(key.url), to_underlying(key.mode));
+        hash = pair_int_hash(hash, to_underlying(key.credentials_mode));
         hash = pair_int_hash(hash, key.integrity_metadata.hash());
         return pair_int_hash(hash, to_underlying(key.referrer_policy));
     }

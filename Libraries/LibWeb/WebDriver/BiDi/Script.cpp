@@ -7,10 +7,10 @@
 #include <AK/HashMap.h>
 #include <AK/JsonArray.h>
 #include <AK/RefCounted.h>
-#include <LibGC/ConservativeVector.h>
 #include <LibGC/Function.h>
 #include <LibGC/Heap.h>
 #include <LibGC/Root.h>
+#include <LibGC/RootVector.h>
 #include <LibJS/Runtime/AbstractOperations.h>
 #include <LibJS/Runtime/Error.h>
 #include <LibJS/Runtime/NativeFunction.h>
@@ -135,7 +135,7 @@ JS::Value create_a_channel(HTML::EnvironmentSettingsObject& settings, JsonObject
     auto channel_properties = protocol_value.get_object("value"sv).value_or({});
 
     // 2. Let steps be the following steps given the argument message:
-    auto steps = [channel_properties = move(channel_properties)](JS::VM& vm) -> JS::ThrowCompletionOr<JS::Value> {
+    auto steps = GC::create_function(GC::Heap::the(), GC::captures(move(channel_properties)), [](JsonObject& channel_properties, JS::VM& vm) -> JS::ThrowCompletionOr<JS::Value> {
         auto message = vm.argument(0);
 
         // 1. Let current realm be the current Realm Record.
@@ -194,10 +194,10 @@ JS::Value create_a_channel(HTML::EnvironmentSettingsObject& settings, JsonObject
         // 7. Emit an event with session and body.
         emit_event(*navigable, "script.message"_string, move(params));
         return JS::js_undefined();
-    };
+    });
 
     // 3. Return CreateBuiltinFunction(steps, 1, "", « », realm).
-    return BindingsGlue::create_channel_function(settings, move(steps));
+    return BindingsGlue::create_channel_function(settings, steps);
 }
 
 // https://w3c.github.io/webdriver-bidi/#get-a-realm-from-a-target
@@ -343,11 +343,13 @@ namespace {
 
 // NB: The session keeps an awaited promise and its evaluation alive until it settles or its environment is destroyed.
 struct PendingEvaluation : RefCounted<PendingEvaluation> {
+    GC_HOLDS_NO_CELL_EDGES;
+
     AK_ALLOC_WITH_KMALLOC;
 
     String environment_id;
     GC::Root<WebIDL::Promise> promise;
-    OnCommandComplete on_complete;
+    GC::Root<GC::Function<void(Response)>> on_complete;
     SerializationOptions serialization_options;
     ResultOwnership result_ownership { ResultOwnership::None };
 
@@ -380,7 +382,7 @@ void PendingEvaluation::complete(Response response)
     }
     promise = {};
     auto callback = move(on_complete);
-    callback(move(response));
+    callback->function()(move(response));
 }
 
 void fail_pending_evaluations(HTML::EnvironmentSettingsObject& settings)
@@ -422,14 +424,14 @@ static void complete_evaluation(HTML::EnvironmentSettingsObject& settings, JS::C
         pending_evaluations().ensure(state->environment_id).append(state);
 
         WebIDL::react_to_promise(promise,
-            GC::create_function(GC::Heap::the(), [settings = GC::Ref { settings }, state](JS::Value value) -> WebIDL::ExceptionOr<JS::Value> {
+            GC::create_function(GC::Heap::the(), GC::captures(GC::Ref { settings }, state), [](auto& settings, auto& state, JS::Value value) -> WebIDL::ExceptionOr<JS::Value> {
                 if (!state->on_complete)
                     return JS::js_undefined();
                 HTML::TemporaryExecutionContext execution_context { *settings, HTML::TemporaryExecutionContext::CallbacksEnabled::Yes };
                 state->complete(JsonValue { evaluation_result_success(*settings, value, state->serialization_options, state->result_ownership) });
                 return JS::js_undefined();
             }),
-            GC::create_function(GC::Heap::the(), [settings = GC::Ref { settings }, state](JS::Value reason) -> WebIDL::ExceptionOr<JS::Value> {
+            GC::create_function(GC::Heap::the(), GC::captures(GC::Ref { settings }, state), [](auto& settings, auto& state, JS::Value reason) -> WebIDL::ExceptionOr<JS::Value> {
                 if (!state->on_complete)
                     return JS::js_undefined();
                 HTML::TemporaryExecutionContext execution_context { *settings, HTML::TemporaryExecutionContext::CallbacksEnabled::Yes };
@@ -443,12 +445,12 @@ static void complete_evaluation(HTML::EnvironmentSettingsObject& settings, JS::C
 
     // If evaluation status.[[Type]] is throw:
     if (evaluation_status.is_abrupt()) {
-        on_complete(JsonValue { evaluation_result_exception(settings, evaluation_status.value(), result_ownership) });
+        on_complete->function()(JsonValue { evaluation_result_exception(settings, evaluation_status.value(), result_ownership) });
         return;
     }
 
     // Assert: evaluation status.[[Type]] is normal.
-    on_complete(JsonValue { evaluation_result_success(settings, evaluation_status.value(), serialization_options, result_ownership) });
+    on_complete->function()(JsonValue { evaluation_result_success(settings, evaluation_status.value(), serialization_options, result_ownership) });
 }
 
 #define TRY_OR_COMPLETE(expression)                                                                  \
@@ -459,7 +461,7 @@ static void complete_evaluation(HTML::EnvironmentSettingsObject& settings, JS::C
         static_assert(!::AK::Detail::IsLvalueReference<decltype(_temporary_result.release_value())>, \
             "Do not return a reference from a fallible expression");                                 \
         if (_temporary_result.is_error()) [[unlikely]] {                                             \
-            on_complete(_temporary_result.release_error());                                          \
+            on_complete->function()(_temporary_result.release_error());                              \
             return;                                                                                  \
         }                                                                                            \
         _temporary_result.release_value();                                                           \
@@ -575,7 +577,7 @@ void call_function(HTML::Navigable& navigable, JsonObject const& params, OnComma
     //    given realm, command arguments and session.
     if (auto command_arguments = params.get("arguments"sv); command_arguments.has_value()) {
         if (!command_arguments->is_array())
-            return on_complete(invalid_argument("Parameter 'arguments' must be a list"sv));
+            return on_complete->function()(invalid_argument("Parameter 'arguments' must be a list"sv));
 
         // https://w3c.github.io/webdriver-bidi/#deserialize-arguments
         for (auto const& serialized_argument : command_arguments->as_array().values())
@@ -619,7 +621,7 @@ void call_function(HTML::Navigable& navigable, JsonObject const& params, OnComma
         //    result ownership and session.
         // 2. Return a new map matching the script.EvaluationResultException production, with the exceptionDetails field
         //    set to exception details.
-        on_complete(JsonValue { evaluation_result_exception(settings, function_body_evaluation_status.value(), result_ownership) });
+        on_complete->function()(JsonValue { evaluation_result_exception(settings, function_body_evaluation_status.value(), result_ownership) });
         return;
     }
 
@@ -629,7 +631,7 @@ void call_function(HTML::Navigable& navigable, JsonObject const& params, OnComma
     // 19. If IsCallable(function object) is false:
     if (!function_object.is_function()) {
         // 1. Return an error with error code invalid argument
-        return on_complete(invalid_argument("Function declaration is not a function"sv));
+        return on_complete->function()(invalid_argument("Function declaration is not a function"sv));
     }
 
     // 20. If command parameters["userActivation"] is true, run activation notification steps.
@@ -709,7 +711,7 @@ Response get_realms(HTML::Navigable& navigable, JsonObject const& params)
     // NB: The browser process asks the process hosting each navigable's active document for the realms of that
     //     document.
     // FIXME: Include the realms of workers.
-    GC::ConservativeVector<HTML::EnvironmentSettingsObject*> environment_settings;
+    GC::RootVector<HTML::EnvironmentSettingsObject*> environment_settings;
     if (auto* local_navigable = as_if<HTML::LocalNavigable>(navigable)) {
         if (auto document = local_navigable->active_document()) {
             auto& settings = document->relevant_settings_object();

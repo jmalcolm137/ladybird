@@ -36,6 +36,10 @@ console.log("NAV vendor=" + navigator.vendor + " appVersion=" + navigator.appVer
 
 PAGE = b"""<!doctype html><html><body>engine feature test</body></html>"""
 
+PREFS_PAGE = b"""<!doctype html><html><body><script>
+console.log("PREF dark=" + matchMedia("(prefers-color-scheme: dark)").matches + " contrast=" + matchMedia("(prefers-contrast: more)").matches + " motion=" + matchMedia("(prefers-reduced-motion: reduce)").matches);
+</script></body></html>"""
+
 requests = []
 submissions = []
 
@@ -65,6 +69,8 @@ class Handler(BaseHTTPRequestHandler):
             body = LINK_PAGE
         elif self.path == "/drag-select":
             body = SELECTION_PAGE
+        elif self.path == "/prefs":
+            body = PREFS_PAGE
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
@@ -177,13 +183,17 @@ Native stack (binary build ID, object address):
         client = Client(stream)
 
         hello = client.wait_for("hello")
-        assert hello.get("protocol") == 17, hello
+        assert hello.get("protocol") == 18, hello
         user_agents = client.wait_for("user_agents")
         default_user_agent = next(agent["value"] for agent in user_agents["agents"] if agent["name"] == "Default")
         modes = client.wait_for("navigator_compatibility_modes")
         assert modes.get("current") == "chrome", modes
         assert [m["value"] for m in modes.get("modes", [])] == ["chrome", "gecko", "webkit"], modes
-        print("ok: protocol 17 and spoofing choices")
+        preferences = client.wait_for("view_preferences")
+        assert preferences.get("color_scheme") == "auto", preferences
+        assert preferences.get("contrast") == "auto", preferences
+        assert preferences.get("motion") == "auto", preferences
+        print("ok: protocol 18, spoofing choices and view preferences")
 
         crash = client.wait_for("crash_report_available")
         assert crash.get("name") == crash_report_name, crash
@@ -204,7 +214,7 @@ Native stack (binary build ID, object address):
         changed = client.wait_for("user_agent_changed")
         assert changed.get("value") == "EngineFeatureTest/1.0", changed
         tab = create_tab(client, f"http://127.0.0.1:{port}/ua", 1)
-        time.sleep(1)
+        time.sleep(1.5)
         assert any(path == "/ua" and headers.get("User-Agent") == "EngineFeatureTest/1.0" for path, headers in requests)
         print("ok: User-Agent override")
 
@@ -225,6 +235,29 @@ Native stack (binary build ID, object address):
         log_text = open(engine_log_path, errors="replace").read()
         assert "NAV vendor= appVersion=5.0 (X11) productSub=20100101" in log_text, log_text[-2000:]
         print("ok: navigator compatibility mode")
+
+        client.send({"type": "set_website_color_scheme", "value": "dark"})
+        preferences = client.wait_for("view_preferences")
+        assert preferences.get("color_scheme") == "dark", preferences
+        client.send({"type": "set_preferred_contrast", "value": "more"})
+        preferences = client.wait_for("view_preferences")
+        assert preferences.get("contrast") == "more", preferences
+        client.send({"type": "set_preferred_motion", "value": "reduce"})
+        preferences = client.wait_for("view_preferences")
+        assert preferences.get("motion") == "reduce", preferences
+        prefs_tab = create_tab(client, f"http://127.0.0.1:{port}/prefs", 5)
+        time.sleep(1.5)
+        engine_log.flush()
+        log_text = open(engine_log_path, errors="replace").read()
+        assert "PREF dark=true contrast=true motion=true" in log_text, log_text[-2000:]
+        print("ok: view preferences")
+
+        client.send({"type": "set_website_color_scheme", "value": "auto"})
+        client.wait_for("view_preferences")
+        client.send({"type": "set_preferred_contrast", "value": "auto"})
+        client.wait_for("view_preferences")
+        client.send({"type": "set_preferred_motion", "value": "auto"})
+        client.wait_for("view_preferences")
 
         client.send({"type": "autocomplete", "tab": tab, "request": 7, "query": "lady"})
         items = []
@@ -263,6 +296,20 @@ Native stack (binary build ID, object address):
         assert any(item.get("type") == "text/plain" and "SELECTIONTEXT" in item.get("data", "") for item in drag.get("items", [])), drag
         client.send({"type": "drag", "tab": selection_tab, "drag_type": "end", "x": 140, "y": 60})
         print("ok: selection drag payload")
+
+        menu_tab = create_tab(client, f"http://127.0.0.1:{port}/drag-link", 6)
+        time.sleep(1.5)
+        mouse(client, menu_tab, "down", 50, 20, "right", 2, 1)
+        mouse(client, menu_tab, "up", 50, 20, "right", 0, 1)
+        menu = client.wait_for("context_menu")
+        assert menu.get("tab") == menu_tab, menu
+        items = menu.get("items", [])
+        copy_link = next((item for item in items if item.get("text") == "Copy Link Address"), None)
+        assert copy_link is not None, items
+        client.send({"type": "context_menu_action", "tab": menu_tab, "action": copy_link["action"]})
+        clipboard = client.wait_for("clipboard_write")
+        assert any(representation.get("name") == "text/plain" and "example.com" in representation.get("data", "") for representation in clipboard.get("items", [])), clipboard
+        print("ok: context menu")
 
         client.send({"type": "quit"})
         time.sleep(0.3)

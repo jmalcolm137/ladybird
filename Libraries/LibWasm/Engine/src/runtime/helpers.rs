@@ -12,8 +12,8 @@ use crate::abi::{
     ExecutionContext, FRAME_FUNCTION, FRAME_HEADER_SIZE, FRAME_INSTANCE, FRAME_RETURN_IP, FRAME_SAVED_FP, MemoryData,
     TableData,
 };
-use crate::futex::{self, AtomicWaitResult, WaitWord};
 use crate::validator::{CatchKind, NO_EXCEPTION_LOCAL, NOT_DELEGATED};
+use ak::waiter_list::{self, AgentWaiter, AtomicWaitResult, WaitWord};
 
 export_runtime_functions! {
     wasm_runtime_memory_grow => memory_grow,
@@ -269,9 +269,9 @@ unsafe fn wait(context: *mut ExecutionContext) -> u64 {
         ));
         return crate::abi::WAIT_CANNOT_BLOCK;
     }
-    // NB: The waits and wakes are those of Atomics.wait and Atomics.notify (LibJS's futex), whose waiter lists are
-    //     the operating system's, per address: JavaScript and WebAssembly wake each other, as the memory model's
-    //     single WaiterList per location requires.
+    // NB: The waits and wakes are those of Atomics.wait and Atomics.notify, in the waiter lists of the process, per
+    //     address: JavaScript and WebAssembly wake each other, as the memory model's single WaiterList per location
+    //     requires.
     let word = unsafe {
         if size == 4 {
             WaitWord::Word32(&*(address as *const std::sync::atomic::AtomicU32))
@@ -280,10 +280,16 @@ unsafe fn wait(context: *mut ExecutionContext) -> u64 {
         }
     };
     let timeout = (timeout >= 0).then(|| std::time::Duration::from_nanos(timeout as u64));
-    match futex::atomic_wait(word, expected, timeout) {
+    // NB: A store without an agent has nothing to interrupt it, as a test's has not.
+    let waiter = store.agent_waiter.clone().unwrap_or_else(AgentWaiter::new);
+    match waiter_list::atomic_wait(word, expected, timeout, &waiter) {
         AtomicWaitResult::Woken => 0,
         AtomicWaitResult::NotEqual => 1,
         AtomicWaitResult::TimedOut => 2,
+        AtomicWaitResult::Interrupted => {
+            store.pending_trap = Some(Trap::StackExhausted);
+            crate::abi::WAIT_CANNOT_BLOCK
+        }
     }
 }
 
@@ -296,5 +302,5 @@ unsafe fn wait(context: *mut ExecutionContext) -> u64 {
 unsafe fn notify(context: *mut ExecutionContext) -> u64 {
     let (address, count) = unsafe { ((*context).arguments[0], (*context).arguments[1]) };
     let word = unsafe { &*(address as *const std::sync::atomic::AtomicU32) };
-    futex::atomic_notify(word, usize::try_from(count).unwrap_or(usize::MAX)) as u64
+    waiter_list::atomic_notify(word, usize::try_from(count).unwrap_or(usize::MAX)) as u64
 }

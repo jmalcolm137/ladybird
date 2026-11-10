@@ -24,26 +24,23 @@ class ServerConnection final
     C_OBJECT(ServerConnection);
 
 public:
-    // What the client is told about devices; a headless server has none to tell of.
-    enum class DeviceEnumeration : u8 {
-        Platform,
-        None,
-    };
-
     // Asks the Browser whether the client's tab may capture from the device; the answer comes once, on this thread.
-    using CapturePermissionRequest = Function<void(ByteString const& device_id, Function<void(bool allowed)> on_decided)>;
+    using CapturePermissionRequest = Function<void(ByteString const& device_id, PlaybackGroupId, Function<void(bool allowed)> on_decided)>;
 
     virtual ~ServerConnection() override;
 
     // Runs when the client disconnects, after its streams have left the mixer.
     Function<void()> on_death;
+    // A capture stream counts from the moment the Browser lets it capture until it is gone, however it goes.
+    Function<void(PlaybackGroupId)> on_capture_started;
+    Function<void(PlaybackGroupId)> on_capture_stopped;
 
     // Whether the Browser says the client's tab holds the microphone permission. Without it the client learns of the
     // devices by their existence alone, and the capture streams it has are closed.
     void set_capture_permitted(bool);
 
 private:
-    ServerConnection(NonnullOwnPtr<IPC::Transport>, int client_id, NonnullRefPtr<PlaybackStreamMixer>, DeviceEnumeration, NonnullRefPtr<CaptureDevices>, CapturePermissionRequest);
+    ServerConnection(NonnullOwnPtr<IPC::Transport>, int client_id, NonnullRefPtr<PlaybackStreamMixer>, NonnullRefPtr<CaptureDevices>, CapturePermissionRequest);
 
     virtual void die() override;
     void remove_streams_from_mixer();
@@ -61,7 +58,7 @@ private:
     virtual void discard_stream(u64 stream_id, u64 request_id) override;
     virtual void set_stream_volume(u64 stream_id, float volume) override;
     virtual void watch_devices() override;
-    virtual void create_record_stream(u64 stream_id, ByteString device_id) override;
+    virtual void create_record_stream(u64 stream_id, ByteString device_id, PlaybackGroupId group) override;
     virtual void destroy_record_stream(u64 stream_id) override;
 
     void devices_changed();
@@ -81,8 +78,11 @@ private:
 
     // No subscriber while the Browser is being asked.
     struct RecordStreamState {
+        PlaybackGroupId group;
         Optional<CaptureSubscriberId> subscriber_id;
+        bool may_capture { false };
     };
+    void record_stream_gone(RecordStreamState const&);
 
     NonnullRefPtr<PlaybackStreamMixer> m_mixer;
     HashMap<u64, PlaybackGroupId> m_session_groups;
@@ -93,7 +93,6 @@ private:
     HashMap<u64, RecordStreamState> m_record_streams;
     bool m_capture_permitted { false };
 
-    DeviceEnumeration m_device_enumeration { DeviceEnumeration::None };
     Optional<AudioDevices::ListenerId> m_devices_changed_listener_id;
     bool m_client_watches_devices { false };
 };

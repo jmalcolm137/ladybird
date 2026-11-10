@@ -6,6 +6,7 @@
 
 #include <AK/NeverDestroyed.h>
 #include <AK/ScopeGuard.h>
+#include <LibAudio/RecordStream.h>
 #include <LibCompositing/DisplayList/DisplayListResourceStorage.h>
 #include <LibGC/Heap.h>
 #include <LibGC/WeakHashMap.h>
@@ -31,6 +32,17 @@
 #include <LibXML/Parser/Parser.h>
 
 namespace Web::SVG {
+
+struct DocumentObserverRoot : RefCounted<DocumentObserverRoot> {
+    GC_HOLDS_NO_CELL_EDGES;
+
+    explicit DocumentObserverRoot(DOM::DocumentObserver& observer)
+        : observer(observer)
+    {
+    }
+
+    GC::Root<DOM::DocumentObserver> observer;
+};
 
 GC_DEFINE_ALLOCATOR(SVGDecodedImageData);
 GC_DEFINE_ALLOCATOR(SVGDecodedImageData::SVGPageClient);
@@ -157,12 +169,14 @@ NonnullRefPtr<SVGDecodedImageData::DecodePromise> SVGDecodedImageData::decode(GC
     auto promise = DecodePromise::construct();
     auto observer = DOM::DocumentObserver::create(*document);
     // Keep the loading state alive until the document finishes loading its internal resources.
-    observer->set_document_completely_loaded([page_client, document, svg_root = GC::Ref { *svg_root }, observer = GC::Root { observer }, promise] {
-        observer->set_document_completely_loaded(nullptr);
+    // NB: The observer's own function cannot keep the observer alive, as what it captures is traced from the observer.
+    auto observer_root = make_ref_counted<DocumentObserverRoot>(*observer);
+    observer->set_document_completely_loaded(GC::create_function(GC::Heap::the(), GC::captures(page_client, document, GC::Ref { *svg_root }, move(observer_root), promise), [](auto& page_client, auto& document, auto& svg_root, auto& observer_root, auto& promise) {
+        observer_root->observer->set_document_completely_loaded(nullptr);
         auto svg_image_data = create(page_client->page(), page_client, document, svg_root);
         page_client->register_svg_image_data(svg_image_data);
         promise->resolve(svg_image_data);
-    });
+    }));
     return promise;
 }
 
@@ -292,7 +306,7 @@ Optional<Compositing::DisplayListResource> SVGDecodedImageData::record_display_l
         m_natural_size.clear();
         m_document->set_svg_image_color_scheme(color_scheme);
         m_document->style_scope().invalidate_style_cache();
-        m_document->record_style_environment_change();
+        m_document->record_style_environment_change(DOM::StyleEnvironmentChange::ColorScheme | DOM::StyleEnvironmentChange::MediaFeatures);
     }
 
     navigable.set_viewport_size(css_size);
@@ -495,6 +509,22 @@ void SVGDecodedImageData::SVGPageClient::request_frame()
         svg_image_data.did_request_frame();
 }
 
+void SVGDecodedImageData::SVGPageClient::request_frame_for(DOM::Document const& document)
+{
+    if (m_frame_request_suppression_count > 0)
+        return;
+
+    // Only the image of the document asking for the frame changes. A document that's still being decoded has no image
+    // yet, and so nothing to invalidate. Invalidating every image instead would make loading n images take O(n^3)
+    // time, since each invalidation prunes the cached resources of every image.
+    for (auto& svg_image_data : m_svg_image_data) {
+        if (&svg_image_data.svg_document() == &document) {
+            svg_image_data.did_request_frame();
+            return;
+        }
+    }
+}
+
 NonnullRefPtr<Media::AudioOutputFactory> SVGDecodedImageData::SVGPageClient::create_audio_output_factory()
 {
     return m_host_page->client().create_audio_output_factory();
@@ -508,6 +538,11 @@ NonnullOwnPtr<MediaClient::RemotePlaybackManager> SVGDecodedImageData::SVGPageCl
 void SVGDecodedImageData::SVGPageClient::rebind_media_playback_manager(MediaClient::RemotePlaybackManager& playback_manager)
 {
     m_host_page->client().rebind_media_playback_manager(playback_manager);
+}
+
+NonnullRefPtr<Audio::RecordStream::CreatePromise> SVGDecodedImageData::SVGPageClient::create_audio_record_stream(StringView device_id, Audio::RecordStream::RecordCallback callback)
+{
+    return m_host_page->client().create_audio_record_stream(device_id, move(callback));
 }
 
 void SVGDecodedImageData::did_request_frame()
@@ -528,7 +563,7 @@ void SVGDecodedImageData::did_request_frame()
     if (m_has_pending_client_notification)
         return;
     m_has_pending_client_notification = true;
-    Platform::EventLoopPlugin::the().deferred_invoke(GC::create_function(heap(), [self = GC::Ref { *this }] {
+    Platform::EventLoopPlugin::the().deferred_invoke(GC::create_function(heap(), GC::captures(GC::Ref { *this }), [](auto& self) {
         self->m_has_pending_client_notification = false;
         self->notify_clients_did_update();
     }));

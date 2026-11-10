@@ -10,12 +10,18 @@
 
 namespace GC {
 
-WeakImpl WeakImpl::the_null_weak_impl;
+constinit WeakImpl WeakImpl::the_null_weak_impl { WeakImpl::State::Null };
 
 WeakBlock* WeakBlock::create()
 {
     auto* block = MUST(Core::System::allocate_anonymous_memory(WeakBlock::BLOCK_SIZE, Core::System::MemoryTag::GarbageCollector));
     return new (block) WeakBlock;
+}
+
+void WeakBlock::destroy(WeakBlock* block)
+{
+    block->~WeakBlock();
+    MUST(Core::System::release_address_space(block, WeakBlock::BLOCK_SIZE));
 }
 
 WeakBlock::WeakBlock()
@@ -28,6 +34,15 @@ WeakBlock::WeakBlock()
 }
 
 WeakBlock::~WeakBlock() = default;
+
+bool WeakBlock::has_referenced_impls() const
+{
+    for (auto const& impl : m_impls) {
+        if (impl.ref_count() != 0)
+            return true;
+    }
+    return false;
+}
 
 WeakImpl* WeakBlock::allocate(Cell* cell)
 {

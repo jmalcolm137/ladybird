@@ -16,7 +16,6 @@ use core::cell::Cell;
 use core::ptr::NonNull;
 
 use crate::build_configuration::HEAP_REGION_OFFSET_MASK;
-use crate::gc::capi;
 use crate::gc::primitive_storage::{OwnedPrimitiveStorage, ZeroFillNewBytes};
 use crate::gc::sweep::Sweep;
 use crate::layout::cell::{CellHeader, Gc};
@@ -77,18 +76,6 @@ impl ExecutableFeedback {
         // SAFETY: new() laid out `count` initialized elements of type T, aligned for T, at `offset` in the storage,
         //         which lives as long as the feedback. Its elements are cells, which allow shared mutation.
         unsafe { ak::slice_from_raw_parts(storage.data().add(offset).cast::<T>(), count as usize) }
-    }
-
-    /// Takes over what `other`, the feedback of an executable with the same bytecode, observed.
-    pub fn copy_from(&self, other: &ExecutableFeedback) {
-        assert!(self.counts == other.counts, "the feedback has the same slots");
-        if let (Some(storage), Some(other_storage)) = (&self.storage, &other.storage) {
-            // SAFETY: Both storages hold `layout.size` bytes laid out for the same counts, and are distinct.
-            unsafe { core::ptr::copy_nonoverlapping(other_storage.data(), storage.data(), self.layout.size) };
-        }
-        for (value, other_value) in self.value.iter().zip(&other.value) {
-            value.set(other_value.get());
-        }
     }
 
     pub fn arith(&self) -> &[Cell<u8>] {
@@ -173,8 +160,8 @@ impl ExecutableFeedback {
 /// the heap region.
 fn decode_weak_reference(reference: &Cell<Option<Gc<CellHeader>>>) -> Option<Gc<CellHeader>> {
     let cell = reference.get()?;
-    // SAFETY: LibGC fixed the heap region base before any cell existed.
-    let base = unsafe { capi::js_heap_region_base } as u64;
+    // NB: The heap region base was fixed before any cell existed.
+    let base = crate::layout_forward::heap_region_base() as u64;
     let address = base + (cell.as_ptr() as u64 & HEAP_REGION_OFFSET_MASK);
     let address = NonNull::new(core::ptr::with_exposed_provenance_mut::<CellHeader>(address as usize))
         .expect("the heap region does not start at null");

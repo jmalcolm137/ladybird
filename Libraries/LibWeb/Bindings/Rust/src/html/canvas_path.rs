@@ -11,6 +11,7 @@
 //! quadraticCurveTo(), arc() and ellipse() are floats, and those of the rest are doubles that become floats where
 //! they become points.
 
+use ak::math;
 use libgfx_rust::{FloatPoint, FloatSize};
 
 use crate::ak_format::ak_formatted;
@@ -174,10 +175,7 @@ fn point(x: f32, y: f32) -> FloatPoint {
     FloatPoint { x, y }
 }
 
-#[allow(
-    clippy::cast_possible_truncation,
-    reason = "a point of a Gfx::Path is in floats, as the C++ made it"
-)]
+#[allow(clippy::cast_possible_truncation, reason = "a point of a path is in floats")]
 fn point_from_doubles(x: f64, y: f64) -> FloatPoint {
     point(x as f32, y as f32)
 }
@@ -350,7 +348,7 @@ pub(crate) fn ellipse(
     let tau = core::f32::consts::TAU;
     #[allow(
         clippy::cast_possible_truncation,
-        reason = "the angles of an arc of a Gfx::Path are floats"
+        reason = "the angles of an arc of a path are floats"
     )]
     let (start_angle, end_angle) = ((start_angle as f32) % tau, (end_angle as f32) % tau);
 
@@ -360,7 +358,7 @@ pub(crate) fn ellipse(
     // positions is just whether our angle is on one of the left quadrants.
     // NB: The C++ took the sine and the cosine of the rotation with the x87 instruction, in extended precision. Taken
     //     in double precision, they round to the same floats but in rare cases.
-    let (sin_rotation, cos_rotation) = f64::from(rotation).sin_cos();
+    let (sin_rotation, cos_rotation) = math::sincos(f64::from(rotation));
     #[allow(
         clippy::cast_possible_truncation,
         reason = "the C++ kept the sine and the cosine in floats"
@@ -368,7 +366,7 @@ pub(crate) fn ellipse(
     let (sin_rotation, cos_rotation) = (sin_rotation as f32, cos_rotation as f32);
 
     let resolve_point_with_angle = |angle: f32| {
-        let tan_relative = angle.tan();
+        let tan_relative = math::tan(angle);
         let tan2 = tan_relative * tan_relative;
 
         let ab = radius_x * radius_y;
@@ -382,7 +380,7 @@ pub(crate) fn ellipse(
         // Make sure to set the correct sign
         // -1 if 0 ≤ θ < 90° or 270°< θ ≤ 360°
         //  1 if 90° < θ< 270°
-        let sn = if angle.cos() >= 0.0 { 1.0 } else { -1.0 };
+        let sn = if math::cos(angle) >= 0.0 { 1.0 } else { -1.0 };
         relative_x_position *= sn;
         relative_y_position *= sn;
 
@@ -497,7 +495,7 @@ pub(crate) fn arc_to(
     //    (x1, y1), and that has a different point tangent to the half-infinite line that ends at the point (x1, y1)
     //    and crosses the point (x2, y2). The points at which this circle touches these two lines are called the start
     //    and end tangent points respectively.
-    let adjacent = radius / f64::from((cos_theta.acos() / 2.0).tan());
+    let adjacent = radius / f64::from(math::tan(math::acos(cos_theta) / 2.0));
     let factor1 = adjacent / f64::from(length(v1));
     let x3 = f64::from(p1.x) + factor1 * f64::from(p0.x - p1.x);
     let y3 = f64::from(p1.y) + factor1 * f64::from(p0.y - p1.y);
@@ -522,7 +520,7 @@ pub(crate) fn arc_to(
     // the subpath.
     #[allow(
         clippy::cast_possible_truncation,
-        reason = "the radius of an arc of a Gfx::Path is a float"
+        reason = "the radius of an arc of a path is a float"
     )]
     path.arc_to(end_tangent, radius as f32, large_arc, sweep);
     Ok(())
@@ -669,7 +667,7 @@ pub(crate) fn round_rect(
     let sweep = x_direction * y_direction > 0.0;
     #[allow(
         clippy::cast_possible_truncation,
-        reason = "the radii of an arc of a Gfx::Path are floats"
+        reason = "the radii of an arc of a path are floats"
     )]
     let radii_of = |radius: RoundRectRadius| FloatSize {
         width: radius.x as f32,
@@ -765,7 +763,7 @@ mod tests {
         Close,
     }
 
-    /// The operations that a path was given, with the rules of a Gfx::Path for its current point.
+    /// The operations that a path was given, with the rules of `Path` for its current point.
     #[derive(Default)]
     struct RecordingPath {
         ops: Vec<Op>,

@@ -6,6 +6,7 @@
 
 #include <AK/Debug.h>
 #include <AK/StringView.h>
+#include <AK/Time.h>
 #include <LibGC/Function.h>
 #include <LibGC/Heap.h>
 #include <LibJS/Runtime/Value.h>
@@ -14,6 +15,7 @@
 #include <LibWeb/Fetch/Infrastructure/HTTP/Bodies.h>
 #include <LibWeb/Fetch/Infrastructure/HTTP/MIME.h>
 #include <LibWeb/Fetch/Infrastructure/HTTP/ResponseView.h>
+#include <LibWeb/HTML/EventLoop/EventLoop.h>
 #include <LibWeb/HTML/HTMLLinkElement.h>
 #include <LibWeb/HTML/Parser/HTMLEncodingDetection.h>
 #include <LibWeb/HTML/Parser/HTMLParser.h>
@@ -62,7 +64,7 @@ void IncrementalDocumentParser::start()
     // FIXME: The spec allows starting the parse after 500 ms or 1024 bytes, whichever comes first.
     // We only honor the byte threshold.
     auto parser = GC::Ref { *this };
-    m_body->wait_for_sniff_bytes(GC::create_function(GC::Heap::the(), [parser](Web::Fetch::Infrastructure::Body::SniffBytes sniff_bytes) {
+    m_body->wait_for_sniff_bytes(GC::create_function(GC::Heap::the(), GC::captures(parser), [](auto& parser, Web::Fetch::Infrastructure::Body::SniffBytes sniff_bytes) {
         // A failed response initializes the parser too.
         parser->initialize_parser(sniff_bytes.bytes);
     }));
@@ -80,17 +82,63 @@ void IncrementalDocumentParser::initialize_parser(ReadonlyBytes sniff_bytes)
     if (m_parser)
         return;
 
+    m_document->set_url(m_url);
+
+    // The parser exists while the prescan runs, so that aborting the document aborts it. Its encoding confidence is
+    // set along with its encoding.
+    m_parser = HTMLParser::create_with_open_input_stream(m_document, EncodingConfidence::Tentative);
+    m_parser->set_change_encoding_callback(GC::create_function(GC::Heap::the(), GC::captures(*this), [](IncrementalDocumentParser& self, StringView encoding) {
+        auto result = self.change_encoding(encoding);
+        if (result.is_error()) {
+            self.release_encoding_change_buffers();
+            return false;
+        }
+        return result.release_value();
+    }));
+    m_parser->set_parsing_complete_callback(GC::create_function(GC::Heap::the(), GC::captures(*this), [](IncrementalDocumentParser& self) {
+        self.release_encoding_change_buffers();
+    }));
+    m_parser->set_ready_for_more_input_callback(GC::create_function(GC::Heap::the(), GC::captures(*this), [](IncrementalDocumentParser& self) {
+        self.feed_parser();
+    }));
+    m_parser->set_allow_declarative_shadow_roots(m_allow_declarative_shadow_roots);
+
     // https://html.spec.whatwg.org/multipage/parsing.html#parsing-with-a-known-character-encoding
     // https://html.spec.whatwg.org/multipage/parsing.html#determining-the-character-encoding
-    Optional<StringView> standardized_encoding;
-    auto encoding_confidence = EncodingConfidence::Certain;
     if (m_document->has_encoding()) {
-        standardized_encoding = TextCodec::get_standardized_encoding(m_document->encoding().value());
+        set_encoding(m_document->encoding()->to_byte_string(), EncodingConfidence::Certain);
+    } else if (auto result = sniff_encoding_before_prescan(sniff_bytes, m_mime_type); result.has_value()) {
+        set_encoding(result->encoding, result->confidence);
     } else {
-        auto [encoding, confidence] = run_encoding_sniffing_algorithm(m_document, sniff_bytes, m_mime_type, m_container_document);
-        standardized_encoding = TextCodec::get_standardized_encoding(encoding);
-        encoding_confidence = confidence;
+        // The prescan can need bytes past the ones for sniffing, as far as the end of the head, so it reads them as
+        // they arrive, and the parser gets them once it's done.
+        m_sniff_bytes = MUST(ByteBuffer::copy(sniff_bytes));
+        m_prescan = make<EncodingDeclarationPrescan>(m_document->is_scripting_enabled());
     }
+
+    start_incremental_read();
+}
+
+void IncrementalDocumentParser::continue_prescan(bool input_complete)
+{
+    auto new_bytes = m_input_bytes.span().slice(m_prescanned_byte_count);
+    m_prescanned_byte_count = m_input_bytes.size();
+
+    auto result = m_prescan->scan(new_bytes, input_complete);
+    if (result == EncodingDeclarationPrescan::Result::NeedMoreInput)
+        return;
+
+    auto [encoding, confidence] = result == EncodingDeclarationPrescan::Result::Found
+        ? EncodingSniffingResult { ByteString { m_prescan->encoding() }, EncodingConfidence::Tentative }
+        : sniff_encoding_after_prescan(m_document, m_sniff_bytes, m_container_document);
+    m_prescan = nullptr;
+    m_sniff_bytes = {};
+    set_encoding(encoding, confidence);
+}
+
+void IncrementalDocumentParser::set_encoding(StringView encoding, EncodingConfidence encoding_confidence)
+{
+    auto standardized_encoding = TextCodec::get_standardized_encoding(encoding);
     VERIFY(standardized_encoding.has_value());
     dbgln_if(HTML_PARSER_DEBUG, "The incremental HTML parser selected encoding '{}'", standardized_encoding.value());
 
@@ -101,26 +149,7 @@ void IncrementalDocumentParser::initialize_parser(ReadonlyBytes sniff_bytes)
     // algorithm, at the same time as the user agent uses the returned value to select the decoder
     // to use for the input byte stream.
     m_document->set_encoding(utf16_string_from_standardized_encoding_label(standardized_encoding.value()));
-
-    m_document->set_url(m_url);
-    m_parser = HTMLParser::create_with_open_input_stream(m_document, encoding_confidence);
-    m_parser->set_change_encoding_callback(GC::create_function(GC::Heap::the(), [this](StringView encoding) {
-        auto result = change_encoding(encoding);
-        if (result.is_error()) {
-            release_encoding_change_buffers();
-            return false;
-        }
-        return result.release_value();
-    }));
-    m_parser->set_parsing_complete_callback(GC::create_function(GC::Heap::the(), [this]() {
-        release_encoding_change_buffers();
-    }));
-    m_parser->set_ready_for_more_input_callback(GC::create_function(GC::Heap::the(), [this]() {
-        feed_parser();
-    }));
-    m_parser->set_allow_declarative_shadow_roots(m_allow_declarative_shadow_roots);
-
-    start_incremental_read();
+    m_parser->set_encoding_confidence({}, encoding_confidence);
 }
 
 void IncrementalDocumentParser::start_incremental_read()
@@ -128,13 +157,13 @@ void IncrementalDocumentParser::start_incremental_read()
     auto parser = GC::Ref { *this };
     m_body->incrementally_read(
         m_document->relevant_settings_object().realm(),
-        GC::create_function(GC::Heap::the(), [parser](ByteBuffer bytes) mutable {
+        GC::create_function(GC::Heap::the(), GC::captures(parser), [](auto& parser, ByteBuffer bytes) {
             parser->process_body_chunk(move(bytes));
         }),
-        GC::create_function(GC::Heap::the(), [parser] {
+        GC::create_function(GC::Heap::the(), GC::captures(parser), [](auto& parser) {
             parser->process_end_of_body();
         }),
-        GC::create_function(GC::Heap::the(), [parser](JS::Value error) {
+        GC::create_function(GC::Heap::the(), GC::captures(parser), [](auto& parser, JS::Value error) {
             parser->process_body_error(error);
         }),
         GC::Ref { m_document->relevant_settings_object().realm().global_object() });
@@ -186,7 +215,10 @@ void IncrementalDocumentParser::process_body_chunk(ByteBuffer bytes)
     else
         m_input_bytes.append(bytes);
 
-    feed_parser();
+    if (m_prescan)
+        continue_prescan(false);
+    if (!m_has_queued_task_to_feed_parser)
+        feed_parser();
     process_link_headers_after_first_task();
 }
 
@@ -219,8 +251,34 @@ static size_t encoding_independent_prefix_length(ReadonlyBytes bytes)
     return length;
 }
 
+void IncrementalDocumentParser::queue_task_to_feed_parser()
+{
+    // NB: A parser that was blocked may ask for more input while this task is queued, and that task goes on from there.
+    if (m_has_queued_task_to_feed_parser)
+        return;
+    ++m_times_yielded_to_event_loop;
+    m_has_queued_task_to_feed_parser = true;
+    queue_global_task(Task::Source::Networking, m_document->relevant_settings_object().realm().global_object(), GC::create_function(GC::Heap::the(), GC::captures(GC::Ref { *this }), [](auto& parser) {
+        parser->m_has_queued_task_to_feed_parser = false;
+        parser->feed_parser();
+    }));
+}
+
 void IncrementalDocumentParser::feed_parser()
 {
+    // The parser gets no bytes until the prescan has found their encoding.
+    if (m_prescan)
+        return;
+
+    // NB: A document that arrives faster than we can parse it would otherwise keep the event loop for as long as that
+    //     takes. The first slices are short, so that the first rendering update has little to lay out. After those,
+    //     longer slices spare us laying out a document over and over while it is still growing.
+    static constexpr size_t maximum_bytes_to_process_at_once = 16 * KiB;
+    static constexpr auto first_slices_time_budget = AK::Duration::from_milliseconds(10);
+    static constexpr auto later_slices_time_budget = AK::Duration::from_milliseconds(500);
+    static constexpr u32 number_of_first_slices = 6;
+    auto const deadline = MonotonicTime::now() + (m_times_yielded_to_event_loop < number_of_first_slices ? first_slices_time_budget : later_slices_time_budget);
+
     while (!undecoded_input_bytes().is_empty()) {
         if (!should_continue()) {
             discard_input_bytes();
@@ -255,7 +313,12 @@ void IncrementalDocumentParser::feed_parser()
             }
         }
 
-        decode_and_process(length_to_decode);
+        decode_and_process(min(length_to_decode, maximum_bytes_to_process_at_once));
+
+        if (!undecoded_input_bytes().is_empty() && MonotonicTime::now() >= deadline) {
+            queue_task_to_feed_parser();
+            return;
+        }
     }
 
     if (!should_continue() || m_parser->encoding_confidence() != EncodingConfidence::Tentative)
@@ -280,9 +343,13 @@ void IncrementalDocumentParser::process_end_of_body()
         return;
     }
 
+    if (m_prescan)
+        continue_prescan(true);
+
     // Bytes held back for a still-possible encoding declaration are fed first; the implied EOF character waits for
     // them in finish_body().
-    feed_parser();
+    if (!m_has_queued_task_to_feed_parser)
+        feed_parser();
     process_link_headers_after_first_task();
 }
 
@@ -378,6 +445,10 @@ void IncrementalDocumentParser::process_body_error(JS::Value)
 {
     m_body = nullptr;
 
+    // The bytes received are all the prescan gets.
+    if (m_prescan && should_continue())
+        continue_prescan(true);
+
     // Bytes withheld while the tokenizer was behind are still part of the document. This ends the parse, so no
     // declaration can still change how they decode: feed them to the tokenizer with the encoding as it stands.
     if (should_continue() && !undecoded_input_bytes().is_empty())
@@ -394,7 +465,7 @@ void IncrementalDocumentParser::register_deferred_start()
         return;
 
     auto parser = GC::Ref { *this };
-    m_document->set_deferred_parser_start(GC::create_function(GC::Heap::the(), [parser] {
+    m_document->set_deferred_parser_start(GC::create_function(GC::Heap::the(), GC::captures(parser), [](auto& parser) {
         parser->pump();
 
         // The tokenizer can consume input again, so hand over any bytes withheld while it could not.

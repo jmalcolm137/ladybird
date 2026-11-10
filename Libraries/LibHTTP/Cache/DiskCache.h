@@ -6,7 +6,6 @@
 
 #pragma once
 
-#include <AK/ByteBuffer.h>
 #include <AK/Error.h>
 #include <AK/LexicalPath.h>
 #include <AK/Optional.h>
@@ -33,6 +32,7 @@ public:
         Testing,
     };
     static ErrorOr<Optional<DiskCache>> create(Mode, LexicalPath const& cache_root);
+    static void remove(Mode, LexicalPath const& cache_root);
 
     DiskCache(DiskCache&&);
     DiskCache& operator=(DiskCache&&);
@@ -51,13 +51,6 @@ public:
         Revalidate,
     };
     Variant<Optional<CacheEntryReader&>, CacheHasOpenEntry> open_entry(CacheRequest&, Utf16String const& partition, URL::URL const&, StringView method, HeaderList const& request_headers, CacheMode, OpenMode);
-
-    ErrorOr<Optional<CacheEntryBodyFile>> store_associated_data(Utf16String const& partition, URL::URL const&, StringView method, HeaderList const& request_headers, Optional<u64> vary_key, CacheEntryAssociatedData, ReadonlyBytes);
-    ErrorOr<Optional<ByteBuffer>> retrieve_associated_data(Utf16String const& partition, URL::URL const&, StringView method, HeaderList const& request_headers, Optional<u64> vary_key, CacheEntryAssociatedData);
-    ErrorOr<Optional<CacheEntryBodyFile>> retrieve_associated_data_file(Utf16String const& partition, URL::URL const&, StringView method, HeaderList const& request_headers, Optional<u64> vary_key, CacheEntryAssociatedData);
-
-    // Ensure an index row exists for url+method so the shelf has something to attach to even if there are no real HTTP requests in flight.
-    ErrorOr<bool> create_synthetic_entry(Utf16String const& partition, URL::URL const&, StringView method);
 
     void remove_entries_exceeding_cache_limit();
     void remove_variants_exceeding_limit(Badge<CacheEntryWriter>, u64 cache_key, u64 vary_key_to_keep);

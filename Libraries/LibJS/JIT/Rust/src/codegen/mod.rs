@@ -73,6 +73,7 @@ use crate::asm::GprSet;
 use crate::asm::Label;
 use crate::asm::MachineFrame;
 use crate::asm::PortableMacroAssembler;
+use crate::asm::Scale;
 use crate::asm::disassembler;
 use crate::bytecode::DecodedInstruction;
 use crate::bytecode::EXCEPTION_REGISTER;
@@ -90,7 +91,7 @@ use crate::code::Repr;
 use crate::code::Site;
 use crate::code::SiteKind;
 use crate::code::ValueLocation;
-use crate::fast_hash::HashMap;
+use crate::fast_hash::{HashMap, HashSet};
 use crate::ir;
 use crate::ir::BlockId;
 use crate::ir::BranchCondition;
@@ -106,6 +107,7 @@ use crate::regalloc::Location;
 use crate::regalloc::Move;
 use crate::regalloc::RegisterMask;
 use crate::regalloc::RegisterSet;
+use crate::snapshot::COMPRESSED_POINTER_SHIFT;
 use crate::snapshot::CellId;
 use crate::snapshot::ExecutableSnapshot;
 use crate::snapshot::RuntimeInfo;
@@ -296,6 +298,8 @@ struct Codegen<'a, M: PortableMacroAssembler> {
     /// `InitializeNamed` nodes whose constant the allocation of their object
     /// stored already.
     absorbed_initializations: Vec<NodeId>,
+    /// `InitializeNamed` nodes right after the allocation of their object, which still has its properties inline.
+    inline_initializations: HashSet<NodeId>,
     /// The slots of the compiled function's frame that hold its arguments
     /// object, which the code never created, when the node being emitted
     /// (in the compiled function or an inlined callee) leaves the code after
@@ -441,6 +445,7 @@ pub fn generate<M: PortableMacroAssembler>(
         deferred_allocations: Vec::new(),
         deferred_storage_growths: Vec::new(),
         absorbed_initializations: Vec::new(),
+        inline_initializations: HashSet::default(),
         leave_arguments: Vec::new(),
         leave_stubs: Vec::new(),
         leave_frame: None,
@@ -926,18 +931,21 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
     fn emit_prologue(&mut self) {
         self.annotate(CodeAnnotation::Prologue);
         let frame = self.frame;
-        self.masm.emit_prologue(&frame);
+        self.masm.emit_prologue_unprobed(&frame);
         // NB: The VM is in its pinned register already.
         self.masm.move64(self.pinned.frame, M::ARGUMENT_GPRS[1]);
-        let root_frame = self.local_address(self.locals.root_frame);
-        self.masm.store64(&root_frame, self.pinned.frame);
 
         // Exit to the interpreter (which runs the function on its own stack,
         // and reports overflows of that) if the native stack is nearly
-        // exhausted. No value lives in a register yet.
+        // exhausted. No value lives in a register yet. The locals are only
+        // touched once the frame is known to fit: on Windows, touching a
+        // frame that goes past the end of the stack would crash.
         let limit = Address::new(self.pinned.vm, self.runtime.offsets.vm_jit_native_stack_limit as i32);
         let resume = self.entry_resume;
         self.masm.branch_if_stack_pointer_below(&limit, resume);
+        self.masm.probe_frame(&frame);
+        let root_frame = self.local_address(self.locals.root_frame);
+        self.masm.store64(&root_frame, self.pinned.frame);
 
         // Materializing the frames of inlined calls must not run out of
         // interpreter stack, so exit if they would not all fit.
@@ -1313,9 +1321,10 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
             }
             Op::PublishFrame => self.emit_publish_frame(),
             Op::LoadOuterEnvironment => {
+                // NB: The environments static coordinates walk through have outer environments.
                 let (output, input) = (self.output(node_id), self.input(node_id, 0));
                 let outer = Address::new(input, self.runtime.layout.environment_outer as i32);
-                self.masm.load64(output, &outer);
+                self.emit_load_compressed_cell(output, &outer);
             }
             Op::LoadEnvironmentBinding { index } => {
                 let (output, input) = (self.output(node_id), self.input(node_id, 0));
@@ -1373,7 +1382,7 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
                 let scratch = self.pinned.scratch;
                 let field = self.frame_field(self.runtime.offsets.execution_context_private_environment);
                 self.masm.load64(scratch, &field);
-                self.masm.load64(
+                self.emit_load_nullable_compressed_cell(
                     scratch,
                     &Address::new(scratch, self.runtime.offsets.private_environment_outer as i32),
                 );
@@ -1387,12 +1396,17 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
             }
             Op::LoadFunctionEnvironment { private } => {
                 let (output, function) = (self.output(node_id), self.input(node_id, 0));
-                let offset = if *private {
-                    self.runtime.offsets.ecmascript_function_private_environment
+                let offsets = self.runtime.offsets;
+                if *private {
+                    // NB: The output may be in the register of the function.
+                    let scratch = self.pinned.scratch;
+                    self.emit_load_function_private_environment(scratch, function);
+                    self.masm.move64(output, scratch);
                 } else {
-                    self.runtime.offsets.ecmascript_function_environment
-                };
-                self.masm.load64(output, &Address::new(function, offset as i32));
+                    // NB: ECMAScript functions always have an environment.
+                    let address = Address::new(function, offsets.ecmascript_function_environment as i32);
+                    self.emit_load_compressed_cell(output, &address);
+                }
             }
             Op::CellAddress => {
                 // NB: Only objects get their cell addresses taken.
@@ -1619,6 +1633,12 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
                 let offset = self.masm.patchable_nop();
                 self.invalidation_points.push((offset, exit));
             }
+            Op::CheckInterrupt => {
+                // NB: This fuses into one micro-op on x86-64, unlike a comparison of a word in memory with zero.
+                let exit = self.exit_site(node_id);
+                let limit = Address::new(self.pinned.vm, self.runtime.offsets.vm_jit_native_stack_limit as i32);
+                self.masm.branch_if_stack_pointer_below(&limit, exit);
+            }
             Op::HasInPrototypeChain => self.emit_has_in_prototype_chain(node_id),
             Op::LoadGlobalBinding { environment, index } => {
                 let exit = self.exit_site(node_id);
@@ -1640,17 +1660,15 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
                 let exit = self.exit_site(node_id);
                 let output = self.output(node_id);
                 let field = self.emit_load_accessor(node_id, output, *offset, *part, exit)?;
-                self.masm.load64(output, &field);
-                self.masm.branch_test64(Condition::Zero, output, u64::MAX, exit);
+                self.emit_load_compressed_cell_or_branch(output, &field, exit);
                 self.box_object(output);
             }
             Op::CheckAccessorFunction { offset, part, function } => {
                 let exit = self.exit_site(node_id);
                 let accessor = Gpr(self.allocation.node(node_id).temps[0]);
                 let field = self.emit_load_accessor(node_id, accessor, *offset, *part, exit)?;
-                let scratch = self.pinned.scratch;
-                self.masm.move_imm64(scratch, function.0);
-                self.masm.branch64_memory(Condition::NotEqual, &field, scratch, exit);
+                self.masm
+                    .branch32_memory_imm(Condition::NotEqual, &field, function.compressed() as i32, exit);
             }
             Op::LoadNamed { offset, holds_data } => {
                 let exit = (!holds_data).then(|| self.exit_site(node_id));
@@ -1679,7 +1697,7 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
             Op::AddNamed { offset, shape, .. } => self.emit_add_named(node_id, *offset, *shape)?,
             Op::ShapeSwitch { cases } => {
                 let exit = self.exit_site(node_id);
-                self.emit_load_shape_of(node_id, self.pinned.scratch, 1);
+                self.emit_load_compressed_shape_of(node_id, self.pinned.scratch, 1);
                 for (shape, block) in cases {
                     let label = self.label(*block);
                     self.emit_branch_on_shape(*shape, label, exit);
@@ -1870,7 +1888,7 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
         self.masm.bind(walk);
         // Only objects with the ordinary [[GetPrototypeOf]] have the
         // prototype of their shape.
-        self.masm.load64(scratch, &Address::new(object, 0));
+        self.emit_load_class(scratch, object);
         self.masm
             .load64(scratch, &Address::new(scratch, layout.class_object_methods as i32));
         self.masm.branch64_memory_imm(
@@ -1879,11 +1897,12 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
             0,
             exit,
         );
-        self.masm
-            .load64(object, &Address::new(object, offsets.object_shape as i32));
-        self.masm
-            .load64(object, &Address::new(object, layout.shape_prototype as i32));
-        self.masm.branch_test64(Condition::Zero, object, u64::MAX, not_found);
+        self.emit_load_compressed_cell(object, &Address::new(object, offsets.object_shape as i32));
+        self.emit_load_compressed_cell_or_branch(
+            object,
+            &Address::new(object, layout.shape_prototype as i32),
+            not_found,
+        );
         self.emit_unbox_cell(output, prototype);
         self.masm.branch64(Condition::Equal, object, output, found);
         self.masm.jump(walk);
@@ -1933,12 +1952,19 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
         temp
     }
 
-    /// `dst` = the shape of the object in input 0 of `node`, whose
-    /// `CellAddress` may be input `address_input`.
-    fn emit_load_shape_of(&mut self, node: NodeId, dst: Gpr, address_input: usize) {
-        let cell = self.cell_address_of(node, dst, address_input);
-        let shape = Address::new(cell, self.runtime.offsets.object_shape as i32);
-        self.masm.load64(dst, &shape);
+    /// `dst` = the compressed shape of the object in input 0 of `node`,
+    /// whose `CellAddress` may be input `address_input`.
+    fn emit_load_compressed_shape_of(&mut self, node: NodeId, dst: Gpr, address_input: usize) {
+        let shape = self.shape_field_of(node, dst, address_input);
+        self.masm.load32(dst, &shape);
+    }
+
+    /// The address of the shape field of the object in input 0 of `node`,
+    /// whose `CellAddress` may be input `address_input`, or else is decoded
+    /// into `temp`.
+    fn shape_field_of(&mut self, node: NodeId, temp: Gpr, address_input: usize) -> Address {
+        let cell = self.cell_address_of(node, temp, address_input);
+        Address::new(cell, self.runtime.offsets.object_shape as i32)
     }
     /// `StoreSlot`: writes input 0, boxed if it is unboxed, to frame slot
     /// `slot`.
@@ -1993,13 +2019,18 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
     /// `CheckShape`: exits unless the object has one of `shapes`.
     fn emit_check_shape(&mut self, node_id: NodeId, shapes: &[ShapeCheck]) {
         let exit = self.exit_site(node_id);
-        self.emit_load_shape_of(node_id, self.pinned.scratch, 1);
+        // OPTIMIZATION: An object has a shape exactly when its compressed
+        //               shape is the shape's compressed pointer, so shapes
+        //               are compared without decoding, against 32-bit
+        //               immediates.
         match shapes {
             [shape] if shape.dictionary_generation.is_none() => {
+                let field = self.shape_field_of(node_id, self.pinned.scratch, 1);
                 self.masm
-                    .branch64_imm(Condition::NotEqual, self.pinned.scratch, shape.shape.0 as i64, exit);
+                    .branch32_memory_imm(Condition::NotEqual, &field, shape.shape.compressed() as i32, exit);
             }
             _ => {
+                self.emit_load_compressed_shape_of(node_id, self.pinned.scratch, 1);
                 let matched = self.masm.new_label();
                 for shape in shapes {
                     self.emit_branch_on_shape(*shape, matched, exit);
@@ -2018,9 +2049,8 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
         let storage = Gpr(self.allocation.node(node_id).temps[0]);
         let cell = self.cell_address_of(node_id, storage, 2);
         let offsets = self.runtime.offsets;
-        self.masm.move_imm64(self.pinned.scratch, shape.0);
         self.masm
-            .store64(&Address::new(cell, offsets.object_shape as i32), self.pinned.scratch);
+            .store_imm32(&Address::new(cell, offsets.object_shape as i32), shape.compressed());
         self.masm
             .load64(storage, &Address::new(cell, offsets.object_named_properties as i32));
         let slot = self.named_property_address(storage, offset)?;
@@ -2028,19 +2058,21 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
         Ok(())
     }
 
-    /// Branches to `matched` if the shape in the scratch register is
-    /// `shape`, or to `exit` if it is `shape` but its dictionary generation
-    /// changed. Clobbers the scratch register only in the latter case.
+    /// Branches to `matched` if the compressed shape in the scratch register
+    /// is that of `shape`, or to `exit` if it is `shape` but its dictionary
+    /// generation changed. Clobbers the scratch register only in the latter
+    /// case.
     fn emit_branch_on_shape(&mut self, shape: ShapeCheck, matched: Label, exit: Label) {
         let scratch = self.pinned.scratch;
+        let compressed = shape.shape.compressed() as i32;
         let Some(generation) = shape.dictionary_generation else {
-            self.masm
-                .branch64_imm(Condition::Equal, scratch, shape.shape.0 as i64, matched);
+            self.masm.branch32_imm(Condition::Equal, scratch, compressed, matched);
             return;
         };
         let other_shape = self.masm.new_label();
         self.masm
-            .branch64_imm(Condition::NotEqual, scratch, shape.shape.0 as i64, other_shape);
+            .branch32_imm(Condition::NotEqual, scratch, compressed, other_shape);
+        self.emit_decompress_cell(scratch);
         let generation_address = Address::new(scratch, self.runtime.offsets.shape_dictionary_generation as i32);
         self.masm.load32(scratch, &generation_address);
         self.masm
@@ -2091,6 +2123,83 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
     fn emit_unbox_cell(&mut self, dst: Gpr, value: Gpr) {
         self.masm.and64_imm(dst, value, self.runtime.heap_region_offset_mask);
         self.masm.add64_imm(dst, dst, self.runtime.heap_region_base as i64);
+    }
+
+    /// `dst = the class of the cell at cell`, which the cell's block holds,
+    /// or the cell keeps after itself if its block is one of an allocator
+    /// that classes share.
+    fn emit_load_class(&mut self, dst: Gpr, cell: Gpr) {
+        assert_ne!(dst, cell, "the cell is read after its block");
+        let layout = self.runtime.layout;
+        let done = self.masm.new_label();
+        self.masm.and64_imm(dst, cell, layout.cell_block_mask);
+        self.masm
+            .load64(dst, &Address::new(dst, layout.block_class_offset as i32));
+        self.masm
+            .branch_test64(Condition::Zero, dst, layout.block_class_tail_tag, done);
+        let cell_size = layout.class_cell_size as i32 - layout.block_class_tail_tag as i32;
+        self.masm.load32(dst, &Address::new(dst, cell_size));
+        self.masm.load64(dst, &Address::indexed(cell, dst, Scale::One, 0));
+        self.masm.bind(done);
+    }
+
+    /// `dst = heap_region_base + (dst << 3)`, the cell pointer the
+    /// compressed cell pointer in `dst` (zero-extended, not null) names,
+    /// which is in the heap region whatever its 32 bits are.
+    fn emit_decompress_cell(&mut self, dst: Gpr) {
+        self.masm.shl64_imm(dst, dst, COMPRESSED_POINTER_SHIFT);
+        self.masm.add64_imm(dst, dst, self.runtime.heap_region_base as i64);
+    }
+
+    /// Loads the compressed cell pointer field at `address`, which is not
+    /// null, into `dst` as a cell pointer.
+    fn emit_load_compressed_cell(&mut self, dst: Gpr, address: &Address) {
+        self.masm.load32(dst, address);
+        self.emit_decompress_cell(dst);
+    }
+
+    /// Loads the compressed cell pointer field at `address` into `dst` as a
+    /// cell pointer, or 0 if it is null.
+    fn emit_load_nullable_compressed_cell(&mut self, dst: Gpr, address: &Address) {
+        let null = self.masm.new_label();
+        self.masm.load32(dst, address);
+        self.masm.branch_test32(Condition::Zero, dst, u32::MAX, null);
+        self.emit_decompress_cell(dst);
+        self.masm.bind(null);
+    }
+
+    /// Loads the private environment of the ECMAScript function that
+    /// `function` holds into `dst`, another register, as a cell pointer, or 0
+    /// if it has none.
+    fn emit_load_function_private_environment(&mut self, dst: Gpr, function: Gpr) {
+        let offsets = self.runtime.offsets;
+        let done = self.masm.new_label();
+        self.masm
+            .load8(dst, &Address::new(function, offsets.object_class_bits as i32));
+        self.masm
+            .and32_imm(dst, dst, offsets.ecmascript_function_flag_has_rare_data);
+        self.masm.branch_test32(Condition::Zero, dst, u32::MAX, done);
+        self.emit_load_nullable_compressed_cell(
+            dst,
+            &Address::new(function, offsets.ecmascript_function_private_environment as i32),
+        );
+        self.masm.bind(done);
+    }
+
+    /// Loads the compressed cell pointer field at `address` into `dst` as a
+    /// cell pointer, or branches to `null` if it is null.
+    fn emit_load_compressed_cell_or_branch(&mut self, dst: Gpr, address: &Address, null: Label) {
+        self.masm.load32(dst, address);
+        self.masm.branch_test32(Condition::Zero, dst, u32::MAX, null);
+        self.emit_decompress_cell(dst);
+    }
+
+    /// Stores the cell pointer `cell` (or 0 for null) to the compressed cell
+    /// pointer field at `address`, through `temp`, which may be `cell`. The
+    /// heap region is aligned to its size, so compressing needs no base.
+    fn emit_store_compressed_cell(&mut self, address: &Address, cell: Gpr, temp: Gpr) {
+        self.masm.shr64_imm(temp, cell, COMPRESSED_POINTER_SHIFT);
+        self.masm.store32(address, temp);
     }
 
     /// The `Enter` bytecode: empty registers and locals, constants copied
@@ -2273,8 +2382,7 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
             BranchCondition::Float64(_) => unreachable!("float64 comparisons branch above"),
             BranchCondition::ArrayIterator => self.emit_branch_on_array_iterator(input, target, invert),
             BranchCondition::GeneratorObject => {
-                // NB: Cells start with the pointer to their class.
-                self.masm.load64(scratch, &Address::new(input, 0));
+                self.emit_load_class(scratch, input);
                 let class = self.runtime.layout.generator_object_class as i64;
                 self.masm.branch64_imm(when(Condition::Equal), scratch, class, target);
             }

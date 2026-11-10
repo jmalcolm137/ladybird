@@ -126,14 +126,26 @@ impl Deref for Promise {
 impl Promise {
     pub fn create(vm: &Vm, realm: Gc<Realm>) -> Gc<Promise> {
         realm.create_object(vm, |defer_gc| {
-            Promise::new(defer_gc, vm, Self::CLASS, realm.intrinsics().promise_prototype(vm))
+            Promise::new(
+                defer_gc,
+                vm,
+                realm,
+                Self::CLASS,
+                realm.intrinsics().promise_prototype(vm),
+            )
         })
     }
 
     /// A promise with `prototype`, for `class`, which is Promise or a class that extends it.
-    pub fn new(_: &DeferGc<'_>, vm: &Vm, class: &'static Class, prototype: Gc<Object>) -> Promise {
+    pub fn new(_: &DeferGc<'_>, vm: &Vm, realm: Gc<Realm>, class: &'static Class, prototype: Gc<Object>) -> Promise {
         Promise {
-            base: Object::new_with_prototype(vm, class, prototype, MayInterfereWithIndexedPropertyAccess::No),
+            base: Object::new_with_prototype(
+                vm,
+                class,
+                realm,
+                Some(prototype),
+                MayInterfereWithIndexedPropertyAccess::No,
+            ),
             state: Cell::new(PromiseState::Pending),
             is_handled: Cell::new(false),
             has_resolver: Cell::new(false),
@@ -169,7 +181,10 @@ impl Promise {
 
     // 27.2.1.3 CreateResolvingFunctions ( promise ), https://tc39.es/ecma262/#sec-createresolvingfunctions
     pub fn create_resolving_functions(&self, vm: &Vm) -> ResolvingFunctions {
-        let realm = vm.current_realm().expect("there is a current realm");
+        self.create_resolving_functions_in_realm(vm, vm.current_realm().expect("there is a current realm"))
+    }
+
+    pub fn create_resolving_functions_in_realm(&self, vm: &Vm, realm: Gc<Realm>) -> ResolvingFunctions {
         self.has_resolver.set(true);
 
         // 1. Let alreadyResolved be the Record { [[Value]]: false }.
@@ -304,6 +319,9 @@ impl Promise {
     pub fn reject_function_steps(vm: &Vm, promise: Gc<Promise>, already_resolved: &Cell<bool>) -> Value {
         let reason = vm.argument(0);
 
+        // NB: An exception that rejects a promise is no longer thrown, even when the promise is already resolved.
+        vm.forget_throw_site_of(reason);
+
         // 1. Let F be the active function object.
         // 2. Assert: F has a [[Promise]] internal slot whose value is an Object.
         // 3. Let promise be F.[[Promise]].
@@ -351,6 +369,9 @@ impl Promise {
 
     // 27.2.1.7 RejectPromise ( promise, reason ), https://tc39.es/ecma262/#sec-rejectpromise
     pub fn reject(&self, vm: &Vm, reason: Value) {
+        // NB: An exception that rejects a promise is no longer thrown.
+        vm.forget_throw_site_of(reason);
+
         // 1. Assert: The value of promise.[[PromiseState]] is pending.
         assert!(self.state.get() == PromiseState::Pending);
 

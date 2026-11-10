@@ -29,19 +29,16 @@ def run_test(webdriver_binary):
                     "decisions": [
                         {"origin": "https://example.com", "permission": "geolocation", "decision": "allow"},
                         {"origin": "https://talk.example.org", "permission": "microphone", "decision": "block"},
+                        {"origin": "https://news.example.net", "permission": "notifications", "decision": "allow"},
                     ],
                     "embargoes": [],
                 }
             )
         )
 
-        port = helpers["unused_port"]()
-        process = subprocess.Popen(
-            [webdriver_binary, "--headless", "-l", "127.0.0.1", "-p", str(port), "--profile-path", directory]
-        )
+        process, port = helpers["launch_webdriver"](webdriver_binary, "--headless", "--profile-path", directory)
         session = None
         try:
-            helpers["wait_for_port"](port)
             session = helpers["create_session"](port)
 
             def command(path, body=None, method="POST"):
@@ -98,6 +95,7 @@ def run_test(webdriver_binary):
 
             assert rows("location-permissions", "geolocation") == [["https://example.com", "allow"]]
             assert rows("microphone-permissions", "microphone") == [["https://talk.example.org", "block"]]
+            assert rows("notifications-permissions", "notifications") == [["https://news.example.net", "allow"]]
 
             rows("location-permissions", "geolocation")
             script("""

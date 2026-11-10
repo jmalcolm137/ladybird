@@ -10,6 +10,7 @@
 #include <AK/NumericLimits.h>
 #include <AK/Optional.h>
 #include <AK/String.h>
+#include <AK/Time.h>
 #include <AK/Vector.h>
 #include <LibHTTP/Proxy.h>
 #include <LibURL/URL.h>
@@ -23,6 +24,7 @@ enum class HeadlessMode {
     LayoutTree,
     Text,
     Manual,
+    Terminal,
     Test,
 };
 
@@ -96,6 +98,7 @@ struct BrowserOptions {
     u32 screenshot_delay { 1 };
     int window_width { 800 };
     int window_height { 600 };
+    double device_pixel_ratio { 1.0 };
     NewWindow new_window { NewWindow::No };
     AllowPopups allow_popups { AllowPopups::No };
     DisableScripting disable_scripting { DisableScripting::No };
@@ -128,6 +131,8 @@ struct RequestServerOptions {
     // Per-session limit, excluding the RequestServer with no site. Sites beyond the limit share that server;
     // zero makes every process share it.
     size_t maximum_site_request_servers { NumericLimits<size_t>::max() };
+    // How long a site's RequestServer is kept around once its last client is gone, in case the site is visited again.
+    AK::Duration idle_site_request_server_timeout { AK::Duration::from_seconds(60) };
 };
 
 enum class IsTestMode {
@@ -141,6 +146,11 @@ enum class LogAllJSExceptions {
 };
 
 enum class EnableMemoryHTTPCache {
+    No,
+    Yes,
+};
+
+enum class ShareProcessBetweenSameOriginTabs {
     No,
     Yes,
 };
@@ -186,6 +196,7 @@ struct WebContentOptions {
     IsTestMode is_test_mode { IsTestMode::No };
     LogAllJSExceptions log_all_js_exceptions { LogAllJSExceptions::No };
     SiteIsolationMode site_isolation_mode { SiteIsolationMode::IFrame };
+    ShareProcessBetweenSameOriginTabs share_process_between_same_origin_tabs { ShareProcessBetweenSameOriginTabs::Yes };
     EnableMemoryHTTPCache enable_http_memory_cache { EnableMemoryHTTPCache::No };
     ExposeExperimentalInterfaces expose_experimental_interfaces { ExposeExperimentalInterfaces::No };
     ExposeInternalsObject expose_internals_object { ExposeInternalsObject::No };

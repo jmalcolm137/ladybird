@@ -13,6 +13,10 @@ use crate::layout::execution_context::ExecutionContext;
 use crate::layout::value::Value;
 use crate::layout::vm::InterpreterStack;
 
+/// More arguments than any call can pass: a frame holding them wouldn't fit in the interpreter stack, which each argument
+/// takes a value's room in.
+pub const MAXIMUM_ARGUMENT_COUNT: u64 = (InterpreterStackMemory::SIZE / size_of::<Value>()) as u64;
+
 /// The memory execution contexts are bump-allocated from, by the runtime and by the interpreter itself.
 pub struct InterpreterStackMemory {
     memory: NonNull<u8>,
@@ -20,6 +24,10 @@ pub struct InterpreterStackMemory {
 
 impl InterpreterStackMemory {
     const SIZE: usize = 8 * 1024 * 1024;
+
+    /// What lies past the limit, for allocate_past_limit(). Once a frame is in here, no script can get a frame until it
+    /// is gone. So this holds what the steps of a native function nest to at most.
+    const RESERVE_SIZE: usize = 64 * 1024;
     const LAYOUT: Layout = match Layout::from_size_align(Self::SIZE, align_of::<ExecutionContext>()) {
         Ok(layout) => layout,
         Err(_) => panic!("the interpreter stack layout is valid"),
@@ -38,7 +46,7 @@ impl InterpreterStackMemory {
         InterpreterStack {
             base: Cell::new(base),
             top: Cell::new(base),
-            limit: Cell::new(base.wrapping_add(Self::SIZE)),
+            limit: Cell::new(base.wrapping_add(Self::SIZE - Self::RESERVE_SIZE)),
             next_frame_id: Cell::new(1),
         }
     }
@@ -64,18 +72,48 @@ impl InterpreterStack {
         constant_count: u32,
         argument_count: u32,
     ) -> Option<NonNull<ExecutionContext>> {
+        self.allocate_below(
+            self.limit.get(),
+            registers_and_locals_count,
+            constant_count,
+            argument_count,
+        )
+    }
+
+    /// As allocate(), for a call that must not fail on a stack that is full: it uses the reserve past the limit.
+    pub fn allocate_past_limit(
+        &self,
+        registers_and_locals_count: u32,
+        constant_count: u32,
+        argument_count: u32,
+    ) -> Option<NonNull<ExecutionContext>> {
+        self.allocate_below(
+            self.base.get().wrapping_add(InterpreterStackMemory::SIZE),
+            registers_and_locals_count,
+            constant_count,
+            argument_count,
+        )
+    }
+
+    fn allocate_below(
+        &self,
+        end: *mut u8,
+        registers_and_locals_count: u32,
+        constant_count: u32,
+        argument_count: u32,
+    ) -> Option<NonNull<ExecutionContext>> {
         let slot_count = registers_and_locals_count
             .checked_add(constant_count)?
             .checked_add(argument_count)?;
         let size = size_of::<ExecutionContext>() + slot_count as usize * size_of::<Value>();
         let size = size.next_multiple_of(align_of::<ExecutionContext>());
         let top = self.top.get();
-        if (self.limit.get() as usize) - (top as usize) < size {
+        if (end as usize).saturating_sub(top as usize) < size {
             return None;
         }
         let frame_id = self.take_next_frame_id();
         let context = top.cast::<ExecutionContext>();
-        // SAFETY: The frame fits between top and limit, and nothing else uses that memory.
+        // SAFETY: The frame fits between top and the end, and nothing else uses that memory.
         unsafe {
             ExecutionContext::initialize_at(
                 context,

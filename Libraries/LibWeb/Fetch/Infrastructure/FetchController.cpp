@@ -77,7 +77,7 @@ void FetchController::set_original_fetch_params(Badge<FetchParams>, FetchParams 
 
 void FetchController::report_webdriver_bidi_fetch_error(StringView error_text) const
 {
-    if (!WebDriver::BiDi::g_network_events_enabled)
+    if (!WebDriver::BiDi::network_events_enabled())
         return;
     if (auto fetch_params = m_original_fetch_params.strong_ref())
         WebDriver::BiDi::network_fetch_error(*fetch_params, error_text);
@@ -113,14 +113,14 @@ void FetchController::set_body_transport(Engine::FetchBodyDeliveryGate::Transpor
     m_body_transport = body_transport;
 }
 
-void FetchController::set_report_timing_steps(Function<void(JS::Object&)> report_timing_steps)
+void FetchController::set_report_timing_steps(GC::Ref<GC::Function<void(JS::Object&)>> report_timing_steps)
 {
-    m_report_timing_steps = GC::create_function(GC::Heap::the(), move(report_timing_steps));
+    m_report_timing_steps = report_timing_steps;
 }
 
-void FetchController::set_next_manual_redirect_steps(Function<void()> next_manual_redirect_steps)
+void FetchController::set_next_manual_redirect_steps(GC::Ref<GC::Function<void()>> next_manual_redirect_steps)
 {
-    m_next_manual_redirect_steps = GC::create_function(GC::Heap::the(), move(next_manual_redirect_steps));
+    m_next_manual_redirect_steps = next_manual_redirect_steps;
 }
 
 // https://fetch.spec.whatwg.org/#finalize-and-report-timing
@@ -222,7 +222,7 @@ void FetchController::stop_fetch()
     //         cancelling any queued fetch tasks and then ignoring any callbacks.
     auto ongoing_fetch_tasks = move(m_ongoing_fetch_tasks);
 
-    HTML::main_thread_event_loop().task_queue().remove_tasks_matching([&](auto const& task) {
+    HTML::current_event_loop().task_queue().remove_tasks_matching([&](auto const& task) {
         return ongoing_fetch_tasks.remove_all_matching([&](u64, HTML::TaskID task_id) {
             return task.id() == task_id;
         });

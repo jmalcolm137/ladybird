@@ -21,6 +21,9 @@ endpoint WebContentTestClient routed by Web::PageId page_id
 
     [NotRouted] set_permission_for_testing(Web::PageId page_id, Web::HTML::CrossProcessId document_id, String name, String state) => (Web::Permissions::PermissionSnapshot snapshot)
     [NotRouted] set_next_permission_prompt_outcome_for_testing(Web::PageId page_id, String name, String outcome, bool held) => ()
+    [NotRouted] set_system_microphone_authorization_for_testing(Web::PageId page_id, String authorization, String answer, bool held) => ()
+    [NotRouted] release_system_microphone_answer_for_testing(Web::PageId page_id) => ()
+    [NotRouted] did_request_microphone_state_for_testing(Web::PageId page_id) => (String state)
     [NotRouted] release_held_permission_prompt_for_testing(Web::PageId page_id, u32 waiters) => ()
     [NotRouted] advance_permission_clock_for_testing(Web::PageId page_id, u64 milliseconds) => (Web::Permissions::PermissionSnapshot snapshot)
     [NotRouted] did_spoof_document_origin_for_testing(Web::PageId page_id, Web::HTML::EnvironmentId environment_id, URL::Origin origin) => ()
@@ -28,9 +31,15 @@ endpoint WebContentTestClient routed by Web::PageId page_id
     [NotRouted] did_request_ui_process_session_history_for_testing(Web::PageId page_id) => (String session_history)
     [NotRouted] did_request_site_isolation_process_tree_for_testing(Web::PageId page_id) => (String process_tree)
     [NotRouted] did_request_tab_is_playing_audio_for_testing(Web::PageId page_id) => (bool is_playing_audio)
+    [NotRouted] did_request_tab_is_heard_playing_audio_for_testing(Web::PageId page_id) => (bool is_heard_playing_audio)
+    [NotRouted] did_request_tab_is_using_microphone_for_testing(Web::PageId page_id) => (bool is_using_microphone)
+    [NotRouted] did_request_tab_is_capturing_audio_for_testing(Web::PageId page_id) => (bool is_capturing_audio)
+    [NotRouted] report_audio_capture_for_testing(Web::PageId page_id, Web::PageId labelled_page_id, bool capturing) => ()
+    [NotRouted] retire_picture_in_picture_window_for_testing(Web::PageId page_id) => ()
     [NotRouted] did_request_tab_audibility_change_count_for_testing(Web::PageId page_id) => (u64 change_count)
     [NotRouted] did_request_has_populated_document_for_testing(Web::PageId page_id, Web::HTML::CrossProcessId navigable_id) => (bool has_populated_document)
     did_request_crash_of_remote_frame_processes_for_testing(Web::PageId page_id) =|
+    did_request_close_tab_for_testing(Web::PageId page_id) =|
     did_request_stop_loading_for_testing(Web::PageId page_id) =|
     did_request_reload_for_testing(Web::PageId page_id, bool bypass_cache) =|
     did_request_traverse_history_by_delta_for_testing(Web::PageId page_id, i32 delta) =|
@@ -38,8 +47,8 @@ endpoint WebContentTestClient routed by Web::PageId page_id
     did_reset_state_for_testing(Web::PageId page_id, Web::HTML::SessionHistoryEntryDescriptor active_entry) =|
     [NotRouted] did_request_capture_session_history_snapshot_for_testing(Web::PageId page_id) => (bool captured)
     [NotRouted] did_request_restore_session_history_snapshot_for_testing(Web::PageId page_id) => (bool restored)
-    [NotRouted] did_request_register_session_store_tab_for_testing(Web::PageId page_id) => (bool registered)
-    [NotRouted] did_request_session_store_tab_state_for_testing(Web::PageId page_id) => (String state)
+    [NotRouted] did_request_record_reported_session_history_for_testing(Web::PageId page_id) => (bool registered)
+    [NotRouted] did_request_reported_session_history_for_testing(Web::PageId page_id) => (String state)
 
     create_virtual_gamepad() => (Optional<Web::Gamepad::VirtualGamepad> virtual_gamepad)
     set_virtual_gamepad_button(Web::Gamepad::GamepadHandle handle, i32 button, bool down) =|

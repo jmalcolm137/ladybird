@@ -2,51 +2,33 @@ Viewport <#document> at [0,0] [0+0+0 800 0+0+0] [0+0+0 600 0+0+0] [BFC] children
   BlockContainer <html> at [0,0] [0+0+0 800 0+0+0] [0+0+0 168 0+0+0] [BFC] children: not-inline
     BlockContainer <body> at [8,16] [8+0+0 784 0+0+8] [8+0+0 136 0+0+8] children: not-inline
       BlockContainer <ol> at [48,16] [0+0+40 744 0+0+0] [16+0+0 60 0+0+16] children: not-inline
-        BlockContainer <(anonymous)> at [48,16] [0+0+0 744 0+0+0] [0+0+0 0 0+0+0] children: inline
-          TextNode <#text> (not painted)
         ListItemBox <li> at [48,16] [0+0+0 744 0+0+0] [0+0+0 30 0+0+0] children: inline
-          frag 0 from TextNode start: 0, length: 1, rect: [48,16 6.34375x16] baseline: 12.796875
+          frag 0 from TextNode start: 0, length: 1, rect: [48,27 6.34375x16] baseline: 13
               "1"
-          ListItemMarkerBox <(anonymous)> at [13,4.796875] [0+0+0 35.03125 0+0+0] [0+0+0 30 0+0+0] [BFC] children: inline
-            frag 0 from GeneratedTextNode start: 0, length: 3, rect: [13,4.796875 35.03125x30] baseline: 24
+          ListItemMarkerBox <(anonymous)> at [13,16] [0+0+0 35.03125 0+0+0] [0+0+0 30 0+0+0] [BFC] children: inline
+            frag 0 from GeneratedTextNode start: 0, length: 3, rect: [13,16 35.03125x30] baseline: 24
                 "1. "
             GeneratedTextNode <(anonymous)> (not painted)
           TextNode <#text> (not painted)
-        BlockContainer <(anonymous)> at [48,46] [0+0+0 744 0+0+0] [0+0+0 0 0+0+0] children: inline
-          TextNode <#text> (not painted)
         ListItemBox <li> at [48,46] [0+0+0 744 0+0+0] [0+0+0 30 0+0+0] children: inline
-          frag 0 from TextNode start: 0, length: 1, rect: [48,46 8.8125x16] baseline: 12.796875
+          frag 0 from TextNode start: 0, length: 1, rect: [48,57 8.8125x16] baseline: 13
               "2"
-          ListItemMarkerBox <(anonymous)> at [8,34.796875] [0+0+0 39.671875 0+0+0] [0+0+0 30 0+0+0] [BFC] children: inline
-            frag 0 from GeneratedTextNode start: 0, length: 3, rect: [8,34.796875 39.671875x30] baseline: 24
+          ListItemMarkerBox <(anonymous)> at [8,46] [0+0+0 39.671875 0+0+0] [0+0+0 30 0+0+0] [BFC] children: inline
+            frag 0 from GeneratedTextNode start: 0, length: 3, rect: [8,46 39.671875x30] baseline: 24
                 "2. "
             GeneratedTextNode <(anonymous)> (not painted)
           TextNode <#text> (not painted)
-        BlockContainer <(anonymous)> at [48,76] [0+0+0 744 0+0+0] [0+0+0 0 0+0+0] children: inline
-          TextNode <#text> (not painted)
-      BlockContainer <(anonymous)> at [8,92] [0+0+0 784 0+0+0] [0+0+0 0 0+0+0] children: inline
-        TextNode <#text> (not painted)
       BlockContainer <ul> at [48,92] [0+0+40 744 0+0+0] [16+0+0 60 0+0+16] children: not-inline
-        BlockContainer <(anonymous)> at [48,92] [0+0+0 744 0+0+0] [0+0+0 0 0+0+0] children: inline
-          TextNode <#text> (not painted)
-        ListItemBox <li> at [48,92] [0+0+0 744 0+0+0] [0+0+0 30 0+0+0] children: inline
+        ListItemBox <li> at [48,92] [0+0+0 744 0+0+0] [0+0+0 30 0+0+0] children: not-inline
           ListItemMarkerBox <(anonymous)> at [22,92] [0+0+0 25.953125 0+0+0] [0+0+0 30 0+0+0] [BFC] children: inline
             frag 0 from GeneratedTextNode start: 0, length: 2, rect: [22,92 25.953125x30] baseline: 24
                 "• "
             GeneratedTextNode <(anonymous)> (not painted)
-          TextNode <#text> (not painted)
-        BlockContainer <(anonymous)> at [48,122] [0+0+0 744 0+0+0] [0+0+0 0 0+0+0] children: inline
-          TextNode <#text> (not painted)
-        ListItemBox <li> at [48,122] [0+0+0 744 0+0+0] [0+0+0 30 0+0+0] children: inline
+        ListItemBox <li> at [48,122] [0+0+0 744 0+0+0] [0+0+0 30 0+0+0] children: not-inline
           ListItemMarkerBox <(anonymous)> at [22,122] [0+0+0 25.953125 0+0+0] [0+0+0 30 0+0+0] [BFC] children: inline
             frag 0 from GeneratedTextNode start: 0, length: 2, rect: [22,122 25.953125x30] baseline: 24
                 "• "
             GeneratedTextNode <(anonymous)> (not painted)
-          TextNode <#text> (not painted)
-        BlockContainer <(anonymous)> at [48,152] [0+0+0 744 0+0+0] [0+0+0 0 0+0+0] children: inline
-          TextNode <#text> (not painted)
-      BlockContainer <(anonymous)> at [8,168] [0+0+0 784 0+0+0] [0+0+0 0 0+0+0] children: inline
-        TextNode <#text> (not painted)
 
 SC for Viewport<#document> [0,0 800x600] (z-index: auto)
  SC for BlockContainer<HTML> [0,0 800x168] (z-index: auto)

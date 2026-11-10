@@ -86,25 +86,11 @@ function (generate_css_implementation)
     )
 
     invoke_py_idl_generator(
-        "GeneratedCSSNumericFactoryMethods.cpp"
         "GeneratedCSSNumericFactoryMethods.idl"
         "generate_libweb_css_numeric_factory_methods.py"
         "${LIBWEB_INPUT_FOLDER}/CSS/Units.json"
-        "CSS/GeneratedCSSNumericFactoryMethods.h"
-        "CSS/GeneratedCSSNumericFactoryMethods.cpp"
         "CSS/GeneratedCSSNumericFactoryMethods.idl"
         arguments -j "${LIBWEB_INPUT_FOLDER}/CSS/Units.json"
-    )
-
-    invoke_py_idl_generator(
-        "GeneratedCSSStyleProperties.cpp"
-        "GeneratedCSSStyleProperties.idl"
-        "generate_libweb_css_style_properties.py"
-        "${LIBWEB_INPUT_FOLDER}/CSS/Properties.json"
-        "CSS/GeneratedCSSStyleProperties.h"
-        "CSS/GeneratedCSSStyleProperties.cpp"
-        "CSS/GeneratedCSSStyleProperties.idl"
-        arguments -j "${LIBWEB_INPUT_FOLDER}/CSS/Properties.json"
     )
 
     embed_as_string(
@@ -141,8 +127,6 @@ function (generate_css_implementation)
 
     set(CSS_GENERATED_HEADERS
        "CSS/Enums.h"
-       "CSS/GeneratedCSSStyleProperties.h"
-       "CSS/GeneratedCSSNumericFactoryMethods.h"
        "CSS/Keyword.h"
        "CSS/MediaFeatureID.h"
        "CSS/PropertyID.h"
@@ -158,7 +142,6 @@ function (generate_css_implementation)
     set(LIBWEB_ALL_GENERATED_HEADERS ${LIBWEB_ALL_GENERATED_HEADERS} PARENT_SCOPE)
 
     set(CSS_GENERATED_IDL
-        "GeneratedCSSStyleProperties.idl"
         "GeneratedCSSNumericFactoryMethods.idl"
     )
     list(APPEND LIBWEB_ALL_GENERATED_IDL ${CSS_GENERATED_IDL})
@@ -327,12 +310,12 @@ function (generate_js_bindings target)
         "${LADYBIRD_SOURCE_DIR}/Meta/Generators/libweb_bindings/rust_members.py"
         "${LADYBIRD_SOURCE_DIR}/Meta/Generators/libweb_bindings/rust_names.py"
         "${LADYBIRD_SOURCE_DIR}/Meta/Generators/libweb_bindings/rust_overloads.py"
+        "${LADYBIRD_SOURCE_DIR}/Meta/Generators/libweb_bindings/rust_structured_serialize.py"
         "${LADYBIRD_SOURCE_DIR}/Meta/Generators/libweb_bindings/rust_to_idl_value.py"
         "${LADYBIRD_SOURCE_DIR}/Meta/Generators/libweb_bindings/rust_to_js_value.py"
         "${LADYBIRD_SOURCE_DIR}/Meta/Generators/libweb_bindings/rust_types.py"
         "${LADYBIRD_SOURCE_DIR}/Meta/Generators/libweb_bindings/rust_usage.py"
         "${LADYBIRD_SOURCE_DIR}/Meta/Generators/libweb_bindings/security_checks.py"
-        "${LADYBIRD_SOURCE_DIR}/Meta/Generators/libweb_bindings/structured_serialize.py"
         "${LADYBIRD_SOURCE_DIR}/Meta/Generators/libweb_bindings/to_idl_value.py"
         "${LADYBIRD_SOURCE_DIR}/Meta/Generators/libweb_bindings/to_js_value.py"
         "${LADYBIRD_SOURCE_DIR}/Meta/Generators/libweb_bindings/wrappers.py"
@@ -374,10 +357,6 @@ function (generate_js_bindings target)
     endif()
     list(APPEND LIBWEB_ALL_GENERATED_HEADERS ${GLOBAL_MIXIN_HEADERS})
     list(APPEND LIBWEB_ALL_BINDINGS_SOURCES ${GLOBAL_MIXIN_HEADERS})
-
-    set(STRUCTURED_SERIALIZE_BINDINGS_SOURCE "${CMAKE_CURRENT_BINARY_DIR}/Bindings/StructuredSerializeBindings.cpp")
-    target_sources(${target} PRIVATE ${STRUCTURED_SERIALIZE_BINDINGS_SOURCE})
-    list(APPEND LIBWEB_ALL_BINDINGS_SOURCES ${STRUCTURED_SERIALIZE_BINDINGS_SOURCE})
 
     set(LIBWEB_ALL_IDL_FILES_ARGUMENT ${LIBWEB_ALL_IDL_FILES})
     set(LIBWEB_ALL_PARSED_IDL_FILES_ARGUMENT ${LIBWEB_ALL_PARSED_IDL_FILES})

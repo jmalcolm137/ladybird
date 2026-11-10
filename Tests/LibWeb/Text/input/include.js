@@ -60,6 +60,26 @@ async function waitForCondition(condition, attempts = 600, interval = 25) {
     return true;
 }
 
+// A page may read the clipboard only while the browser pastes it. So this pastes the clipboard into the focused navigable,
+// which must be target's, and calls read() from the paste event, which it cancels and hides from the page's listeners.
+// The read goes through the UI process, so it also waits for earlier clipboard writes to land.
+async function readClipboardFromPaste(target, read = clipboard => clipboard.read()) {
+    const targetWindow = target.ownerDocument.defaultView;
+    const { promise, resolve, reject } = Promise.withResolvers();
+    targetWindow.addEventListener(
+        "paste",
+        event => {
+            event.preventDefault();
+            event.stopImmediatePropagation();
+            read(targetWindow.navigator.clipboard).then(resolve, reject);
+        },
+        { capture: true, once: true }
+    );
+    internals.dispatchUserActivatedEvent(target, new Event("mousedown"));
+    internals.pasteFromClipboard();
+    return promise;
+}
+
 // Each round runs in a task of its own, so that pending tasks can drop their references and the objects that WeakRefs
 // kept alive for an earlier job are released.
 async function collectGarbageUntilCleared(weakRefs, rounds = 100) {
@@ -220,17 +240,21 @@ function asyncTest(f) {
     };
     document.addEventListener("DOMContentLoaded", () => {
         Promise.resolve(f(done)).catch(error => {
-            println(`Caught error while running async test: ${error}`);
+            println(`Caught error while running async test: ${String(error)}`);
             done();
         });
     });
 }
 
 function promiseTest(f) {
+    const done = () => {
+        __preventMultipleTestFunctions();
+        __finishTest();
+    };
     document.addEventListener("DOMContentLoaded", () => {
-        f().then(() => {
-            __preventMultipleTestFunctions();
-            __finishTest();
+        f().then(done, error => {
+            println(`Caught error while running promise test: ${String(error)}`);
+            done();
         });
     });
 }
@@ -267,6 +291,9 @@ class HTTPTestServer {
     recordedRequestHeadersURL(echoURL) {
         return `${this.baseURL}/recorded-request-headers${new URL(echoURL).pathname}`;
     }
+    recordedRequestCountURL(echoURL) {
+        return `${this.baseURL}/recorded-request-count${new URL(echoURL).pathname}`;
+    }
     // Resolves once the echo server has seen a request for echoURL, query included.
     async waitForRequest(echoURL) {
         const url = new URL(echoURL);
@@ -289,7 +316,10 @@ class HTTPTestServer {
 const __httpTestServer = (function () {
     if (globalThis.internals && globalThis.internals.getEchoServerPort) {
         const echoServerPort = internals.getEchoServerPort();
-        const isLoadedFromEchoServer = location.protocol === "http:" && location.port === String(echoServerPort);
+        const httpsEchoServerPort = internals.getHttpsEchoServerPort();
+        const isLoadedFromEchoServer =
+            (location.protocol === "http:" && location.port === String(echoServerPort)) ||
+            (location.protocol === "https:" && location.port === String(httpsEchoServerPort));
 
         // Tests loaded through the echo server should create echo URLs on their current origin,
         // so same-origin iframe/fetch checks keep working with unique localhost hostnames.

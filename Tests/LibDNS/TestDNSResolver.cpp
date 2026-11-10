@@ -9,9 +9,11 @@
 #include <AK/ByteBuffer.h>
 #include <AK/ConditionVariable.h>
 #include <AK/Endian.h>
+#include <AK/Function.h>
 #include <AK/IPv4Address.h>
 #include <AK/IPv6Address.h>
 #include <AK/MemoryStream.h>
+#include <AK/Optional.h>
 #include <LibCore/EventLoop.h>
 #include <LibCore/Socket.h>
 #include <LibCore/TCPServer.h>
@@ -175,7 +177,33 @@ ErrorOr<ByteBuffer> build_truncated_response(ReadonlyBytes query_bytes)
     return out;
 }
 
-void expect_successful_lookup(DNS::Resolver& resolver, Core::EventLoop& loop)
+// The resolver's system-lookup workers post their results to the event loop they were started from, and expect it to
+// live as long as the process, as a real process's main loop does: A worker can still be waking the loop after posting
+// the result that ends a test. So all the tests share one event loop that's never destroyed. And since an event loop
+// can't run again once it's been asked to quit, each test runs that loop through a TestLoop of its own.
+class TestLoop {
+public:
+    TestLoop()
+    {
+        static auto& event_loop = *new Core::EventLoop;
+        VERIFY(&Core::EventLoop::current() == &event_loop);
+    }
+
+    int exec()
+    {
+        spin_until([this] { return m_exit_code.has_value(); });
+        return *m_exit_code;
+    }
+
+    void quit(int code) { m_exit_code = code; }
+    bool was_exit_requested() const { return m_exit_code.has_value(); }
+    void spin_until(Function<bool()> goal_condition) { Core::EventLoop::current().spin_until(move(goal_condition)); }
+
+private:
+    Optional<int> m_exit_code;
+};
+
+void expect_successful_lookup(DNS::Resolver& resolver, TestLoop& loop)
 {
     TRY_OR_FAIL(resolver.when_socket_ready()->await());
 
@@ -196,7 +224,7 @@ void expect_successful_lookup(DNS::Resolver& resolver, Core::EventLoop& loop)
 
 TEST_CASE(test_udp)
 {
-    Core::EventLoop loop;
+    TestLoop loop;
 
     auto server = Core::UDPServer::construct();
     EXPECT(server->bind(IPv4Address { 127, 0, 0, 1 }, 0));
@@ -224,7 +252,7 @@ TEST_CASE(test_udp)
 
 TEST_CASE(test_tcp)
 {
-    Core::EventLoop loop;
+    TestLoop loop;
 
     auto server = MUST(Core::TCPServer::try_create());
     MUST(server->listen(IPv4Address { 127, 0, 0, 1 }, 0, Core::TCPServer::AllowAddressReuse::Yes));
@@ -282,7 +310,7 @@ TEST_CASE(test_tcp)
 
 TEST_CASE(test_dnssec_response_rejects_unknown_key_tag)
 {
-    Core::EventLoop loop;
+    TestLoop loop;
 
     auto server = Core::UDPServer::construct();
     EXPECT(server->bind(IPv4Address { 127, 0, 0, 1 }, 0));
@@ -319,7 +347,7 @@ TEST_CASE(test_dnssec_response_rejects_unknown_key_tag)
 
 TEST_CASE(test_dnssec_response_rejects_unhandled_algorithm)
 {
-    Core::EventLoop loop;
+    TestLoop loop;
 
     auto server = Core::UDPServer::construct();
     EXPECT(server->bind(IPv4Address { 127, 0, 0, 1 }, 0));
@@ -356,7 +384,7 @@ TEST_CASE(test_dnssec_response_rejects_unhandled_algorithm)
 
 TEST_CASE(test_localhost_resolves_to_loopback_without_a_socket)
 {
-    Core::EventLoop loop;
+    TestLoop loop;
 
     // The socket factory must never run: localhost names are answered in-process, never sent upstream.
     DNS::Resolver resolver {
@@ -400,7 +428,7 @@ TEST_CASE(test_localhost_resolves_to_loopback_without_a_socket)
 
 TEST_CASE(test_loopback_domains_resolve_to_loopback_without_a_socket)
 {
-    Core::EventLoop loop;
+    TestLoop loop;
 
     auto resolves_to_loopback = [](DNS::Resolver& resolver, StringView name) {
         auto result = resolver.lookup(name, DNS::Messages::Class::IN, { DNS::Messages::ResourceType::A, DNS::Messages::ResourceType::AAAA })->await();
@@ -441,7 +469,7 @@ TEST_CASE(test_loopback_domains_resolve_to_loopback_without_a_socket)
 
 TEST_CASE(test_lookup_rejects_names_that_must_not_go_upstream)
 {
-    Core::EventLoop loop;
+    TestLoop loop;
 
     DNS::Resolver resolver {
         [&] -> ErrorOr<Optional<DNS::Resolver::SocketResult>> {
@@ -464,7 +492,7 @@ TEST_CASE(test_lookup_rejects_names_that_must_not_go_upstream)
 
 TEST_CASE(test_configured_server_failure_does_not_fall_back_to_the_system_resolver)
 {
-    Core::EventLoop loop;
+    TestLoop loop;
 
     DNS::Resolver resolver {
         [&] -> ErrorOr<Optional<DNS::Resolver::SocketResult>> {
@@ -480,7 +508,7 @@ TEST_CASE(test_configured_server_failure_does_not_fall_back_to_the_system_resolv
 
 TEST_CASE(test_unrelated_answers_are_not_cached)
 {
-    Core::EventLoop loop;
+    TestLoop loop;
 
     size_t queries = 0;
     auto server = Core::UDPServer::construct();
@@ -520,7 +548,7 @@ TEST_CASE(test_unrelated_answers_are_not_cached)
 
 TEST_CASE(test_concurrent_lookups_for_one_name_all_resolve)
 {
-    Core::EventLoop loop;
+    TestLoop loop;
 
     size_t queries = 0;
     auto server = Core::UDPServer::construct();
@@ -559,7 +587,7 @@ TEST_CASE(test_concurrent_lookups_for_one_name_all_resolve)
 
 TEST_CASE(test_validated_lookup_settles_on_a_negative_response)
 {
-    Core::EventLoop loop;
+    TestLoop loop;
 
     auto server = Core::UDPServer::construct();
     EXPECT(server->bind(IPv4Address { 127, 0, 0, 1 }, 0));
@@ -599,7 +627,7 @@ TEST_CASE(test_validated_lookup_settles_on_a_negative_response)
 
 TEST_CASE(test_short_udp_datagram_does_not_block_the_event_loop)
 {
-    Core::EventLoop loop;
+    TestLoop loop;
 
     auto server = Core::UDPServer::construct();
     EXPECT(server->bind(IPv4Address { 127, 0, 0, 1 }, 0));
@@ -631,7 +659,7 @@ TEST_CASE(test_short_udp_datagram_does_not_block_the_event_loop)
 
 TEST_CASE(test_partial_tcp_frame_does_not_block_the_event_loop)
 {
-    Core::EventLoop loop;
+    TestLoop loop;
 
     auto server = MUST(Core::TCPServer::try_create());
     MUST(server->listen(IPv4Address { 127, 0, 0, 1 }, 0, Core::TCPServer::AllowAddressReuse::Yes));
@@ -697,7 +725,7 @@ TEST_CASE(test_partial_tcp_frame_does_not_block_the_event_loop)
 
 TEST_CASE(test_tcp_connection_is_replaced_after_the_server_closes_it)
 {
-    Core::EventLoop loop;
+    TestLoop loop;
 
     auto server = MUST(Core::TCPServer::try_create());
     MUST(server->listen(IPv4Address { 127, 0, 0, 1 }, 0, Core::TCPServer::AllowAddressReuse::Yes));
@@ -761,26 +789,59 @@ TEST_CASE(test_tcp_connection_is_replaced_after_the_server_closes_it)
 
 TEST_CASE(test_truncated_udp_response_is_retried_over_tcp)
 {
-    Core::EventLoop loop;
+    TestLoop loop;
 
-    // The server answers on one port over both UDP and TCP. The port the system picks for TCP isn't reserved for UDP,
-    // though, so another socket can already hold it for UDP — in which case, try again with a fresh port.
+    // The server answers on one port over both UDP and TCP. The system may reserve ranges of ports for one protocol but
+    // not the other, and hands out ports in order, so a port it picks for one protocol can sit in a block the other is
+    // refused for. So each attempt tries both ways: TCP on the port the system picks for UDP, then UDP on the port it
+    // picks for TCP. A server whose port the other protocol turns down stays open for the rest of the test, so that the
+    // system moves on to a fresh port rather than handing out the same one again.
     RefPtr<Core::TCPServer> tcp_server;
     RefPtr<Core::UDPServer> udp_server;
-    u16 server_port = 0;
-    for (size_t attempt = 0; attempt < 10 && !udp_server; ++attempt) {
-        tcp_server = MUST(Core::TCPServer::try_create());
-        MUST(tcp_server->listen(IPv4Address { 127, 0, 0, 1 }, 0, Core::TCPServer::AllowAddressReuse::Yes));
-        server_port = tcp_server->local_port().value();
+    Vector<NonnullRefPtr<Core::UDPServer>> rejected_udp_servers;
+    Vector<NonnullRefPtr<Core::TCPServer>> rejected_tcp_servers;
+    Vector<u16> udp_ports_tcp_refused;
+    Vector<u16> tcp_ports_udp_refused;
+    Optional<Error> listen_error;
+    for (size_t attempt = 0; attempt < 10 && !tcp_server; ++attempt) {
+        auto udp_candidate = Core::UDPServer::construct();
+        if (!udp_candidate->bind(IPv4Address { 127, 0, 0, 1 }, 0)) {
+            FAIL("Couldn't bind UDP to a port the system picks");
+            return;
+        }
+        auto udp_port = udp_candidate->local_port().value();
+        auto tcp_candidate = MUST(Core::TCPServer::try_create());
+        auto listened = tcp_candidate->listen(IPv4Address { 127, 0, 0, 1 }, udp_port);
+        if (!listened.is_error()) {
+            udp_server = move(udp_candidate);
+            tcp_server = move(tcp_candidate);
+            break;
+        }
+        listen_error = listened.release_error();
+        udp_ports_tcp_refused.append(udp_port);
+        rejected_udp_servers.append(move(udp_candidate));
 
-        auto candidate = Core::UDPServer::construct();
-        if (candidate->bind(IPv4Address { 127, 0, 0, 1 }, server_port))
-            udp_server = move(candidate);
+        auto tcp_first = MUST(Core::TCPServer::try_create());
+        if (auto result = tcp_first->listen(IPv4Address { 127, 0, 0, 1 }, 0); result.is_error()) {
+            FAIL(ByteString::formatted("Couldn't listen for TCP on a port the system picks: {}", result.error()));
+            return;
+        }
+        auto tcp_port = tcp_first->local_port().value();
+        auto udp_second = Core::UDPServer::construct();
+        if (udp_second->bind(IPv4Address { 127, 0, 0, 1 }, tcp_port)) {
+            udp_server = move(udp_second);
+            tcp_server = move(tcp_first);
+            break;
+        }
+        tcp_ports_udp_refused.append(tcp_port);
+        rejected_tcp_servers.append(move(tcp_first));
     }
-    if (!udp_server) {
-        FAIL("Couldn't bind UDP to the port of a TCP server");
+    if (!tcp_server) {
+        FAIL(ByteString::formatted("Couldn't serve UDP and TCP on one port: TCP refused UDP's ports {} ({}), and UDP refused TCP's ports {}",
+            ByteString::join(", "sv, udp_ports_tcp_refused), listen_error.value(), ByteString::join(", "sv, tcp_ports_udp_refused)));
         return;
     }
+    auto server_port = udp_server->local_port().value();
 
     size_t udp_queries = 0;
     udp_server->on_ready_to_receive = [&] {
@@ -851,7 +912,7 @@ TEST_CASE(test_truncated_udp_response_is_retried_over_tcp)
 
 TEST_CASE(test_expired_addresses_are_not_mistaken_for_a_negative_answer)
 {
-    Core::EventLoop loop;
+    TestLoop loop;
 
     // A long-lived CNAME to short-lived addresses: Once the addresses expire, the CNAME is still cached.
     size_t queries = 0;
@@ -964,7 +1025,7 @@ bool has_address_of_family(DNS::LookupResult const& result, bool ipv6)
 
 TEST_CASE(test_system_resolver_waits_for_ipv4_addresses_after_ipv6_addresses)
 {
-    Core::EventLoop loop;
+    TestLoop loop;
     SystemResolverWithHeldBackIPv4 system_resolver;
     DNS::Resolver resolver {
         [] -> ErrorOr<Optional<DNS::Resolver::SocketResult>> { return OptionalNone {}; },
@@ -992,7 +1053,7 @@ TEST_CASE(test_system_resolver_waits_for_ipv4_addresses_after_ipv6_addresses)
 
 TEST_CASE(test_system_resolver_goes_ahead_with_ipv6_addresses_when_ipv4_addresses_take_too_long)
 {
-    Core::EventLoop loop;
+    TestLoop loop;
     SystemResolverWithHeldBackIPv4 system_resolver;
     DNS::Resolver resolver {
         [] -> ErrorOr<Optional<DNS::Resolver::SocketResult>> { return OptionalNone {}; },
@@ -1011,7 +1072,7 @@ TEST_CASE(test_system_resolver_goes_ahead_with_ipv6_addresses_when_ipv4_addresse
 
 TEST_CASE(test_system_resolver_skips_ipv6_addresses_when_ipv6_is_unreachable)
 {
-    Core::EventLoop loop;
+    TestLoop loop;
     SystemResolverWithHeldBackIPv4 system_resolver;
     DNS::Resolver resolver {
         [] -> ErrorOr<Optional<DNS::Resolver::SocketResult>> { return OptionalNone {}; },
@@ -1027,7 +1088,7 @@ TEST_CASE(test_system_resolver_skips_ipv6_addresses_when_ipv6_is_unreachable)
 
 TEST_CASE(test_system_resolver_resolves_ipv6_addresses_of_local_names_when_ipv6_is_unreachable)
 {
-    Core::EventLoop loop;
+    TestLoop loop;
     SystemResolverWithHeldBackIPv4 system_resolver;
     DNS::Resolver resolver {
         [] -> ErrorOr<Optional<DNS::Resolver::SocketResult>> { return OptionalNone {}; },
@@ -1043,7 +1104,7 @@ TEST_CASE(test_system_resolver_resolves_ipv6_addresses_of_local_names_when_ipv6_
 
 TEST_CASE(test_system_resolver_looks_up_ipv6_addresses_again_once_ipv6_is_reachable)
 {
-    Core::EventLoop loop;
+    TestLoop loop;
     SystemResolverWithHeldBackIPv4 system_resolver;
     DNS::Resolver resolver {
         [] -> ErrorOr<Optional<DNS::Resolver::SocketResult>> { return OptionalNone {}; },
@@ -1079,7 +1140,7 @@ TEST_CASE(test_system_resolver_looks_up_ipv6_addresses_again_once_ipv6_is_reacha
 
 TEST_CASE(test_system_resolver_does_not_join_a_lookup_without_ipv6_addresses_once_ipv6_is_reachable)
 {
-    Core::EventLoop loop;
+    TestLoop loop;
     SystemResolverWithHeldBackIPv4 system_resolver;
     DNS::Resolver resolver {
         [] -> ErrorOr<Optional<DNS::Resolver::SocketResult>> { return OptionalNone {}; },
@@ -1119,7 +1180,7 @@ TEST_CASE(test_system_resolver_does_not_join_a_lookup_without_ipv6_addresses_onc
 
 TEST_CASE(test_system_resolver_does_not_join_a_lookup_without_ipv4_addresses_once_ipv6_is_unreachable)
 {
-    Core::EventLoop loop;
+    TestLoop loop;
     SystemResolverWithHeldBackIPv4 system_resolver;
     DNS::Resolver resolver {
         [] -> ErrorOr<Optional<DNS::Resolver::SocketResult>> { return OptionalNone {}; },

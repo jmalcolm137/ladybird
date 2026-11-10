@@ -20,6 +20,16 @@
 
 namespace Crypto::PK {
 
+void RSAPrivateKey::clear_sensitive_data()
+{
+    m_private_exponent.clear_sensitive_data();
+    m_prime_1.clear_sensitive_data();
+    m_prime_2.clear_sensitive_data();
+    m_exponent_1.clear_sensitive_data();
+    m_exponent_2.clear_sensitive_data();
+    m_coefficient.clear_sensitive_data();
+}
+
 ErrorOr<RSA::KeyPairType> RSA::parse_rsa_key(ReadonlyBytes der, bool is_private, Vector<StringView> current_scope)
 {
     KeyPairType keypair;
@@ -118,8 +128,21 @@ ErrorOr<RSA::KeyPairType> RSA::parse_rsa_key(ReadonlyBytes der, bool is_private,
     }
 }
 
+ErrorOr<void> RSA::validate_key_generation_parameters(size_t bits)
+{
+    // OpenSSL refuses to generate keys with shorter moduli.
+    static constexpr size_t minimum_modulus_length = 512;
+
+    if (bits < minimum_modulus_length)
+        return Error::from_string_literal("RSA modulus length must be at least 512 bits");
+
+    return {};
+}
+
 ErrorOr<RSA::KeyPairType> RSA::generate_key_pair(size_t bits, UnsignedBigInteger e)
 {
+    TRY(validate_key_generation_parameters(bits));
+
     auto ctx = TRY(OpenSSL_PKEY_CTX::wrap(EVP_PKEY_CTX_new_from_name(nullptr, "RSA", nullptr)));
 
     OPENSSL_TRY(EVP_PKEY_keygen_init(ctx.ptr()));

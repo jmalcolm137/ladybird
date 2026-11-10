@@ -37,8 +37,13 @@ add_subdirectory(Meta)
 if (NOT WIN32)
     string(TOUPPER "${RUST_TARGET_TRIPLE}" rust_target_upper)
     string(REPLACE "-" "_" rust_target_upper "${rust_target_upper}")
-    set(rust_test_env "CARGO_TARGET_${rust_target_upper}_RUSTFLAGS=${RUSTC_TARGET_FLAGS}")
+    set(rust_test_env
+        "CARGO_TARGET_${rust_target_upper}_RUSTFLAGS=${RUSTC_TARGET_FLAGS}"
+        "LLVM_LIBC_INCLUDE_DIR=${LLVM_LIBC_INCLUDE_DIR}/llvm-libc"
+    )
 
+    # --all-targets leaves out doctests. The workspace has none that run, but scheduling them would still make Cargo
+    # compile the plain library of every crate, on top of its unit test binary.
     set(rust_workspace_test_command
         "${CMAKE_COMMAND}" -E env
             ${rust_test_env}
@@ -47,6 +52,7 @@ if (NOT WIN32)
             "${RUST_CARGO}" test --workspace
                 --manifest-path "${LADYBIRD_SOURCE_DIR}/Cargo.toml"
                 --target "${RUST_TARGET_TRIPLE}"
+                --all-targets
     )
     set(flap_test_command
         "${CMAKE_COMMAND}" -E env
@@ -91,6 +97,8 @@ if (NOT WIN32)
 
     add_test(NAME RustWorkspace COMMAND ${rust_workspace_test_command})
     add_test(NAME Flap COMMAND ${flap_test_command})
+    # cargo test already uses every core.
+    set_tests_properties(RustWorkspace Flap PROPERTIES RUN_SERIAL TRUE)
 endif()
 
 if (ENABLE_GUI_TARGETS)

@@ -182,7 +182,7 @@ void HTMLOrSVGOrMathMLElement<ElementBase>::inserted()
 
     // https://html.spec.whatwg.org/multipage/interaction.html#the-autofocus-attribute
     // OPTIMIZATION: The subtree attribute name filter rules out the attribute for most elements without a lookup.
-    auto might_have_autofocus = (element.subtree_attribute_name_filter() & DOM::Element::attribute_name_filter_bit(HTML::AttributeNames::autofocus)) != 0;
+    auto might_have_autofocus = (element.subtree_name_filter() & DOM::Element::name_filter_bit(HTML::AttributeNames::autofocus)) != 0;
     if (might_have_autofocus && element.has_attribute(HTML::AttributeNames::autofocus)) {
         // When an element with the autofocus attribute specified is inserted into a document, run the following steps:
 
@@ -204,6 +204,13 @@ void HTMLOrSVGOrMathMLElement<ElementBase>::inserted()
         // 5. If the allow focus steps given target return false, then return.
         if (!target.allow_focus())
             return;
+
+        // AD-HOC: Match Chromium, Firefox, and WebKit by excluding autofocus candidates with a cross-origin ancestor.
+        for (auto ancestor = target.navigable()->parent(); ancestor; ancestor = ancestor->parent()) {
+            auto ancestor_origin = ancestor->active_document_origin();
+            if (!ancestor_origin.has_value() || !target.origin().is_same_origin(*ancestor_origin))
+                return;
+        }
 
         // 6. Let topDocument be target's node navigable's top-level traversable's active document.
         // FIXME: The candidates of a top-level document hosted by another process are kept there. Only an element same

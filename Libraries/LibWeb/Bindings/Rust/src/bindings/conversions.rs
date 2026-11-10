@@ -14,8 +14,8 @@ use std::borrow::Cow;
 use ak::{Utf16String, Utf16StringUnits, convert_valid_utf16_to_utf8, utf8_length_from_valid_utf16};
 use libjs_rust::api::{
     Array, ArrayBuffer, ArrayBufferOrder, ArrayBufferShared, DataView, ErrorKind, ErrorType, FunctionObject, Gc,
-    MarkedVec, Must, Object, PrimitiveString, PropertyKey, ThrowCompletionOr, Trace, TypedArrayBase, TypedArrayKind,
-    Value, Vm, create_typed_array_on_buffer, get_iterator_from_method_impl, get_view_byte_length,
+    IntegrityLevel, MarkedVec, Must, Object, PrimitiveString, PropertyKey, ThrowCompletionOr, Trace, TypedArrayBase,
+    TypedArrayKind, Value, Vm, create_typed_array_on_buffer, get_iterator_from_method_impl, get_view_byte_length,
     is_typed_array_out_of_bounds, is_view_out_of_bounds, iterator_step_value,
     make_data_view_with_buffer_witness_record, make_typed_array_with_buffer_witness_record, to_well_formed,
     typed_array_byte_length,
@@ -25,10 +25,11 @@ use crate::ak_format::ak_formatted;
 use crate::bindings::interface::{Interface, Ref, create_dictionary_object, wrap};
 use crate::bindings::promise::WebIdlPromise;
 use crate::bindings::services::web_bindings_object_implements_interface;
-use crate::bindings::{CallContext, Exception, WebIdlResult};
+use crate::bindings::{CallContext, WebIdlResult};
 
 /// A USVString, a string without lone surrogates. Its UTF-16 code units are always well-formed.
-#[derive(Clone, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq, Trace)]
+#[gc(crate = libjs_rust)]
 pub(crate) struct UsvString(Utf16String);
 
 impl UsvString {
@@ -47,6 +48,7 @@ impl UsvString {
     pub(crate) fn utf8_length(&self) -> usize {
         match self.units() {
             Utf16StringUnits::Ascii(bytes) => bytes.len(),
+            Utf16StringUnits::Latin1(bytes) => bytes.len() + bytes.iter().filter(|&&byte| byte >= 0x80).count(),
             Utf16StringUnits::Utf16(code_units) => utf8_length_from_valid_utf16(code_units),
         }
     }
@@ -64,6 +66,16 @@ impl UsvString {
                 output[..bytes.len()].write_copy_of_slice(bytes);
                 bytes.len()
             }
+            Utf16StringUnits::Latin1(bytes) => {
+                let mut length = 0;
+                for &byte in bytes {
+                    let mut buffer = [0; 2];
+                    let encoded = char::from(byte).encode_utf8(&mut buffer).as_bytes();
+                    output[length..length + encoded.len()].write_copy_of_slice(encoded);
+                    length += encoded.len();
+                }
+                length
+            }
             Utf16StringUnits::Utf16(code_units) => {
                 debug_assert!(output.len() >= utf8_length_from_valid_utf16(code_units));
                 // SAFETY: A USVString is well-formed, and the caller gives the output room for its encoding.
@@ -76,6 +88,11 @@ impl UsvString {
     pub(crate) fn strip_ascii_prefix(&self, prefix: u8) -> Option<Self> {
         match self.units() {
             Utf16StringUnits::Ascii(bytes) => bytes.strip_prefix(&[prefix]).map(Self::from_ascii),
+            Utf16StringUnits::Latin1(bytes) => bytes.strip_prefix(&[prefix]).map(|rest| {
+                Self(Utf16String::from_utf16(
+                    &rest.iter().map(|&byte| u16::from(byte)).collect::<Vec<_>>(),
+                ))
+            }),
             Utf16StringUnits::Utf16(code_units) => code_units
                 .strip_prefix(&[u16::from(prefix)])
                 .map(|rest| Self(Utf16String::from_utf16(rest))),
@@ -86,6 +103,19 @@ impl UsvString {
         self.0
     }
 
+    pub(crate) fn as_utf16_string(&self) -> &Utf16String {
+        &self.0
+    }
+
+    /// https://infra.spec.whatwg.org/#javascript-string-convert
+    pub(crate) fn from_utf16_string(string: &Utf16String) -> Self {
+        Self(to_well_formed(string))
+    }
+
+    pub(crate) fn to_utf16(&self) -> std::borrow::Cow<'_, [u16]> {
+        self.0.to_utf16()
+    }
+
     pub(crate) fn from_utf8(string: &str) -> Self {
         Self(Utf16String::from_utf8(string))
     }
@@ -93,6 +123,7 @@ impl UsvString {
     pub(crate) fn to_utf8(&self) -> String {
         match self.units() {
             Utf16StringUnits::Ascii(bytes) => String::from_utf8(bytes.to_vec()),
+            Utf16StringUnits::Latin1(bytes) => Ok(bytes.iter().map(|&byte| char::from(byte)).collect()),
             Utf16StringUnits::Utf16(code_units) => String::from_utf16(code_units).map_err(|_| unreachable!()),
         }
         .expect("a USVString is well-formed")
@@ -151,6 +182,8 @@ pub(crate) fn to_enumeration_value(
         .iter()
         .position(|enumeration_value| match string.as_units() {
             Utf16StringUnits::Ascii(units) => units == enumeration_value.as_bytes(),
+            // NB: Every enumeration value is ASCII.
+            Utf16StringUnits::Latin1(_) => false,
             Utf16StringUnits::Utf16(units) => units.iter().copied().eq(enumeration_value.bytes().map(u16::from)),
         });
     match index {
@@ -244,6 +277,26 @@ fn to_integer_enforcing_range(vm: &Vm, value: Value, lower_bound: f64, upper_bou
 /// The largest integer that a JS number represents unambiguously, the upper bound of a 64-bit integer type with
 /// [EnforceRange] or [Clamp].
 const MAX_SAFE_INTEGER: f64 = 9_007_199_254_740_991.0;
+
+/// A JS value converted to an octet with [EnforceRange], https://webidl.spec.whatwg.org/#js-octet
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "the value is an integer within the bounds of the type"
+)]
+pub(crate) fn to_octet_enforcing_range(vm: &Vm, value: Value) -> ThrowCompletionOr<u8> {
+    Ok(to_integer_enforcing_range(vm, value, 0.0, f64::from(u8::MAX))? as u8)
+}
+
+/// A JS value converted to an unsigned short with [EnforceRange], https://webidl.spec.whatwg.org/#js-unsigned-short
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "the value is an integer within the bounds of the type"
+)]
+pub(crate) fn to_unsigned_short_enforcing_range(vm: &Vm, value: Value) -> ThrowCompletionOr<u16> {
+    Ok(to_integer_enforcing_range(vm, value, 0.0, f64::from(u16::MAX))? as u16)
+}
 
 /// A JS value converted to a long with [EnforceRange], https://webidl.spec.whatwg.org/#js-long
 #[allow(
@@ -462,6 +515,32 @@ pub(crate) struct BufferSourceRules {
     pub(crate) allow_resizable: bool,
 }
 
+// https://webidl.spec.whatwg.org/#js-ArrayBuffer
+pub(crate) fn to_array_buffer(vm: &Vm, value: Value, rules: &BufferSourceRules) -> ThrowCompletionOr<Gc<ArrayBuffer>> {
+    // 1. If V is not an Object, or V does not have an [[ArrayBufferData]] internal slot, then throw a TypeError.
+    let buffer = value
+        .is_object()
+        .then(|| value.as_object().downcast::<ArrayBuffer>())
+        .flatten();
+    let Some(buffer) = buffer else {
+        return vm.throw_completion(ErrorKind::TypeError, ErrorType::NotAnObjectOfType, &[&"ArrayBuffer"]);
+    };
+    // 2. If IsSharedArrayBuffer(V) is true, then throw a TypeError.
+    if buffer.is_shared_array_buffer() {
+        return vm.throw_completion(ErrorKind::TypeError, ErrorType::SharedArrayBuffer, &[]);
+    }
+    // 3. If the conversion is not to an IDL type associated with the [AllowResizable] extended attribute, and IsFixedLengthArrayBuffer(V) is false, then throw a TypeError.
+    if !rules.allow_resizable && !buffer.is_fixed_length() {
+        return vm.throw_completion(
+            ErrorKind::TypeError,
+            ErrorType::NotAnObjectOfType,
+            &[&"fixed-length ArrayBuffer"],
+        );
+    }
+    // 4. Return the IDL ArrayBuffer value that is a reference to the same object as V.
+    Ok(buffer)
+}
+
 /// A JS value converted to an IDL typed array value of the kind, whose name is the type's name.
 pub(crate) fn to_typed_array(
     vm: &Vm,
@@ -562,9 +641,9 @@ impl BufferSource {
                 BufferSourceExtent {
                     buffer: typed_array.viewed_array_buffer(),
                     is_out_of_bounds,
-                    byte_offset: typed_array.byte_offset() as usize,
+                    byte_offset: typed_array.byte_offset(),
                     byte_length,
-                    element_size: typed_array.element_size() as usize,
+                    element_size: typed_array.element_size(),
                 }
             }
             Self::DataView(view) => {
@@ -580,7 +659,7 @@ impl BufferSource {
                 BufferSourceExtent {
                     buffer: view.viewed_array_buffer(),
                     is_out_of_bounds,
-                    byte_offset: view.byte_offset() as usize,
+                    byte_offset: view.byte_offset(),
                     byte_length,
                     element_size: 1,
                 }
@@ -692,8 +771,6 @@ pub(crate) fn buffer_source_type_of(value: Value) -> Option<BufferSource> {
 
 /// https://webidl.spec.whatwg.org/#arraybufferview-create, for a Uint8Array in the realm of the call context.
 pub(crate) fn create_uint8_array(cx: &CallContext, bytes: &[u8]) -> WebIdlResult<Gc<Object>> {
-    let length = u32::try_from(bytes.len())
-        .map_err(|_| Exception::RangeError(ErrorType::InvalidLength.message(&[&"typed array"])))?;
     let buffer =
         ArrayBuffer::try_create_written_by(cx.vm(), cx.realm(), bytes.len(), ArrayBufferShared::No, |output| {
             for (byte, value) in output.iter_mut().zip(bytes) {
@@ -701,7 +778,7 @@ pub(crate) fn create_uint8_array(cx: &CallContext, bytes: &[u8]) -> WebIdlResult
             }
             bytes.len()
         })?;
-    Ok(create_typed_array_on_buffer(cx.vm(), cx.realm(), TypedArrayKind::Uint8Array, length, buffer).upcast())
+    Ok(create_typed_array_on_buffer(cx.vm(), cx.realm(), TypedArrayKind::Uint8Array, bytes.len(), buffer).upcast())
 }
 
 impl ArrayBufferView {
@@ -744,8 +821,15 @@ pub(crate) fn buffer_source_if(
         return Ok(Some(BufferSource::ArrayBuffer(buffer)));
     }
 
-    // FIXME: 7. If V is an Object, V has an [[ArrayBufferData]] internal slot, and IsSharedArrayBuffer(V) is true,
-    //           then:
+    // 7. If V is an Object, V, has an [[ArrayBufferData]] internal slot, and IsSharedArrayBuffer(V) is true, then:
+    //     1. If types includes SharedArrayBuffer, then return the result of converting V to SharedArrayBuffer.
+    if rules.allow_shared
+        && let Some(buffer) = object.downcast::<ArrayBuffer>()
+        && buffer.is_shared_array_buffer()
+    {
+        check_buffer_of_buffer_source(vm, &buffer, "SharedArrayBuffer", rules)?;
+        return Ok(Some(BufferSource::ArrayBuffer(buffer)));
+    }
 
     // 8. If V is an Object and V has a [[DataView]] internal slot, then:
     //     1. If types includes DataView, then return the result of converting V to DataView.
@@ -1093,6 +1177,15 @@ impl ToJs for Gc<TypedArrayBase> {
     }
 }
 
+impl ToJs for ArrayBufferView {
+    fn to_js(self, _: &CallContext) -> ThrowCompletionOr<Value> {
+        Ok(match self {
+            Self::DataView(view) => Value::from_object(view),
+            Self::TypedArray(array) => Value::from_object(array),
+        })
+    }
+}
+
 impl ToJs for Gc<ArrayBuffer> {
     fn to_js(self, _: &CallContext) -> ThrowCompletionOr<Value> {
         Ok(Value::from_object(self))
@@ -1214,19 +1307,44 @@ pub(crate) fn sequence_to_js<T>(
     Ok(Value::from_object(array))
 }
 
+/// https://webidl.spec.whatwg.org/#js-frozen-array
+pub(crate) fn frozen_array_to_js(cx: &CallContext, array: ThrowCompletionOr<Value>) -> ThrowCompletionOr<Value> {
+    // 1. Let array be the result of converting the sequence of type T to a JavaScript value.
+    let array = array?;
+
+    // 2. Perform ! SetIntegrityLevel(array, "frozen").
+    array
+        .as_object()
+        .set_integrity_level(cx.vm(), IntegrityLevel::Frozen)
+        .must();
+
+    // 3. Return array.
+    Ok(array)
+}
+
 /// sequence_to_js() for a sequence of cells, which stay rooted while converting an element allocates.
 pub(crate) fn rooted_sequence_to_js<T: Trace + Clone + 'static>(
     cx: &CallContext,
     sequence: MarkedVec<'_, T>,
-    mut element_to_js: impl FnMut(T) -> ThrowCompletionOr<Value>,
+    mut element_to_js: impl FnMut(&T) -> ThrowCompletionOr<Value>,
 ) -> ThrowCompletionOr<Value> {
     let array = Array::create(cx.vm(), cx.realm(), sequence.len() as u64, None)?;
-    for index in 0..sequence.len() {
-        let element = element_to_js(sequence.get(index).expect("the index is in the sequence"))?;
+    for (index, element) in sequence.values().iter().enumerate() {
+        let element = element_to_js(element)?;
         let index = u32::try_from(index).expect("an array of the length of the sequence was created");
         array.create_data_property(cx.vm(), &PropertyKey::from(index), element, None, None)?;
     }
     Ok(Value::from_object(array))
+}
+
+/// The elements of a sequence of a dictionary in a MarkedVec, which keeps them alive while the dictionary is converted.
+pub(crate) fn mark_sequence<'vm, T: Trace + Clone + 'static>(
+    cx: &CallContext<'vm>,
+    sequence: &[T],
+) -> MarkedVec<'vm, T> {
+    let marked = MarkedVec::with_capacity(cx.vm(), sequence.len());
+    marked.extend_from_slice(sequence);
+    marked
 }
 
 /// An IDL record converted to a JS value, https://webidl.spec.whatwg.org/#js-record, with the conversion of its

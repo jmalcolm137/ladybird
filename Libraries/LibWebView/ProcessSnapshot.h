@@ -28,13 +28,18 @@ struct ProcessPageSnapshot {
     u64 view_id { 0 };
     URL::URL url;
     ProcessPageKind kind { ProcessPageKind::TopLevel };
-    Optional<String> favicon_hash;
 };
 
 // A tab whose page a WebContent process hosts.
 struct ProcessTabSnapshot {
     Utf16String title;
     ProcessPageSnapshot page;
+};
+
+// A frame whose document a WebContent process hosts for a tab another process displays.
+struct ProcessFrameSnapshot {
+    URL::URL url;
+    bool is_sandboxed { false };
 };
 
 struct ProcessSnapshot {
@@ -47,14 +52,15 @@ struct ProcessSnapshot {
     float cpu_percent { 0 };
     u64 memory_usage_bytes { 0 };
     Optional<ProcessPageSnapshot> page;
-    // The tabs whose pages the process hosts, and how many frames of other tabs' pages it hosts.
+    // The tabs whose pages the process hosts, and the frames of other tabs' pages it hosts.
     Vector<ProcessTabSnapshot> tabs;
-    size_t frame_count { 0 };
+    Vector<ProcessFrameSnapshot> frames;
 };
 
 // Updates the process statistics, and describes every process with the page that best represents it.
 WEBVIEW_API Vector<ProcessSnapshot> process_snapshots(ProcessManager&);
 
-WEBVIEW_API Optional<ByteBuffer> favicon_png_for_page(ProcessPageSnapshot const&);
+// Ends a process, and is satisfied with one that is already gone. Returns false for one that could not be ended.
+WEBVIEW_API bool end_process(ProcessManager&, u64 child_id);
 
 }

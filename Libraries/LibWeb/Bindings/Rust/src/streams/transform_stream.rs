@@ -23,7 +23,6 @@ use crate::streams::algorithms::{
     AbortAlgorithm, CancelAlgorithm, CloseAlgorithm, FlushAlgorithm, PullAlgorithm, SizeAlgorithm, StartAlgorithm,
     TransformAlgorithm, WriteAlgorithm,
 };
-use crate::streams::cross_realm_transform::{deserialize_with_transfer, serialize_with_transfer};
 use crate::streams::queuing_strategy::{QueuingStrategy, extract_high_water_mark, extract_size_algorithm};
 use crate::streams::readable_stream::{
     ReadableStream, ReadableStreamState, create_readable_stream, is_readable_stream_locked,
@@ -286,9 +285,11 @@ impl TransformStream {
     }
 
     // https://streams.spec.whatwg.org/#transformstream-enqueue
-    pub(crate) fn enqueue(this: Ref<Self>, vm: &Vm, chunk: Value) {
+    pub(crate) fn enqueue(this: Ref<Self>, vm: &Vm, chunk: Value) -> WebIdlResult<()> {
         // To enqueue the JavaScript value chunk into a TransformStream stream, perform
         // ! TransformStreamDefaultControllerEnqueue(stream.[[controller]], chunk).
+        // AD-HOC: This can throw: a chunk looks up "then" on the read result, and script there can cancel the readable
+        //         side before the next chunk of the same transform.
         let controller = this
             .controller()
             .expect("a transform stream that is set up has a controller");
@@ -297,7 +298,6 @@ impl TransformStream {
             controller,
             chunk,
         )
-        .must();
     }
 }
 
@@ -335,10 +335,14 @@ impl Transferable for TransformStream {
         }
 
         // 5. Set dataHolder.[[readable]] to ! StructuredSerializeWithTransfer(readable, « readable »).
-        serialize_with_transfer(data_holder, Value::from_object(wrap(cx, readable)));
+        data_holder
+            .write_transferred_value(cx, Value::from_object(wrap(cx, readable)))
+            .must();
 
         // 6. Set dataHolder.[[writable]] to ! StructuredSerializeWithTransfer(writable, « writable »).
-        serialize_with_transfer(data_holder, Value::from_object(wrap(cx, writable)));
+        data_holder
+            .write_transferred_value(cx, Value::from_object(wrap(cx, writable)))
+            .must();
 
         Ok(())
     }
@@ -348,10 +352,10 @@ impl Transferable for TransformStream {
         let value = allocate(cx.vm(), |_| Self::new(cx.realm()));
 
         // 1. Let readableRecord be ! StructuredDeserializeWithTransfer(dataHolder.[[readable]], the current Realm).
-        let readable_record = deserialize_with_transfer(data_holder);
+        let readable_record = data_holder.read_transferred_value(cx).must();
 
         // 2. Let writableRecord be ! StructuredDeserializeWithTransfer(dataHolder.[[writable]], the current Realm).
-        let writable_record = deserialize_with_transfer(data_holder);
+        let writable_record = data_holder.read_transferred_value(cx).must();
 
         // 3. Set value.[[readable]] to readableRecord.[[Deserialized]].
         assert!(readable_record.is_object());
@@ -594,10 +598,13 @@ pub(crate) fn transform_stream_default_sink_abort_algorithm(
     controller.set_finish_promise(Some(create_promise(vm, realm)));
 
     // 5. Let cancelPromise be the result of performing controller.[[cancelAlgorithm]], passing reason.
-    let cancel_algorithm = controller
-        .cancel_algorithm()
-        .expect("the controller's algorithms are not cleared");
-    let cancel_promise = cancel_algorithm.run(&stream.context(vm), reason);
+    // AD-HOC: terminate() and an error clear the algorithms without setting controller.[[finishPromise]], and script can
+    //         get here after that, by aborting the writable side or canceling the readable side. There is nothing left
+    //         to run then.
+    let cancel_promise = match controller.cancel_algorithm() {
+        Some(cancel_algorithm) => cancel_algorithm.run(&stream.context(vm), reason),
+        None => create_resolved_promise(vm, realm, Value::UNDEFINED),
+    };
 
     // 6. Perform ! TransformStreamDefaultControllerClearAlgorithms(controller).
     transform_stream_default_controller_clear_algorithms(controller);
@@ -685,10 +692,11 @@ pub(crate) fn transform_stream_default_sink_close_algorithm(
     controller.set_finish_promise(Some(create_promise(vm, realm)));
 
     // 5. Let flushPromise be the result of performing controller.[[flushAlgorithm]].
-    let flush_algorithm = controller
-        .flush_algorithm()
-        .expect("the controller's algorithms are not cleared");
-    let flush_promise = flush_algorithm.run(&stream.context(vm));
+    // AD-HOC: As with the abort algorithm, there is nothing left to run once the algorithms are cleared.
+    let flush_promise = match controller.flush_algorithm() {
+        Some(flush_algorithm) => flush_algorithm.run(&stream.context(vm)),
+        None => create_resolved_promise(vm, realm, Value::UNDEFINED),
+    };
 
     // 6. Perform ! TransformStreamDefaultControllerClearAlgorithms(controller).
     transform_stream_default_controller_clear_algorithms(controller);
@@ -773,10 +781,13 @@ pub(crate) fn transform_stream_default_source_cancel_algorithm(
     controller.set_finish_promise(Some(create_promise(vm, realm)));
 
     // 5. Let cancelPromise be the result of performing controller.[[cancelAlgorithm]], passing reason.
-    let cancel_algorithm = controller
-        .cancel_algorithm()
-        .expect("the controller's algorithms are not cleared");
-    let cancel_promise = cancel_algorithm.run(&stream.context(vm), reason);
+    // AD-HOC: terminate() and an error clear the algorithms without setting controller.[[finishPromise]], and script can
+    //         get here after that, by aborting the writable side or canceling the readable side. There is nothing left
+    //         to run then.
+    let cancel_promise = match controller.cancel_algorithm() {
+        Some(cancel_algorithm) => cancel_algorithm.run(&stream.context(vm), reason),
+        None => create_resolved_promise(vm, realm, Value::UNDEFINED),
+    };
 
     // 6. Perform ! TransformStreamDefaultControllerClearAlgorithms(controller).
     transform_stream_default_controller_clear_algorithms(controller);

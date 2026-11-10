@@ -14,6 +14,7 @@ use libjs_runtime_macros::Trace;
 use crate::gc::class::{Finalize, GcCell, define_cell};
 use crate::interpreter::vm::Vm;
 use crate::layout::cell::Gc;
+use crate::layout::member::NullableMember;
 use crate::layout::object::Object;
 use crate::layout::value::Value;
 use crate::runtime::abstract_operations::ordinary_create_from_constructor_of;
@@ -132,6 +133,9 @@ const PARAGRAPH_SEPARATOR: u16 = 0x2029;
 #[derive(Trace)]
 pub struct RegExpObject {
     base: Object,
+    /// OPTIMIZATION: The named property of most RegExp objects is "lastIndex".
+    #[gc(untraced = "the object traces its inline named storage")]
+    inline_named_storage: [Cell<Value>; 1],
     #[gc(untraced)]
     pattern: RefCell<Utf16String>,
     #[gc(untraced)]
@@ -140,12 +144,15 @@ pub struct RegExpObject {
     flag_bits: Cell<RegExpFlags>,
     #[gc(untraced)]
     legacy_features_enabled: Cell<bool>, // [[LegacyFeaturesEnabled]]
+    // Note: This is initialized in RegExpAlloc, but will be non-null afterwards
+    realm: NullableMember<Realm>, // [[Realm]]
     /// The compiled pattern, which RegExp objects with the same pattern and flags share through the regex cache.
     #[gc(untraced)]
     cached_regex: RefCell<Option<Rc<EcmaScriptRegex>>>,
-    // Note: This is initialized in RegExpAlloc, but will be non-null afterwards
-    realm: Cell<Option<Gc<Realm>>>, // [[Realm]]
 }
+
+const _: () = assert!(size_of::<RegExpObject>() == 96);
+const _: () = assert!(core::mem::offset_of!(RegExpObject, inline_named_storage) == size_of::<Object>());
 
 static REGEXP_OBJECT_METHODS: ObjectMethods = ObjectMethods {
     initialize: RegExpObject::initialize,
@@ -176,6 +183,7 @@ impl RegExpObject {
         realm.create_object(vm, |_| {
             Self::new(
                 vm,
+                realm,
                 Utf16String::default(),
                 Utf16String::default(),
                 realm.intrinsics().regexp_prototype(vm),
@@ -194,28 +202,45 @@ impl RegExpObject {
         let shape = realm.intrinsics().new_regexp_object_shape(vm);
         let flag_bits = to_flag_bits(Utf16View::of_string(&flags));
         let regexp_object = allocate_object(vm, |_| RegExpObject {
-            base: Object::new_with_shape(Self::CLASS, shape, MayInterfereWithIndexedPropertyAccess::No),
+            base: Self::with_inline_named_storage(Object::new_with_shape(
+                Self::CLASS,
+                shape,
+                MayInterfereWithIndexedPropertyAccess::No,
+            )),
+            inline_named_storage: [const { Cell::new(Value::UNDEFINED) }; 1],
             pattern: RefCell::new(pattern),
             flags: RefCell::new(flags),
             flag_bits: Cell::new(flag_bits),
             legacy_features_enabled: Cell::new(false),
             cached_regex: RefCell::new(None),
-            realm: Cell::new(None),
+            realm: NullableMember::null(),
         });
         regexp_object.initialize_direct(NEW_REGEXP_OBJECT_LAST_INDEX_OFFSET, Value::from_i32(0));
         regexp_object
     }
 
-    fn new(vm: &Vm, pattern: Utf16String, flags: Utf16String, prototype: Gc<Object>) -> RegExpObject {
+    fn with_inline_named_storage(base: Object) -> Object {
+        base.inline_named_capacity.set(1);
+        base
+    }
+
+    fn new(vm: &Vm, realm: Gc<Realm>, pattern: Utf16String, flags: Utf16String, prototype: Gc<Object>) -> RegExpObject {
         let flag_bits = to_flag_bits(Utf16View::of_string(&flags));
         RegExpObject {
-            base: Object::new_with_prototype(vm, Self::CLASS, prototype, MayInterfereWithIndexedPropertyAccess::No),
+            base: Self::with_inline_named_storage(Object::new_with_prototype(
+                vm,
+                Self::CLASS,
+                realm,
+                Some(prototype),
+                MayInterfereWithIndexedPropertyAccess::No,
+            )),
+            inline_named_storage: [const { Cell::new(Value::UNDEFINED) }; 1],
             pattern: RefCell::new(pattern),
             flags: RefCell::new(flags),
             flag_bits: Cell::new(flag_bits),
             legacy_features_enabled: Cell::new(false),
             cached_regex: RefCell::new(None),
-            realm: Cell::new(None),
+            realm: NullableMember::null(),
         }
     }
 
@@ -444,7 +469,7 @@ pub fn regexp_create(vm: &Vm, pattern: Value, flags: Value) -> ThrowCompletionOr
     let realm = vm.current_realm().expect("RegExpCreate runs in a realm");
 
     // 1. Let obj be ! RegExpAlloc(%RegExp%).
-    let regexp_object = regexp_alloc(vm, realm.intrinsics().regexp_constructor(vm).upcast()).must();
+    let regexp_object = regexp_alloc(vm, realm, realm.intrinsics().regexp_constructor(vm).upcast()).must();
 
     // 2. Return ? RegExpInitialize(obj, P, F).
     regexp_object.regexp_initialize(vm, pattern, flags)
@@ -452,7 +477,7 @@ pub fn regexp_create(vm: &Vm, pattern: Value, flags: Value) -> ThrowCompletionOr
 
 // 22.2.3.2 RegExpAlloc ( newTarget ), https://tc39.es/ecma262/#sec-regexpalloc
 // 22.2.3.2 RegExpAlloc ( newTarget ), https://github.com/tc39/proposal-regexp-legacy-features#regexpalloc--newtarget-
-pub fn regexp_alloc(vm: &Vm, new_target: Gc<FunctionObject>) -> ThrowCompletionOr<Gc<RegExpObject>> {
+pub fn regexp_alloc(vm: &Vm, realm: Gc<Realm>, new_target: Gc<FunctionObject>) -> ThrowCompletionOr<Gc<RegExpObject>> {
     let current_realm = vm.current_realm().expect("RegExpAlloc runs in a realm");
 
     // 1. Let obj be ? OrdinaryCreateFromConstructor(newTarget, "%RegExp.prototype%", « [[OriginalSource]], [[OriginalFlags]], [[RegExpRecord]], [[RegExpMatcher]] »).
@@ -461,7 +486,7 @@ pub fn regexp_alloc(vm: &Vm, new_target: Gc<FunctionObject>) -> ThrowCompletionO
         current_realm,
         new_target,
         Intrinsics::regexp_prototype,
-        |_, prototype| RegExpObject::new(vm, Utf16String::default(), Utf16String::default(), prototype),
+        |_, prototype| RegExpObject::new(vm, realm, Utf16String::default(), Utf16String::default(), prototype),
     )?;
 
     // 2. Let thisRealm be the current Realm Record.

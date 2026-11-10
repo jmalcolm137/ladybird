@@ -392,9 +392,11 @@ mod tests {
             Instruction::NewClass {
                 dst: operand(6),
                 super_class: None,
+                proto_parent: None,
                 class_environment: operand(7),
                 class_blueprint_index: 1,
                 lhs_name: Some(IdentifierTableIndex(4)),
+                computed_name: None,
                 element_keys_count: 3,
                 element_keys: vec![Some(operand(8)), None, Some(operand(9))],
             },
@@ -416,11 +418,9 @@ mod tests {
                 lhs: operand(6),
                 rhs: -5,
             },
-            Instruction::Mov2 {
-                c0_dst: operand(5),
-                c0_src: operand(6),
-                c1_dst: operand(7),
-                c1_src: operand(5),
+            Instruction::Mov {
+                dst: operand(5),
+                src: operand(6),
             },
             Instruction::PostfixIncrement {
                 arith_feedback: 0,
@@ -463,12 +463,7 @@ mod tests {
         assert!(operands_with_roles(&decoded[4].instruction).is_empty());
         assert_eq!(
             operands_with_roles(&decoded[6].instruction),
-            [
-                (5, OperandRole::Out),
-                (6, OperandRole::In),
-                (7, OperandRole::Out),
-                (5, OperandRole::In)
-            ]
+            [(5, OperandRole::Out), (6, OperandRole::In)]
         );
         assert_eq!(
             operands_with_roles(&decoded[7].instruction),

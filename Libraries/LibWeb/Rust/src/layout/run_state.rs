@@ -9,14 +9,10 @@ use super::*;
 /// What the layout stage keeps for itself besides what each of its runs keeps: what the runs of a layout pass share. It
 /// is the stage's scratch rather than arena columns: nothing outside a running pass reads it, but for the memos it
 /// keeps for later passes.
+#[derive(Default)]
 pub(crate) struct LayoutScratch {
     /// The intrinsic sizes passes measured, kept for the passes after them.
     pub(super) intrinsic_size_caches: super::layout_node_arena::IntrinsicSizeCaches,
-    /// The inline items a block container generated, kept for its later runs in the same pass. The
-    /// items borrow fonts for the current pass, so the stashes are cleared when the pass ends.
-    inline_item_stashes: RefCell<HashMap<NodeSlotId, super::inline_level_iterator::StashedInlineItems>>,
-    /// What the pass found out for the host outside any run, which its driver reports itself.
-    pub(super) host_findings_outside_runs: RefCell<HostFindings>,
     /// The results of formatting context runs, kept for the runs after them in this pass and the passes after it.
     fc_run_cache_store: super::fc_run_cache::FcRunCacheStore,
     /// The layouts of in-flow blocks, kept for the passes after the one that laid them out.
@@ -26,6 +22,8 @@ pub(crate) struct LayoutScratch {
     pub(super) layout_trace: super::trace::LayoutTrace,
     /// The chunks and grapheme segmenters of the text rows the passes laid out.
     text_memos: super::rendered_text::TextMemos,
+    prepared_inline_content_memos: super::prepared_inline_content::PreparedInlineContentMemos,
+    fragment_builder_scratch: fragment_tree::FragmentBuilderScratch,
 }
 
 /// What layout found out that the host hears of once the layout that found it is committed: what the
@@ -35,19 +33,64 @@ pub(crate) struct LayoutScratch {
 pub(crate) struct HostFindings {
     pub(crate) messages: Vec<super::commit::FfiCommitMessage>,
     pub(crate) document_svg_root_natural_size: Option<(NodeSlotId, crate::css::style::NaturalSize)>,
+    pub(crate) container_length_reads: Vec<ContainerLengthRead>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct ContainerLengthRead {
+    pub(crate) reader: NodeSlotId,
+    pub(crate) element: crate::css::style::tree::StyleNodeID,
+    pub(crate) bases: crate::css::style::ContainerUnitBases,
+}
+
+#[derive(Default)]
+pub(crate) struct HostFindingsSink {
+    findings: std::sync::Mutex<HostFindings>,
+    noted_any: std::sync::atomic::AtomicBool,
+    notes: std::sync::atomic::AtomicU64,
+}
+
+impl HostFindingsSink {
+    pub(crate) fn note(&self, note: impl FnOnce(&mut HostFindings)) {
+        let mut findings = self.findings.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        note(&mut findings);
+        self.noted_any.store(true, std::sync::atomic::Ordering::Relaxed);
+        self.notes.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub(crate) fn notes_so_far(&self) -> u64 {
+        self.notes.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub(crate) fn take(&self) -> HostFindings {
+        if !self.noted_any.load(std::sync::atomic::Ordering::Relaxed) {
+            return HostFindings::default();
+        }
+        let mut findings = self.findings.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.noted_any.store(false, std::sync::atomic::Ordering::Relaxed);
+        std::mem::take(&mut *findings)
+    }
 }
 
 impl HostFindings {
     pub(crate) fn is_empty(&self) -> bool {
-        self.messages.is_empty() && self.document_svg_root_natural_size.is_none()
+        self.messages.is_empty()
+            && self.document_svg_root_natural_size.is_none()
+            && self.container_length_reads.is_empty()
     }
 
     pub(crate) fn note_container_length_dependencies(
         &mut self,
+        reader: NodeSlotId,
         element: crate::css::style::tree::StyleNodeID,
         bases: &crate::css::style::ContainerUnitBases,
     ) {
         use super::commit::{FfiCommitMessage, FfiCommitMessageKind};
+        self.note_container_length_read(ContainerLengthRead {
+            reader,
+            element,
+            bases: *bases,
+        });
         self.note_message(FfiCommitMessage::new(
             element.raw(),
             FfiCommitMessageKind::StyleDependsOnSizeContainerQuery,
@@ -75,9 +118,18 @@ impl HostFindings {
         }
     }
 
+    fn note_container_length_read(&mut self, read: ContainerLengthRead) {
+        if !self.container_length_reads.contains(&read) {
+            self.container_length_reads.push(read);
+        }
+    }
+
     pub(crate) fn receive(&mut self, other: HostFindings) {
         for message in other.messages {
             self.note_message(message);
+        }
+        for read in other.container_length_reads {
+            self.note_container_length_read(read);
         }
         if other.document_svg_root_natural_size.is_some() {
             self.document_svg_root_natural_size = other.document_svg_root_natural_size;
@@ -85,40 +137,31 @@ impl HostFindings {
     }
 }
 
-// The scratch can move to the thread a layout stage runs on.
+// The scratch can move to the thread a layout stage runs on, and the runs of a pass can share it across threads.
 const _: () = {
-    const fn assert_send<T: Send>() {}
-    assert_send::<LayoutScratch>();
+    const fn assert_send_and_sync<T: Send + Sync>() {}
+    assert_send_and_sync::<LayoutScratch>();
 };
-
-impl Default for LayoutScratch {
-    fn default() -> Self {
-        Self {
-            intrinsic_size_caches: Default::default(),
-            inline_item_stashes: RefCell::new(HashMap::default()),
-            host_findings_outside_runs: RefCell::new(HostFindings::default()),
-            fc_run_cache_store: Default::default(),
-            in_flow_block_cache_store: Default::default(),
-            layout_trace: Default::default(),
-            text_memos: Default::default(),
-        }
-    }
-}
 
 impl LayoutScratch {
     /// The scratch of a fork of the arena, which keeps the run memos the arena's entries were stored for and starts
     /// the rest anew.
     pub(super) fn fork(&self) -> Self {
         Self {
-            fc_run_cache_store: self.fc_run_cache_store.clone(),
-            in_flow_block_cache_store: self.in_flow_block_cache_store.clone(),
+            fc_run_cache_store: self.fc_run_cache_store.fork(),
+            in_flow_block_cache_store: self.in_flow_block_cache_store.fork(),
             text_memos: self.text_memos.fork(),
+            prepared_inline_content_memos: self.prepared_inline_content_memos.fork(),
             ..Self::default()
         }
     }
 
     pub(super) fn fc_run_cache_store(&self) -> &super::fc_run_cache::FcRunCacheStore {
         &self.fc_run_cache_store
+    }
+
+    pub(super) fn fragment_builder_scratch(&self) -> &fragment_tree::FragmentBuilderScratch {
+        &self.fragment_builder_scratch
     }
 
     pub(super) fn in_flow_block_cache_store(&self) -> &super::in_flow_block_cache::InFlowBlockCacheStore {
@@ -129,41 +172,32 @@ impl LayoutScratch {
         &self.text_memos
     }
 
+    pub(super) fn prepared_inline_content_memos(&self) -> &super::prepared_inline_content::PreparedInlineContentMemos {
+        &self.prepared_inline_content_memos
+    }
+
     /// Brings the run memos up to date with what the arena's writes since the last call did to their boxes.
-    pub(super) fn apply_memo_invalidations(&self, arena: &mut LayoutNodeArena) {
+    pub(super) fn apply_memo_invalidations(&mut self, arena: &mut LayoutNodeArena) {
+        let slot_count = arena.slot_capacity();
+        self.intrinsic_size_caches.cover_slots(slot_count);
+        self.text_memos.cover_text_states(arena.text_state_capacity());
+        self.fragment_builder_scratch.cover_slots(slot_count);
+        self.fc_run_cache_store.cover_slots(slot_count);
+        self.in_flow_block_cache_store.cover_slots(slot_count);
+        self.prepared_inline_content_memos.cover_slots(slot_count);
         arena.take_memo_invalidations().apply_to(
-            &self.fc_run_cache_store,
-            &self.in_flow_block_cache_store,
-            &self.text_memos,
-            &self.intrinsic_size_caches,
+            &mut self.fc_run_cache_store,
+            &mut self.in_flow_block_cache_store,
+            &mut self.text_memos,
+            &mut self.prepared_inline_content_memos,
+            &mut self.intrinsic_size_caches,
         );
     }
 
-    pub(super) fn store_inline_item_stash(
-        &self,
-        block_container: NodeSlotId,
-        stash: super::inline_level_iterator::StashedInlineItems,
-    ) {
-        self.inline_item_stashes.borrow_mut().insert(block_container, stash);
-    }
-
-    pub(super) fn inline_item_stash(
-        &self,
-        block_container: NodeSlotId,
-    ) -> Option<super::inline_level_iterator::StashedInlineItems> {
-        self.inline_item_stashes.borrow().get(&block_container).cloned()
-    }
-
-    /// What the pass found out outside any run, which its driver reports itself.
-    pub(crate) fn take_host_findings_outside_runs(&self) -> HostFindings {
-        std::mem::take(&mut self.host_findings_outside_runs.borrow_mut())
-    }
-
-    /// Lets go of what the pass that just committed into `arena` kept for itself, and sweeps the run cache.
-    pub(crate) fn end_layout_pass(&self, arena: &mut LayoutNodeArena) {
+    /// Brings the run memos up to date with what the commit into `arena` did to their boxes, and sweeps the run cache.
+    pub(crate) fn end_layout_pass(&mut self, arena: &mut LayoutNodeArena) {
         self.apply_memo_invalidations(arena);
-        arena.sweep_stale_fc_run_cache_entries(&self.fc_run_cache_store);
-        self.inline_item_stashes.borrow_mut().clear();
+        arena.sweep_stale_fc_run_cache_entries(&mut self.fc_run_cache_store);
     }
 }
 
@@ -180,7 +214,8 @@ pub(crate) struct RunState {
     /// The anchor-size() resolutions of an absolutely positioned root, a run input that is constant for the run.
     root_anchor_resolved_values: Option<Box<style_values::AnchorResolvedValues>>,
     /// What the run found out for the host so far, which the pass the run is handed notes into.
-    host_findings: RefCell<HostFindings>,
+    host_findings: HostFindingsSink,
+    fragments: Option<fragment_tree::RunFragmentBuilder>,
 }
 
 /// Where a box is placed: the offset of its content box in the containing block it is placed in.
@@ -191,7 +226,8 @@ pub(crate) struct BoxPlacement {
 }
 
 /// What the placement of a box shows of the layout of its parent, which decides it: the link that places the box's
-/// fragment shows the table and line clamp facts, and the fragment shows whether fragmentation broke the box.
+/// fragment shows the table and line clamp facts and the clip, and the fragment shows whether fragmentation broke the
+/// box.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct FragmentFactsDecidedByParent {
     /// For table cells and table-column(-group) boxes: the first grid column the box occupies and the number of grid
@@ -203,10 +239,21 @@ pub(crate) struct FragmentFactsDecidedByParent {
     pub(crate) hidden_by_collapsed_columns: bool,
     /// Whether the box lies after the clamp point of a line-clamp container, which hides it.
     pub(crate) is_invisible_for_line_clamp: bool,
+    /// The physical clip an ancestor's layout puts on the box and its contents, relative to the box's border box: empty
+    /// for a box hidden after a clamp point, and the area before the block-end content edge of a line-clamp container
+    /// for a float inside it.
+    pub(crate) clip_decided_by_parent: Option<CssPixelRect>,
     /// Whether fragmentation broke the box, so that this fragment continues one in an earlier fragmentainer, or
     /// continues in a later one.
     pub(crate) continues_from_previous_fragment: bool,
     pub(crate) continues_in_next_fragment: bool,
+}
+
+impl FragmentFactsDecidedByParent {
+    pub(crate) fn hide_after_clamp_point(&mut self) {
+        self.is_invisible_for_line_clamp = true;
+        self.clip_decided_by_parent = Some(CssPixelRect::default());
+    }
 }
 
 /// What the parent of a box decides about the box, kept with the box by the run that holds it.
@@ -293,60 +340,83 @@ impl RunState {
     /// Runs `run` with what a run rooted at `root` keeps, and the pass as that run sees it. The style reads of an
     /// absolutely positioned root see `root_anchor_resolved_values`.
     pub(crate) fn with_root<R>(
-        callbacks: LayoutPass<'_>,
+        pass: LayoutPass<'_>,
         root: Node,
         root_containing_block: Node,
         root_anchor_resolved_values: Option<Box<style_values::AnchorResolvedValues>>,
         run: impl for<'run> FnOnce(&'run Self, LayoutPass<'run>) -> R,
     ) -> R {
         Self::enter(
-            callbacks,
+            pass,
             root,
             root_containing_block,
             root_anchor_resolved_values,
             ContentSizing::Layout,
+            None,
+            run,
+        )
+    }
+
+    pub(crate) fn with_root_building_fragments<R>(
+        pass: LayoutPass<'_>,
+        root: Node,
+        root_containing_block: Node,
+        root_anchor_resolved_values: Option<Box<style_values::AnchorResolvedValues>>,
+        fragments: Option<fragment_tree::RunFragmentBuilder>,
+        run: impl for<'run> FnOnce(&'run Self, LayoutPass<'run>) -> R,
+    ) -> R {
+        Self::enter(
+            pass,
+            root,
+            root_containing_block,
+            root_anchor_resolved_values,
+            ContentSizing::Layout,
+            fragments,
             run,
         )
     }
 
     pub(crate) fn with_content_sizing_root<R>(
-        callbacks: LayoutPass<'_>,
+        pass: LayoutPass<'_>,
         root: Node,
         root_containing_block: Node,
         run: impl for<'run> FnOnce(&'run Self, LayoutPass<'run>) -> R,
     ) -> R {
         Self::enter(
-            callbacks,
+            pass,
             root,
             root_containing_block,
             None,
             ContentSizing::RootContributions,
+            None,
             run,
         )
     }
 
     pub(crate) fn with_content_inline_sizes_root<R>(
-        callbacks: LayoutPass<'_>,
+        pass: LayoutPass<'_>,
         root: Node,
         root_containing_block: Node,
         run: impl for<'run> FnOnce(&'run Self, LayoutPass<'run>) -> R,
     ) -> R {
         Self::enter(
-            callbacks,
+            pass,
             root,
             root_containing_block,
             None,
             ContentSizing::RootContentInlineSizes,
+            None,
             run,
         )
     }
 
     fn enter<R>(
-        callbacks: LayoutPass<'_>,
+        pass: LayoutPass<'_>,
         root: Node,
         root_containing_block: Node,
         root_anchor_resolved_values: Option<Box<style_values::AnchorResolvedValues>>,
         content_sizing: ContentSizing,
+        fragments: Option<fragment_tree::RunFragmentBuilder>,
         run: impl for<'run> FnOnce(&'run Self, LayoutPass<'run>) -> R,
     ) -> R {
         let state = Self {
@@ -357,17 +427,19 @@ impl RunState {
                 PercentageBlockSizeDependency::default()
             )]),
             root_anchor_resolved_values,
-            host_findings: RefCell::new(HostFindings::default()),
+            host_findings: HostFindingsSink::default(),
+            fragments,
         };
-        run(
-            &state,
-            callbacks.for_run(root, root_containing_block, &state.host_findings),
-        )
+        run(&state, pass.for_run(root, root_containing_block, &state.host_findings))
+    }
+
+    pub(crate) fn fragments(&self) -> Option<&fragment_tree::RunFragmentBuilder> {
+        self.fragments.as_ref()
     }
 
     /// What this run found out for the host, which its outputs carry to the run that uses its result.
     pub(crate) fn take_host_findings(&self) -> Option<Box<HostFindings>> {
-        let findings = std::mem::take(&mut *self.host_findings.borrow_mut());
+        let findings = self.host_findings.take();
         (!findings.is_empty()).then(|| Box::new(findings))
     }
 
@@ -469,22 +541,23 @@ mod tests {
     fn a_nested_run_keeps_its_own_root_and_host_findings() {
         let mut arena = LayoutNodeArena::new();
         let scratch = LayoutScratch::default();
+        let host_findings_outside_runs = HostFindingsSink::default();
         let root = arena.allocate_for_test().slot;
         let child = arena.allocate_for_test().slot;
         RunState::with_root(
-            LayoutPass::for_test(&arena, &scratch),
+            LayoutPass::for_test(&arena, &scratch, &host_findings_outside_runs),
             root,
             NodeSlotId::INVALID,
             None,
-            |parent, parent_callbacks| {
+            |parent, parent_pass| {
                 assert_eq!(parent.root(), root);
-                let nested_findings = RunState::with_root(parent_callbacks, child, root, None, |nested, callbacks| {
+                let nested_findings = RunState::with_root(parent_pass, child, root, None, |nested, pass| {
                     assert_eq!(nested.root(), child);
                     assert!(nested.resolves_percentage_block_size_dependency_of(child));
                     assert!(!nested.resolves_percentage_block_size_dependency_of(root));
                     assert!(!parent.resolves_percentage_block_size_dependency_of(child));
                     assert!(nested.anchor_resolved_values_of(child).is_none());
-                    callbacks.note_host_findings(|findings| {
+                    pass.note_host_findings(|findings| {
                         findings.document_svg_root_natural_size =
                             Some((child, crate::css::style::NaturalSize::default()));
                     });
@@ -498,6 +571,6 @@ mod tests {
                 );
             },
         );
-        assert!(scratch.take_host_findings_outside_runs().is_empty());
+        assert!(host_findings_outside_runs.take().is_empty());
     }
 }

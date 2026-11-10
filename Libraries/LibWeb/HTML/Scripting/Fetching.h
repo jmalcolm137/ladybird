@@ -26,10 +26,20 @@ enum class TopLevelModule {
 };
 
 using OnFetchScriptComplete = GC::Ref<GC::Function<void(GC::Ptr<Script>)>>;
-using PerformTheFetchHook = GC::Ptr<GC::Function<WebIDL::ExceptionOr<void>(NonnullRefPtr<Fetch::Infrastructure::Request>, TopLevelModule, Fetch::Infrastructure::FetchAlgorithms::ProcessResponseConsumeBodyFunction)>>;
+using ProcessCustomFetchResponse = GC::Ref<GC::Function<Fetch::Infrastructure::FetchAlgorithms::ProcessResponseConsumeBodyFunction::FunctionType>>;
+using PerformTheFetchHook = GC::Ptr<GC::Function<WebIDL::ExceptionOr<void>(NonnullRefPtr<Fetch::Infrastructure::Request>, TopLevelModule, ProcessCustomFetchResponse)>>;
 
-WEB_API OnFetchScriptComplete create_on_fetch_script_complete(GC::Heap& heap, Function<void(GC::Ptr<Script>)> function);
-WEB_API PerformTheFetchHook create_perform_the_fetch_hook(GC::Heap& heap, Function<WebIDL::ExceptionOr<void>(NonnullRefPtr<Fetch::Infrastructure::Request>, TopLevelModule, Fetch::Infrastructure::FetchAlgorithms::ProcessResponseConsumeBodyFunction)> function);
+template<typename... Values, typename Callable>
+OnFetchScriptComplete create_on_fetch_script_complete(GC::Heap& heap, GC::CaptureList<Values...>&& captures, Callable&& callable)
+{
+    return GC::create_function<void(GC::Ptr<Script>)>(heap, move(captures), forward<Callable>(callable));
+}
+
+template<typename Callable>
+OnFetchScriptComplete create_on_fetch_script_complete(GC::Heap& heap, Callable&& callable)
+{
+    return GC::create_function<void(GC::Ptr<Script>)>(heap, GC::CaptureList<> {}, forward<Callable>(callable));
+}
 
 class FetchContext : public JS::Cell {
     GC_CELL(FetchContext, JS::Cell);
@@ -66,7 +76,7 @@ Optional<URL::URL> resolve_url_like_module_specifier(Utf16View specifier, URL::U
 ScriptFetchOptions get_descendant_script_fetch_options(ScriptFetchOptions const& original_options, URL::URL const& url, EnvironmentSettingsObject& settings_object);
 Utf16String resolve_a_module_integrity_metadata(URL::URL const& url, EnvironmentSettingsObject& settings_object);
 void set_up_module_script_request(Fetch::Infrastructure::Request&, ScriptFetchOptions const&);
-void fetch_classic_script(GC::Ref<HTMLScriptElement>, URL::URL const&, EnvironmentSettingsObject& settings_object, ScriptFetchOptions options, CORSSettingAttribute cors_setting, Utf16String character_encoding, OnFetchScriptComplete on_complete);
+void fetch_classic_script(JS::Realm&, URL::URL const&, EnvironmentSettingsObject& settings_object, ScriptFetchOptions options, CORSSettingAttribute cors_setting, Utf16String character_encoding, OnFetchScriptComplete on_complete);
 WEB_API WebIDL::ExceptionOr<void> fetch_classic_worker_script(URL::URL const&, FetchClient const& fetch_client, Fetch::Infrastructure::Request::Destination, EnvironmentSettingsObject& settings_object, PerformTheFetchHook, OnFetchScriptComplete);
 WebIDL::ExceptionOr<GC::Ref<ClassicScript>> fetch_a_classic_worker_imported_script(URL::URL const&, HTML::EnvironmentSettingsObject&, PerformTheFetchHook = nullptr);
 WEB_API WebIDL::ExceptionOr<void> fetch_module_worker_script_graph(URL::URL const&, FetchClient const& fetch_client, Fetch::Infrastructure::Request::Destination, EnvironmentSettingsObject& settings_object, PerformTheFetchHook, OnFetchScriptComplete, Fetch::Infrastructure::Request::CredentialsMode = Fetch::Infrastructure::Request::CredentialsMode::SameOrigin);

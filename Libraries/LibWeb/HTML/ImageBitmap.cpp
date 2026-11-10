@@ -48,137 +48,16 @@ static constexpr size_t shared_pixels_alignment = 64;
     return TRY_OR_THROW_OOM(vm, Gfx::Bitmap::create_wrapper(format, alpha_type, Gfx::IntSize(width, height), pitch, pixels, [bitmap_data = move(bitmap_data)] { }));
 }
 
-template<typename T, typename Encoder>
-static WebIDL::ExceptionOr<void> encode_bitmap_value(Encoder& encoder, T const& value)
-{
-    if constexpr (IsSame<Encoder, HTML::StructuredSerializeWriter>) {
-        encoder.encode(value);
-    } else {
-        if (encoder.encode(value).is_error())
-            return WebIDL::DataCloneError::create("Unable to transfer ImageBitmap"_utf16);
-    }
-    return {};
-}
-
 enum class SerializedColorSpaceKind : u8 {
     SRGB,
     CICP,
     ICCProfile,
 };
 
-template<typename Encoder>
-static WebIDL::ExceptionOr<void> serialize_color_space(Encoder& encoder, Gfx::ColorSpace const& color_space)
+[[nodiscard]] static WebIDL::ExceptionOr<NonnullRefPtr<Gfx::Bitmap>> bitmap_from_shared_pixels(JS::VM& vm, Vector<Core::AnonymousBuffer> const* shared_buffers, u32 const buffer_index, u64 const offset, Gfx::BitmapFormat const format, Gfx::AlphaType const alpha_type, int const width, int const height)
 {
-    return color_space.data().visit(
-        [&](Empty) -> WebIDL::ExceptionOr<void> {
-            return encode_bitmap_value(encoder, to_underlying(SerializedColorSpaceKind::SRGB));
-        },
-        [&](Gfx::ColorSpace::CICP const& cicp) -> WebIDL::ExceptionOr<void> {
-            TRY(encode_bitmap_value(encoder, to_underlying(SerializedColorSpaceKind::CICP)));
-            TRY(encode_bitmap_value(encoder, to_underlying(cicp.color_primaries)));
-            TRY(encode_bitmap_value(encoder, to_underlying(cicp.transfer_characteristics)));
-            return {};
-        },
-        [&](NonnullRefPtr<Gfx::ColorSpace::ICCProfile const> const& icc_profile) -> WebIDL::ExceptionOr<void> {
-            TRY(encode_bitmap_value(encoder, to_underlying(SerializedColorSpaceKind::ICCProfile)));
-            TRY(encode_bitmap_value(encoder, icc_profile->bytes()));
-            return {};
-        });
-}
-
-template<typename Decoder>
-[[nodiscard]] static ErrorOr<Gfx::ColorSpace> deserialize_color_space(Decoder& decoder)
-{
-    auto kind = TRY(decoder.template decode<u8>());
-    switch (static_cast<SerializedColorSpaceKind>(kind)) {
-    case SerializedColorSpaceKind::SRGB:
-        return Gfx::ColorSpace {};
-    case SerializedColorSpaceKind::CICP: {
-        auto color_primaries = static_cast<Media::ColorPrimaries>(TRY(decoder.template decode<u8>()));
-        auto transfer_characteristics = static_cast<Media::TransferCharacteristics>(TRY(decoder.template decode<u8>()));
-        return Gfx::ColorSpace::from_cicp({ color_primaries, transfer_characteristics, Media::MatrixCoefficients::Identity, Media::VideoFullRangeFlag::Full });
-    }
-    case SerializedColorSpaceKind::ICCProfile: {
-        auto icc_bytes = TRY(decoder.template decode<ByteBuffer>());
-        return Gfx::ColorSpace::from_icc_bytes(icc_bytes);
-    }
-    }
-    return Error::from_string_literal("Invalid ImageBitmap color space");
-}
-
-// NB: Records of a bitmap in sRGB keep the layout they had before ImageBitmaps kept a color space, so stored records
-//     of either kind decode.
-enum class SerializedBitmapKind : u8 {
-    None,
-    SRGB,
-    WithColorSpace,
-};
-
-template<typename Encoder>
-static WebIDL::ExceptionOr<void> serialize_bitmap(Encoder& encoder, Gfx::DecodedImageFrame const* frame)
-{
-    if (!frame)
-        return encode_bitmap_value(encoder, to_underlying(SerializedBitmapKind::None));
-
-    auto const& bitmap = frame->bitmap();
-    auto const has_color_space = !frame->color_space().data().has<Empty>();
-    TRY(encode_bitmap_value(encoder, to_underlying(has_color_space ? SerializedBitmapKind::WithColorSpace : SerializedBitmapKind::SRGB)));
-    TRY(encode_bitmap_value(encoder, bitmap.width()));
-    TRY(encode_bitmap_value(encoder, bitmap.height()));
-    TRY(encode_bitmap_value(encoder, static_cast<u64>(bitmap.pitch())));
-    TRY(encode_bitmap_value(encoder, bitmap.format()));
-    TRY(encode_bitmap_value(encoder, bitmap.alpha_type()));
-    TRY(encode_bitmap_value(encoder, ReadonlyBytes { bitmap.scanline_u8(0), bitmap.data_size() }));
-    if (has_color_space)
-        TRY(serialize_color_space(encoder, frame->color_space()));
-    return {};
-}
-
-template<typename Decoder>
-[[nodiscard]] static WebIDL::ExceptionOr<Optional<Gfx::DecodedImageFrame>> deserialize_bitmap(JS::Realm& realm, Decoder& decoder)
-{
-    auto const kind = TRY(decode_or_throw_data_clone_error<u8>(realm, decoder));
-    if (kind == to_underlying(SerializedBitmapKind::None))
-        return OptionalNone {};
-    if (kind != to_underlying(SerializedBitmapKind::SRGB) && kind != to_underlying(SerializedBitmapKind::WithColorSpace))
-        return WebIDL::DataCloneError::create("Invalid ImageBitmap bitmap data"_utf16);
-    auto const width = TRY(decode_or_throw_data_clone_error<int>(realm, decoder));
-    auto const height = TRY(decode_or_throw_data_clone_error<int>(realm, decoder));
-    auto const pitch = TRY(decode_or_throw_data_clone_error<size_t>(realm, decoder));
-    auto const format = TRY(decode_or_throw_data_clone_error<Gfx::BitmapFormat>(realm, decoder));
-    auto const alpha_type = TRY(decode_or_throw_data_clone_error<Gfx::AlphaType>(realm, decoder));
-    auto data = TRY(decode_or_throw_data_clone_error<ByteBuffer>(realm, decoder));
-    auto bitmap = TRY(create_bitmap_from_bitmap_data(realm.vm(), format, alpha_type, width, height, pitch, move(data)));
-    Gfx::ColorSpace color_space;
-    if (kind == to_underlying(SerializedBitmapKind::WithColorSpace)) {
-        auto decoded_color_space = deserialize_color_space(decoder);
-        if (decoded_color_space.is_error())
-            return data_clone_error_from_serialization_error(realm, decoded_color_space.release_error());
-        color_space = decoded_color_space.release_value();
-    }
-    return Gfx::DecodedImageFrame { *bitmap, move(color_space) };
-}
-
-template<typename T>
-[[nodiscard]] static WebIDL::ExceptionOr<T> decode_shared_pixels_value(HTML::TransferDataDecoder& decoder)
-{
-    auto value = decoder.decode<T>();
-    if (value.is_error())
-        return WebIDL::DataCloneError::create("Invalid ImageBitmap shared pixels"_utf16);
-    return value.release_value();
-}
-
-[[nodiscard]] static WebIDL::ExceptionOr<NonnullRefPtr<Gfx::Bitmap>> bitmap_from_shared_pixels(JS::VM& vm, HTML::TransferDataDecoder& decoder)
-{
-    auto const buffer_index = TRY(decode_shared_pixels_value<u32>(decoder));
-    auto const offset = TRY(decode_shared_pixels_value<u64>(decoder));
-    auto const width = TRY(decode_shared_pixels_value<int>(decoder));
-    auto const height = TRY(decode_shared_pixels_value<int>(decoder));
-    auto const format = TRY(decode_shared_pixels_value<Gfx::BitmapFormat>(decoder));
-    auto const alpha_type = TRY(decode_shared_pixels_value<Gfx::AlphaType>(decoder));
     TRY(validate_bitmap_layout(format, alpha_type, width, height));
 
-    auto const* shared_buffers = decoder.shared_buffers();
     if (!shared_buffers || buffer_index >= shared_buffers->size())
         return WebIDL::DataCloneError::create("Invalid ImageBitmap shared pixels"_utf16);
     auto buffer = (*shared_buffers)[buffer_index];
@@ -224,48 +103,6 @@ template<typename T>
     return TRY_OR_THROW_OOM(vm, Gfx::Bitmap::create_wrapper(format, alpha_type, size, pitch, pixels, [buffer = move(buffer)] { }));
 }
 
-// 2. Set dataHolder.[[BitmapData]] to value's bitmap data, of
-// https://html.spec.whatwg.org/multipage/imagebitmap-and-animations.html#the-imagebitmap-interface:transfer-steps
-static WebIDL::ExceptionOr<void> transfer_bitmap(HTML::TransferDataEncoder& data_holder, ImageBitmapSharedPixels* shared_pixels, Gfx::DecodedImageFrame const* frame)
-{
-    auto const* bitmap = frame ? &frame->bitmap() : nullptr;
-    // NB: The pixels go to the shared memory if there is room for them there, and inline otherwise.
-    if (shared_pixels && bitmap && ImageBitmap::shared_pixels_size(*bitmap) <= shared_pixels->buffer.size() - shared_pixels->used_size) {
-        auto const pitch = Gfx::Bitmap::minimum_pitch(bitmap->width(), bitmap->format());
-        auto* pixels = shared_pixels->buffer.data<u8>() + shared_pixels->used_size;
-        for (int y = 0; y < bitmap->height(); ++y)
-            memcpy(pixels + y * pitch, bitmap->scanline_u8(y), pitch);
-
-        TRY(encode_bitmap_value(data_holder, true));
-        TRY(encode_bitmap_value(data_holder, shared_pixels->buffer_index));
-        TRY(encode_bitmap_value(data_holder, static_cast<u64>(shared_pixels->used_size)));
-        TRY(encode_bitmap_value(data_holder, bitmap->width()));
-        TRY(encode_bitmap_value(data_holder, bitmap->height()));
-        TRY(encode_bitmap_value(data_holder, bitmap->format()));
-        TRY(encode_bitmap_value(data_holder, bitmap->alpha_type()));
-        TRY(serialize_color_space(data_holder, frame->color_space()));
-        shared_pixels->used_size += ImageBitmap::shared_pixels_size(*bitmap);
-    } else {
-        TRY(encode_bitmap_value(data_holder, false));
-        TRY(serialize_bitmap(data_holder, frame));
-    }
-    return {};
-}
-
-// 1. Set value's bitmap data to dataHolder.[[BitmapData]], of
-// https://html.spec.whatwg.org/multipage/imagebitmap-and-animations.html#the-imagebitmap-interface:transfer-receiving-steps
-static WebIDL::ExceptionOr<Optional<Gfx::DecodedImageFrame>> receive_bitmap(JS::Realm& realm, HTML::TransferDataDecoder& data_holder)
-{
-    auto const has_shared_pixels = TRY(decode_or_throw_data_clone_error<bool>(realm, data_holder));
-    if (!has_shared_pixels)
-        return TRY(deserialize_bitmap(realm, data_holder));
-    auto bitmap = TRY(bitmap_from_shared_pixels(realm.vm(), data_holder));
-    auto color_space = deserialize_color_space(data_holder);
-    if (color_space.is_error())
-        return data_clone_error_from_serialization_error(realm, color_space.release_error());
-    return Gfx::DecodedImageFrame { *bitmap, color_space.release_value() };
-}
-
 size_t ImageBitmap::shared_pixels_size(Gfx::Bitmap const& bitmap)
 {
     auto size = Gfx::Bitmap::size_in_bytes(Gfx::Bitmap::minimum_pitch(bitmap.width(), bitmap.format()), bitmap.height());
@@ -292,48 +129,142 @@ bool web_image_bitmap_origin_clean(void const* image_bitmap);
 void web_image_bitmap_set_origin_clean(void* image_bitmap, bool origin_clean);
 Gfx::DecodedImageFrame const* web_image_bitmap_frame(void const* image_bitmap);
 
-// What Bindings/Rust/src/html/image_bitmap.rs asks of C++, which owns the encoding of a Gfx::Bitmap: a bitmap that it
-// is handed over is a Gfx::DecodedImageFrame allocated with new, or null for none.
+// The bitmap data of a frame, which the serialization steps of Bindings/Rust/src/html/image_bitmap.rs write and their
+// deserialization steps read. The bytes of the pixels that C++ hands over borrow from the frame.
+struct FramePixels {
+    i32 width { 0 };
+    i32 height { 0 };
+    u64 pitch { 0 };
+    i32 format { 0 };
+    i32 alpha_type { 0 };
+    u8 const* data { nullptr };
+    size_t data_size { 0 };
+    u8 color_space_kind { 0 };
+    u8 color_primaries { 0 };
+    u8 transfer_characteristics { 0 };
+    u8 const* icc_profile { nullptr };
+    size_t icc_profile_size { 0 };
+};
+
+// What Bindings/Rust/src/html/image_bitmap.rs asks of C++, which owns the encoding of the Gfx::Bitmap of a transferred
+// frame: a frame that it is handed over is a Gfx::DecodedImageFrame allocated with new, or null for none.
 size_t web_image_bitmap_frame_size_in_bytes(Gfx::DecodedImageFrame const*);
-void web_image_bitmap_serialize_bitmap(Bindings::RustSerializationWriter*, Gfx::DecodedImageFrame const*);
-JSCompletion web_image_bitmap_deserialize_bitmap(Bindings::RustSerializationReader*, Gfx::DecodedImageFrame** out_frame);
-JSCompletion web_image_bitmap_transfer_bitmap(Bindings::RustTransferDataWriter*, Gfx::DecodedImageFrame const*);
-JSCompletion web_image_bitmap_receive_bitmap(Bindings::RustTransferDataReader*, Gfx::DecodedImageFrame** out_frame);
+void web_image_bitmap_frame_pixels(Gfx::DecodedImageFrame const*, FramePixels*);
+JSCompletion web_image_bitmap_create_frame(void* realm, FramePixels const*, Gfx::DecodedImageFrame** out_frame);
+bool web_image_bitmap_copy_to_shared_pixels(ImageBitmapSharedPixels*, Gfx::DecodedImageFrame const*, u32* buffer_index, u64* offset);
+JSCompletion web_image_bitmap_create_frame_from_shared_pixels(void* realm, Vector<Core::AnonymousBuffer> const*, u32 buffer_index, u64 offset, FramePixels const*, Gfx::DecodedImageFrame** out_frame);
 
 size_t web_image_bitmap_frame_size_in_bytes(Gfx::DecodedImageFrame const* frame)
 {
     return frame->bitmap().data_size();
 }
 
-void web_image_bitmap_serialize_bitmap(Bindings::RustSerializationWriter* writer, Gfx::DecodedImageFrame const* frame)
+// NB: The Rust side names these values by their underlying values.
+static_assert(to_underlying(Gfx::BitmapFormat::BGRx8888) == 1);
+static_assert(to_underlying(Gfx::BitmapFormat::BGRA8888) == 2);
+static_assert(to_underlying(Gfx::BitmapFormat::RGBx8888) == 3);
+static_assert(to_underlying(Gfx::BitmapFormat::RGBA8888) == 4);
+static_assert(to_underlying(Gfx::AlphaType::Premultiplied) == 0);
+static_assert(to_underlying(Gfx::AlphaType::Unpremultiplied) == 1);
+static_assert(to_underlying(SerializedColorSpaceKind::SRGB) == 0);
+static_assert(to_underlying(SerializedColorSpaceKind::CICP) == 1);
+static_assert(to_underlying(SerializedColorSpaceKind::ICCProfile) == 2);
+
+void web_image_bitmap_frame_pixels(Gfx::DecodedImageFrame const* frame, FramePixels* pixels)
 {
-    MUST(serialize_bitmap(writer->serialized, frame));
+    auto const& bitmap = frame->bitmap();
+    pixels->width = bitmap.width();
+    pixels->height = bitmap.height();
+    pixels->pitch = bitmap.pitch();
+    pixels->format = to_underlying(bitmap.format());
+    pixels->alpha_type = to_underlying(bitmap.alpha_type());
+    pixels->data = bitmap.scanline_u8(0);
+    pixels->data_size = bitmap.data_size();
+    frame->color_space().data().visit(
+        [&](Empty) {
+            pixels->color_space_kind = to_underlying(SerializedColorSpaceKind::SRGB);
+        },
+        [&](Gfx::ColorSpace::CICP const& cicp) {
+            pixels->color_space_kind = to_underlying(SerializedColorSpaceKind::CICP);
+            pixels->color_primaries = to_underlying(cicp.color_primaries);
+            pixels->transfer_characteristics = to_underlying(cicp.transfer_characteristics);
+        },
+        [&](NonnullRefPtr<Gfx::ColorSpace::ICCProfile const> const& icc_profile) {
+            pixels->color_space_kind = to_underlying(SerializedColorSpaceKind::ICCProfile);
+            pixels->icc_profile = icc_profile->bytes().data();
+            pixels->icc_profile_size = icc_profile->bytes().size();
+        });
 }
 
-JSCompletion web_image_bitmap_deserialize_bitmap(Bindings::RustSerializationReader* reader, Gfx::DecodedImageFrame** out_frame)
+[[nodiscard]] static ErrorOr<Gfx::ColorSpace> color_space_from_frame_pixels(FramePixels const& pixels)
 {
-    auto frame = deserialize_bitmap(reader->realm, reader->serialized);
+    switch (static_cast<SerializedColorSpaceKind>(pixels.color_space_kind)) {
+    case SerializedColorSpaceKind::SRGB:
+        return Gfx::ColorSpace {};
+    case SerializedColorSpaceKind::CICP: {
+        auto color_primaries = static_cast<Media::ColorPrimaries>(pixels.color_primaries);
+        auto transfer_characteristics = static_cast<Media::TransferCharacteristics>(pixels.transfer_characteristics);
+        return Gfx::ColorSpace::from_cicp({ color_primaries, transfer_characteristics, Media::MatrixCoefficients::Identity, Media::VideoFullRangeFlag::Full });
+    }
+    case SerializedColorSpaceKind::ICCProfile: {
+        auto icc_bytes = TRY(ByteBuffer::copy(pixels.icc_profile, pixels.icc_profile_size));
+        return Gfx::ColorSpace::from_icc_bytes(icc_bytes);
+    }
+    }
+    return Error::from_string_literal("Invalid ImageBitmap color space");
+}
+
+JSCompletion web_image_bitmap_create_frame(void* realm, FramePixels const* pixels, Gfx::DecodedImageFrame** out_frame)
+{
+    auto& js_realm = *static_cast<JS::Realm*>(realm);
+    auto frame = [&]() -> WebIDL::ExceptionOr<Gfx::DecodedImageFrame> {
+        auto data = TRY_OR_THROW_OOM(js_realm.vm(), ByteBuffer::copy(pixels->data, pixels->data_size));
+        auto bitmap = TRY(create_bitmap_from_bitmap_data(js_realm.vm(), static_cast<Gfx::BitmapFormat>(pixels->format), static_cast<Gfx::AlphaType>(pixels->alpha_type), pixels->width, pixels->height, pixels->pitch, move(data)));
+        auto color_space = color_space_from_frame_pixels(*pixels);
+        if (color_space.is_error())
+            return data_clone_error_from_serialization_error(js_realm, color_space.release_error());
+        return Gfx::DecodedImageFrame { *bitmap, color_space.release_value() };
+    }();
     if (frame.is_exception())
-        return Bindings::completion_to_abi(reader->realm, frame.release_error());
+        return Bindings::completion_to_abi(js_realm, frame.release_error());
     *out_frame = frame_to_hand_over(frame.release_value());
-    return Bindings::completion_to_abi(reader->realm, JS::js_undefined());
+    return Bindings::completion_to_abi(js_realm, JS::js_undefined());
 }
 
-JSCompletion web_image_bitmap_transfer_bitmap(Bindings::RustTransferDataWriter* writer, Gfx::DecodedImageFrame const* frame)
+// AD-HOC: Copies the pixels of the frame to the shared memory of a transfer, if there is room for them there, and
+//         returns where they are.
+bool web_image_bitmap_copy_to_shared_pixels(ImageBitmapSharedPixels* shared_pixels, Gfx::DecodedImageFrame const* frame, u32* buffer_index, u64* offset)
 {
-    auto result = transfer_bitmap(writer->data_holder, writer->image_bitmap_pixels, frame);
-    if (result.is_exception())
-        return Bindings::completion_to_abi(writer->realm, result.release_error());
-    return Bindings::completion_to_abi(writer->realm, JS::js_undefined());
+    auto const& bitmap = frame->bitmap();
+    if (!shared_pixels || ImageBitmap::shared_pixels_size(bitmap) > shared_pixels->buffer.size() - shared_pixels->used_size)
+        return false;
+    auto const pitch = Gfx::Bitmap::minimum_pitch(bitmap.width(), bitmap.format());
+    auto* pixels = shared_pixels->buffer.data<u8>() + shared_pixels->used_size;
+    for (int y = 0; y < bitmap.height(); ++y)
+        memcpy(pixels + y * pitch, bitmap.scanline_u8(y), pitch);
+    *buffer_index = shared_pixels->buffer_index;
+    *offset = shared_pixels->used_size;
+    shared_pixels->used_size += ImageBitmap::shared_pixels_size(bitmap);
+    return true;
 }
 
-JSCompletion web_image_bitmap_receive_bitmap(Bindings::RustTransferDataReader* reader, Gfx::DecodedImageFrame** out_frame)
+// AD-HOC: A frame over the pixels at the offset of the shared memory of a transfer, as the transfer steps of
+//         Bindings/Rust/src/html/image_bitmap.rs place them there. The values of the bitmap and the color space are in
+//         the pixels, whose bytes are unused.
+JSCompletion web_image_bitmap_create_frame_from_shared_pixels(void* realm, Vector<Core::AnonymousBuffer> const* shared_buffers, u32 buffer_index, u64 offset, FramePixels const* pixels, Gfx::DecodedImageFrame** out_frame)
 {
-    auto frame = receive_bitmap(reader->realm, reader->data_holder);
+    auto& js_realm = *static_cast<JS::Realm*>(realm);
+    auto frame = [&]() -> WebIDL::ExceptionOr<Gfx::DecodedImageFrame> {
+        auto bitmap = TRY(bitmap_from_shared_pixels(js_realm.vm(), shared_buffers, buffer_index, offset, static_cast<Gfx::BitmapFormat>(pixels->format), static_cast<Gfx::AlphaType>(pixels->alpha_type), pixels->width, pixels->height));
+        auto color_space = color_space_from_frame_pixels(*pixels);
+        if (color_space.is_error())
+            return data_clone_error_from_serialization_error(js_realm, color_space.release_error());
+        return Gfx::DecodedImageFrame { *bitmap, color_space.release_value() };
+    }();
     if (frame.is_exception())
-        return Bindings::completion_to_abi(reader->realm, frame.release_error());
+        return Bindings::completion_to_abi(js_realm, frame.release_error());
     *out_frame = frame_to_hand_over(frame.release_value());
-    return Bindings::completion_to_abi(reader->realm, JS::js_undefined());
+    return Bindings::completion_to_abi(js_realm, JS::js_undefined());
 }
 }
 

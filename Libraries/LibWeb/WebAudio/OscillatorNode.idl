@@ -16,11 +16,11 @@ dictionary OscillatorOptions : AudioNodeOptions {
 };
 
 // https://webaudio.github.io/web-audio-api/#OscillatorNode
-[Exposed=Window]
+[Exposed=Window, ImplementedIn=Rust]
 interface OscillatorNode : AudioScheduledSourceNode {
     constructor(BaseAudioContext context, optional OscillatorOptions options = {});
     attribute OscillatorType type;
-    [DirectGetter] readonly attribute AudioParam frequency;
-    [DirectGetter] readonly attribute AudioParam detune;
+    readonly attribute AudioParam frequency;
+    readonly attribute AudioParam detune;
     undefined setPeriodicWave(PeriodicWave periodicWave);
 };

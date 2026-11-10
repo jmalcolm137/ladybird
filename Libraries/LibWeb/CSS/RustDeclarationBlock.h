@@ -14,20 +14,20 @@
 
 namespace Web::CSS {
 
-// A read-only Arc<DeclarationBlockData>. The cascade never needs a live CSSOM owner.
+// A read-only reference to a declaration block. The cascade never needs a live CSSOM owner.
 class WEB_API RustDeclarationBlockSnapshot {
     AK_MAKE_NONCOPYABLE(RustDeclarationBlockSnapshot);
 
 public:
-    explicit RustDeclarationBlockSnapshot(Parser::ValueParserFFI::DeclarationBlockData const*);
+    explicit RustDeclarationBlockSnapshot(Parser::ValueParserFFI::DeclarationBlockHeader const*);
     ~RustDeclarationBlockSnapshot();
     RustDeclarationBlockSnapshot(RustDeclarationBlockSnapshot&&);
     RustDeclarationBlockSnapshot& operator=(RustDeclarationBlockSnapshot&&);
 
-    Parser::ValueParserFFI::DeclarationBlockData const* data() const { return m_data; }
+    Parser::ValueParserFFI::DeclarationBlockHeader const* data() const { return m_data; }
 
 private:
-    Parser::ValueParserFFI::DeclarationBlockData const* m_data;
+    Parser::ValueParserFFI::DeclarationBlockHeader const* m_data;
 };
 
 // The declarations live in Rust. These document-thread views retain facade-local resource state.
@@ -58,10 +58,10 @@ public:
     OrderedHashMap<Utf16FlyString, StyleProperty> const& custom_properties() const;
     size_t external_memory_size() const;
 
-    bool set(PropertyID, StyleValue const&, Important);
-    void append(PropertyID, StyleValue const&, Important);
+    bool set_expanding_shorthands(PropertyID, StyleValue const&, Important);
+    void append_expanding_shorthands(PropertyID, StyleValue const&, Important);
     void set_custom(Utf16FlyString const&, StyleProperty const&);
-    bool remove(PropertyID);
+    bool remove_expanding_shorthands(PropertyID);
     bool remove_custom(Utf16FlyString const&);
 
     Parser::ValueParserFFI::DeclarationBlock const* handle() const { return m_block; }

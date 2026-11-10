@@ -4,6 +4,8 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+use ak::math;
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 #[repr(transparent)]
 pub struct Color(pub u32);
@@ -59,6 +61,15 @@ impl Color {
     pub const fn inverted(self) -> Self {
         Self::from_rgba(!self.red(), !self.green(), !self.blue(), self.alpha())
     }
+    pub fn lightened(self, amount: f32) -> Self {
+        let lighten = |channel: u8| (channel as f32 * amount).min(255.0) as u8;
+        Self::from_rgba(
+            lighten(self.red()),
+            lighten(self.green()),
+            lighten(self.blue()),
+            self.alpha(),
+        )
+    }
     pub fn interpolate(self, other: Self, weight: f32) -> Self {
         let mix = |a: u8, b: u8| -> u8 {
             let a = a as f32;
@@ -97,7 +108,7 @@ impl Color {
             if srgb_component <= 0.04045 {
                 srgb_component / 12.92
             } else {
-                ((srgb_component + 0.055) / 1.055).powf(2.4)
+                math::pow((srgb_component + 0.055) / 1.055, 2.4)
             }
         }
         0.2126 * linearized(self.red()) + 0.7152 * linearized(self.green()) + 0.0722 * linearized(self.blue())

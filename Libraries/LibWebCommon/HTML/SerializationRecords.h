@@ -11,12 +11,14 @@
 
 #include <AK/Array.h>
 #include <AK/ByteBuffer.h>
+#include <AK/Optional.h>
 #include <AK/RefCounted.h>
 #include <AK/RefPtr.h>
 #include <AK/Vector.h>
 #include <LibCore/AnonymousBuffer.h>
-#include <LibCrypto/Forward.h>
+#include <LibGC/Forward.h>
 #include <LibIPC/Encoder.h>
+#include <LibIPC/File.h>
 #include <LibIPC/Forward.h>
 #include <LibIPC/Message.h>
 #include <LibWebCommon/Export.h>
@@ -24,18 +26,18 @@
 namespace Web::HTML {
 
 // NB: References that are only meaningful inside the process that produced a serialization record, such as LibWeb's
-//     same-process SharedArrayBuffer aliases. It is never IPC-encoded, and is opaque outside of LibWeb.
-class WEBCOMMON_API SameProcessSerializationSideTable : public RefCounted<SameProcessSerializationSideTable> {
+//     same-agent SharedArrayBuffer aliases. It is never IPC-encoded, and is opaque outside of LibWeb.
+class WEBCOMMON_API SameAgentSerializationSideTable : public RefCounted<SameAgentSerializationSideTable> {
 public:
-    virtual ~SameProcessSerializationSideTable();
+    virtual ~SameAgentSerializationSideTable();
 };
 
 struct IPCSerializationRecord {
     IPC::MessageDataType data;
 
-    // Same-process SharedArrayBuffer aliases. This is intentionally not IPC-encoded; cross-process
+    // Same-agent SharedArrayBuffer aliases. This is intentionally not IPC-encoded; cross-process
     // records fall back to the byte copy in `data`.
-    RefPtr<SameProcessSerializationSideTable const> same_process_side_table;
+    RefPtr<SameAgentSerializationSideTable const> same_agent_side_table;
 
     IPCSerializationRecord() = default;
     explicit IPCSerializationRecord(IPC::MessageDataType data)
@@ -128,10 +130,6 @@ public:
         return m_encoder.encode(value);
     }
 
-    void append(IPCSerializationRecord&&);
-    void extend(Vector<TransferDataEncoder>);
-    void encode_unsigned_big_integer(::Crypto::UnsignedBigInteger const&);
-
     IPC::MessageBuffer const& buffer() const;
     IPC::MessageBuffer take_buffer() const;
 
@@ -141,18 +139,36 @@ private:
     IPC::Encoder m_encoder;
 };
 
+// AD-HOC: What keeps the SharedArrayBuffer stores that a message names alive while the message is on its way, for as
+//         long as this or a copy of it in any process is open. It gives no access to the stores, whose bytes never leave
+//         their process. See shared_backing_store.rs in LibJS.
+struct WEBCOMMON_API SharedStoreLifeline {
+    static SharedStoreLifeline adopting_fd(int fd);
+
+    int fd() const;
+
+    Optional<IPC::File> file;
+};
+
 struct SerializedTransferRecord {
+    AK_ALLOC_WITH_KMALLOC;
+
     IPCSerializationRecord serialized;
     Vector<TransferDataEncoder> transfer_data_holders;
-    // AD-HOC: Cross-process shared memory backing serialized SharedArrayBuffers — referenced by index from the main
-    //         record (whose bytes can't carry file descriptors). Unlike the record's same-process side table, this one
-    //         is IPC-encoded, so it reaches an agent in another process.
+    // AD-HOC: Shared memory that hands the pixels of transferred ImageBitmaps over, by index from the data holders.
     Vector<Core::AnonymousBuffer> shared_buffers;
+    SharedStoreLifeline shared_store_lifeline;
 };
 
 }
 
 namespace IPC {
+
+template<>
+WEBCOMMON_API ErrorOr<void> encode(Encoder&, Web::HTML::SharedStoreLifeline const&);
+
+template<>
+WEBCOMMON_API ErrorOr<Web::HTML::SharedStoreLifeline> decode(Decoder&);
 
 template<>
 WEBCOMMON_API ErrorOr<void> encode(Encoder&, Web::HTML::IPCSerializationRecord const&);
@@ -179,3 +195,5 @@ template<>
 WEBCOMMON_API ErrorOr<Web::HTML::SerializedTransferRecord> decode(Decoder&);
 
 }
+
+GC_UNTRACED_CAPTURE(Web::HTML::TransferDataEncoder);

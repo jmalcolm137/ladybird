@@ -13,6 +13,7 @@
 #include <AK/RefPtr.h>
 #include <AK/Types.h>
 #include <AK/WeakPtr.h>
+#include <AudioServer/CaptureActivity.h>
 #include <AudioServer/CaptureDevices.h>
 #include <AudioServer/PlaybackStreamMixer.h>
 #include <AudioServer/ServerConnection.h>
@@ -30,9 +31,11 @@ class Tabs {
 public:
     static Tabs& the();
 
-    // Decides what every tab's device stream is; headless instances discard their mix into a null stream and have no
-    // devices to capture from.
-    void set_audio_output(Audio::AudioOutput audio_output) { m_audio_output = audio_output; }
+    Tabs();
+
+    // Decides what every tab's devices are; headless instances discard their mix into a null stream and capture from a
+    // null input device.
+    void set_audio_output(Audio::AudioOutput);
     // The Browser rules on every capture request, and is asked over this connection.
     void set_control_connection(ControlConnection&);
 
@@ -55,7 +58,7 @@ private:
     Tab& tab_for(u64 tab_id);
     Audio::CaptureDevices& capture_devices();
     void connection_died(u64 tab_id, int client_id);
-    void request_capture_permission(u64 tab_id, ByteString const& device_id, Function<void(bool)> on_decided);
+    void request_capture_permission(u64 tab_id, ByteString const& device_id, Audio::PlaybackGroupId, Function<void(bool)> on_decided);
 
     HashMap<u64, Tab> m_tabs;
     HashTable<u64> m_tabs_with_capture_permission;
@@ -68,6 +71,7 @@ private:
     WeakPtr<ControlConnection> m_control_connection;
     HashMap<u64, Function<void(bool)>> m_pending_capture_decisions;
     u64 m_next_capture_request_id { 1 };
+    CaptureActivity m_capture_activity;
 };
 
 }

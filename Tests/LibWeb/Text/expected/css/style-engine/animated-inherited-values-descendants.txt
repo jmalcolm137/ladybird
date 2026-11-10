@@ -1,0 +1,1 @@
+grandchild: width 30px, color rgb(0, 0, 100)

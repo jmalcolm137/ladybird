@@ -12,8 +12,8 @@
 //! than the timeout is killed by SIGALRM, which the driver records as a timeout. A panic, including one from a runtime
 //! function that is not implemented yet, reports `assert_fail` for the running test and exits with status 12.
 //!
-//! With --agent, the runner is instead one of the agents that a test starts with $262.agent.start(): it runs the
-//! agent's script, which the test sends it, in a VM of its own (see contrib/test262/agents.rs).
+//! The agents that a test starts with $262.agent.start() are threads of the runner, each with a VM of its own (see
+//! contrib/test262/agents.rs).
 
 use core::ffi::{c_char, c_int};
 use std::collections::HashMap;
@@ -510,7 +510,7 @@ fn decoded_source<'source>(source: Option<&'source [u16]>, what: &str) -> &'sour
 }
 
 fn parse_only_check(source: &[u16], program_type: ProgramType) -> Result<(), TestError> {
-    if parse(source, program_type, 1).has_errors() {
+    if parse(&Utf16String::from_utf16(source), program_type, 1).has_errors() {
         return Err(TestError::syntax_error(
             NegativePhase::ParseOrEarly,
             "Parse error".to_string(),
@@ -537,7 +537,7 @@ fn parse_program(
         TestError::syntax_error(NegativePhase::ParseOrEarly, first_parser_error(&errors), "")
     };
     if program_type == ProgramType::Script {
-        return Script::parse_with_filename(vm, source, realm, filepath)
+        return Script::parse_with_filename(vm, &Utf16String::from_utf16(source), realm, filepath)
             .map(ScriptOrModuleProgram::Script)
             .map_err(syntax_error);
     }
@@ -597,12 +597,8 @@ fn run_program(vm: &Vm, program: ScriptOrModuleProgram) -> Result<(), TestError>
         .map_err(|throw| describe_thrown_value(vm, throw.value()))
 }
 
-/// A VM whose SharedArrayBuffers agents can map, as broadcasting one hands its shared memory to them.
 fn create_vm() -> Box<Vm> {
-    Vm::create_with(VmOptions {
-        shared_memory_shared_array_buffers: true,
-        ..VmOptions::default()
-    })
+    Vm::create_with(VmOptions::default())
 }
 
 fn run_test(
@@ -639,7 +635,7 @@ fn run_test(
         let harness_source = utf16_from_wtf8(&harness_source);
         let harness_program = Script::parse_with_filename(
             &vm,
-            decoded_source(harness_source.as_deref(), "The harness"),
+            &Utf16String::from_utf16(decoded_source(harness_source.as_deref(), "The harness")),
             realm,
             "<harness>",
         )
@@ -674,7 +670,6 @@ fn is_unimplemented_feature_error(error_type: &str, details: &str) -> bool {
 fn is_unimplemented_feature_failure(failure: &AgentFailure) -> bool {
     match failure {
         AgentFailure::UncaughtException { name, message } => is_unimplemented_feature_error(name, message),
-        AgentFailure::Panic(_) | AgentFailure::Exited(_) => false,
     }
 }
 
@@ -757,7 +752,6 @@ struct Options {
     parse_only: bool,
     timeout_in_seconds: i64,
     disable_core_dumping: bool,
-    run_as_agent: bool,
 }
 
 fn parse_options(arguments: &[String]) -> Result<Options, String> {
@@ -766,7 +760,6 @@ fn parse_options(arguments: &[String]) -> Result<Options, String> {
         parse_only: false,
         timeout_in_seconds: 10,
         disable_core_dumping: false,
-        run_as_agent: false,
     };
     let mut arguments = arguments.iter().skip(1);
     while let Some(argument) = arguments.next() {
@@ -790,7 +783,6 @@ fn parse_options(arguments: &[String]) -> Result<Options, String> {
             // The runtime has no debug logging to enable, so this is accepted and does nothing.
             "-d" | "--debug" => {}
             "--disable-core-dump" => options.disable_core_dumping = true,
-            "--agent" => options.run_as_agent = true,
             _ => return Err(format!("Unknown option {argument}")),
         }
     }
@@ -942,9 +934,7 @@ fn run(options: &Options) -> c_int {
     install_assertion_failure_hook(current_test.clone(), saved_stdout);
 
     #[cfg(unix)]
-    if let Ok(program) = std::env::current_exe() {
-        agents::enable_agents(program, vec!["--agent".into()]);
-    }
+    agents::enable_agents(agent_mode::run_agent);
 
     let mut harness_files = HarnessFiles {
         directory: harness_directory,
@@ -1002,15 +992,14 @@ fn run(options: &Options) -> c_int {
     0
 }
 
-/// --agent: the runner as one of the agents that a test starts.
+/// The thread of one of the agents that a test starts.
 #[cfg(unix)]
 mod agent_mode {
     use core::cell::RefCell;
-    use core::ffi::c_int;
 
     use super::{
-        EXIT_ASSERTION_FAILED, EXIT_SETUP_INPUT_FAILURE, NegativePhase, ScriptOrModuleProgram, TestError, create_vm,
-        decoded_source, describe_panic, describe_thrown_value, first_parser_error, run_program,
+        NegativePhase, ScriptOrModuleProgram, TestError, create_vm, decoded_source, describe_thrown_value,
+        first_parser_error, run_program,
     };
     use crate::contrib::test262::agents;
     use crate::contrib::test262::global_object::Test262GlobalObject;
@@ -1039,7 +1028,8 @@ mod agent_mode {
 
     fn run_agent_script(vm: &Vm, realm: Gc<Realm>, source: &[u8]) -> Result<(), TestError> {
         let source = utf16_from_wtf8(source);
-        let script = Script::parse_with_filename(vm, decoded_source(source.as_deref(), "The agent"), realm, "<agent>")
+        let source = ak::Utf16String::from_utf16(decoded_source(source.as_deref(), "The agent"));
+        let script = Script::parse_with_filename(vm, &source, realm, "<agent>")
             .map_err(|errors| TestError::syntax_error(NegativePhase::ParseOrEarly, first_parser_error(&errors), ""))?;
         run_program(vm, ScriptOrModuleProgram::Script(script))?;
         match UNHANDLED_REJECTIONS.take().into_iter().next() {
@@ -1049,33 +1039,21 @@ mod agent_mode {
     }
 
     /// Runs the script of one agent of a test, and tells the test if it failed.
-    pub(super) fn run_agent() -> c_int {
-        let source = match agents::connect_to_test() {
-            Ok(source) => source,
-            Err(error) => {
-                eprintln!("test262-runner: an agent could not connect to its test: {error}");
-                return EXIT_SETUP_INPUT_FAILURE;
-            }
-        };
-        std::panic::set_hook(Box::new(|info| {
-            agents::report_panic(&describe_panic(info));
-            // SAFETY: Exits without unwinding or running destructors, from a state that may be broken.
-            unsafe { libc::_exit(EXIT_ASSERTION_FAILED) }
-        }));
-
+    pub(super) fn run_agent(source: &[u8]) {
         let vm = create_vm();
         vm.set_on_promise_unhandled_rejection(Some(remember_unhandled_rejection));
         vm.set_on_promise_rejection_handled(Some(forget_handled_rejection));
         let root_execution_context =
             initialize_realm_with_global_object(&vm, &|realm| Test262GlobalObject::allocate(&vm, realm).upcast());
-        agents::acknowledge_start();
+        agents::acknowledge_start(&vm);
 
-        if let Err(error) = run_agent_script(&vm, root_execution_context.realm(), &source) {
+        let result = run_agent_script(&vm, root_execution_context.realm(), source);
+        if let Err(error) = result
+            && !vm.interrupt_requested()
+        {
             agents::report_uncaught_exception(&error.error_type, &error.details);
         }
-        // SAFETY: Ends the agent without tearing down its VM, which nothing needs any more, while the thread that
-        //         listens to the test still waits.
-        unsafe { libc::_exit(0) }
+        agents::agent_vm_went_away();
     }
 }
 
@@ -1214,8 +1192,6 @@ pub unsafe extern "C" fn libjs_rust_test262_runner_main(argc: c_int, argv: *cons
         })
         .collect();
     match parse_options(&arguments) {
-        #[cfg(unix)]
-        Ok(options) if options.run_as_agent => agent_mode::run_agent(),
         Ok(options) => run(&options),
         Err(error) => {
             eprintln!("test262-runner: {error}");

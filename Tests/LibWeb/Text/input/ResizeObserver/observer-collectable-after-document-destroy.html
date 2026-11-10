@@ -1,0 +1,22 @@
+<!DOCTYPE html>
+<script src="../include.js"></script>
+<script>
+    promiseTest(async () => {
+        let frame = document.createElement("iframe");
+        document.body.append(frame);
+        frame.contentDocument.body.innerHTML = `<div id="target" style="width: 100px; height: 100px"></div>`;
+
+        let observer = new frame.contentWindow.ResizeObserver(() => {});
+        const weak = new WeakRef(observer);
+        observer.observe(frame.contentDocument.getElementById("target"));
+        observer = null;
+
+        await new Promise(resolve => {
+            frame.contentWindow.addEventListener("unload", resolve, { once: true });
+            frame.remove();
+        });
+        frame = null;
+        await internals.gcAsync();
+        println(`observer collected after document destroy: ${weak.deref() === undefined}`);
+    });
+</script>

@@ -74,8 +74,8 @@ WEB_API JS::Value window_named_item_value(WrapperWorld&, JS::Realm&, HTML::Windo
 namespace Web::HTML {
 
 class IdleCallback;
-using AnimationFrameCallbackHandler = Function<void(double)>;
-using IdleCallbackHandler = Function<JS::Completion(GC::Ref<RequestIdleCallback::IdleDeadline>)>;
+using AnimationFrameCallbackHandler = GC::Ref<GC::Function<void(double)>>;
+using IdleCallbackHandler = GC::Ref<GC::Function<JS::Completion(GC::Ref<RequestIdleCallback::IdleDeadline>)>>;
 
 // https://html.spec.whatwg.org/multipage/webappapis.html#specifier-resolution-record
 // A specifier resolution record is a struct. It has the following items:
@@ -231,15 +231,8 @@ public:
         Utf16String target_origin;
     };
     WebIDL::ExceptionOr<void> post_message(JS::Realm&, JS::Value message, PostMessageOptions const&);
-    struct PreparedPostMessage {
-        SerializedTransferRecord serialize_with_transfer_result;
-        Variant<Utf16String, URL::Origin> target_origin;
-        EnvironmentId incumbent_settings_id;
-        URL::Origin source_origin;
-        GC::Ref<WindowProxy> source;
-    };
-    static WebIDL::ExceptionOr<PreparedPostMessage> prepare_post_message(JS::Realm&, JS::Value message, PostMessageOptions const&);
-    void deliver_posted_message(SerializedTransferRecord, Variant<Utf16String, URL::Origin> const& target_origin, URL::Origin const& source_origin, GC::Ptr<WindowProxy> source);
+    static WebIDL::ExceptionOr<void> window_post_message_steps(JS::Realm&, Variant<GC::Ref<Window>, GC::Ref<RemoteNavigable>> target_window, JS::Value, PostMessageOptions const&);
+    void queue_posted_message(SerializedTransferRecord, Variant<Utf16String, URL::Origin> const& target_origin, URL::Origin const& source_origin, GC::Ptr<WindowProxy> source);
 
     Variant<GC::Ref<DOM::Event>, Empty> event() const;
 
@@ -294,12 +287,17 @@ public:
     void set_last_activation_timestamp(HighResolutionTime::DOMHighResTimeStamp timestamp) { m_last_activation_timestamp = timestamp; }
 
     void notify_about_user_activation();
+    static void run_activation_notification_steps(DOM::Document&);
     void consume_user_activation();
 
     HighResolutionTime::DOMHighResTimeStamp last_history_action_activation_timestamp() const { return m_last_history_action_activation_timestamp; }
     void set_last_history_action_activation_timestamp(HighResolutionTime::DOMHighResTimeStamp timestamp) { m_last_history_action_activation_timestamp = timestamp; }
 
     void consume_history_action_user_activation();
+
+    // The system clipboard data that the paste event this window is dispatching pastes, if it pastes the clipboard.
+    Vector<Clipboard::SystemClipboardItem> const* system_clipboard_data_being_pasted() const { return m_system_clipboard_data_being_pasted; }
+    void set_system_clipboard_data_being_pasted(Vector<Clipboard::SystemClipboardItem> const* data) { m_system_clipboard_data_being_pasted = data; }
 
     // Steps 4 and 5 of both consumptions for the windows a page hosts. The UI process runs this in every page of the
     // tab, since the navigables of top's active document span its pages.
@@ -349,8 +347,6 @@ private:
     };
     NamedObjects named_objects(Utf16View name);
 
-    WebIDL::ExceptionOr<void> window_post_message_steps(JS::Realm&, JS::Value, PostMessageOptions const&);
-
     // https://html.spec.whatwg.org/multipage/window-object.html#concept-document-window
     GC::Ptr<DOM::Document> m_associated_document;
     GC::Ptr<WindowEnvironmentSettingsObject> m_environment_settings_object;
@@ -398,6 +394,8 @@ private:
 
     // https://html.spec.whatwg.org/multipage/interaction.html#last-history-action-activation-timestamp
     HighResolutionTime::DOMHighResTimeStamp m_last_history_action_activation_timestamp { AK::Infinity<double> };
+
+    Vector<Clipboard::SystemClipboardItem> const* m_system_clipboard_data_being_pasted { nullptr };
 
     // https://html.spec.whatwg.org/multipage/nav-history-apis.html#dom-window-status
     // When the Window object is created, the attribute must be set to the empty string. It does not do anything else.

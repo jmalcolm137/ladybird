@@ -6,30 +6,19 @@
 
 //! https://html.spec.whatwg.org/multipage/imagebitmap-and-animations.html#imagedata
 
-use core::ffi::c_void;
 use core::ptr::NonNull;
 
 use ak::Utf16String;
 use libjs_rust::api::{
-    ArrayBuffer, ArrayBufferOrder, ArrayBufferShared, Gc, RawNativeFunctionResult, Trace, TypedArrayBase,
-    TypedArrayKind, Value, create_typed_array_on_buffer, is_typed_array_out_of_bounds,
-    make_typed_array_with_buffer_witness_record, typed_array_byte_length,
+    ArrayBuffer, ArrayBufferOrder, ArrayBufferShared, Gc, Trace, TypedArrayBase, TypedArrayKind, Value,
+    create_typed_array_on_buffer, is_typed_array_out_of_bounds, make_typed_array_with_buffer_witness_record,
+    typed_array_byte_length,
 };
 
 use super::predefined_color_space::PredefinedColorSpace;
 use crate::bindings::interface::{Ref, Wrappable, allocate};
 use crate::bindings::structured_data::{Serializable, SerializationReader, SerializationWriter};
 use crate::bindings::{CallContext, Exception, WebIdlResult};
-
-unsafe extern "C" {
-    // Defined in Libraries/LibWeb/HTML/ImageData.cpp, which encodes the color space as StructuredSerialize encodes a
-    // Web::Bindings::PredefinedColorSpace.
-    fn web_image_data_serialize_color_space(serialized: *mut c_void, color_space: PredefinedColorSpace);
-    fn web_image_data_deserialize_color_space(
-        serialized: *mut c_void,
-        out_color_space: &mut u8,
-    ) -> RawNativeFunctionResult;
-}
 
 /// https://html.spec.whatwg.org/multipage/imagebitmap-and-animations.html#imagedatasettings
 #[derive(Clone, Copy, Debug, Default)]
@@ -109,29 +98,29 @@ impl ImageData {
         let length = typed_array_byte_length(&data_record);
 
         // 2. If length is not a nonzero integral multiple of four, then throw an "InvalidStateError" DOMException.
-        if length == 0 || !length.is_multiple_of(BYTES_PER_PIXEL) {
+        if length == 0 || !length.is_multiple_of(BYTES_PER_PIXEL as usize) {
             return Err(invalid_state_error(
                 b"Source data must have a non-zero length that is a multiple of four.",
             ));
         }
 
         // 3. Let length be length divided by four.
-        let length = length / BYTES_PER_PIXEL;
+        let length = length / BYTES_PER_PIXEL as usize;
 
         // 4. If length is not an integral multiple of sw, then throw an "IndexSizeError" DOMException.
         // NOTE: At this step, the length is guaranteed to be greater than zero (otherwise the second step above would
         //       have aborted the steps), so if sw is zero, this step will throw the exception and return.
-        if sw == 0 || !length.is_multiple_of(sw) {
+        if sw == 0 || !length.is_multiple_of(sw as usize) {
             return Err(Exception::index_size_error(Utf16String::from_ascii(
                 b"Source width must be a multiple of source data's length.",
             )));
         }
 
         // 5. Let height be length divided by sw.
-        let height = length / sw;
+        let height = length / sw as usize;
 
         // 6. If sh was given and its value is not equal to height, then throw an "IndexSizeError" DOMException.
-        if sh.is_some_and(|sh| sh != height) {
+        if sh.is_some_and(|sh| sh as usize != height) {
             return Err(Exception::index_size_error(Utf16String::from_ascii(
                 b"Source height must be equal to the calculated height of the data.",
             )));
@@ -139,6 +128,11 @@ impl ImageData {
 
         // 7. Initialize this given sw, sh, settings set to settings, and source set to data.
         // FIXME: This seems to be a spec issue, sh is an optional but height always have a value.
+        let Ok(height) = u32::try_from(height) else {
+            return Err(Exception::index_size_error(Utf16String::from_ascii(
+                b"The specified image size could not be created",
+            )));
+        };
         Self::initialize(cx, height, sw, Some(&settings), Some(data), None)
     }
 
@@ -185,7 +179,13 @@ impl ImageData {
                 // 3. If the Canvas Pixel ArrayBuffer cannot be allocated, then rethrow the RangeError thrown by
                 //    JavaScript, and return.
                 let buffer = ArrayBuffer::create(cx.vm(), cx.realm(), size as usize, ArrayBufferShared::No)?;
-                create_typed_array_on_buffer(cx.vm(), cx.realm(), TypedArrayKind::Uint8ClampedArray, size, buffer)
+                create_typed_array_on_buffer(
+                    cx.vm(),
+                    cx.realm(),
+                    TypedArrayKind::Uint8ClampedArray,
+                    size as usize,
+                    buffer,
+                )
             }
         };
 
@@ -258,7 +258,7 @@ impl ImageData {
             return None;
         }
         let buffer = self.data.viewed_array_buffer();
-        let byte_offset = self.data.byte_offset() as usize;
+        let byte_offset = self.data.byte_offset();
         NonNull::new(buffer.with_data_block(|data_block| data_block.data_at(byte_offset)))
     }
 }
@@ -267,13 +267,56 @@ fn invalid_state_error(message: &[u8]) -> Exception {
     Exception::Dom("InvalidStateError", Utf16String::from_ascii(message))
 }
 
+/// The identifier by which a storage record holds a color space.
+fn color_space_storage_identifier(color_space: PredefinedColorSpace) -> &'static [u8] {
+    match color_space {
+        PredefinedColorSpace::Srgb => b"srgb",
+        PredefinedColorSpace::SrgbLinear => b"srgb-linear",
+        PredefinedColorSpace::DisplayP3 => b"display-p3",
+        PredefinedColorSpace::DisplayP3Linear => b"display-p3-linear",
+    }
+}
+
+/// Writes the color space as a record holds one: by its identifier in a storage record, and by its underlying value in
+/// one for IPC.
+fn serialize_color_space(serialized: &mut SerializationWriter, color_space: PredefinedColorSpace, for_storage: bool) {
+    if for_storage {
+        serialized.write_utf16_string(&Utf16String::from_ascii(color_space_storage_identifier(color_space)));
+    } else {
+        serialized.write_u8(color_space as u8);
+    }
+}
+
+/// Reads what serialize_color_space() writes.
+fn deserialize_color_space(serialized: &mut SerializationReader) -> WebIdlResult<PredefinedColorSpace> {
+    let color_space = if serialized.is_for_storage() {
+        let identifier = serialized.read_utf16_string()?;
+        [
+            PredefinedColorSpace::Srgb,
+            PredefinedColorSpace::SrgbLinear,
+            PredefinedColorSpace::DisplayP3,
+            PredefinedColorSpace::DisplayP3Linear,
+        ]
+        .into_iter()
+        .find(|&color_space| identifier == Utf16String::from_ascii(color_space_storage_identifier(color_space)))
+    } else {
+        PredefinedColorSpace::from_u8(serialized.read_u8()?)
+    };
+    color_space.ok_or_else(|| {
+        Exception::Dom(
+            "DataCloneError",
+            Utf16String::from_ascii(b"Unknown structured serialize color space"),
+        )
+    })
+}
+
 impl Serializable for ImageData {
     /// https://html.spec.whatwg.org/multipage/imagebitmap-and-animations.html#the-imagedata-interface:serialization-steps
     fn serialization_steps(
         &self,
         _: &mut CallContext,
         serialized: &mut SerializationWriter,
-        _for_storage: bool,
+        for_storage: bool,
     ) -> WebIdlResult<()> {
         // 1. Set serialized.[[Data]] to the sub-serialization of the value of value's data attribute.
         serialized.write_value(Value::from_object(self.data))?;
@@ -285,8 +328,7 @@ impl Serializable for ImageData {
         serialized.write_u32(self.height);
 
         // 4. Set serialized.[[ColorSpace]] to the value of value's colorSpace attribute.
-        // SAFETY: The writer is lent for the steps.
-        unsafe { web_image_data_serialize_color_space(serialized.as_raw(), self.color_space) };
+        serialize_color_space(serialized, self.color_space, for_storage);
 
         // FIXME: 5. Set serialized.[[PixelFormat]] to the value of value's pixelFormat attribute.
 
@@ -316,10 +358,7 @@ impl Serializable for ImageData {
         let height = serialized.read_u32()?;
 
         // 4. Initialize value's colorSpace attribute to serialized.[[ColorSpace]].
-        let mut color_space = 0;
-        // SAFETY: The reader is lent for the steps.
-        unsafe { web_image_data_deserialize_color_space(serialized.as_raw(), &mut color_space) }.into_completion()?;
-        let color_space = PredefinedColorSpace::from_u8(color_space).expect("C++ decodes a color space");
+        let color_space = deserialize_color_space(serialized)?;
 
         // FIXME: 5. Initialize value's pixelFormat attribute to serialized.[[PixelFormat]].
 

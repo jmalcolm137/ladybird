@@ -11,7 +11,6 @@
 #include <LibGC/Weak.h>
 #include <LibJS/HostClassBuilder.h>
 #include <LibJS/Runtime/Realm.h>
-#include <LibURL/RustIntegration.h>
 #include <LibWeb/Bindings/MainThreadVM.h>
 #include <LibWeb/Bindings/RustInterface.h>
 #include <LibWeb/Bindings/Wrappable.h>
@@ -20,12 +19,9 @@
 #include <LibWeb/HTML/DOMStringList.h>
 #include <LibWeb/HTML/EventLoop/EventLoop.h>
 #include <LibWeb/HTML/Scripting/Environments.h>
-#include <LibWeb/HTML/StructuredSerialize.h>
 #include <LibWeb/Page/Page.h>
 #include <LibWeb/Platform/EventLoopPlugin.h>
-#include <LibWeb/StorageAPI/StorageKey.h>
 #include <LibWeb/WebIDL/DOMException.h>
-#include <LibWeb/WebIDL/ExceptionOrUtils.h>
 #include <LibWebCommon/IndexedDB/TransactionChanges.h>
 
 // What the Rust implementation of IndexedDB asks of LibWeb's C++ code, declared on the Rust side in
@@ -40,13 +36,10 @@ void web_rust_indexed_db_check_pending_connection_wait(JSVM*, void* database);
 void* web_indexed_db_create_dom_exception(ReadonlyBytes name, FlatPtr message);
 void* web_indexed_db_dom_exception_from_value(JSValue);
 JSObject* web_indexed_db_wrap_dom_exception(void* realm, void* exception);
-bool web_indexed_db_obtain_a_storage_key(void* realm, void* ctx, void (*on_origin)(void*, URL::FFI::FfiOrigin const*));
 JSObject* web_indexed_db_create_dom_string_list(void* realm, FlatPtr const* strings, size_t count);
-JSCompletion web_indexed_db_structured_serialize_for_storage(void* realm, JSValue, void* bytes, void (*append)(void*, u8 const*, size_t));
-JSCompletion web_indexed_db_structured_deserialize(void* realm, ReadonlyBytes);
 void web_indexed_db_queue_a_database_task(void* cell, void (*steps)(JSVM*, void*));
 void web_indexed_db_run_in_parallel(void* cell, void (*steps)(JSVM*, void*));
-void* web_indexed_db_main_thread_event_loop();
+void* web_indexed_db_current_event_loop();
 void web_indexed_db_enqueue_check_pending_connection_wait(void* database);
 bool web_indexed_db_devtools_client_is_active(void* realm);
 IndexedDB::TransactionChanges* web_indexed_db_create_transaction_changes();
@@ -80,18 +73,6 @@ JSObject* web_indexed_db_wrap_dom_exception(void* realm, void* exception)
     return JS::HostABI::object_to_abi(Bindings::wrap(Bindings::host_defined_wrapper_world(js_realm), js_realm, GC::Ref { dom_exception }).ptr());
 }
 
-bool web_indexed_db_obtain_a_storage_key(void* realm, void* ctx, void (*on_origin)(void*, URL::FFI::FfiOrigin const*))
-{
-    auto& js_realm = *static_cast<JS::Realm*>(realm);
-    auto storage_key = StorageAPI::obtain_a_storage_key(HTML::relevant_settings_object(js_realm.global_object()));
-    if (!storage_key.has_value())
-        return false;
-    URL::RustIntegration::lend_origin_to_ffi(storage_key->origin, [&](URL::FFI::FfiOrigin const& origin) {
-        on_origin(ctx, &origin);
-    });
-    return true;
-}
-
 JSObject* web_indexed_db_create_dom_string_list(void* realm, FlatPtr const* strings, size_t count)
 {
     auto& js_realm = *static_cast<JS::Realm*>(realm);
@@ -103,51 +84,28 @@ JSObject* web_indexed_db_create_dom_string_list(void* realm, FlatPtr const* stri
     return JS::HostABI::object_to_abi(Bindings::wrap(Bindings::host_defined_wrapper_world(js_realm), js_realm, list).ptr());
 }
 
-// https://html.spec.whatwg.org/multipage/structured-data.html#structuredserializeforstorage
-JSCompletion web_indexed_db_structured_serialize_for_storage(void* realm, JSValue raw_value, void* bytes, void (*append)(void*, u8 const*, size_t))
-{
-    auto& js_realm = *static_cast<JS::Realm*>(realm);
-    auto serialized = HTML::structured_serialize_for_storage(js_realm.vm(), JS::HostABI::value_from_abi(raw_value));
-    if (serialized.is_exception())
-        return JS::HostABI::completion_to_abi(JS::ThrowCompletionOr<JS::Value> { WebIDL::exception_to_throw_completion(js_realm.vm(), js_realm, serialized.release_error()) });
-    auto record = serialized.release_value();
-    append(bytes, record.data.data(), record.data.size());
-    return JS::HostABI::completion_to_abi(JS::ThrowCompletionOr<JS::Value> { JS::js_undefined() });
-}
-
-// https://html.spec.whatwg.org/multipage/structured-data.html#structureddeserialize
-JSCompletion web_indexed_db_structured_deserialize(void* realm, ReadonlyBytes bytes)
-{
-    auto& js_realm = *static_cast<JS::Realm*>(realm);
-    HTML::StorageSerializationRecord record { MUST(ByteBuffer::copy(bytes)) };
-    auto value = HTML::structured_deserialize(js_realm.vm(), record, js_realm);
-    if (value.is_exception())
-        return JS::HostABI::completion_to_abi(JS::ThrowCompletionOr<JS::Value> { WebIDL::exception_to_throw_completion(js_realm.vm(), js_realm, value.release_error()) });
-    return JS::HostABI::completion_to_abi(JS::ThrowCompletionOr<JS::Value> { value.release_value() });
-}
-
 // https://w3c.github.io/IndexedDB/#queue-a-database-task
 void web_indexed_db_queue_a_database_task(void* cell, void (*steps)(JSVM*, void*))
 {
     GC::Ref<GC::Cell> function = *static_cast<GC::Cell*>(cell);
-    // NB: The task's captures, which the collector scans, keep the function alive until the steps run.
-    HTML::queue_a_task(HTML::Task::Source::DatabaseAccess, nullptr, nullptr, GC::create_function(GC::Heap::the(), [function, steps] {
-        steps(JS::HostABI::vm_to_abi(Bindings::main_thread_vm()), function.ptr());
+    // NB: The task's captures, which the collector traces, keep the function alive until the steps run.
+    HTML::queue_a_task(HTML::Task::Source::DatabaseAccess, nullptr, nullptr, GC::create_function(GC::Heap::the(), GC::captures(function, steps), [](auto& function, auto& steps) {
+        steps(JS::HostABI::vm_to_abi(JS::VM::the()), function.ptr());
     }));
 }
 
 void web_indexed_db_run_in_parallel(void* cell, void (*steps)(JSVM*, void*))
 {
     GC::Ref<GC::Cell> function = *static_cast<GC::Cell*>(cell);
-    // NB: The function's captures, which the collector scans, keep the cell alive until the steps run.
-    Platform::EventLoopPlugin::the().deferred_invoke(GC::create_function(GC::Heap::the(), [function, steps] {
-        steps(JS::HostABI::vm_to_abi(Bindings::main_thread_vm()), function.ptr());
+    // NB: The function's captures, which the collector traces, keep the cell alive until the steps run.
+    Platform::EventLoopPlugin::the().deferred_invoke(GC::create_function(GC::Heap::the(), GC::captures(function, steps), [](auto& function, auto& steps) {
+        steps(JS::HostABI::vm_to_abi(JS::VM::the()), function.ptr());
     }));
 }
 
-void* web_indexed_db_main_thread_event_loop()
+void* web_indexed_db_current_event_loop()
 {
-    return &HTML::main_thread_event_loop();
+    return &HTML::current_event_loop();
 }
 
 void web_indexed_db_enqueue_check_pending_connection_wait(void* database)
@@ -155,7 +113,7 @@ void web_indexed_db_enqueue_check_pending_connection_wait(void* database)
     GC::Heap::the().enqueue_post_gc_task([database = GC::Weak<GC::Cell>(*static_cast<GC::Cell*>(database))] {
         if (!database)
             return;
-        web_rust_indexed_db_check_pending_connection_wait(JS::HostABI::vm_to_abi(Bindings::main_thread_vm()), database.ptr().ptr());
+        web_rust_indexed_db_check_pending_connection_wait(JS::HostABI::vm_to_abi(JS::VM::the()), database.ptr().ptr());
     });
 }
 

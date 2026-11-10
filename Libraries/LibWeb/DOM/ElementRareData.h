@@ -13,6 +13,7 @@
 #include <LibWeb/DOM/Element.h>
 #include <LibWeb/HTML/CustomElements/CustomStateSet.h>
 #include <LibWeb/IntersectionObserver/IntersectionObserver.h>
+#include <LibWeb/ResizeObserver/ResizeObserver.h>
 
 namespace Web::DOM {
 
@@ -31,15 +32,7 @@ struct Element::RareData
     GC::Ptr<DOMTokenList> part_list;
     GC::Ptr<NamedNodeMap> attribute_map;
     mutable OwnPtr<PseudoElementData> pseudo_element_data;
-    struct CustomPropertyConsumerData {
-        AK_ALLOC_WITH_KMALLOC;
-
-        Vector<Utf16FlyString> style_query_references;
-        Vector<PseudoElementStyleQueryCustomPropertyReferences> pseudo_element_style_query_references;
-        Vector<RefPtr<CSS::CustomPropertyData const>> published_pseudo_element_data;
-        Vector<Utf16FlyString> published_references;
-    };
-    OwnPtr<CustomPropertyConsumerData> custom_property_consumer_data;
+    CustomHighlightStyles custom_highlight_styles;
     Optional<CSS::PseudoElement> associated_shadow_host_pseudo_element;
     Vector<Utf16FlyString> parts;
 
@@ -57,6 +50,10 @@ struct Element::RareData
     // https://www.w3.org/TR/intersection-observer/#dom-element-registeredintersectionobservers-slot
     // Element objects have an internal [[RegisteredIntersectionObservers]] slot, which is initialized to an empty list.
     OwnPtr<Vector<GC::Ref<IntersectionObserver::IntersectionObserver>>> registered_intersection_observers;
+
+    // https://drafts.csswg.org/resize-observer-1/#lifetime
+    // NB: An observer observing this element must stay alive, so the element holds it.
+    OwnPtr<Vector<GC::Ref<ResizeObserver::ResizeObserver>>> registered_resize_observers;
 
     // https://drafts.css-houdini.org/css-typed-om-1/#dom-element-computedstylemapcache-slot
     // Every Element has a [[computedStyleMapCache]] internal slot, initially set to null, which caches the result of

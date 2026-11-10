@@ -19,9 +19,6 @@ pub(crate) struct StaticPositionRect {
     pub(crate) inline_alignment: StaticPositionAlignment,
     pub(crate) block_alignment: StaticPositionAlignment,
     pub(crate) alignment_derives_from_own_computed_values: bool,
-    /// False when the box was laid out without computing where it would have been in flow, because
-    /// insets placed it on both axes. Such a rect stands in for nothing and cannot be replayed.
-    pub(crate) is_known: bool,
 }
 
 impl StaticPositionAlignment {
@@ -132,7 +129,7 @@ pub(crate) struct AbsposContainingBlockInfo {
 impl AbsposContainingBlockInfo {
     // NB: A grid area, a position area and anchor-center give an axis an alignment, and set its mode whatever the
     //     insets are. They may size or align the box against the static position rect.
-    fn axes_placed_by_own_insets(&self) -> (bool, bool) {
+    pub(crate) fn axes_placed_by_own_insets(&self) -> (bool, bool) {
         let placed_by_own_insets = |mode: AbsposAxisMode, alignment: Option<AbsposAlignment>| {
             mode == AbsposAxisMode::InsetFromRect && alignment.is_none()
         };
@@ -165,23 +162,23 @@ pub(crate) struct DefaultScrollShift {
     pub(crate) compensates_for_vertical_scroll: bool,
 }
 
-/// The position option a box was laid out with: an entry of its position options list, which was made of the base
-/// styles of one style record.
+/// The position option a box was laid out with: an entry of its position options list.
 /// https://drafts.csswg.org/css-anchor-position-1/#last-successful-position-option
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct PositionOptionChoice {
     /// 0 for the base styles, or one more than the index of the position-try-fallbacks entry that made the option.
     pub(crate) option: u32,
-    pub(crate) base_style_record: u64,
-    /// The identity of the @position-try rule the entry names, or 0 where it names none.
+    /// The @position-try rule the entry names.
     /// NB: A choice whose rule was replaced since is no longer the box's last successful position option.
-    pub(crate) rule: usize,
+    pub(crate) rule: crate::css::style::position_try::PositionTryRuleID,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct AbsposLayoutInputs {
     pub(crate) containing_block: super::formatting_context::Node,
     pub(crate) inline_containing_block: super::formatting_context::Node,
+    /// Where the box would have been in flow, in the axes its layout reads that. An axis the box's own insets place it
+    /// in holds nothing, so that the inputs stay the same as the static position moves along that axis.
     pub(crate) static_position_rect: StaticPositionRect,
     pub(crate) containing_block_info: AbsposContainingBlockInfo,
     pub(crate) resolved_anchor_insets: Option<super::formatting_context::ResolvedAnchorInsets>,

@@ -1001,18 +1001,18 @@ struct ResolvedWhiteSpace {
             && first_is_one_of(*collapse, CSS::Keyword::Preserve, CSS::Keyword::PreserveBreaks, CSS::Keyword::BreakSpaces);
     }
 
-    Optional<StringView> white_space_value() const
+    Optional<Utf16View> white_space_value() const
     {
         if (!collapse.has_value() || !wrap_mode.has_value())
             return {};
         auto nowrap = *wrap_mode == CSS::Keyword::Nowrap;
         switch (*collapse) {
         case CSS::Keyword::Collapse:
-            return nowrap ? "nowrap"sv : "normal"sv;
+            return nowrap ? u"nowrap"sv : u"normal"sv;
         case CSS::Keyword::Preserve:
-            return nowrap ? "pre"sv : "pre-wrap"sv;
+            return nowrap ? u"pre"sv : u"pre-wrap"sv;
         case CSS::Keyword::PreserveBreaks:
-            return nowrap ? OptionalNone {} : Optional<StringView> { "pre-line"sv };
+            return nowrap ? OptionalNone {} : Optional<Utf16View> { u"pre-line"sv };
         default:
             return {};
         }
@@ -1022,6 +1022,8 @@ struct ResolvedWhiteSpace {
 struct RecordedWhiteSpace {
     GC::Ref<DOM::Node> node;
     ResolvedWhiteSpace white_space;
+
+    void visit_edges(GC::Cell::Visitor& visitor) { visitor.visit(node); }
 };
 
 }
@@ -1140,13 +1142,10 @@ static bool author_style_sheet_sets_white_space(DOM::Element& element)
         return false;
     };
 
-    auto& style_sheets = element.document().style_sheets();
-    for (size_t index = 0; index < style_sheets.length(); ++index) {
-        auto* style_sheet = style_sheets.item(index);
-        if (!style_sheet || style_sheet->disabled())
+    for (auto const& style_sheet : element.document().style_scope().style_sheets()) {
+        if (style_sheet->disabled() || !style_sheet->is_origin_clean())
             continue;
-        auto rules = style_sheet->css_rules();
-        if (!rules.is_error() && rule_list_sets_white_space(rule_list_sets_white_space, *rules.value()))
+        if (rule_list_sets_white_space(rule_list_sets_white_space, style_sheet->rules()))
             return true;
     }
     return false;
@@ -1177,9 +1176,9 @@ bool element_changes_formatting(DOM::Element& element)
 }
 
 // Record the white-space style of nodes, which are about to be joined into another block.
-static GC::ConservativeVector<RecordedWhiteSpace> record_white_space_of_nodes(GC::RootVector<GC::Ref<DOM::Node>>& nodes)
+static GC::RootVector<RecordedWhiteSpace> record_white_space_of_nodes(GC::RootVector<GC::Ref<DOM::Node>>& nodes)
 {
-    GC::ConservativeVector<RecordedWhiteSpace> recorded;
+    GC::RootVector<RecordedWhiteSpace> recorded;
     GC::RootVector<GC::Ref<DOM::Node>> new_nodes;
     for (auto node : nodes) {
         auto white_space = resolved_white_space(node);
@@ -1589,8 +1588,8 @@ void delete_the_selection(Selection& selection, bool block_merging, bool strip_w
         remove_node(*start_block->first_child());
 
     // 32. If start block is an ancestor of end block:
-    GC::ConservativeVector<RecordedNodeValue> values;
-    GC::ConservativeVector<RecordedWhiteSpace> recorded_white_space;
+    GC::RootVector<RecordedNodeValue> values;
+    GC::RootVector<RecordedWhiteSpace> recorded_white_space;
     if (start_block->is_ancestor_of(*end_block)) {
         // 1. Let reference node be end block.
         auto reference_node = end_block;
@@ -4129,10 +4128,10 @@ Vector<RecordedOverride> record_current_states_and_values(DOM::Document const& d
 }
 
 // https://w3c.github.io/editing/docs/execCommand/#record-the-values
-GC::ConservativeVector<RecordedNodeValue> record_the_values_of_nodes(Vector<GC::Ref<DOM::Node>> const& node_list)
+GC::RootVector<RecordedNodeValue> record_the_values_of_nodes(Vector<GC::Ref<DOM::Node>> const& node_list)
 {
     // 1. Let values be a list of (node, command, specified command value) triples, initially empty.
-    GC::ConservativeVector<RecordedNodeValue> values;
+    GC::RootVector<RecordedNodeValue> values;
 
     // 2. For each node in node list, for each command in the list "subscript", "bold", "fontName",
     //    "fontSize", "foreColor", "hiliteColor", "italic", "strikethrough", and "underline" in that
@@ -5542,15 +5541,8 @@ CSSPixels font_size_to_pixel_size(Utf16View const& font_size)
     if (!keyword.has_value())
         return pixel_size;
 
-    // Convert the keyword to an absolute-size
-    auto absolute_size = CSS::keyword_to_absolute_size(keyword.value());
-
-    // If that failed - give up
-    if (!absolute_size.has_value())
-        return pixel_size;
-
-    // Return scaled pixel size
-    return CSS::StyleComputer::absolute_size_mapping(absolute_size.value(), pixel_size);
+    // Return scaled pixel size, or give up if the keyword is not an absolute-size
+    return CSSPixels::from_raw(CSS::ComputedValuesFFI::rust_absolute_size_font_mapping(to_underlying(keyword.value()), pixel_size.raw_value()));
 }
 
 void for_each_node_effectively_contained_in_range(GC::Ptr<DOM::Range> range, Function<TraversalDecision(GC::Ref<DOM::Node>)> callback)

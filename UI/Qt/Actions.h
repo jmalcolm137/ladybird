@@ -1,0 +1,321 @@
+/*
+ * Copyright (c) 2025-2026, Tim Flynn <trflynn89@ladybird.org>
+ *
+ * SPDX-License-Identifier: BSD-2-Clause
+ */
+
+#pragma once
+
+#include <AK/ByteBuffer.h>
+#include <AK/Function.h>
+#include <AK/HashMap.h>
+#include <AK/NonnullOwnPtr.h>
+#include <AK/NonnullRefPtr.h>
+#include <AK/Optional.h>
+#include <AK/RefCounted.h>
+#include <AK/String.h>
+#include <AK/StringView.h>
+#include <AK/Variant.h>
+#include <AK/Vector.h>
+#include <AK/WeakPtr.h>
+#include <AK/Weakable.h>
+#include <LibWebView/Forward.h>
+
+namespace Ladybird {
+
+class Action;
+class Menu;
+
+enum class ActionID {
+    NavigateBack,
+    NavigateForward,
+    Reload,
+    ReloadBypassingCache,
+    ViewDownloads,
+    ViewHistory,
+    ClearBrowsingData,
+
+    Undo,
+    Redo,
+    CopySelection,
+    CutSelection,
+    Paste,
+    PasteAndMatchStyle,
+    SelectAll,
+
+    LookUpSelectedText,
+    SearchSelectedText,
+    CopyLinkToHighlight,
+    SpellingGuess,
+    NoSpellingGuesses,
+    IgnoreSpelling,
+    LearnSpelling,
+
+    TakeScreenshot,
+    ReportWebsiteIssue,
+
+    ToggleVerticalTabsExpanded,
+
+    ToggleMenuBar,
+
+    ManageBookmarks,
+    ToggleBookmark,
+    ToggleBookmarkViaToolbar,
+    ToggleBookmarksBar,
+    ShowBookmarksBar,
+    BookmarkItem,
+
+    OpenAllBookmarksInTabs,
+    AddBookmark,
+    AddBookmarkAllTabs,
+    AddBookmarkFolder,
+    DeleteBookmark,
+    DeleteBookmarkFolder,
+    EditBookmark,
+    EditBookmarkFolder,
+
+    OpenAboutPage,
+    OpenTaskManager,
+    OpenSettingsPage,
+    ToggleDevTools,
+    ViewSource,
+    InspectElement,
+
+    OpenInNewTab,
+    OpenInNewWindow,
+    OpenInNewPrivateWindow,
+    DownloadLinkedFile,
+    DownloadLinkedFileAs,
+    CopyURL,
+
+    OpenImage,
+    SaveImage,
+    CopyImage,
+
+    OpenAudio,
+    OpenVideo,
+    PlayMedia,
+    PauseMedia,
+    MuteMedia,
+    UnmuteMedia,
+    ShowControls,
+    HideControls,
+    ToggleMediaLoopState,
+    EnterFullscreen,
+    ExitFullscreen,
+    EnterPictureInPicture,
+    ExitPictureInPicture,
+
+    TranslatePage,
+    TranslateTo,
+    ShowOriginal,
+    DownloadTranslationLanguages,
+    PreferHigherQualityTranslation,
+    EditPreferredLanguages,
+
+    ZoomIn,
+    ZoomOut,
+    ResetZoom,
+    ResetZoomViaToolbar,
+
+    PreferredColorScheme,
+    ForceDark,
+    PreferredContrast,
+    PreferredMotion,
+
+    DumpSessionHistoryTree,
+    DumpDOMTree,
+    DumpLayoutTree,
+    DumpStackingContextTree,
+    DumpSiteIsolationProcessTree,
+    DumpDisplayList,
+    DumpStyleSheets,
+    DumpStyles,
+    DumpCSSErrors,
+    DumpCookies,
+    DumpLocalStorage,
+    DumpSessionStorage,
+    DumpGCGraph,
+    ReportLeakedDocuments,
+    ShowLineBoxBorders,
+    ShowCaretHitTestDebugOverlay,
+    ShowTabPerformanceMonitor,
+    CollectGarbage,
+    CrashCurrentPage,
+    CrashCompositorProcess,
+    SpoofUserAgent,
+    NavigatorCompatibilityMode,
+    EnableScripting,
+    BlockPopUps,
+};
+
+using ActionText = Variant<StringView, String>;
+
+inline StringView action_text_to_string_view(ActionText const& text)
+{
+    return text.visit([](auto const& text) -> StringView { return text; });
+}
+
+class Action
+    : public RefCounted<Action>
+    , public Weakable<Action> {
+public:
+    static NonnullRefPtr<Action> create(ActionText text, ActionID id, Function<void()> action);
+    static NonnullRefPtr<Action> create_checkable(ActionText text, ActionID id, Function<void()> action);
+
+    void activate() { m_action(); }
+
+    StringView text() const { return action_text_to_string_view(m_text); }
+    void set_text(ActionText);
+
+    bool has_tooltip() const { return m_tooltip.has_value(); }
+    StringView tooltip() const { return action_text_to_string_view(*m_tooltip); }
+    void set_tooltip(ActionText);
+
+    void set_png_icon(Optional<ByteBuffer> png_icon) { m_png_icon = move(png_icon); }
+    Optional<ByteBuffer const&> png_icon() const { return m_png_icon; }
+
+    ActionID id() const { return m_id; }
+
+    HashMap<StringView, String> const& properties() const { return m_properties; }
+    void add_property(StringView name, String value) { m_properties.set(name, move(value)); }
+
+    bool enabled() const { return m_enabled; }
+    void set_enabled(bool);
+
+    bool visible() const { return m_visible; }
+    void set_visible(bool);
+
+    bool engaged() const { return m_engaged; }
+    void set_engaged(bool);
+
+    // Work the action started is under way, e.g. a download, which its button shows by pulsing.
+    bool busy() const { return m_busy; }
+    void set_busy(bool);
+
+    bool is_checkable() const { return m_checked.has_value(); }
+    bool checked() const { return *m_checked; }
+    void set_checked(bool);
+
+    struct Observer {
+        AK_ALLOC_WITH_KMALLOC;
+
+        virtual ~Observer() = default;
+
+        virtual void on_text_changed(Action&) { }
+        virtual void on_tooltip_changed(Action&) { }
+        virtual void on_enabled_state_changed(Action&) { }
+        virtual void on_visible_state_changed(Action&) { }
+        virtual void on_engaged_state_changed(Action&) { }
+        virtual void on_busy_state_changed(Action&) { }
+        virtual void on_checked_state_changed(Action&) { }
+    };
+
+    void add_observer(NonnullOwnPtr<Observer>);
+    void remove_observer(Observer const& observer);
+
+    void set_group(Badge<Menu>, Menu& group) { m_group = group; }
+
+private:
+    Action(ActionText text, ActionID id, Function<void()> action)
+        : m_text(move(text))
+        , m_id(id)
+        , m_action(move(action))
+    {
+    }
+
+    void set_checked_internal(bool checked);
+
+    ActionText m_text;
+    Optional<ActionText> m_tooltip;
+    Optional<ByteBuffer> m_png_icon;
+
+    ActionID m_id;
+    HashMap<StringView, String> m_properties;
+
+    bool m_enabled { true };
+    bool m_visible { true };
+    bool m_engaged { false };
+    bool m_busy { false };
+    Optional<bool> m_checked;
+
+    Function<void()> m_action;
+    Vector<NonnullOwnPtr<Observer>, 1> m_observers;
+
+    WeakPtr<Menu> m_group;
+};
+
+struct Separator { };
+
+class Menu
+    : public RefCounted<Menu>
+    , public Weakable<Menu> {
+public:
+    using MenuItem = Variant<NonnullRefPtr<Action>, NonnullRefPtr<Menu>, Separator>;
+
+    static NonnullRefPtr<Menu> create(ActionText title);
+    static NonnullRefPtr<Menu> create_group(ActionText title);
+
+    void add_action(NonnullRefPtr<Action> action);
+    void add_submenu(NonnullRefPtr<Menu> submenu) { m_items.append(move(submenu)); }
+    void add_separator() { m_items.append(Separator {}); }
+
+    size_t size() const { return m_items.size(); }
+    void shrink(size_t size) { m_items.shrink(size); }
+
+    StringView title() const { return action_text_to_string_view(m_title); }
+
+    Span<MenuItem> items() { return m_items; }
+    ReadonlySpan<MenuItem> items() const { return m_items; }
+
+    HashMap<StringView, String> const& properties() const { return m_properties; }
+    void add_property(StringView name, String value) { m_properties.set(name, move(value)); }
+
+    void set_render_group_icon(bool render_group_icon) { m_render_group_icon = render_group_icon; }
+    bool render_group_icon() const { return m_render_group_icon; }
+
+    bool is_group() const { return m_is_group; }
+
+    bool visible() const { return m_visible; }
+    void set_visible(bool);
+
+    template<typename Callback>
+    void for_each_action(Callback const& callback)
+    {
+        for (auto& item : m_items) {
+            item.visit(
+                [&](NonnullRefPtr<Action>& action) { callback(*action); },
+                [&](NonnullRefPtr<Menu>& submenu) { submenu->for_each_action(callback); },
+                [&](Separator) { });
+        }
+    }
+
+    struct Observer {
+        AK_ALLOC_WITH_KMALLOC;
+
+        virtual ~Observer() = default;
+
+        virtual void on_visible_state_changed(Menu&) { }
+    };
+
+    void add_observer(NonnullOwnPtr<Observer>);
+    void remove_observer(Observer const& observer);
+
+private:
+    explicit Menu(ActionText title)
+        : m_title(move(title))
+    {
+    }
+
+    ActionText m_title;
+    Vector<MenuItem> m_items;
+
+    HashMap<StringView, String> m_properties;
+    Vector<NonnullOwnPtr<Observer>, 1> m_observers;
+
+    bool m_is_group { false };
+    bool m_render_group_icon { false };
+    bool m_visible { true };
+};
+
+}

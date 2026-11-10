@@ -24,16 +24,16 @@ use ak::Utf16FlyString;
 use libjs_rust::api::{
     Attribute, DeferGc, EmbedderCell, EmbedderClass, EmbedderValue, ErrorKind, ErrorType, ExternalMemorySize,
     FunctionObject, Gc, HostObject, JSHostClass, Object, PrimitiveString, PropertyAttributes, PropertyKey,
-    RawNativeFunction, RawNativeFunctionPointer, Realm, Throw, ThrowCompletionOr, Trace, Value, Vm, get_function_realm,
-    host_data_of, is_host_instance_of,
+    RawNativeFunction, RawNativeFunctionPointer, Realm, ThrowCompletionOr, Trace, Value, Vm, get_function_realm,
+    host_class_of, host_data_of, is_host_instance_of,
 };
 
 use crate::bindings::CallContext;
 use crate::bindings::realm_data::wrapper_world_of;
 use crate::bindings::services::{
-    web_bindings_ensure_web_constructor, web_bindings_ensure_web_prototype, web_bindings_realm_is_window,
-    web_bindings_rejected_promise, web_bindings_rust_wrapper_for, web_bindings_set_rust_wrapper,
-    web_bindings_with_temporary_execution_context,
+    web_bindings_define_unforgeable_attributes, web_bindings_ensure_web_constructor, web_bindings_ensure_web_prototype,
+    web_bindings_perform_a_security_check, web_bindings_realm_is_secure_context, web_bindings_realm_is_window,
+    web_bindings_rust_wrapper_for, web_bindings_set_rust_wrapper, web_bindings_with_temporary_execution_context,
 };
 
 /// What an implementation can tell the bindings about its objects, as a C++ implementation object does by overriding
@@ -42,7 +42,7 @@ pub(crate) trait Wrappable {
     /// The realm of the relevant global object of the object, which the wrapper of the object in the main world is
     /// created in, as Wrappable::relevant_global_impl() decides for a C++ implementation object. Without one, the
     /// wrapper is created in the realm that first asks for it.
-    fn relevant_realm(&self, _vm: &Vm) -> Option<Gc<Realm>> {
+    fn relevant_realm(&self) -> Option<Gc<Realm>> {
         None
     }
 
@@ -114,6 +114,9 @@ pub(crate) trait Interface: Wrappable + Trace + Sized + 'static {
     const INTERFACE_NAME: u16;
     /// The name that errors call the interface.
     const NAME: &'static str;
+    /// The interface implemented in C++ that the interface inherits from, if it has unforgeable attributes, which are
+    /// properties of each wrapper.
+    const UNFORGEABLE_ATTRIBUTES_INTERFACE: Option<u16> = None;
 
     /// The class of the wrappers of the objects of the interface.
     fn wrapper_class() -> &'static JSHostClass;
@@ -195,13 +198,46 @@ impl<T: Interface> ConstructedObject<T> for Ref<T> {
     }
 }
 
+/// HTML::SecurityCheckType.
+#[derive(Clone, Copy)]
+#[repr(u8)]
+pub(crate) enum SecurityCheckType {
+    Method,
+    Getter,
+    Setter,
+}
+
+/// https://webidl.spec.whatwg.org/#dfn-perform-a-security-check
+pub(crate) fn perform_a_security_check(
+    vm: &Vm,
+    platform_object: Value,
+    identifier: &str,
+    check_type: SecurityCheckType,
+) -> ThrowCompletionOr<()> {
+    let realm = vm.current_realm().expect("a native function runs in a realm");
+    // SAFETY: The realm is live, the value is live while the native function runs, and the identifier is lent for the
+    //         call.
+    unsafe {
+        web_bindings_perform_a_security_check(
+            realm.as_ptr().cast(),
+            platform_object.to_raw(),
+            ak::Span::new(identifier.as_bytes()),
+            check_type as u8,
+        )
+    }
+    .into_completion()
+    .map(|_| ())
+}
+
 /// The object an attribute or an operation of an interface runs on, if it is a wrapper of the interface or of an
 /// interface that inherits from it, with the object's realm. A nullish this value stands for the global object of
-/// the current realm.
+/// the current realm. https://webidl.spec.whatwg.org/#implementation-check-an-object
 pub(crate) fn this_object(
     vm: &Vm,
     wrapper_class: &'static JSHostClass,
     interface_name: &str,
+    identifier: &str,
+    check_type: SecurityCheckType,
 ) -> ThrowCompletionOr<(Gc<Object>, Gc<Realm>)> {
     let mut this_value = vm.this_value();
     if this_value.is_nullish() {
@@ -214,6 +250,8 @@ pub(crate) fn this_object(
             return Ok((object, object.shape().realm()));
         }
     }
+    // NB: This runs after the check above, which no Window or Location object passes.
+    perform_a_security_check(vm, this_value, identifier, check_type)?;
     vm.throw_completion(ErrorKind::TypeError, ErrorType::NotAnObjectOfType, &[&interface_name])
 }
 
@@ -231,18 +269,37 @@ pub(crate) fn implementation_if<T: Interface>(wrapper: Gc<Object>) -> Option<Ref
     unsafe { T::CELL_CLASS.downcast(host_data) }
 }
 
+/// The object of the interface that the object is a wrapper of, if it is one.
+pub(crate) fn implementation_if_wrapper<T: Interface>(object: Gc<Object>) -> Option<Ref<T>> {
+    is_host_instance_of(&object, T::wrapper_class()).then(|| implementation_of(object))
+}
+
+/// Whether the object is a wrapper of exactly this interface, and not of one that inherits from it.
+pub(crate) fn is_exact_wrapper<T: Interface>(object: Gc<Object>) -> bool {
+    host_class_of(&object).is_some_and(|class| core::ptr::eq(class, T::wrapper_class()))
+}
+
 /// An object of the interface converted from a JS value, https://webidl.spec.whatwg.org/#js-interface
 pub(crate) fn to_interface<T: Interface>(vm: &Vm, value: Value) -> ThrowCompletionOr<Ref<T>> {
     // 1. If V implements I, then return the IDL interface type value that represents a reference to that platform
     //    object.
-    if value.is_object() {
-        let object = value.as_object();
-        if is_host_instance_of(&object, T::wrapper_class()) {
-            return Ok(implementation_of(object));
-        }
+    if value.is_object()
+        && let Some(object) = implementation_if_wrapper(value.as_object())
+    {
+        return Ok(object);
     }
     // 2. Throw a TypeError.
     vm.throw_completion(ErrorKind::TypeError, ErrorType::NotAnObjectOfType, &[&T::NAME])
+}
+
+/// The `this` value of an operation of a setlike or maplike, its implementation, and the context of its realm.
+pub(crate) fn this_implementation<'vm, T: Interface>(
+    vm: &'vm Vm,
+    identifier: &str,
+    check_type: SecurityCheckType,
+) -> ThrowCompletionOr<(Gc<Object>, Ref<T>, CallContext<'vm>)> {
+    let (wrapper, realm) = this_object(vm, T::wrapper_class(), T::NAME, identifier, check_type)?;
+    Ok((wrapper, implementation_of(wrapper), CallContext::new(vm, realm)))
 }
 
 /// The wrapper of the object in the wrapper world of the realm of the call context, which the first call for that
@@ -268,15 +325,10 @@ pub(crate) fn wrap<T: Interface>(cx: &CallContext, object: Ref<T>) -> Gc<Object>
             return wrapper.upcast();
         }
         let wrapper_realm = object
-            .relevant_realm(vm)
+            .relevant_realm()
             .filter(|relevant_realm| wrapper_world_of(vm, *relevant_realm) == wrapper_world)
             .unwrap_or(realm);
-        let wrapper = create_wrapper(
-            vm,
-            wrapper_realm,
-            interface_prototype_object(wrapper_realm, T::INTERFACE_NAME),
-            object,
-        );
+        let wrapper = create_wrapper(vm, wrapper_realm, object);
         object.main_world_wrapper.set(Some(wrapper));
         return wrapper.upcast();
     }
@@ -287,7 +339,7 @@ pub(crate) fn wrap<T: Interface>(cx: &CallContext, object: Ref<T>) -> Gc<Object>
         // SAFETY: LibWeb returns a live wrapper.
         return unsafe { Gc::from_non_null(wrapper) };
     }
-    let wrapper = create_wrapper(vm, realm, interface_prototype_object(realm, T::INTERFACE_NAME), object);
+    let wrapper = create_wrapper(vm, realm, object);
     register_wrapper_outside_main_world(realm, object, wrapper);
     wrapper.upcast()
 }
@@ -305,7 +357,8 @@ pub(crate) fn construct_wrapper<T: Interface>(
         object.main_world_wrapper.get().is_none(),
         "the constructor steps create no wrapper of the new object"
     );
-    let wrapper = create_wrapper(vm, realm, prototype, object);
+    let wrapper = create_wrapper(vm, realm, object);
+    wrapper.set_prototype(vm, Some(prototype));
     if wrapper_world_of(vm, realm).is_main_world() {
         object.main_world_wrapper.set(Some(wrapper));
     } else {
@@ -321,10 +374,15 @@ fn register_wrapper_outside_main_world<T: Interface>(realm: Gc<Realm>, object: R
     }
 }
 
-fn create_wrapper<T: Interface>(vm: &Vm, realm: Gc<Realm>, prototype: Gc<Object>, object: Ref<T>) -> Gc<HostObject> {
+/// A new wrapper of the object, which always starts from the interface's own prototype. Shapes do not know the class of
+/// their objects, so a wrapper created directly with the prototype of another interface would share the shape of that
+/// interface's wrappers, and a direct getter validated on those would read a field of the other interface out of this
+/// wrapper's implementation.
+fn create_wrapper<T: Interface>(vm: &Vm, realm: Gc<Realm>, object: Ref<T>) -> Gc<HostObject> {
+    let prototype = interface_prototype_object(realm, T::INTERFACE_NAME);
     // SAFETY: The wrapper class's hooks expect a wrappable exactly for an interface that inherits from an interface
     //         implemented in C++, whose objects own one, and the wrappable and the host data are live cells.
-    unsafe {
+    let wrapper = unsafe {
         HostObject::create(
             vm,
             realm,
@@ -333,7 +391,14 @@ fn create_wrapper<T: Interface>(vm: &Vm, realm: Gc<Realm>, prototype: Gc<Object>
             object.cpp_parent(),
             Some(object.as_non_null().cast()),
         )
+    };
+    if let Some(interface_name) = T::UNFORGEABLE_ATTRIBUTES_INTERFACE {
+        // SAFETY: The realm and the wrapper are live, and the interface is one the wrapper's interface inherits from.
+        unsafe {
+            web_bindings_define_unforgeable_attributes(realm.as_ptr().cast(), wrapper.as_ptr().cast(), interface_name);
+        }
     }
+    wrapper
 }
 
 /// The cell of an object of the interface, as LibWeb's C++ code holds it: a pointer to a class that derives from
@@ -372,6 +437,12 @@ pub(crate) fn realm_is_window(realm: Gc<Realm>) -> bool {
     unsafe { web_bindings_realm_is_window(realm.as_ptr().cast()) }
 }
 
+/// Whether the realm is a secure context, which the [SecureContext] members are defined for.
+pub(crate) fn realm_is_secure_context(realm: Gc<Realm>) -> bool {
+    // SAFETY: The realm is live.
+    unsafe { web_bindings_realm_is_secure_context(realm.as_ptr().cast()) }
+}
+
 /// Runs the steps while an execution context of the realm is on the stack, for steps that can run script but that do not
 /// run on behalf of script, as an HTML::TemporaryExecutionContext does for C++.
 pub(crate) fn with_temporary_execution_context<F: FnOnce() -> R, R>(realm: Gc<Realm>, steps: F) -> R {
@@ -402,23 +473,6 @@ fn run_with_temporary_execution_context<F: FnOnce() -> R, R>(realm: Gc<Realm>, c
         );
     }
     context.1.expect("LibWeb runs the steps")
-}
-
-/// What an operation that returns a promise type returns in place of throwing: a promise rejected with what its
-/// steps threw, https://webidl.spec.whatwg.org/#dfn-create-operation-function
-pub(crate) fn rejected_promise(vm: &Vm, throw: Throw) -> Value {
-    let current_realm = vm.current_realm().expect("a native function runs in a realm");
-    // SAFETY: The realm is live, and the values are live while the native function runs.
-    let promise = unsafe {
-        web_bindings_rejected_promise(
-            current_realm.as_ptr().cast(),
-            vm.this_value().to_raw(),
-            throw.value().to_raw(),
-        )
-    };
-    let promise = NonNull::new(promise.cast::<Object>()).expect("LibWeb returns the promise");
-    // SAFETY: LibWeb returns a live promise.
-    Value::from_object(unsafe { Gc::from_non_null(promise) })
 }
 
 /// The interface prototype object of the interface in the realm.
@@ -569,17 +623,23 @@ pub(crate) fn define_operation(
     );
 }
 
+/// Defines the @@iterator property of the interface prototype object of an interface that supports indexed properties,
+/// which is %Array.prototype.values%, https://webidl.spec.whatwg.org/#es-iterator
+pub(crate) fn define_indexed_properties_iterator(vm: &Vm, realm: Gc<Realm>, prototype: Gc<Object>) {
+    let array_prototype = realm.intrinsics().array_prototype(vm);
+    prototype.define_direct_property(
+        vm,
+        &PropertyKey::from(vm.well_known_symbols().iterator),
+        array_prototype.get_without_side_effects(vm, &vm.names.values),
+        PropertyAttributes::new(Attribute::CONFIGURABLE | Attribute::WRITABLE),
+    );
+}
+
 /// Defines the properties of a value iterator on the interface prototype object of an interface that supports indexed
 /// properties, which are those of %Array.prototype%, https://webidl.spec.whatwg.org/#define-the-iteration-methods
 pub(crate) fn define_value_iterator_properties(vm: &Vm, realm: Gc<Realm>, prototype: Gc<Object>) {
     let array_prototype = realm.intrinsics().array_prototype(vm);
     let names = &vm.names;
-    prototype.define_direct_property(
-        vm,
-        &PropertyKey::from(vm.well_known_symbols().iterator),
-        array_prototype.get_without_side_effects(vm, &names.values),
-        PropertyAttributes::new(Attribute::CONFIGURABLE | Attribute::WRITABLE),
-    );
     for name in [&names.entries, &names.keys, &names.values, &names.forEach] {
         prototype.define_direct_property(
             vm,

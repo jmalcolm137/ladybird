@@ -31,7 +31,7 @@ GC::Ref<DOM::HTMLCollection> HTMLDataListElement::options()
 {
     // The options IDL attribute must return an HTMLCollection rooted at the datalist node, whose filter matches option elements.
     if (!m_options) {
-        m_options = DOM::HTMLCollection::create(*this, DOM::HTMLCollection::Scope::Descendants, [](Element const& element) { return is<HTML::HTMLOptionElement>(element); }, DOM::HTMLCollection::AttributeInvalidationType::None);
+        m_options = DOM::HTMLCollection::create(*this, DOM::HTMLCollection::Scope::Descendants, GC::create_function(GC::Heap::the(), [](Element const& element) { return is<HTML::HTMLOptionElement>(element); }), DOM::HTMLCollection::AttributeInvalidationType::None);
     }
     return *m_options;
 }
@@ -65,13 +65,13 @@ void HTMLDataListElement::attribute_changed(Utf16FlyString const& name, Optional
 //     left, shows the suggestions of whatever element its list attribute now names.
 void HTMLDataListElement::notify_inputs_with_suggestions_sources_in(DOM::Node& root)
 {
-    queue_an_element_task(HTML::Task::Source::DOMManipulation, [root = GC::Ref { root }] {
+    queue_an_element_task(HTML::Task::Source::DOMManipulation, GC::create_function(GC::Heap::the(), GC::captures(GC::Ref { root }), [](GC::Ref<DOM::Node>& root) {
         root->for_each_in_inclusive_subtree_of_type<HTMLInputElement>([](HTMLInputElement& input) {
             if (input.has_attribute(AttributeNames::list))
                 input.suggestions_source_element_did_change();
             return TraversalDecision::Continue;
         });
-    });
+    }));
 }
 
 // NB: An input that shows the suggestions of a datalist, such as the ticks of a slider, shows them again once the
@@ -82,14 +82,14 @@ void HTMLDataListElement::notify_inputs_using_this_as_suggestions_source()
     if (m_input_notification_queued || !id().has_value())
         return;
     m_input_notification_queued = true;
-    queue_an_element_task(HTML::Task::Source::DOMManipulation, [this] {
-        m_input_notification_queued = false;
-        root().for_each_in_inclusive_subtree_of_type<HTMLInputElement>([&](HTMLInputElement& input) {
-            if (auto list = input.get_attribute(AttributeNames::list); list.has_value() && id() == *list)
+    queue_an_element_task(HTML::Task::Source::DOMManipulation, GC::create_function(GC::Heap::the(), GC::captures(*this), [](HTMLDataListElement& self) {
+        self.m_input_notification_queued = false;
+        self.root().for_each_in_inclusive_subtree_of_type<HTMLInputElement>([&](HTMLInputElement& input) {
+            if (auto list = input.get_attribute(AttributeNames::list); list.has_value() && self.id() == *list)
                 input.suggestions_source_element_did_change();
             return TraversalDecision::Continue;
         });
-    });
+    }));
 }
 
 }

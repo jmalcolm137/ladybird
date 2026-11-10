@@ -14,6 +14,7 @@
 #include <AK/String.h>
 #include <AK/Vector.h>
 #include <AK/Weakable.h>
+#include <LibURL/Forward.h>
 #include <LibWebView/CrashReportStore.h>
 #include <LibWebView/CrashReportSubmission.h>
 #include <LibWebView/Forward.h>
@@ -30,6 +31,13 @@ public:
     static constexpr size_t maximum_description_bytes = 16384;
     static constexpr size_t maximum_url_bytes = 4096;
 
+    // What an earlier attempt sent, which lets another attempt count as the same submission.
+    struct PreparedSubmission {
+        ByteString manifest;
+        String description;
+        Optional<String> url;
+    };
+
     struct Report {
         ByteString name;
         // The fields that tell crashes apart. The rest is in the report itself, which report_text() reads.
@@ -39,13 +47,17 @@ public:
     explicit CrashReportReview(CrashReportStore& = CrashReportStore::the());
     ~CrashReportReview();
 
-    // Opens the named report, or the newest one awaiting review. Being shown is the user's one prompt for a report, so
-    // it counts as seen from then on and declining it needs no further step.
-    ErrorOr<Report> open(Optional<ByteString> const& name = {});
-    bool has_next_report() const;
+    // Opens the named report, which goes on waiting until it is sent or declined.
+    ErrorOr<Report> open(ByteString const& name);
+
+    // The user's answer that this report is not to be sent, after which it no longer waits.
+    ErrorOr<void> decline();
 
     // The open report's text, exactly as it would be attached.
     ErrorOr<ByteString> report_text() const;
+
+    // What a report may say about the page that crashed: an http or https URL without its credentials and fragment.
+    static Optional<String> website_from_url(URL::URL const&);
 
     // A message for the user when these choices cannot be sent.
     static Optional<String> validate(StringView description, Optional<StringView> url);
@@ -53,7 +65,11 @@ public:
     // Returns why nothing was sent, or nothing when the report is on its way. A report on its way keeps being sent if
     // the review is destroyed, which then only stops hearing about it.
     Optional<String> send(String const& description, Optional<String> const& url);
+    PreparedSubmission prepared_submission() const { return { m_prepared_manifest, m_prepared_description, m_prepared_url }; }
+    void set_prepared_submission(PreparedSubmission);
     bool is_sending() const { return m_submission; }
+    CrashReportSubmission* submission() { return m_submission; }
+    ByteString const& report_name() const { return m_report_name; }
     void cancel_sending();
 
     Function<void(ReportSubmission::Stage)> on_progress;

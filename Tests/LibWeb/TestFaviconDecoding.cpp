@@ -34,8 +34,9 @@ public:
     }
 
     virtual ErrorOr<Web::Platform::DecodedFirstFrame> decode_first_frame_synchronously(ReadonlyBytes) override { VERIFY_NOT_REACHED(); }
-    virtual void request_animation_frames(i64, u32, u32) override { VERIFY_NOT_REACHED(); }
     virtual void stop_animation_decode(i64) override { VERIFY_NOT_REACHED(); }
+    virtual void connect_frame_client(IPC::TransportHandle) override { VERIFY_NOT_REACHED(); }
+    virtual u64 client_generation() const override { VERIFY_NOT_REACHED(); }
 
     size_t decode_count { 0 };
 };
@@ -64,7 +65,7 @@ TEST_CASE(each_favicon_is_decoded_once)
         link.set_rel("icon"_utf16);
         link.set_href(source);
         MUST(document->head()->append_child(element));
-        Web::HTML::main_thread_event_loop().spin_until(GC::create_function(document->heap(), [link = GC::Ref { link }] {
+        Web::HTML::main_thread_event_loop().spin_until(GC::create_function(document->heap(), GC::captures(GC::Ref { link }), [](auto& link) {
             return link->has_loaded_icon();
         }));
         ++expected_decode_count;

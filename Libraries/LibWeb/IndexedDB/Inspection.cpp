@@ -49,11 +49,13 @@ struct IndexedDatabaseDocument {
     String url;
     GC::Ref<DOM::Document> document;
     StorageAPI::StorageKey storage_key;
+
+    void visit_edges(GC::Cell::Visitor& visitor) { visitor.visit(document); }
 };
 
 static JSVM* vm()
 {
-    return JS::HostABI::vm_to_abi(Bindings::main_thread_vm());
+    return JS::HostABI::vm_to_abi(JS::VM::the());
 }
 
 static String serialize_key_path(KeyPathAbi const& key_path)
@@ -83,9 +85,9 @@ static String serialize_record_value(JS::Realm& realm, ReadonlyBytes bytes)
     return serialized.release_value();
 }
 
-static GC::ConservativeVector<IndexedDatabaseDocument> indexed_database_documents_for_inspection(DOM::Document& root_document)
+static GC::RootVector<IndexedDatabaseDocument> indexed_database_documents_for_inspection(DOM::Document& root_document)
 {
-    GC::ConservativeVector<IndexedDatabaseDocument> documents;
+    GC::RootVector<IndexedDatabaseDocument> documents;
 
     auto append_document = [&](DOM::Document& document) {
         auto storage_key = StorageAPI::obtain_a_storage_key(document.relevant_settings_object());

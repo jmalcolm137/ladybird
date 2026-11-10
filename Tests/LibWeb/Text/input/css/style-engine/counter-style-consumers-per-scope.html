@@ -1,0 +1,40 @@
+<!DOCTYPE html>
+<script src="../../include.js"></script>
+<div id="first"></div>
+<div id="second"></div>
+<script>
+    function attach(host, symbols) {
+        const root = host.attachShadow({ mode: "open" });
+        root.innerHTML = `<style>
+            @counter-style marker { system: cyclic; symbols: "${symbols}"; }
+            .item { display: list-item; list-style: marker inside; width: max-content; }
+        </style><span></span><span></span>`;
+        return root;
+    }
+
+    function append_items(root) {
+        for (let index = 0; index < 3; ++index) {
+            const item = document.createElement("div");
+            item.className = "item";
+            root.appendChild(item);
+        }
+        return [...root.querySelectorAll(".item")];
+    }
+
+    test(() => {
+        const first_root = attach(document.getElementById("first"), "A");
+        const second_root = attach(document.getElementById("second"), "BBBBBBBB");
+        internals.updateStyle();
+        const first = append_items(first_root);
+        const second = append_items(second_root);
+        internals.updateStyle();
+        const record = element => internals.styleRecordIdentity(element);
+        const width = element => element.getBoundingClientRect().width;
+        // NB: Whether two consumers of one scope's counter style hold one record is up to the caches, which may have no
+        //     room for it. No record answers for a consumer of the other scope's, and each consumer shows its own.
+        println(`scopes' consumers hold different records: ${first.every(a => second.every(b => record(a) !== record(b)))}`);
+        println(`first scope's consumers look alike: ${first.every(item => width(item) === width(first[0]))}`);
+        println(`second scope's consumers look alike: ${second.every(item => width(item) === width(second[0]))}`);
+        println(`each scope's consumers use its counter style: ${first.every(a => second.every(b => width(b) > width(a)))}`);
+    });
+</script>

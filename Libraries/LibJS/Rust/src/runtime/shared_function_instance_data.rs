@@ -4,32 +4,33 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-use core::cell::{Cell, RefCell};
+use core::cell::{Cell, OnceCell, RefCell};
 use std::collections::HashSet;
 use std::rc::Rc;
+use std::sync::Arc;
 
 use ak::{Utf16FlyString, Utf16String};
 use libjs_runtime_macros::Trace;
 
 pub use crate::ast::FunctionKind;
-use crate::ast::FunctionPayload;
-use crate::bytecode::bytecode_cache::materialize_cached_function_executable;
 use crate::bytecode::executable::Executable;
-use crate::bytecode::generator::{FunctionSfdMetadata, PendingSharedFunctionData, PrecompiledFunction};
-use crate::bytecode_cache::{DecodedCachedExecutableRecord, DecodedFunctionRecord};
-use crate::compile::FunctionPrecompileMode;
+use crate::bytecode::executable_data::{FunctionSfdMetadata, PendingSharedFunctionData, PrecompiledFunction};
+use crate::compile::FunctionPayload;
 use crate::compile::SharedFunctionDescription;
 use crate::gc::class::{GcCell, define_cell};
+use crate::gc::defer_gc::DeferGc;
 use crate::gc::gc_ref_cell::GcRefCell;
-use crate::gc::root::MarkedVec;
 use crate::gc::visitor::{Trace, Visitor};
-use crate::interpreter::run::should_dump_bytecode;
 use crate::interpreter::vm::Vm;
-use crate::layout::cell::{CellHeader, Gc};
+use crate::layout::cell::{CellHeaderTail, Gc};
+use crate::layout::execution_context::{ScriptOrModule, ScriptOrModuleSlot};
 use crate::layout::function_object::CallEnvironmentTemplate;
 pub use crate::layout::function_object::{SharedFunctionInstanceData, asm_call_metadata};
+use crate::layout::member::NullableMember;
+use crate::runtime::completion::ThrowCompletionOr;
 use crate::runtime::environment_shape::{EnvironmentShape, EnvironmentShapeCache};
-use crate::runtime::private_environment::PrivateName;
+use crate::runtime::error::ErrorKind;
+use crate::runtime::error_types::ErrorType;
 use crate::runtime::property_key::PropertyKey;
 use crate::runtime::shape::Shape;
 use crate::source_code::SourceCode;
@@ -43,6 +44,7 @@ pub enum ThisMode {
 
 /// How many closures of a function were created.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
 pub enum ClosureCount {
     None,
     One,
@@ -55,13 +57,102 @@ pub enum ConstructorKind {
     Derived,
 }
 
-/// [[ClassFieldInitializerName]]: Variant<PropertyKey, PrivateName, Empty>.
+/// [[ClassFieldInitializerName]]: Variant<PropertyKey, PrivateName, Empty>. Only whether there is a name matters, so a
+/// Private Name is kept as its description.
 #[derive(Clone, Debug, Default, Trace)]
 pub enum ClassFieldInitializerName {
     PropertyKey(PropertyKey),
-    PrivateName(#[gc(untraced)] PrivateName),
+    PrivateName(#[gc(untraced)] Utf16FlyString),
     #[default]
     Empty,
+}
+
+/// What a function's executable is made from when it is first called, which only one thing can be at a time.
+enum CompileInput {
+    None,
+    /// The function is not parsed yet: its source and its row there, which its tree is parsed from.
+    Unparsed(Arc<FunctionPayload>),
+    /// Freshly compiled bytecode.
+    PrecompiledBytecode(Arc<PrecompiledFunction>),
+}
+
+/// A CompileInput in one word: the pointer, with what it points at in its lowest bits.
+struct CompileInputSlot(Cell<*mut ()>);
+
+// NB: The pointers in a slot leave room for its tag.
+const _: () = assert!(
+    align_of::<FunctionPayload>() > CompileInputSlot::TAG_MASK
+        && align_of::<PrecompiledFunction>() > CompileInputSlot::TAG_MASK
+);
+
+impl CompileInputSlot {
+    const TAG_MASK: usize = 0b11;
+    const TAG_UNPARSED: usize = 1;
+    const TAG_PRECOMPILED_BYTECODE: usize = 2;
+
+    fn new(input: CompileInput) -> Self {
+        let slot = Self(Cell::new(core::ptr::null_mut()));
+        slot.set(input);
+        slot
+    }
+
+    fn set(&self, input: CompileInput) {
+        drop(self.take());
+        self.0.set(match input {
+            CompileInput::None => core::ptr::null_mut(),
+            CompileInput::Unparsed(payload) => Self::tagged(Arc::into_raw(payload).cast_mut(), Self::TAG_UNPARSED),
+            CompileInput::PrecompiledBytecode(precompiled) => {
+                Self::tagged(Arc::into_raw(precompiled).cast_mut(), Self::TAG_PRECOMPILED_BYTECODE)
+            }
+        });
+    }
+
+    fn tagged<T>(pointer: *mut T, tag: usize) -> *mut () {
+        pointer.cast::<()>().map_addr(|address| address | tag)
+    }
+
+    fn take(&self) -> CompileInput {
+        let word = self.0.replace(core::ptr::null_mut());
+        let pointer = word.map_addr(|address| address & !Self::TAG_MASK);
+        // SAFETY: set() made the word from a reference of the type its tag says, which this takes over now that the
+        //         word is gone from the slot.
+        unsafe {
+            match word.addr() & Self::TAG_MASK {
+                Self::TAG_UNPARSED => CompileInput::Unparsed(Arc::from_raw(pointer.cast())),
+                Self::TAG_PRECOMPILED_BYTECODE => CompileInput::PrecompiledBytecode(Arc::from_raw(pointer.cast())),
+                _ => CompileInput::None,
+            }
+        }
+    }
+}
+
+impl Drop for CompileInputSlot {
+    fn drop(&mut self) {
+        drop(self.take());
+    }
+}
+
+/// The names of the parameters of a function with a simple parameter list that has any.
+struct ParameterNames {
+    /// The name each argument index of a mapped arguments object maps to, which is empty where a later parameter has
+    /// the same name.
+    mapped_argument_names: Rc<[Utf16FlyString]>,
+    /// The names of the parameters without the ones that repeat, in the order the bindings of the parameters are
+    /// created in the function environment.
+    parameter_binding_names: Rc<[Utf16FlyString]>,
+}
+
+/// The parts of the shared data of a function that few functions need.
+#[derive(Default, Trace)]
+struct SharedFunctionInstanceDataRareData {
+    /// Owns the source text if it is not simply a range of the source code the function was parsed from, as for
+    /// dynamically created functions via the Function constructor, or once something asked for it.
+    #[gc(untraced)]
+    source_text_owner: RefCell<Utf16String>,
+    class_field_initializer_name: GcRefCell<ClassFieldInitializerName>, // [[ClassFieldInitializerName]]
+    /// Functions with parameter expressions may have a separate var environment.
+    var_environment_bindings_count: Cell<u32>,
+    var_environment_shape: NullableMember<EnvironmentShape>,
 }
 
 /// The parts of the shared data of a function that the interpreter does not read.
@@ -69,83 +160,33 @@ pub enum ClassFieldInitializerName {
 pub struct SharedFunctionInstanceDataStorage {
     name: Utf16FlyString,
 
-    // NB: source_text_offset and source_text_length normally refer to
-    //     ranges within the underlying SourceCode we parsed the AST from,
-    //     kept alive by source_code. source_text_owner is used if the
-    //     source text needs to be owned by the function data (e.g. for
-    //     dynamically created functions via Function constructor).
+    // NB: source_text_offset and source_text_length are a range of the source code we parsed the function from.
     #[gc(untraced)]
-    source_code: RefCell<Option<Rc<SourceCode>>>,
-    #[gc(untraced)]
-    source_text_owner: RefCell<Utf16String>,
-    source_text_offset: Cell<usize>,
-    source_text_length: Cell<usize>, // [[SourceText]]
-
-    function_length: i32,
-    /// The name each argument index of a mapped arguments object maps to, which is empty where a later parameter has
-    /// the same name.
-    #[gc(untraced)]
-    mapped_argument_names: Rc<[Utf16FlyString]>,
-    /// The names of the parameters without the ones that repeat, in the order the bindings of the parameters are
-    /// created in the function environment.
-    #[gc(untraced)]
-    parameter_binding_names: Rc<[Utf16FlyString]>,
+    source_code: Cell<Option<Rc<SourceCode>>>,
+    source_text_offset: Cell<u32>,
+    source_text_length: Cell<u32>, // [[SourceText]]
 
     #[gc(untraced)]
-    this_mode: ThisMode, // [[ThisMode]]
+    parameter_names: OnceCell<Box<ParameterNames>>,
     #[gc(untraced)]
-    kind: FunctionKind,
+    compile_input: CompileInputSlot,
+    rare_data: OnceCell<Box<SharedFunctionInstanceDataRareData>>,
 
-    might_need_arguments_object: Cell<bool>,
-    contains_direct_call_to_eval: Cell<bool>,
-    is_arrow_function: bool,
-    has_simple_parameter_list: bool,
-    is_module_wrapper: Cell<bool>,
-
-    this_value_needs_environment_resolution: Cell<bool>,
-
-    function_environment_bindings_count: Cell<usize>,
-    var_environment_bindings_count: Cell<usize>,
-    function_environment_shape: Cell<Option<Gc<EnvironmentShape>>>,
-    var_environment_shape: Cell<Option<Gc<EnvironmentShape>>>,
-
-    class_field_initializer_name: GcRefCell<ClassFieldInitializerName>, // [[ClassFieldInitializerName]]
-    #[gc(untraced)]
-    constructor_kind: Cell<ConstructorKind>,         // [[ConstructorKind]]
-    is_class_constructor: Cell<bool>,                                   // [[IsClassConstructor]]
-
-    // NB: When present, the function's AST, which its bytecode is compiled from when it is first called.
-    #[gc(untraced)]
-    rust_function_ast: RefCell<Option<Box<FunctionPayload>>>,
-    // NB: When present, freshly compiled bytecode that becomes the function's executable when it is first called.
-    #[gc(untraced)]
-    precompiled_bytecode_executable: RefCell<Option<Box<PrecompiledFunction>>>,
-    // NB: When present, the function's executable in a bytecode cache blob, which becomes its executable when it is
-    //     first called.
-    #[gc(untraced)]
-    cached_bytecode_executable: RefCell<Option<Box<DecodedCachedExecutableRecord>>>,
-    // NB: The source text range the function was created with, which a bytecode cache blob identifies the function
-    //     by, even after the range of a class constructor grew to the whole class.
-    bytecode_cache_source_text_offset: Cell<usize>,
-    bytecode_cache_source_text_length: Cell<usize>,
-    use_rust_compilation: bool,
-
-    /// How many properties the objects constructions of the function create get, as far as known (see
-    /// construct_reserve()), and how many constructions asked.
-    construct_reserve: Cell<u32>,
-    construct_count: Cell<u32>,
-
-    /// How many closures of the function were created. JIT code may only treat the bindings of a closure's
-    /// environment as the bindings of every frame running the function while it is the only closure.
-    #[gc(untraced)]
-    closure_count: Cell<ClosureCount>,
+    function_environment_bindings_count: Cell<u32>,
+    function_environment_shape: NullableMember<EnvironmentShape>,
 }
+
+// NB: Every function has these bytes.
+const _: () = assert!(size_of::<SharedFunctionInstanceData>() == 88);
 
 /// The most properties that constructions make room for ahead (the largest inline capacity of plain objects).
 const MAX_CONSTRUCT_RESERVE: u32 = 16;
 
 /// The last construction that follows the transitions again (see SharedFunctionInstanceData::construct_reserve()).
 const MAX_CONSTRUCT_RESERVE_UPDATES: u32 = 1024;
+
+const _: () = assert!(MAX_CONSTRUCT_RESERVE <= u8::MAX as u32);
+const _: () = assert!(MAX_CONSTRUCT_RESERVE_UPDATES as u64 <= asm_call_metadata::CONSTRUCT_COUNT_MASK);
 
 define_cell!(SharedFunctionInstanceData, Other);
 
@@ -154,6 +195,11 @@ unsafe impl Trace for SharedFunctionInstanceData {
     fn trace(&self, visitor: &mut Visitor) {
         self.executable.trace(visitor);
         self.call_environment_template.trace(visitor);
+        match self.script_or_module.get() {
+            ScriptOrModule::Empty => {}
+            ScriptOrModule::Script(script) => script.trace(visitor),
+            ScriptOrModule::Module(module) => module.trace(visitor),
+        }
         self.storage.trace(visitor);
     }
 }
@@ -166,38 +212,69 @@ unsafe impl Trace for CallEnvironmentTemplate {
     fn trace(&self, _visitor: &mut Visitor) {}
 }
 
-fn parameter_binding_names(parameter_names: &[Utf16FlyString]) -> Rc<[Utf16FlyString]> {
-    let mut seen_names = HashSet::with_capacity(parameter_names.len());
-    let mut names: Vec<Utf16FlyString> = Vec::with_capacity(parameter_names.len());
-    for name in parameter_names {
-        if seen_names.insert(name) {
-            names.push(name.clone());
-        }
-    }
-    names.into()
-}
-
 /// OPTIMIZATION: Precompute the argument indices that alias parameter bindings. Only the last occurrence of each
 ///               parameter name is eligible; each arguments object also limits the mapping to its argument count.
 ///               https://tc39.es/ecma262/#sec-createmappedargumentsobject
-fn mapped_argument_names(parameter_names: Vec<Utf16FlyString>) -> Rc<[Utf16FlyString]> {
+fn parameter_names_of(parameter_names: &[Utf16FlyString]) -> Option<Box<ParameterNames>> {
+    if parameter_names.is_empty() {
+        return None;
+    }
+    // OPTIMIZATION: Going through a few names beats a hash set of them.
+    const MAXIMUM_PARAMETERS_TO_SCAN: usize = 8;
+    if parameter_names.len() <= MAXIMUM_PARAMETERS_TO_SCAN {
+        let has_repeated_name =
+            (1..parameter_names.len()).any(|index| parameter_names[..index].contains(&parameter_names[index]));
+        if !has_repeated_name {
+            let names: Rc<[Utf16FlyString]> = parameter_names.into();
+            return Some(Box::new(ParameterNames {
+                mapped_argument_names: names.clone(),
+                parameter_binding_names: names,
+            }));
+        }
+    }
     let mut seen_names = HashSet::with_capacity(parameter_names.len());
     let mut mapped_names: Vec<Utf16FlyString> = vec![Utf16FlyString::default(); parameter_names.len()];
+    let mut has_repeated_name = false;
 
     for index in (0..parameter_names.len()).rev() {
         let name = &parameter_names[index];
         // OPTIMIZATION: A hash set avoids scanning later parameters for every name.
         if !seen_names.insert(name) {
+            has_repeated_name = true;
             continue;
         }
         mapped_names[index] = name.clone();
     }
-    mapped_names.into()
+    let mapped_argument_names: Rc<[Utf16FlyString]> = mapped_names.into();
+
+    // NB: Without repeated names, both lists are the parameter names.
+    let parameter_binding_names = if has_repeated_name {
+        let mut seen_names = HashSet::with_capacity(parameter_names.len());
+        let mut names: Vec<Utf16FlyString> = Vec::with_capacity(parameter_names.len());
+        for name in parameter_names {
+            if seen_names.insert(name) {
+                names.push(name.clone());
+            }
+        }
+        names.into()
+    } else {
+        mapped_argument_names.clone()
+    };
+
+    Some(Box::new(ParameterNames {
+        mapped_argument_names,
+        parameter_binding_names,
+    }))
+}
+
+fn source_text_offset_or_length(offset_or_length: usize) -> u32 {
+    u32::try_from(offset_or_length).expect("a source code fits u32 code units")
 }
 
 impl SharedFunctionInstanceData {
     #[allow(clippy::too_many_arguments)]
     fn new(
+        _: &DeferGc<'_>,
         kind: FunctionKind,
         name: Utf16FlyString,
         function_length: i32,
@@ -206,238 +283,146 @@ impl SharedFunctionInstanceData {
         is_arrow_function: bool,
         has_simple_parameter_list: bool,
         parameter_names_for_mapped_arguments: Vec<Utf16FlyString>,
-        rust_function_ast: Option<Box<FunctionPayload>>,
+        payload: Option<Arc<FunctionPayload>>,
     ) -> Self {
         // NB: initialize_after_construction()
-        let this_mode = if is_arrow_function {
-            ThisMode::Lexical
-        } else if strict {
-            ThisMode::Strict
-        } else {
-            ThisMode::Global
-        };
+        let mut metadata = u64::from(formal_parameter_count)
+            | asm_call_metadata::MIGHT_NEED_ARGUMENTS_OBJECT
+            | asm_call_metadata::CONTAINS_DIRECT_CALL_TO_EVAL
+            | (kind as u64) << asm_call_metadata::FUNCTION_KIND_SHIFT;
+        if strict {
+            metadata |= asm_call_metadata::STRICT;
+        }
+        if is_arrow_function {
+            metadata |= asm_call_metadata::IS_ARROW_FUNCTION;
+        }
+        if has_simple_parameter_list {
+            metadata |= asm_call_metadata::HAS_SIMPLE_PARAMETER_LIST;
+        }
 
         Self {
-            header: CellHeader::for_class(Self::CLASS),
-            executable: Cell::new(None),
-            asm_call_metadata: Cell::new(0),
-            formal_parameter_count: Cell::new(formal_parameter_count),
-            strict: Cell::new(strict),
-            function_environment_needed: Cell::new(false),
-            uses_this: Cell::new(false),
-            can_inline_call: Cell::new(false),
-            call_environment_template: Cell::new(None),
+            executable: NullableMember::null(),
+            call_environment_template: NullableMember::null(),
+            header: CellHeaderTail::for_class(Self::CLASS),
+            construct_reserve: Cell::new(0),
+            function_length,
+            asm_call_metadata: Cell::new(metadata),
+            script_or_module: ScriptOrModuleSlot::new(ScriptOrModule::Empty),
             storage: SharedFunctionInstanceDataStorage {
                 name,
-                source_code: RefCell::new(None),
-                source_text_owner: RefCell::new(Utf16String::default()),
+                source_code: Cell::new(None),
                 source_text_offset: Cell::new(0),
                 source_text_length: Cell::new(0),
-                function_length,
-                parameter_binding_names: parameter_binding_names(&parameter_names_for_mapped_arguments),
-                mapped_argument_names: mapped_argument_names(parameter_names_for_mapped_arguments),
-                this_mode,
-                kind,
-                might_need_arguments_object: Cell::new(true),
-                contains_direct_call_to_eval: Cell::new(true),
-                is_arrow_function,
-                has_simple_parameter_list,
-                is_module_wrapper: Cell::new(false),
-                this_value_needs_environment_resolution: Cell::new(false),
+                parameter_names: parameter_names_of(&parameter_names_for_mapped_arguments)
+                    .map_or_else(OnceCell::new, OnceCell::from),
+                compile_input: CompileInputSlot::new(payload.map_or(CompileInput::None, CompileInput::Unparsed)),
+                rare_data: OnceCell::new(),
                 function_environment_bindings_count: Cell::new(0),
-                var_environment_bindings_count: Cell::new(0),
-                function_environment_shape: Cell::new(None),
-                var_environment_shape: Cell::new(None),
-                class_field_initializer_name: GcRefCell::new(ClassFieldInitializerName::Empty),
-                constructor_kind: Cell::new(ConstructorKind::Base),
-                is_class_constructor: Cell::new(false),
-                rust_function_ast: RefCell::new(rust_function_ast),
-                precompiled_bytecode_executable: RefCell::new(None),
-                cached_bytecode_executable: RefCell::new(None),
-                bytecode_cache_source_text_offset: Cell::new(0),
-                bytecode_cache_source_text_length: Cell::new(0),
-                use_rust_compilation: true,
-                construct_reserve: Cell::new(0),
-                construct_count: Cell::new(0),
-                closure_count: Cell::new(ClosureCount::None),
+                function_environment_shape: NullableMember::null(),
             },
         }
     }
 
-    /// Creates the shared data of a function the frontend described.
+    fn rare_data(&self) -> &SharedFunctionInstanceDataRareData {
+        self.storage.rare_data.get_or_init(Box::default)
+    }
+
+    fn metadata_bit(&self, bit: u64) -> bool {
+        self.asm_call_metadata.get() & bit != 0
+    }
+
+    fn set_metadata_bit(&self, bit: u64, value: bool) {
+        let mut metadata = self.asm_call_metadata.get() & !bit;
+        if value {
+            metadata |= bit;
+        }
+        metadata &= !asm_call_metadata::NEEDS_ENVIRONMENT_OR_THIS_VALUE_RESOLUTION;
+        if metadata
+            & (asm_call_metadata::FUNCTION_ENVIRONMENT_NEEDED
+                | asm_call_metadata::THIS_VALUE_NEEDS_ENVIRONMENT_RESOLUTION)
+            != 0
+        {
+            metadata |= asm_call_metadata::NEEDS_ENVIRONMENT_OR_THIS_VALUE_RESOLUTION;
+        }
+        self.asm_call_metadata.set(metadata);
+    }
+
+    /// Creates the shared data of a function the frontend described, which is strict if `strict`.
     pub fn create(
         vm: &Vm,
-        description: SharedFunctionDescription,
+        description: &SharedFunctionDescription,
+        strict: bool,
         source_code: Option<&Rc<SourceCode>>,
     ) -> Gc<SharedFunctionInstanceData> {
-        let name = if description.name.is_empty() {
-            Utf16FlyString::default()
-        } else {
-            Utf16FlyString::from_utf16(&description.name)
-        };
-
-        let mapped_parameter_names = if description.has_simple_parameter_list {
-            description.parameter_names
-        } else {
-            Vec::new()
-        };
-
-        let shared = vm.heap().allocate(|_| {
-            Self::new(
-                description.function_kind,
-                name,
-                description.function_length,
-                description.formal_parameter_count,
-                description.strict,
-                description.is_arrow,
-                description.has_simple_parameter_list,
-                mapped_parameter_names,
-                Some(description.payload),
-            )
-        });
-        shared.update_can_inline_call();
-
-        // Set parsing insights that must be available before lazy compilation.
-        shared.uses_this.set(description.uses_this);
-        shared
-            .storage
-            .this_value_needs_environment_resolution
-            .set(description.uses_this_from_environment);
-        if description.uses_this_from_environment && !description.is_arrow {
-            shared.function_environment_needed.set(true);
-        }
-        shared.update_asm_call_metadata();
-
-        if let Some(source_code) = source_code {
-            shared.set_source_text_range(
-                source_code,
-                description.source_text_offset,
-                description.source_text_length,
-            );
-        }
-        shared.set_bytecode_cache_source_text_range(description.source_text_offset, description.source_text_length);
-        shared
+        Self::create_from_owned_description(vm, description.clone(), strict, source_code)
     }
 
-    /// Creates the shared data of a function of a bytecode cache blob that passed validation, whose executable stays in
-    /// the blob until the function is first called. The function is strict if its own code is or `outer_strict` is.
-    pub fn create_from_bytecode_cache(
+    fn create_from_owned_description(
         vm: &Vm,
-        function: &DecodedFunctionRecord,
-        outer_strict: bool,
-        source_code: &Rc<SourceCode>,
+        description: SharedFunctionDescription,
+        strict: bool,
+        source_code: Option<&Rc<SourceCode>>,
     ) -> Gc<SharedFunctionInstanceData> {
-        let name = function
-            .function_name()
-            .map_or_else(Utf16FlyString::default, |name| Utf16FlyString::from_utf16(&name));
-        let simple_parameter_names = function.simple_parameter_names();
-        let has_simple_parameter_list = simple_parameter_names.is_some();
-        let source_text_range = function.source_text_range();
-        let source_text_length = source_text_range.end.saturating_sub(source_text_range.start);
-        let is_arrow_function = function.is_arrow();
-
-        let shared = vm.heap().allocate(|_| {
+        let SharedFunctionDescription {
+            name,
+            function_kind,
+            function_length,
+            formal_parameter_count,
+            is_arrow,
+            has_simple_parameter_list,
+            source_text_offset,
+            source_text_length,
+            uses_this,
+            uses_this_from_environment,
+            payload,
+            ..
+        } = description;
+        let shared = vm.heap().allocate(|defer| {
             Self::new(
-                function.function_kind(),
+                defer,
+                function_kind,
                 name,
-                function.length(),
-                function.parameter_count(),
-                function.has_strict_code() || outer_strict,
-                is_arrow_function,
+                function_length,
+                formal_parameter_count,
+                strict,
+                is_arrow,
                 has_simple_parameter_list,
-                simple_parameter_names.unwrap_or_default(),
-                None,
+                Vec::new(),
+                Some(payload),
             )
         });
         shared.update_can_inline_call();
 
         // Set parsing insights that must be available before lazy compilation.
-        let (uses_this, uses_this_from_environment) = function.parsing_insights_about_this();
-        shared.uses_this.set(uses_this);
-        shared
-            .storage
-            .this_value_needs_environment_resolution
-            .set(uses_this_from_environment);
-        if uses_this_from_environment && !is_arrow_function {
-            shared.function_environment_needed.set(true);
+        shared.set_uses_this(uses_this);
+        shared.set_metadata_bit(
+            asm_call_metadata::THIS_VALUE_NEEDS_ENVIRONMENT_RESOLUTION,
+            uses_this_from_environment,
+        );
+        if uses_this_from_environment && !is_arrow {
+            shared.set_function_environment_needed(true);
         }
-        shared.update_asm_call_metadata();
 
-        shared.set_source_text_range(source_code, source_text_range.start, source_text_length);
-        shared.set_bytecode_cache_source_text_range(source_text_range.start, source_text_length);
-        if let Some((name, is_private)) = function.field_initializer_name() {
-            shared.set_class_field_initializer_name_from_utf16(&name, is_private);
-        }
-        shared.set_metadata(function.scope_metadata());
-        shared
-            .storage
-            .cached_bytecode_executable
-            .replace(Some(Box::new(function.cached_executable())));
+        shared.storage.source_code.set(source_code.cloned());
+        shared.initialize_source_text_range(source_text_offset, source_text_length);
         shared
     }
 
-    fn set_bytecode_cache_source_text_range(&self, source_text_offset: usize, source_text_length: usize) {
-        self.storage.bytecode_cache_source_text_offset.set(source_text_offset);
-        self.storage.bytecode_cache_source_text_length.set(source_text_length);
-    }
-
-    /// The offset and length of the source text the function was created with.
-    pub fn bytecode_cache_source_text_range(&self) -> (usize, usize) {
-        (
-            self.storage.bytecode_cache_source_text_offset.get(),
-            self.storage.bytecode_cache_source_text_length.get(),
-        )
-    }
-
-    /// Whether `function`, a function of a bytecode cache blob nested in code that is strict if `outer_strict` is, is
-    /// the function this shared data was created for, as rust_sfd_matches_bytecode_cache_function decides.
-    pub fn matches_bytecode_cache_function(&self, function: &DecodedFunctionRecord, outer_strict: bool) -> bool {
-        let source_text_range = function.source_text_range();
-        self.bytecode_cache_source_text_range()
-            == (
-                source_text_range.start,
-                source_text_range.end.saturating_sub(source_text_range.start),
-            )
-            && self.storage.function_length == function.length()
-            && self.formal_parameter_count.get() == function.parameter_count()
-            && self.storage.kind == function.function_kind()
-            && self.strict.get() == (function.has_strict_code() || outer_strict)
-            && self.storage.is_arrow_function == function.is_arrow()
-            && self.storage.has_simple_parameter_list == function.simple_parameter_names().is_some()
-    }
-
-    /// Replaces how the function compiles with its executable in a bytecode cache blob, which becomes its executable
-    /// when it is first called, as rust_sfd_install_cached_bytecode_executable does.
-    pub fn install_cached_bytecode_executable(
-        &self,
-        cached_executable: DecodedCachedExecutableRecord,
-        metadata: &FunctionSfdMetadata,
-    ) {
-        self.clear_compile_inputs();
-        self.set_metadata(metadata);
+    fn initialize_source_text_range(&self, source_text_offset: usize, source_text_length: usize) {
         self.storage
-            .cached_bytecode_executable
-            .replace(Some(Box::new(cached_executable)));
-    }
-
-    /// Replaces the executable of a function that already ran with one materialized from a bytecode cache blob, which
-    /// took over the inline caches of the previous one, as rust_sfd_install_bytecode_cache_executable does.
-    pub fn install_bytecode_cache_executable(&self, executable: Gc<Executable>, metadata: &FunctionSfdMetadata) {
-        self.set_metadata(metadata);
-        self.set_executable(Some(executable));
-        executable.set_name(self.name());
-        if should_dump_bytecode() {
-            executable.dump();
-        }
-        self.clear_compile_inputs();
+            .source_text_offset
+            .set(source_text_offset_or_length(source_text_offset));
+        self.storage
+            .source_text_length
+            .set(source_text_offset_or_length(source_text_length));
     }
 
     /// vm.heap().allocate<SharedFunctionInstanceData>(vm, kind, name, function_length, formal_parameter_count, strict,
     /// is_arrow_function, has_simple_parameter_list, parameter_names_for_mapped_arguments, NoSharedFunctionDataList {},
-    /// nullptr): shared data that has no AST to compile, such as the wrapper of a module with top-level await, whose
+    /// nullptr): shared data that has nothing to compile, such as the wrapper of a module with top-level await, whose
     /// executable the caller sets.
     #[allow(clippy::too_many_arguments)]
-    pub fn create_without_function_ast(
+    pub fn create_without_compile_input(
         vm: &Vm,
         kind: FunctionKind,
         name: Utf16FlyString,
@@ -448,8 +433,9 @@ impl SharedFunctionInstanceData {
         has_simple_parameter_list: bool,
         parameter_names_for_mapped_arguments: Vec<Utf16FlyString>,
     ) -> Gc<SharedFunctionInstanceData> {
-        let shared = vm.heap().allocate(|_| {
+        let shared = vm.heap().allocate(|defer| {
             Self::new(
+                defer,
                 kind,
                 name,
                 function_length,
@@ -465,19 +451,37 @@ impl SharedFunctionInstanceData {
         shared
     }
 
-    /// Creates the shared data of one of the functions an executable declares, taking what the frontend kept for it:
-    /// its AST, its class field initializer name and the bytecode it may have compiled already.
+    /// Creates the shared data of one of the functions an executable declares, from what the frontend kept for it: its
+    /// description, its class field initializer name and the bytecode it may have compiled already.
     pub fn create_from_pending_shared_function_data(
         vm: &Vm,
-        pending: &mut PendingSharedFunctionData,
+        pending: &PendingSharedFunctionData,
         is_strict: bool,
         source_code: Option<&Rc<SourceCode>>,
     ) -> Gc<SharedFunctionInstanceData> {
-        let shared = Self::create(vm, pending.take_description(is_strict), source_code);
+        let shared = Self::create(vm, &pending.description, pending.is_strict_in(is_strict), source_code);
         if let Some((name, is_private)) = &pending.class_field_initializer_name {
-            shared.set_class_field_initializer_name_from_utf16(name, *is_private);
+            shared.set_class_field_initializer_name_from_utf16(&name.to_utf16(), *is_private);
         }
-        if let Some(precompiled) = pending.precompiled_function.take() {
+        if let Some(precompiled) = &pending.precompiled_function {
+            shared.set_precompiled_bytecode_executable(precompiled.clone());
+        }
+        shared
+    }
+
+    /// create_from_pending_shared_function_data() for what nothing links again, which moves into the shared data.
+    pub fn create_from_owned_pending_shared_function_data(
+        vm: &Vm,
+        pending: PendingSharedFunctionData,
+        is_strict: bool,
+        source_code: Option<&Rc<SourceCode>>,
+    ) -> Gc<SharedFunctionInstanceData> {
+        let strict = pending.is_strict_in(is_strict);
+        let shared = Self::create_from_owned_description(vm, pending.description, strict, source_code);
+        if let Some((name, is_private)) = &pending.class_field_initializer_name {
+            shared.set_class_field_initializer_name_from_utf16(&name.to_utf16(), *is_private);
+        }
+        if let Some(precompiled) = pending.precompiled_function {
             shared.set_precompiled_bytecode_executable(precompiled);
         }
         shared
@@ -493,72 +497,55 @@ impl SharedFunctionInstanceData {
     }
 
     pub fn set_is_class_constructor(&self) {
-        self.storage.is_class_constructor.set(true);
+        self.set_metadata_bit(asm_call_metadata::IS_CLASS_CONSTRUCTOR, true);
         self.update_can_inline_call();
     }
 
-    pub fn update_asm_call_metadata(&self) {
-        let mut metadata = u64::from(self.formal_parameter_count.get());
-        if self.can_inline_call.get() {
-            metadata |= asm_call_metadata::CAN_INLINE_CALL;
-        }
-        if self.function_environment_needed.get() || self.storage.this_value_needs_environment_resolution.get() {
-            metadata |= asm_call_metadata::NEEDS_ENVIRONMENT_OR_THIS_VALUE_RESOLUTION;
-        }
-        if self.uses_this.get() {
-            metadata |= asm_call_metadata::USES_THIS;
-        }
-        if self.strict.get() {
-            metadata |= asm_call_metadata::STRICT;
-        }
-        self.asm_call_metadata.set(metadata);
-    }
-
     pub fn can_inline_call(&self) -> bool {
-        self.can_inline_call.get()
+        self.metadata_bit(asm_call_metadata::CAN_INLINE_CALL)
     }
 
     fn update_can_inline_call(&self) {
-        self.can_inline_call.set(
-            self.executable.get().is_some()
-                && self.storage.kind == FunctionKind::Normal
-                && !self.storage.is_class_constructor.get(),
+        self.set_metadata_bit(
+            asm_call_metadata::CAN_INLINE_CALL,
+            self.executable.get().is_some() && self.kind() == FunctionKind::Normal && !self.is_class_constructor(),
         );
-        self.update_asm_call_metadata();
     }
 
     pub fn name(&self) -> Utf16FlyString {
         self.storage.name.clone()
     }
 
+    pub fn source_text_owner(&self) -> Option<Utf16String> {
+        let source_text_owner = self.storage.rare_data.get()?.source_text_owner.borrow();
+        (!source_text_owner.is_empty()).then(|| source_text_owner.clone())
+    }
+
     pub fn source_text(&self) -> Utf16String {
-        {
-            let source_text_owner = self.storage.source_text_owner.borrow();
-            if !source_text_owner.is_empty() {
-                return source_text_owner.clone();
-            }
+        if let Some(source_text_owner) = self.source_text_owner() {
+            return source_text_owner;
         }
 
-        let Some(source_code) = self.storage.source_code.borrow().clone() else {
+        let Some(source_code) = self.source_code() else {
             return Utf16String::default();
         };
 
         let source_text = source_code.source_text_from_offsets(
-            self.storage.source_text_offset.get(),
-            self.storage.source_text_length.get(),
+            self.storage.source_text_offset.get() as usize,
+            self.storage.source_text_length.get() as usize,
         );
-        self.storage.source_text_owner.replace(source_text.clone());
+        self.rare_data().source_text_owner.replace(source_text.clone());
         source_text
     }
 
     /// Makes `source_text` the [[SourceText]] while keeping the source code the function compiles from.
     pub fn set_source_text_owner(&self, source_text: Utf16String) {
-        self.storage.source_text_owner.replace(source_text);
+        self.rare_data().source_text_owner.replace(source_text);
     }
 
     pub fn set_source_text(&self, source_text: Utf16String) {
-        self.storage.source_text_owner.replace(source_text);
-        self.storage.source_code.replace(None);
+        self.rare_data().source_text_owner.replace(source_text);
+        self.storage.source_code.set(None);
         self.storage.source_text_offset.set(0);
         self.storage.source_text_length.set(0);
     }
@@ -569,90 +556,54 @@ impl SharedFunctionInstanceData {
         source_text_offset: usize,
         source_text_length: usize,
     ) {
-        self.storage.source_text_owner.replace(Utf16String::default());
-        self.storage.source_code.replace(Some(source_code.clone()));
-        self.storage.source_text_offset.set(source_text_offset);
-        self.storage.source_text_length.set(source_text_length);
+        self.rare_data().source_text_owner.replace(Utf16String::default());
+        self.storage.source_code.set(Some(source_code.clone()));
+        self.initialize_source_text_range(source_text_offset, source_text_length);
     }
 
     pub fn source_code(&self) -> Option<Rc<SourceCode>> {
-        self.storage.source_code.borrow().clone()
+        let source_code = self.storage.source_code.take();
+        self.storage.source_code.set(source_code.clone());
+        source_code
     }
 
     pub fn clear_compile_inputs(&self) {
-        self.clear_non_bytecode_cache_compile_inputs();
-        drop(self.storage.cached_bytecode_executable.take());
-    }
-
-    pub fn clear_non_bytecode_cache_compile_inputs(&self) {
-        drop(self.storage.rust_function_ast.take());
-        drop(self.storage.precompiled_bytecode_executable.take());
-    }
-
-    /// Whether the function still has the AST it compiles from when it is first called.
-    pub fn has_function_ast(&self) -> bool {
-        self.storage.rust_function_ast.borrow().is_some()
-    }
-
-    /// Whether the function still has bytecode compiled ahead of its first call, apart from that of a bytecode cache.
-    pub fn has_precompiled_bytecode(&self) -> bool {
-        self.storage.precompiled_bytecode_executable.borrow().is_some()
-    }
-
-    /// Whether the function's executable is still in a bytecode cache blob, waiting for its first call.
-    pub fn has_cached_bytecode(&self) -> bool {
-        self.storage.cached_bytecode_executable.borrow().is_some()
-    }
-
-    /// Appends the functions that `executable` creates and that have not been compiled yet to `functions`, and returns
-    /// a copy of the AST of each, so that they can be compiled elsewhere, such as on another thread, while their own
-    /// ASTs stay in place for a first call that comes sooner.
-    pub fn uncompiled_functions_of(
-        executable: Gc<Executable>,
-        functions: &MarkedVec<'_, Gc<SharedFunctionInstanceData>>,
-    ) -> Vec<Box<FunctionPayload>> {
-        let mut function_asts = Vec::new();
-        for index in 0..executable.shared_function_data_count() {
-            let shared_data = executable.shared_function_data(u32::try_from(index).expect("the index fits in u32"));
-            if shared_data.executable().is_some() {
-                continue;
-            }
-            let Some(function_ast) = shared_data.storage.rust_function_ast.borrow().clone() else {
-                continue;
-            };
-            functions.push(shared_data);
-            function_asts.push(function_ast);
-        }
-        function_asts
+        self.storage.compile_input.set(CompileInput::None);
     }
 
     /// Records what scope analysis found out about the function's body, as rust_sfd_set_metadata does.
     pub fn set_metadata(&self, metadata: &FunctionSfdMetadata) {
-        self.uses_this.set(metadata.uses_this);
-        self.storage
-            .this_value_needs_environment_resolution
-            .set(metadata.this_value_needs_environment_resolution);
-        self.function_environment_needed
-            .set(metadata.function_environment_needed);
-        self.update_asm_call_metadata();
+        if let Some(parameter_names) = parameter_names_of(&metadata.parameter_names) {
+            let _ = self.storage.parameter_names.set(parameter_names);
+        }
+        self.set_uses_this(metadata.uses_this);
+        self.set_metadata_bit(
+            asm_call_metadata::THIS_VALUE_NEEDS_ENVIRONMENT_RESOLUTION,
+            metadata.this_value_needs_environment_resolution,
+        );
+        self.set_function_environment_needed(metadata.function_environment_needed);
         self.storage
             .function_environment_bindings_count
-            .set(metadata.function_environment_bindings_count);
-        self.storage
-            .var_environment_bindings_count
-            .set(metadata.var_environment_bindings_count);
-        self.storage
-            .might_need_arguments_object
-            .set(metadata.might_need_arguments);
-        self.storage.contains_direct_call_to_eval.set(metadata.contains_eval);
+            .set(u32::try_from(metadata.function_environment_bindings_count).expect("the count fits in u32"));
+        if metadata.var_environment_bindings_count != 0 || self.storage.rare_data.get().is_some() {
+            self.rare_data()
+                .var_environment_bindings_count
+                .set(u32::try_from(metadata.var_environment_bindings_count).expect("the count fits in u32"));
+        }
+        self.set_metadata_bit(
+            asm_call_metadata::MIGHT_NEED_ARGUMENTS_OBJECT,
+            metadata.might_need_arguments,
+        );
+        self.set_metadata_bit(asm_call_metadata::CONTAINS_DIRECT_CALL_TO_EVAL, metadata.contains_eval);
     }
 
     /// Keeps bytecode the frontend compiled ahead of the first call, as rust_sfd_set_precompiled_bytecode_executable
     /// does.
-    pub fn set_precompiled_bytecode_executable(&self, precompiled: Box<PrecompiledFunction>) {
-        self.clear_compile_inputs();
+    pub fn set_precompiled_bytecode_executable(&self, precompiled: Arc<PrecompiledFunction>) {
         self.set_metadata(&precompiled.metadata);
-        self.storage.precompiled_bytecode_executable.replace(Some(precompiled));
+        self.storage
+            .compile_input
+            .set(CompileInput::PrecompiledBytecode(precompiled));
     }
 
     /// Sets [[ClassFieldInitializerName]] to a name the frontend found, as rust_sfd_set_class_field_initializer_name
@@ -660,82 +611,117 @@ impl SharedFunctionInstanceData {
     pub fn set_class_field_initializer_name_from_utf16(&self, name: &[u16], is_private: bool) {
         let name = Utf16FlyString::from_utf16(name);
         self.set_class_field_initializer_name(if is_private {
-            ClassFieldInitializerName::PrivateName(PrivateName::new(0, name))
+            ClassFieldInitializerName::PrivateName(name)
         } else {
             ClassFieldInitializerName::PropertyKey(PropertyKey::from(name))
         });
     }
 
     pub fn class_field_initializer_name(&self) -> ClassFieldInitializerName {
-        self.storage.class_field_initializer_name.borrow().clone()
+        self.storage
+            .rare_data
+            .get()
+            .map_or(ClassFieldInitializerName::Empty, |rare_data| {
+                rare_data.class_field_initializer_name.borrow().clone()
+            })
     }
 
     pub fn set_class_field_initializer_name(&self, name: ClassFieldInitializerName) {
-        self.storage.class_field_initializer_name.replace(name);
+        self.rare_data().class_field_initializer_name.replace(name);
     }
 
     pub fn kind(&self) -> FunctionKind {
-        self.storage.kind
+        let kind = self.asm_call_metadata.get() >> asm_call_metadata::FUNCTION_KIND_SHIFT
+            & asm_call_metadata::FUNCTION_KIND_MASK;
+        match kind {
+            0 => FunctionKind::Normal,
+            1 => FunctionKind::Generator,
+            2 => FunctionKind::Async,
+            _ => FunctionKind::AsyncGenerator,
+        }
     }
 
     pub fn this_mode(&self) -> ThisMode {
-        self.storage.this_mode
+        if self.is_arrow_function() {
+            ThisMode::Lexical
+        } else if self.strict() {
+            ThisMode::Strict
+        } else {
+            ThisMode::Global
+        }
     }
 
     pub fn function_length(&self) -> i32 {
-        self.storage.function_length
+        self.function_length
     }
 
     pub fn formal_parameter_count(&self) -> u32 {
-        self.formal_parameter_count.get()
+        self.asm_call_metadata.get() as u32
     }
 
     pub fn mapped_argument_names(&self) -> Rc<[Utf16FlyString]> {
-        self.storage.mapped_argument_names.clone()
+        self.storage.parameter_names.get().map_or_else(
+            || Vm::of_cell(self).no_parameter_names.clone(),
+            |names| names.mapped_argument_names.clone(),
+        )
     }
 
     pub fn parameter_binding_names(&self) -> Rc<[Utf16FlyString]> {
-        self.storage.parameter_binding_names.clone()
+        self.storage.parameter_names.get().map_or_else(
+            || Vm::of_cell(self).no_parameter_names.clone(),
+            |names| names.parameter_binding_names.clone(),
+        )
     }
 
     pub fn strict(&self) -> bool {
-        self.strict.get()
+        self.metadata_bit(asm_call_metadata::STRICT)
     }
 
     pub fn is_arrow_function(&self) -> bool {
-        self.storage.is_arrow_function
+        self.metadata_bit(asm_call_metadata::IS_ARROW_FUNCTION)
     }
 
     pub fn has_simple_parameter_list(&self) -> bool {
-        self.storage.has_simple_parameter_list
+        self.metadata_bit(asm_call_metadata::HAS_SIMPLE_PARAMETER_LIST)
     }
 
     pub fn is_module_wrapper(&self) -> bool {
-        self.storage.is_module_wrapper.get()
+        self.metadata_bit(asm_call_metadata::IS_MODULE_WRAPPER)
     }
 
     pub fn set_is_module_wrapper(&self, is_module_wrapper: bool) {
-        self.storage.is_module_wrapper.set(is_module_wrapper);
+        self.set_metadata_bit(asm_call_metadata::IS_MODULE_WRAPPER, is_module_wrapper);
     }
 
     pub fn is_class_constructor(&self) -> bool {
-        self.storage.is_class_constructor.get()
+        self.metadata_bit(asm_call_metadata::IS_CLASS_CONSTRUCTOR)
     }
 
     pub fn constructor_kind(&self) -> ConstructorKind {
-        self.storage.constructor_kind.get()
+        if self.metadata_bit(asm_call_metadata::IS_DERIVED_CONSTRUCTOR) {
+            ConstructorKind::Derived
+        } else {
+            ConstructorKind::Base
+        }
     }
 
     pub fn set_constructor_kind(&self, constructor_kind: ConstructorKind) {
-        self.storage.constructor_kind.set(constructor_kind);
+        self.set_metadata_bit(
+            asm_call_metadata::IS_DERIVED_CONSTRUCTOR,
+            constructor_kind == ConstructorKind::Derived,
+        );
     }
 
     pub fn uses_this(&self) -> bool {
-        self.uses_this.get()
+        self.metadata_bit(asm_call_metadata::USES_THIS)
+    }
+
+    pub fn set_uses_this(&self, uses_this: bool) {
+        self.set_metadata_bit(asm_call_metadata::USES_THIS, uses_this);
     }
 
     pub fn this_value_needs_environment_resolution(&self) -> bool {
-        self.storage.this_value_needs_environment_resolution.get()
+        self.metadata_bit(asm_call_metadata::THIS_VALUE_NEEDS_ENVIRONMENT_RESOLUTION)
     }
 
     /// How many properties to make room for in an object that a construction of the function creates with `shape`:
@@ -743,52 +729,86 @@ impl SharedFunctionInstanceData {
     /// shape tells (every object a constructor builds the same way follows one). The transitions are looked at again
     /// on the first, second, fourth and so on construction, up to the 1024th.
     pub fn construct_reserve(&self, shape: Gc<Shape>) -> u32 {
-        let storage = &self.storage;
-        let count = storage.construct_count.get();
-        if count <= MAX_CONSTRUCT_RESERVE_UPDATES && count.is_power_of_two() {
-            let reserve = shape.property_count() + shape.longest_forward_transition_chain(MAX_CONSTRUCT_RESERVE);
-            storage.construct_reserve.set(reserve.min(MAX_CONSTRUCT_RESERVE));
+        let metadata = self.asm_call_metadata.get();
+        let count =
+            (metadata >> asm_call_metadata::CONSTRUCT_COUNT_SHIFT & asm_call_metadata::CONSTRUCT_COUNT_MASK) as u32;
+        if count <= MAX_CONSTRUCT_RESERVE_UPDATES {
+            if count.is_power_of_two() {
+                let reserve = shape.property_count() + shape.longest_forward_transition_chain(MAX_CONSTRUCT_RESERVE);
+                self.construct_reserve.set(reserve.min(MAX_CONSTRUCT_RESERVE) as u8);
+            }
+            self.asm_call_metadata
+                .set(metadata + (1 << asm_call_metadata::CONSTRUCT_COUNT_SHIFT));
         }
-        storage.construct_count.set(count.saturating_add(1));
-        storage.construct_reserve.get()
+        u32::from(self.construct_reserve.get())
     }
 
     pub fn closure_count(&self) -> ClosureCount {
-        self.storage.closure_count.get()
+        let count = self.asm_call_metadata.get() >> asm_call_metadata::CLOSURE_COUNT_SHIFT
+            & asm_call_metadata::CLOSURE_COUNT_MASK;
+        match count {
+            0 => ClosureCount::None,
+            1 => ClosureCount::One,
+            _ => ClosureCount::Many,
+        }
     }
 
     /// Counts a new closure of the function.
     pub fn note_closure_created(&self) {
-        let count = match self.storage.closure_count.get() {
+        let count = match self.closure_count() {
             ClosureCount::None => ClosureCount::One,
             ClosureCount::One | ClosureCount::Many => ClosureCount::Many,
         };
-        self.storage.closure_count.set(count);
+        let metadata = self.asm_call_metadata.get()
+            & !(asm_call_metadata::CLOSURE_COUNT_MASK << asm_call_metadata::CLOSURE_COUNT_SHIFT);
+        self.asm_call_metadata
+            .set(metadata | (count as u64) << asm_call_metadata::CLOSURE_COUNT_SHIFT);
     }
 
     /// The reserve of the last construct_reserve(), without asking for it.
     pub fn current_construct_reserve(&self) -> u32 {
-        self.storage.construct_reserve.get()
+        u32::from(self.construct_reserve.get())
+    }
+
+    /// Whether the environment of a call has to answer for `this`, `new.target` or `super`, because something reads
+    /// them through the environment. Otherwise a declarative environment does for the function's bindings, just as no
+    /// environment at all does for a function without any.
+    pub fn function_environment_has_this_binding(&self) -> bool {
+        let metadata = self.asm_call_metadata.get();
+        metadata & (asm_call_metadata::CONTAINS_DIRECT_CALL_TO_EVAL | asm_call_metadata::IS_MODULE_WRAPPER) != 0
+            || metadata
+                & (asm_call_metadata::IS_ARROW_FUNCTION | asm_call_metadata::THIS_VALUE_NEEDS_ENVIRONMENT_RESOLUTION)
+                == asm_call_metadata::THIS_VALUE_NEEDS_ENVIRONMENT_RESOLUTION
     }
 
     pub fn function_environment_needed(&self) -> bool {
-        self.function_environment_needed.get()
+        self.metadata_bit(asm_call_metadata::FUNCTION_ENVIRONMENT_NEEDED)
+    }
+
+    pub fn set_function_environment_needed(&self, function_environment_needed: bool) {
+        self.set_metadata_bit(
+            asm_call_metadata::FUNCTION_ENVIRONMENT_NEEDED,
+            function_environment_needed,
+        );
     }
 
     pub fn might_need_arguments_object(&self) -> bool {
-        self.storage.might_need_arguments_object.get()
+        self.metadata_bit(asm_call_metadata::MIGHT_NEED_ARGUMENTS_OBJECT)
     }
 
     pub fn contains_direct_call_to_eval(&self) -> bool {
-        self.storage.contains_direct_call_to_eval.get()
+        self.metadata_bit(asm_call_metadata::CONTAINS_DIRECT_CALL_TO_EVAL)
     }
 
     pub fn function_environment_bindings_count(&self) -> usize {
-        self.storage.function_environment_bindings_count.get()
+        self.storage.function_environment_bindings_count.get() as usize
     }
 
     pub fn var_environment_bindings_count(&self) -> usize {
-        self.storage.var_environment_bindings_count.get()
+        self.storage
+            .rare_data
+            .get()
+            .map_or(0, |rare_data| rare_data.var_environment_bindings_count.get() as usize)
     }
 
     /// Where the function environments of calls to the function find their shape.
@@ -801,59 +821,48 @@ impl SharedFunctionInstanceData {
         EnvironmentShapeCache::VarEnvironment(Gc::from_ref(self))
     }
 
-    pub(crate) fn function_environment_shape_slot(&self) -> &Cell<Option<Gc<EnvironmentShape>>> {
+    pub(crate) fn function_environment_shape_slot(&self) -> &NullableMember<EnvironmentShape> {
         &self.storage.function_environment_shape
     }
 
-    pub(crate) fn var_environment_shape_slot(&self) -> &Cell<Option<Gc<EnvironmentShape>>> {
-        &self.storage.var_environment_shape
+    pub(crate) fn var_environment_shape_slot(&self) -> &NullableMember<EnvironmentShape> {
+        &self.rare_data().var_environment_shape
     }
 
     /// RustIntegration::compile_function(): the function's executable, from the bytecode compiled ahead of time if
-    /// there is some, and otherwise compiled from its AST now.
+    /// there is some, and otherwise parsed and compiled now. Running out of stack on the way is a RangeError, like
+    /// running out of stack in the call that got here.
     pub fn compile_function(
         vm: &Vm,
         shared_data: Gc<SharedFunctionInstanceData>,
         builtin_abstract_operations_enabled: bool,
-    ) -> Option<Gc<Executable>> {
+    ) -> ThrowCompletionOr<Gc<Executable>> {
         let source_code = shared_data.source_code();
 
-        if let Some(precompiled) = shared_data.storage.precompiled_bytecode_executable.take() {
-            return Some(Executable::create_with_source_code(
-                vm,
-                precompiled.executable,
-                source_code.as_ref(),
-            ));
-        }
-
-        if let Some(cached_executable) = shared_data.storage.cached_bytecode_executable.take() {
-            let source_code = source_code.expect("a function of a bytecode cache blob has its source code");
-            return materialize_cached_function_executable(vm, &cached_executable, &source_code);
-        }
-
-        if !shared_data.storage.use_rust_compilation {
-            return None;
-        }
-
-        let payload = shared_data
-            .storage
-            .rust_function_ast
-            .take()
-            .expect("a function that was not compiled yet has its AST");
-        // NB: The frontend checks that nested functions lie within the source, which is unknown without a source code.
-        let source_length = source_code
-            .as_ref()
-            .map_or(usize::MAX, |source_code| source_code.length_in_code_units());
-        let precompiled = crate::compile::compile_function(
-            payload,
-            source_length,
-            builtin_abstract_operations_enabled,
-            FunctionPrecompileMode::EagerOnly,
-        );
+        let payload = match shared_data.storage.compile_input.take() {
+            CompileInput::PrecompiledBytecode(precompiled) => {
+                // NB: This stays the only reference to the code if nothing else holds the function.
+                let executable = Arc::try_unwrap(precompiled)
+                    .map_or_else(|shared| shared.executable.clone(), |unique| unique.executable);
+                return Ok(Executable::create_with_source_code(
+                    vm,
+                    executable,
+                    source_code.as_ref(),
+                ));
+            }
+            CompileInput::Unparsed(payload) => payload,
+            CompileInput::None => panic!("a function that was not compiled yet knows how to compile"),
+        };
+        let precompiled =
+            crate::compile::compile_function(&payload, builtin_abstract_operations_enabled, vm.native_stack_limit());
+        let Ok(precompiled) = precompiled else {
+            shared_data.storage.compile_input.set(CompileInput::Unparsed(payload));
+            return vm.throw_completion(ErrorKind::RangeError, ErrorType::CallStackSizeExceeded, &[]);
+        };
 
         shared_data.set_metadata(&precompiled.metadata);
 
-        Some(Executable::create_with_source_code(
+        Ok(Executable::create_with_source_code(
             vm,
             precompiled.executable,
             source_code.as_ref(),

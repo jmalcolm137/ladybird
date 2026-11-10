@@ -71,6 +71,7 @@ public:
     virtual Optional<u64> browsing_context_group_id() const = 0;
     virtual Optional<URL::URL> active_document_url() const = 0;
     virtual Optional<URL::Origin> active_document_origin() const = 0;
+    virtual SandboxingFlagSet active_document_sandboxing_flag_set() const = 0;
     virtual bool active_document_is_fully_active() const = 0;
     virtual bool active_document_is_completely_loaded() const = 0;
     virtual bool active_document_is(DOM::Document const&) const = 0;
@@ -96,6 +97,7 @@ public:
     // NB: Given this navigable's container, whose state another process can report.
     PermissionsPolicy::PermissionsPolicy create_a_permissions_policy_from_a_response(URL::Origin const&, HTTP::HeaderList const& response_header_list) const;
     Optional<Utf16FlyString> container_local_name() const { return container_state().local_name; }
+    Optional<Utf16FlyString> container_name() const;
     ReferrerPolicy::ReferrerPolicy container_iframe_referrer_policy() const { return container_state().iframe_referrer_policy; }
 
     virtual bool has_session_history_entry_and_ready_for_navigation() const = 0;
@@ -104,6 +106,7 @@ public:
     // https://html.spec.whatwg.org/multipage/interaction.html#currently-focused-area-of-a-top-level-traversable
     virtual GC::Ptr<DOM::Node> currently_focused_area() = 0;
     GC::Ptr<DOM::Node> currently_focused_area_shown_by_focused_navigable();
+    GC::Ptr<DOM::Node> focused_area_shown_by_focused_navigable_regardless_of_system_focus();
 
     WebIDL::ExceptionOr<void> navigate(NavigateParams);
 

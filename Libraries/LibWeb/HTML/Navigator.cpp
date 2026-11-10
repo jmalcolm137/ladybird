@@ -21,14 +21,12 @@
 #include <LibWeb/HTML/Scripting/Environments.h>
 #include <LibWeb/HTML/Scripting/TemporaryExecutionContext.h>
 #include <LibWeb/HTML/Window.h>
-#include <LibWeb/Internals/XRTest.h>
 #include <LibWeb/Loader/ResourceLoader.h>
 #include <LibWeb/MediaCapture/MediaDevices.h>
 #include <LibWeb/Page/Page.h>
 #include <LibWeb/PermissionsAPI/Permissions.h>
 #include <LibWeb/Platform/EventLoopPlugin.h>
 #include <LibWeb/ServiceWorker/ServiceWorkerContainer.h>
-#include <LibWeb/WebXR/XRSystem.h>
 
 namespace Web::HTML {
 
@@ -84,13 +82,11 @@ void Navigator::visit_edges(GC::Cell::Visitor& visitor)
     visitor.visit(m_plugin_array);
     visitor.visit(m_clipboard);
     visitor.visit(m_geolocation);
-    visitor.visit(m_serial);
     visitor.visit(m_user_activation);
     visitor.visit(m_service_worker_container);
     visitor.visit(m_media_capabilities);
     visitor.visit(m_media_devices);
     visitor.visit(m_credentials);
-    visitor.visit(m_xr);
     visitor.visit(m_permissions);
 }
 
@@ -122,13 +118,6 @@ GC::Ref<Geolocation::Geolocation> Navigator::geolocation()
     return *m_geolocation;
 }
 
-GC::Ref<Serial::Serial> Navigator::serial()
-{
-    if (!m_serial)
-        m_serial = Serial::Serial::create();
-    return *m_serial;
-}
-
 GC::Ref<UserActivation> Navigator::user_activation()
 {
     if (!m_user_activation)
@@ -141,19 +130,6 @@ GC::Ref<CredentialManagement::CredentialsContainer> Navigator::credentials()
     if (!m_credentials)
         m_credentials = CredentialManagement::CredentialsContainer::create();
     return *m_credentials;
-}
-
-GC::Ref<WebXR::XRSystem> Navigator::xr()
-{
-    if (!m_xr)
-        m_xr = WebXR::XRSystem::create(*m_window);
-    auto& realm = HTML::relevant_realm(*m_window);
-    auto& wrapper_world = Bindings::host_defined_wrapper_world(realm);
-
-    if (Window::is_internals_object_exposed())
-        Bindings::wrap(wrapper_world, realm, GC::Ref { *m_xr })->define_direct_property("test"_utf16_fly_string, Bindings::wrap(wrapper_world, realm, Internals::XRTest::create(*m_window)), JS::default_attributes);
-
-    return *m_xr;
 }
 
 // https://w3c.github.io/pointerevents/#dom-navigator-maxtouchpoints
@@ -249,7 +225,7 @@ void Navigator::request_media_key_system_access(Utf16String key_system, Vector<E
 
     // 7. Run the following steps in parallel:
     auto& realm = WebIDL::promise_realm(promise);
-    Platform::EventLoopPlugin::the().deferred_invoke(GC::create_function(GC::Heap::the(), [&realm, key_system, supported_configurations = move(supported_configurations), origin, promise]() mutable {
+    Platform::EventLoopPlugin::the().deferred_invoke(GC::create_function(GC::Heap::the(), GC::captures(realm, key_system, move(supported_configurations), origin, promise), [](auto& realm, auto& key_system, auto& supported_configurations, auto& origin, auto& promise) {
         TemporaryExecutionContext context(realm, TemporaryExecutionContext::CallbacksEnabled::Yes);
 
         // 1. If keySystem is not one of the Key Systems supported by the user agent, reject promise with a NotSupportedError. String comparison is case-sensitive.

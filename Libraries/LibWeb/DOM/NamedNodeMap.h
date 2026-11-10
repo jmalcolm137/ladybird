@@ -27,6 +27,7 @@ public:
     ~NamedNodeMap() = default;
 
     virtual Vector<Utf16FlyString> supported_property_names() const override;
+    virtual bool is_supported_property_name(Utf16FlyString const&) const override;
 
     size_t length() const;
     bool is_empty() const { return length() == 0; }
@@ -67,7 +68,7 @@ private:
     GC::Ptr<Attr> find_attribute_node(QualifiedName const&) const;
     GC::Ref<Attr> ensure_attribute_node(QualifiedName const&) const;
 
-    GC::Ref<DOM::Element> m_element;
+    GC::NonnullMember<DOM::Element> m_element;
     mutable Vector<GC::Ref<Attr>> m_attribute_nodes;
 };
 

@@ -1,0 +1,112 @@
+/*
+ * Copyright (c) 2026, Tim Flynn <trflynn89@ladybird.org>
+ *
+ * SPDX-License-Identifier: BSD-2-Clause
+ */
+
+#pragma once
+
+#include <AK/ByteBuffer.h>
+#include <AK/Function.h>
+#include <AK/HashTable.h>
+#include <AK/JsonValue.h>
+#include <AK/Optional.h>
+#include <AK/String.h>
+#include <AK/Time.h>
+#include <AK/Variant.h>
+#include <AK/Vector.h>
+#include <AK/WeakPtr.h>
+#include <AK/Weakable.h>
+#include <LibURL/URL.h>
+
+namespace Ladybird {
+
+class BookmarkStore;
+
+struct BookmarkItem {
+    struct Bookmark {
+        URL::URL url;
+        Optional<String> title;
+        Optional<String> favicon_hash;
+    };
+
+    struct Folder {
+        Optional<String> title;
+        Vector<BookmarkItem> children;
+    };
+
+    String id;
+    UnixDateTime date_added;
+    UnixDateTime last_modified;
+    Variant<Bookmark, Folder> data;
+
+    bool is_bookmark() const { return data.has<Bookmark>(); }
+    bool is_folder() const { return data.has<Folder>(); }
+
+    Bookmark const& bookmark() const { return data.get<Bookmark>(); }
+    Bookmark& bookmark() { return data.get<Bookmark>(); }
+
+    Folder const& folder() const { return data.get<Folder>(); }
+    Folder& folder() { return data.get<Folder>(); }
+};
+
+class BookmarkStoreObserver {
+public:
+    explicit BookmarkStoreObserver(BookmarkStore&);
+    virtual ~BookmarkStoreObserver();
+
+    virtual void bookmarks_changed() { }
+
+private:
+    WeakPtr<BookmarkStore> m_bookmark_store;
+};
+
+class BookmarkStore : public Weakable<BookmarkStore> {
+public:
+    AK_ALLOC_WITH_KMALLOC;
+
+    static BookmarkStore create(ByteString bookmarks_path);
+
+    Vector<BookmarkItem> const& root_items() const { return m_items; }
+
+    bool is_bookmarked(URL::URL const&) const;
+
+    Optional<BookmarkItem const&> find_bookmark_by_url(URL::URL const&) const;
+    Optional<BookmarkItem const&> find_item_by_id(StringView id) const;
+
+    void import_items(JsonArray const& items_array);
+
+    void add_bookmark(URL::URL url, Optional<String> title, Optional<String> favicon_hash, Optional<String const&> target_folder_id = {});
+    String add_folder(Optional<String> title, Optional<String const&> target_folder_id = {});
+
+    void edit_bookmark(StringView id, URL::URL url, Optional<String> title);
+    void edit_folder(StringView id, Optional<String> title);
+
+    void move_item(StringView id, Optional<String const&> target_folder_id, size_t index);
+    void remove_item(StringView id);
+
+    void update_favicon(URL::URL const& url, String favicon_hash);
+
+    using FaviconReader = Function<Optional<ByteBuffer>(String const& favicon_hash)>;
+    JsonValue serialize_items(FaviconReader const& read_favicon = {}) const;
+    HashTable<String> favicon_hashes() const;
+
+    void add_observer(Badge<BookmarkStoreObserver>, BookmarkStoreObserver&);
+    void remove_observer(Badge<BookmarkStoreObserver>, BookmarkStoreObserver&);
+
+private:
+    explicit BookmarkStore(ByteString bookmarks_path);
+
+    Optional<BookmarkItem&> find_mutable_item_by_id(StringView id);
+    Optional<Vector<BookmarkItem>&> find_containing_item_list(StringView id);
+
+    JsonValue serialize_store() const;
+    void persist_bookmarks();
+    void notify_observers();
+
+    ByteString m_bookmarks_path;
+    Vector<BookmarkItem> m_items;
+    Vector<BookmarkStoreObserver&> m_observers;
+};
+
+}

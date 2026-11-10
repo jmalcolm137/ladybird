@@ -44,7 +44,7 @@ class NetworkContinuation final : public JS::Cell {
     GC_DECLARE_ALLOCATOR(NetworkContinuation);
 
 public:
-    using Callback = Function<void(NetworkContinuationAction, RefPtr<Fetch::Infrastructure::Response>)>;
+    using Callback = GC::Ref<GC::Function<void(NetworkContinuationAction, RefPtr<Fetch::Infrastructure::Response>)>>;
     static GC::Ref<NetworkContinuation> create(GC::Heap&, Callback);
     void invoke(NetworkContinuationAction, RefPtr<Fetch::Infrastructure::Response>);
     void clear_blocked_state();
@@ -61,7 +61,7 @@ private:
     explicit NetworkContinuation(Callback);
     virtual void finalize() override;
     virtual void visit_edges(JS::Cell::Visitor&) override;
-    Callback m_callback;
+    GC::Ptr<GC::Function<void(NetworkContinuationAction, RefPtr<Fetch::Infrastructure::Response>)>> m_callback;
 };
 
 // https://w3c.github.io/webdriver-bidi/#request-id
@@ -89,8 +89,9 @@ private:
 };
 
 // NB: Fetch checks this cached flag before doing any network instrumentation.
-WEB_API extern bool g_network_events_enabled;
-WEB_API extern bool g_network_configuration_enabled;
+// NB: A session reaches only the window agent, so these are false on the thread of a worker.
+WEB_API bool network_events_enabled();
+WEB_API bool network_configuration_enabled();
 
 void network_session_state_changed();
 void cancel_network_interception(Fetch::Infrastructure::FetchParams const&);

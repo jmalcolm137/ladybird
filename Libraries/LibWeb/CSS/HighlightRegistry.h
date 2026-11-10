@@ -6,42 +6,33 @@
 
 #pragma once
 
-#include <AK/HashMap.h>
+#include <AK/Function.h>
+#include <AK/Span.h>
 #include <AK/Utf16String.h>
-#include <LibGC/ConservativeVector.h>
+#include <LibGC/Ptr.h>
 #include <LibWeb/Bindings/HighlightRegistry.h>
-#include <LibWeb/Bindings/Wrappable.h>
+#include <LibWeb/Bindings/RustInterface.h>
 #include <LibWeb/Export.h>
 #include <LibWeb/Forward.h>
 
 namespace Web::CSS {
 
 // https://drafts.csswg.org/css-highlight-api-1/#highlightregistry
-class WEB_API HighlightRegistry final : public Bindings::GCAllocatedWrappable {
-    WEB_WRAPPABLE(HighlightRegistry, Bindings::GCAllocatedWrappable);
-    GC_DECLARE_ALLOCATOR(HighlightRegistry);
+class WEB_API HighlightRegistry final : public Bindings::RustInterfaceCell {
+    WEB_RUST_INTERFACE(HighlightRegistry, highlight_registry)
 
 public:
     [[nodiscard]] static GC::Ref<HighlightRegistry> create(DOM::Document&);
-    virtual ~HighlightRegistry() override = default;
 
-    // The map entries of this maplike object, in insertion order.
-    OrderedHashMap<Utf16String, GC::Ref<Highlight>> const& highlights() const { return m_highlights; }
-    GC::Ptr<Highlight> get_highlight(Utf16View name) const;
-    bool has_highlight(Utf16View name) const;
-    void set_highlight(Utf16String name, GC::Ref<Highlight>);
-    bool remove_highlight(Utf16View name);
-    void clear_highlights();
+    bool has_highlights();
+    bool has_ranges();
+    bool contains_range(DOM::AbstractRange&);
 
-    GC::ConservativeVector<Bindings::HighlightHitResult> highlights_from_point(float x, float y, Bindings::HighlightsFromPointOptions const&);
+    // Calls back with the name and the ranges of each registered custom highlight, from the bottom of the stacking
+    // order to the top.
+    void for_each_highlight_in_stacking_order(Function<void(Utf16String const& name, ReadonlySpan<GC::Ref<DOM::AbstractRange>> ranges)> const&);
 
-private:
-    explicit HighlightRegistry(DOM::Document&);
-
-    virtual void visit_edges(GC::Cell::Visitor&) override;
-
-    GC::Ref<DOM::Document> m_document;
-    OrderedHashMap<Utf16String, GC::Ref<Highlight>> m_highlights;
+    static bool range_is_paintable(DOM::Document const&, DOM::AbstractRange const&);
 };
 
 }

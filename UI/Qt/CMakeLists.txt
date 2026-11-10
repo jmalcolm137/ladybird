@@ -2,19 +2,6 @@ set(CMAKE_AUTOMOC ON)
 set(CMAKE_AUTORCC ON)
 set(CMAKE_AUTOUIC ON)
 
-find_package(Qt6 6.10 REQUIRED COMPONENTS Core Widgets)
-
-if (NOT APPLE)
-    find_package(Qt6 6.10 REQUIRED COMPONENTS Positioning)
-endif()
-
-if (APPLE OR (LINUX AND NOT ANDROID) OR HAS_DIRECTX)
-    # The native presentation paths use platform GPU buffer handles directly instead of copying frames through CPU memory.
-    # Wayland activation also uses Qt platform APIs.
-    set(QT_NO_PRIVATE_MODULE_WARNING ON)
-    find_package(Qt6 6.10 REQUIRED COMPONENTS GuiPrivate)
-endif()
-
 if (LINUX AND NOT ANDROID)
     find_package(PkgConfig REQUIRED)
     pkg_check_modules(GIO REQUIRED IMPORTED_TARGET gio-2.0 gio-unix-2.0)
@@ -25,75 +12,94 @@ if (LINUX AND NOT ANDROID)
     pkg_check_modules(XCB_ICCCM REQUIRED IMPORTED_TARGET xcb-icccm)
 endif()
 
-qt_add_executable(ladybird main.cpp)
-target_sources(ladybird PRIVATE
+add_library(ladybird_impl STATIC
     AllTabsPopover.cpp
+    Actions.cpp
     Application.cpp
+    ApplicationActions.cpp
     Autocomplete.cpp
     BookmarkDialog.cpp
+    BookmarkStore.cpp
     BookmarkPopover.cpp
+    Bookmarks.cpp
     BookmarksBar.cpp
+    BookmarksPage.cpp
+    DownloadPresentation.cpp
+    DownloadsPage.cpp
     BrowserWindow.cpp
     ChromeStyle.cpp
-    CrashReportNotifier.cpp
+    ContextMenus.cpp
     CrashReportReviewWidget.cpp
     DevToolsBanner.cpp
     EventLoopImplementationQt.cpp
     EventLoopImplementationQtEventTarget.cpp
+    FeedbackPopover.cpp
     FindInPageWidget.cpp
-    Icon.cpp
     HiddenPageSizing.cpp
+    HistoryPage.cpp
+    HubConnection.cpp
+    Icon.cpp
     InputMethodUtils.cpp
     JavaScriptDialog.cpp
     LadybirdButton.cpp
     LocationEdit.cpp
     Menu.cpp
-    NativeWindowContainer.cpp
     NativeTextEditingLineEdit.cpp
-    ProcessManagerWindow.cpp
+    NativeWindowContainer.cpp
     PerformanceMonitorWidget.cpp
     PermissionPromptPopover.cpp
     PictureInPictureWindow.cpp
+    PlainText.cpp
     Popover.cpp
+    ProcessManagerWindow.cpp
+    RemoteDownloads.cpp
+    RemoteView.cpp
     ReportReview.cpp
     RestoreSessionCard.cpp
     ScreenshotSelectionOverlay.cpp
     ScreenshotViewer.cpp
+    SessionHistorySnapshotStorage.cpp
+    SessionStore.cpp
     SelectDropdown.cpp
     SiteSettingsPopover.cpp
     StringUtils.cpp
+    SuggestionProvider.cpp
     SystemAppearance.cpp
     Tab.cpp
     TabBar.cpp
     Theme.cpp
+    VersionPage.cpp
     WebCompatReportReview.cpp
     WebContentView.cpp
+    WebUIPage.cpp
     WindowCloseCoordinator.cpp
     WindowControlButton.cpp
+    WindowControlsReveal.cpp
     WindowScreenObserver.cpp
-    ladybird.qrc
+    WindowToolbar.cpp
 )
 if (NOT APPLE AND NOT WIN32 AND NOT ANDROID)
-    target_sources(ladybird PRIVATE
+    target_sources(ladybird_impl PRIVATE
         AccessibilityInterface.cpp
     )
 endif()
 
-target_link_libraries(ladybird PRIVATE Qt::Core Qt::Gui Qt::Widgets)
+target_link_libraries(ladybird_impl PUBLIC Qt::Core Qt::Gui Qt::Widgets)
+target_link_libraries(ladybird_impl PRIVATE LibDatabase LibFileSystem LibUnicode)
 
 if (TARGET Qt6::Positioning)
-    target_sources(ladybird PRIVATE GeolocationProviderQt.cpp GeolocationProviderQt.h)
-    target_link_libraries(ladybird PRIVATE Qt::Positioning)
-    target_compile_definitions(ladybird PRIVATE LADYBIRD_QT_HAVE_POSITIONING=1)
+    target_sources(ladybird_impl PRIVATE GeolocationProviderQt.cpp GeolocationProviderQt.h)
+    target_link_libraries(ladybird_impl PUBLIC Qt::Positioning)
+    target_compile_definitions(ladybird_impl PUBLIC LADYBIRD_QT_HAVE_POSITIONING=1)
 endif()
 
 if (LINUX AND NOT ANDROID)
-    target_sources(ladybird PRIVATE ExternalURLActivationToken.cpp ExternalURLHandler.cpp X11Window.cpp X11Window.h)
-    target_link_libraries(ladybird PRIVATE LibThreading PkgConfig::GIO PkgConfig::XCB_ICCCM Qt::GuiPrivate)
+    target_sources(ladybird_impl PRIVATE ExternalURLActivationToken.cpp ExternalURLHandler.cpp X11Window.cpp X11Window.h)
+    target_link_libraries(ladybird_impl PRIVATE LibThreading PkgConfig::GIO PkgConfig::XCB_ICCCM Qt::GuiPrivate)
     if (WAYLAND_CLIENT_FOUND)
-        target_sources(ladybird PRIVATE WaylandWindow.cpp WaylandWindow.h)
-        target_link_libraries(ladybird PRIVATE PkgConfig::WAYLAND_CLIENT)
-        target_compile_definitions(ladybird PRIVATE LADYBIRD_HAS_WAYLAND_CLIENT)
+        target_sources(ladybird_impl PRIVATE WaylandWindow.cpp WaylandWindow.h)
+        target_link_libraries(ladybird_impl PRIVATE PkgConfig::WAYLAND_CLIENT)
+        target_compile_definitions(ladybird_impl PUBLIC LADYBIRD_HAS_WAYLAND_CLIENT)
     endif()
     if (WAYLAND_CLIENT_FOUND AND WAYLAND_SCANNER_FOUND AND USE_VULKAN_DMABUF_IMAGES)
         pkg_get_variable(WAYLAND_SCANNER_EXECUTABLE wayland-scanner wayland_scanner)
@@ -113,9 +119,9 @@ if (LINUX AND NOT ANDROID)
                 DEPENDS "${protocol_xml}"
                 VERBATIM
             )
-            target_sources(ladybird PRIVATE "${protocol_header}" "${protocol_code}")
+            target_sources(ladybird_impl PRIVATE "${protocol_header}" "${protocol_code}")
         endforeach()
-        target_sources(ladybird PRIVATE
+        target_sources(ladybird_impl PRIVATE
             WaylandGpu.cpp
             WaylandGpu.h
             WaylandPageSurface.cpp
@@ -123,35 +129,76 @@ if (LINUX AND NOT ANDROID)
             WaylandRegistry.cpp
             WaylandRegistry.h
         )
-        target_include_directories(ladybird PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
-        target_compile_definitions(ladybird PRIVATE LADYBIRD_HAS_WAYLAND_GPU_QUERY)
+        target_include_directories(ladybird_impl PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
+        target_compile_definitions(ladybird_impl PUBLIC LADYBIRD_HAS_WAYLAND_GPU_QUERY)
+    else()
+        message(WARNING "Building without the Wayland page surface. Pages on Wayland will use a fallback that can fall "
+            "behind the window as it resizes. The page surface needs the wayland-client and wayland-scanner pkg-config "
+            "modules (libwayland-dev on Debian and Ubuntu), Vulkan and glslangValidator.")
     endif()
 endif()
 
 if (APPLE)
-    target_sources(ladybird PRIVATE
+    target_sources(ladybird_impl PRIVATE
         ApplicationIcon.mm
         Conversions.mm
         DictionaryLookup.mm
         ExternalURLHandler.mm
+        LaunchURLsMacOS.cpp
         LadybirdAccessibilityElement.mm
         MacWindow.mm
         MacWindowFocus.mm
+        MicrophoneAuthorizerMacOS.mm
         NativeTextEditingBindings.mm
         Menu.mm
         ScrollbarPreferencesMac.mm
         SpellCheckerMac.mm
         SystemAppearanceMac.mm
+        TranslateIconMac.mm
         WebContentViewAccessibility.mm
         WebContentViewMac.mm
     )
-    target_link_libraries(ladybird PRIVATE Qt::GuiPrivate "-framework ApplicationServices" "-framework Cocoa" "-framework IOSurface" "-framework QuartzCore")
+    target_link_libraries(ladybird_impl PRIVATE Qt::GuiPrivate "-framework ApplicationServices" "-framework AVFoundation" "-framework Carbon" "-framework Cocoa" "-framework CoreServices" "-framework IOSurface" "-framework QuartzCore")
     set_source_files_properties(
         LadybirdAccessibilityElement.mm
+        MicrophoneAuthorizerMacOS.mm
         SpellCheckerMac.mm
+        TranslateIconMac.mm
+        TranslatorMac.mm
         WebContentViewAccessibility.mm
         PROPERTIES COMPILE_FLAGS "-fobjc-arc"
     )
+
+    # The Translation framework has no Objective-C API, so the browser reaches it through a small Swift library. The
+    # API it uses came in the macOS 26.4 SDK, and CMake builds Swift for one architecture at a time. So a build with an
+    # older SDK, or a universal build, leaves the translator out, and the browser doesn't offer to translate pages.
+    include(CheckLanguage)
+    check_language(Swift)
+    list(LENGTH CMAKE_OSX_ARCHITECTURES ladybird_architecture_count)
+    set(ladybird_sdk "${CMAKE_OSX_SYSROOT}")
+    if (NOT ladybird_sdk)
+        set(ladybird_sdk macosx)
+    endif()
+    execute_process(COMMAND xcrun --sdk "${ladybird_sdk}" --show-sdk-version OUTPUT_VARIABLE ladybird_sdk_version OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+    if (CMAKE_Swift_COMPILER AND ladybird_architecture_count LESS_EQUAL 1 AND ladybird_sdk_version VERSION_GREATER_EQUAL 26.4)
+        set(ladybird_swift_architecture "${CMAKE_SYSTEM_PROCESSOR}")
+        if (CMAKE_OSX_ARCHITECTURES)
+            set(ladybird_swift_architecture "${CMAKE_OSX_ARCHITECTURES}")
+        endif()
+        set(CMAKE_Swift_COMPILER_TARGET "${ladybird_swift_architecture}-apple-macosx${CMAKE_OSX_DEPLOYMENT_TARGET}")
+        enable_language(Swift)
+        # NB: Whatever links the library keeps linking as C++, so it keeps the link options that only apply to C and C++
+        #     links.
+        set(CMAKE_Swift_LINKER_PREFERENCE_PROPAGATES OFF)
+        add_library(ladybird_translation_service STATIC TranslationServiceMac.swift)
+        target_sources(ladybird_impl PRIVATE TranslatorMac.mm)
+        target_link_libraries(ladybird_impl PRIVATE ladybird_translation_service "-framework NaturalLanguage")
+        target_compile_definitions(ladybird_impl PUBLIC LADYBIRD_HAS_TRANSLATOR)
+        # The framework only exists from macOS 15, and the browser runs on older versions without it.
+        target_link_options(ladybird_impl INTERFACE "LINKER:-weak_framework,Translation")
+    else()
+        message(STATUS "Building without page translation, which needs Swift, the macOS 26.4 SDK, and a single architecture")
+    endif()
 endif()
 
 if (NOT APPLE AND USE_VULKAN_DMABUF_IMAGES)
@@ -194,20 +241,23 @@ if (NOT APPLE AND USE_VULKAN_DMABUF_IMAGES)
             "${WEB_CONTENT_VIEW_LINUX_FRAG_SHADER_HEADER}"
     )
 
-    target_sources(ladybird PRIVATE
+    target_sources(ladybird_impl PRIVATE
         WebContentViewLinux.cpp
         "${WEB_CONTENT_VIEW_LINUX_VERT_SHADER_HEADER}"
         "${WEB_CONTENT_VIEW_LINUX_FRAG_SHADER_HEADER}"
     )
-    target_include_directories(ladybird PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
-    target_link_libraries(ladybird PRIVATE Vulkan::Vulkan)
-    add_dependencies(ladybird generate_web_content_view_linux_shaders)
+    target_include_directories(ladybird_impl PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
+    target_link_libraries(ladybird_impl PRIVATE Vulkan::Vulkan)
+    add_dependencies(ladybird_impl generate_web_content_view_linux_shaders)
 endif()
 
 if (HAS_DIRECTX)
-    target_sources(ladybird PRIVATE WebContentViewWindows.cpp)
-    target_link_libraries(ladybird PRIVATE Qt::GuiPrivate d3d11)
+    target_sources(ladybird_impl PRIVATE WebContentViewWindows.cpp)
+    target_link_libraries(ladybird_impl PRIVATE Qt::GuiPrivate d3d11)
 endif()
+
+qt_add_executable(ladybird main.cpp ladybird.qrc)
+target_link_libraries(ladybird PRIVATE ladybird_impl)
 
 create_ladybird_bundle(ladybird)
 
@@ -229,49 +279,4 @@ qt_deploy_runtime_dependencies(
             -P ${ladybird_deploy_script}
         COMMAND_EXPAND_LISTS
     )
-endif()
-
-if (BUILD_TESTING AND NOT BUILD_BROWSER_TESTS_ONLY)
-    if (APPLE)
-        add_library(NativeTextEditingTestMain OBJECT
-            ${LADYBIRD_SOURCE_DIR}/Tests/UI/Qt/NativeTextEditingTestMain.mm
-            ${LADYBIRD_SOURCE_DIR}/Libraries/LibTest/AssertionHandler.cpp
-        )
-        target_link_libraries(NativeTextEditingTestMain PRIVATE AK LibTest "-framework AppKit")
-        ladybird_test("${LADYBIRD_SOURCE_DIR}/Tests/UI/Qt/TestNativeTextEditingBindings.mm" UI/Qt
-            NO_TEST
-            CUSTOM_MAIN "$<TARGET_OBJECTS:NativeTextEditingTestMain>"
-            LIBS LibWebCommon Qt::Widgets "-framework AppKit"
-        )
-        foreach(mode default custom)
-            add_test(NAME TestNativeTextEditingBindings-${mode}
-                COMMAND ${Python3_EXECUTABLE}
-                    ${LADYBIRD_SOURCE_DIR}/Tests/UI/Qt/run-native-text-editing-tests.py
-                    $<TARGET_FILE:TestNativeTextEditingBindings> ${mode}
-            )
-        endforeach()
-    endif()
-
-    add_executable(TestPerformanceMonitorWidget
-        ${LADYBIRD_SOURCE_DIR}/Tests/LibWebView/TestPerformanceMonitorWidget.cpp
-        ChromeStyle.cpp
-        PerformanceMonitorWidget.cpp
-        StringUtils.cpp
-        SystemAppearance.cpp
-        Theme.cpp
-    )
-    if (APPLE)
-        target_sources(TestPerformanceMonitorWidget PRIVATE SystemAppearanceMac.mm)
-        target_link_libraries(TestPerformanceMonitorWidget PRIVATE "-framework AppKit")
-    endif()
-    if (LINUX AND NOT ANDROID)
-        target_sources(TestPerformanceMonitorWidget PRIVATE X11Window.cpp)
-        target_link_libraries(TestPerformanceMonitorWidget PRIVATE PkgConfig::XCB_ICCCM)
-    endif()
-    set_target_properties(TestPerformanceMonitorWidget PROPERTIES AUTOMOC ON)
-    target_include_directories(TestPerformanceMonitorWidget PRIVATE ${LADYBIRD_SOURCE_DIR})
-    target_link_libraries(TestPerformanceMonitorWidget PRIVATE Qt6::Widgets LibWebView LibURL AK)
-    qt_import_plugins(TestPerformanceMonitorWidget INCLUDE Qt6::QOffscreenIntegrationPlugin)
-    add_test(NAME TestPerformanceMonitorWidget COMMAND TestPerformanceMonitorWidget)
-    set_tests_properties(TestPerformanceMonitorWidget PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
 endif()

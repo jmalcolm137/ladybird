@@ -1,0 +1,16 @@
+appended sheet
+target: rgb(0, 128, 0)
+inserted rule
+other: rgb(0, 0, 255)
+edited rule
+other: rgb(255, 165, 0)
+deleted rule
+other: rgb(0, 0, 0)
+media off
+target: rgb(0, 0, 0)
+media on
+target: rgb(0, 128, 0)
+removed sheet
+target: rgb(0, 0, 0)
+sheet inserted before
+target: rgb(0, 128, 0)

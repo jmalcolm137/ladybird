@@ -13,12 +13,17 @@ pub use crate::embedding::abi_types::{completion_into_abi, object_from_abi, vm_f
 pub use crate::embedding::host::host_function::HostFunction;
 pub use crate::embedding::host::host_module::{HostModule, host_class_of as host_module_class_of};
 pub use crate::embedding::host::host_object::{HostObject, host_class_of, host_data_of, is_host_instance_of};
+pub use crate::gc::capi::GC_PRIMITIVE_STORAGE_NULL_HANDLE;
 pub use crate::gc::class::ExternalMemorySize;
 pub use crate::gc::defer_gc::DeferGc;
 pub use crate::gc::embedder_cell::{EmbedderCell, EmbedderClass, EmbedderValue};
 pub use crate::gc::foreign::ForeignCellSlot;
 pub use crate::gc::gc_ref_cell::{GcRefCell, GcRefMut};
-pub use crate::gc::root::{MarkedVec, Root};
+pub use crate::gc::root::{CellRoot, MarkedVec, Root};
+pub use crate::gc::shared_memory::{
+    AsSharedMemory, OwnedSharedMemory, borrowed_from_raw_descriptor, into_raw_descriptor, owned_from_raw_descriptor,
+    raw_descriptor,
+};
 pub use crate::gc::visitor::{Trace, Visitor};
 pub use crate::gc::weak::GcWeak;
 pub use crate::interpreter::vm::{TypeErrorRealmScope, Vm};
@@ -40,8 +45,8 @@ pub use crate::runtime::abstract_operations::{
 pub use crate::runtime::agent::agent_can_suspend;
 pub use crate::runtime::array::Array;
 pub use crate::runtime::array_buffer::{
-    ArrayBuffer, DataBlock, DataBlockStorage, ExternalPrimitiveStorage, Order as ArrayBufferOrder,
-    Shared as ArrayBufferShared, clone_array_buffer, create_byte_data_block, detach_array_buffer,
+    ArrayBuffer, DataBlock, DataBlockStorage, ExternalPrimitiveStorage, Order as ArrayBufferOrder, OutOfMemory,
+    OwnedBackingStore, Shared as ArrayBufferShared, clone_array_buffer, create_byte_data_block, detach_array_buffer,
 };
 pub use crate::runtime::big_int::BigInt;
 pub use crate::runtime::big_int_object::BigIntObject;
@@ -63,13 +68,15 @@ pub use crate::runtime::iterator::{
     IteratorHint, IteratorRecord, create_iterator_result_object, get_iterator, get_iterator_from_method_impl,
     iterator_complete, iterator_next, iterator_step_value, iterator_to_list, iterator_value,
 };
+pub use crate::runtime::json_object::JSONObject;
 pub use crate::runtime::map::Map;
+pub use crate::runtime::map_iterator::MapIterator;
 pub use crate::runtime::module::Module;
 pub use crate::runtime::module_environment::ModuleEnvironment;
 pub use crate::runtime::module_request::ModuleRequest;
 pub use crate::runtime::native_function::{NativeFunction, RawNativeFunction};
 pub use crate::runtime::number_object::NumberObject;
-pub use crate::runtime::object::{IntegrityLevel, Object, PropertyKind};
+pub use crate::runtime::object::{IntegrityLevel, Object, PropertyKind, ShouldThrowExceptions};
 pub use crate::runtime::primitive_string::PrimitiveString;
 pub use crate::runtime::promise::{Promise, PromiseState, RejectionOperation};
 pub use crate::runtime::promise_capability::{PromiseCapability, new_promise_capability};
@@ -78,12 +85,18 @@ pub use crate::runtime::property_key::PropertyKey;
 pub use crate::runtime::realm::Realm;
 pub use crate::runtime::regexp_object::{RegExpObject, regexp_create};
 pub use crate::runtime::set::Set;
+pub use crate::runtime::set_iterator::SetIterator;
+pub use crate::runtime::shared_backing_store::{
+    SharedBackingStore, SharedStoreLifeline, SharedStorePin, duplicate_lifeline_from_raw_descriptor,
+    lifeline_from_raw_descriptor, lifeline_into_raw_descriptor, release_stores_of_lost_messages,
+};
 pub use crate::runtime::string_object::StringObject;
 pub use crate::runtime::typed_array::{
-    Kind as TypedArrayKind, TypedArrayBase, TypedArrayWithBufferWitness, create_typed_array_on_buffer,
-    is_typed_array_out_of_bounds, make_typed_array_with_buffer_witness_record, typed_array_byte_length,
+    Kind as TypedArrayKind, TypedArrayBase, TypedArrayWithBufferWitness, create_typed_array,
+    create_typed_array_on_buffer, is_typed_array_out_of_bounds, make_typed_array_with_buffer_witness_record,
+    typed_array_byte_length, typed_array_length,
 };
 pub use crate::runtime::value::{number_to_string, same_value};
-pub use crate::utf16::{Utf16Display, to_well_formed};
+pub use crate::utf16::{Utf16Display, Utf16View, to_well_formed, utf16_formatted};
 /// Derives Trace for a type of the embedder, which marks the type `#[gc(crate = libjs_rust)]`.
 pub use libjs_runtime_macros::Trace;

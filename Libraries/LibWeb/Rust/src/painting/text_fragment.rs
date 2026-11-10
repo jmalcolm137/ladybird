@@ -177,15 +177,25 @@ pub(crate) fn for_each_fragment_of_nodes(
     node_slots: &[NodeSlotId],
     mut callback: impl FnMut(NodeSlotId, u32, &FragmentRecord) -> bool,
 ) {
+    // OPTIMIZATION: Up to this many fragments, a scan costs less than building an index would.
+    const MAX_FRAGMENTS_TO_SCAN: usize = 32;
+
     for &node in node_slots {
         let Some(block) = containing_block_paintable_of_node(layout_arena, node) else {
             continue;
         };
-        for (index, fragment) in layout_arena.committed_side_data(block).fragments().iter().enumerate() {
-            if fragment.layout_node != node {
-                continue;
+        let side_data = layout_arena.committed_side_data(block);
+        let fragments = side_data.fragments();
+        if fragments.len() <= MAX_FRAGMENTS_TO_SCAN {
+            for (index, fragment) in fragments.iter().enumerate() {
+                if fragment.layout_node == node && !callback(block, index as u32, fragment) {
+                    return;
+                }
             }
-            if !callback(block, index as u32, fragment) {
+            continue;
+        }
+        for &index in side_data.fragment_indices_of(node) {
+            if !callback(block, index, &fragments[index as usize]) {
                 return;
             }
         }
@@ -240,26 +250,97 @@ pub(crate) fn selection_offsets_for_dom_range(
     })
 }
 
+/// Calls `callback` with each cluster of a fragment's glyph run, in glyph order: the code units it covers
+/// (`cluster_start..cluster_end`) and its advance. Each glyph that covers code units starts a cluster, even one with no
+/// advance (e.g. a soft hyphen's), and a glyph that covers none (another glyph of the same cluster) adds its advance to
+/// the cluster before it. Stops early when `callback` returns false.
 fn for_each_cluster_in_glyph_run(
     glyphs: &[libgfx_rust::text_layout::DrawGlyph],
     fragment_length_in_code_units: usize,
     mut callback: impl FnMut(usize, usize, f32) -> bool,
 ) {
     let mut cursor = 0usize;
+    // The cluster whose glyphs are still being added up, and the advance of glyphs that came before any code unit.
+    let mut pending: Option<(usize, usize, f32)> = None;
+    let mut leading_advance = 0.0f32;
     for glyph in glyphs {
-        if glyph.glyph_width == 0.0 {
+        if glyph.length_in_code_units() == 0 {
+            match &mut pending {
+                Some((_, _, width)) => *width += glyph.advance,
+                None => leading_advance += glyph.advance,
+            }
             continue;
         }
         let cluster_start = cursor;
-        let cluster_end = (cursor + glyph.length_in_code_units).min(fragment_length_in_code_units);
+        let cluster_end = (cursor + glyph.length_in_code_units()).min(fragment_length_in_code_units);
         cursor = cluster_end;
-        if cluster_end <= cluster_start {
-            continue;
-        }
-        if !callback(cluster_start, cluster_end, glyph.glyph_width) {
+        if let Some((start, end, width)) = pending.take()
+            && !callback(start, end, width)
+        {
             return;
         }
+        if cluster_end > cluster_start {
+            pending = Some((
+                cluster_start,
+                cluster_end,
+                glyph.advance + std::mem::take(&mut leading_advance),
+            ));
+        }
     }
+    if let Some((start, end, width)) = pending {
+        callback(start, end, width);
+    }
+}
+
+/// Calls `callback` with each DOM offset (in UTF-16 code units) that the horizontal `fragment` renders, from its first
+/// offset through the one past its last, along with the document-absolute x coordinate where that offset's character
+/// starts (or, for the last one, where the fragment's text ends). The advances come from the fragment's shaped glyph
+/// run, so kerning and ligatures are reflected; a cluster's advance is split evenly among its code units.
+pub(crate) fn for_each_dom_offset_x(
+    layout_arena: &impl PaintRead,
+    fragment: &FragmentRecord,
+    mut callback: impl FnMut(usize, f32),
+) {
+    if !is_horizontal(fragment) {
+        return;
+    }
+    let Some(run) = &fragment.glyph_run else {
+        return;
+    };
+    // FIXME: Report the positions of right-to-left text. Its glyphs are in visual order, so an advance accumulated in
+    //        glyph order doesn't belong to the character at the same logical offset.
+    if run.glyphs.placed().any(|placed| placed.is_rtl) {
+        return;
+    }
+    let Some(rendered_text) = layout_arena.rendered_text(fragment.layout_node) else {
+        return;
+    };
+    let length = fragment.length_in_code_units;
+    // advance_before[i] is the advance of the fragment's rendered text before its rendered offset i.
+    let mut advance_before = vec![0.0f32; length + 1];
+    let mut cursor = 0usize;
+    for_each_cluster_in_glyph_run(&run.glyphs, length, |cluster_start, cluster_end, cluster_width| {
+        let per_unit_advance = cluster_width / (cluster_end - cluster_start) as f32;
+        for offset in cluster_start..cluster_end {
+            advance_before[offset + 1] = advance_before[offset] + per_unit_advance;
+        }
+        cursor = cluster_end;
+        true
+    });
+    // Code units past the last cluster take the end position.
+    for offset in cursor..length {
+        advance_before[offset + 1] = advance_before[offset];
+    }
+    let x = absolute_rect(layout_arena, fragment).x.to_float();
+    rendered_text.for_each_rendered_text_offset_of_dom_offsets(
+        fragment.dom_start_offset_in_node,
+        fragment.dom_end_offset_in_node,
+        crate::layout::RenderedTextBoundary::End,
+        |dom_offset, rendered_offset| {
+            let offset_in_fragment = rendered_offset.clamp(fragment.start, fragment.start + length) - fragment.start;
+            callback(dom_offset, x + advance_before[offset_in_fragment]);
+        },
+    );
 }
 
 pub(crate) fn rect_for_selection_offsets(
@@ -338,8 +419,9 @@ pub(crate) fn rect_for_selection_offsets(
         let ascent_f = font.facts().ascent;
         let descent_f = font.facts().descent;
         if ascent_f > 0.0 || descent_f > 0.0 {
-            let ascent = CssPixels::nearest_value_for_f32(ascent_f);
-            let descent = CssPixels::nearest_value_for_f32(descent_f);
+            // NB: Layout counts the font's ascent and descent in whole pixels, so its text baselines are too.
+            let ascent = CssPixels::nearest_value_for_f32(ascent_f.round_ties_even());
+            let descent = CssPixels::nearest_value_for_f32(descent_f.round_ties_even());
             let zero = CssPixels::from_raw(0);
             let overflow_top = (ascent - fragment.baseline).max(zero);
             let overflow_bottom = (descent - secondary_size(rect, horizontal) + fragment.baseline).max(zero);
@@ -432,20 +514,20 @@ pub(crate) fn physical_edge_offset(
     left: bool,
 ) -> Option<(usize, bool)> {
     let run = fragment.glyph_run.as_ref()?;
-    let glyph = run
+    let placed = run
         .glyphs
-        .iter()
-        .filter(|glyph| glyph.length_in_code_units > 0 && glyph.glyph_width > 0.0)
+        .placed()
+        .filter(|placed| placed.glyph.length_in_code_units() > 0 && placed.glyph.advance > 0.0)
         .min_by(|a, b| {
             if left {
                 a.x.total_cmp(&b.x)
             } else {
-                (b.x + b.glyph_width).total_cmp(&(a.x + a.glyph_width))
+                (b.x + b.glyph.advance).total_cmp(&(a.x + a.glyph.advance))
             }
         })?;
-    let boundary = glyph.cluster_start as usize
-        + if left == glyph.is_rtl {
-            glyph.length_in_code_units
+    let boundary = placed.cluster_start as usize
+        + if left == placed.is_rtl {
+            placed.glyph.length_in_code_units()
         } else {
             0
         };
@@ -455,21 +537,26 @@ pub(crate) fn physical_edge_offset(
             fragment.start + boundary,
             crate::layout::RenderedTextBoundary::End,
         ),
-        left == glyph.is_rtl,
+        left == placed.is_rtl,
     ))
 }
 
 pub(crate) fn caret_inline_offset(fragment: &FragmentRecord, offset: usize, downstream: bool) -> Option<f32> {
     let run = fragment.glyph_run.as_ref()?;
     let mut fallback = None;
-    for glyph in run.glyphs.iter().filter(|glyph| glyph.length_in_code_units > 0) {
-        let start = glyph.cluster_start as usize;
-        let end = start + glyph.length_in_code_units;
+    for placed in run
+        .glyphs
+        .placed()
+        .filter(|placed| placed.glyph.length_in_code_units() > 0)
+    {
+        let start = placed.cluster_start as usize;
+        let length = placed.glyph.length_in_code_units();
+        let end = start + length;
         if offset < start || offset > end {
             continue;
         }
-        let fraction = (offset - start) as f32 / glyph.length_in_code_units as f32;
-        let coordinate = glyph.x + glyph.glyph_width * if glyph.is_rtl { 1.0 - fraction } else { fraction };
+        let fraction = (offset - start) as f32 / length as f32;
+        let coordinate = placed.x + placed.glyph.advance * if placed.is_rtl { 1.0 - fraction } else { fraction };
         if (offset > start && offset < end) || (downstream && offset == start) || (!downstream && offset == end) {
             return Some(coordinate);
         }

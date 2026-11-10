@@ -324,6 +324,7 @@ private:
     void update_radio_button_group_registration();
     virtual void computed_properties_changed() override;
     virtual void prepare_for_style_computation() override { create_shadow_tree_if_needed(); }
+    virtual bool needs_preparation_for_style_computation() const override { return true; }
 
     virtual bool is_presentational_hint(Utf16FlyString const&) const override;
     virtual void apply_presentational_hints(Vector<CSS::StyleProperty>&) const override;
@@ -355,7 +356,7 @@ private:
     Optional<double> convert_string_to_number(Utf16View input) const;
     Utf16String convert_number_to_string(double input) const;
 
-    WebIDL::ExceptionOr<Optional<double>> convert_string_to_date(StringView input) const;
+    WebIDL::ExceptionOr<Optional<double>> convert_string_to_date(Utf16View input) const;
     WebIDL::ExceptionOr<Optional<double>> convert_string_to_date(Utf16String const& input) const;
     Utf16String convert_date_to_string(double input) const;
 

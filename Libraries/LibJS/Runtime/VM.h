@@ -129,7 +129,19 @@ public:
     void ref() const { ++m_reference_count; }
     void unref() const;
 
+    // The VM of the calling thread. A thread that runs a VM creates and destroys it, and has at most one at a time.
+#if defined(AK_OS_WINDOWS)
+    static VM& the();
+    static bool exists_on_this_thread();
+#else
     ALWAYS_INLINE static VM& the() { return *s_the; }
+    ALWAYS_INLINE static bool exists_on_this_thread() { return s_the != nullptr; }
+#endif
+
+    // A thread that runs a VM should have a stack of at least this size, which is what main threads usually get. The
+    // default for other threads can be far less (512 KiB on macOS), where recursion that works on the main thread would
+    // end in a RangeError.
+    static constexpr size_t MINIMUM_THREAD_STACK_SIZE = 8 * MiB;
 
     GC::Heap& heap() const { return *m_heap; }
 
@@ -147,6 +159,16 @@ public:
     // The runtime's debugger, which is attached while debugging is enabled. A Debugger handle has the VM's address.
     [[nodiscard]] Debugger* debugger();
     [[nodiscard]] Debugger const* debugger() const;
+
+    // Stops script on this VM for good: it unwinds past every handler, finally blocks included, up to the native code
+    // that ran it, and nothing runs on this VM anymore. Native code sees a thrown exception, and whatever it tries to
+    // run next throws one as well. Any thread may call this, as long as the VM stays alive until it returns.
+    void request_interrupt();
+    [[nodiscard]] bool interrupt_requested() const;
+
+    // Whether the thread of this VM sleeps in Atomics.wait() or memory.atomic.wait, on the list that a notify takes it
+    // off. Any thread may call this, as long as the VM stays alive until it returns.
+    [[nodiscard]] bool is_waiting_on_shared_memory() const;
 
 #define __JS_ENUMERATE(SymbolName, snake_name)                 \
     GC::Ref<Symbol> well_known_symbol_##snake_name() const     \
@@ -327,46 +349,6 @@ public:
     // Returns the base of the Reference Record, or null if the reference is unresolvable.
     ThrowCompletionOr<GC::Ptr<Environment>> resolve_binding(Utf16FlyString const&, Strict, GC::Ptr<Environment> = nullptr);
 
-    // Has the TypeErrors that are thrown at the execution context stack depth the scope was created at created in
-    // `realm`, until the scope is restored. Callees that push execution contexts are unaffected.
-    class TypeErrorRealmScope {
-        AK_MAKE_NONCOPYABLE(TypeErrorRealmScope);
-        AK_MAKE_NONMOVABLE(TypeErrorRealmScope);
-
-    public:
-        TypeErrorRealmScope(VM& vm, Realm& realm)
-            : m_vm(vm)
-            , m_previous_realm(vm.engine_head_field<Realm*>(JS_LAYOUT_VM_TYPE_ERROR_REALM_OVERRIDE_OFFSET))
-            , m_previous_depth(vm.engine_head_field<size_t>(JS_LAYOUT_VM_TYPE_ERROR_REALM_OVERRIDE_DEPTH_OFFSET))
-        {
-            vm.set_engine_head_field<Realm*>(JS_LAYOUT_VM_TYPE_ERROR_REALM_OVERRIDE_OFFSET, &realm);
-            vm.set_engine_head_field<size_t>(JS_LAYOUT_VM_TYPE_ERROR_REALM_OVERRIDE_DEPTH_OFFSET, vm.execution_context_stack_length());
-        }
-
-        ~TypeErrorRealmScope()
-        {
-            restore();
-        }
-
-        void restore()
-        {
-            if (!m_active)
-                return;
-            m_vm.set_engine_head_field<Realm*>(JS_LAYOUT_VM_TYPE_ERROR_REALM_OVERRIDE_OFFSET, m_previous_realm.ptr());
-            m_vm.set_engine_head_field<size_t>(JS_LAYOUT_VM_TYPE_ERROR_REALM_OVERRIDE_DEPTH_OFFSET, m_previous_depth);
-            m_active = false;
-        }
-
-    private:
-        static_assert(JS_LAYOUT_VM_TYPE_ERROR_REALM_OVERRIDE_SIZE == sizeof(Realm*));
-        static_assert(JS_LAYOUT_VM_TYPE_ERROR_REALM_OVERRIDE_DEPTH_SIZE == sizeof(size_t));
-
-        VM& m_vm;
-        GC::Ptr<Realm> m_previous_realm;
-        size_t m_previous_depth { 0 };
-        bool m_active { true };
-    };
-
     // 5.2.3.2 Throw an Exception, https://tc39.es/ecma262/#sec-throw-an-exception
     // The runtime creates the errors of its own constructors, in the current realm or the realm of a TypeErrorRealmScope.
     template<typename T, typename... Args>
@@ -407,7 +389,8 @@ public:
     void set_agent(OwnPtr<Agent>);
 
     // How Error.prototype.stack writes its frames and how Function.prototype.toString writes a built-in function: the
-    // embedder's choice, since scripts read both to tell engines apart.
+    // embedder's choice, since scripts read both to tell engines apart. This goes for all the VMs of the process, on any
+    // thread.
     enum class StackFrameSyntax : u8 {
         Indented, // "    at f (url:line:col)", under a "Name: message" line
         AtSign,   // "f@url:line:col", frames only
@@ -416,7 +399,7 @@ public:
         SingleLine, // "function f() { [native code] }"
         MultiLine,  // "function f() {\n    [native code]\n}"
     };
-    void set_source_text_syntaxes(StackFrameSyntax, NativeFunctionSourceSyntax);
+    static void set_source_text_syntaxes(StackFrameSyntax, NativeFunctionSourceSyntax);
     Agent* agent() { return m_agent; }
     Agent const* agent() const { return m_agent; }
 
@@ -450,6 +433,10 @@ public:
 
     // The frames of the execution context stack from the running one down, with where in its source code each one is.
     [[nodiscard]] Vector<StackTraceElement> stack_trace() const;
+
+    // Where the given value was thrown, if it is the last exception thrown. Only one report may take the location of a
+    // throw.
+    [[nodiscard]] Optional<SourceRange> take_throw_site_of(Value);
 
 private:
     friend class InterpreterStack;
@@ -523,7 +510,10 @@ private:
 
     void push_execution_context_growing_the_stack(ExecutionContext&);
 
-    static VM* s_the;
+#if !defined(AK_OS_WINDOWS)
+    // NB: Cell::vm() reads this all the time, so it stays inline where it can: a DLL cannot export a thread_local.
+    AK_TLS_INITIAL_EXEC static constinit thread_local VM* s_the;
+#endif
 
     mutable u32 m_reference_count { 1 };
     GC::Heap* m_heap { nullptr };

@@ -7,16 +7,20 @@
 #pragma once
 
 #include <AK/Function.h>
+#include <AK/HashMap.h>
 #include <AK/Noncopyable.h>
 #include <AK/NonnullRefPtr.h>
 #include <AK/Optional.h>
 #include <AK/OwnPtr.h>
 #include <AK/Types.h>
+#include <AK/Vector.h>
+#include <AK/Weakable.h>
 #include <LibCompositing/DisplayList/DisplayListResourceStorage.h>
 #include <LibCompositing/Scrolling/AsyncScrollTree.h>
 #include <LibCompositing/Types.h>
 #include <LibCompositing/Video/VideoFrameHold.h>
 #include <LibGfx/Bitmap.h>
+#include <LibGfx/ColorSpace.h>
 #include <LibGfx/Point.h>
 #include <LibGfx/Rect.h>
 #include <LibGfx/Size.h>
@@ -33,6 +37,12 @@ class CompositorHost;
 class NavigablePresenter;
 struct CompositorFrame;
 
+// Whether the compositor took a requested screenshot, so painted the bitmap the request handed it.
+enum class ScreenshotResult : u8 {
+    Taken,
+    Failed,
+};
+
 struct PlaceholderCanvasLink {
     Compositing::CanvasId canvas_id;
     u64 secret { 0 };
@@ -41,6 +51,25 @@ struct PlaceholderCanvasLink {
 struct PlaceholderCanvasPixels {
     RefPtr<Gfx::Bitmap> bitmap;
     bool origin_clean { true };
+};
+
+// What the compositor needs to animate an image: it asks the decoder's session for the frames.
+struct AnimatedImageRegistration {
+    i64 session_id { 0 };
+    Gfx::IntSize size;
+    Gfx::ColorSpace color_space;
+    Vector<u32> frame_durations_in_milliseconds;
+    u32 loop_count { 0 };
+    // The decoder the session belongs to, which may be gone by the time a new compositor hears of the image.
+    u64 image_decoder_client_generation { 0 };
+    bool is_started { false };
+};
+
+struct AnimatedImageState {
+    bool is_animating { false };
+    u32 frame_index { 0 };
+    u32 shown_frame_index { 0 };
+    u32 loops_completed { 0 };
 };
 
 class WEB_API CompositorContextHandle {
@@ -59,8 +88,9 @@ public:
     void set_video_sink_ticking(Media::VideoSinkHandle, bool should_tick);
     void invalidate_wheel_event_listener_state(u64 generation);
     void invalidate_keyboard_scroll_state(u64 generation);
-    Compositing::AsyncScrollEnqueueResult async_scroll_by(UniqueNodeID expected_document_id, Gfx::FloatPoint position, Gfx::FloatPoint delta_in_device_pixels,
-        Gfx::IntRect viewport_rect, Web::WheelDeltaPrecision, Web::ScrollGesturePhase, u32 modifiers, Compositing::AsyncScrollOperationTracking, Compositing::WheelStepDispatch, u64 input_event_id);
+    Compositing::WheelEventAnswer take_wheel_event_from_main_thread(Web::MouseEvent const&, Compositing::AsyncScrollOperationTracking, Compositing::WheelEventRouting);
+    Compositing::WheelEventAnswer wheel_event_let_through(Compositing::WheelStepLetThrough const&, Compositing::AsyncScrollOperationTracking);
+    void wheel_event_canceled(u64 wheel_gesture_id);
     String scroll_state_for_testing(Web::AsyncScrollNodeStableID stretched_scroller);
     void synchronize_for_testing();
     Optional<Compositing::FirstWheelStepRouteForTesting> route_first_wheel_step_for_testing(Gfx::FloatPoint position, Gfx::FloatPoint delta_in_css_pixels);
@@ -71,7 +101,7 @@ public:
     void viewport_size_updated(Gfx::IntSize, double device_pixel_ratio, Compositing::WindowResizingInProgress);
     bool request_rendering_opportunity(double maximum_frames_per_second);
     void hurry_rendering_opportunity();
-    void request_screenshot(NonnullRefPtr<Gfx::Bitmap>, Function<void()>&& callback);
+    void request_screenshot(NonnullRefPtr<Gfx::Bitmap>, Function<void(ScreenshotResult)>&& callback);
     // Sends the canvas commands a frame may sample ahead of it, and answers whether the compositor can be reached.
     bool ready_for_frame();
 
@@ -84,7 +114,7 @@ private:
     Web::CompositorContextId m_context_id;
 };
 
-class WEB_API CompositorHost {
+class WEB_API CompositorHost : public Weakable<CompositorHost> {
     AK_MAKE_NONCOPYABLE(CompositorHost);
     AK_MAKE_NONMOVABLE(CompositorHost);
 
@@ -115,14 +145,24 @@ public:
     void set_parent_context(Web::CompositorContextId, Optional<Web::CompositorContextId>);
     void stop_presenting_to_client(Web::CompositorContextId);
 
+    // Has the compositor show the frames of an animated image under the image frame with the id.
+    void add_animated_image(u64 frame_id, AnimatedImageRegistration);
+    void remove_animated_image(u64 frame_id);
+    void start_animated_image(u64 frame_id);
+    void stop_animated_image(u64 frame_id);
+    AnimatedImageState animated_image_state_for_testing(u64 frame_id) const;
+    // A new compositor process has heard of none of the images.
+    void register_animated_images_with_new_compositor();
+
     void add_video_sink(Media::VideoSinkHandle, NonnullRefPtr<Compositing::VideoFramePresentationPage>);
     void remove_video_sink(Media::VideoSinkHandle);
     void set_video_sink_ticking(Media::VideoSinkHandle, bool should_tick);
     Compositing::VideoFrameHold::ReleaseThroughCompositor video_frame_hold_releaser_for_current_connection() const;
     void invalidate_wheel_event_listener_state(Web::CompositorContextId, u64 generation);
     void invalidate_keyboard_scroll_state(Web::CompositorContextId, u64 generation);
-    Compositing::AsyncScrollEnqueueResult async_scroll_by(Web::CompositorContextId, UniqueNodeID expected_document_id, Gfx::FloatPoint position,
-        Gfx::FloatPoint delta_in_device_pixels, Gfx::IntRect viewport_rect, Web::WheelDeltaPrecision, Web::ScrollGesturePhase, u32 modifiers, Compositing::AsyncScrollOperationTracking, Compositing::WheelStepDispatch, u64 input_event_id);
+    Compositing::WheelEventAnswer take_wheel_event_from_main_thread(Web::CompositorContextId, Web::MouseEvent const&, Compositing::AsyncScrollOperationTracking, Compositing::WheelEventRouting);
+    Compositing::WheelEventAnswer wheel_event_let_through(Web::CompositorContextId, Compositing::WheelStepLetThrough const&, Compositing::AsyncScrollOperationTracking);
+    void wheel_event_canceled(Web::CompositorContextId, u64 wheel_gesture_id);
     String scroll_state_for_testing(Web::CompositorContextId, Web::AsyncScrollNodeStableID stretched_scroller);
     void synchronize_for_testing();
     Optional<Compositing::FirstWheelStepRouteForTesting> route_first_wheel_step_for_testing(Web::CompositorContextId, Gfx::FloatPoint position, Gfx::FloatPoint delta_in_css_pixels);
@@ -133,7 +173,7 @@ public:
     void viewport_size_updated(Web::CompositorContextId, Gfx::IntSize, double device_pixel_ratio, Compositing::WindowResizingInProgress);
     bool request_rendering_opportunity(Web::CompositorContextId, double maximum_frames_per_second);
     void hurry_rendering_opportunity(Web::CompositorContextId);
-    void request_screenshot(Web::CompositorContextId, NonnullRefPtr<Gfx::Bitmap>, Function<void()>&& callback);
+    void request_screenshot(Web::CompositorContextId, NonnullRefPtr<Gfx::Bitmap>, Function<void(ScreenshotResult)>&& callback);
 
 protected:
     CompositorHost();
@@ -144,6 +184,8 @@ protected:
 
 private:
     friend class CompositorContextHandle;
+
+    HashMap<u64, AnimatedImageRegistration> m_animated_images;
 
     // Drains the stream, but only when the message can actually be delivered.
     void send_canvas_2d_stream(Compositing::Canvas2DCommandStream&);

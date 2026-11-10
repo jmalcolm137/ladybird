@@ -90,7 +90,7 @@ pub fn get_by_value_with_keyed_cache(
     property_key: &PropertyKey,
     site_cache: Option<(&PropertyLookupCache, u64)>,
 ) -> ThrowCompletionOr<Value> {
-    if !property_key.is_string() {
+    if !property_key.is_string() || !base_object.is_cacheable_across_realms() {
         return base_object.internal_get(vm, property_key, this_value, None, PropertyLookupPhase::OwnProperty);
     }
 
@@ -384,6 +384,9 @@ pub fn get_with_property_lookup_cache(
     if let Some(value) = cached_property_slot(base_obj, cache, cache_key) {
         return get_cached_property_value(vm, value, this_value);
     }
+    if vm.is_static_property_lookup_cache(cache) && !base_obj.is_cacheable_across_realms() {
+        return base_obj.internal_get(vm, property_name, this_value, None, PropertyLookupPhase::OwnProperty);
+    }
     let shape = base_obj.shape();
     let prototype_chain_validity = shape
         .prototype()
@@ -447,7 +450,7 @@ fn throw_null_or_undefined_property_access<T>(
     vm: &Vm,
     base_value: Value,
     base_identifier: Option<Utf16FlyString>,
-    property_identifier: &PropertyKey,
+    property_identifier: &dyn Utf16Display,
 ) -> ThrowCompletionOr<T> {
     assert!(base_value.is_nullish());
 
@@ -465,6 +468,30 @@ fn throw_null_or_undefined_property_access<T>(
     )
 }
 
+/// Throw the TypeError of a put to `base` if it is null or undefined. ToObject converts the base before the key is
+/// converted to a property key, so `property_name` is the property as the error names it: a key, or the value a key
+/// has yet to be computed from.
+pub fn throw_if_nullish_put_base(
+    vm: &Vm,
+    base: Value,
+    get_base_identifier: impl FnOnce() -> Option<Utf16FlyString>,
+    property_name: &dyn Utf16Display,
+    strict: Strict,
+) -> ThrowCompletionOr<()> {
+    if !base.is_nullish() {
+        return Ok(());
+    }
+    // Better error message than to_object would give
+    if strict == Strict::Yes {
+        return vm.throw_completion(
+            ErrorKind::TypeError,
+            ErrorType::ReferenceNullishSetProperty,
+            &[property_name, &base],
+        );
+    }
+    throw_null_or_undefined_property_access(vm, base, get_base_identifier(), property_name)
+}
+
 #[allow(clippy::too_many_arguments)]
 #[inline]
 pub fn put_by_property_key(
@@ -479,19 +506,8 @@ pub fn put_by_property_key(
     caches: Option<&PropertyLookupCache>,
     cache_key: u64,
 ) -> ThrowCompletionOr<()> {
-    // Better error message than to_object would give
-    if strict == Strict::Yes && base.is_nullish() {
-        return vm.throw_completion(
-            ErrorKind::TypeError,
-            ErrorType::ReferenceNullishSetProperty,
-            &[name, &base],
-        );
-    }
-
     // a. Let baseObj be ? ToObject(V.[[Base]]).
-    if base.is_nullish() {
-        return throw_null_or_undefined_property_access(vm, base, get_base_identifier(), name);
-    }
+    throw_if_nullish_put_base(vm, base, get_base_identifier, name, strict)?;
     let object = base.to_object(vm)?;
 
     if kind == PutKind::Getter || kind == PutKind::Setter {
@@ -585,11 +601,6 @@ pub fn put_by_property_key(
                                 continue;
                             };
 
-                            // Cannot add properties to non-extensible objects (frozen, sealed, or preventExtensions).
-                            if !object.internal_is_extensible(vm)? {
-                                continue;
-                            }
-
                             // The cache is invalid if the prototype chain has been mutated, since such a mutation could have added a setter for the property.
                             if cache
                                 .prototype_chain_validity
@@ -609,6 +620,8 @@ pub fn put_by_property_key(
                 }
             }
 
+            let caches = caches
+                .filter(|cache| !vm.is_static_property_lookup_cache(cache) || object.is_cacheable_across_realms());
             let prototype_chain_validity = object
                 .shape()
                 .prototype()

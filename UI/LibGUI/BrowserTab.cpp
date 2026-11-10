@@ -26,6 +26,7 @@
 #include <LibGUI/TableView.h>
 #include <LibGUI/ToolbarContainer.h>
 #include <LibCore/Timer.h>
+#include <LibURL/URL.h>
 #include <LibGfx/AntiAliasingPainter.h>
 #include <LibGfx/Bitmap.h>
 #include <LibGfx/Painter.h>
@@ -593,6 +594,16 @@ void BrowserTab::navigate(String const& url)
         m_engine.navigate(m_tab_id, url, true);
 }
 
+void BrowserTab::open_file()
+{
+    auto path = GUI::FilePicker::get_open_filepath(m_root->window(), "Open File"sv, Core::StandardPaths::home_directory());
+    if (!path.has_value())
+        return;
+
+    auto url = URL::create_with_file_scheme(path.value());
+    navigate(String::from_byte_string(url.serialize()).release_value());
+}
+
 void BrowserTab::reload()
 {
     if (is_attached())
@@ -619,6 +630,9 @@ void BrowserTab::go_forward()
 
 void BrowserTab::focus_location()
 {
+    if (Core::Environment::has("LADYBIRD_SDE_TEST_LOG_FOCUS"sv))
+        warnln("focus location");
+
     m_location_box->set_focus(true);
     m_location_box->select_all();
 }

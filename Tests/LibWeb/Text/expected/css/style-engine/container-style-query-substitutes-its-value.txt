@@ -1,0 +1,14 @@
+registered: yes
+registered-other: no
+registered-fallback: yes
+registered-calc: yes
+unregistered: yes
+unregistered-other: no
+unregistered-fallback: yes
+unregistered-missing: yes
+itself: yes
+both-missing: yes
+no-arguments: no
+function: yes
+registered, after its value moves: no
+registered, moved back: yes

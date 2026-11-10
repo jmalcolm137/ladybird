@@ -169,22 +169,14 @@ public:
     void start_request(u64 request_id, Optional<URL::URL> target_url = {}, ByteString method = "GET"sv, Vector<HTTP::Header> headers = {}, Optional<HTTP::NetworkIsolationKey> network_isolation_key = {})
     {
         auto url = target_url.value_or(URL::Parser::basic_parse("http://localhost"sv).release_value());
-        auto message = make<Messages::RequestServer::StartRequest>(request_id, move(method), move(url), move(headers), ByteBuffer {}, HTTP::CacheMode::Default, move(network_isolation_key), HTTP::Cookie::IncludeCredentials::Yes, true, Optional<u32> {}, false, 0, 0);
+        auto message = make<Messages::RequestServer::StartRequest>(request_id, move(method), move(url), move(headers), ByteBuffer {}, HTTP::CacheMode::Default, move(network_isolation_key), HTTP::Cookie::IncludeCredentials::Yes, true, Optional<u32> {}, false, 0, 0, HTTP::Cookie::SameSiteContext {});
         auto response = dispatch(move(message));
         VERIFY(!response);
     }
 
-    void store_cache_associated_data(HTTP::CacheEntryAssociatedData associated_data)
-    {
-        auto url = URL::Parser::basic_parse("http://localhost"sv).release_value();
-        auto message = make<Messages::RequestServer::StoreCacheAssociatedData>(Optional<HTTP::NetworkIsolationKey> {}, move(url), ByteString { "GET" }, Vector<HTTP::Header> {}, Optional<u64> {}, associated_data, MUST(Core::AnonymousBuffer::create_with_size(1)));
-        auto response = dispatch(move(message));
-        VERIFY(response);
-    }
-
     void websocket_connect(u64 websocket_id, URL::URL url, ByteString origin = "http://localhost"sv, Vector<ByteString> protocols = {}, Vector<HTTP::Header> headers = {})
     {
-        auto message = make<Messages::RequestServer::WebsocketConnect>(websocket_id, move(url), Optional<HTTP::NetworkIsolationKey> {}, move(origin), move(protocols), Vector<ByteString> {}, move(headers));
+        auto message = make<Messages::RequestServer::WebsocketConnect>(websocket_id, move(url), Optional<HTTP::NetworkIsolationKey> {}, move(origin), move(protocols), Vector<ByteString> {}, move(headers), HTTP::Cookie::SameSiteContext {});
         auto response = dispatch(move(message));
         VERIFY(!response);
     }
@@ -451,23 +443,6 @@ TEST_CASE(websockets_to_unsupported_urls_are_refused)
     connection.websocket_connect(0, URL::Parser::basic_parse("ws://localhost:8080/"sv).release_value());
     EXPECT_EQ(control.take_cookie_request()->request_id(), 0u);
     EXPECT(connection.is_open());
-}
-
-TEST_CASE(unknown_cache_associated_data_kind_is_rejected)
-{
-    {
-        TestServer server;
-        TestConnection connection { server };
-
-        connection.store_cache_associated_data(HTTP::CacheEntryAssociatedData::JavaScriptBytecode);
-        EXPECT(connection.is_open());
-    }
-
-    TestServer server;
-    TestConnection connection { server };
-
-    connection.store_cache_associated_data(static_cast<HTTP::CacheEntryAssociatedData>(0x7fffffff));
-    EXPECT(!connection.is_open());
 }
 
 TEST_CASE(cookie_responses_cannot_target_connect_requests)

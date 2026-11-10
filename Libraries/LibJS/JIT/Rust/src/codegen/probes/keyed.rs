@@ -217,8 +217,7 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
         self.masm
             .load64(name, &Address::new(name, layout.primitive_string_storage as i32));
         self.emit_unbox_cell(object, base);
-        self.masm
-            .load64(shape, &Address::new(object, self.runtime.offsets.object_shape as i32));
+        self.emit_load_compressed_cell(shape, &Address::new(object, self.runtime.offsets.object_shape as i32));
         // The entry: the top bits of the Fibonacci hash of the shape and the name.
         let entry_size_log2 = layout.keyed_lookup_cache_entry_size.trailing_zeros();
         let bits = layout.keyed_lookup_cache_index_bits;
@@ -294,8 +293,7 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
             );
             self.masm
                 .and64_imm(entry, entry, layout.property_lookup_cache_data_pointer_mask);
-            self.masm
-                .load64(shape, &Address::new(object, self.runtime.offsets.object_shape as i32));
+            self.emit_load_compressed_cell(shape, &Address::new(object, self.runtime.offsets.object_shape as i32));
             self.emit_megamorphic_cache_lookup(shape, entry, MegamorphicKey::Keyed { key }, found, miss);
             self.masm.bind(not_megamorphic);
         }
@@ -306,8 +304,7 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
         self.masm.move64(scratch, entry);
         self.masm
             .and64_imm(entry, entry, layout.property_lookup_cache_data_pointer_mask);
-        self.masm
-            .load64(shape, &Address::new(object, self.runtime.offsets.object_shape as i32));
+        self.emit_load_compressed_cell(shape, &Address::new(object, self.runtime.offsets.object_shape as i32));
         let entry_key = Address::new(entry, layout.property_lookup_cache_entry_key as i32);
         for index in 0..layout.property_lookup_cache_polymorphic_entry_count {
             let next = self.masm.new_label();
@@ -545,20 +542,19 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
             self.masm.move_imm64(output, value::TRUE);
             self.masm.jump(done);
             self.masm.bind(absent);
-            // NB: Plain objects, which start with the virtual table pointer
-            //     of their class like the template of new plain objects, have
-            //     the own string-keyed properties of their shapes. Their
-            //     prototypes may have it, which `in` leaves to the runtime.
-            match self.runtime.object_allocation.template.first() {
-                Some(&plain_object_vtable) if own => {
-                    self.emit_unbox_cell(entry, object);
-                    self.masm.move_imm64(scratch, plain_object_vtable);
-                    self.masm
-                        .branch64_memory(Condition::NotEqual, &Address::new(entry, 0), scratch, probe);
-                    self.masm.move_imm64(output, value::FALSE);
-                    self.masm.jump(done);
-                }
-                _ => self.masm.jump(probe),
+            // NB: Plain objects have the own string-keyed properties of their
+            //     shapes. Their prototypes may have it, which `in` leaves to
+            //     the runtime.
+            let object_class = layout.object_class;
+            if own && object_class != 0 {
+                self.emit_unbox_cell(entry, object);
+                self.emit_load_class(scratch, entry);
+                self.masm
+                    .branch64_imm(Condition::NotEqual, scratch, object_class as i64, probe);
+                self.masm.move_imm64(output, value::FALSE);
+                self.masm.jump(done);
+            } else {
+                self.masm.jump(probe);
             }
         }
         self.bind_probe_failure(output, value::EMPTY, failure, done);

@@ -4,7 +4,9 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+use crate::css::style_value::{ConicGradientPayload, LinearGradientPayload, RadialGradientPayload};
 use crate::painting::record::trace::Observer;
+use ak::math;
 
 use crate::css::color_resolution::{ColorResolutionInput, to_color};
 use crate::css::computed_value_views::ComputedValuesView;
@@ -114,11 +116,11 @@ fn ak_pow_f32(x: f32, y: f32) -> f32 {
         }
         return result;
     }
-    ((y * ak_log2_f32(x)) as f64).exp2() as f32
+    math::exp2((y * ak_log2_f32(x)) as f64) as f32
 }
 
 fn ak_log_f32(x: f32) -> f32 {
-    (x as f64).ln() as f32
+    math::log(x as f64) as f32
 }
 
 fn color_stop_step(previous_stop: &GradientStop, next_stop: &GradientStop, position: f32) -> f32 {
@@ -665,8 +667,10 @@ fn linear_gradient_angle_degrees(
             angle as f32
         }
     } else {
-        let corner_angle_degrees =
-            || gradient_size.height.to_double().atan2(gradient_size.width.to_double()) * 180.0 / std::f64::consts::PI;
+        let corner_angle_degrees = || {
+            math::atan2(gradient_size.height.to_double(), gradient_size.width.to_double()) * 180.0
+                / std::f64::consts::PI
+        };
         let angle = match SideOrCorner::from_computed_value(side_or_corner) {
             SideOrCorner::Top => 0.0,
             SideOrCorner::Bottom => 180.0,
@@ -689,8 +693,8 @@ fn linear_gradient_angle_degrees(
 fn calculate_gradient_length(gradient_size: CssPixelSize, gradient_angle: f32) -> f32 {
     let real_angle = 90.0 - gradient_angle;
     let radians = real_angle * std::f32::consts::PI / 180.0;
-    let sin_angle = (radians as f64).sin() as f32;
-    let cos_angle = (radians as f64).cos() as f32;
+    let sin_angle = math::sin(radians as f64) as f32;
+    let cos_angle = math::cos(radians as f64) as f32;
     (gradient_size.height.to_float() * sin_angle).abs() + (gradient_size.width.to_float() * cos_angle).abs()
 }
 
@@ -836,34 +840,38 @@ pub(crate) fn resolve_gradient_paint_with_input(
 ) -> ResolvedGradientPaint {
     let gradient_box = CssPixelRect::from_location_and_size(CssPixelPoint::default(), tile_size);
     match gradient_value {
-        StyleValueData::LinearGradient {
-            has_direction_value,
-            direction_value,
-            side_or_corner,
-            color_stop_list,
-            gradient_type,
-            repeating,
-            color_interpolation_method,
-            color_syntax,
-        } => ResolvedGradientPaint::Linear(resolve_linear_gradient_paint(
-            color_stop_list.as_slice(),
-            has_direction_value.then(|| direction_value.data()),
-            *side_or_corner,
-            *gradient_type,
-            *repeating,
-            color_interpolation_method,
-            *color_syntax,
-            tile_size,
-            color_input,
-        )),
-        StyleValueData::ConicGradient {
-            from_angle,
-            position,
-            color_stop_list,
-            repeating,
-            color_interpolation_method,
-            color_syntax,
-        } => {
+        StyleValueData::LinearGradient(linear_gradient_payload) => {
+            let LinearGradientPayload {
+                has_direction_value,
+                direction_value,
+                side_or_corner,
+                color_stop_list,
+                gradient_type,
+                repeating,
+                color_interpolation_method,
+                color_syntax,
+            } = &**linear_gradient_payload;
+            ResolvedGradientPaint::Linear(resolve_linear_gradient_paint(
+                color_stop_list.as_slice(),
+                has_direction_value.then(|| direction_value.data()),
+                *side_or_corner,
+                *gradient_type,
+                *repeating,
+                color_interpolation_method,
+                *color_syntax,
+                tile_size,
+                color_input,
+            ))
+        }
+        StyleValueData::ConicGradient(conic_gradient_payload) => {
+            let ConicGradientPayload {
+                from_angle,
+                position,
+                color_stop_list,
+                repeating,
+                color_interpolation_method,
+                color_syntax,
+            } = &**conic_gradient_payload;
             let (data, resolved_position) = resolve_conic_gradient_paint(
                 color_stop_list.as_slice(),
                 from_angle,
@@ -879,15 +887,16 @@ pub(crate) fn resolve_gradient_paint_with_input(
                 position: resolved_position,
             }
         }
-        StyleValueData::RadialGradient {
-            ending_shape,
-            size,
-            position,
-            color_stop_list,
-            repeating,
-            color_interpolation_method,
-            color_syntax,
-        } => {
+        StyleValueData::RadialGradient(radial_gradient_payload) => {
+            let RadialGradientPayload {
+                ending_shape,
+                size,
+                position,
+                color_stop_list,
+                repeating,
+                color_interpolation_method,
+                color_syntax,
+            } = &**radial_gradient_payload;
             let (data, center, gradient_size) = resolve_radial_gradient_paint(
                 color_stop_list.as_slice(),
                 *ending_shape,

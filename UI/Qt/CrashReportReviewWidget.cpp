@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <LibWebView/CrashReportOutbox.h>
 #include <UI/Qt/CrashReportReviewWidget.h>
 #include <UI/Qt/ReportReview.h>
 #include <UI/Qt/StringUtils.h>
@@ -142,15 +143,12 @@ CrashReportReviewWidget::CrashReportReviewWidget(QString exit_text, QWidget* par
     m_retry_button->setObjectName("CrashReportRetryButton");
     m_cancel_button = new QPushButton(tr("Cancel"), m_status_page);
     m_cancel_button->setObjectName("CrashReportCancelButton");
-    m_next_button = new QPushButton(tr("Review the next crash report"), m_status_page);
-    m_next_button->setObjectName("CrashReportNextButton");
     m_exit_button = new QPushButton(exit_text, m_status_page);
     m_exit_button->setObjectName("CrashReportExitButton");
     auto* status_buttons = new QHBoxLayout;
     status_buttons->setSpacing(button_spacing);
     status_buttons->addWidget(m_retry_button);
     status_buttons->addWidget(m_cancel_button);
-    status_buttons->addWidget(m_next_button);
     status_buttons->addWidget(m_exit_button);
     status_buttons->addStretch();
     status_layout->addLayout(status_buttons);
@@ -168,22 +166,25 @@ CrashReportReviewWidget::CrashReportReviewWidget(QString exit_text, QWidget* par
     layout->addWidget(m_report_text_page);
 
     QObject::connect(send_button, &QPushButton::clicked, this, [this] { send(); });
-    QObject::connect(decline_button, &QPushButton::clicked, this, [this] { show_declined(); });
-    QObject::connect(m_retry_button, &QPushButton::clicked, this, [this] {
-        show_progress(WebView::ReportSubmission::Stage::Preparing);
-        VERIFY(!m_review.send(m_description, m_url).has_value());
+    QObject::connect(decline_button, &QPushButton::clicked, this, [this] {
+        if (WebView::CrashReportOutbox::the().is_sending(m_review.report_name())) {
+            show_already_sending();
+            return;
+        }
+        if (auto result = m_review.decline(); result.is_error()) {
+            warnln("Could not mark crash report as seen: {}", result.error());
+            m_validation->setText(tr("This report could not be declined. It may already have been sent or deleted."));
+            m_validation->show();
+            return;
+        }
+        WebView::CrashReportOutbox::the().reports_changed();
+        show_declined();
     });
+    QObject::connect(m_retry_button, &QPushButton::clicked, this, [this] { start_sending(); });
     QObject::connect(m_cancel_button, &QPushButton::clicked, this, [this] {
         m_review.cancel_sending();
         show_page(*m_review_page);
         m_description_edit->setFocus(Qt::OtherFocusReason);
-    });
-    QObject::connect(m_next_button, &QPushButton::clicked, this, [this] {
-        if (auto result = open_report(); result.is_error()) {
-            warnln("Could not open the next crash report: {}", result.error());
-            if (on_exit)
-                on_exit();
-        }
     });
     for (auto* button : { review_exit_button, m_exit_button }) {
         QObject::connect(button, &QPushButton::clicked, this, [this] {
@@ -229,7 +230,7 @@ void CrashReportReviewWidget::update_chrome_style()
     m_is_updating_chrome_style = false;
 }
 
-ErrorOr<void> CrashReportReviewWidget::open_report(Optional<ByteString> const& name, Optional<String> const& website)
+ErrorOr<void> CrashReportReviewWidget::open_report(ByteString const& name, Optional<String> const& website)
 {
     auto report = TRY(m_review.open(name));
 
@@ -267,8 +268,21 @@ void CrashReportReviewWidget::send()
     }
 
     m_validation->hide();
+    start_sending();
+}
+
+void CrashReportReviewWidget::start_sending()
+{
     show_progress(WebView::ReportSubmission::Stage::Preparing);
-    VERIFY(!m_review.send(m_description, m_url).has_value());
+    if (WebView::CrashReportOutbox::the().send_from_review(m_review, m_description, m_url).has_value())
+        show_already_sending();
+}
+
+// The list of crash reports took this report on first, so there is nothing left to answer here.
+void CrashReportReviewWidget::show_already_sending()
+{
+    m_progress->hide();
+    show_outcome(tr("Report already on its way"), tr("This report is being sent from the list of crash reports."));
 }
 
 void CrashReportReviewWidget::show_page(QWidget& page)
@@ -301,7 +315,7 @@ void CrashReportReviewWidget::show_status(QString const& title, QString const& m
     m_status_title->setText(title);
     m_status_message->setText(message);
     show_page(*m_status_page);
-    QPushButton* all_actions[] = { m_retry_button, m_cancel_button, m_next_button, m_exit_button };
+    QPushButton* all_actions[] = { m_retry_button, m_cancel_button, m_exit_button };
     show_actions(all_actions, actions, primary);
 }
 
@@ -344,16 +358,12 @@ void CrashReportReviewWidget::show_failure(WebView::ReportSubmission::Failure fa
     show_outcome(tr("Couldn’t send report"), qstring_from_ak_string(reason));
 }
 
-// Once the report is answered, the review moves on to the next one waiting, or is left.
 void CrashReportReviewWidget::show_outcome(QString const& title, QString const& message)
 {
     if (on_answered)
         on_answered();
 
-    if (m_review.has_next_report())
-        show_status(title, message, { m_next_button, m_exit_button }, m_next_button);
-    else
-        show_status(title, message, { m_exit_button }, m_exit_button);
+    show_status(title, message, { m_exit_button }, m_exit_button);
 }
 
 }

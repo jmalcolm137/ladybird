@@ -49,11 +49,12 @@ struct SvgPaintFacts {
     references_paint_server: bool,
 }
 
-pub(crate) fn svg_paint_color(paint: &ComputedSvgPaint) -> Option<u32> {
+/// The color `paint` paints with, with `currentcolor` resolved to `current_color`.
+pub(crate) fn svg_paint_color(paint: &ComputedSvgPaint, current_color: u32) -> Option<u32> {
     match paint.kind {
         SVG_PAINT_NONE => None,
-        SVG_PAINT_COLOR => Some(paint.color),
-        _ => paint.has_color.then_some(paint.color),
+        SVG_PAINT_COLOR => Some(paint.color.resolve(current_color)),
+        _ => paint.has_color.then(|| paint.color.resolve(current_color)),
     }
 }
 
@@ -96,8 +97,8 @@ fn svg_paint_facts<O: Observer>(
     facts.fill_winding = to_winding(svg.fill_rule);
     facts.fill_opacity = svg.fill_opacity;
     facts.stroke_opacity = svg.stroke_opacity;
-    facts.fill_color = svg_paint_color(&svg.fill);
-    facts.stroke_color = svg_paint_color(&svg.stroke);
+    facts.fill_color = svg_paint_color(&svg.fill, style.current_color());
+    facts.stroke_color = svg_paint_color(&svg.stroke, style.current_color());
     facts.references_paint_server = svg.fill.kind == SVG_PAINT_URL || svg.stroke.kind == SVG_PAINT_URL;
     let stroke = svg_stroke_style(layout_arena, paintable, &style);
     facts.cap_style = stroke.cap_style;
@@ -128,7 +129,33 @@ pub(crate) fn svg_stroke_style(
     style: &ComputedValuesView<'_>,
 ) -> SvgStrokeStyle {
     let basis = crate::painting::paintable_geometry::committed_svg_viewport_percentage_basis(layout_arena, paintable);
-    svg_stroke_style_for_percentage_basis(style, basis)
+    let mut stroke = svg_stroke_style_for_percentage_basis(style, basis);
+    if !stroke.dash_array.is_empty()
+        && let Some(path_length) =
+            crate::painting::paintable_geometry::committed_svg_author_path_length(layout_arena, paintable)
+    {
+        // https://svgwg.org/svg2-draft/paths.html#PathLengthAttribute
+        // The user agent will scale all distance-along-a-path computations by the ratio of 'pathLength' to the user
+        // agent's own computed value for total path length.
+        // AD-HOC: The spec says "'pathLength' has no effect on percentage distance-along-a-path calculations", but a
+        //         percentage in the dash array or offset is resolved first and then scaled like any other length, for
+        //         web compatibility.
+        if path_length == 0.0 {
+            // A value of zero is valid and must be treated as a scaling factor of infinity. A value of zero scaled
+            // infinitely must remain zero, while any non-percentage value greater than zero must become +Infinity.
+            // AD-HOC: The stroke draws solid, for web compatibility, rather than keeping each zero-length dash or
+            //         gap at zero; that's the same stroke for any dash array without a zero in it.
+            stroke.dash_array.clear();
+            stroke.dash_offset = 0.0;
+        } else if path_length > 0.0
+            && let Some(path) = crate::painting::paintable_geometry::committed_svg_path(layout_arena, paintable)
+        {
+            let scale = path.length() / path_length;
+            stroke.dash_array.iter_mut().for_each(|dash| *dash *= scale);
+            stroke.dash_offset *= scale;
+        }
+    }
+    stroke
 }
 
 /// The stroke properties of an SVG shape, with percentages resolved against the given basis.
@@ -598,6 +625,43 @@ pub(crate) fn svg_image_unquantized_device_rect(
     )
 }
 
+// https://svgwg.org/svg2-draft/coords.html#PreserveAspectRatioAttribute
+// Where an image of `natural_size` is drawn to fit `image_rect` as its preserveAspectRatio says, taking its own size as
+// its view box.
+fn image_draw_rect(image_rect: FloatRect, natural_size: (f32, f32), align: u8, meet_or_slice: u8) -> FloatRect {
+    use crate::layout::svg_formatting_context::{
+        MEET_OR_SLICE_SLICE, PRESERVE_ASPECT_RATIO_NONE, PRESERVE_ASPECT_RATIO_X_MIN_Y_MIN,
+    };
+    // NB: With "none", the image is scaled non-uniformly to fill the rectangle exactly.
+    if natural_size.0 <= 0.0 || natural_size.1 <= 0.0 || align == PRESERVE_ASPECT_RATIO_NONE {
+        return image_rect;
+    }
+    let scale_x = image_rect.width / natural_size.0;
+    let scale_y = image_rect.height / natural_size.1;
+    // "meet" shows all of the image within the rectangle; "slice" covers all of the rectangle with the image.
+    let scale = if meet_or_slice == MEET_OR_SLICE_SLICE {
+        scale_x.max(scale_y)
+    } else {
+        scale_x.min(scale_y)
+    };
+    let width = natural_size.0 * scale;
+    let height = natural_size.1 * scale;
+    // NB: The alignments count up from xMinYMin through min, mid and max along x, then through min, mid and max along
+    //     y, each putting none, half or all of the space left over before the image.
+    let alignment = align.saturating_sub(PRESERVE_ASPECT_RATIO_X_MIN_Y_MIN);
+    let offset = |alignment_in_axis: u8, free_space: f32| match alignment_in_axis {
+        0 => 0.0,
+        1 => free_space / 2.0,
+        _ => free_space,
+    };
+    FloatRect::new(
+        image_rect.x + offset(alignment % 3, image_rect.width - width),
+        image_rect.y + offset(alignment / 3, image_rect.height - height),
+        width,
+        height,
+    )
+}
+
 pub(crate) fn paint_image_element<O: Observer>(
     recorder: &mut PaintRecorder<'_, O>,
     paintable: NodeSlotId,
@@ -632,19 +696,12 @@ pub(crate) fn paint_image_element<O: Observer>(
         (Some(width), Some(height)) => (width.to_float(), height.to_float()),
         _ => (image_rect.width, image_rect.height),
     };
-    // FIXME: Respect the preserveAspectRatio attribute instead of assuming its default value.
-    let mut draw_rect = image_rect;
-    if natural_size.0 > 0.0 && natural_size.1 > 0.0 {
-        let contain_scale = (image_rect.width / natural_size.0).min(image_rect.height / natural_size.1);
-        let width = natural_size.0 * contain_scale;
-        let height = natural_size.1 * contain_scale;
-        draw_rect = FloatRect::new(
-            image_rect.x + image_rect.width / 2.0 - width / 2.0,
-            image_rect.y + image_rect.height / 2.0 - height / 2.0,
-            width,
-            height,
-        );
-    }
+    let draw_rect = image_draw_rect(
+        image_rect,
+        natural_size,
+        image.preserve_aspect_ratio_align,
+        image.preserve_aspect_ratio_meet_or_slice,
+    );
     if draw_rect.is_empty() {
         return;
     }
@@ -659,8 +716,7 @@ pub(crate) fn paint_image_element<O: Observer>(
             .map_or((false, 0), |style| {
                 use crate::css::css_enums::overflow;
                 (
-                    style.box_values().overflow_x == overflow::VISIBLE
-                        && style.box_values().overflow_y == overflow::VISIBLE,
+                    style.overflow_x() == overflow::VISIBLE && style.overflow_y() == overflow::VISIBLE,
                     style.image_rendering(),
                 )
             });

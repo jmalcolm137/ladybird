@@ -70,7 +70,7 @@ Utf16String Utf16String::from_utf8_without_validation(StringView utf8_string)
         return string;
     }
 
-    return Utf16String { Detail::Utf16StringData::from_utf8(utf8_string, Detail::Utf16StringData::AllowASCIIStorage::Yes) };
+    return Utf16String { Detail::Utf16StringData::from_utf8(utf8_string) };
 }
 
 Utf16String Utf16String::from_utf16(Utf16View const& utf16_string)
@@ -79,8 +79,8 @@ Utf16String Utf16String::from_utf16(Utf16View const& utf16_string)
         Utf16String string;
         string.m_value.short_ascii_string = Detail::ShortString::create_with_byte_count(utf16_string.length_in_code_units());
 
-        if (utf16_string.has_ascii_storage()) {
-            auto result = utf16_string.bytes().copy_to(string.m_value.short_ascii_string.storage);
+        if (utf16_string.has_latin1_storage()) {
+            auto result = utf16_string.latin1_span().copy_to(string.m_value.short_ascii_string.storage);
             VERIFY(result == utf16_string.length_in_code_units());
         } else {
             auto result = simdutf::convert_utf16_to_utf8(utf16_string.utf16_span().data(), utf16_string.length_in_code_units(), reinterpret_cast<char*>(string.m_value.short_ascii_string.storage));
@@ -97,11 +97,11 @@ Utf16String Utf16String::from_string_builder(Badge<Utf16StringBuilder>, Utf16Str
 {
     auto view = builder.view();
 
-    if (view.length_in_code_units() <= Detail::MAX_SHORT_STRING_BYTE_COUNT && view.has_ascii_storage()) {
+    if (view.length_in_code_units() <= Detail::MAX_SHORT_STRING_BYTE_COUNT && view.has_latin1_storage() && view.is_ascii()) {
         Utf16String string;
         string.m_value.short_ascii_string = Detail::ShortString::create_with_byte_count(view.length_in_code_units());
 
-        auto result = view.bytes().copy_to(string.m_value.short_ascii_string.storage);
+        auto result = view.ascii_bytes().copy_to(string.m_value.short_ascii_string.storage);
         VERIFY(result == view.length_in_code_units());
 
         return string;
@@ -110,22 +110,18 @@ Utf16String Utf16String::from_string_builder(Badge<Utf16StringBuilder>, Utf16Str
     return Utf16String { Detail::Utf16StringData::from_string_builder(builder) };
 }
 
-ErrorOr<Utf16String> Utf16String::from_ipc_stream(Stream& stream, size_t length_in_code_units, bool is_ascii)
+ErrorOr<Utf16String> Utf16String::from_ipc_stream(Stream& stream, size_t length_in_code_units, bool has_latin1_storage)
 {
-    if (is_ascii && length_in_code_units <= Detail::MAX_SHORT_STRING_BYTE_COUNT) {
-        Utf16String string;
-        string.m_value.short_ascii_string = Detail::ShortString::create_with_byte_count(length_in_code_units);
-
-        Bytes bytes { string.m_value.short_ascii_string.storage, length_in_code_units };
+    if (has_latin1_storage && length_in_code_units <= Detail::MAX_SHORT_STRING_BYTE_COUNT) {
+        Array<u8, Detail::MAX_SHORT_STRING_BYTE_COUNT> buffer;
+        auto bytes = buffer.span().trim(length_in_code_units);
         TRY(stream.read_until_filled(bytes));
 
-        if (!StringView { bytes }.is_ascii())
-            return Error::from_string_literal("Stream contains invalid ASCII data");
-
-        return string;
+        // NB: Only ASCII is stored in a short string.
+        return from_utf16(Utf16View::from_latin1(bytes, false));
     }
 
-    return Utf16String { TRY(Detail::Utf16StringData::from_ipc_stream(stream, length_in_code_units, is_ascii)) };
+    return Utf16String { TRY(Detail::Utf16StringData::from_ipc_stream(stream, length_in_code_units, has_latin1_storage)) };
 }
 
 Utf16String Utf16String::repeated(u32 code_point, size_t count)
@@ -166,9 +162,10 @@ String Utf16String::to_well_formed_utf8() const
 
 ErrorOr<void> Formatter<Utf16String>::format(FormatBuilder& builder, Utf16String const& utf16_string)
 {
-    if (utf16_string.has_long_utf16_storage())
-        return builder.put_string(utf16_string.utf16_view());
-    return builder.put_string(utf16_string.ascii_view());
+    // One-byte storage holds Latin-1, which is UTF-8 only when it's all ASCII.
+    if (utf16_string.has_ascii_storage())
+        return builder.put_string(utf16_string.ascii_view());
+    return builder.put_string(utf16_string.utf16_view());
 }
 
 template<Integral T>

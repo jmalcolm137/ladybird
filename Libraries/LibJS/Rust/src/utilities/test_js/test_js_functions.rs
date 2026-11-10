@@ -10,7 +10,7 @@
 use core::ops::ControlFlow;
 use std::ffi::{CStr, CString};
 
-use ak::{Utf16FlyString, Utf16String};
+use ak::Utf16FlyString;
 
 use super::javascript_test_runner::{JSFileResult, parse_module, parse_script};
 use super::test_runner::{Case, Suite, TestResult, get_time_in_ms, relative_path};
@@ -72,10 +72,6 @@ pub const EXPOSED_GLOBAL_FUNCTIONS: &[(&str, RawNativeFunctionPointer)] = &[
     ("createDefaultTypedArray", raw_native!(create_default_typed_array)),
 ];
 
-fn code_units_of(string: &Utf16String) -> Vec<u16> {
-    Utf16View::of_string(string).code_units().collect()
-}
-
 /// Value::as_if<T>(): the object `value` is, if it is a T.
 fn as_if<T: GcCell + Extends<Object>>(value: Value) -> Option<Gc<T>> {
     if !value.is_object() {
@@ -106,7 +102,7 @@ fn set_dictionary_generation(vm: &Vm) -> ThrowCompletionOr<Value> {
 fn can_parse_source(vm: &Vm) -> ThrowCompletionOr<Value> {
     let realm = vm.current_realm().expect("canParseSource runs in a realm");
     let source = vm.argument(0).to_utf16_string(vm)?;
-    let script = Script::parse(vm, &code_units_of(&source), realm);
+    let script = Script::parse(vm, &source, realm);
     Ok(Value::from_bool(script.is_ok()))
 }
 
@@ -138,7 +134,7 @@ fn evaluate_source(vm: &Vm) -> ThrowCompletionOr<Value> {
 
     let source = vm.argument(0).to_utf16_string(vm)?;
 
-    let script = match Script::parse(vm, &code_units_of(&source), realm) {
+    let script = match Script::parse(vm, &source, realm) {
         Ok(script) => script,
         Err(errors) => return vm.throw_completion_with_message(ErrorKind::SyntaxError, errors[0].to_string()),
     };
@@ -335,7 +331,7 @@ fn to_utf8_bytes(vm: &Vm) -> ThrowCompletionOr<Value> {
     let realm = vm.current_realm().expect("toUTF8Bytes runs in a realm");
 
     let string = Utf16View::of_string(&vm.argument(0).to_utf16_string(vm)?).to_wtf8();
-    let typed_array = Uint8Array::create(vm, realm, string.len() as u32)?;
+    let typed_array = Uint8Array::create(vm, realm, string.len())?;
 
     for (i, &byte) in string.iter().enumerate() {
         typed_array.set_value_in_buffer(vm, i, Value::from_i32(i32::from(byte)), Order::SeqCst);
@@ -349,7 +345,7 @@ fn create_default_typed_array(vm: &Vm) -> ThrowCompletionOr<Value> {
 
     let typed_array = typed_array_from(vm, vm.argument(0))?;
     let length = vm.argument(1).to_index(vm)?;
-    let Ok(length) = u32::try_from(length) else {
+    let Ok(length) = usize::try_from(length) else {
         return vm.throw_completion(ErrorKind::RangeError, ErrorType::InvalidLength, &[&"typed array"]);
     };
 

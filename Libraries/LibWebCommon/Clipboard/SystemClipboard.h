@@ -10,6 +10,7 @@
 #include <AK/String.h>
 #include <AK/Variant.h>
 #include <AK/Vector.h>
+#include <LibGC/Forward.h>
 #include <LibIPC/Forward.h>
 #include <LibWebCommon/Export.h>
 #include <LibWebCommon/HTML/SelectedFile.h>
@@ -34,6 +35,13 @@ struct SystemClipboardItem {
     Vector<SystemClipboardRepresentation> system_clipboard_representations;
 };
 
+enum class PasteMode : u8 {
+    AllMimeTypes,
+    PlainTextOnly,
+};
+
+WEBCOMMON_API void apply_paste_mode(SystemClipboardItem&, PasteMode);
+
 }
 
 namespace IPC {
@@ -51,3 +59,5 @@ template<>
 WEBCOMMON_API ErrorOr<Web::Clipboard::SystemClipboardItem> decode(Decoder&);
 
 }
+
+GC_UNTRACED_CAPTURE(Web::Clipboard::SystemClipboardItem);

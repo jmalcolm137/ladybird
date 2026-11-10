@@ -25,22 +25,17 @@ static void show_scrollbars_by_scrolling_away_and_back(Compositor::ScrollbarCont
 static Compositor::ScrollbarController::Drag begin_scrollbar_drag(Gfx::Orientation orientation, Gfx::FloatPoint position, Optional<Gfx::IntRect> expanded_thumb_rect = {})
 {
     auto vertical = orientation == Gfx::Orientation::Vertical;
-    auto document_id = Web::UniqueNodeID { 1 };
     auto scroll_node_index = Compositing::SpatialNodeIndex { 1 };
-    auto scroll_node_id = Compositing::AsyncScrollNodeID {
-        .document_id = document_id,
-        .scroll_node_index = scroll_node_index,
-    };
 
     Compositing::AsyncScrollingState scrolling_state;
     scrolling_state.scroll_nodes.append({
-        .node_id = scroll_node_id,
+        .scroll_node_index = scroll_node_index,
         .stable_node_id = {
             .node_id = Web::UniqueNodeID { 2 },
             .kind = Web::AsyncScrollNodeKind::Viewport,
             .pseudo_element_type = 0,
         },
-        .parent_node_id = {},
+        .parent_scroll_node_index = {},
         .scrollport_rect = { 0, 0, 100, 100 },
         .min_scroll_offset = { 0, 0 },
         .max_scroll_offset = { 100, 100 },
@@ -55,7 +50,6 @@ static Compositor::ScrollbarController::Drag begin_scrollbar_drag(Gfx::Orientati
 
     Vector<Compositing::AsyncScrollbar> scrollbars;
     scrollbars.append({
-        .scroll_node_id = scroll_node_id,
         .scroller_stable_node_id = {},
         .scroll_node_index = scroll_node_index,
         .context = {},
@@ -70,6 +64,7 @@ static Compositor::ScrollbarController::Drag begin_scrollbar_drag(Gfx::Orientati
         .min_scroll_offset = 0,
         .max_scroll_offset = 100,
         .thumb_color = Gfx::Color::Black,
+        .thumb_outline_color = Gfx::Color::White,
         .track_color = Gfx::Color::Transparent,
         .vertical = vertical,
         .is_painted_by_compositor = true,
@@ -121,10 +116,6 @@ TEST_CASE(starting_scrollbar_drag_uses_expanded_thumb_geometry)
 static Compositing::AsyncScrollbar scrollbar_painted_by_display_list()
 {
     return {
-        .scroll_node_id = {
-            .document_id = Web::UniqueNodeID { 1 },
-            .scroll_node_index = Compositing::SpatialNodeIndex { 1 },
-        },
         .scroller_stable_node_id = Web::AsyncScrollNodeStableID {
             .node_id = Web::UniqueNodeID { 2 },
             .kind = Web::AsyncScrollNodeKind::Element,
@@ -143,6 +134,7 @@ static Compositing::AsyncScrollbar scrollbar_painted_by_display_list()
         .min_scroll_offset = 0,
         .max_scroll_offset = 100,
         .thumb_color = Gfx::Color::Black,
+        .thumb_outline_color = Gfx::Color::White,
         .track_color = Gfx::Color::Transparent,
         .vertical = true,
         .is_painted_by_compositor = false,
@@ -151,7 +143,7 @@ static Compositing::AsyncScrollbar scrollbar_painted_by_display_list()
 
 static Compositor::ScrollbarController::PresentedScrollbar presented_scrollbar(Compositor::ScrollbarController const& controller, Compositing::ScrollStateSnapshot const& scroll_state_snapshot = {})
 {
-    auto scrollbar = controller.presented_scrollbar_painted_by_display_list(Compositing::SpatialNodeIndex { 1 }, true, Gfx::Color(0, 0, 0, 100), Gfx::Color(0, 0, 0, 20), scroll_state_snapshot);
+    auto scrollbar = controller.presented_scrollbar_painted_by_display_list(Compositing::SpatialNodeIndex { 1 }, true, Gfx::Color(0, 0, 0, 100), Gfx::Color(255, 255, 255, 64), Gfx::Color(0, 0, 0, 20), scroll_state_snapshot);
     VERIFY(scrollbar.has_value());
     return *scrollbar;
 }

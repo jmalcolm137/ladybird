@@ -16,14 +16,12 @@ class Color;
 
 class Emoji;
 class Font;
-class GlyphRun;
 class ImageDecoder;
 struct FontPixelMetrics;
 
 class Palette;
 class YUVData;
 class PaletteImpl;
-class Path;
 struct PathData;
 class SharedImage;
 class SharedImageBuffer;

@@ -18,7 +18,6 @@
 #include <LibGfx/VulkanContext.h>
 #include <LibGfx/VulkanImage.h>
 #include <LibWebView/Application.h>
-#include <LibWebView/WebContentClient.h>
 #include <UI/Qt/NativeWindowContainer.h>
 #include <UI/Qt/WebContentView.h>
 #ifdef LADYBIRD_HAS_WAYLAND_GPU_QUERY
@@ -204,7 +203,7 @@ RefPtr<Gfx::Bitmap const> WebContentView::cpu_bitmap_to_paint(Paintable const& p
     //     what it paints, and painting the frame there would be slow: from GPU memory it has to be read back, and a
     //     linear frame is mapped from memory that is slow to read.
     QRect visible_frame { 0, 0, paintable.bitmap_size.width(), paintable.bitmap_size.height() };
-    visible_frame &= QRect { QPoint { 0, 0 }, size() * m_device_pixel_ratio };
+    visible_frame &= QRect { QPoint { 0, 0 }, size() * device_pixel_ratio() };
     if (visible_frame.isEmpty() || rect_covered_by_page_window().contains(visible_frame))
         return {};
     return cpu_bitmap_of(paintable);
@@ -941,7 +940,7 @@ struct WebContentView::VulkanWindowRenderer final : public QVulkanWindowRenderer
         };
         vkCmdBeginRenderPass(command_buffer, &render_pass_begin_info, VK_SUBPASS_CONTENTS_INLINE);
 
-        bool rendered = m_renderer.render(command_buffer, *paintable->shared_image_buffer, paintable->bitmap_size, target_size, m_view.m_scales_frames_to_fit);
+        bool rendered = m_renderer.render(command_buffer, *paintable->shared_image_buffer, paintable->bitmap_size, target_size, m_view.scales_frames_to_fit());
 
         if (rendered && m_view.m_vulkan_window_supports_alpha_blending.value_or(false)) {
             // Clear the regions covered by hover-expanded browser chrome to transparent so widgets painted in the
@@ -1042,8 +1041,6 @@ struct WebContentView::VulkanWindow final : public QVulkanWindow {
 
     virtual bool event(QEvent* event) override
     {
-        if (m_view && m_view->handle_vulkan_window_event(event))
-            return true;
         // NB: Every step of a resize asks to present again, which recreates the swap chain at the new size only to show
         //     the same frame in it. Until the page has a frame for the new size, keep the last one on screen. Its
         //     surface keeps its size until it presents again, and the view paints the edge it leaves bare.
@@ -1089,23 +1086,13 @@ void WebContentView::create_vulkan_window()
         VK_FORMAT_R8G8B8A8_UNORM,
     });
 
-    m_vulkan_window_container = QWidget::createWindowContainer(m_vulkan_window, this);
-    m_vulkan_window_container->setAcceptDrops(true);
-    m_vulkan_window_container->setFocusPolicy(Qt::FocusPolicy::StrongFocus);
-    m_vulkan_window_container->setMouseTracking(true);
+    m_vulkan_window_container = create_native_window_container(*m_vulkan_window, *this);
     m_vulkan_window_container->setGeometry(rect());
     m_vulkan_window_container->hide();
-
-    install_native_window_container_event_forwarding(*this, *m_vulkan_window, *m_vulkan_window_container);
 
     m_unexposed_vulkan_window_timer.setSingleShot(true);
     m_unexposed_vulkan_window_timer.setInterval(500);
     QObject::connect(&m_unexposed_vulkan_window_timer, &QTimer::timeout, this, [this] { remap_unexposed_vulkan_window(); });
-}
-
-bool WebContentView::vulkan_window_has_native_focus() const
-{
-    return m_vulkan_window && QGuiApplication::focusWindow() == m_vulkan_window;
 }
 
 void WebContentView::set_vulkan_window_container_visible(bool visible)
@@ -1113,7 +1100,7 @@ void WebContentView::set_vulkan_window_container_visible(bool visible)
     if (!visible)
         m_presented_page_window_size = {};
     if (m_vulkan_window_container)
-        set_native_window_container_visible(*this, *m_vulkan_window_container, visible);
+        m_vulkan_window_container->setVisible(visible);
 }
 
 bool WebContentView::vulkan_window_update_would_only_resize() const
@@ -1122,7 +1109,7 @@ bool WebContentView::vulkan_window_update_would_only_resize() const
     if (!m_vulkan_window || m_presented_page_window_size.isEmpty() || QGuiApplication::platformName() != "wayland")
         return false;
     // NB: A frame scaled to fit the view has to be scaled again for its new size.
-    if (m_scales_frames_to_fit)
+    if (scales_frames_to_fit())
         return false;
     if (m_presented_page_window_content_serial != m_page_window_content_serial)
         return false;
@@ -1195,7 +1182,6 @@ void WebContentView::fall_back_to_bitmap_rendering()
 
 void WebContentView::destroy_vulkan_window()
 {
-    setFocusProxy(nullptr);
     if (m_vulkan_window)
         m_vulkan_window->clear_view();
 
@@ -1228,7 +1214,7 @@ void WebContentView::schedule_vulkan_window_update()
         //     such as a hover card, which comes and goes quickly. Qt reads the frame back from GPU memory then.
         if (isVisible())
             set_presents_from_cpu_memory(is_page_covered_by_overlay());
-        update_page_surface();
+        update_page_surface(PageSurfaceContent::MayHaveChanged);
         return;
     }
 #endif
@@ -1263,10 +1249,10 @@ void WebContentView::schedule_vulkan_window_update()
     update();
 }
 
-void WebContentView::release_backing_store(i32 bitmap_id)
+void WebContentView::release_backing_store(u64 page_id, i32 bitmap_id)
 {
 #ifdef LADYBIRD_HAS_WAYLAND_GPU_QUERY
-    if (auto index = m_retired_backing_stores.find_first_index_if([&](auto const& store) { return store.page_id == page().id().value() && store.bitmap_id == bitmap_id; }); index.has_value()) {
+    if (auto index = m_retired_backing_stores.find_first_index_if([&](auto const& store) { return store.page_id == page_id && store.bitmap_id == bitmap_id; }); index.has_value()) {
         auto& release = *m_retired_backing_stores[*index].release;
         auto handled = release.view_finished_reading();
         if (release.is_released())
@@ -1276,14 +1262,13 @@ void WebContentView::release_backing_store(i32 bitmap_id)
     }
     // NB: The compositor of the desktop may read a frame until it releases its buffer, which it does once another frame
     //     replaced it on screen. The Compositor must not paint into the backing store until then.
-    if (m_page_surface && m_page_surface->holds_backing_store(page().id().value(), bitmap_id)) {
-        auto& page = this->page();
-        if (!m_backing_stores_waiting_for_release.contains([&](auto const& store) { return store.page.ptr() == &page && store.bitmap_id == bitmap_id; }))
-            m_backing_stores_waiting_for_release.append({ page, bitmap_id });
+    if (m_page_surface && m_page_surface->holds_backing_store(page_id, bitmap_id)) {
+        if (!m_backing_stores_waiting_for_release.contains([&](auto const& store) { return store.page_id == page_id && store.bitmap_id == bitmap_id; }))
+            m_backing_stores_waiting_for_release.append({ page_id, bitmap_id });
         return;
     }
 #endif
-    WebView::ViewImplementation::release_backing_store(bitmap_id);
+    RemoteView::release_backing_store(page_id, bitmap_id);
 }
 
 #ifdef LADYBIRD_HAS_WAYLAND_GPU_QUERY
@@ -1295,12 +1280,12 @@ bool WebContentView::create_page_surface()
 
     m_page_surface->on_backing_store_released = [this](u64 page_id, i32 bitmap_id) {
         auto index = m_backing_stores_waiting_for_release.find_first_index_if([&](auto const& store) {
-            return store.page->id().value() == page_id && store.bitmap_id == bitmap_id;
+            return store.page_id == page_id && store.bitmap_id == bitmap_id;
         });
         if (!index.has_value())
             return;
         auto store = m_backing_stores_waiting_for_release.take(*index);
-        store.page->release_presented_bitmap(store.bitmap_id);
+        release_backing_store_to_page(store.page_id, store.bitmap_id);
     };
     m_page_surface->on_ready_to_present = [this] {
         schedule_vulkan_window_update();
@@ -1317,7 +1302,7 @@ bool WebContentView::page_surface_can_show_frames() const
         return false;
     // NB: The page surface leaves the strips that hover-expanded chrome covers to Qt, except for a frame scaled to fit.
     auto has_hover_expanded_chrome = m_vertical_tab_overlay_left != 0 || m_vertical_tab_overlay_right != 0 || m_bookmarks_bar_overlay_height != 0;
-    return !m_scales_frames_to_fit || !has_hover_expanded_chrome;
+    return !scales_frames_to_fit() || !has_hover_expanded_chrome;
 }
 
 void WebContentView::hide_page_surface()
@@ -1329,7 +1314,7 @@ void WebContentView::hide_page_surface()
     }
 }
 
-void WebContentView::update_page_surface()
+void WebContentView::update_page_surface(PageSurfaceContent content)
 {
     auto paintable = current_paintable();
     auto const* dmabuf = paintable.has_value() ? paintable->shared_image_buffer->linux_dmabuf_handle() : nullptr;
@@ -1347,7 +1332,7 @@ void WebContentView::update_page_surface()
     QRect frame_rect;
     QRect source;
     QRect target;
-    if (m_scales_frames_to_fit) {
+    if (scales_frames_to_fit()) {
         auto fitted = rect_fitting_frame(bitmap_size, m_viewport_size);
         frame_rect = { fitted.x(), fitted.y(), fitted.width(), fitted.height() };
         source = { 0, 0, bitmap_size.width(), bitmap_size.height() };
@@ -1355,21 +1340,21 @@ void WebContentView::update_page_surface()
     } else {
         // NB: The view can already be smaller than the viewport the page has, and the compositor doesn't clip the
         //     page surface to the browser window.
-        auto view_size = size() * m_device_pixel_ratio;
+        auto view_size = size() * device_pixel_ratio();
         frame_rect = { 0, 0, min(min(bitmap_size.width(), m_viewport_size.width()), view_size.width()), min(min(bitmap_size.height(), m_viewport_size.height()), view_size.height()) };
         // NB: Hover-expanded chrome paints in the view over strips of the page, which the page surface would cover.
-        auto left = qRound(m_vertical_tab_overlay_left * m_device_pixel_ratio);
-        auto right = qRound(m_vertical_tab_overlay_right * m_device_pixel_ratio);
-        auto top = qRound(m_bookmarks_bar_overlay_height * m_device_pixel_ratio);
+        auto left = qRound(m_vertical_tab_overlay_left * device_pixel_ratio());
+        auto right = qRound(m_vertical_tab_overlay_right * device_pixel_ratio());
+        auto top = qRound(m_bookmarks_bar_overlay_height * device_pixel_ratio());
         source = frame_rect.intersected({ left, top, view_size.width() - left - right, view_size.height() - top });
         // NB: Qt clips the view to the widgets it is in, such as while the page slides along with a toggling sidebar,
         //     but the compositor clips the page surface to nothing.
         auto shown = rect_shown_in_window();
-        source &= QRect { qRound(shown.x() * m_device_pixel_ratio), qRound(shown.y() * m_device_pixel_ratio), qRound(shown.width() * m_device_pixel_ratio), qRound(shown.height() * m_device_pixel_ratio) };
+        source &= QRect { qRound(shown.x() * device_pixel_ratio()), qRound(shown.y() * device_pixel_ratio()), qRound(shown.width() * device_pixel_ratio()), qRound(shown.height() * device_pixel_ratio()) };
         target = source;
     }
 
-    auto to_logical = [&](int device_pixels) { return max(1, qRound(device_pixels / m_device_pixel_ratio)); };
+    auto to_logical = [&](int device_pixels) { return max(1, qRound(device_pixels / device_pixel_ratio())); };
     auto view_position = mapTo(window(), QPoint { 0, 0 });
     WaylandPageSurface::Frame frame {
         .shared_image_buffer = *paintable->shared_image_buffer,
@@ -1377,16 +1362,18 @@ void WebContentView::update_page_surface()
         .page_id = paintable->page_id,
         .bitmap_id = paintable->bitmap_id,
         .source = source,
-        .position = view_position + QPoint { qRound(target.x() / m_device_pixel_ratio), qRound(target.y() / m_device_pixel_ratio) },
+        .position = view_position + QPoint { qRound(target.x() / device_pixel_ratio()), qRound(target.y() / device_pixel_ratio()) },
         .destination = { to_logical(target.width()), to_logical(target.height()) },
+        .has_new_content = content == PageSurfaceContent::MayHaveChanged,
     };
 
-    // NB: The position of the page surface changes when the browser window commits next, so whatever else changes in
-    //     the frame waits for that commit too.
-    if (m_page_surface->is_showing() && frame.position != m_page_surface_position)
+    // NB: The layout of the browser window changes on screen when it commits next, and so does the position of the page
+    //     surface. Whatever else changes in where the frame goes waits for that commit too, such as the crop to a
+    //     shrinking window, which would otherwise show before the window has shrunk.
+    if (m_page_surface->is_showing() && m_page_surface->would_change_placement(frame))
         m_page_surface->set_synchronized(true);
 
-    m_page_surface->forget_buffers_except(backing_stores());
+    m_page_surface->forget_buffers_except(backing_stores().shared_image_buffers());
     auto result = m_page_surface->present(*parent, frame);
     if (result == WaylandPageSurface::PresentResult::Failed) {
         m_page_surface_failed = true;
@@ -1404,9 +1391,10 @@ void WebContentView::update_page_surface()
         covered_rect = result == WaylandPageSurface::PresentResult::Presented ? frame_rect : m_page_surface_rect;
     if (!covered_rect.contains(m_page_surface_rect))
         update();
-    // NB: Nothing else may make the browser window commit, so have Qt repaint a pixel of it.
+    // NB: Nothing else may make the browser window commit, so have Qt repaint a pixel of it. Qt drops updates to any
+    //     part of the view that the widgets it is in clip away.
     else if (result == WaylandPageSurface::PresentResult::Presented && m_page_surface->needs_parent_commit())
-        update(0, 0, 1, 1);
+        update(QRect { rect_shown_in_window().topLeft(), QSize { 1, 1 } });
     m_page_surface_rect = covered_rect;
     if (result == WaylandPageSurface::PresentResult::Presented)
         m_page_surface_position = frame.position;
@@ -1419,20 +1407,6 @@ QRect WebContentView::rect_shown_in_window() const
     for (auto* ancestor = parentWidget(); ancestor && !ancestor->isWindow(); ancestor = ancestor->parentWidget())
         shown &= QRect { mapFrom(ancestor, QPoint { 0, 0 }), ancestor->size() };
     return shown;
-}
-
-Vector<Gfx::SharedImageBuffer const*> WebContentView::backing_stores() const
-{
-    Vector<Gfx::SharedImageBuffer const*> backing_stores;
-    if (m_front_bitmap.shared_image_buffer)
-        backing_stores.append(m_front_bitmap.shared_image_buffer.ptr());
-    for (auto const& bitmap : m_other_bitmaps) {
-        if (bitmap.shared_image_buffer)
-            backing_stores.append(bitmap.shared_image_buffer.ptr());
-    }
-    if (m_backup_shared_image_buffer)
-        backing_stores.append(m_backup_shared_image_buffer.ptr());
-    return backing_stores;
 }
 
 bool WebContentView::show_image_over_page(QImage const& image, QPoint position)
@@ -1456,17 +1430,14 @@ void WebContentView::hide_image_over_page()
 void WebContentView::destroy_page_surface()
 {
     m_page_surface->retire_buffers([this](WaylandPageSurface::HeldBackingStore const& held) -> Function<void()> {
-        RefPtr<WebView::WebContentPage> owner;
         bool view_finished_reading = false;
-        if (auto index = m_backing_stores_waiting_for_release.find_first_index_if([&](auto const& store) { return store.page->id().value() == held.page_id && store.bitmap_id == held.bitmap_id; }); index.has_value()) {
-            owner = m_backing_stores_waiting_for_release.take(*index).page;
+        if (auto index = m_backing_stores_waiting_for_release.find_first_index_if([&](auto const& store) { return store.page_id == held.page_id && store.bitmap_id == held.bitmap_id; }); index.has_value()) {
+            m_backing_stores_waiting_for_release.remove(*index);
             view_finished_reading = true;
-        } else if (auto client = WebView::WebContentClient::client_for_compositor_context_id(Web::compositor_context_id_for_page(Web::PageId { held.page_id })); client.has_value()) {
-            owner = client->page(Web::PageId { held.page_id });
         }
-        if (!owner || held.bitmap_id < 0)
+        if (held.bitmap_id < 0)
             return {};
-        auto release = make_ref_counted<BackingStoreRelease>([owner = owner.release_nonnull(), bitmap_id = held.bitmap_id] { owner->release_presented_bitmap(bitmap_id); });
+        auto release = make_ref_counted<BackingStoreRelease>([page_id = held.page_id, bitmap_id = held.bitmap_id] { release_backing_store_to_page(page_id, bitmap_id); });
         if (view_finished_reading)
             release->view_finished_reading();
         else
@@ -1477,7 +1448,7 @@ void WebContentView::destroy_page_surface()
     m_page_surface_rect = {};
     // NB: Unheld stores do not need to wait for a Wayland release. Held stores moved their acknowledgements above.
     for (auto& store : exchange(m_backing_stores_waiting_for_release, {}))
-        store.page->release_presented_bitmap(store.bitmap_id);
+        release_backing_store_to_page(store.page_id, store.bitmap_id);
     release_retired_backing_stores_no_longer_painted();
 }
 
@@ -1535,12 +1506,13 @@ void WebContentView::update_vulkan_window_mask()
     if (!m_vulkan_window || !m_vulkan_window_container)
         return;
 
-    // On X11, the native window's bounding shape exposes the regions painted transparent for hover-expanded chrome.
-    // Wayland instead uses the renderer's alpha output and empties the native window's input region separately.
+    // On X11, the native window's bounding shape exposes the regions of hover-expanded chrome, with or without alpha
+    // blending. Wayland instead uses the renderer's alpha output and empties the native window's input region
+    // separately.
     auto size = m_vulkan_window_container->size();
     QRegion window_mask { QRect { QPoint { 0, 0 }, size } };
 
-    if (m_vulkan_window_supports_alpha_blending.value_or(false)) {
+    if (QGuiApplication::platformName() == "xcb" || m_vulkan_window_supports_alpha_blending.value_or(false)) {
         if (m_vertical_tab_overlay_left > 0)
             window_mask -= QRect { 0, 0, m_vertical_tab_overlay_left, size.height() };
         if (m_vertical_tab_overlay_right > 0)
@@ -1589,20 +1561,8 @@ void WebContentView::update_vulkan_alpha_blending_support()
 
     m_vulkan_window_supports_alpha_blending = color_format_has_alpha && (capabilities.supportedCompositeAlpha & blending_modes) != 0;
 
-    // Route pointer input through QWidget when it can also display widgets beneath the Vulkan surface. QWidget's
-    // implicit mouse capture then preserves move and release events while the pointer is outside the browser window.
-    m_vulkan_window->setFlag(Qt::WindowTransparentForInput, *m_vulkan_window_supports_alpha_blending);
-
     // The window mask was computed while support was still unknown; refresh it now that any stored insets can apply.
     update_vulkan_window_mask();
-}
-
-void WebContentView::set_vulkan_window_cursor(QCursor const& cursor)
-{
-    if (m_vulkan_window_container)
-        m_vulkan_window_container->setCursor(cursor);
-    if (m_vulkan_window)
-        m_vulkan_window->setCursor(cursor);
 }
 
 }

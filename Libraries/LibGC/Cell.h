@@ -14,6 +14,7 @@
 #include <AK/StringView.h>
 #include <LibGC/Forward.h>
 #include <LibGC/Internals.h>
+#include <LibGC/Member.h>
 #include <LibGC/NanBoxedValue.h>
 #include <LibGC/Ptr.h>
 
@@ -125,6 +126,21 @@ public:
             visit_impl(*as_cell(const_cast<RemoveConst<T>*>(cell.ptr())));
         }
 
+        // Members are visited through their slot, which a moving collector will update. For now this visits the cell
+        // they point to.
+        template<typename T>
+        void visit(Member<T> const& slot)
+        {
+            if (slot)
+                visit_member_cell(slot.ptr());
+        }
+
+        template<typename T>
+        void visit(NonnullMember<T> const& slot)
+        {
+            visit_member_cell(slot.ptr());
+        }
+
         template<typename T>
         void visit(ReadonlySpan<T> span)
         requires(!IsBaseOf<NanBoxedValue, T> && IsVisitable<T>::value)
@@ -168,6 +184,13 @@ public:
         requires(IsBaseOf<NanBoxedValue, T>)
         {
             visit_impl(ReadonlySpan<NanBoxedValue>(vector.span().data(), vector.size()));
+        }
+
+        template<typename T, size_t size>
+        void visit(Array<T, size> const& array)
+        requires(IsVisitable<T>::value)
+        {
+            visit(array.span());
         }
 
         template<typename T>
@@ -257,13 +280,20 @@ public:
         {
         }
 
-        virtual void visit_possible_values(ReadonlyBytes) = 0;
-
         // Visits a value that is reachable only while key is, such as a WeakMap entry's. Only marking tells them apart.
         // The caller must drop its entries whose key died, or the next collection reads a freed key.
         virtual void visit_ephemeron(Cell& key, NanBoxedValue const& value);
 
     protected:
+        template<typename T>
+        ALWAYS_INLINE void visit_member_cell(T* cell)
+        {
+            auto* mutable_cell = as_cell(const_cast<RemoveConst<T>*>(cell));
+            // A compressed pointer must name the start of its cell.
+            ASSERT(static_cast<void const*>(mutable_cell) == static_cast<void const*>(cell));
+            visit_impl(*mutable_cell);
+        }
+
         virtual void visit_impl(Cell&) = 0;
         virtual void visit_impl(ReadonlySpan<NanBoxedValue>) = 0;
         virtual ~Visitor() = default;

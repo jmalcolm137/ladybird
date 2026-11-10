@@ -86,6 +86,7 @@ public:
     void detach();
 
     void navigate(String const& url);
+    void open_file();
     void reload();
     void stop();
     void go_back();

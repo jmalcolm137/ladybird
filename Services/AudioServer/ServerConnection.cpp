@@ -6,18 +6,18 @@
 
 #include <AK/Atomic.h>
 #include <AudioServer/ServerConnection.h>
+#include <LibAudio/RecordStreamFailure.h>
 #include <math.h>
 
 namespace Audio {
 
 static MixerClientId s_next_mixer_client_id { 1 };
 
-ServerConnection::ServerConnection(NonnullOwnPtr<IPC::Transport> transport, int client_id, NonnullRefPtr<PlaybackStreamMixer> mixer, DeviceEnumeration device_enumeration, NonnullRefPtr<CaptureDevices> capture_devices, CapturePermissionRequest request_capture_permission)
+ServerConnection::ServerConnection(NonnullOwnPtr<IPC::Transport> transport, int client_id, NonnullRefPtr<PlaybackStreamMixer> mixer, NonnullRefPtr<CaptureDevices> capture_devices, CapturePermissionRequest request_capture_permission)
     : IPC::ConnectionFromClient<AudioClientEndpoint, AudioServerEndpoint>(*this, move(transport), client_id)
     , m_mixer(move(mixer))
     , m_capture_devices(move(capture_devices))
     , m_request_capture_permission(move(request_capture_permission))
-    , m_device_enumeration(device_enumeration)
 {
 }
 
@@ -41,11 +41,16 @@ void ServerConnection::die()
 
 void ServerConnection::remove_record_streams()
 {
-    for (auto& [stream_id, stream] : m_record_streams) {
-        if (stream.subscriber_id.has_value())
-            m_capture_devices->unsubscribe(stream.subscriber_id.value());
-    }
-    m_record_streams.clear();
+    for (auto& [stream_id, stream] : exchange(m_record_streams, {}))
+        record_stream_gone(stream);
+}
+
+void ServerConnection::record_stream_gone(RecordStreamState const& stream)
+{
+    if (stream.subscriber_id.has_value())
+        m_capture_devices->unsubscribe(stream.subscriber_id.value());
+    if (stream.may_capture && on_capture_stopped)
+        on_capture_stopped(stream.group);
 }
 
 void ServerConnection::set_capture_permitted(bool permitted)
@@ -233,10 +238,10 @@ void ServerConnection::set_stream_volume(u64 stream_id, float volume)
 void ServerConnection::watch_devices()
 {
     m_client_watches_devices = true;
-    if (m_device_enumeration == DeviceEnumeration::Platform && !m_devices_changed_listener_id.has_value())
+    if (!m_devices_changed_listener_id.has_value())
         m_devices_changed_listener_id = AudioDevices::the().add_devices_changed_listener([this] { devices_changed(); });
     // A list not yet available follows as soon as the platform reports one.
-    if (m_device_enumeration == DeviceEnumeration::None || AudioDevices::the().has_device_list())
+    if (AudioDevices::the().has_device_list())
         send_device_list();
 }
 
@@ -249,10 +254,6 @@ static Vector<AudioDeviceInfo> reduced_to_their_existence(Vector<AudioDeviceInfo
 
 void ServerConnection::send_device_list()
 {
-    if (m_device_enumeration == DeviceEnumeration::None) {
-        async_devices_changed({}, {});
-        return;
-    }
     auto& devices = AudioDevices::the();
     // A page without the permission may learn only that devices exist, so that is all its process learns.
     if (!m_capture_permitted) {
@@ -268,7 +269,7 @@ void ServerConnection::devices_changed()
         send_device_list();
 }
 
-void ServerConnection::create_record_stream(u64 stream_id, ByteString device_id)
+void ServerConnection::create_record_stream(u64 stream_id, ByteString device_id, PlaybackGroupId group)
 {
     if (m_record_streams.contains(stream_id)) {
         did_misbehave("create_record_stream: stream ID already exists");
@@ -276,8 +277,8 @@ void ServerConnection::create_record_stream(u64 stream_id, ByteString device_id)
     }
 
     // The Browser rules on every request, so a client once allowed cannot simply start another.
-    m_record_streams.set(stream_id, RecordStreamState {});
-    m_request_capture_permission(device_id, [weak_self = make_weak_ptr<ServerConnection>(), stream_id, device_id](bool allowed) {
+    m_record_streams.set(stream_id, RecordStreamState { .group = group, .subscriber_id = {}, .may_capture = false });
+    m_request_capture_permission(device_id, group, [weak_self = make_weak_ptr<ServerConnection>(), stream_id, device_id](bool allowed) {
         auto self = weak_self.strong_ref();
         if (self)
             self->capture_permission_decided(stream_id, device_id, allowed);
@@ -291,9 +292,15 @@ void ServerConnection::capture_permission_decided(u64 stream_id, ByteString cons
         return;
     if (!allowed) {
         m_record_streams.remove(stream_id);
-        async_record_stream_creation_failed(stream_id);
+        async_record_stream_creation_failed(stream_id, RecordStreamFailure::Refused);
         return;
     }
+
+    // The stream counts as capturing from here on, even while the device opens.
+    auto& stream = m_record_streams.get(stream_id).value();
+    stream.may_capture = true;
+    if (on_capture_started)
+        on_capture_started(stream.group);
 
     // The state exists before subscribing, since a device that is already open reports at once.
     auto subscriber_id = m_capture_devices->subscribe(device_id, [weak_self = make_weak_ptr<ServerConnection>(), stream_id](CaptureSubscriberId subscriber_id, ErrorOr<SampleSpecification> const& result) {
@@ -313,9 +320,10 @@ void ServerConnection::capture_device_ready(u64 stream_id, CaptureSubscriberId s
         return;
 
     auto fail = [&] {
-        m_capture_devices->unsubscribe(subscriber_id);
-        m_record_streams.remove(stream_id);
-        async_record_stream_creation_failed(stream_id);
+        auto stream = m_record_streams.take(stream_id).release_value();
+        stream.subscriber_id = subscriber_id;
+        record_stream_gone(stream);
+        async_record_stream_creation_failed(stream_id, RecordStreamFailure::DeviceUnavailable);
     };
     if (result.is_error()) {
         fail();
@@ -335,10 +343,8 @@ void ServerConnection::capture_device_ready(u64 stream_id, CaptureSubscriberId s
 
 void ServerConnection::destroy_record_stream(u64 stream_id)
 {
-    auto stream = m_record_streams.take(stream_id);
-    if (!stream.has_value() || !stream->subscriber_id.has_value())
-        return;
-    m_capture_devices->unsubscribe(stream->subscriber_id.value());
+    if (auto stream = m_record_streams.take(stream_id); stream.has_value())
+        record_stream_gone(*stream);
 }
 
 }

@@ -20,11 +20,13 @@ glyphs as Qt: a chevron ("Show All Tabs") and the site-settings sliders
 information" on local or browser pages).
 
 - Window and tab chrome, tab close buttons, tab drag-reorder, middle-click
-  close, duplicate tab, close other tabs.
-- Back/forward/reload/stop, home, new tab/window/private window.
+  close, duplicate tab, close other tabs. The tab menu and View menu can pin a
+  window always on top (backed by `serenity_toplevel.set_always_on_top`).
+- Back/forward/reload/stop, home, new tab/window/private window, and
+  File → Open File… (Ctrl+O) for local files.
 - Address bar with URL entry, search fallback, and autocomplete/search
-  suggestions; bookmarks toggle, find bar with match count, zoom controls with
-  a visible percentage, view source.
+  suggestions; Ctrl+L and F6 focus it. Bookmarks toggle, find bar with match
+  count, zoom controls with a visible percentage, and view source.
 - Bookmarks bar with folders and an overflow menu, downloads window, permission
   prompts, file picker, native `<select>` dropdowns, JavaScript dialogs.
 - Reopen-closed-tab and tab search actions; a site indicator/popover with the
@@ -74,6 +76,11 @@ information" on local or browser pages).
   clipboard portal now carries a list of representations per item, so
   text/plain, text/html, and images are all available to other applications at
   the same time.
+- **Page preferences**: **Done.** View → Color Scheme, Contrast, and Motion
+  select `prefers-color-scheme`, `prefers-contrast`, and
+  `prefers-reduced-motion` for every page and worker. The choices ride the
+  engine protocol (`view_preferences`), and the color scheme is persisted in
+  the profile like the reference frontend.
 - **Accessibility**: expose web-content accessibility through the LibGUI/AT-SPI
   bridge.
 

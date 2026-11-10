@@ -8,12 +8,11 @@
 //! what.
 
 use core::cell::{Cell, RefCell};
-use core::ffi::c_void;
 use core::marker::PhantomData;
 use core::ops::Deref;
 
 use ak::Utf16String;
-use libjs_rust::api::{DeferGc, ForeignCellSlot, Gc, GcRefCell, Realm, Trace, Visitor, Vm};
+use libjs_rust::api::{DeferGc, ForeignCellSlot, Gc, GcRefCell, Realm, Trace, Visitor};
 
 use super::canvas::{
     Canvas, TexImageSourceFrame, TexImageSourceKind, read_tex_image_frame, read_tex_image_pixels, read_tex_image_source,
@@ -39,11 +38,18 @@ use super::web_gl_transform_feedback::WebGLTransformFeedback;
 use super::web_gl_uniform_location::WebGLUniformLocation;
 use super::web_gl_vertex_array_object::WebGLVertexArrayObject;
 use super::web_gl_vertex_array_object_oes::WebGLVertexArrayObjectOES;
-use crate::bindings::interface::{Inherits, Interface, Ref, Wrappable, cell_into_abi};
+use crate::bindings::interface::{Inherits, Interface, Ref, Wrappable};
 use crate::bindings::{Exception, WebIdlResult};
 use crate::canvas_2d::canvas::CanvasImageSourceKind;
 
 pub(crate) const MAX_WEBGL_DRAWING_BUFFER_DIMENSION: i32 = 16384;
+
+/// The width or height of the drawing buffer for a canvas of this width or height.
+// https://registry.khronos.org/webgl/specs/latest/1.0/#THE_DRAWING_BUFFER
+// A 0x0 canvas yields a 1x1 drawing buffer, and a canvas larger than the implementation supports yields a smaller one.
+pub(crate) fn drawing_buffer_dimension(canvas_dimension: i32) -> i32 {
+    canvas_dimension.clamp(1, MAX_WEBGL_DRAWING_BUFFER_DIMENSION)
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum WebGLVersion {
@@ -90,7 +96,7 @@ unsafe impl<V: Version> Trace for RenderingContext<V> {
 }
 
 impl<V: Version> Wrappable for RenderingContext<V> {
-    fn relevant_realm(&self, _vm: &Vm) -> Option<Gc<Realm>> {
+    fn relevant_realm(&self) -> Option<Gc<Realm>> {
         self.state.canvas().relevant_realm()
     }
 }
@@ -107,13 +113,6 @@ impl ContextRef {
         match self {
             Self::WebGL1(context) => &context.state,
             Self::WebGL2(context) => &context.state,
-        }
-    }
-
-    pub(crate) fn cell(&self) -> *mut c_void {
-        match *self {
-            Self::WebGL1(context) => cell_into_abi(context),
-            Self::WebGL2(context) => cell_into_abi(context),
         }
     }
 }
@@ -156,9 +155,6 @@ pub(crate) struct ContextState {
     context_lost: Cell<bool>,
     #[gc(untraced)]
     context_restore_requested: Cell<bool>,
-    /// https://immersive-web.github.io/webxr/#xr-compatible
-    #[gc(untraced)]
-    xr_compatible: Cell<bool>,
     #[gc(untraced)]
     context_generation: Cell<u64>,
 
@@ -227,7 +223,6 @@ impl ContextState {
             error: Cell::new(GL_NO_ERROR),
             context_lost: Cell::new(false),
             context_restore_requested: Cell::new(false),
-            xr_compatible: Cell::new(false),
             context_generation: Cell::new(0),
             unpack_state: Cell::new(PixelUnpackState::default()),
             unpack_flip_y: Cell::new(false),
@@ -291,14 +286,6 @@ impl ContextState {
 
     pub(crate) fn is_context_lost(&self) -> bool {
         self.context_lost.get()
-    }
-
-    pub(crate) fn xr_compatible(&self) -> bool {
-        self.xr_compatible.get()
-    }
-
-    pub(crate) fn set_xr_compatible(&self, xr_compatible: bool) {
-        self.xr_compatible.set(xr_compatible);
     }
 
     /// Makes `error` the error of the context, unless it has one already.
@@ -399,6 +386,12 @@ impl ContextState {
                 read_tex_image_source(object, TexImageSourceKind::OffscreenCanvas, format, r#type)
             }
         };
+        if tex_image_source_is_not_origin_clean(source) {
+            return Err(Exception::Dom(
+                "SecurityError",
+                Utf16String::from_ascii(b"Cannot upload a texture source that is not origin-clean"),
+            ));
+        }
         let frame = match source_frame {
             TexImageSourceFrame::Frame(frame) => frame,
             TexImageSourceFrame::NoFrame => return Ok(None),

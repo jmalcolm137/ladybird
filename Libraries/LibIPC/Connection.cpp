@@ -6,13 +6,47 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <AK/Diagnostics.h>
 #include <AK/ScopeGuard.h>
+#include <AK/TemporaryChange.h>
 #include <AK/Vector.h>
 #include <LibIPC/Connection.h>
 #include <LibIPC/Message.h>
 #include <LibIPC/Stub.h>
 
 namespace IPC {
+
+// NB: Drop each thread's reference when that thread exits.
+#ifdef AK_COMPILER_CLANG
+AK_IGNORE_DIAGNOSTIC("-Wexit-time-destructors", static thread_local RefPtr<SyncRequestCanceller> s_sync_request_canceller)
+#else
+static thread_local RefPtr<SyncRequestCanceller> s_sync_request_canceller;
+#endif
+
+void SyncRequestCanceller::install_on_this_thread()
+{
+    s_sync_request_canceller = *this;
+}
+
+bool SyncRequestCanceller::is_installed_on_this_thread()
+{
+    return s_sync_request_canceller;
+}
+
+void SyncRequestCanceller::cancel()
+{
+    m_cancelled.store(true, AK::MemoryOrder::memory_order_release);
+
+    MutexLocker locker(m_mutex);
+    if (m_transport_waited_on)
+        m_transport_waited_on->interrupt_wait_until_readable();
+}
+
+void SyncRequestCanceller::set_transport_waited_on(Transport* transport)
+{
+    MutexLocker locker(m_mutex);
+    m_transport_waited_on = transport;
+}
 
 ConnectionBase::ConnectionBase(IPC::Stub& local_stub, NonnullOwnPtr<Transport> transport, u32 local_endpoint_magic)
     : m_local_stub(local_stub)
@@ -58,16 +92,24 @@ ErrorOr<void> ConnectionBase::post_sync_request(Message const& request)
     // rather than hand the failure to a caller that may have no way to carry on — as WebKit's sendSyncMessage() does
     // (thru didFailToSendSyncMessage) for a connection with setShouldExitOnSyncMessageSendFailure().
     if (result.is_error() && m_peer_owns_this_process && !is_open())
-        shutdown();
+        did_lose_peer_during_sync_request();
     return result;
 }
 
 void ConnectionBase::shutdown()
 {
-    m_transport->close();
+    VERIFY(m_owner_thread_id.is_current_thread());
     if (m_died)
         return;
     m_died = true;
+    m_transport->close();
+
+    m_unprocessed_messages.clear();
+    for (auto batch : m_dispatching_message_batches) {
+        for (auto& message : batch)
+            message.clear();
+    }
+
     die();
 }
 
@@ -109,6 +151,8 @@ void ConnectionBase::dispatch_pending_messages()
 void ConnectionBase::handle_messages()
 {
     VERIFY(m_owner_thread_id.is_current_thread());
+    if (m_died)
+        return;
     auto messages = move(m_unprocessed_messages);
     m_dispatching_message_batches.append(messages.span());
     ScopeGuard remove_batch = [&] { m_dispatching_message_batches.take_last(); };
@@ -153,6 +197,8 @@ void ConnectionBase::wait_for_transport_to_become_readable()
 ConnectionBase::PeerEOF ConnectionBase::drain_messages_from_peer()
 {
     VERIFY(m_owner_thread_id.is_current_thread());
+    if (m_died)
+        return PeerEOF::Yes;
     bool parse_error = false;
     auto schedule_shutdown = m_transport->read_as_many_messages_as_possible_without_blocking([&](auto&& raw_message) {
         auto bytes = raw_message.bytes.bytes();
@@ -173,8 +219,11 @@ ConnectionBase::PeerEOF ConnectionBase::drain_messages_from_peer()
     // dispatching that would run handlers on a connection that's closed under them. So, drop it all and shut down now,
     // rather than after one last dispatch; see set_peer_owns_this_process().
     if (schedule_shutdown == Transport::ShouldShutdown::Yes && m_peer_owns_this_process) {
-        m_unprocessed_messages.clear();
-        shutdown();
+        // NB: A wait for a sync response acts on this once it sees that no response came, and shuts down then.
+        if (m_is_waiting_for_sync_response)
+            m_unprocessed_messages.clear();
+        else
+            shutdown();
         return PeerEOF::Yes;
     }
 
@@ -194,10 +243,21 @@ ConnectionBase::PeerEOF ConnectionBase::drain_messages_from_peer()
     return PeerEOF::No;
 }
 
-OwnPtr<IPC::Message> ConnectionBase::wait_for_specific_endpoint_message_impl(u32 endpoint_magic, int message_id)
+OwnPtr<IPC::Message> ConnectionBase::wait_for_specific_endpoint_message_impl(u32 endpoint_magic, int message_id, MayCancel may_cancel)
 {
     VERIFY(m_owner_thread_id.is_current_thread());
+    TemporaryChange waiting_for_sync_response { m_is_waiting_for_sync_response, true };
     bool peer_disconnected_during_wait = false;
+
+    // NB: The canceller knows the transport before this thread looks at its flag, so it cannot slip in between that look
+    //     and the wait: if it does not find the transport, this thread sees the flag.
+    auto canceller = may_cancel == MayCancel::Yes ? s_sync_request_canceller : nullptr;
+    if (canceller)
+        canceller->set_transport_waited_on(m_transport.ptr());
+    ScopeGuard forget_transport = [&] {
+        if (canceller)
+            canceller->set_transport_waited_on(nullptr);
+    };
 
     auto take_matching_message = [&]() -> OwnPtr<IPC::Message> {
         for (size_t i = 0; i < m_unprocessed_messages.size(); ++i) {
@@ -211,6 +271,12 @@ OwnPtr<IPC::Message> ConnectionBase::wait_for_specific_endpoint_message_impl(u32
     };
 
     for (;;) {
+        // NB: Responses have no ID, so one that a cancelled wait left behind would pass for the response to the next
+        //     request of that type. A canceller stays cancelled, so nothing takes that response after this point. It
+        //     is not dispatched either, as it is not for this endpoint.
+        if (canceller && canceller->is_cancelled())
+            return {};
+
         // Double check we don't already have the event waiting for us.
         // Otherwise we might end up blocked for a while for no reason.
         if (auto message = take_matching_message())
@@ -245,16 +311,16 @@ OwnPtr<IPC::Message> ConnectionBase::wait_for_specific_endpoint_message_impl(u32
     }
 
     if (peer_disconnected_during_wait) {
-        // Don't dispatch any remaining queued messages here. wait_for_specific_endpoint_message_impl can be entered
+        // shutdown() discards any remaining queued messages. wait_for_specific_endpoint_message_impl can be entered
         // from any sync IPC call — including from inside a constructor whose members are still being initialized. (See
         // issue #9582. PageHost's constructor issues a sync IPC before ConnectionFromClient::m_page_host has been
         // assigned.) Re-entering arbitrary handlers from here can hit uninitialized state and crash. shutdown() closes
         // the transport and calls die(). That exits processes cleanly — the same as queued close_server message would.
-        shutdown();
+        did_lose_peer_during_sync_request();
     } else if (m_peer_owns_this_process && !is_open()) {
         // NB: A peer that owns this process may also have been found gone before the wait began — e.g. by the
         // transport's IO thread, right after the request was posted; see set_peer_owns_this_process().
-        shutdown();
+        did_lose_peer_during_sync_request();
     }
 
     return {};

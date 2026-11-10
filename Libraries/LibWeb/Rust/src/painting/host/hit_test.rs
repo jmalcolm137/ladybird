@@ -18,14 +18,16 @@ pub struct FfiHitTestQueryCallbacks {
     pub scroll_offsets_len: usize,
     pub has_chrome_metrics: bool,
     pub chrome_metrics: crate::painting::ffi::FfiChromeMetrics,
+    /// Where set, the query reads the compositor's animations at this time, as a frame of the compositor's shows them.
+    pub has_visual_animation_sample_time: bool,
+    pub visual_animation_sample_time_ns: i64,
     /// Private: reached only through the method below, which takes the main thread token.
     contains: extern "C" fn(*mut c_void, FfiNodeIdentity, FfiNodeIdentity) -> bool,
 }
 
 impl FfiHitTestQueryCallbacks {
     /// Callbacks for a point query on the render owner, which reaches nothing of the host: the scroll offsets and
-    /// chrome metrics are copies the host sealed, and no caret query, the only one that asks the host about the DOM,
-    /// runs there.
+    /// chrome metrics are copies the host sealed, and a caret query there asks the style engine's mirror about the DOM.
     pub(crate) fn sealed(
         device_pixels_per_css_pixel: f64,
         scroll_offsets: &[libgfx_rust::FloatPoint],
@@ -41,8 +43,15 @@ impl FfiHitTestQueryCallbacks {
             scroll_offsets_len: scroll_offsets.len(),
             has_chrome_metrics: true,
             chrome_metrics,
+            has_visual_animation_sample_time: false,
+            visual_animation_sample_time_ns: 0,
             contains: no_contains,
         }
+    }
+
+    pub(crate) fn visual_animation_sample_time_ns(&self) -> Option<i64> {
+        self.has_visual_animation_sample_time
+            .then_some(self.visual_animation_sample_time_ns)
     }
 
     /// Whether `node` is `ancestor` or one of its descendants in the DOM.

@@ -84,7 +84,8 @@ fn frames_above(vm: &Vm, frame: NonNull<ExecutionContext>) -> Option<Vec<NonNull
 
 /// What calls of an executable without JIT code enter through its slot in the JIT entry table.
 pub fn not_compiled_call_entry() -> *const core::ffi::c_void {
-    entry_exit::libjs_jit_not_compiled_call_entry as *const core::ffi::c_void
+    libjs_runtime_macros::jit_function_address!(entry_exit::libjs_jit_not_compiled_call_entry)
+        as *const core::ffi::c_void
 }
 
 /// Which interpreter handlers an executable's frames run with. Each tier's value is the index of its dispatch table
@@ -415,8 +416,15 @@ impl JitState {
             .get_or_init(|| {
                 let code = libjs_jit::codegen::generate_entry_trampoline::<libjs_jit::asm::MacroAssembler>()
                     .expect("the entry trampoline can be generated");
+                // NB: On Windows, the trampoline goes first in a chunk of its own, whose unwind info then describes
+                //     its prologue: native code calls it, and keeps no frame pointer that a stack walk from the
+                //     prologue could take for the trampoline's.
+                #[cfg(windows)]
+                let allocator = Rc::new(RefCell::new(CodeAllocator::default()));
+                #[cfg(not(windows))]
+                let allocator = Rc::clone(&self.code_allocator);
                 let memory = ExecutableMemory::allocate(
-                    &self.code_allocator,
+                    &allocator,
                     &[code.as_slice()],
                     &["entry trampoline"],
                     self.options.perf_map,
@@ -477,7 +485,7 @@ pub fn describe_executable(executable: &Executable) -> String {
     } else {
         name
     };
-    let Some(entry) = executable.source_map.iter().find(|entry| entry.line != 0) else {
+    let Some(entry) = executable.source_positions().find(|entry| entry.line != 0) else {
         return name;
     };
     let filename = executable.source_code().map_or(String::new(), |source_code| {

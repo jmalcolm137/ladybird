@@ -1,3 +1,5 @@
+include(python_environment)
+
 set(SOURCES
     Application.cpp
     CaptureFile.cpp
@@ -13,8 +15,10 @@ set(SOURCES
 )
 
 add_executable(test-web ${SOURCES})
-add_dependencies(test-web ladybird_build_resource_files ${ladybird_helper_processes})
-target_link_libraries(test-web PRIVATE AK LibCore LibDiff LibFileSystem LibGfx LibImageDecoders LibImageDecoderClient LibIPC LibJS LibMain LibRequests LibURL LibWeb LibWebView)
+target_compile_definitions(test-web PRIVATE HAS_PDFJS=$<BOOL:${PDFJS_FOUND}>)
+target_compile_definitions(test-web PRIVATE LADYBIRD_PYTHON_EXECUTABLE="${LADYBIRD_TEST_PYTHON}")
+add_dependencies(test-web ladybird_build_resource_files ladybird_python_environment ${ladybird_helper_processes})
+target_link_libraries(test-web PRIVATE AK LibCore LibDiff LibFileSystem LibGfx LibImageDecoders LibImageDecoderClient LibGamepad LibIPC LibJS LibMain LibRequests LibURL LibWeb LibWebView)
 
 if (APPLE)
     target_compile_definitions(test-web PRIVATE LADYBIRD_BINARY_PATH="$<TARGET_FILE_DIR:ladybird>")
@@ -24,42 +28,29 @@ elseif (WIN32)
     ladybird_windows_bin(test-web CONSOLE)
 endif()
 
-# FIXME: Add support for running test-web on Windows
-if (WIN32)
-    return()
-endif()
-
 if (BUILD_TESTING)
-    add_test(
-        NAME LibWebManualRenderingReset
-        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-manual-rendering-reset.py
-            $<TARGET_FILE:test-web> ${LADYBIRD_SOURCE_DIR}
-    )
-    set_tests_properties(LibWebManualRenderingReset PROPERTIES TIMEOUT 240)
-
-    add_test(
-        NAME LibWebHistoryRateLimitReset
-        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-history-rate-limit-reset.py
-            $<TARGET_FILE:test-web> ${LADYBIRD_SOURCE_DIR}
-    )
-    set_tests_properties(LibWebHistoryRateLimitReset PROPERTIES TIMEOUT 120)
+    ladybird_python_test(test-history-rate-limit-reset.py
+        PYTHON_EXECUTABLE "${LADYBIRD_TEST_PYTHON}" ARGS $<TARGET_FILE:test-web>)
+    ladybird_python_test(test-manual-rendering-reset.py
+        PYTHON_EXECUTABLE "${LADYBIRD_TEST_PYTHON}" ARGS $<TARGET_FILE:test-web> TIMEOUT 240)
 
     add_test(
         NAME LibWeb
-        COMMAND $<TARGET_FILE:test-web> --python-executable ${Python3_EXECUTABLE} --per-test-timeout 120 -v -v
+        COMMAND $<TARGET_FILE:test-web> --per-test-timeout 120 -v -v
     )
 
     add_test(
         NAME LibWebUIProcessSessionHistory
-        COMMAND $<TARGET_FILE:test-web> --python-executable ${Python3_EXECUTABLE} --per-test-timeout 120
+        COMMAND $<TARGET_FILE:test-web> --per-test-timeout 120
             --force-new-process --run-ui-process-session-history-tests -f "Text/input/navigation/*"
             --results-dir test-dumps/ui-process-session-history-results
     )
 
-    set_tests_properties(LibWeb PROPERTIES
+    set_tests_properties(LibWeb LibWebUIProcessSessionHistory PROPERTIES
         ENVIRONMENT LADYBIRD_SOURCE_DIR=${LADYBIRD_SOURCE_DIR}
-        TIMEOUT_SIGNAL_NAME SIGTERM)
-    set_tests_properties(LibWebUIProcessSessionHistory PROPERTIES
-        ENVIRONMENT LADYBIRD_SOURCE_DIR=${LADYBIRD_SOURCE_DIR}
-        TIMEOUT_SIGNAL_NAME SIGTERM)
+        RUN_SERIAL TRUE)
+    # CTest refuses to run tests with a timeout signal on Windows.
+    if (NOT WIN32)
+        set_tests_properties(LibWeb LibWebUIProcessSessionHistory PROPERTIES TIMEOUT_SIGNAL_NAME SIGTERM)
+    endif()
 endif()

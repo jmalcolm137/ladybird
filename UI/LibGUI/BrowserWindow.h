@@ -11,6 +11,7 @@
 #include "EngineClient.h"
 
 #include <AK/ByteString.h>
+#include <AK/HashMap.h>
 #include <AK/NonnullOwnPtr.h>
 #include <AK/Vector.h>
 #include <LibGUI/Action.h>
@@ -31,6 +32,9 @@ public:
     ~BrowserWindow();
 
     void show();
+
+    // Check the View > Color Scheme / Contrast / Motion items that match the session's current choices.
+    void update_view_preference_actions();
 
     void reopen_tab(String const& url);
     void open_startup_urls(Vector<String> const& urls);
@@ -150,6 +154,8 @@ private:
     RefPtr<GUI::Action> m_home_action;
     RefPtr<GUI::Action> m_new_window_action;
     RefPtr<GUI::Action> m_new_private_window_action;
+    RefPtr<GUI::Action> m_open_file_action;
+    RefPtr<GUI::Action> m_always_on_top_action;
     RefPtr<GUI::Action> m_bookmarks_bar_action;
     RefPtr<GUI::Action> m_close_tab_action;
     RefPtr<GUI::Action> m_reopen_closed_tab_action;
@@ -179,6 +185,9 @@ private:
     RefPtr<GUI::Action> m_navigator_compatibility_action;
     RefPtr<GUI::Action> m_crash_reports_action;
     RefPtr<GUI::Action> m_process_manager_action;
+    HashMap<String, RefPtr<GUI::Action>> m_color_scheme_actions;
+    HashMap<String, RefPtr<GUI::Action>> m_contrast_actions;
+    HashMap<String, RefPtr<GUI::Action>> m_motion_actions;
     RefPtr<GUI::Widget> m_devtools_bar;
     RefPtr<GUI::Label> m_devtools_label;
 
@@ -229,6 +238,7 @@ private:
     };
     Vector<RecentHistoryEntry> m_recent_history;
     bool m_reordering_tabs { false };
+    bool m_always_on_top { false };
     HashMap<u64, BrowserTab*> m_pending_session_tab_requests;
     bool m_show_bookmarks_bar { true };
     RefPtr<Gfx::Bitmap const> m_bookmark_icon;

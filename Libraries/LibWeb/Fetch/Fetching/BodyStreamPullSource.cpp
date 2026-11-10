@@ -38,6 +38,7 @@ public:
         m_armed_sources.ensure(token, [&] { return GC::make_root(source); });
     }
     void disarm(BodyStreamWakeToken token) { m_armed_sources.remove(token); }
+    void disarm_all() { m_armed_sources.clear(); }
 
     void notify(BodyStreamWakeToken token, Engine::WakeTicket ticket)
     {
@@ -52,6 +53,11 @@ private:
     u64 m_next_token { 1 };
     HashMap<BodyStreamWakeToken, GC::Root<BodyStreamPullSource>> m_armed_sources;
 };
+
+void disarm_all_body_stream_wakes()
+{
+    BodyStreamWakeRegistry::the().disarm_all();
+}
 
 NonnullRefPtr<BodyStreamWakeSink> BodyStreamWakeSink::create()
 {
@@ -212,7 +218,7 @@ void BodyStreamPullSource::on_pull_wake()
 
     // AD-HOC: While the HTML event loop is paused, the pull runs now rather than in a fetch task, which would not run
     //         until the loop resumes.
-    if (HTML::main_thread_event_loop().execution_paused()) {
+    if (HTML::current_event_loop().execution_paused()) {
         run_pull_task();
         push_while_paused();
         return;
@@ -220,8 +226,8 @@ void BodyStreamPullSource::on_pull_wake()
 
     // 3. Queue a fetch task to run the following steps, with fetchParams’s task destination:
     // NB: This task stays queued when the fetch is stopped.
-    auto steps = GC::create_function(heap(), [this] {
-        run_pull_task();
+    auto steps = GC::create_function(heap(), GC::captures(*this), [](BodyStreamPullSource& self) {
+        self.run_pull_task();
     });
     if (m_fetch_controller) {
         Infrastructure::queue_fetch_task(m_fetch_controller->task_destination(), steps);
@@ -230,7 +236,7 @@ void BodyStreamPullSource::on_pull_wake()
 
     // AD-HOC: The tasks of a navigation body adopted from another process are queued without a document, since the
     //         previous document's tasks stop running once the new document replaces it.
-    HTML::queue_a_task(HTML::Task::Source::Networking, HTML::main_thread_event_loop(), nullptr, steps);
+    HTML::queue_a_task(HTML::Task::Source::Networking, HTML::current_event_loop(), nullptr, steps);
 }
 
 // AD-HOC: A sync XHR send() pauses the HTML event loop while it waits for exactly these bytes, and a stream set up
@@ -239,7 +245,7 @@ void BodyStreamPullSource::on_pull_wake()
 //         would deliver them (see the sync XHR body path in fetch_response_handover()).
 void BodyStreamPullSource::push_while_paused()
 {
-    if (m_detached || m_pending_pull_promise || m_push_ticket.has_value() || !HTML::main_thread_event_loop().execution_paused())
+    if (m_detached || m_pending_pull_promise || m_push_ticket.has_value() || !HTML::current_event_loop().execution_paused())
         return;
     if (!m_fetch_controller || m_fetch_controller->control_block().body_intent() != Engine::BodyIntent::SyncAccumulate)
         return;
@@ -369,12 +375,12 @@ GC::Ref<Infrastructure::Body> create_body_from_channel(JS::Realm& realm, GC::Ptr
     auto pull_source = GC::Heap::the().allocate<BodyStreamPullSource>(realm, fetch_controller, stream, move(channel), *wake_sink);
 
     // 11. Let pullAlgorithm be the following steps:
-    auto pull_algorithm = GC::create_function(GC::Heap::the(), [pull_source]() {
+    auto pull_algorithm = GC::create_function(GC::Heap::the(), GC::captures(pull_source), [](GC::Ref<BodyStreamPullSource> pull_source) {
         return pull_source->pull();
     });
 
     // 12. Let cancelAlgorithm be an algorithm that aborts fetchParams’s controller with reason, given reason.
-    auto cancel_algorithm = GC::create_function(GC::Heap::the(), [pull_source](JS::Value reason) {
+    auto cancel_algorithm = GC::create_function(GC::Heap::the(), GC::captures(pull_source), [](GC::Ref<BodyStreamPullSource> pull_source, JS::Value reason) {
         return pull_source->cancel(reason);
     });
 
@@ -382,7 +388,7 @@ GC::Ref<Infrastructure::Body> create_body_from_channel(JS::Realm& realm, GC::Ptr
     stream->set_up_with_byte_reading_support(realm, pull_algorithm, cancel_algorithm);
     pull_source->watch_channel();
 
-    auto read_resource_header = GC::create_function(GC::Heap::the(), [pull_source](Infrastructure::Body::ResourceHeaderCallback on_resource_header) {
+    auto read_resource_header = GC::create_function(GC::Heap::the(), GC::captures(pull_source), [](GC::Ref<BodyStreamPullSource> pull_source, Infrastructure::Body::ResourceHeaderCallback on_resource_header) {
         pull_source->read_resource_header(on_resource_header);
     });
     return Infrastructure::Body::create_over_arriving_bytes(stream, read_resource_header);

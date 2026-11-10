@@ -5,7 +5,6 @@
  */
 
 #include <AK/NeverDestroyed.h>
-#include <LibGC/ConservativeVector.h>
 #include <LibGC/RootVector.h>
 #include <LibWeb/CSS/ComputedValues.h>
 #include <LibWeb/CSS/FontComputer.h>
@@ -33,6 +32,11 @@
 #include <LibWeb/Painting/BoxViews.h>
 
 namespace Web::PaintTiming {
+
+void PendingImageRecord::visit_edges(GC::Cell::Visitor& visitor) const
+{
+    visitor.visit(element);
+}
 
 static Utf16String const& first_paint_name()
 {
@@ -126,6 +130,7 @@ static bool svg_has_rendered_descendants(Layout::Node const& svg_box)
 // NB: This answers the question for the box of an element, or for a text node's box, which stands for the element
 //     the text node is a child of. Generated content has boxes of its own, so a pseudo-element's content is found
 //     the same way as an element's.
+// NB: A box this can answer yes for must also make layout_rows_may_be_contentful() answer yes.
 static bool is_contentful(Layout::Node const& node)
 {
     // An element target is contentful when one or more of the following apply:
@@ -144,8 +149,6 @@ static bool is_contentful(Layout::Node const& node)
     if (!node_with_style)
         return false;
 
-    auto const* dom_node = node.dom_node();
-
     switch (node.kind()) {
     // - target is a replaced element representing an available image.
     case Layout::RustFFI::NodeKind::ImageBox:
@@ -157,13 +160,13 @@ static bool is_contentful(Layout::Node const& node)
     }
     // - target is a canvas with its context mode set to any value other than none.
     case Layout::RustFFI::NodeKind::CanvasBox:
-        if (auto const* canvas = as_if<HTML::HTMLCanvasElement>(dom_node); canvas && !canvas->context().has<Empty>())
+        if (auto const* canvas = as_if<HTML::HTMLCanvasElement>(node.dom_node()); canvas && !canvas->context().has<Empty>())
             return true;
         break;
     // - target is a video element that represents its poster frame or the first video frame and the frame is
     //   available.
     case Layout::RustFFI::NodeKind::VideoBox:
-        if (auto const* video = as_if<HTML::HTMLVideoElement>(dom_node)) {
+        if (auto const* video = as_if<HTML::HTMLVideoElement>(node.dom_node())) {
             auto representation = video->current_representation();
             if (representation == HTML::HTMLVideoElement::Representation::PosterFrame && video->poster_frame().has_value())
                 return true;
@@ -179,7 +182,7 @@ static bool is_contentful(Layout::Node const& node)
     // - target is an input element with a non-empty value attribute.
     // NB: The value is what the control renders, which the value attribute only provides the default for.
     case Layout::RustFFI::NodeKind::TextInputBox:
-        if (auto const* input = as_if<HTML::HTMLInputElement>(dom_node)) {
+        if (auto const* input = as_if<HTML::HTMLInputElement>(node.dom_node())) {
             auto value = input->value();
             if (is_non_empty(value.utf16_view()))
                 return true;
@@ -349,6 +352,11 @@ static PaintedContent find_painted_content(PaintableChecker const& checker, Pain
     if (!viewport)
         return result;
 
+    // OPTIMIZATION: This runs every frame until first contentful paint is reported, which a document with nothing that
+    //               can be contentful never does, so its boxes are not walked.
+    if (result.has_non_default_content && !Layout::RustFFI::layout_rows_may_be_contentful(viewport->document_host(), &checker.read()))
+        return result;
+
     viewport->for_each_in_inclusive_subtree([&](Layout::Node const& node) {
         if (auto const* node_with_style = as_if<Layout::NodeWithStyle>(node); node_with_style && node_with_style->opacity() <= 0)
             return TraversalDecision::SkipChildrenAndContinue;
@@ -471,7 +479,7 @@ void mark_paint_timing(DOM::Document& document)
     };
 
     // 3. Let paintedImages be a new ordered set
-    GC::ConservativeVector<PendingImageRecord> painted_images;
+    GC::RootVector<PendingImageRecord> painted_images;
 
     // 4. Let paintedTextNodes be a new ordered set
     PaintedTextNodes painted_text_nodes;
@@ -502,13 +510,11 @@ void mark_paint_timing(DOM::Document& document)
         if (!text->is_connected() || &text->document() != &document)
             return true;
         auto const* text_box = text->layout_node(checker.read());
-        if (!text_box) {
-            // OPTIMIZATION: Text that is all white space paints nothing, and is not looked at again until its data
-            //               changes to something else.
+        if (!text_box || !checker.is_paintable(*text_box, PaintableChecker::CheckAncestorOpacity::Yes)) {
+            // OPTIMIZATION: Text that is all white space and paints nothing, often in a box without fragments, is not
+            //               looked at again until its data changes to something else.
             return !is_non_empty(text->data().utf16_view());
         }
-        if (!checker.is_paintable(*text_box, PaintableChecker::CheckAncestorOpacity::Yes))
-            return false;
 
         // https://w3c.github.io/paint-timing/#sec-modifications-dom
         // When the user agent paints a Text node text for the first time, it should execute the following steps:

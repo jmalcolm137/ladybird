@@ -46,6 +46,8 @@ public:
         address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
         MUST(Core::System::bind(m_socket, reinterpret_cast<sockaddr*>(&address), sizeof(address)));
         MUST(Core::System::listen(m_socket, 16));
+        // accept() must not block when a connection that poll() reported is gone by then.
+        MUST(Core::System::fcntl(m_socket, F_SETFL, O_NONBLOCK));
 
         socklen_t address_size = sizeof(address);
         VERIFY(::getsockname(m_socket, reinterpret_cast<sockaddr*>(&address), &address_size) == 0);
@@ -61,7 +63,6 @@ public:
     ~TestHttpServer()
     {
         m_shutting_down.store(true);
-        wake_server();
         (void)m_thread->join();
         (void)Core::System::close(m_socket);
     }
@@ -71,38 +72,42 @@ public:
         return URL::Parser::basic_parse(ByteString::formatted("http://127.0.0.1:{}/page", m_port)).release_value();
     }
 
-    URL::URL url() const
+    URL::URL url(bool cross_site = false) const
     {
-        return URL::Parser::basic_parse(ByteString::formatted("http://127.0.0.1:{}/file", m_port)).release_value();
+        return URL::Parser::basic_parse(ByteString::formatted("http://{}:{}/file", cross_site ? "localhost" : "127.0.0.1", m_port)).release_value();
+    }
+
+    URL::URL redirect_url() const
+    {
+        return URL::Parser::basic_parse(ByteString::formatted("http://127.0.0.1:{}/redirect", m_port)).release_value();
     }
 
     // The number of requests for url(), not counting the page.
     size_t request_count() const { return m_request_count.load(); }
 
 private:
+    // A connection made to wake accept() can be lost to a signal, so poll and recheck for shutdown instead.
     void run()
     {
         while (!m_shutting_down.load()) {
-            auto client = ::accept(m_socket, nullptr, nullptr);
-            if (client < 0)
+            pollfd poll_fd { .fd = m_socket, .events = POLLIN, .revents = 0 };
+            auto ready = Core::System::poll({ &poll_fd, 1 }, 100);
+            if (ready.is_error() && ready.error().code() != EINTR)
                 return;
+            if (ready.is_error() || ready.value() == 0)
+                continue;
+
+            auto client = ::accept(m_socket, nullptr, nullptr);
+            if (client < 0) {
+                if (errno == EAGAIN || errno == ECONNABORTED)
+                    continue;
+                return;
+            }
+            // Accepted sockets inherit O_NONBLOCK on some platforms.
+            MUST(Core::System::fcntl(client, F_SETFL, 0));
             respond(client);
             (void)Core::System::close(client);
         }
-    }
-
-    void wake_server()
-    {
-        auto socket = Core::System::socket(AF_INET, SOCK_STREAM, 0);
-        if (socket.is_error())
-            return;
-
-        sockaddr_in address {};
-        address.sin_family = AF_INET;
-        address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-        address.sin_port = htons(m_port);
-        (void)::connect(socket.value(), reinterpret_cast<sockaddr*>(&address), sizeof(address));
-        (void)Core::System::close(socket.value());
     }
 
     void respond(int client)
@@ -119,6 +124,11 @@ private:
         if (request.string_view().starts_with("GET /page "sv)) {
             auto page = "<!DOCTYPE html><title>Downloads</title>"sv;
             auto response = ByteString::formatted("HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", page.length(), page);
+            (void)write_all(client, response.bytes());
+            return;
+        }
+        if (request.string_view().starts_with("GET /redirect "sv)) {
+            auto response = ByteString::formatted("HTTP/1.1 302 Found\r\nLocation: {}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", url(true));
             (void)write_all(client, response.bytes());
             return;
         }
@@ -254,6 +264,16 @@ void expect_navigation_downloads_cached_body(Core::AnonymousBuffer const& theme,
     }
 }
 
+void expect_cross_site_navigation_downloads_body(Core::AnonymousBuffer const& theme, StringView what, ByteString headers, ByteBuffer const& body, bool redirect, Optional<size_t> pause_after = {})
+{
+    TestHttpServer server { move(headers), body, pause_after };
+    auto view = WebView::HeadlessWebView::create(theme, { 800, 600 });
+    load_page(*view, server.page_url());
+    expect_download_holds_body(what, download_navigation_response(*view, redirect ? server.redirect_url() : server.url(true)), body);
+    EXPECT(!view->is_loading());
+    EXPECT_EQ(view->url(), server.page_url());
+}
+
 }
 
 TEST_CASE(navigation_downloads)
@@ -276,6 +296,12 @@ TEST_CASE(navigation_downloads)
     expect_navigation_downloads_body(theme, "a response sniffed from bytes that arrive in parts"sv, "Content-Type: application/octet-stream\r\n"sv, body, 500);
     expect_navigation_downloads_cached_body(theme, "a response sniffed from the disk cache"sv, "Cache-Control: max-age=3600\r\nContent-Type: application/octet-stream\r\n"sv, body);
     expect_navigation_downloads_cached_body(theme, "an attachment from the disk cache"sv, "Cache-Control: max-age=3600\r\nContent-Disposition: attachment; filename=\"attachment.bin\"\r\n"sv, body);
+
+    for (bool redirect : { false, true }) {
+        expect_cross_site_navigation_downloads_body(theme, "a cross-site attachment"sv, "Content-Disposition: attachment; filename=\"cross-site.bin\"\r\n"sv, body, redirect);
+        expect_cross_site_navigation_downloads_body(theme, "a cross-site response sniffed as unrenderable"sv, "Content-Type: application/octet-stream\r\n"sv, body, redirect);
+    }
+    expect_cross_site_navigation_downloads_body(theme, "a cross-site response whose bytes arrive in parts"sv, "Content-Type: application/octet-stream\r\n"sv, body, false, 500);
 
     outln("PASS: navigation responses download byte for byte");
 }

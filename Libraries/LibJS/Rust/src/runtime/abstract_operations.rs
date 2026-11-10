@@ -138,15 +138,24 @@ fn with_callee_context<T>(
         argument_count: u32::try_from(arguments_list.len()).expect("the argument count fits in u32"),
         ..Default::default()
     };
-    function.get_stack_frame_info(vm, &mut stack_frame_info);
+    function.get_stack_frame_info(vm, &mut stack_frame_info)?;
 
     let stack = vm.interpreter_stack();
     let stack_mark = stack.top.get();
-    let Some(callee_context) = stack.allocate(
+    let (registers_and_locals_count, constant_count, argument_count) = (
         stack_frame_info.registers_and_locals_count,
         stack_frame_info.constant_count,
         stack_frame_info.argument_count,
-    ) else {
+    );
+    let callee_context = stack
+        .allocate(registers_and_locals_count, constant_count, argument_count)
+        .or_else(|| {
+            function
+                .ignores_stack_space_limit()
+                .then(|| stack.allocate_past_limit(registers_and_locals_count, constant_count, argument_count))
+                .flatten()
+        });
+    let Some(callee_context) = callee_context else {
         return vm.throw_completion(ErrorKind::InternalError, ErrorType::CallStackSizeExceeded, &[]);
     };
     let _deallocate_guard = ScopeGuard::new(|| stack.deallocate(stack_mark));
@@ -253,8 +262,43 @@ pub fn create_list_from_array_like<'vm>(
     // 3. Let len be ? LengthOfArrayLike(obj).
     let length = length_of_array_like(vm, &array_like)?;
 
+    list_from_array_like(vm, &array_like, length, check_value)
+}
+
+/// CreateListFromArrayLike ( obj ), for the arguments of a call: An array-like longer than any call can take throws
+/// before any of its elements are read.
+pub fn create_argument_list_from_array_like(vm: &Vm, value: Value) -> ThrowCompletionOr<MarkedVec<'_, Value>> {
+    if !value.is_object() {
+        return vm.throw_completion(ErrorKind::TypeError, ErrorType::NotAnObject, &[&value]);
+    }
+    let array_like = value.as_object();
+    let length = length_of_array_like(vm, &array_like)?;
+    throw_if_too_many_arguments(vm, length)?;
+    list_from_array_like(vm, &array_like, length, None)
+}
+
+/// Throws where `argument_count` is more arguments than any call can pass.
+pub fn throw_if_too_many_arguments(vm: &Vm, argument_count: u64) -> ThrowCompletionOr<()> {
+    if argument_count > crate::interpreter::interpreter_stack::MAXIMUM_ARGUMENT_COUNT {
+        return vm.throw_completion(ErrorKind::InternalError, ErrorType::CallStackSizeExceeded, &[]);
+    }
+    Ok(())
+}
+
+/// Steps 4 through 7 of CreateListFromArrayLike.
+fn list_from_array_like<'vm>(
+    vm: &'vm Vm,
+    array_like: &Object,
+    length: u64,
+    check_value: Option<&dyn Fn(Value) -> ThrowCompletionOr<()>>,
+) -> ThrowCompletionOr<MarkedVec<'vm, Value>> {
     // 4. Let list be a new empty List.
-    let list = MarkedVec::with_capacity(vm, length as usize);
+    // NB: The list grows as its elements are read, past what it reserves: A length no list could hold, such as an
+    //     ownKeys trap's, then fails on the elements it reads rather than on the reservation.
+    let list = MarkedVec::with_capacity(
+        vm,
+        length.min(crate::interpreter::interpreter_stack::MAXIMUM_ARGUMENT_COUNT) as usize,
+    );
 
     // 5. Let index be 0.
     // 6. Repeat, while index < len,
@@ -737,7 +781,13 @@ pub fn ordinary_create_from_constructor(
     intrinsic_default_prototype: IntrinsicDefaultPrototype,
 ) -> ThrowCompletionOr<Gc<Object>> {
     ordinary_create_from_constructor_of(vm, realm, constructor, intrinsic_default_prototype, |_, prototype| {
-        Object::new_with_prototype(vm, Object::CLASS, prototype, MayInterfereWithIndexedPropertyAccess::No)
+        Object::new_with_prototype(
+            vm,
+            Object::CLASS,
+            realm,
+            Some(prototype),
+            MayInterfereWithIndexedPropertyAccess::No,
+        )
     })
 }
 
@@ -821,6 +871,24 @@ pub fn new_object_environment(
             IsWithEnvironment::No
         },
         environment,
+    )
+}
+
+/// The environment of a call of `function`, which needs one: a function environment if the function's code reads
+/// anything of one through its environment, and otherwise the same without the fields it would never read.
+pub fn new_call_environment(
+    vm: &Vm,
+    function: Gc<EcmascriptFunctionObject>,
+    new_target: Option<Gc<Object>>,
+) -> Gc<DeclarativeEnvironment> {
+    let shared_data = function.shared_data();
+    if shared_data.function_environment_has_this_binding() {
+        return new_function_environment(vm, function, new_target).upcast();
+    }
+    DeclarativeEnvironment::create_with_binding_capacity(
+        vm,
+        function.environment(),
+        shared_data.function_environment_bindings_count(),
     )
 }
 
@@ -1247,11 +1315,11 @@ struct EvalResult<'vm> {
     declaration_data: EvalDeclarationData<'vm>,
 }
 
-fn fly_string_of(name: &crate::ast::Utf16String) -> Utf16FlyString {
-    Utf16FlyString::from_utf16(&name.0)
+fn fly_string_of(name: &Utf16String) -> Utf16FlyString {
+    Utf16View::of_string(name).to_utf16_fly_string()
 }
 
-fn fly_strings_of(names: &[crate::ast::Utf16String]) -> Vec<Utf16FlyString> {
+fn fly_strings_of(names: &[Utf16String]) -> Vec<Utf16FlyString> {
     names.iter().map(fly_string_of).collect()
 }
 
@@ -1271,10 +1339,6 @@ fn compile_eval(
     in_class_field_initializer: bool,
 ) -> Result<EvalResult<'_>, String> {
     let source_code = SourceCode::create(Utf16String::default(), code);
-    let mut code_units = Vec::with_capacity(source_code.length_in_code_units());
-    Utf16View::of_string(source_code.code()).append_to(&mut code_units);
-    let length = code_units.len();
-
     let context = EvalContext {
         starts_in_strict_mode: strict_caller == CallerMode::Strict,
         in_eval_function_context: in_function,
@@ -1282,7 +1346,7 @@ fn compile_eval(
         allow_super_constructor_call: in_derived_constructor,
         in_class_field_initializer,
     };
-    let parsed = parse_eval(&code_units, context).map_err(|errors| {
+    let parsed = parse_eval(source_code.code(), context).map_err(|errors| {
         errors
             .first()
             .map(|error| format!("{} (line: {}, column: {})", error.message, error.line, error.column))
@@ -1292,17 +1356,17 @@ fn compile_eval(
     let CompiledEval {
         executable,
         declarations,
-    } = crate::compile::compile_eval(parsed, length);
+    } = crate::compile::compile_eval(parsed);
     let executable = Executable::create_with_source_code(vm, executable, Some(&source_code));
     executable.set_name(Utf16FlyString::from_utf8("eval"));
 
     let functions_to_initialize_shared_data = MarkedVec::with_capacity(vm, declarations.functions_to_initialize.len());
     let mut functions_to_initialize = Vec::with_capacity(declarations.functions_to_initialize.len());
     let mut declared_function_names = HashSet::new();
-    for mut function in declarations.functions_to_initialize {
+    for function in &declarations.functions_to_initialize {
         functions_to_initialize_shared_data.push(SharedFunctionInstanceData::create_from_pending_shared_function_data(
             vm,
-            &mut function.shared_function_data,
+            &function.shared_function_data,
             declarations.is_strict,
             Some(&source_code),
         ));
@@ -1687,7 +1751,7 @@ pub fn create_unmapped_arguments_object(vm: &Vm, arguments: &[Cell<Value>]) -> G
 
     // 2. Let obj be OrdinaryObjectCreate(%Object.prototype%, « [[ParameterMap]] »).
     // 3. Set obj.[[ParameterMap]] to undefined.
-    let object = Object::create_with_premade_shape(vm, realm.unmapped_arguments_object_shape());
+    let object = Object::create_with_premade_shape_for_indexed_elements(vm, realm.unmapped_arguments_object_shape());
 
     // 4. Perform ! DefinePropertyOrThrow(obj, "length", PropertyDescriptor { [[Value]]: 𝔽(len), [[Writable]]: true, [[Enumerable]]: false, [[Configurable]]: true }).
     object.initialize_direct(
@@ -2500,9 +2564,13 @@ pub fn canonical_numeric_index_string(property_key: &PropertyKey, mode: Canonica
         return CanonicalIndex::new(CanonicalIndexType::Undefined, 0);
     };
 
-    // FIXME: We return 0 instead of n but it might not observable?
     // 3. If SameValue(! ToString(n), argument) is true, return n.
     if Utf16View::Utf16(&number_to_utf16_string(number)) == argument {
+        // NB: Array index keys are numbers, so the only integer a u32 holds that reaches here is 2^32 - 1, the last
+        //     index of a typed array of 2^32 elements. Other numbers are never valid integer indices.
+        if number == f64::from(u32::MAX) {
+            return CanonicalIndex::new(CanonicalIndexType::Index, u32::MAX);
+        }
         return CanonicalIndex::new(CanonicalIndexType::Numeric, 0);
     }
 

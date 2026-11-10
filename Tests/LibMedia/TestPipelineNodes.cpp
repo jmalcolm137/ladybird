@@ -226,6 +226,62 @@ static void sleep_past_the_idle_timeout()
     MUST(Core::System::sleep_ms(static_cast<u32>(SHORT_AUTO_SUSPEND_TIMEOUT.to_milliseconds() * 4)));
 }
 
+// A stalled test thread can leave the producer idle long enough to suspend before it is ever seen with data.
+static bool has_data_or_already_suspended(Media::PipelineStatus status)
+{
+    return status == Media::PipelineStatus::HaveData || status == Media::PipelineStatus::Suspended;
+}
+
+// A stalled test thread can leave the producer idle long enough to suspend again before it peeks, and a consumer that
+// sees a suspension must seek again. These resume from a seek as such a consumer would.
+template<typename Producer>
+static bool seek_to_resume_and_pump_until_woken_with_data(Core::EventLoop& loop, Producer& producer, AK::Duration timestamp)
+{
+    bool woken = false;
+    producer.set_wake_handler([&] { woken = true; });
+    producer.seek(timestamp);
+    auto resumed = pump_until(loop, [&] {
+        if (!woken)
+            return false;
+        woken = false;
+        auto status = producer.peek().status;
+        if (status == Media::PipelineStatus::Suspended) {
+            producer.seek(timestamp);
+            return false;
+        }
+        return status == Media::PipelineStatus::HaveData;
+    });
+    producer.set_wake_handler(nullptr);
+    return resumed;
+}
+
+template<typename Node>
+static bool seek_to_resume_and_pump_until_data(Core::EventLoop& loop, Node& node, AK::Duration timestamp)
+{
+    node.seek(timestamp);
+    return pump_until(loop, [&] {
+        auto status = node.peek().status;
+        if (status == Media::PipelineStatus::Suspended) {
+            node.seek(timestamp);
+            return false;
+        }
+        return status == Media::PipelineStatus::HaveData;
+    });
+}
+
+// The producer may suspend before the sink takes a frame, and the sink only resumes it on demand.
+static bool pump_until_the_sink_displays_a_frame(Core::EventLoop& loop, Media::DisplayingVideoSink& sink, Media::DecodedVideoProducer& producer, Media::MediaClock const& clock)
+{
+    return pump_until(loop, [&] {
+        (void)sink.update(MonotonicTime::now());
+        if (sink.current_frame() != nullptr)
+            return true;
+        if (producer.peek().status == Media::PipelineStatus::Suspended)
+            sink.seek(clock.time_reader().current_time());
+        return false;
+    });
+}
+
 TEST_CASE(video_producer_auto_suspends_and_resumes_only_from_a_seek)
 {
     auto& loop = never_destroyed_event_loop();
@@ -238,7 +294,7 @@ TEST_CASE(video_producer_auto_suspends_and_resumes_only_from_a_seek)
     auto producer = TRY_OR_FAIL(Media::DecodedVideoProducer::try_create(loop, demuxer, tracks[0], SHORT_AUTO_SUSPEND_TIMEOUT));
     producer->start();
 
-    EXPECT(pump_until(loop, [&] { return producer->peek().status == Media::PipelineStatus::HaveData; }));
+    EXPECT(pump_until(loop, [&] { return has_data_or_already_suspended(producer->peek().status); }));
 
     // Left idle, the producer suspends. The checking peeks are spaced wider than the idle timeout
     // so they cannot defer it indefinitely.
@@ -257,10 +313,7 @@ TEST_CASE(video_producer_auto_suspends_and_resumes_only_from_a_seek)
     EXPECT_EQ(producer->peek().status, Media::PipelineStatus::Suspended);
 
     // A seek resumes decoding and wakes the waiting consumer.
-    bool woken = false;
-    producer->set_wake_handler([&] { woken = true; });
-    producer->seek(AK::Duration::zero());
-    EXPECT(pump_until(loop, [&] { return woken && producer->peek().status == Media::PipelineStatus::HaveData; }));
+    EXPECT(seek_to_resume_and_pump_until_woken_with_data(loop, *producer, AK::Duration::zero()));
 }
 
 TEST_CASE(video_producer_suspends_while_frames_are_held_and_wakes_the_consumer)
@@ -311,7 +364,7 @@ TEST_CASE(audio_producer_auto_suspends_and_resumes_only_from_a_seek)
     auto producer = TRY_OR_FAIL(Media::DecodedAudioProducer::try_create(loop, demuxer, tracks[0], SHORT_AUTO_SUSPEND_TIMEOUT));
     producer->start();
 
-    EXPECT(pump_until(loop, [&] { return producer->peek().status == Media::PipelineStatus::HaveData; }));
+    EXPECT(pump_until(loop, [&] { return has_data_or_already_suspended(producer->peek().status); }));
 
     EXPECT(pump_until(loop, [&] {
         sleep_past_the_idle_timeout();
@@ -319,10 +372,7 @@ TEST_CASE(audio_producer_auto_suspends_and_resumes_only_from_a_seek)
     }));
 
     // A seek resumes decoding and wakes the waiting consumer.
-    bool woken = false;
-    producer->set_wake_handler([&] { woken = true; });
-    producer->seek(AK::Duration::zero());
-    EXPECT(pump_until(loop, [&] { return woken && producer->peek().status == Media::PipelineStatus::HaveData; }));
+    EXPECT(seek_to_resume_and_pump_until_woken_with_data(loop, *producer, AK::Duration::zero()));
 }
 
 TEST_CASE(audio_mixer_forwards_a_suspended_input)
@@ -342,7 +392,7 @@ TEST_CASE(audio_mixer_forwards_a_suspended_input)
     mixer->start();
 
     // Leave the output unconsumed, so that the suspension arrives while data is buffered.
-    EXPECT(pump_until(loop, [&] { return mixer->peek().status == Media::PipelineStatus::HaveData; }));
+    EXPECT(seek_to_resume_and_pump_until_data(loop, *mixer, AK::Duration::zero()));
 
     EXPECT(pump_until(loop, [&] {
         sleep_past_the_idle_timeout();
@@ -354,8 +404,7 @@ TEST_CASE(audio_mixer_forwards_a_suspended_input)
     EXPECT_EQ(output.status, Media::PipelineStatus::Suspended);
     EXPECT(output.block == nullptr);
 
-    mixer->seek(AK::Duration::zero());
-    EXPECT(pump_until(loop, [&] { return mixer->peek().status == Media::PipelineStatus::HaveData; }));
+    EXPECT(seek_to_resume_and_pump_until_data(loop, *mixer, AK::Duration::zero()));
 }
 
 TEST_CASE(audio_time_stretch_processor_forwards_a_suspended_input)
@@ -375,7 +424,7 @@ TEST_CASE(audio_time_stretch_processor_forwards_a_suspended_input)
     stretcher->start();
 
     // Leave the output unconsumed, so that the suspension arrives while data is buffered.
-    EXPECT(pump_until(loop, [&] { return stretcher->peek().status == Media::PipelineStatus::HaveData; }));
+    EXPECT(seek_to_resume_and_pump_until_data(loop, *stretcher, AK::Duration::zero()));
 
     EXPECT(pump_until(loop, [&] {
         sleep_past_the_idle_timeout();
@@ -387,8 +436,7 @@ TEST_CASE(audio_time_stretch_processor_forwards_a_suspended_input)
     EXPECT_EQ(output.status, Media::PipelineStatus::Suspended);
     EXPECT(output.block == nullptr);
 
-    stretcher->seek(AK::Duration::zero());
-    EXPECT(pump_until(loop, [&] { return stretcher->peek().status == Media::PipelineStatus::HaveData; }));
+    EXPECT(seek_to_resume_and_pump_until_data(loop, *stretcher, AK::Duration::zero()));
 }
 
 // The output frame is numbered apart from the media time once it ran at a rate other than 1, so a seek that continues an
@@ -566,6 +614,33 @@ TEST_CASE(audio_playback_sink_reseeks_its_input_from_the_written_output_without_
     EXPECT(pump_until(loop, [&] { return time_reader.current_time() > time_after_reseeking + AK::Duration::from_milliseconds(200); }));
 }
 
+// Video sinks stop watching a stopped clock until they are told it resumed, so a seek while playing must hold the clock
+// rather than stop it. Pausing must then stop it, even before the stream has finished stopping for the seek.
+TEST_CASE(audio_playback_sink_holds_its_clock_through_a_seek_while_playing)
+{
+    auto& loop = never_destroyed_event_loop();
+
+    auto sink = MUST(Media::AudioPlaybackSink::try_create([](Media::PipelineStatus) { }, Media::AudioOutputFactory::create_null()));
+    auto producer = RecordingAudioProducer::create();
+    MUST(sink->connect_input(producer));
+    sink->start();
+    EXPECT(pump_until(loop, [&] { return !producer->seeks().is_empty(); }));
+
+    sink->resume();
+    auto time_reader = sink->time_reader();
+    EXPECT(pump_until(loop, [&] { return time_reader.current_time() > AK::Duration::from_milliseconds(100); }));
+
+    sink->seek(AK::Duration::from_seconds(2));
+    EXPECT(time_reader.time_state(MonotonicTime::now()).is_advancing);
+    EXPECT(pump_until(loop, [&] { return time_reader.current_time() > AK::Duration::from_milliseconds(2100); }));
+
+    sink->seek(AK::Duration::from_seconds(1));
+    sink->pause();
+    EXPECT(!time_reader.time_state(MonotonicTime::now()).is_advancing);
+    loop.pump(Core::EventLoop::WaitMode::PollForEvents);
+    EXPECT(pump_until(loop, [&] { return !time_reader.time_state(MonotonicTime::now()).is_advancing; }));
+}
+
 TEST_CASE(displaying_video_sink_reports_a_suspended_input_while_unticked)
 {
     auto& loop = never_destroyed_event_loop();
@@ -583,10 +658,7 @@ TEST_CASE(displaying_video_sink_reports_a_suspended_input_while_unticked)
     sink->set_state_change_handler([&](Media::PipelineStatus status) { last_dispatched_status = status; });
     TRY_OR_FAIL(sink->connect_input(producer));
 
-    EXPECT(pump_until(loop, [&] {
-        (void)sink->update(MonotonicTime::now());
-        return sink->current_frame() != nullptr;
-    }));
+    EXPECT(pump_until_the_sink_displays_a_frame(loop, *sink, *producer, *clock));
 
     // With no further ticks, the suspension wake is the sink's only signal, and it must forward
     // the status to its user.
@@ -609,10 +681,7 @@ TEST_CASE(displaying_video_sink_demand_seeks_a_suspended_input)
     TRY_OR_FAIL(sink->connect_input(producer));
 
     // Display the first frame, then leave the sink unticked until the producer suspends.
-    EXPECT(pump_until(loop, [&] {
-        (void)sink->update(MonotonicTime::now());
-        return sink->current_frame() != nullptr;
-    }));
+    EXPECT(pump_until_the_sink_displays_a_frame(loop, *sink, *producer, *clock));
     EXPECT(pump_until(loop, [&] {
         sleep_past_the_idle_timeout();
         return producer->peek().status == Media::PipelineStatus::Suspended;

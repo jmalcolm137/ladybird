@@ -1,0 +1,31 @@
+<!DOCTYPE html>
+<script src="../../include.js"></script>
+<style>
+    @property --x { syntax: "<length>"; inherits: true; initial-value: 0px; }
+    @keyframes grows {
+        from { --x: 10px; color: rgb(0, 0, 0); }
+        to { --x: 50px; color: rgb(0, 0, 200); }
+    }
+    #grandchild { width: var(--x); height: 1px; }
+</style>
+<div id="grandparent"><div id="child"><div id="grandchild"></div></div></div>
+<script>
+    // An animation on the grandparent moves values its descendants inherit, among them a registered
+    // custom property the grandchild reads. The child of the animating element composes its
+    // parent's animations; the grandchild only inherits. Check the grandchild takes the animated
+    // values.
+    test(() => {
+        const grandparent = document.getElementById("grandparent");
+        grandparent.style.animation = "grows 1000s linear paused";
+        const seek = time => {
+            for (const animation of grandparent.getAnimations())
+                animation.currentTime = time;
+        };
+        seek(0);
+        internals.updateStyle();
+        seek(500000);
+        internals.updateStyle();
+        const style = getComputedStyle(document.getElementById("grandchild"));
+        println(`grandchild: width ${style.width}, color ${style.color}`);
+    });
+</script>

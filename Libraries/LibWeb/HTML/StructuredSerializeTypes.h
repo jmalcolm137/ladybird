@@ -8,45 +8,13 @@
 
 #include <AK/Array.h>
 #include <AK/ByteBuffer.h>
-#include <AK/HashMap.h>
 #include <AK/Vector.h>
-#include <LibGC/Root.h>
 #include <LibIPC/Forward.h>
 #include <LibJS/Forward.h>
 #include <LibWeb/Export.h>
 #include <LibWebCommon/HTML/SerializationRecords.h>
 
 namespace Web::HTML {
-
-using DeserializationMemory = GC::RootVector<JS::Value>;
-using SerializationMemory = HashMap<GC::Root<JS::Value>, u32>;
-
-enum class SerializationType : u8 {
-    IPC,
-    Storage,
-};
-
-enum class CheckFullyConsumed : u8 {
-    No,
-    Yes,
-};
-
-enum class TransferType : u8 {
-    Unknown = 0,
-    MessagePort = 1,
-    ArrayBuffer = 2,
-    ResizableArrayBuffer = 3,
-    ReadableStream = 4,
-    WritableStream = 5,
-    TransformStream = 6,
-    ImageBitmap = 7,
-    OffscreenCanvas = 8,
-};
-
-// The per-interface payload version encoded after every SerializableObject's interface name in
-// storage records. The decoder requires an exact match, so a bump orphans stored records of every
-// type unless migration support is added alongside it.
-static constexpr u64 serializable_payload_version = 1;
 
 // A storage-golden expectation, not a deserializer rule.
 enum class Expectation : u8 {

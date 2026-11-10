@@ -7,7 +7,8 @@
 use core::cell::Cell;
 
 use super::buffer::InterpreterBuffer;
-use super::cell::{CellHeader, Gc};
+use super::cell::{CellHeader, CellHeaderTail, Gc};
+use super::member::NullableMember;
 use super::object::Object;
 use super::value::Value;
 use crate::layout_forward::{
@@ -19,26 +20,43 @@ pub const BINDING_FLAG_MUTABLE: u8 = 1 << 1;
 
 #[repr(C)]
 pub struct Environment {
-    pub header: CellHeader,
+    pub outer: NullableMember<Environment>,
+    /// The shape of a declarative environment (null for other environments).
+    pub shape: NullableMember<EnvironmentShape>,
+    pub header: CellHeaderTail,
     pub this_binding_status: Cell<u8>,
     pub permanently_screwed_by_eval: Cell<bool>,
     pub declarative: Cell<bool>,
-    /// Whether the binding values of a declarative environment are stored in its cell, after the fields of its class.
-    pub binding_values_are_inline: Cell<bool>,
-    pub outer: Cell<Option<Gc<Environment>>>,
+    /// How many binding values a declarative environment has room for in its cell, after the fields of its class. Zero
+    /// if it keeps them elsewhere.
+    pub inline_binding_capacity: Cell<u8>,
 }
+
+const _: () = assert!(size_of::<Environment>() == 16);
 
 #[repr(C)]
 pub struct DeclarativeEnvironment {
     pub base: Environment,
-    pub shape: Cell<Option<Gc<EnvironmentShape>>>,
-    pub binding_values: InterpreterBuffer<Value>,
-    pub rare_data: Cell<*mut DeclarativeEnvironmentRareData>,
+    /// The first binding value, in the cell or in a malloc allocation that has its capacity in front of the first
+    /// value.
+    pub binding_values: Cell<*mut Value>,
+    pub binding_count: Cell<u32>,
+    pub rare_data: NullableMember<DeclarativeEnvironmentRareData>,
+}
+
+const _: () = assert!(size_of::<DeclarativeEnvironment>() == 32);
+
+/// The declarative environment of a global environment. Caches of global variables hold on to its serial number, which
+/// changes when the bindings do.
+#[repr(C)]
+pub struct GlobalDeclarativeEnvironment {
+    pub base: DeclarativeEnvironment,
     pub serial_number: Cell<u64>,
 }
 
 #[repr(C)]
 pub struct DeclarativeEnvironmentRareData {
+    pub header: CellHeader,
     pub binding_flags: InterpreterBuffer<u8>,
     pub storage: DeclarativeEnvironmentRareDataStorage,
 }
@@ -54,7 +72,7 @@ pub struct GlobalEnvironment {
 #[repr(C)]
 pub struct PrivateEnvironment {
     pub header: CellHeader,
-    pub outer: Cell<Option<Gc<PrivateEnvironment>>>,
+    pub outer: NullableMember<PrivateEnvironment>,
     pub storage: PrivateEnvironmentStorage,
 }
 

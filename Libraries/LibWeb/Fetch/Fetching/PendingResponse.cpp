@@ -52,7 +52,7 @@ void PendingResponse::visit_edges(JS::Cell::Visitor& visitor)
 void PendingResponse::when_loaded(Callback callback)
 {
     VERIFY(!m_callback);
-    m_callback = GC::create_function(GC::Heap::the(), move(callback));
+    m_callback = callback;
     if (m_response)
         run_callback();
 }
@@ -69,16 +69,14 @@ void PendingResponse::run_callback()
 {
     VERIFY(m_callback);
     VERIFY(m_response);
-    Platform::EventLoopPlugin::the().deferred_invoke(GC::create_function(GC::Heap::the(), [this] {
-        VERIFY(m_callback);
-        VERIFY(m_response);
+    Platform::EventLoopPlugin::the().deferred_invoke(GC::create_function(GC::Heap::the(), GC::captures(*this), [](PendingResponse& self) {
+        VERIFY(self.m_callback);
+        VERIFY(self.m_response);
         // NB: The callback runs only once, so let go of it as it runs. A pending response can live for as long as its
-        //     fetch streams, and the closure would otherwise keep what it captured alive all that time, including
-        //     anything that stale bytes in its padding happen to point to, since its captures are visited
-        //     conservatively.
-        auto callback = exchange(m_callback, nullptr);
-        callback->function()(*m_response);
-        m_fetch_controller->remove_pending_response({}, *this);
+        //     fetch streams, and the callback would otherwise keep what it captured alive all that time.
+        auto callback = exchange(self.m_callback, nullptr);
+        callback->function()(*self.m_response);
+        self.m_fetch_controller->remove_pending_response({}, self);
     }));
 }
 

@@ -67,6 +67,14 @@ void ReportSubmission::Contents::add_text(StringView key, StringView type, Strin
         add(key, type, to_string(value));
 }
 
+void ReportSubmission::Contents::add_build_information(StringView platform, StringView architecture, StringView git_commit, StringView build_configuration)
+{
+    add_text("platform"sv, "text"sv, platform);
+    add_text("architecture"sv, "text"sv, architecture);
+    add_text("git_commit"sv, "text"sv, git_commit);
+    add_text("build_configuration"sv, "text"sv, build_configuration);
+}
+
 ByteString ReportSubmission::build_manifest(Contents const& contents, ReadonlySpan<Attachment> attachments)
 {
     JsonArray fields;
@@ -169,6 +177,13 @@ static Optional<int> retry_after_ms(HTTP::HeaderList const& headers)
 // It can outlive whatever started it.
 ReportSubmission::ReportSubmission() = default;
 
+static ReportSubmission::PostFunction& s_post_function = *new ReportSubmission::PostFunction;
+
+void ReportSubmission::set_post_function(PostFunction post_function)
+{
+    s_post_function = move(post_function);
+}
+
 // A submission of a payload prepared in advance sends that payload, so a retry of it keeps its submission ID.
 NonnullRefPtr<ReportSubmission> ReportSubmission::create(Payload payload)
 {
@@ -184,9 +199,16 @@ ErrorOr<ReportSubmission::Payload, String> ReportSubmission::prepare()
 
 ReportSubmission::~ReportSubmission()
 {
+    cancel_post();
     m_proof_cancelled.store(true);
     if (m_proof_thread && m_proof_thread->needs_to_be_joined())
         (void)m_proof_thread->join();
+}
+
+void ReportSubmission::cancel_post()
+{
+    if (auto cancel_post = move(m_cancel_post))
+        cancel_post();
 }
 
 // A submission keeps itself alive until it is sent or fails for good, so it outlives the review that started it.
@@ -208,6 +230,7 @@ void ReportSubmission::cancel()
     on_retry = nullptr;
     on_sent = nullptr;
     on_failed = nullptr;
+    ++m_post_serial;
 
     m_proof_cancelled.store(true);
     if (m_retry_timer) {
@@ -220,7 +243,10 @@ void ReportSubmission::cancel()
     }
     if (auto request = move(m_request))
         request->stop();
+    cancel_post();
     m_self_while_in_flight = nullptr;
+
+    did_finish();
 }
 
 void ReportSubmission::begin_attempt()
@@ -250,6 +276,7 @@ void ReportSubmission::fail_preparation(String reason)
     m_self_while_in_flight = nullptr;
     if (on_failed)
         on_failed(Failure::Preparation, move(reason));
+    did_finish();
 }
 
 void ReportSubmission::request_challenge()
@@ -344,13 +371,30 @@ void ReportSubmission::send_report(ProofOfWork proof)
 }
 
 // A response outside the 2xx range fails this attempt, and the activity names what was going on in that message.
-void ReportSubmission::post(StringView path, StringView activity, StringView content_type, ByteString body,
-    Optional<ProofOfWork> proof, Function<void(ByteString)> on_success)
+static Optional<URL::URL> report_server_url(StringView path)
 {
     auto endpoint = Core::Environment::get("LADYBIRD_REPORTS_ENDPOINT"sv).value_or(default_endpoint);
     auto url = URL::Parser::basic_parse(MUST(String::formatted("{}{}{}", endpoint,
         endpoint.ends_with('/') ? ""sv : "/"sv, path.substring_view(1))));
-    if (!url.has_value() || (url->scheme() != "https"sv && url->scheme() != "http"sv)) {
+    if (!url.has_value() || (url->scheme() != "https"sv && url->scheme() != "http"sv))
+        return {};
+    return url;
+}
+
+bool ReportSubmission::is_report_server_url(URL::URL const& url)
+{
+    for (auto path : { challenge_path, report_path }) {
+        if (auto report_url = report_server_url(path); report_url.has_value() && *report_url == url)
+            return true;
+    }
+    return false;
+}
+
+void ReportSubmission::post(StringView path, StringView activity, StringView content_type, ByteString body,
+    Optional<ProofOfWork> proof, Function<void(ByteString)> on_success)
+{
+    auto url = report_server_url(path);
+    if (!url.has_value()) {
         fail("Invalid report server configuration."_string, ShouldRetry::No);
         return;
     }
@@ -362,44 +406,50 @@ void ReportSubmission::post(StringView path, StringView activity, StringView con
         headers->set({ "X-Ladybird-Nonce"sv, ByteString::number(proof->nonce) });
     }
 
+    if (s_post_function) {
+        // NB: The hook may answer before it returns, and that answer can end this submission or start a retry.
+        NonnullRefPtr protector = *this;
+        auto serial = ++m_post_serial;
+        arm_request_timeout();
+        auto cancel_post = s_post_function(*url, headers->headers(), move(body),
+            [weak_this = make_weak_ptr<ReportSubmission>(), serial, activity = ByteString { activity },
+                on_success = move(on_success)](PostResponse response) {
+                auto self = weak_this.strong_ref();
+                if (!self || self->m_post_serial != serial)
+                    return;
+                self->m_cancel_post = nullptr;
+                self->did_receive_response(activity, response.had_network_error, response.response_code,
+                    *HTTP::HeaderList::create(move(response.headers)), response.body.bytes(), on_success);
+            });
+        if (m_post_serial == serial && m_request_timeout)
+            m_cancel_post = move(cancel_post);
+        return;
+    }
+
     auto request_client = Application::request_server_client(IsPrivate::No);
     if (request_client.is_error()) {
         fail("Could not start the report request."_string, ShouldRetry::Yes);
         return;
     }
-    m_request = request_client.value()->start_request("POST"sv, *url, *headers, body.bytes(),
+    m_request = request_client.value()->start_request("POST"sv, *url, {}, *headers, body.bytes(),
         HTTP::CacheMode::NoStore, HTTP::Cookie::IncludeCredentials::No);
     if (!m_request) {
         fail("Could not connect to the report server."_string, ShouldRetry::Yes);
         return;
     }
 
-    m_request_timeout = Core::Timer::create_single_shot(AK::Duration::from_milliseconds(request_timeout_ms),
-        [weak_this = make_weak_ptr<ReportSubmission>()] {
-            auto self = weak_this.strong_ref();
-            if (!self)
-                return;
-            auto request = move(self->m_request);
-            self->m_request_timeout = nullptr;
-            if (request)
-                request->stop();
-            self->fail("The report server did not respond in time."_string, ShouldRetry::Yes);
-        });
-    m_request_timeout->start();
+    arm_request_timeout();
 
     m_request->set_buffered_request_finished_callback(
         [weak_this = make_weak_ptr<ReportSubmission>(), activity = ByteString { activity },
             on_success = move(on_success)](u64, Requests::RequestTimingInfo const&,
             Optional<Requests::NetworkError> const& network_error, HTTP::HeaderList const& response_headers,
             Optional<u32> response_code, Optional<String> const&,
-            Optional<Core::ImmutableBytes>, Optional<u64>, Requests::CacheState,
+            Requests::CacheState,
             Core::ImmutableBytes payload) {
             auto self = weak_this.strong_ref();
             if (!self || !self->m_request)
                 return;
-            if (self->m_request_timeout)
-                self->m_request_timeout->stop();
-            self->m_request_timeout = nullptr;
 
             // A request cannot be destroyed from inside its own callback.
             Core::deferred_invoke([weak_this] {
@@ -407,18 +457,45 @@ void ReportSubmission::post(StringView path, StringView activity, StringView con
                     self->m_request = nullptr;
             });
 
-            if (network_error.has_value() || !response_code.has_value()) {
-                self->fail("Network error while contacting the report server."_string, ShouldRetry::Yes);
-                return;
-            }
-            if (*response_code < 200 || *response_code >= 300) {
-                self->fail(MUST(String::formatted("Report server returned {} while {}.", *response_code, activity)),
-                    is_transient_status(*response_code) ? ShouldRetry::Yes : ShouldRetry::No,
-                    retry_after_ms(response_headers));
-                return;
-            }
-            on_success(ByteString::copy(payload.bytes()));
+            self->did_receive_response(activity, network_error.has_value(), response_code, response_headers, payload.bytes(), on_success);
         });
+}
+
+void ReportSubmission::arm_request_timeout()
+{
+    m_request_timeout = Core::Timer::create_single_shot(AK::Duration::from_milliseconds(request_timeout_ms),
+        [weak_this = make_weak_ptr<ReportSubmission>()] {
+            auto self = weak_this.strong_ref();
+            if (!self)
+                return;
+            auto request = move(self->m_request);
+            self->m_request_timeout = nullptr;
+            ++self->m_post_serial;
+            if (request)
+                request->stop();
+            self->cancel_post();
+            self->fail("The report server did not respond in time."_string, ShouldRetry::Yes);
+        });
+    m_request_timeout->start();
+}
+
+void ReportSubmission::did_receive_response(StringView activity, bool had_network_error, Optional<u32> response_code, HTTP::HeaderList const& response_headers, ReadonlyBytes body, Function<void(ByteString)> const& on_success)
+{
+    if (m_request_timeout)
+        m_request_timeout->stop();
+    m_request_timeout = nullptr;
+
+    if (had_network_error || !response_code.has_value()) {
+        fail("Network error while contacting the report server."_string, ShouldRetry::Yes);
+        return;
+    }
+    if (*response_code < 200 || *response_code >= 300) {
+        fail(MUST(String::formatted("Report server returned {} while {}.", *response_code, activity)),
+            is_transient_status(*response_code) ? ShouldRetry::Yes : ShouldRetry::No,
+            retry_after_ms(response_headers));
+        return;
+    }
+    on_success(ByteString::copy(body));
 }
 
 void ReportSubmission::finish()
@@ -434,6 +511,15 @@ void ReportSubmission::finish()
     m_self_while_in_flight = nullptr;
     if (on_sent)
         on_sent();
+    did_finish();
+}
+
+void ReportSubmission::did_finish()
+{
+    auto finished = move(on_finished);
+    on_finished = nullptr;
+    if (finished)
+        finished();
 }
 
 void ReportSubmission::fail(String reason, ShouldRetry should_retry, Optional<int> retry_after_ms)
@@ -450,6 +536,7 @@ void ReportSubmission::fail(String reason, ShouldRetry should_retry, Optional<in
         m_self_while_in_flight = nullptr;
         if (on_failed)
             on_failed(Failure::Sending, move(reason));
+        did_finish();
         return;
     }
 

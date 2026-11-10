@@ -44,11 +44,6 @@ static_assert(offsetof(Compositing::RustFFI::NodeSlotId, index) == 0);
 static_assert(sizeof(RustFFI::NodeKind) == sizeof(u8));
 static_assert(sizeof(RustFFI::NodeFlag) == sizeof(u32));
 
-enum class LayoutUpdatePropagation : u8 {
-    ThroughAncestors,
-    BoundarySelfOnly,
-};
-
 enum class BindToPreparedArenaSlot {
     Yes,
 };
@@ -172,10 +167,7 @@ public:
     bool needs_compositor_background_color_frame() const { return has_compositor_animation_frame(RustFFI::CompositorAnimationFrameKind::BackgroundColor); }
     void set_needs_compositor_background_color_frame(bool value) { set_needs_compositor_animation_frame(RustFFI::CompositorAnimationFrameKind::BackgroundColor, value); }
 
-    // Set when a style change altered geometry-determining properties of this node itself, so
-    // a partial relayout must re-resolve its own size and position instead of reusing them.
-    void set_needs_own_geometry_update() { set_flag(RustFFI::NodeFlag::NeedsOwnGeometryUpdate, true); }
-    void set_needs_layout_update(DOM::SetNeedsLayoutReason, LayoutUpdatePropagation = LayoutUpdatePropagation::ThroughAncestors);
+    void set_needs_layout_update(DOM::SetNeedsLayoutReason);
 
     bool is_generated_for_pseudo_element() const { return generated_for() != 0; }
     Optional<CSS::PseudoElement> generated_for_pseudo_element() const
@@ -352,6 +344,11 @@ public:
         AK_ALLOC_WITH_KMALLOC;
 
         Vector<RefPtr<CSS::CursorStyleValue const>> cursor_style_values;
+        // NB: The images these observers paint with, which a decode beside a frame in flight reads, as the frame may
+        //     have swept the style the node last read.
+        Vector<RefPtr<CSS::AbstractImageStyleValue const>> background_images;
+        Vector<RefPtr<CSS::AbstractImageStyleValue const>> mask_images;
+        RefPtr<CSS::AbstractImageStyleValue const> border_image_source_value;
         Vector<OwnPtr<ImageObserver>> background_layers;
         Vector<OwnPtr<ImageObserver>> mask_layers;
         Vector<OwnPtr<ImageObserver>> cursors;
@@ -359,6 +356,7 @@ public:
         OwnPtr<ImageObserver> list_style_image;
     };
 
+    ImageObserverSlots const* image_observers() const;
     ImageObserver const* background_image_observer(size_t layer_index) const;
     ImageObserver const* mask_image_observer(size_t layer_index) const;
     ImageObserver const* cursor_image_observer(size_t cursor_index) const;
@@ -369,12 +367,10 @@ public:
     template<typename StyleGroup>
     StyleGroup const& style_group() const
     {
-        VERIFY(m_style_payloads);
-        auto const* payloads = static_cast<void const* const*>(m_style_payloads);
-        auto const* payload = payloads[StyleGroup::style_group_index];
-        VERIFY(payload);
-        return *static_cast<StyleGroup const*>(payload);
+        return CSS::style_record_group<StyleGroup>(m_style_record);
     }
+    // The inherited longhands the style holds as bits, and its effective zoom.
+    CSS::ComputedValuesFFI::InheritedSetValues const& inherited_set_values() const { return CSS::style_record_inherited_values(m_style_record); }
 
     static CSS::LengthPercentageOrAuto length_percentage_or_auto(CSS::ComputedValuesFFI::ComputedLengthPercentageOrAuto const& value)
     {
@@ -394,20 +390,21 @@ public:
     }
 
     CSS::Display display() const { return CSS::display_from_ffi_display(style_group<CSS::ComputedValues::BoxValues>().display); }
-    CSS::Float float_() const { return static_cast<CSS::Float>(style_group<CSS::ComputedValues::BoxValues>().float_); }
-    CSS::Positioning position() const { return static_cast<CSS::Positioning>(style_group<CSS::ComputedValues::BoxValues>().position); }
-    CSS::BoxSizing box_sizing() const { return static_cast<CSS::BoxSizing>(style_group<CSS::ComputedValues::BoxValues>().box_sizing); }
-    CSS::Overflow overflow_x() const { return static_cast<CSS::Overflow>(style_group<CSS::ComputedValues::BoxValues>().overflow_x); }
-    CSS::Overflow overflow_y() const { return static_cast<CSS::Overflow>(style_group<CSS::ComputedValues::BoxValues>().overflow_y); }
+    CSS::ComputedValuesFFI::ResetBits reset_bits() const { return CSS::style_record_reset_bits(m_style_record); }
+    CSS::Float float_() const { return CSS::float_from_reset_bits(reset_bits()); }
+    CSS::Positioning position() const { return CSS::position_from_reset_bits(reset_bits()); }
+    CSS::BoxSizing box_sizing() const { return CSS::box_sizing_from_reset_bits(reset_bits()); }
+    CSS::Overflow overflow_x() const { return CSS::overflow_x_from_reset_bits(reset_bits()); }
+    CSS::Overflow overflow_y() const { return CSS::overflow_y_from_reset_bits(reset_bits()); }
     CSS::Resize resize() const { return static_cast<CSS::Resize>(style_group<CSS::ComputedValues::BoxValues>().resize); }
     CSS::Containment contain() const
     {
         auto const& values = style_group<CSS::ComputedValues::BoxValues>();
         return { values.size_containment, values.inline_size_containment, values.layout_containment, values.style_containment, values.paint_containment };
     }
-    CSS::ContentVisibility content_visibility() const { return static_cast<CSS::ContentVisibility>(style_group<CSS::ComputedValues::InheritedBoxValues>().content_visibility); }
-    CSS::Direction direction() const { return static_cast<CSS::Direction>(style_group<CSS::ComputedValues::InheritedBoxValues>().direction); }
-    CSS::WritingMode writing_mode() const { return static_cast<CSS::WritingMode>(style_group<CSS::ComputedValues::InheritedBoxValues>().writing_mode); }
+    CSS::ContentVisibility content_visibility() const { return static_cast<CSS::ContentVisibility>(style_group<CSS::ComputedValues::MiscLayoutValues>().content_visibility); }
+    CSS::Direction direction() const { return CSS::direction_from_inherited_bits(inherited_set_values().bits); }
+    CSS::WritingMode writing_mode() const { return CSS::writing_mode_from_inherited_bits(inherited_set_values().bits); }
     bool inline_axis_is_reverse() const
     {
         switch (writing_mode()) {
@@ -421,25 +418,24 @@ public:
         }
         VERIFY_NOT_REACHED();
     }
-    CSS::Visibility visibility() const { return static_cast<CSS::Visibility>(style_group<CSS::ComputedValues::InheritedBoxValues>().visibility); }
+    CSS::Visibility visibility() const { return CSS::visibility_from_inherited_bits(inherited_set_values().bits); }
     // https://drafts.csswg.org/css-ui-4/#caret-color
     // auto: "User agents should use currentColor." It computes to auto, so the box's own color is read here.
     Color caret_color() const
     {
-        auto const& ui = style_group<CSS::ComputedValues::InheritedUIValues>();
-        return ui.caret_color.is_auto ? color() : ui.caret_color_value();
+        return style_group<CSS::ComputedValues::InheritedUIValues>().caret_color_value(color());
     }
     CSS::PreferredColorScheme color_scheme() const { return style_group<CSS::ComputedValues::InheritedUIValues>().color_scheme_value(); }
     ReadonlySpan<Utf16FlyString> color_schemes() const { return style_group<CSS::ComputedValues::InheritedUIValues>().color_schemes_span(); }
     bool color_scheme_only() const { return style_group<CSS::ComputedValues::InheritedUIValues>().color_scheme_only; }
     ReadonlySpan<CSS::ComputedValuesFFI::ComputedCursor> cursor() const { return style_group<CSS::ComputedValues::InheritedUIValues>().cursor_span(); }
     ReadonlySpan<RefPtr<CSS::CursorStyleValue const>> cursor_style_values() const;
-    CSS::PointerEvents pointer_events() const { return style_group<CSS::ComputedValues::InheritedUIValues>().pointer_events_value(); }
-    CSS::UserSelect user_select() const { return static_cast<CSS::UserSelect>(style_group<CSS::ComputedValues::MiscResetValues>().user_select); }
-    Optional<Utf16FlyString> view_transition_name() const { return style_group<CSS::ComputedValues::MiscResetValues>().view_transition_name_value(); }
-    Color outline_color() const { return Color::from_bgra(style_group<CSS::ComputedValues::MiscResetValues>().outline_color); }
-    Color column_rule_color() const { return Color::from_bgra(style_group<CSS::ComputedValues::MiscResetValues>().column_rule_color); }
-    Color background_color() const { return style_group<CSS::ComputedValues::BackgroundValues>().background_color_value(); }
+    CSS::PointerEvents pointer_events() const { return CSS::pointer_events_from_inherited_bits(inherited_set_values().bits); }
+    CSS::UserSelect user_select() const { return static_cast<CSS::UserSelect>(style_group<CSS::ComputedValues::MiscInteractionValues>().user_select); }
+    Optional<Utf16FlyString> view_transition_name() const { return style_group<CSS::ComputedValues::MiscInteractionValues>().view_transition_name_value(); }
+    Color outline_color() const { return CSS::resolve_style_color(style_group<CSS::ComputedValues::MiscLayoutValues>().outline_color, color()); }
+    Color column_rule_color() const { return CSS::resolve_style_color(style_group<CSS::ComputedValues::MiscLayoutValues>().column_rule_color, color()); }
+    Color background_color() const { return style_group<CSS::ComputedValues::BackgroundValues>().background_color_value(color()); }
     // One image per background layer, null where the layer has no image.
     ReadonlySpan<RefPtr<CSS::AbstractImageStyleValue const>> background_images() const
     {
@@ -457,7 +453,7 @@ public:
     CSS::AbstractImageStyleValue const* list_style_image() const
     {
         if (!m_list_style_image.has_value())
-            m_list_style_image = style_group<CSS::ComputedValues::InheritedListValues>().list_style_image_value();
+            m_list_style_image = style_group<CSS::ComputedValues::InheritedListTableValues>().list_style_image_value();
         return m_list_style_image->ptr();
     }
     CSS::ComputedFilterView backdrop_filter() const { return style_group<CSS::ComputedValues::EffectsValues>().backdrop_filter_value(); }
@@ -465,10 +461,10 @@ public:
     CSS::MixBlendMode mix_blend_mode() const { return style_group<CSS::ComputedValues::EffectsValues>().mix_blend_mode_value(); }
     float opacity() const { return style_group<CSS::ComputedValues::EffectsValues>().opacity; }
     ReadonlySpan<CSS::ShadowData> box_shadow() const { return style_group<CSS::ComputedValues::EffectsValues>().box_shadow_span(); }
-    CSS::BorderData const& border_left() const { return style_group<CSS::ComputedValues::BorderValues>().border_left_value(); }
-    CSS::BorderData const& border_top() const { return style_group<CSS::ComputedValues::BorderValues>().border_top_value(); }
-    CSS::BorderData const& border_right() const { return style_group<CSS::ComputedValues::BorderValues>().border_right_value(); }
-    CSS::BorderData const& border_bottom() const { return style_group<CSS::ComputedValues::BorderValues>().border_bottom_value(); }
+    CSS::BorderData border_left() const { return style_group<CSS::ComputedValues::BorderValues>().border_left_value(color()); }
+    CSS::BorderData border_top() const { return style_group<CSS::ComputedValues::BorderValues>().border_top_value(color()); }
+    CSS::BorderData border_right() const { return style_group<CSS::ComputedValues::BorderValues>().border_right_value(color()); }
+    CSS::BorderData border_bottom() const { return style_group<CSS::ComputedValues::BorderValues>().border_bottom_value(color()); }
     CSS::AbstractImageStyleValue const* border_image_source() const
     {
         if (!m_border_image_source.has_value())
@@ -479,8 +475,8 @@ public:
     Color webkit_text_fill_color() const { return style_group<CSS::ComputedValues::InheritedTextValues>().webkit_text_fill_color_value(); }
     CSSPixels letter_spacing() const { return style_group<CSS::ComputedValues::InheritedTextValues>().letter_spacing_value(); }
     ReadonlySpan<CSS::ShadowData> text_shadow() const { return style_group<CSS::ComputedValues::InheritedTextValues>().text_shadow_span(); }
-    Color text_decoration_color() const { return Color::from_bgra(style_group<CSS::ComputedValues::TextResetValues>().text_decoration_color); }
-    CSSPixels line_height() const { return style_group<CSS::ComputedValues::FontValues>().line_height_used; }
+    Color text_decoration_color() const { return CSS::resolve_style_color(style_group<CSS::ComputedValues::TextResetValues>().text_decoration_color, color()); }
+    CSSPixels line_height() const { return style_group<CSS::ComputedValues::FontValues>().line_height_used_value(); }
     CSSPixels font_size() const { return style_group<CSS::ComputedValues::FontValues>().font_size; }
     Gfx::FontCascadeList const& font_list() const { return style_group<CSS::ComputedValues::FontValues>().font_list_value(); }
     CSS::LengthBox inset() const { return length_box(style_group<CSS::ComputedValues::SurroundValues>().inset); }
@@ -543,14 +539,15 @@ public:
     void release_pinned_style_record();
 
 private:
+    bool keeps_style_until_rebuilt(CSS::StyleRecordID);
     virtual bool is_node_with_style() const final { return true; }
 
     void publish_style_record_to_node_data();
+    void adopt_style_record_installed_by_render_state();
     void did_update_style_record();
 
     void rebuild_image_observers(Vector<RefPtr<CSS::CursorStyleValue const>>);
-    ImageObserverSlots const* image_observers() const;
-    void const* m_style_payloads { nullptr };
+    void const* m_style_record { nullptr };
     // Whether the row holds a pin of its style record for C++'s readers, which only this layout node takes and drops.
     bool m_style_record_pinned_for_cxx_consumers { false };
     // Whether the arena derived the row's style record. Only this layout node publishes a record of its node to the row
@@ -595,5 +592,9 @@ inline Gfx::Font const& NodeWithStyle::first_available_font() const
 }
 
 bool overflow_value_makes_box_a_scroll_container(CSS::Overflow overflow);
+
+// Whether the render side installed `style_record_identity` in the row of `node` ahead of the host, with the relayout
+// and the repaint the move asks for, as it installs a style update.
+bool style_record_installed_by_render_state(NodeWithStyle const& node, CSS::StyleRecordID style_record_identity);
 
 }

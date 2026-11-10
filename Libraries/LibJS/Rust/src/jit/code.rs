@@ -53,11 +53,19 @@ pub struct JitResult {
 
 /// `entry(VM*, ExecutionContext* frame)`: the frame is fully built for its executable, at pc 0 with Enter not run yet
 /// (or, for an on-stack replacement entry, at the loop back edge the entry is for).
+#[cfg(not(all(target_arch = "x86_64", windows)))]
 pub type JitEntry = unsafe extern "C" fn(*const Vm, *mut ExecutionContext) -> JitResult;
+#[cfg(all(target_arch = "x86_64", windows))]
+pub type JitEntry = unsafe extern "sysv64" fn(*const Vm, *mut ExecutionContext) -> JitResult;
 
 /// `JitResult trampoline(VM*, ExecutionContext* frame, JitEntry entry)`: how native code calls JIT code (see
 /// `libjs_jit::codegen::generate_entry_trampoline()`), which expects the VM in its pinned register.
+#[cfg(not(all(target_arch = "x86_64", windows)))]
 pub type EntryTrampoline = unsafe extern "C" fn(*const Vm, *mut ExecutionContext, JitEntry) -> JitResult;
+// NB: JIT code uses the System V calling convention on Windows too. Native code that calls it with that convention
+//     keeps the registers that are callee-saved only on Windows, and gets the result in two registers.
+#[cfg(all(target_arch = "x86_64", windows))]
+pub type EntryTrampoline = unsafe extern "sysv64" fn(*const Vm, *mut ExecutionContext, JitEntry) -> JitResult;
 
 /// Where an executable is in its JIT compilation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -509,25 +517,6 @@ impl Executable {
 
     pub fn set_jit_compile_state(&self, state: CompileState) {
         self.head.jit_compile_state.set(state as u8);
-    }
-
-    /// Whether the executable has JIT code, or a compile on its way, which is tied to the executable.
-    pub fn has_jit_code_or_compile(&self) -> bool {
-        matches!(
-            self.jit_compile_state(),
-            CompileState::Queued | CompileState::Installed | CompileState::Discarding
-        )
-    }
-
-    /// Makes the executable never compile, with the tier and the tier-up budget of `other`, if `other` was refused,
-    /// as replacing an executable with one of the same bytecode does not change whether it can compile.
-    pub fn take_over_jit_refusal_from(&self, other: &Executable) {
-        if other.jit_compile_state() != CompileState::Refused {
-            return;
-        }
-        self.set_jit_compile_state(CompileState::Refused);
-        self.set_interpreter_tier(other.interpreter_tier());
-        self.head.tier_up_budget.set(other.head.tier_up_budget.get());
     }
 
     /// The executable's slot in the JIT entry table of `vm`, the VM whose heap the executable lives in, and the table,

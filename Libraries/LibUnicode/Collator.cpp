@@ -40,7 +40,7 @@ static NonnullOwnPtr<icu::Locale> apply_usage_to_locale(icu::Locale const& local
 
     switch (usage) {
     case Usage::Sort:
-        result->setUnicodeKeywordValue("co", icu_string_piece(StringView { collation.bytes() }), status);
+        result->setUnicodeKeywordValue("co", icu_string_piece(StringView { collation.ascii_bytes() }), status);
         break;
     case Usage::Search:
         result->setUnicodeKeywordValue("co", "search", status);
@@ -170,7 +170,7 @@ public:
     SubstringSearcherImpl(icu::RuleBasedCollator const& collator, Utf16View const& haystack, Utf16View const& needle)
     {
         auto to_unicode_string = [](Utf16View const& string) {
-            if (string.has_ascii_storage()) {
+            if (string.has_latin1_storage()) {
                 auto utf8 = MUST(string.to_utf8());
                 return icu::UnicodeString::fromUTF8(icu_string_piece(utf8.bytes_as_string_view()));
             }
@@ -225,11 +225,17 @@ public:
     virtual Collator::Order compare(Utf16View const& lhs, Utf16View const& rhs) const override
     {
         UErrorCode status = U_ZERO_ERROR;
+        UCollationResult result;
 
-        auto lhs_it = icu_string_iterator(lhs);
-        auto rhs_it = icu_string_iterator(rhs);
-
-        auto result = m_collator->compare(lhs_it, rhs_it, status);
+        // NB: ICU has no iterator over Latin-1, so a string with Latin-1 storage that is not ASCII is compared as UTF-16.
+        auto has_non_ascii_latin1_storage = [](Utf16View const& string) { return string.has_latin1_storage() && !string.has_ascii_storage(); };
+        if (has_non_ascii_latin1_storage(lhs) || has_non_ascii_latin1_storage(rhs)) {
+            result = m_collator->compare(icu_string(lhs), icu_string(rhs), status);
+        } else {
+            auto lhs_it = icu_string_iterator(lhs);
+            auto rhs_it = icu_string_iterator(rhs);
+            result = m_collator->compare(lhs_it, rhs_it, status);
+        }
         verify_icu_success(status);
 
         switch (result) {
@@ -276,7 +282,7 @@ NonnullOwnPtr<Collator> Collator::create(
 {
     UErrorCode status = U_ZERO_ERROR;
 
-    auto locale_data = LocaleData::for_locale(locale.bytes());
+    auto locale_data = LocaleData::for_locale(locale.ascii_bytes());
     VERIFY(locale_data.has_value());
 
     auto locale_with_usage = apply_usage_to_locale(locale_data->locale(), usage, collation);

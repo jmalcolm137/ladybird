@@ -64,7 +64,7 @@ public:
 
     RefPtr<Gfx::Typeface const> typeface() const { return m_parsed_font; }
 
-    // The number this face is known by in the process. A style update that must not mutate the face names it by this
+    // The number this face is known by in the process, which only its agent can look up. A style update that must not mutate the face names it by this
     // number and leaves the mutation for the drain below.
     [[nodiscard]] u64 id() const { return m_id; }
     [[nodiscard]] static RefPtr<FontFaceState> with_id(u64);
@@ -124,6 +124,7 @@ private:
     JS::Object& task_global_object() const;
     void reject_status_promise(WebIDL::Exception);
     void did_load(RefPtr<Gfx::Typeface const>);
+    void did_finish_loading_in_containing_sets(bool succeeded);
     void set_parsed_font(RefPtr<Gfx::Typeface const>);
 
     Optional<FontComputer&> font_computer() const;

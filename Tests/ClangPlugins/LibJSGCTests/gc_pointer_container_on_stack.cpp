@@ -12,7 +12,6 @@
 #include <AK/Optional.h>
 #include <AK/Vector.h>
 #include <LibGC/Cell.h>
-#include <LibGC/ConservativeVector.h>
 #include <LibGC/NanBoxedValue.h>
 #include <LibGC/Ptr.h>
 #include <LibGC/Root.h>
@@ -34,6 +33,12 @@ struct State {
 };
 
 struct DerivedState : State { };
+
+struct TracedState {
+    Vector<GC::Ref<GC::Cell>> cells;
+
+    void visit_edges(GC::Cell::Visitor& visitor) { visitor.visit(cells); }
+};
 
 struct DerivedEntry : Entry { };
 
@@ -81,8 +86,6 @@ void unrooted_locals()
     Vector<GC::Ref<GC::Cell>> groups[2];
     // expected-error@+1 {{'Vector<GC::Ref<GC::Cell>>' keeps GC pointers in heap memory that is not scanned for roots}}
     GC::RootHashMap<GC::Ref<GC::Cell>, Vector<GC::Ref<GC::Cell>>> root_map_of_vectors;
-    // expected-error@+1 {{'Vector<GC::Ref<GC::Cell>>' keeps GC pointers in heap memory that is not scanned for roots}}
-    GC::ConservativeVector<State> conservative_states;
     // expected-error@+1 {{keeps GC pointers in heap memory that is not scanned for roots}}
     auto deduced = make_cells();
     // expected-error@+1 {{keeps GC pointers in heap memory that is not scanned for roots}}
@@ -165,7 +168,8 @@ void rooted_or_not_holding_gc_pointers(State& state)
     GC::RootVector<GC::Ref<GC::Cell>> root_vector;
     GC::RootVector<GC::Ref<GC::Cell>> root_groups[2];
     Vector<GC::Root<GC::Cell>> roots;
-    GC::ConservativeVector<Entry> conservative_entries;
+    GC::RootVector<TracedState> traced_states;
+    GC::RootHashMap<int, TracedState> traced_state_map;
     GC::RootHashMap<int, GC::Ref<GC::Cell>> root_map;
     GC::RootHashTable<GC::Ptr<GC::Cell>> root_table;
     Vector<GC::RawPtr<GC::Cell>> raw_ptrs;

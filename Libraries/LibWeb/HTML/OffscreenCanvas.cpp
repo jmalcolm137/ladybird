@@ -8,9 +8,11 @@
 #include <AK/TypeCasts.h>
 #include <LibGC/Heap.h>
 #include <LibGfx/Bitmap.h>
+#include <LibJS/HostClassBuilder.h>
 #include <LibJS/Runtime/VM.h>
 #include <LibWeb/Bindings/CanvasRenderingContext2DSettings.h>
 #include <LibWeb/Bindings/PrincipalHostDefined.h>
+#include <LibWeb/Bindings/RustSerialization.h>
 #include <LibWeb/Bindings/WrapperWorld.h>
 #include <LibWeb/CSS/ComputedValues.h>
 #include <LibWeb/CSS/FontComputer.h>
@@ -89,14 +91,16 @@ JS::Object& OffscreenCanvas::relevant_global_object() const
 }
 
 // https://html.spec.whatwg.org/multipage/canvas.html#the-offscreencanvas-interface:transfer-steps
-WebIDL::ExceptionOr<void> OffscreenCanvas::transfer_steps(JS::Realm& realm, HTML::TransferDataEncoder& data_holder)
+WebIDL::ExceptionOr<OffscreenCanvas::TransferredFields> OffscreenCanvas::transfer_steps()
 {
     // 1. If value's context mode is not equal to none, then throw an "InvalidStateError" DOMException.
     if (!m_context.has<Empty>())
         return WebIDL::InvalidStateError::create("Cannot transfer an OffscreenCanvas that has a rendering context"_utf16);
 
     // 2. Set value's context mode to detached.
-    // NB: The [[Detached]] internal slot is set once these steps return, and it also stands for this context mode.
+    // NB: This context mode is the [[Detached]] internal slot, which StructuredSerializeWithTransfer sets again once
+    //     these steps return.
+    m_detached = true;
 
     // 3. Let width and height be the dimensions of value's bitmap.
     auto width = m_width;
@@ -109,49 +113,29 @@ WebIDL::ExceptionOr<void> OffscreenCanvas::transfer_steps(JS::Realm& realm, HTML
     m_height = 0;
 
     // 6. Set dataHolder.[[Width]] to width and dataHolder.[[Height]] to height.
-    TRY(encode_or_throw_data_clone_error(realm, data_holder, width));
-    TRY(encode_or_throw_data_clone_error(realm, data_holder, height));
-
     // FIXME: 7. Set dataHolder.[[Language]] to language and dataHolder.[[Direction]] to direction.
-
     // 8. Set dataHolder.[[PlaceholderCanvas]] to be a weak reference to value's placeholder canvas element, if value
     //    has one, or null if it does not.
+    // NB: The transfer in Libraries/LibWeb/Bindings/Rust/src/html/offscreen_canvas.rs writes these fields.
     auto placeholder_link = m_placeholder_link;
     m_placeholder_link.clear();
-    TRY(encode_or_throw_data_clone_error(realm, data_holder, placeholder_link.has_value()));
-    if (placeholder_link.has_value()) {
-        TRY(encode_or_throw_data_clone_error(realm, data_holder, placeholder_link->canvas_id.value()));
-        TRY(encode_or_throw_data_clone_error(realm, data_holder, placeholder_link->secret));
-    }
-
-    return {};
+    return TransferredFields { .width = width, .height = height, .placeholder_link = placeholder_link };
 }
 
 // https://html.spec.whatwg.org/multipage/canvas.html#the-offscreencanvas-interface:transfer-receiving-steps
-WebIDL::ExceptionOr<void> OffscreenCanvas::transfer_receiving_steps(JS::Realm& realm, HTML::TransferDataDecoder& data_holder)
+void OffscreenCanvas::transfer_receiving_steps(TransferredFields const& data_holder)
 {
     // 1. Initialize value's bitmap to a rectangular array of transparent black pixels with width given by
     //    dataHolder.[[Width]] and height given by dataHolder.[[Height]].
-    m_width = TRY(decode_or_throw_data_clone_error<WebIDL::UnsignedLongLong>(realm, data_holder));
-    m_height = TRY(decode_or_throw_data_clone_error<WebIDL::UnsignedLongLong>(realm, data_holder));
+    m_width = data_holder.width;
+    m_height = data_holder.height;
 
     // FIXME: 2. Set value's inherited language to dataHolder.[[Language]] and its inherited direction to
     //           dataHolder.[[Direction]].
 
     // 3. If dataHolder.[[PlaceholderCanvas]] is not null, set value's placeholder canvas element to
     //    dataHolder.[[PlaceholderCanvas]] (while maintaining the weak reference semantics).
-    if (TRY(decode_or_throw_data_clone_error<bool>(realm, data_holder))) {
-        auto canvas_id = TRY(decode_or_throw_data_clone_error<u64>(realm, data_holder));
-        auto secret = TRY(decode_or_throw_data_clone_error<u64>(realm, data_holder));
-        m_placeholder_link = Compositor::PlaceholderCanvasLink { Compositing::CanvasId { canvas_id }, secret };
-    }
-
-    return {};
-}
-
-HTML::TransferType OffscreenCanvas::primary_interface() const
-{
-    return TransferType::OffscreenCanvas;
+    m_placeholder_link = data_holder.placeholder_link;
 }
 
 void OffscreenCanvas::replace_bitmap()
@@ -436,7 +420,7 @@ GC::Ref<WebIDL::Promise> convert_to_blob(JS::Realm& realm, HTML::OffscreenCanvas
     auto& global = offscreen_canvas.relevant_global_object();
 
     // 7. Run these steps in parallel:
-    Platform::EventLoopPlugin::the().deferred_invoke(GC::create_function(GC::Heap::the(), [realm = GC::Ref(realm), &global, result_promise, bitmap, image_encode_options] {
+    Platform::EventLoopPlugin::the().deferred_invoke(GC::create_function(GC::Heap::the(), GC::captures(GC::Ref(realm), global, result_promise, bitmap, image_encode_options), [](auto& realm, auto& global, auto& result_promise, auto& bitmap, auto& image_encode_options) {
         // 1. Let file be a serialization of bitmap as a file, with options's type and quality if present.
         Optional<HTML::SerializeBitmapResult> file_result {};
 
@@ -446,7 +430,7 @@ GC::Ref<WebIDL::Promise> convert_to_blob(JS::Realm& realm, HTML::OffscreenCanvas
         }
 
         // 2. Queue a global task on the canvas blob serialization task source given global to run these steps:
-        HTML::queue_global_task(HTML::Task::Source::CanvasBlobSerializationTask, global, GC::create_function(GC::Heap::the(), [realm, result_promise, file_result = move(file_result)] -> void {
+        HTML::queue_global_task(HTML::Task::Source::CanvasBlobSerializationTask, global, GC::create_function(GC::Heap::the(), GC::captures(realm, result_promise, move(file_result)), [](auto& realm, auto& result_promise, auto& file_result) -> void {
             HTML::TemporaryExecutionContext context(realm, HTML::TemporaryExecutionContext::CallbacksEnabled::Yes);
 
             // 1. If file is null, then reject result with an "EncodingError" DOMException.
@@ -510,4 +494,67 @@ JS::ThrowCompletionOr<HTML::OffscreenRenderingContext> get_context(JS::Realm& re
     return Empty {};
 }
 
+}
+
+// What the transfer steps in Libraries/LibWeb/Bindings/Rust/src/html/structured_serialize ask of OffscreenCanvas,
+// declared on the Rust side in Libraries/LibWeb/Bindings/Rust/src/html/offscreen_canvas.rs.
+extern "C" {
+
+u16 web_offscreen_canvas_interface_name();
+bool web_offscreen_canvas_is_detached(JSObject*);
+// The fields that the transfer steps set the data holder's fields to.
+struct OffscreenCanvasTransferredFields {
+    u64 width;
+    u64 height;
+    bool has_placeholder_canvas;
+    u64 placeholder_canvas_id;
+    u64 placeholder_secret;
+};
+
+JSCompletion web_offscreen_canvas_transfer_steps(void* realm, JSObject*, OffscreenCanvasTransferredFields*);
+JSCompletion web_offscreen_canvas_create_from_transfer(void* realm, OffscreenCanvasTransferredFields const*);
+
+u16 web_offscreen_canvas_interface_name()
+{
+    return to_underlying(Web::Bindings::InterfaceName::OffscreenCanvas);
+}
+
+bool web_offscreen_canvas_is_detached(JSObject* object)
+{
+    return Web::Bindings::impl_from<Web::HTML::OffscreenCanvas>(JS::HostABI::object_from_abi(object))->is_detached();
+}
+
+JSCompletion web_offscreen_canvas_transfer_steps(void* realm, JSObject* object, OffscreenCanvasTransferredFields* fields)
+{
+    auto& js_realm = *static_cast<JS::Realm*>(realm);
+    auto* offscreen_canvas = Web::Bindings::impl_from<Web::HTML::OffscreenCanvas>(JS::HostABI::object_from_abi(object));
+    auto result = offscreen_canvas->transfer_steps();
+    if (result.is_exception())
+        return Web::Bindings::completion_to_abi(js_realm, result.release_error());
+    auto transferred = result.release_value();
+    *fields = {
+        .width = transferred.width,
+        .height = transferred.height,
+        .has_placeholder_canvas = transferred.placeholder_link.has_value(),
+        .placeholder_canvas_id = transferred.placeholder_link.has_value() ? transferred.placeholder_link->canvas_id.value() : 0,
+        .placeholder_secret = transferred.placeholder_link.has_value() ? transferred.placeholder_link->secret : 0,
+    };
+    return Web::Bindings::completion_to_abi(js_realm, JS::js_undefined());
+}
+
+// A new OffscreenCanvas in the realm, after its transfer-receiving steps given the fields of the data holder, as the
+// value of the completion.
+JSCompletion web_offscreen_canvas_create_from_transfer(void* realm, OffscreenCanvasTransferredFields const* fields)
+{
+    auto& js_realm = *static_cast<JS::Realm*>(realm);
+    auto* global_scope = Web::HTML::window_or_worker_global_scope_from_global_object(js_realm.global_object());
+    VERIFY(global_scope);
+    auto offscreen_canvas = Web::HTML::OffscreenCanvas::create(global_scope->this_impl(), 0, 0);
+    Optional<Web::Compositor::PlaceholderCanvasLink> placeholder_link;
+    if (fields->has_placeholder_canvas)
+        placeholder_link = Web::Compositor::PlaceholderCanvasLink { Compositing::CanvasId { fields->placeholder_canvas_id }, fields->placeholder_secret };
+    offscreen_canvas->transfer_receiving_steps({ .width = fields->width, .height = fields->height, .placeholder_link = placeholder_link });
+    auto wrapper = Web::Bindings::wrap(Web::Bindings::host_defined_wrapper_world(js_realm), js_realm, offscreen_canvas);
+    return Web::Bindings::completion_to_abi(js_realm, JS::Value { wrapper });
+}
 }

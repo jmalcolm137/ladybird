@@ -9,10 +9,13 @@
 #include "TestWeb.h"
 #include "TestWebView.h"
 
+#include <AK/GenericShorthands.h>
 #include <AK/LexicalPath.h>
 #include <LibCore/System.h>
+#include <LibWebCommon/WebView/Utilities.h>
 
 #if !defined(AK_OS_WINDOWS)
+#    include <signal.h>
 #    include <sys/wait.h>
 #endif
 
@@ -20,6 +23,7 @@ namespace TestWeb {
 
 static ByteString format_elapsed_time(UnixDateTime run_start_time);
 static ByteString format_exit_status(Optional<int> exit_status);
+static bool is_crash_of_worker(WebView::ProcessType, Optional<int> exit_status);
 static void setup_capture_notifier(RefPtr<Core::Notifier>& notifier, Core::File& file, bool drain_available, Function<void(StringView)> on_output);
 static bool drain_capture_output(Core::File& file, bool drain_available, Function<void(StringView)> const& on_output);
 
@@ -50,6 +54,8 @@ TestRunCapture::TestRunCapture()
             { process.type(), process.pid() },
             m_stderr_capture.original_fd.value_or(STDERR_FILENO),
             ByteString::formatted("test-web: process exited: {}\n", format_exit_status(exit_status)));
+        if (is_crash_of_worker(process.type(), exit_status))
+            ++m_crashed_worker_count;
         m_previous_on_process_exited(move(process), exit_status);
     };
 
@@ -136,6 +142,20 @@ static ByteString format_exit_status(Optional<int> exit_status)
     if (WIFSTOPPED(*exit_status))
         return ByteString::formatted("stopped by signal {}", WSTOPSIG(*exit_status));
     return ByteString::formatted("raw wait status {}", *exit_status);
+#endif
+}
+
+// NB: A worker runs on a thread of a WebContent process that can go down between tests, or be the process of a remote
+//     frame or of nothing but shared workers, where no test would notice.
+bool is_crash_of_worker(WebView::ProcessType type, Optional<int> exit_status)
+{
+#if defined(AK_OS_WINDOWS)
+    (void)type;
+    (void)exit_status;
+    return false;
+#else
+    return type == WebView::ProcessType::WebContent && exit_status.has_value() && WIFEXITED(*exit_status)
+        && WEXITSTATUS(*exit_status) > WebView::worker_thread_crash_exit_status;
 #endif
 }
 

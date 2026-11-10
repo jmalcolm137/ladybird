@@ -11,13 +11,11 @@
 
 pub struct Class;
 pub struct Symbol;
+pub struct SpecialPropertyCache;
 pub struct Script;
 pub struct Module;
 pub struct ObjectEnvironment;
 pub struct Intrinsics;
-
-#[repr(transparent)]
-pub struct PrivateElements(usize);
 
 #[repr(transparent)]
 pub struct FlyStringSlot(usize);
@@ -31,6 +29,7 @@ pub struct Utf16StringSlot(usize);
 #[repr(transparent)]
 pub struct RawNativeFunctionPointer(usize);
 
+pub struct DescriptorArray;
 pub struct ShapeStorage;
 pub struct WatchpointSetStorage;
 pub struct ObjectPropertyIteratorCacheDataStorage;
@@ -50,4 +49,10 @@ pub struct Utf16StringDataHeader {
     pub length_in_code_points: u32,
     pub hash: u32,
     pub flags: u32,
+}
+
+/// The build script never decodes compressed pointers. The crate's tests decode them against this base, which is
+/// aligned like LibGC aligns the real one, and where nothing is mapped.
+pub fn heap_region_base() -> usize {
+    0x7a00_0000_0000
 }

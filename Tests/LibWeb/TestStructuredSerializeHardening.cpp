@@ -8,12 +8,22 @@
 
 TEST_CASE(storage_reader_rejects_unknown_enum_like_identifiers)
 {
-    EXPECT(decode_unknown_storage_identifier<Web::Bindings::KeyType>("future-key-type"sv).is_error());
-    EXPECT(decode_unknown_storage_identifier<Web::Bindings::KeyUsage>("future-key-usage"sv).is_error());
-    EXPECT(decode_unknown_storage_identifier<Web::Bindings::PredefinedColorSpace>("future-color-space"sv).is_error());
-    EXPECT(decode_unknown_storage_identifier<Gfx::BitmapFormat>("FutureBitmapFormat"sv).is_error());
-    EXPECT(decode_unknown_storage_identifier<Gfx::AlphaType>("future-alpha-type"sv).is_error());
-    EXPECT(decode_unknown_storage_identifier<Web::Bindings::InterfaceName>("FutureSerializableInterface"sv).is_error());
+    auto crypto_key = [](StringView type, StringView usage) {
+        return principal_storage_deserialize(crypto_key_full_record(type, usage, alg_key_algorithm("HKDF"sv), handle_byte_buffer("0123456789abcdef"sv.bytes())));
+    };
+    EXPECT(!crypto_key("secret"sv, "deriveKey"sv).is_error());
+    EXPECT(crypto_key("future-key-type"sv, "deriveKey"sv).is_error());
+    EXPECT(crypto_key("secret"sv, "future-key-usage"sv).is_error());
+
+    Array<u8, 4> pixels { 1, 2, 3, 255 };
+    EXPECT(!storage_deserialize(frozen_image_data_record(pixels.span(), 1, 1, "srgb"sv)).is_error());
+    EXPECT(storage_deserialize(frozen_image_data_record(pixels.span(), 1, 1, "future-color-space"sv)).is_error());
+
+    EXPECT(!storage_deserialize(image_bitmap_record(1, 1, 4, "BGRA8888"sv, "premultiplied"sv, pixels.span())).is_error());
+    EXPECT(storage_deserialize(image_bitmap_record(1, 1, 4, "FutureBitmapFormat"sv, "premultiplied"sv, pixels.span())).is_error());
+    EXPECT(storage_deserialize(image_bitmap_record(1, 1, 4, "BGRA8888"sv, "future-alpha-type"sv, pixels.span())).is_error());
+
+    EXPECT(storage_deserialize(serializable_storage_record("FutureSerializableInterface"sv, 1)).is_error());
 }
 
 TEST_CASE(storage_reader_rejects_unknown_and_reserved_serializable_versions)
@@ -196,14 +206,14 @@ TEST_CASE(storage_reader_rejects_a_resizable_array_buffer_longer_than_its_max_by
 
 TEST_CASE(transfer_receiver_rejects_a_resizable_array_buffer_longer_than_its_max_byte_length)
 {
-    auto& realm = test_realm();
-    auto receive = [&](size_t byte_length, size_t max_byte_length) {
-        Web::HTML::TransferDataEncoder holder;
-        MUST(holder.encode(to_underlying(Web::HTML::TransferType::ResizableArrayBuffer)));
-        MUST(holder.encode(MUST(ByteBuffer::create_zeroed(byte_length))));
-        MUST(holder.encode(max_byte_length));
-        Web::HTML::TransferDataDecoder decoder { move(holder) };
-        return Web::HTML::structured_deserialize_with_transfer_internal(decoder, realm);
+    static constexpr u8 resizable_array_buffer_transfer_type = 3;
+    auto receive = [](size_t byte_length, size_t max_byte_length) {
+        IPC::MessageBuffer holder;
+        IPC::Encoder encoder { holder };
+        MUST(encoder.encode(resizable_array_buffer_transfer_type));
+        MUST(encoder.encode(MUST(ByteBuffer::create_zeroed(byte_length))));
+        MUST(encoder.encode(max_byte_length));
+        return receive_transfer_data_holder(move(holder));
     };
 
     EXPECT(receive(8, 4).is_error());
@@ -212,11 +222,10 @@ TEST_CASE(transfer_receiver_rejects_a_resizable_array_buffer_longer_than_its_max
 
 TEST_CASE(transfer_receiver_rejects_an_unknown_transfer_type)
 {
-    auto& realm = test_realm();
-    Web::HTML::TransferDataEncoder holder;
-    MUST(holder.encode(static_cast<u8>(0xEE)));
-    Web::HTML::TransferDataDecoder decoder { move(holder) };
-    EXPECT(Web::HTML::structured_deserialize_with_transfer_internal(decoder, realm).is_error());
+    IPC::MessageBuffer holder;
+    IPC::Encoder encoder { holder };
+    MUST(encoder.encode(static_cast<u8>(0xEE)));
+    EXPECT(receive_transfer_data_holder(move(holder)).is_error());
 }
 
 TEST_CASE(storage_reader_rejects_a_truncated_or_overlong_int32)
@@ -256,12 +265,14 @@ TEST_CASE(storage_reader_rejects_trailing_bytes)
     EXPECT(!storage_deserialize(storage_record_with_value(clean)).is_error());
 }
 
-TEST_CASE(storage_reader_rejects_ascii_flagged_string_with_non_ascii_bytes)
+TEST_CASE(storage_reader_decodes_latin1_flagged_string_with_non_ascii_bytes)
 {
     Vector<u8> value { to_underlying(ValueTag::StringPrimitive) };
-    append_storage_string_header(value, /*is_ascii=*/true, 1);
-    value.append(0x80); // not ASCII
-    EXPECT(storage_deserialize(storage_record_with_value(value)).is_error());
+    append_storage_string_header(value, /*is_latin1=*/true, 1);
+    value.append(0xE9); // U+00E9
+    auto decoded = MUST(storage_deserialize(storage_record_with_value(value)));
+    EXPECT(decoded.is_string());
+    expect_utf16_equals(decoded.as_string().utf16_string(), Utf16String::from_utf8("é"sv));
 }
 
 TEST_CASE(storage_reader_decodes_ascii_content_flagged_as_utf16)
@@ -293,18 +304,18 @@ TEST_CASE(storage_reader_rejects_a_string_with_fewer_bytes_than_its_length_claim
         return storage_record_with_value(value);
     };
 
-    // ASCII: one byte per code unit, so two code units need two bytes — only one is present.
+    // Latin-1: one byte per code unit, so two code units need two bytes — only one is present.
     {
         Vector<u8> body;
-        append_storage_string_header(body, /*is_ascii=*/true, 2);
+        append_storage_string_header(body, /*is_latin1=*/true, 2);
         body.append('h'); // one byte, not two
         EXPECT(storage_deserialize(string_record(body)).is_error());
     }
 
-    // Non-ASCII: two bytes per code unit, so two code units need four bytes — only two are present.
+    // UTF-16: two bytes per code unit, so two code units need four bytes — only two are present.
     {
         Vector<u8> body;
-        append_storage_string_header(body, /*is_ascii=*/false, 2);
+        append_storage_string_header(body, /*is_latin1=*/false, 2);
         append_little_endian_u16(body, u'h'); // one code unit (two bytes), not two
         EXPECT(storage_deserialize(string_record(body)).is_error());
     }
@@ -474,11 +485,13 @@ TEST_CASE(storage_reader_rejects_end_object_tag_where_a_value_is_expected)
 
 TEST_CASE(storage_reader_does_not_overallocate_on_huge_vector_count)
 {
-    Vector<u8> value;
-    append_storage_leb128(value, NumericLimits<u64>::max());
-    auto record = storage_record_with_value(value);
-    Web::HTML::StructuredSerializeReader reader { record };
-    EXPECT(reader.decode<Vector<Web::Bindings::KeyUsage>>().is_error());
+    Vector<u8> body;
+    append_storage_string(body, "secret"sv);
+    body.append(0); // [[extractable]] = false
+    auto algorithm = alg_key_algorithm("HKDF"sv);
+    body.append(algorithm.data(), algorithm.size());
+    append_storage_leb128(body, NumericLimits<u64>::max()); // [[usages]] count
+    EXPECT(principal_storage_deserialize(serializable_storage_record("CryptoKey"sv, 1, body)).is_error());
 }
 
 TEST_CASE(crypto_key_with_truncated_handle_is_rejected)

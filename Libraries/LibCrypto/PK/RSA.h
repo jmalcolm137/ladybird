@@ -81,6 +81,8 @@ public:
     RSAPrivateKey() = default;
 
     UnsignedBigInteger const& modulus() const { return m_modulus; }
+    void clear_sensitive_data();
+
     UnsignedBigInteger const& private_exponent() const { return m_private_exponent; }
     UnsignedBigInteger const& public_exponent() const { return m_public_exponent; }
     UnsignedBigInteger const& prime1() const { return m_prime_1; }
@@ -138,6 +140,7 @@ public:
     using KeyPairType = RSAKeyPair<PublicKeyType, PrivateKeyType>;
 
     static ErrorOr<KeyPairType> parse_rsa_key(ReadonlyBytes der, bool is_private, Vector<StringView> current_scope);
+    static ErrorOr<void> validate_key_generation_parameters(size_t bits);
     static ErrorOr<KeyPairType> generate_key_pair(size_t bits, UnsignedBigInteger e = 65537);
 
     RSA(KeyPairType const& pair)

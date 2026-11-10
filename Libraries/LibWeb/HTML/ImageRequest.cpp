@@ -82,6 +82,13 @@ void ImageRequest::set_current_url(DOM::Document& document, Utf16String url, COR
     set_current_url(document, url.to_utf8(), cors_setting);
 }
 
+void ImageRequest::set_current_url(Utf16String url, GC::Ref<SharedResourceRequest> shared_resource_request)
+{
+    m_current_url = move(url);
+    stop_waiting_for_fetch();
+    m_shared_resource_request = shared_resource_request;
+}
+
 // https://html.spec.whatwg.org/multipage/images.html#abort-the-image-request
 void abort_the_image_request(GC::Ptr<ImageRequest> image_request)
 {
@@ -131,17 +138,17 @@ void ImageRequest::fetch_image(NonnullRefPtr<Fetch::Infrastructure::Request> req
         m_shared_resource_request->fetch_resource(request);
 }
 
-void ImageRequest::add_callbacks(Function<void()> on_finish, Function<void()> on_fail, Function<void()> on_stop)
+void ImageRequest::add_callbacks(GC::Ptr<GC::Function<void()>> on_finish, GC::Ptr<GC::Function<void()>> on_fail, GC::Ptr<GC::Function<void()>> on_stop, SharedResourceRequest::DelaysLoadEvent delays_load_event)
 {
     VERIFY(m_shared_resource_request);
-    if (auto id = m_shared_resource_request->add_removable_callbacks(move(on_finish), move(on_fail), move(on_stop)); id.has_value())
+    if (auto id = m_shared_resource_request->add_removable_callbacks(on_finish, on_fail, on_stop, delays_load_event); id.has_value())
         m_shared_resource_request_callbacks_ids.append(*id);
 }
 
-void ImageRequest::add_callbacks_without_delaying_the_load_event(Function<void()> on_finish, Function<void()> on_fail)
+void ImageRequest::add_callbacks_without_delaying_the_load_event(GC::Ptr<GC::Function<void()>> on_finish, GC::Ptr<GC::Function<void()>> on_fail)
 {
     VERIFY(m_shared_resource_request);
-    (void)m_shared_resource_request->add_removable_callbacks(move(on_finish), move(on_fail), {}, SharedResourceRequest::DelaysLoadEvent::No);
+    (void)m_shared_resource_request->add_removable_callbacks(on_finish, on_fail, {}, SharedResourceRequest::DelaysLoadEvent::No);
 }
 
 void ImageRequest::stop_waiting_for_fetch()

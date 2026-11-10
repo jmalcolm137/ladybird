@@ -7,9 +7,9 @@
 
 import re
 
+from collections.abc import Iterable
 from pathlib import Path
 from typing import FrozenSet
-from typing import Iterable
 from typing import List
 from typing import Optional
 
@@ -65,6 +65,7 @@ FLOATING_POINT_TYPES = {"float": "f32", "unrestricted float": "f32", "double": "
 # The types whose values are plain data, with the Rust type of their values. None of these Rust types is or holds a
 # cell, which holds_cells() relies on.
 PLAIN_DATA_TYPES = {
+    "CSSOMString": "Utf16String",
     "DOMString": "Utf16String",
     "USVString": "UsvString",
     "boolean": "bool",
@@ -168,6 +169,14 @@ def cpp_interface(idl_type: IDLType, context: GenerationContext) -> Optional[Int
     if interface.is_namespace or interface.is_callback_interface:
         return None
     return interface
+
+
+def is_callback_interface(idl_type: IDLType, context: GenerationContext) -> bool:
+    """Whether the type names a callback interface."""
+    if isinstance(idl_type, (IDLParameterizedType, IDLUnionType)):
+        return False
+    interface = context.interfaces.get(idl_type.name)
+    return interface is not None and interface.is_callback_interface
 
 
 def cpp_interface_name_constant(interface: Interface) -> str:
@@ -364,7 +373,7 @@ def rust_enumeration_variant(value: str, enumeration: Enumeration) -> str:
     way."""
     variant = string_to_cpp_enum_name(value)
     is_plain = value.isascii() and value.isprintable() and '"' not in value and "\\" not in value
-    if not is_plain or not re.fullmatch(r"[A-Z][A-Za-z0-9]*", variant) or variant == "Self":
+    if not is_plain or not re.fullmatch(r"(?:[A-Z]|_[0-9])[A-Za-z0-9]*", variant) or variant == "Self":
         raise UnsupportedByRustBindings(
             f"The value {value!r} of the enumeration {enumeration.name} has no name that the Rust bindings can give "
             "its variant"
@@ -403,7 +412,7 @@ def rust_type(idl_type: IDLType, context: GenerationContext, what: str, is_resul
         return f"Option<{rust_type(idl_type.without_nullable(), context, what, is_result)}>"
     name = idl_type.name
     if isinstance(idl_type, IDLParameterizedType):
-        if name == "sequence":
+        if name in ("sequence", "FrozenArray"):
             element_type = idl_type.parameters[0]
             element = rust_type(element_type, context, what, is_result)
             # NB: A Vec would hide cells that the implementation returns from the collector until they are converted.
@@ -426,7 +435,7 @@ def rust_type(idl_type: IDLType, context: GenerationContext, what: str, is_resul
         return "Gc<Object>"
     if name in TYPED_ARRAY_NAMES:
         return "Gc<TypedArrayBase>"
-    if name == "ArrayBuffer" and is_result:
+    if name == "ArrayBuffer":
         return "Gc<ArrayBuffer>"
     callback_function = context.callback_function(idl_type)
     if callback_function is not None:
@@ -435,6 +444,8 @@ def rust_type(idl_type: IDLType, context: GenerationContext, what: str, is_resul
         if is_result:
             return "Gc<FunctionObject>"
         return "PromiseCallbackFunction" if is_promise_type(callback_function.return_type) else "CallbackFunction"
+    if is_callback_interface(idl_type, context) and not is_result:
+        return "CallbackInterface"
     interface = rust_interface(idl_type, context)
     if interface is not None:
         if inheriting_interfaces(interface, context) and not is_result:
@@ -446,7 +457,7 @@ def rust_type(idl_type: IDLType, context: GenerationContext, what: str, is_resul
         return "CppInterface"
     dictionary = resolved_dictionary(idl_type, context)
     if dictionary is not None:
-        return rust_dictionary_path(dictionary, context)
+        return rust_dictionary_type(dictionary, context)
     enumeration = context.enumeration(idl_type)
     if enumeration is not None:
         return rust_enumeration_path(enumeration, context)
@@ -484,7 +495,7 @@ def holds_cells(
             return True
         return any_holds_cells(idl_type.flattened_member_types())
     if isinstance(idl_type, IDLParameterizedType):
-        if idl_type.name in ("sequence", "record"):
+        if idl_type.name in ("sequence", "FrozenArray", "record"):
             return any_holds_cells(idl_type.parameters)
         return True
     if idl_type.name in PLAIN_DATA_TYPES or context.enumeration(idl_type) is not None:
@@ -514,8 +525,28 @@ def is_sequence_of_cells(idl_type: IDLType, context: GenerationContext) -> bool:
     )
 
 
+def dictionary_holds_sequence_of_cells(dictionary: Dictionary, context: GenerationContext) -> bool:
+    """Whether a member of the dictionary is a sequence of values that are or can hold cells, which the struct of the
+    dictionary keeps alive in a MarkedVec, for as long as the reference to the VM that it was converted with lives."""
+    return any(is_sequence_of_cells(member.type, context) for member in dictionary.members)
+
+
+def rust_dictionary_type(dictionary: Dictionary, context: GenerationContext) -> str:
+    """The Rust type of the struct of a dictionary: its path, with the lifetime of the reference to the VM when the
+    dictionary holds a sequence of values that are or can hold cells."""
+    path = rust_dictionary_path(dictionary, context)
+    if dictionary_holds_sequence_of_cells(dictionary, context):
+        return f"{path}<'_>"
+    return path
+
+
 def rust_parameter_type(parameter: OperationParameter, context: GenerationContext, what: str) -> str:
     """The Rust type the implementation receives for the parameter."""
+    if parameter.variadic:
+        element_type = rust_type(parameter.type, context, what)
+        if holds_cells(parameter.type, context):
+            return f"MarkedVec<'_, {element_type}>"
+        return f"Vec<{element_type}>"
     if is_sequence_of_cells(parameter.type, context):
         assert isinstance(parameter.type, IDLParameterizedType)
         value_type = f"MarkedVec<'_, {rust_type(parameter.type.parameters[0], context, what)}>"

@@ -252,7 +252,9 @@ void register_geometry_host(Layout::NodeArena& arena)
         .set_scroll_offset = [](void* context, Layout::BegunRead const* read, Compositing::RustFFI::NodeSlotId slot, CSSPixelPoint offset) {
             auto* layout_node = static_cast<Layout::NodeArena*>(context)->node_if_live(*read, slot);
             VERIFY(layout_node);
-            set_scroll_offset(*layout_node, offset); },
+            auto navigable = layout_node->document().navigable();
+            VERIFY(navigable);
+            navigable->set_scroll_offset_settled_by_layout(*layout_node, offset); },
     };
     Layout::RustFFI::document_host_set_geometry_host(arena.host(), callbacks);
 }
@@ -591,7 +593,6 @@ Optional<DisplayListRecording> start_rust_display_list_recording(Layout::BegunRe
     inputs.force_dark_foreground_threshold = config.force_dark_foreground_threshold;
     inputs.force_dark_background_threshold = config.force_dark_background_threshold;
     inputs.should_paint_overlay = config.paint_overlay;
-    inputs.document_id = document.unique_id().value();
     inputs.has_blocking_wheel_event_region_covering_viewport = wheel_event_region_state.has_blocking_wheel_event_region_covering_viewport;
     inputs.wheel_event_listener_state_generation = document.page().wheel_event_listener_state_generation();
     inputs.chrome_metrics = document.page().chrome_metrics();
@@ -609,12 +610,13 @@ Optional<DisplayListRecording> start_rust_display_list_recording(Layout::BegunRe
         inputs.outline_auto_color = CSS::SystemColor::accent_color(CSS::PreferredColorScheme::Auto);
         auto palette = document.page().palette();
         inputs.palette_is_dark = palette.is_dark();
-        inputs.selection_background_from_palette = CSS::SystemColor::transform_selection_background_color(palette.selection());
-        inputs.selection_background_light = CSS::SystemColor::transform_selection_background_color(CSS::SystemColor::highlight(CSS::PreferredColorScheme::Light));
-        inputs.selection_background_dark = CSS::SystemColor::transform_selection_background_color(CSS::SystemColor::highlight(CSS::PreferredColorScheme::Dark));
-        inputs.inactive_selection_background_from_palette = CSS::SystemColor::transform_selection_background_color(palette.inactive_selection());
-        inputs.inactive_selection_background_light = CSS::SystemColor::transform_selection_background_color(CSS::SystemColor::inactive_highlight(CSS::PreferredColorScheme::Light));
-        inputs.inactive_selection_background_dark = CSS::SystemColor::transform_selection_background_color(CSS::SystemColor::inactive_highlight(CSS::PreferredColorScheme::Dark));
+        auto palette_color_scheme = palette.is_dark() ? CSS::PreferredColorScheme::Dark : CSS::PreferredColorScheme::Light;
+        inputs.selection_background_from_palette = CSS::SystemColor::transform_selection_background_color(palette.selection(), palette_color_scheme);
+        inputs.selection_background_light = CSS::SystemColor::transform_selection_background_color(CSS::SystemColor::highlight(CSS::PreferredColorScheme::Light), CSS::PreferredColorScheme::Light);
+        inputs.selection_background_dark = CSS::SystemColor::transform_selection_background_color(CSS::SystemColor::highlight(CSS::PreferredColorScheme::Dark), CSS::PreferredColorScheme::Dark);
+        inputs.inactive_selection_background_from_palette = CSS::SystemColor::transform_selection_background_color(palette.inactive_selection(), palette_color_scheme);
+        inputs.inactive_selection_background_light = CSS::SystemColor::transform_selection_background_color(CSS::SystemColor::inactive_highlight(CSS::PreferredColorScheme::Light), CSS::PreferredColorScheme::Light);
+        inputs.inactive_selection_background_dark = CSS::SystemColor::transform_selection_background_color(CSS::SystemColor::inactive_highlight(CSS::PreferredColorScheme::Dark), CSS::PreferredColorScheme::Dark);
         inputs.document_has_supported_color_schemes = document.supported_color_schemes().has_value();
         if (auto schemes = document.supported_color_schemes(); schemes.has_value())
             inputs.document_supports_light_or_dark = schemes->contains_slow("light"_utf16) || schemes->contains_slow("dark"_utf16);

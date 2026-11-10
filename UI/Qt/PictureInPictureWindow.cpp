@@ -56,7 +56,7 @@ class PictureInPictureWindow final
 public:
     AK_ALLOC_WITH_KMALLOC;
 
-    PictureInPictureWindow(WebView::CanonicalTraversable& traversable, WebView::ViewImplementation const& owner_view, Gfx::IntSize video_size)
+    PictureInPictureWindow(RemoteView const& owner_view, u64 view_id, Gfx::IntSize video_size)
         : QWidget(nullptr, window_flags())
     {
         // The window's native window and view are created for the screen of the browser window it is opened from.
@@ -82,16 +82,16 @@ public:
             .is_private = owner_view.is_private(),
             .maximum_frames_per_second = m_screen_observer->refresh_rate(),
             .display_id = m_screen_observer->display_id(),
-            .owner_view = &owner_view,
+            .owner_view_id = owner_view.view_id(),
+            .is_tab = false,
         };
-        m_view = new WebContentView(this, traversable, view_initial_state);
+        m_view = new WebContentView(this, view_id, view_initial_state);
         m_screen_observer->on_device_pixel_ratio_change = [this] {
             m_view->set_device_pixel_ratio(m_screen_observer->device_pixel_ratio());
         };
         m_screen_observer->on_display_metadata_change = [this] {
             m_view->set_display_metadata(m_screen_observer->display_id(), m_screen_observer->refresh_rate());
         };
-        report_page_close_of(*m_view);
         m_view->installEventFilter(this);
         // The window's controls, and its page's, show on hover, which works while Ladybird is in the background too.
         m_view->set_follows_mouse_while_inactive(true);
@@ -231,7 +231,7 @@ private:
     // minimized, to play the video there.
     void go_back_to_tab(u64 owner_view_id)
     {
-        if (auto owner = WebView::ViewImplementation::find_view_by_id(owner_view_id); owner.has_value()) {
+        if (auto* owner = RemoteView::find(owner_view_id)) {
             auto* browser_window = static_cast<WebContentView&>(*owner).window();
             browser_window->setWindowState(browser_window->windowState() & ~Qt::WindowMinimized);
             browser_window->raise();
@@ -355,9 +355,9 @@ private:
     Optional<Press> m_press;
 };
 
-NonnullOwnPtr<WebView::PictureInPictureWindow> create_picture_in_picture_window(WebView::CanonicalTraversable& traversable, WebView::ViewImplementation const& owner_view, Gfx::IntSize video_size)
+NonnullOwnPtr<WebView::PictureInPictureWindow> create_picture_in_picture_window(RemoteView const& owner_view, u64 view_id, Gfx::IntSize video_size)
 {
-    return make<PictureInPictureWindow>(traversable, owner_view, video_size);
+    return make<PictureInPictureWindow>(owner_view, view_id, video_size);
 }
 
 }

@@ -13,6 +13,7 @@
 <div id="container"></div>
 <script>
     test(() => {
+        internals.updateStyle();
         const parents = [];
         for (let index = 0; index < 4; ++index) {
             const parent = document.createElement("div");
@@ -26,11 +27,7 @@
             parents.push(parent);
             container.append(parent);
         }
-        const before = internals.styleEngineCounters();
         internals.updateStyle();
-        const after = internals.styleEngineCounters();
-        println(`early sharing used: ${after.engineComputedRecordSharedHits > before.engineComputedRecordSharedHits
-            || after.engineComputedRecordCohortHits > before.engineComputedRecordCohortHits}`);
 
         function checkStyles(label, color, background) {
             let correct = true;

@@ -7,6 +7,8 @@
  */
 
 #include <AK/SourceLocation.h>
+#include <AK/Utf16StringBuilder.h>
+#include <LibAudio/RecordStream.h>
 #include <LibGC/Heap.h>
 #include <LibGC/HeapVector.h>
 #include <LibGfx/Bitmap.h>
@@ -14,14 +16,17 @@
 #include <LibIPC/Encoder.h>
 #include <LibWeb/Bindings/CSS.h>
 #include <LibWeb/CSS/StyleComputer.h>
+#include <LibWeb/CSS/StyleEngineInput.h>
 #include <LibWeb/Compositor/CompositorHost.h>
 #include <LibWeb/DOM/Document.h>
 #include <LibWeb/DOM/Element.h>
 #include <LibWeb/DOM/Range.h>
+#include <LibWeb/DOM/Text.h>
 #include <LibWeb/Editing/SpellCheckController.h>
 #include <LibWeb/Editing/SpellingMarkers.h>
 #include <LibWeb/Editing/WritingSuggestionController.h>
 #include <LibWeb/HTML/BrowsingContext.h>
+#include <LibWeb/HTML/CheckUnloadingCanceledState.h>
 #include <LibWeb/HTML/EventLoop/EventLoop.h>
 #include <LibWeb/HTML/EventNames.h>
 #include <LibWeb/HTML/Focus.h>
@@ -33,14 +38,18 @@
 #include <LibWeb/HTML/HistoryExecutor.h>
 #include <LibWeb/HTML/LocalTraversableNavigable.h>
 #include <LibWeb/HTML/NavigableContainer.h>
+#include <LibWeb/HTML/Navigator.h>
 #include <LibWeb/HTML/OffscreenCanvas.h>
 #include <LibWeb/HTML/RemoteNavigable.h>
 #include <LibWeb/HTML/Scripting/Environments.h>
 #include <LibWeb/HTML/Scripting/TemporaryExecutionContext.h>
+#include <LibWeb/HTML/TagNames.h>
 #include <LibWeb/HTML/Window.h>
 #include <LibWeb/HTML/WindowProxy.h>
 #include <LibWeb/Layout/Viewport.h>
 #include <LibWeb/Loader/ContentBlocker.h>
+#include <LibWeb/MediaCapture/MediaDevices.h>
+#include <LibWeb/NotificationsAPI/Notification.h>
 #include <LibWeb/Page/Page.h>
 #include <LibWeb/Page/RenderingStats.h>
 #include <LibWeb/Painting/BoxViews.h>
@@ -48,6 +57,7 @@
 #include <LibWeb/PictureInPicture/PictureInPictureController.h>
 #include <LibWeb/Platform/EventLoopPlugin.h>
 #include <LibWeb/Selection/Selection.h>
+#include <LibWeb/Translation/DocumentTranslator.h>
 #include <LibWeb/WebIDL/Promise.h>
 #include <LibWebCommon/Clipboard/SystemClipboard.h>
 #include <LibWebCommon/HTML/NavigationPopulationRequest.h>
@@ -148,6 +158,7 @@ void Page::visit_edges(JS::Cell::Visitor& visitor)
     visitor.visit(m_pending_clipboard_requests);
     visitor.visit(m_pending_spell_check_requests);
     visitor.visit(m_spell_checking_settled_callbacks);
+    visitor.visit(m_translation_settled_callbacks);
     visitor.visit(m_pending_writing_suggestion_requests);
     visitor.visit(m_writing_suggestions_settled_callbacks);
     visitor.visit(m_writing_suggestion_requested_callbacks);
@@ -158,6 +169,8 @@ void Page::visit_edges(JS::Cell::Visitor& visitor)
     for (auto const& request : m_pending_geolocation_requests)
         visitor.visit(request.value.callback);
     visitor.visit(m_pending_permission_requests);
+    visitor.visit(m_notifications_list);
+    visitor.visit(m_unloading_canceled_checks);
     m_pending_fullscreen_operations.for_each([&](auto const& operation) {
         operation.visit([&](PendingFullscreenEnter const& enter_operation) {
                 visitor.visit(enter_operation.element);
@@ -209,6 +222,27 @@ GC::Ptr<HTML::Navigable> Page::focused_navigable() const
 GC::Ptr<HTML::LocalNavigable> Page::hosted_focused_navigable() const
 {
     return as_if<HTML::LocalNavigable>(focused_navigable().ptr());
+}
+
+void Page::system_focus_changed()
+{
+    for (auto const& navigable : hosted_navigables()) {
+        auto document = navigable->active_document();
+        if (!document)
+            continue;
+        auto window = document->window();
+        if (!window)
+            continue;
+        if (auto navigator = window->navigator_if_created(); navigator) {
+            if (auto media_devices = navigator->media_devices_if_created())
+                media_devices->system_focus_changed();
+        }
+    }
+
+    if (auto focused_navigable = hosted_focused_navigable()) {
+        if (auto focused_document = focused_navigable->active_document())
+            HTML::dispatch_system_focus_events(*focused_document, client().has_focus());
+    }
 }
 
 void Page::set_focused_navigable(HTML::Navigable& navigable)
@@ -298,7 +332,11 @@ void Page::process_screenshot_requests()
             }
             auto bitmap = bitmap_or_error.release_value();
             HTML::PaintConfig paint_config { .canvas_fill_rect = rect.to_type<int>() };
-            navigable->render_screenshot(bitmap, paint_config, [bitmap, &client] {
+            navigable->render_screenshot(bitmap, paint_config, [bitmap, &client](auto result) {
+                if (result == Compositor::ScreenshotResult::Failed) {
+                    client.page_did_take_screenshot({});
+                    return;
+                }
                 client.page_did_take_screenshot(bitmap->to_shareable_bitmap());
             });
         } else {
@@ -315,7 +353,11 @@ void Page::process_screenshot_requests()
             }
             auto bitmap = bitmap_or_error.release_value();
             HTML::PaintConfig paint_config { .paint_overlay = true, .canvas_fill_rect = rect.to_type<int>() };
-            navigable->render_screenshot(bitmap, paint_config, [bitmap, &client] {
+            navigable->render_screenshot(bitmap, paint_config, [bitmap, &client](auto result) {
+                if (result == Compositor::ScreenshotResult::Failed) {
+                    client.page_did_take_screenshot({});
+                    return;
+                }
                 client.page_did_take_screenshot(bitmap->to_shareable_bitmap());
             });
         }
@@ -595,7 +637,8 @@ EventResult Page::handle_drag_and_drop_event(DragEvent::Type type, DevicePixelPo
 
 EventResult Page::handle_pinch_event(HTML::LocalNavigable& root, PinchEvent const& event, Optional<RemoteInputEventTarget>* remote_target)
 {
-    if (event.async_zoom_performed_default_action && root.is_top_level_traversable())
+    // The compositor forwards its scroll updates ahead of the event. Listeners must see the zoom already presented.
+    if (root.is_top_level_traversable())
         root.adopt_pending_async_scroll_offsets(Compositing::AsyncScrollUpdateFreshness::Pushed);
     return root.event_handler().handle_pinch_event(device_to_css_point(event.position), event, remote_target);
 }
@@ -607,10 +650,16 @@ EventResult Page::handle_pinch_event(DevicePixelPoint position, unsigned modifie
         .modifiers = static_cast<UIEvents::KeyModifier>(modifiers),
         .scale_delta = scale,
     };
+    auto result = handle_pinch_event(local_traversable(), event, nullptr);
+    if (result != EventResult::Accepted)
+        return result;
+
+    // NB: No UI process is there to ask for the zoom of an event left uncanceled.
+    event.wheel_event_was_dispatched = true;
     return handle_pinch_event(local_traversable(), event, nullptr);
 }
 
-EventResult Page::handle_keydown(UIEvents::KeyCode key, unsigned modifiers, u32 code_point, bool repeat, bool should_insert_text, bool async_scroll_performed_default_action, ReadonlySpan<TextEditingCommand> editing_commands, bool native_editing_binding_resolved)
+EventResult Page::handle_keydown(UIEvents::KeyCode key, unsigned modifiers, u32 code_point, bool repeat, bool should_insert_text, bool async_scroll_performed_default_action, ReadonlySpan<TextEditingCommand> editing_commands, bool native_editing_binding_resolved, Optional<u64> user_input_scroll_count_with_nothing_to_scroll)
 {
     // The compositor forwards these updates ahead of keyboard events. Both DOM listeners and a main-thread
     // fallback default action must observe the offsets that have already been presented.
@@ -618,6 +667,12 @@ EventResult Page::handle_keydown(UIEvents::KeyCode key, unsigned modifiers, u32 
     if (!navigable)
         return EventResult::Dropped;
     navigable->local_root()->adopt_pending_async_scroll_offsets(Compositing::AsyncScrollUpdateFreshness::Pushed);
+    // NB: The compositor found nothing to scroll for this key, and left it here for content the page may have added
+    //     past the end of a scroll range it knew. This thread may hear of the key late. Once the compositor has
+    //     scrolled for later input, the key has been left behind, and scrolling for it now would go against that input.
+    if (user_input_scroll_count_with_nothing_to_scroll.has_value()
+        && navigable->local_root()->compositor_user_input_scroll_count() > *user_input_scroll_count_with_nothing_to_scroll)
+        async_scroll_performed_default_action = true;
     return navigable->event_handler().handle_keydown(key, modifiers, code_point, repeat, should_insert_text, async_scroll_performed_default_action, editing_commands, native_editing_binding_resolved);
 }
 
@@ -1096,15 +1151,65 @@ void Page::unfullscreen_descendant_documents(Vector<GC::Root<HTML::Navigable>> c
 
 void Page::discard()
 {
+    if (m_has_been_discarded)
+        return;
+    m_has_been_discarded = true;
+
+    // Nothing answers a dialog of a closed tab anymore, and the process's event loop stays paused while it is open.
+    close_pending_dialog_of_discarded_page();
+
     // A tab closed while this page still displayed a document of it: the document goes without the unload the UI
     // process runs otherwise, as the documents of a top-level traversable being destroyed do.
-    for (auto const& navigable : local_roots()) {
-        if (auto document = navigable->active_document())
-            document->destroy_a_document_and_its_descendants();
-        navigable->set_has_been_destroyed();
-        navigable->remove_from_all_local_navigables();
+    auto navigables = local_roots();
+    if (navigables.is_empty()) {
+        finish_discarding();
+        return;
     }
 
+    m_local_roots_left_to_discard = navigables.size();
+    for (auto const& navigable : navigables) {
+        auto detach_navigable = GC::create_function(heap(), GC::captures(*this, navigable), [](Page& page, GC::Ref<HTML::LocalNavigable> navigable) {
+            navigable->set_has_been_destroyed();
+            navigable->remove_from_all_local_navigables();
+            if (--page.m_local_roots_left_to_discard == 0)
+                page.finish_discarding();
+        });
+
+        // NB: The task destroying a document only runs while the document is fully active, so its navigable can only
+        //     be detached after that task.
+        auto document = navigable->active_document();
+        if (document && !document->has_been_destroyed() && document->is_fully_active()) {
+            document->destroy_a_document_and_its_descendants(detach_navigable);
+            continue;
+        }
+        if (document && !document->has_been_destroyed())
+            document->destroy();
+        detach_navigable->function()();
+    }
+}
+
+void Page::close_pending_dialog_of_discarded_page()
+{
+    switch (m_pending_dialog) {
+    case PendingDialog::None:
+        break;
+    case PendingDialog::Alert:
+        alert_closed();
+        break;
+    case PendingDialog::BeforeUnload:
+        before_unload_closed(true);
+        break;
+    case PendingDialog::Confirm:
+        confirm_closed(false);
+        break;
+    case PendingDialog::Prompt:
+        prompt_closed({});
+        break;
+    }
+}
+
+void Page::finish_discarding()
+{
     // The navigables of other processes this page held no longer stand for anything here, and a WindowProxy a script
     // of another page holds for one of them is closed.
     GC::RootVector<GC::Ref<HTML::RemoteNavigable>> remote_navigables;
@@ -1140,14 +1245,16 @@ void Page::did_complete_window_rect_request(u64 completion_id)
         m_window_rect_observer->function()({ window_position(), window_size() }, completion_id);
 }
 
-template<typename ResponseType>
-static ResponseType spin_event_loop_until_dialog_closed(PageClient& client, Optional<ResponseType>& response, HTML::EventLoop* event_loop = nullptr, SourceLocation location = SourceLocation::current())
+// NB: The response is named as a member of the page, so that the function waiting for it captures only the page.
+template<auto response>
+static auto spin_event_loop_until_dialog_closed(Page& page, HTML::EventLoop* event_loop = nullptr, SourceLocation location = SourceLocation::current())
 {
+    auto& client = page.client();
     auto& responsible_event_loop = event_loop ? *event_loop : Web::HTML::current_settings_object().responsible_event_loop();
     auto pause_handle = responsible_event_loop.pause();
 
-    Web::Platform::EventLoopPlugin::the().spin_until(GC::create_function(GC::Heap::the(), [&]() {
-        return response.has_value() || !client.is_connection_open();
+    Web::Platform::EventLoopPlugin::the().spin_until(GC::create_function(GC::Heap::the(), GC::captures(page), [](Page& page) {
+        return (page.*response).has_value() || !page.client().is_connection_open();
     }));
 
     if (!client.is_connection_open()) {
@@ -1155,7 +1262,7 @@ static ResponseType spin_event_loop_until_dialog_closed(PageClient& client, Opti
         exit(0);
     }
 
-    return response.release_value();
+    return (page.*response).release_value();
 }
 
 void Page::did_request_alert(Utf16String const& message)
@@ -1166,7 +1273,7 @@ void Page::did_request_alert(Utf16String const& message)
     if (!message.is_empty())
         m_pending_dialog_text = message;
 
-    spin_event_loop_until_dialog_closed(*m_client, m_pending_alert_response);
+    spin_event_loop_until_dialog_closed<&Page::m_pending_alert_response>(*this);
 }
 
 void Page::alert_closed()
@@ -1182,7 +1289,7 @@ bool Page::did_request_before_unload(String const& source, HTML::EventLoop& even
     m_pending_dialog = PendingDialog::BeforeUnload;
     m_client->page_did_request_before_unload(source);
 
-    return spin_event_loop_until_dialog_closed(*m_client, m_pending_before_unload_response, &event_loop);
+    return spin_event_loop_until_dialog_closed<&Page::m_pending_before_unload_response>(*this, &event_loop);
 }
 
 void Page::before_unload_closed(bool accepted)
@@ -1201,7 +1308,7 @@ bool Page::did_request_confirm(Utf16String const& message)
     if (!message.is_empty())
         m_pending_dialog_text = message;
 
-    return spin_event_loop_until_dialog_closed(*m_client, m_pending_confirm_response);
+    return spin_event_loop_until_dialog_closed<&Page::m_pending_confirm_response>(*this);
 }
 
 void Page::confirm_closed(bool accepted)
@@ -1220,7 +1327,7 @@ Optional<Utf16String> Page::did_request_prompt(Utf16String const& message, Utf16
     if (!message.is_empty())
         m_pending_dialog_text = message;
 
-    return spin_event_loop_until_dialog_closed(*m_client, m_pending_prompt_response);
+    return spin_event_loop_until_dialog_closed<&Page::m_pending_prompt_response>(*this);
 }
 
 void Page::prompt_closed(Optional<Utf16String> response)
@@ -1395,12 +1502,20 @@ void Page::select_dropdown_closed(Optional<u32> const& selected_item_id)
     }
 }
 
-void Page::request_clipboard_entries(ClipboardRequest request)
+void Page::request_clipboard_entries_for_paste(ClipboardRequest request)
 {
     auto request_id = m_next_clipboard_request_id++;
     m_pending_clipboard_requests.set(request_id, request);
 
-    client().page_did_request_clipboard_entries(request_id);
+    client().page_did_request_clipboard_entries_for_paste(request_id);
+}
+
+void Page::request_clipboard_entries(ClipboardRequest request, HTML::CrossProcessId reading_document_id)
+{
+    auto request_id = m_next_clipboard_request_id++;
+    m_pending_clipboard_requests.set(request_id, request);
+
+    client().page_did_request_clipboard_entries(request_id, reading_document_id);
 }
 
 void Page::retrieved_clipboard_entries(u64 request_id, Vector<Clipboard::SystemClipboardItem> items)
@@ -1593,6 +1708,61 @@ void Page::permission_request_completed(u64 request_id, Web::Permissions::Effect
 {
     if (auto callback = m_pending_permission_requests.take(request_id); callback.has_value())
         callback.value()->function()(state);
+}
+
+void Page::add_unloading_canceled_check(Badge<HTML::CheckUnloadingCanceledState>, GC::Ref<HTML::CheckUnloadingCanceledState> check)
+{
+    m_unloading_canceled_checks.set(check);
+}
+
+void Page::remove_unloading_canceled_check(Badge<HTML::CheckUnloadingCanceledState>, GC::Ref<HTML::CheckUnloadingCanceledState> check)
+{
+    m_unloading_canceled_checks.remove(check);
+}
+
+void Page::register_showing_notification(u64 notification_id, GC::Ref<NotificationsAPI::Notification> notification)
+{
+    m_notifications_list.set(notification_id, notification);
+}
+
+void Page::unregister_notification(u64 notification_id)
+{
+    m_notifications_list.remove(notification_id);
+}
+
+void Page::notification_shown(u64 notification_id)
+{
+    if (auto notification = m_notifications_list.get(notification_id); notification.has_value())
+        (*notification)->did_show();
+}
+
+void Page::notification_show_failed(u64 notification_id)
+{
+    if (auto notification = m_notifications_list.get(notification_id); notification.has_value())
+        (*notification)->did_fail_to_show();
+}
+
+void Page::notification_clicked(u64 notification_id)
+{
+    if (auto notification = m_notifications_list.get(notification_id); notification.has_value())
+        (*notification)->did_click();
+}
+
+void Page::notification_closed(u64 notification_id, bool by_user)
+{
+    if (auto notification = m_notifications_list.get(notification_id); notification.has_value())
+        (*notification)->did_close(by_user);
+}
+
+void Page::notifications_document_destroyed(DOM::Document const& document)
+{
+    GC::RootVector<GC::Ref<NotificationsAPI::Notification>> abandoned;
+    for (auto const& [id, notification] : m_notifications_list) {
+        if (notification->document() == &document)
+            abandoned.append(notification);
+    }
+    for (auto const& notification : abandoned)
+        notification->abandon();
 }
 
 u64 Page::request_geolocation_position(HTML::CrossProcessId requesting_document_id, GeolocationPositionCallback callback, GeolocationRequestType type)
@@ -1959,13 +2129,15 @@ void Page::invalidate_user_style()
     if (!has_top_level_traversable())
         return;
 
+    // NB: The new user sheet is attached in place of the old one, which restyles the elements the rules of either
+    //     match. It is attached now, so a style read before the next style update sees it pending. Its rules
+    //     match in shadow trees as in the document, and the animations naming its @keyframes, which the document's
+    //     scope publishes, are planned again, so no element of a shadow tree restyles for it otherwise.
     auto invalidate_document = [](DOM::Document& document) {
         document.invalidate_content_blocker_style_sheet();
         document.style_scope().invalidate_user_style_sheet();
-        document.for_each_shadow_root([](auto& shadow_root) {
-            shadow_root.record_style_environment_change();
-        });
-        document.record_style_environment_change();
+        if (document.style_computer_if_created())
+            CSS::record_non_author_stylesheets(document);
     };
 
     // Each page invalidates the documents it hosts.
@@ -1981,7 +2153,7 @@ void Page::invalidate_style_for_preference_change()
         return;
 
     auto invalidate_document = [](DOM::Document& document) {
-        document.record_style_environment_change();
+        document.record_style_environment_change(DOM::StyleEnvironmentChange::ColorScheme | DOM::StyleEnvironmentChange::MediaFeatures);
         document.set_needs_media_query_evaluation();
     };
 
@@ -2202,17 +2374,20 @@ void Page::update_find_in_page_active_match(Vector<GC::Root<DOM::Range>> const& 
     auto current_range = matches[m_find_in_page_match_index];
     set_find_in_page_active_match(current_range.ptr());
 
-    auto common_ancestor_container = current_range->common_ancestor_container();
-    if (!common_ancestor_container->document().window())
+    auto& document = current_range->start_container()->document();
+    if (!document.window())
         return;
 
-    if (auto element = common_ancestor_container->parent_element()) {
-        DOM::Element::ScrollIntoViewOptions scroll_options;
-        scroll_options.block = DOM::Element::ScrollLogicalPosition::Nearest;
-        scroll_options.inline_ = DOM::Element::ScrollLogicalPosition::Nearest;
-        scroll_options.behavior = DOM::Element::ScrollBehavior::Instant;
-        element->scroll_into_view(scroll_options, nullptr);
-    }
+    // NB: Scroll the matched text itself into view. An element around it can be wider than the viewport, as a <pre> of
+    //     long lines is, and then scrolling it into view leaves the match where it is.
+    document.update_layout(DOM::UpdateLayoutReason::RangeGetClientRects);
+    Layout::ForcedReadScope read { document };
+    DOM::scroll_a_target_into_view(
+        read,
+        DOM::ScrollIntoViewTarget { current_range.ptr() },
+        DOM::Element::ScrollBehavior::Instant,
+        DOM::Element::ScrollLogicalPosition::Nearest,
+        DOM::Element::ScrollLogicalPosition::Nearest);
 }
 
 void Page::update_find_in_page_highlighted_matches(Vector<GC::Root<DOM::Range>> const& matches, bool highlight_all_matches)
@@ -2265,8 +2440,8 @@ void Page::enqueue_fullscreen_enter(GC::Ref<DOM::Element> element, GC::Ref<DOM::
     m_pending_fullscreen_operations.enqueue(PendingFullscreenEnter { element, pending_doc, error, promise, request_type });
     // NOTE: Processing is deferred because the spec says "run the remaining steps in parallel",
     //       meaning the caller's synchronous JS should complete before we process the operation.
-    Platform::EventLoopPlugin::the().deferred_invoke(GC::create_function(GC::Heap::the(), [this]() {
-        process_pending_fullscreen_operations();
+    Platform::EventLoopPlugin::the().deferred_invoke(GC::create_function(GC::Heap::the(), GC::captures(*this), [](Page& self) {
+        self.process_pending_fullscreen_operations();
     }));
 }
 
@@ -2275,8 +2450,8 @@ void Page::enqueue_fullscreen_exit(GC::Ref<DOM::Document> doc, bool resize, GC::
     m_pending_fullscreen_operations.enqueue(PendingFullscreenExit { doc, resize, promise, requesting_navigable_id });
     // NOTE: Processing is deferred because the spec says "run the remaining steps in parallel",
     //       meaning the caller's synchronous JS should complete before we process the operation.
-    Platform::EventLoopPlugin::the().deferred_invoke(GC::create_function(GC::Heap::the(), [this]() {
-        process_pending_fullscreen_operations();
+    Platform::EventLoopPlugin::the().deferred_invoke(GC::create_function(GC::Heap::the(), GC::captures(*this), [](Page& self) {
+        self.process_pending_fullscreen_operations();
     }));
 }
 
@@ -2501,7 +2676,12 @@ void PageClient::navigation_params_creation_finished(HTML::LocalNavigable&, HTML
     VERIFY_NOT_REACHED();
 }
 
-void PageClient::history_navigation_params_creation_finished(HTML::CrossProcessId, HTML::HistoryNavigationPopulation)
+void PageClient::changing_navigable_history_job_reached_population(HTML::CrossProcessId, HTML::CrossProcessId, HTML::NavigationSourceSnapshot)
+{
+    VERIFY_NOT_REACHED();
+}
+
+void PageClient::history_navigation_params_creation_finished(HTML::CrossProcessId, HTML::CrossProcessId, HTML::NavigationPopulationResult)
 {
     VERIFY_NOT_REACHED();
 }
@@ -2517,6 +2697,156 @@ NonnullOwnPtr<MediaClient::RemotePlaybackManager> PageClient::create_media_playb
 }
 
 void PageClient::rebind_media_playback_manager(MediaClient::RemotePlaybackManager&)
+{
+    VERIFY_NOT_REACHED();
+}
+
+// The UI process asks for the language of the tab's document, which a page hosting it answers.
+TranslationLanguageSample Page::translation_language_sample()
+{
+    // Enough text to tell its language by, but no more.
+    static constexpr size_t MAXIMUM_SAMPLE_LENGTH = 4096;
+
+    TranslationLanguageSample sample;
+    for (auto const& navigable : hosted_navigables()) {
+        if (!navigable->is_top_level_traversable())
+            continue;
+        auto document = navigable->active_document();
+        if (!document)
+            break;
+        if (auto* document_element = document->document_element()) {
+            if (auto language = document_element->lang(); language.has_value() && !language->is_empty())
+                sample.declared_language = language->to_utf8_but_should_be_ported_to_utf16();
+        }
+        // NB: The sample is the text in the tree, rather than the rendered text, so taking it never lays the page out: It's
+        //     taken from every page that loads, and a layout would change when the page itself sees its layout happen.
+        if (auto* body = document->body()) {
+            Utf16StringBuilder builder;
+            body->for_each_in_subtree([&](DOM::Node const& node) {
+                if (builder.length_in_code_units() >= MAXIMUM_SAMPLE_LENGTH)
+                    return TraversalDecision::Break;
+                if (auto const* element = as_if<DOM::Element>(node)) {
+                    if (first_is_one_of(element->local_name(), HTML::TagNames::script, HTML::TagNames::style, HTML::TagNames::template_, HTML::TagNames::noscript))
+                        return TraversalDecision::SkipChildrenAndContinue;
+                    return TraversalDecision::Continue;
+                }
+                if (auto const* text = as_if<DOM::Text>(node)) {
+                    builder.append(text->data());
+                    builder.append_code_point(' ');
+                }
+                return TraversalDecision::Continue;
+            });
+            auto text = builder.to_string();
+            if (text.length_in_code_units() > MAXIMUM_SAMPLE_LENGTH)
+                text = Utf16String::from_utf16(text.substring_view(0, MAXIMUM_SAMPLE_LENGTH));
+            sample.text = move(text);
+        }
+        break;
+    }
+    return sample;
+}
+
+void Page::start_translation(String source_language, String target_language)
+{
+    if (is_translating())
+        return;
+    m_translation_source_language = move(source_language);
+    m_translation_target_language = move(target_language);
+    // NB: A document still loading starts too: The text its parser adds later is translated as the page adds it.
+    for (auto const& navigable : hosted_navigables()) {
+        if (auto document = navigable->active_document())
+            document->document_translator().start(*m_translation_source_language, *m_translation_target_language);
+    }
+    notify_translation_progress();
+}
+
+// The UI process stops the translation as the tab's document changes, and as the user shows the original. So the page
+// forgets it, and the next document isn't translated unless the UI process asks again.
+void Page::stop_translation()
+{
+    m_translation_source_language.clear();
+    m_translation_target_language.clear();
+    m_translation_units_in_flight.clear();
+    for (auto const& navigable : hosted_navigables()) {
+        if (auto document = navigable->active_document())
+            document->forget_document_translator();
+    }
+}
+
+// A document that finishes loading in a translated page is translated too, e.g. an iframe's. The tab's own document is
+// translated only as the UI process asks, since the translation applies to the document it was asked for.
+void Page::did_completely_load_document(DOM::Document& document)
+{
+    auto navigable = document.navigable();
+    if (is_translating() && navigable && !navigable->is_top_level_traversable())
+        document.document_translator().start(*m_translation_source_language, *m_translation_target_language);
+}
+
+void Page::did_translate(TranslatedUnit unit)
+{
+    if (auto document = m_translation_units_in_flight.take(unit.id); document.has_value()) {
+        if (auto strong_document = document->ptr()) {
+            if (auto* translator = strong_document->document_translator_if_exists())
+                translator->did_translate(unit);
+        }
+    }
+    notify_translation_progress();
+}
+
+void Page::notify_translation_progress()
+{
+    // The translator takes one unit at a time, so only a few are sent ahead: The next one to send is picked when one
+    // comes back, which is when the page may have scrolled, or changed.
+    static constexpr size_t MAXIMUM_UNITS_IN_FLIGHT = 2;
+
+    while (is_translating() && m_translation_units_in_flight.size() < MAXIMUM_UNITS_IN_FLIGHT) {
+        GC::Ptr<DOM::Document> best_document;
+        Optional<Translation::DocumentTranslator::Candidate> best_candidate;
+        for (auto const& navigable : hosted_navigables()) {
+            auto document = navigable->active_document();
+            if (!document)
+                continue;
+            auto* translator = document->document_translator_if_exists();
+            if (!translator || !translator->is_started())
+                continue;
+            auto candidate = translator->next_candidate();
+            if (candidate.has_value() && (!best_candidate.has_value() || candidate->priority < best_candidate->priority)) {
+                best_candidate = candidate;
+                best_document = document;
+            }
+        }
+        if (!best_candidate.has_value())
+            break;
+        auto unit = best_document->document_translator().take_unit_for_translation(best_candidate->unit_id);
+        m_translation_units_in_flight.set(unit.id, *best_document);
+        client().page_did_request_translation(unit);
+    }
+
+    if (m_translation_settled_callbacks.is_empty() || !is_translating() || !m_translation_units_in_flight.is_empty())
+        return;
+    for (auto const& navigable : hosted_navigables()) {
+        if (auto document = navigable->active_document()) {
+            if (auto* translator = document->document_translator_if_exists(); translator && !translator->is_settled())
+                return;
+        }
+    }
+    GC::RootVector callbacks { exchange(m_translation_settled_callbacks, {}) };
+    for (auto& callback : callbacks)
+        callback->function()();
+}
+
+void Page::request_translation_for_testing(String const& target_language)
+{
+    client().page_did_request_page_translation_for_testing(target_language);
+}
+
+void Page::when_translation_settled(GC::Ref<GC::Function<void()>> callback)
+{
+    m_translation_settled_callbacks.append(callback);
+    notify_translation_progress();
+}
+
+NonnullRefPtr<Audio::RecordStream::CreatePromise> PageClient::create_audio_record_stream(StringView, Audio::RecordStream::RecordCallback)
 {
     VERIFY_NOT_REACHED();
 }

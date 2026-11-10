@@ -1,0 +1,19 @@
+Harness status: OK
+
+Found 14 tests
+
+14 Pass
+Pass	textStream method existence
+Pass	Response.textStream() basic functionality
+Pass	Request.textStream() basic functionality
+Pass	textStream() handles chunked byte stream input
+Pass	Response.textStream() on consumed body throws TypeError
+Pass	Request.textStream() on consumed body throws TypeError
+Pass	Response.textStream() on locked body throws TypeError
+Pass	Request.textStream() on locked body throws TypeError
+Pass	Response.textStream() with null body
+Pass	Request.textStream() with null body
+Pass	Response.textStream() with empty body
+Pass	Response.textStream() ignores Content-Type charset (UTF-16LE)
+Pass	Request.textStream() ignores Content-Type charset (UTF-16LE)
+Pass	Response.textStream() ignores invalid Content-Type charset (invalid-charset)

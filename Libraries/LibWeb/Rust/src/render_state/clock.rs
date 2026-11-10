@@ -6,7 +6,7 @@
 
 //! The render clock's lanes of a document's presented frames.
 //!
-//! Each frame of a document the host presents has a lane, which the render clock's ticks follow on the StyleLayout
+//! Each frame of a document the host presents has a lane, which the render clock's ticks follow on the Render
 //! thread, as the render owner, from the frame on, until the lane of the host's next frame takes its place: a tick
 //! hovers what is under the pointer, for real, as the host would as it handles the move (see [`hover`]), and samples
 //! the running animations of the plan the frame's rendering update sealed at the tick's time beside a task, shows the
@@ -40,15 +40,17 @@ use crate::layout::used_values::FfiCssPixelRect;
 use crate::layout::{ClockRound, ClockRoundDeclined, HostStyle, LayoutNodeArena, build_keeps_box};
 use crate::paint_stage::Presenting;
 use crate::painting::paint_passes::{ClockTickVisualContexts, VisualContextsNeedHost, prepare_for_clock_tick};
-use crate::painting::paintable_geometry::absolute_border_box_rect;
+use crate::painting::paintable_geometry::{
+    absolute_border_box_rect, absolute_padding_box_rect, committed_content_size, scrollable_overflow_rect,
+};
 use crate::painting::presentation::Presentation;
 use crate::painting::record::damage::PaintDamage;
 use crate::painting::record::inputs::UnframedRecordingInputs;
 use crate::painting::record::publish::{
-    published_vector_image_display_lists, renders_vector_images, take_in_published_output, take_in_recording,
+    PresentedOutput, published_vector_image_display_lists, renders_vector_images, take_in_recording,
 };
 use crate::painting::record::recorder_state::RecorderState;
-use crate::painting::record::{RecordingInputs, RecordingOutput};
+use crate::painting::record::{PublishedHitTestItems, RecordingInputs, RecordingOutput};
 use crate::painting::recording_slot::{
     FrameInputs, FrozenFrame, RecordingAnswer, RecordingJob, freeze_recording_frame, present,
     present_with_vector_images, record_frame, wait_while_recording_is_held_for_testing,
@@ -62,9 +64,10 @@ use std::sync::{Arc, Mutex};
 mod effects;
 pub(crate) mod hover;
 mod lane;
+mod selection;
 pub(crate) use hover::PendingPointer;
 pub(crate) use lane::LaneDelivery;
-pub(super) use lane::{LaneSlot, note_host_write, retire_slot, seal_plan, take_lanes_in};
+pub(super) use lane::{LaneSlot, note_host_write, retire_slot, seal_plan, take_lane_report, take_lanes_in};
 
 /// What the ticks of a lane sample, sealed at the end of the lane's frame's rendering update.
 pub(crate) struct ClockPlan {
@@ -89,14 +92,135 @@ pub(crate) struct ClockPlan {
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct FfiPlannedScrollTimeline {
+    /// The identity the host gave the timeline.
+    pub timeline: u64,
     /// The unique node id of the element whose scroll node the timeline follows, or of the document for its viewport,
     /// and whether along the vertical axis.
     pub scroller: i64,
+    /// The style node of the element whose box scrolls, or 0 for the viewport.
+    pub scroller_element: u32,
     pub vertical: bool,
-    /// The scroll offset at 100% progress, in CSS pixels, in the layout the host sealed the plan from.
+    /// The scroll offset the host laid out, in CSS pixels.
+    pub scroll_offset: f64,
+    /// The scroll offset at 100% progress, in CSS pixels, in the layout the host sealed the plan from, and in the
+    /// layout of the last frame a tick presented from then on.
     pub max_scroll_offset: f64,
-    /// The progress, in percent, at the scroll offset the host laid out.
-    pub progress: f64,
+    pub view: FfiPlannedViewTimeline,
+}
+
+/// What decides the progress of a view progress timeline, along its axis, in CSS pixels, in the layout the host sealed
+/// the plan from, and where a tick's layout moved them in the layout of the last frame a tick presented from then on.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct FfiPlannedViewTimeline {
+    /// The style node of the timeline's subject, or 0 for a scroll progress timeline, which has none of this.
+    pub subject: u32,
+    pub scrollport_size: f64,
+    /// The insets of the view progress visibility range, at the start and at the end of the scrollport.
+    pub inset_start: f64,
+    pub inset_end: f64,
+    /// How much of those insets is a percentage of the scrollport's size. Scroll padding counts as none, whose pixels
+    /// hold until the host's next plan.
+    pub inset_start_percentage: f64,
+    pub inset_end_percentage: f64,
+    /// Where the subject's border box starts, from the start of the scrollport, and its size.
+    pub subject_offset: f64,
+    pub subject_size: f64,
+}
+
+impl FfiPlannedViewTimeline {
+    /// The scroll offsets at the start and at the end of the cover range.
+    fn cover_range(&self) -> (f64, f64) {
+        // https://drafts.csswg.org/scroll-animations-1/#valdef-animation-timeline-range-cover
+        // 0% progress represents the latest position at which the start border edge of the element's principal box
+        // coincides with the end edge of its view progress visibility range.
+        // 100% progress represents the earliest position at which the end border edge of the element's principal box
+        // coincides with the start edge of its view progress visibility range.
+        (
+            self.subject_offset - (self.scrollport_size - self.inset_end),
+            self.subject_offset + self.subject_size - self.inset_start,
+        )
+    }
+
+    /// https://drafts.csswg.org/scroll-animations-1/#view-timeline-progress
+    /// The progress, in percent, at the scroll offset `position`.
+    /// NB: The 0% and 100% positions never coincide: the host plans no such timeline, and `follow_layout` leaves one
+    ///     where they would.
+    fn progress_at(&self, position: f64) -> f64 {
+        let (cover_start, cover_end) = self.cover_range();
+        (position - cover_start) / (cover_end - cover_start) * 100.0
+    }
+}
+
+impl FfiPlannedScrollTimeline {
+    /// Where `scroll_offsets` scrolled the timeline's scroller to, or where the host laid it out without one for it, up
+    /// to the end of the scroll range: a tick's layout may have shrunk it before the compositor hears of that.
+    /// NB: A scroller that overflows towards its start, as with `direction: rtl`, scrolls to negative offsets.
+    fn position_in(&self, scroll_offsets: &[FfiScrollOffset]) -> f64 {
+        let position = scroll_offsets
+            .iter()
+            .find(|offset| offset.scroller == self.scroller)
+            .map_or(
+                self.scroll_offset,
+                |offset| {
+                    if self.vertical { offset.y } else { offset.x }
+                },
+            );
+        position.min(self.max_scroll_offset)
+    }
+
+    /// The progress, in percent, of the timeline at the scroll offset `position`.
+    fn progress_at(&self, position: f64) -> f64 {
+        if self.view.subject == 0 {
+            return position / self.max_scroll_offset * 100.0;
+        }
+        self.view.progress_at(position)
+    }
+
+    /// Has the timeline follow the layout `arena` holds, as a host's layout decides its next rendering update's
+    /// samples.
+    /// What makes the timeline inactive there leaves it where it was: the host decides that.
+    fn follow_layout(&mut self, arena: &LayoutNodeArena) {
+        let rows = arena.paintable_rows();
+        let scroller = StyleNodeID::from_raw(self.scroller_element)
+            .map_or_else(|| arena.layout_root(), |element| arena.bound_row(element));
+        let Some(overflow) = scrollable_overflow_rect(&rows, scroller) else {
+            return;
+        };
+        let content = committed_content_size(&rows, scroller);
+        let max_scroll_offset = match self.vertical {
+            true => overflow.height.to_double() - content.height.to_double(),
+            false => overflow.width.to_double() - content.width.to_double(),
+        };
+        if max_scroll_offset <= 0.0 {
+            return;
+        }
+        self.max_scroll_offset = max_scroll_offset;
+        let Some(subject) = StyleNodeID::from_raw(self.view.subject) else {
+            return;
+        };
+        let subject = arena.bound_row(subject);
+        if !rows.paintable_row_is_populated(subject) {
+            return;
+        }
+        let along = |rect: CssPixelRect| match self.vertical {
+            true => (rect.y.to_double(), rect.height.to_double()),
+            false => (rect.x.to_double(), rect.width.to_double()),
+        };
+        let mut view = self.view;
+        let (scrollport_start, scrollport_size) = along(absolute_padding_box_rect(&rows, scroller));
+        let (subject_start, subject_size) = along(absolute_border_box_rect(&rows, subject));
+        let resized_by = scrollport_size - view.scrollport_size;
+        view.scrollport_size = scrollport_size;
+        view.inset_start += view.inset_start_percentage / 100.0 * resized_by;
+        view.inset_end += view.inset_end_percentage / 100.0 * resized_by;
+        view.subject_offset = subject_start - scrollport_start;
+        view.subject_size = subject_size;
+        let (cover_start, cover_end) = view.cover_range();
+        if cover_start != cover_end {
+            self.view = view;
+        }
+    }
 }
 
 /// Where the compositor had scrolled the scroll node of an element, or of a document's viewport, by its unique node id,
@@ -114,10 +238,11 @@ impl ClockPlan {
         elements: Vec<StyleNodeID>,
         time_origin: f64,
         last_end: f64,
-        scroll_timelines: Vec<FfiPlannedScrollTimeline>,
+        mut scroll_timelines: Vec<FfiPlannedScrollTimeline>,
         round: ClockRound,
         hover: Option<hover::HoverPlan>,
     ) -> Self {
+        scroll_timelines.sort_unstable_by_key(|timeline| timeline.timeline);
         Self {
             elements,
             time_origin,
@@ -129,24 +254,24 @@ impl ClockPlan {
         }
     }
 
-    /// The progress of the scroll timelines where `scroll_offsets` scrolled their scrollers to, or where the host laid
-    /// out those it has none for.
-    fn scroll_progress(&self, scroll_offsets: &[FfiScrollOffset]) -> SmallVec<[ScrollProgress; 2]> {
+    /// Where `scroll_offsets` scrolled the scrollers of the scroll timelines to, or where the host laid out those it
+    /// has none for.
+    fn scroll_positions(&self, scroll_offsets: &[FfiScrollOffset]) -> SmallVec<[f64; 2]> {
         self.scroll_timelines
             .iter()
-            .map(|timeline| {
-                let progress = scroll_offsets
-                    .iter()
-                    .find(|offset| offset.scroller == timeline.scroller)
-                    .map_or(timeline.progress, |offset| {
-                        let position = if timeline.vertical { offset.y } else { offset.x };
-                        position / timeline.max_scroll_offset * 100.0
-                    });
-                ScrollProgress {
-                    scroller: timeline.scroller,
-                    vertical: timeline.vertical,
-                    progress,
-                }
+            .map(|timeline| timeline.position_in(scroll_offsets))
+            .collect()
+    }
+
+    /// The progress of the scroll timelines, sorted by timeline, with their scrollers at `positions`, as
+    /// `scroll_positions` gives them.
+    fn scroll_progress(&self, positions: &[f64]) -> SmallVec<[ScrollProgress; 2]> {
+        self.scroll_timelines
+            .iter()
+            .zip(positions)
+            .map(|(timeline, &position)| ScrollProgress {
+                timeline: timeline.timeline,
+                progress: timeline.progress_at(position),
             })
             .collect()
     }
@@ -166,6 +291,17 @@ impl ClockPlan {
         self.hover.is_some()
     }
 }
+
+/// How many frames after a scroll a tick's layout decides the next tick's scroll timelines, as a host's layout decides
+/// them in its next rendering update. Boxes an animation resizes may lay out so that no layout agrees with the progress
+/// it decides, as where text wraps at a width the progress crosses, and a host goes back and forth between the two with
+/// a rendering update's two rounds of layout showing only one of them. So the timelines stop following once the scroll
+/// stops, and hold still until the next scroll or the host's next plan, which is as far as the ticks settle them.
+const SETTLING_FRAMES_AFTER_A_SCROLL: u8 = 3;
+
+/// How far a scroller moves, in CSS pixels, before it counts as scrolled, past the difference between the fixed point
+/// offsets the host lays out and those the compositor holds.
+const SCROLL_POSITION_TOLERANCE: f64 = 0.05;
 
 /// The lane of a frame of a document the host presented, on the render owner: the fork of the render state its ticks
 /// write, the recording of the frame its last tick presented, which brings back the recorder state and presentation it
@@ -201,12 +337,18 @@ pub(crate) struct Lane {
     /// infinity for the lane's frame, and the progress at which it shows the plan's scroll timelines.
     shown_at: f64,
     shown_scroll_progress: SmallVec<[ScrollProgress; 2]>,
+    /// Where the scrollers of the plan's scroll timelines were at the latest tick.
+    scroll_positions: SmallVec<[f64; 2]>,
+    /// How many more frames the plan's scroll timelines follow the layout of, since a scroll moved them.
+    settling_frames: u8,
     /// Whether a tick found the lane could sample no more: past the animations' ends, or something only the host
     /// computes.
     parked: bool,
     /// Whether a tick left its frame to the host, after which the fork may hold what no frame the lane presented shows,
     /// such as visual contexts of another structure than the compositor has: the lane presents no other frame.
     frame_left_to_host: bool,
+    /// Whether a tick had a frame presented.
+    presented_a_tick: bool,
     /// What the lane's hover moved.
     hovered: hover::LaneHover,
     /// What the move a tick's hover made started, with the time it made it at, until the tick presents the frame that
@@ -215,6 +357,12 @@ pub(crate) struct Lane {
     /// Whether a move of the hover had boxes show the styles the host installed in them again in place of samples, which
     /// the tick shows again.
     samples_restored: bool,
+    /// The list a drag selection finds its caret positions in, for the frame whose items it holds.
+    selection_hit_test_list: Option<crate::painting::hit_test::HitTestList>,
+    /// What a drag selection owes the rows of the fork of `::selection` styles, once a tick asked.
+    selection_styles: Option<crate::css::style::drag_selection::SelectionStyles>,
+    /// Where the highlight the fork holds ends, if a tick moved it.
+    selection_focus_shown: Option<selection::Boundary>,
 }
 
 /// What the ticks of a lane write: the render state of the render owner while it still shows the lane's frame, which
@@ -224,7 +372,11 @@ pub(crate) struct Lane {
 pub(crate) enum LaneState {
     #[default]
     Shown,
-    Forked(super::RenderFork),
+    Forked {
+        fork: super::RenderFork,
+        /// Whether the host wrote the state since the lane forked it.
+        state_moved_on: bool,
+    },
     MovedOn,
 }
 
@@ -232,22 +384,50 @@ impl LaneState {
     /// Forks the render state of `document`, where it still shows the lane's frame.
     pub(super) fn fork(&mut self, document: DocumentId) {
         if matches!(self, Self::Shown) {
-            *self = Self::Forked(super::owner::with_state(document, None, |state| state.fork()));
+            *self = Self::Forked {
+                fork: super::owner::with_state(document, None, |state| state.fork()),
+                state_moved_on: false,
+            };
         }
     }
 
-    /// Notes that the render state no longer shows the lane's frame, where the lane did not fork it.
+    /// Notes that the render state no longer shows the lane's frame.
     pub(super) fn move_on(&mut self) {
-        if matches!(self, Self::Shown) {
-            *self = Self::MovedOn;
+        match self {
+            Self::Shown => *self = Self::MovedOn,
+            Self::Forked { state_moved_on, .. } => *state_moved_on = true,
+            Self::MovedOn => {}
+        }
+    }
+
+    /// Notes that a rendering update ended that presents no frame of its own, which leaves the render state showing the
+    /// lane's frame, with all the host wrote: the screen and the document have no other state than that. A fork from
+    /// before those writes shows what the document no longer is, and goes, for the next tick or the next task's first
+    /// write to fork the state again. Answers whether a fork went.
+    pub(super) fn rejoin_the_state(&mut self) -> bool {
+        match std::mem::take(self) {
+            Self::Forked {
+                fork,
+                state_moved_on: true,
+            } => {
+                super::owner::drop_after_hold(fork);
+                true
+            }
+            forked @ Self::Forked { .. } => {
+                *self = forked;
+                false
+            }
+            Self::Shown | Self::MovedOn => false,
         }
     }
 }
 
-/// What a tick of a lane did: the pointer move its hover took, if it took one, and whether it presented a frame.
+/// What a tick of a lane did: the pointer move its hover took, if it took one, whether it presented a frame, and
+/// whether the samples of animations or transitions it showed in that frame moved boxes.
 struct Ticked {
     hover_move: Option<LaneMove>,
     presented: bool,
+    sampled: bool,
 }
 
 /// A pointer move a tick of a lane took, which the host takes in.
@@ -274,6 +454,9 @@ pub(crate) struct ClockRecorder {
     pub(super) recorder: RecorderState,
     pub(super) presentation: Presentation,
     pub(super) presented: TickPresented,
+    /// The hit-test items of the frame a tick presented last. The recorder's stay those of the lane's frame, which every
+    /// tick's frame copies clean output from.
+    pub(super) presented_hit_test_items: Option<Arc<PublishedHitTestItems>>,
 }
 
 /// What the recording of a tick's frame presented.
@@ -284,9 +467,10 @@ pub(crate) enum TickPresented {
     Frame {
         output: Arc<RecordingOutput>,
         hit_test_list_changed: bool,
+        publishes: bool,
     },
     /// Nothing: the frame renders an SVG image the recording published last did not draw, which only the host renders,
-    /// and the lane samples no more.
+    /// or a recording of the host rewrote the paint-order tree the lane reads, and the lane samples no more.
     LeftToHost,
 }
 
@@ -304,7 +488,7 @@ impl crate::stage_thread::Flown for ClockRecorder {
 }
 
 /// The right to sample a frame of a document for the Paint thread to present. Only a tick of the render clock and the
-/// commit of a rendering update mint one, in the job the StyleLayout thread runs them in, so a job the host hands the
+/// commit of a rendering update mint one, in the job the Render thread runs them in, so a job the host hands the
 /// render owner to ask or write its render state cannot sample a frame.
 pub(crate) struct SamplingTurn(());
 
@@ -631,6 +815,13 @@ impl ClockTicks {
         self.pointer_state().moved(pointer, follows)
     }
 
+    /// Hands the lane that the pointer rests where an animation moves what is under it, which the next tick hovers
+    /// again, and answers what the lane wants next.
+    pub(super) fn pointer_rests_on_moving_content(&self) -> hover::PointerAnswer {
+        let follows = self.published().follows_pointer;
+        self.pointer_state().rests_on_moving_content(follows)
+    }
+
     /// Where the compositor said the pointer went last, beside the mouse event the host takes, if it said so.
     pub(super) fn newest_pointer(&self) -> Option<PendingPointer> {
         self.pointer_state().last()
@@ -667,6 +858,11 @@ impl ClockTicks {
     /// Hands the lane a pointer move, and ticks it at `frame_time_nanoseconds`. For a test.
     pub(super) fn inject_pointer(self: &Arc<Self>, pointer: PendingPointer, frame_time_nanoseconds: i64) {
         let _ = self.pointer_moved(pointer);
+        self.tick(frame_time_nanoseconds, &[]);
+    }
+
+    pub(super) fn inject_pointer_rest(self: &Arc<Self>, frame_time_nanoseconds: i64) {
+        let _ = self.pointer_rests_on_moving_content();
         self.tick(frame_time_nanoseconds, &[]);
     }
 
@@ -831,6 +1027,10 @@ impl Lane {
     /// those styles move for the round's tree build to build again. An element whose animations `animated` samples
     /// composes over its host's style, which only the host restyles.
     fn restyle_size_query_dependents(&mut self, state: &mut RenderState, resized: &[StyleNodeID]) -> Result<(), Park> {
+        // NB: What a hover left to the host is pending on this fork, whose elements no record can be derived below.
+        if !state.engine_mut().takes_hover_transactions() {
+            return Err(Park("a hover left a restyle to the host"));
+        }
         // An element whose box shows a sample, or what it inherits of one, shows it over the record the host installed,
         // which a restyle would replace.
         let animated: SmallVec<[StyleNodeID; 8]> = self
@@ -1089,7 +1289,8 @@ impl Drop for Lane {
 impl Lane {
     /// A lane whose ticks record and present with `recorder`, follow `plan`, and write what `state` says.
     fn new(recorder: ClockRecorder, plan: ClockPlan, state: LaneState) -> Self {
-        let shown_scroll_progress = plan.scroll_progress(&[]);
+        let scroll_positions = plan.scroll_positions(&[]);
+        let shown_scroll_progress = plan.scroll_progress(&scroll_positions);
         let parked = !plan.animates();
         Self {
             recording: TickRecording(Riding::landed(recorder)),
@@ -1106,11 +1307,17 @@ impl Lane {
             scroll_offsets: Vec::new(),
             shown_at: f64::NEG_INFINITY,
             shown_scroll_progress,
+            scroll_positions,
+            settling_frames: 0,
             parked,
             frame_left_to_host: false,
+            presented_a_tick: false,
             hovered: hover::LaneHover::default(),
             unshown_move: None,
             samples_restored: false,
+            selection_hit_test_list: None,
+            selection_styles: None,
+            selection_focus_shown: None,
         }
     }
 
@@ -1123,6 +1330,28 @@ impl Lane {
     /// frame it was presented with, and the hovers the host took in.
     fn samples_nothing(&self) -> bool {
         self.ticked.is_empty() && self.effects.iter().all(effects::ElementEffects::is_host)
+    }
+
+    /// Has the lane go on from the render state as a rendering update that presents no frame of its own left it, where
+    /// no tick showed a sample in a box of its fork. What the hover installed in that fork goes with it.
+    fn rejoin_the_state(&mut self) {
+        if self.samples_nothing() && self.state.rejoin_the_state() {
+            self.hovered.installs.clear();
+            self.selection_focus_shown = None;
+            // The compositor shows visual contexts of what the ticks presented, which the state the lane rejoins may not
+            // have the structure of.
+            if self.presented_a_tick {
+                self.leave_frame_to_host();
+            }
+        }
+    }
+
+    /// Has the lane present no other frame: the frame is the host's.
+    fn leave_frame_to_host(&mut self) {
+        self.parked = true;
+        self.frame_left_to_host = true;
+        self.hovered.park();
+        self.forget_unshown_move();
     }
 
     /// Has the lane follow no plan, as a rendering update that sealed none leaves it: it ticks nothing until the plan of
@@ -1139,8 +1368,15 @@ impl Lane {
     /// one it followed.
     fn replan(&mut self, plan: ClockPlan) {
         self.parked = !plan.animates();
-        self.shown_scroll_progress = plan.scroll_progress(&[]);
+        self.scroll_positions = plan.scroll_positions(&[]);
+        self.shown_scroll_progress = plan.scroll_progress(&self.scroll_positions);
+        self.settling_frames = 0;
         self.shown_at = f64::NEG_INFINITY;
+        self.selection_focus_shown = None;
+        self.selection_styles = None;
+        if plan.hover.as_ref().is_none_or(|hover| hover.selection_drag().is_none()) {
+            self.selection_hit_test_list = None;
+        }
         self.replan_host_effects(&plan.elements);
         self.plan = plan;
     }
@@ -1167,16 +1403,33 @@ impl Lane {
         pointer: Option<PendingPointer>,
         samples_animations: bool,
     ) -> Option<Ticked> {
-        let mut fork = match std::mem::take(&mut self.state) {
-            LaneState::Forked(fork) => fork,
+        let (mut fork, state_moved_on) = match std::mem::take(&mut self.state) {
+            LaneState::Forked { fork, state_moved_on } => (fork, state_moved_on),
             state => {
                 self.state = state;
                 return None;
             }
         };
         let ticked = self.tick(&mut fork, frame_time_nanoseconds, pointer, samples_animations);
-        self.state = LaneState::Forked(fork);
+        fork.engine_mut().free_style_records_after_tick();
+        self.state = LaneState::Forked { fork, state_moved_on };
         Some(ticked)
+    }
+
+    /// Shows the cursor of what is under `pointer` in the frame the screen shows at `frame_time_nanoseconds`, on the
+    /// lane's fork, as a tick that may present nothing would (see [`Lane::show_cursor_only`]). Answers the move it
+    /// leaves to the host, or none where the lane has no fork to hit test on.
+    fn show_cursor_on_fork(&mut self, frame_time_nanoseconds: i64, pointer: PendingPointer) -> Option<LaneMove> {
+        let (mut fork, state_moved_on) = match std::mem::take(&mut self.state) {
+            LaneState::Forked { fork, state_moved_on } => (fork, state_moved_on),
+            state => {
+                self.state = state;
+                return None;
+            }
+        };
+        let left_to_host = self.show_cursor_only(&mut fork, pointer, frame_time_nanoseconds);
+        self.state = LaneState::Forked { fork, state_moved_on };
+        Some(left_to_host)
     }
 
     fn tick(
@@ -1193,7 +1446,14 @@ impl Lane {
         let mut ticked = Ticked {
             hover_move: None,
             presented: false,
+            sampled: false,
         };
+        // A parked hover, or a frame left to the host, hovers nothing: the cursor follows the pointer all the same.
+        if let Some(pointer) = pointer
+            && (hovers.is_none() || self.frame_left_to_host)
+        {
+            ticked.hover_move = Some(self.show_cursor_only(state, pointer, frame_time_nanoseconds));
+        }
         if self.frame_left_to_host || (!samples_animations && hovers.is_none() && !transitions) {
             return ticked;
         }
@@ -1210,12 +1470,26 @@ impl Lane {
         state.engine_mut().lend_tick_shown(std::mem::take(&mut self.shown));
         self.refresh_host_effect_timings(state);
         let mut moved = false;
+        let mut sampled = false;
         if transitions {
             // NB: Transitions a tick left to the host keep what their boxes showed, beside what the others moved.
-            moved |= self.sample_started_transitions(state, sampled_at.0).unwrap_or(true);
+            sampled |= self.sample_started_transitions(state, sampled_at.0).unwrap_or(true);
+            moved |= sampled;
         }
-        if let Some(pointer) = hovers {
-            let hovered = self.hover(state, pointer, sampled_at.0);
+        let drags = hovers.filter(|pointer| pointer.holds_the_primary_button() && self.selection_drag().is_some());
+        if let Some(pointer) = drags {
+            moved |= self.extend_selection(state, pointer, frame_time_nanoseconds);
+            // The host hovers what is under the pointer as it handles the move, as for any move with a button held.
+            ticked.hover_move = Some(LaneMove {
+                input_event_id: pointer.input_event_id,
+                target: None,
+                handed: false,
+            });
+        } else if let Some(pointer) = hovers {
+            if !pointer.holds_the_primary_button() {
+                self.end_selection_drag();
+            }
+            let hovered = self.hover(state, pointer, sampled_at.0, frame_time_nanoseconds);
             ticked.hover_move = Some(LaneMove {
                 input_event_id: pointer.input_event_id,
                 target: match hovered {
@@ -1238,15 +1512,15 @@ impl Lane {
                         false => Ok(false),
                     });
                 match shown {
-                    Ok(sampled) => moved |= sampled,
+                    Ok(transitions_moved) => {
+                        moved |= transitions_moved;
+                        sampled |= transitions_moved;
+                    }
                     Err(Park(reason)) => {
                         if hover::logs_hover() {
                             eprintln!("{} hover lane: frame left to the host: {reason}", hover::log_time());
                         }
-                        self.parked = true;
-                        self.frame_left_to_host = true;
-                        self.hovered.park();
-                        self.forget_unshown_move();
+                        self.leave_frame_to_host();
                     }
                 }
             }
@@ -1262,6 +1536,7 @@ impl Lane {
             match self.sample_host_animations(state, samples) {
                 Ok(()) => {
                     moved = true;
+                    sampled = true;
                     self.shown_at = sampled_at.0;
                     self.shown_scroll_progress = progress;
                 }
@@ -1284,15 +1559,13 @@ impl Lane {
                         );
                     }
                     ticked.presented = true;
+                    ticked.sampled = sampled;
                 }
                 Err(Park(reason)) => {
                     if hover::logs_hover() {
                         eprintln!("{} hover lane: frame left to the host: {reason}", hover::log_time());
                     }
-                    self.parked = true;
-                    self.frame_left_to_host = true;
-                    self.hovered.park();
-                    self.forget_unshown_move();
+                    self.leave_frame_to_host();
                 }
             }
         }
@@ -1304,8 +1577,18 @@ impl Lane {
     /// The progress of the scroll timelines a tick samples the plan's animations at, or none where a frame that showed
     /// the document timeline's animations ended shows them already and nothing scrolled since. The ticks go on past the
     /// events of the animations, which the host sends as it gets to them.
-    fn sample_progress(&self) -> Option<SmallVec<[ScrollProgress; 2]>> {
-        let scroll_progress = self.plan.scroll_progress(&self.scroll_offsets);
+    fn sample_progress(&mut self) -> Option<SmallVec<[ScrollProgress; 2]>> {
+        let positions = self.plan.scroll_positions(&self.scroll_offsets);
+        let scrolled = positions
+            .iter()
+            .zip(&self.scroll_positions)
+            .any(|(position, last)| (position - last).abs() > SCROLL_POSITION_TOLERANCE);
+        // NB: What a slow scroll moves per frame adds up to a scroll, so the positions stay until it does.
+        if scrolled {
+            self.settling_frames = SETTLING_FRAMES_AFTER_A_SCROLL;
+            self.scroll_positions = positions.clone();
+        }
+        let scroll_progress = self.plan.scroll_progress(&positions);
         if self.shown_at >= self.plan.last_end && scroll_progress == self.shown_scroll_progress {
             return None;
         }
@@ -1410,6 +1693,7 @@ impl Lane {
                 self.recording = TickRecording(crate::paint_stage::ride_presenting(frame, move |frame, presenting| {
                     clock_recorder.record(frame, presenting)
                 }));
+                self.presented_a_tick = true;
             }
             Err(park) => {
                 self.recording = TickRecording(Riding::landed(clock_recorder));
@@ -1480,13 +1764,17 @@ impl Lane {
                 if row.is_invalid() || !arena.slot_is_live(row) {
                     return None;
                 }
-                let payloads = arena.style_payloads(row)?;
-                let color = crate::layout::ComputedValuesView::new(&payloads.groups)
-                    .inherited_text()
-                    .color;
+                let payloads = arena.style_view(row)?;
+                let color = payloads.inherited_text().color;
                 Some((element, generated_for, color))
             })
         }));
+        if self.settling_frames > 0 {
+            self.settling_frames -= 1;
+            for timeline in &mut self.plan.scroll_timelines {
+                timeline.follow_layout(arena);
+            }
+        }
         Ok(())
     }
 }
@@ -1505,8 +1793,9 @@ fn freeze_tick_frame(
         TickPresented::Frame {
             output,
             hit_test_list_changed,
+            publishes,
         } => {
-            take_in_recording(arena, output, hit_test_list_changed, true);
+            take_in_recording(arena, output, hit_test_list_changed, publishes);
         }
         TickPresented::LeftToHost => return Err(Park("the host presents the frame")),
     }
@@ -1515,6 +1804,13 @@ fn freeze_tick_frame(
         return Err(Park("a trace reads the recording"));
     }
     let visual_contexts = prepare_for_clock_tick(arena, viewport)?;
+    // A tick's frame copies from the lane's own, and its damage stays: the whole document would record again on every tick.
+    if arena.paint_damage_covers_everything()
+        || arena.scroll_metadata_damaged_everywhere()
+        || recorder.published_recording.is_none()
+    {
+        return Err(Park("the whole document records again"));
+    }
     let inputs = recorder
         .published_inputs
         .take()
@@ -1522,7 +1818,7 @@ fn freeze_tick_frame(
     let frame_inputs = FrameInputs {
         viewport,
         css_viewport_rect: inputs.css_viewport_rect,
-        publishes_recording: true,
+        publishes_recording: false,
         published_root_background_canvas_rect: recorder
             .published_recording
             .as_ref()
@@ -1544,46 +1840,56 @@ impl ClockRecorder {
     /// Paint thread. Only the host renders an SVG image: the frame draws those the recording published last drew, as the
     /// host rendered them for it, and leaves the frame to the host where it draws another.
     fn record(mut self, frame: SampledFrame<RecordedFrame>, presenting: &mut Presenting) -> Self {
-        let Self {
-            recorder,
-            presentation,
-            presented,
-        } = &mut self;
+        debug_assert!(self.recorder.paint_order_tree.is_reader());
+        if !self.recorder.paint_order_tree.reads_current_tree() {
+            self.leave_frame_to_host();
+            return self;
+        }
         let SampledFrame(RecordedFrame {
             frozen,
             viewport,
             inputs,
             visual_contexts,
         }) = frame;
-        let (pending, _) = record_frame(frozen.frame, recorder, viewport, false, inputs);
+        let (pending, _) = record_frame(frozen.frame, &mut self.recorder, viewport, false, inputs);
         let vector_image_display_lists = match renders_vector_images(&pending) {
-            true => match published_vector_image_display_lists(&pending, recorder) {
+            true => match published_vector_image_display_lists(&pending, &self.recorder) {
                 Some(display_list_ids) => Some(display_list_ids),
                 None => {
-                    // The recording wrote the paint-order tree, which no longer describes the recording published last.
-                    recorder.forget_published_recording();
-                    *presented = TickPresented::LeftToHost;
+                    self.leave_frame_to_host();
                     return self;
                 }
             },
             false => None,
         };
         if let Some(visual_contexts) = visual_contexts {
-            presentation.take_visual_context_tree(visual_contexts);
+            self.presentation.take_visual_context_tree(visual_contexts);
         }
         let output = match vector_image_display_lists {
-            Some(display_list_ids) => {
-                present_with_vector_images(presentation, pending, recorder, presenting, &display_list_ids)
-            }
-            None => present(presentation, pending, recorder, presenting),
+            Some(display_list_ids) => present_with_vector_images(
+                &mut self.presentation,
+                pending,
+                &self.recorder,
+                presenting,
+                &display_list_ids,
+            ),
+            None => present(&mut self.presentation, pending, &self.recorder, presenting),
         };
-        take_in_published_output(recorder, &mut None, output, true, |output, hit_test_list_changed| {
-            *presented = TickPresented::Frame {
-                output,
-                hit_test_list_changed,
-            };
-        });
+        let output = PresentedOutput::of(output);
+        self.presented_hit_test_items = Some(output.published_hit_test_items());
+        self.presented = TickPresented::Frame {
+            output: output.output,
+            hit_test_list_changed: true,
+            publishes: false,
+        };
         self
+    }
+
+    /// Leaves the frame to the host, which a lane that presents no other frame finds no more items to hit test.
+    fn leave_frame_to_host(&mut self) {
+        self.recorder.published_hit_test_items = None;
+        self.presented_hit_test_items = None;
+        self.presented = TickPresented::LeftToHost;
     }
 }
 
@@ -1622,7 +1928,7 @@ pub extern "C" fn document_host_drop_clock_plan(host: &DocumentHost, update: u64
 /// stand, and the lanes' hover goes on.
 #[unsafe(no_mangle)]
 pub extern "C" fn document_host_note_animation_change(host: &DocumentHost) {
-    host.clock_ticks().note_animation_change();
+    host.note_animation_change();
 }
 
 /// Takes in what the lanes of `host`'s document did, as a rendering update begins, and answers whether a tick of a lane
@@ -1635,6 +1941,21 @@ pub extern "C" fn document_host_note_animation_change(host: &DocumentHost) {
 #[unsafe(no_mangle)]
 pub extern "C" fn document_host_take_clock_lanes_in(host: &DocumentHost, update: u64, outer_input_event: u64) -> bool {
     host.take_clock_lanes_in(update, outer_input_event)
+}
+
+/// Forgets where the compositor said the pointer of `host`'s document went: the lanes of the next document hear of no
+/// move before one of its own. For a test, whose documents follow each other with the pointer where the last left it.
+#[unsafe(no_mangle)]
+pub extern "C" fn document_host_forget_pointer_for_testing(host: &DocumentHost) {
+    host.clock_ticks().pointer_state().forget();
+}
+
+/// Takes in what the lanes of `host`'s document did, as a task between two rendering updates handles a press, and
+/// answers as [`document_host_take_clock_lanes_in`] does. No frame of the host's follows yet, so the lanes tick on.
+/// `outer_input_event` is as there.
+#[unsafe(no_mangle)]
+pub extern "C" fn document_host_take_in_what_clock_lanes_did(host: &DocumentHost, outer_input_event: u64) -> bool {
+    host.take_in_what_clock_lanes_did(outer_input_event)
 }
 
 /// Whether the lanes of `host`'s document may hover or run transitions beside the tasks: the last plan the host sealed for
@@ -1740,7 +2061,7 @@ pub extern "C" fn document_host_clock_lane_is_coming(host: &DocumentHost) -> boo
 }
 
 /// Hands the lanes of `host`'s document a tick at `frame_time_nanoseconds`, at which the compositor had scrolled to
-/// `scroll_offset`, if not null, and waits until the StyleLayout thread has run the jobs handed to it before, the tick
+/// `scroll_offset`, if not null, and waits until the Render thread has run the jobs handed to it before, the tick
 /// among them, and the Paint thread the recording of the frame the tick presents. For a test, whose clock ticks only
 /// where it injects them.
 #[unsafe(no_mangle)]
@@ -1756,7 +2077,7 @@ pub extern "C" fn document_host_inject_clock_tick(
 }
 
 /// Waits until the Paint thread has run the jobs handed to it before, where a test holds no recording on it, then the
-/// StyleLayout thread, and the Paint thread again: the lane of a frame presented by then has come together, and the
+/// Render thread, and the Paint thread again: the lane of a frame presented by then has come together, and the
 /// frames ticks recorded were presented. For a test.
 pub(super) fn settle_lanes_for_testing() {
     let settle_paint = || {
@@ -1820,6 +2141,29 @@ pub extern "C" fn document_host_presented_compositor_animation_count(
     };
     *count = presented;
     true
+}
+
+/// Calls `push` with `context` for every node the selection highlights, in the state the host paints, or where
+/// `presented`, in the fork the lane of `host`'s document shows, if it has one: the node's style node, its selection
+/// state, where the selection starts and ends, and the background and text colors of its `::selection` styles. For a
+/// test.
+#[unsafe(no_mangle)]
+pub extern "C" fn document_host_selection_for_testing(
+    host: &DocumentHost,
+    presented: bool,
+    context: *mut std::ffi::c_void,
+    push: extern "C" fn(*mut std::ffi::c_void, u32, u8, usize, usize, u32, u32),
+) {
+    let document = host.clock_ticks().document;
+    let rows = super::on_render_side(0, move || {
+        presented
+            .then(|| lane::selection_shown_for_testing(document))
+            .flatten()
+            .unwrap_or_else(|| super::owner::with_state(document, None, |state| selection::rows_for_testing(state)))
+    });
+    for (node, state, start, end, background, text) in rows {
+        push(context, node, state, start, end, background, text);
+    }
 }
 
 /// Writes the opacity the effect nodes of the box of `element` gave it in the last frame a tick of a lane of `host`'s

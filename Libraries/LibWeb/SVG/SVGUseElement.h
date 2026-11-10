@@ -29,6 +29,7 @@ public:
     void svg_element_changed(SVGElement&);
     void svg_element_changed_before_parsing_complete(SVGElement&);
     void svg_element_removed(SVGElement&);
+    void element_instance_changed(Badge<SVGElement>);
 
     // AD-HOC: The spec states that the x, y, width and height IDL attributes reflect the respective computed values and their
     //         corresponding presentation attributes but other browsers reflect the attribute values instead - see
@@ -63,15 +64,23 @@ private:
 
     virtual CSS::ElementBoxKind box_kind() const override;
 
+    virtual bool needs_preparation_for_style_computation() const override { return m_reclone_pending; }
+    virtual void prepare_for_style_computation() override;
+
     void process_the_url(Optional<Utf16String> const& href);
     Optional<Utf16String> href_value() const;
+    DOM::Document const& document_containing_reference() const;
 
     GC::Ptr<DOM::Element> referenced_element() const;
 
     void fetch_the_document(URL::URL const& url);
+    void discard_the_url();
+    void stop_using_resource_request();
     bool is_referenced_element_same_document() const;
 
+    void request_reclone();
     void clone_element_tree_as_our_shadow_tree(GC::Ptr<Element> to_clone);
+    static void link_to_corresponding_elements(SVGElement& instance, SVGElement& original);
     bool is_valid_reference_element(Element const& reference_element) const;
     bool would_create_circular_reference(Element const& target) const;
     bool would_create_circular_reference_impl(Element const& target, GC::HeapHashTable<GC::Ref<Element const>>& visited) const;
@@ -79,11 +88,13 @@ private:
     void unregister_for_referenced_element_changes();
 
     bool m_needs_parsing_complete_reclone { false };
+    bool m_reclone_pending { false };
 
     Optional<URL::URL> m_href;
 
     GC::Ptr<DOM::DocumentObserver> m_document_observer;
     GC::Ptr<HTML::SharedResourceRequest> m_resource_request;
+    Optional<u64> m_resource_request_callbacks_id;
     Optional<DOM::DocumentLoadEventDelayer> m_load_event_delayer;
 
     IntrusiveListNode<SVGUseElement> m_list_node;

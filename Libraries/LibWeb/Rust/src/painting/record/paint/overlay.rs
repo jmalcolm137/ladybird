@@ -30,11 +30,11 @@ pub(crate) fn paint_overlay<O: Observer>(recorder: &mut PaintRecorder<'_, O>, pa
     let chrome_geometry = ChromeGeometry::for_recording(recorder.source, recorder.inputs);
     let style = recorder.source.node_style_if_live(paintable);
     let paints_scrollbars = style.is_some_and(|style| {
-        !is_viewport && style.misc_reset().scrollbar_width != crate::css::css_enums::scrollbar_width::NONE
+        !is_viewport && style.misc_interaction().scrollbar_width != crate::css::css_enums::scrollbar_width::NONE
     });
 
     if paints_scrollbars {
-        let (thumb_color, track_color) = scrollbar_colors_for_paint(
+        let colors = scrollbar_colors_for_paint(
             recorder.source,
             paintable,
             recorder.inputs.uncaptured.root_background_source,
@@ -54,11 +54,7 @@ pub(crate) fn paint_overlay<O: Observer>(recorder: &mut PaintRecorder<'_, O>, pa
                 .compute_scrollbar_data(paintable, direction, true)
                 .map(|expanded| expanded.gutter_rect)
                 .unwrap_or_default();
-            recorder.record_compositor_scrollbar_painted_by_display_list(
-                paintable,
-                direction,
-                (thumb_color, track_color),
-            );
+            recorder.record_compositor_scrollbar_painted_by_display_list(paintable, direction, colors);
             recorder.recorder.paint_scrollbar(
                 scroll_node_index,
                 converter.rounded_device_rect(scrollbar.gutter_rect),
@@ -66,8 +62,9 @@ pub(crate) fn paint_overlay<O: Observer>(recorder: &mut PaintRecorder<'_, O>, pa
                 converter.rounded_device_rect(scrollbar.track_rect),
                 converter.rounded_device_rect(expanded_gutter_rect),
                 scrollbar.thumb_travel_to_scroll_ratio.to_double(),
-                thumb_color,
-                track_color,
+                colors.thumb,
+                colors.thumb_outline,
+                colors.track,
                 direction == ScrollDirection::Vertical,
                 ForceDarkRole::Background,
             );

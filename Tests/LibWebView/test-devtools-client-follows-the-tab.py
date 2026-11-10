@@ -118,14 +118,17 @@ class DevToolsClient:
         watcher = self.receive_matching(lambda packet: packet.get("from") == tab and "actor" in packet)["actor"]
         self.send({"to": watcher, "type": "watchTargets", "targetType": "frame"})
         self.follow_frame_target()
+        return watcher
 
     def follow_frame_target(self):
         self.receive_matching(lambda packet: packet.get("type") == "target-available-form")
 
-    def evaluate(self, script):
-        # A target switch between choosing the console and its answer loses the request: the old console is gone (an
-        # unknownActor error naming it, with no resultID) or drops its pending result. Ask the new target's console
-        # again then. An error for an earlier console is stale, and passes by.
+    def submit(self, script):
+        # Hands the script to the current target's console, and returns that console and the script's resultID once the
+        # console accepts it. Each request gets one answer: a resultID, or an unknownActor error naming the console if a
+        # target switch removed it first. Only the error means the request was lost, so ask the new target's console
+        # again then. A target switch alone doesn't: The old console stays registered until a deferred task removes it,
+        # so it may still accept a request that arrives after the switch. An error for an earlier console is stale.
         def unknown_actor(packet, console):
             return packet.get("error") == "unknownActor" and console in packet.get("message", "")
 
@@ -134,16 +137,19 @@ class DevToolsClient:
             self.send({"to": console, "type": "evaluateJSAsync", "text": script})
             packet = self.receive_matching(
                 lambda packet, console=console: (
-                    (packet.get("from") == console and "resultID" in packet)
-                    or unknown_actor(packet, console)
-                    or self.console != console
+                    (packet.get("from") == console and "resultID" in packet) or unknown_actor(packet, console)
                 )
             )
-            if unknown_actor(packet, console) and self.console == console:
+            if "resultID" in packet:
+                return console, packet["resultID"]
+            if self.console == console:
                 self.follow_frame_target()
-            if self.console != console:
-                continue
-            result_id = packet["resultID"]
+
+    def evaluate(self, script):
+        # A console that a target switch destroys after accepting the script drops its pending result, so evaluate the
+        # script again in the new target's console then.
+        while True:
+            console, result_id = self.submit(script)
             result = self.receive_matching(
                 lambda packet, console=console, result_id=result_id: (
                     (packet.get("type") == "evaluationResult" and packet.get("resultID") == result_id)
@@ -236,7 +242,8 @@ def assert_page_survives_disconnects(devtools_port, path, load):
     client = DevToolsClient(devtools_port)
     try:
         client.watch_frame_targets()
-        assert client.evaluate("window.load") == load
+        page_load = client.evaluate("window.load")
+        assert page_load == load, f"window.load is {page_load!r}"
     finally:
         client.close()
     assert load_count(path) == load, f"{path} was loaded {load_count(path)} times"
@@ -251,8 +258,12 @@ def test_cross_site_navigation(ladybird_binary, profile, server):
             wait_for_page(client, source_url, "/source")
             client.watch_frame_targets()
 
-            # A cross-site navigation moves the tab into a page of another process.
-            client.evaluate(f"setTimeout(() => location.href = {json.dumps(target_url)}, 0)")
+            # A cross-site navigation moves the tab into a page of another process. Don't wait for its result: The
+            # navigation is what switches the target, so evaluate() would see the result lost, and run the navigation
+            # a second time. But the source page's own load can still finish and switch the target before the request
+            # arrives, so it needs submit() to hand it to a live console.
+            navigate = f"setTimeout(() => location.href = {json.dumps(target_url)}, 0)"
+            client.submit(navigate)
             wait_for_page(client, target_url, "/target")
         finally:
             client.close()
@@ -275,10 +286,11 @@ def test_crash_recovery(ladybird_binary, profile, server):
 
             # The headless browser restores the crashed tab into a page of a new process, and the client inspects
             # that page's document once it's active.
-            panic = "internals.panicRenderStateForTesting()"
-            client.send({"to": client.console, "type": "evaluateJSAsync", "text": panic})
-            client.follow_frame_target()
-            assert client.evaluate("window.load") == 2
+            # A target switch can remove the console before the crash request reaches it, and the server then drops
+            # the request: submit() asks the new target's console again, until one accepts it.
+            client.submit("internals.panicRenderStateForTesting()")
+            # A target form for the crashed page itself can still arrive first.
+            wait_until("the client inspects the restored page", lambda: client.evaluate("window.load") == 2)
         finally:
             client.close()
 

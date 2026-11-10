@@ -51,6 +51,8 @@ pub struct GcLayout {
     pub heap_allocated_bytes_since_last_gc_offset: u32,
     pub heap_gc_bytes_threshold_offset: u32,
     pub heap_total_allocated_bytes_offset: u32,
+    pub block_size: u32,
+    pub block_foreign_type_offset: u32,
     pub heap_region_offset_mask: u64,
     pub primitive_storage_cage_offset_mask: u64,
 }
@@ -71,8 +73,12 @@ pub struct PrimitiveStorageLayout {
 pub struct GcInterface {
     pub heap: *mut c_void,
     pub gc_get_layout: unsafe extern "C" fn(layout: *mut GcLayout),
-    pub gc_allocator_create:
-        unsafe extern "C" fn(type_info: *const CellTypeInfo, name: *const c_char, name_length: usize) -> *mut c_void,
+    pub gc_allocator_create: unsafe extern "C" fn(
+        type_info: *const CellTypeInfo,
+        name: *const c_char,
+        name_length: usize,
+        foreign_type: *const c_void,
+    ) -> *mut c_void,
     pub gc_heap_allocate_cell:
         unsafe extern "C" fn(heap: *mut c_void, allocator: *mut c_void, must_mark: *mut bool) -> *mut c_void,
     pub gc_heap_defer_gc: unsafe extern "C" fn(heap: *mut c_void),
@@ -82,7 +88,6 @@ pub struct GcInterface {
     pub gc_root_create: unsafe extern "C" fn(cell: *mut c_void) -> *mut c_void,
     pub gc_root_destroy: unsafe extern "C" fn(root: *mut c_void),
     pub gc_visitor_visit_cell: unsafe extern "C" fn(visitor: *mut c_void, cell: *mut c_void),
-    pub gc_visitor_visit_possible_values: unsafe extern "C" fn(visitor: *mut c_void, data: *const u8, size: usize),
     pub gc_primitive_storage_reserve: unsafe extern "C" fn(
         size: usize,
         capacity: usize,
@@ -197,7 +202,7 @@ struct Allocators {
     entities: Vec<*mut c_void>,
 }
 
-// The allocators are only handles, which LibGC only uses from the thread of the heap it allocates from.
+// The allocators are only handles: LibGC never changes them, and keeps what it allocates with in each heap.
 unsafe impl Send for Allocators {}
 unsafe impl Sync for Allocators {}
 
@@ -270,7 +275,7 @@ impl Allocators {
     fn new(interface: &GcInterface) -> Self {
         let create = |cell_type: CellType| {
             let (info, name) = type_info(cell_type);
-            unsafe { (interface.gc_allocator_create)(info, name.as_ptr().cast(), name.len()) }
+            unsafe { (interface.gc_allocator_create)(info, name.as_ptr().cast(), name.len(), core::ptr::null()) }
         };
         Self {
             objects: (0..OBJECT_DATA_SIZE_CLASSES.len())
@@ -477,17 +482,7 @@ impl Visitor {
         if reference == 0 || reference & 1 != 0 {
             return;
         }
-        if reference & 3 == 2 {
-            // An embedder's host value, which LibGC only follows if it points into a cell.
-            unsafe {
-                ((*self.interface).gc_visitor_visit_possible_values)(
-                    self.raw,
-                    (&raw const reference).cast(),
-                    size_of::<u64>(),
-                );
-            }
-            return;
-        }
-        self.visit_cell(reference as *mut u8);
+        // NB: An embedder's host value is the address of one of its cells, with bit 1 set.
+        self.visit_cell((reference & !3) as *mut u8);
     }
 }

@@ -27,7 +27,7 @@
 #include <LibWeb/Loader/FileRequest.h>
 #include <LibWeb/Page/Page.h>
 #include <LibWeb/Platform/Timer.h>
-#include <LibWeb/StorageAPI/StorageAreaMirror.h>
+#include <LibWeb/StorageAPI/StorageAreaMirrorClient.h>
 #include <LibWebCommon/CSS/PreferredColorScheme.h>
 #include <LibWebCommon/CSS/PreferredContrast.h>
 #include <LibWebCommon/CSS/PreferredMotion.h>
@@ -72,11 +72,12 @@ public:
     void did_destroy_compositor_context(Web::CompositorContextId);
 
     Function<void(IPC::TransportHandle const&, Optional<int> client_id, Optional<Utf16String> const& top_level_site)> on_request_server_connection;
-    Function<void(IPC::TransportHandle const&)> on_image_decoder_connection;
 
     // Asks the Browser to spawn this process's MediaServer if it has none, and to connect a client to it.
     ErrorOr<NonnullOwnPtr<IPC::Transport>> request_media_server_transport();
     ErrorOr<NonnullOwnPtr<IPC::Transport>> request_audio_server_transport();
+    ErrorOr<NonnullOwnPtr<IPC::Transport>> request_webrtc_client_transport();
+    ErrorOr<NonnullOwnPtr<IPC::Transport>> request_image_decoder_transport();
 
     // Null outside test mode: the UI process connects the test endpoint only when it runs tests.
     TestConnection* test_connection();
@@ -96,13 +97,15 @@ private:
     virtual void initialize(Web::PageId initial_page_id, Vector<Web::HTML::RemoteNavigableDescriptor> remote_navigables, Web::HTML::CrossProcessId root_navigable_id, Web::HTML::CrossProcessIdAllocator cross_process_id_allocator, Web::HTML::SessionHistoryEntryDescriptor initial_history_entry, Web::HTML::CrossProcessId initial_document_id, Web::HTML::VisibilityState system_visibility_state) override;
     virtual void create_representing_page(Web::PageId page_id, Vector<Web::HTML::RemoteNavigableDescriptor> remote_navigables) override;
     virtual void create_embedded_page(Web::PageId page_id, Vector<Web::HTML::RemoteNavigableDescriptor> remote_navigables, Web::HTML::CrossProcessId root_navigable_id, Web::HTML::SessionHistoryEntryDescriptor initial_history_entry, Web::HTML::VisibilityState system_visibility_state) override;
-    virtual void continue_history_navigation_population(Web::PageId page_id, Web::HTML::CrossProcessId operation_id, Web::HTML::SessionHistoryEntryDescriptor target_entry, Optional<Web::Bindings::NavigationType>, bool ongoing_navigation_is_traversal, Web::HTML::HistoryNavigationPopulation) override;
+    virtual void continue_history_navigation_population(Web::PageId page_id, Web::HTML::CrossProcessId operation_id, Web::HTML::HistoryNavigationPopulation) override;
+    virtual void populate_history_entry_document(Web::PageId page_id, Web::HTML::CrossProcessId operation_id, Web::HTML::SessionHistoryEntryDescriptor target_entry, Optional<Web::Bindings::NavigationType>, bool ongoing_navigation_is_traversal, Web::HTML::HistoryNavigationPopulation) override;
     virtual void insert_remote_navigable(Web::PageId page_id, Web::HTML::RemoteNavigableDescriptor) override;
     virtual void remove_remote_navigable(Web::PageId page_id, Web::HTML::CrossProcessId navigable_id) override;
     virtual void update_remote_navigable(Web::PageId page_id, Web::HTML::CrossProcessId navigable_id, Web::HTML::ReplicatedNavigableState) override;
     virtual void content_navigable_completely_finished_loading(Web::PageId page_id, Web::HTML::CrossProcessId navigable_id) override;
     virtual void update_local_root_container_state(Web::PageId page_id, Web::HTML::CrossProcessId navigable_id, Web::HTML::ReplicatedContainerState) override;
     virtual void close_server() override;
+    virtual void start_worker_thread(IPC::TransportHandle worker_transport, Web::HTML::AgentType agent_type) override;
     virtual Messages::WebContentServer::GetWindowHandleResponse get_window_handle(Web::PageId page_id) override;
     virtual void set_window_handle(Web::PageId page_id, String handle) override;
     virtual void run_webdriver_command(Web::PageId page_id, u64 command_id, Optional<Web::HTML::CrossProcessId> navigable_id, String name, JsonValue payload, Vector<String> arguments) override;
@@ -114,7 +117,7 @@ private:
     virtual void connect_to_web_ui(Web::PageId page_id, IPC::TransportHandle handle) override;
     virtual void connect_to_request_server(IPC::TransportHandle handle, int client_id, Optional<Utf16String> top_level_site) override;
     virtual void connect_to_test_endpoint(IPC::TransportHandle handle) override;
-    virtual void connect_to_image_decoder(IPC::TransportHandle handle) override;
+    virtual void disconnect_from_image_decoder() override;
     virtual void connect_to_compositor_process(IPC::TransportHandle handle, IPC::TransportHandle render_clock_handle) override;
     virtual void set_site_compatibility_data(JsonValue data) override;
     virtual void set_permission_snapshot(Web::Permissions::PermissionSnapshot snapshot) override;
@@ -144,10 +147,11 @@ private:
     virtual void run_beforeunload_check(Web::PageId page_id, Web::HTML::CrossProcessId check_id, Vector<Web::HTML::CrossProcessId> navigable_ids, Optional<Web::HTML::SessionHistoryEntryDescriptor> target_entry, Optional<Web::HTML::UserNavigationInvolvement> user_involvement_for_navigate_event, Web::HTML::UnloadPromptShown unload_prompt_shown) override;
     virtual void discard_embedded_page(Web::PageId page_id) override;
     virtual void queue_navigation_api_state_clear_task(Web::PageId page_id, Web::HTML::CrossProcessId navigable_id) override;
-    virtual void run_changing_navigable_history_job(Web::PageId page_id, Web::HTML::CrossProcessId operation_id, Web::HTML::CrossProcessId navigable_id, Web::HTML::SessionHistoryEntryDescriptor target_entry, Web::HTML::UserNavigationInvolvement user_involvement, Optional<Web::Bindings::NavigationType> navigation_type, Optional<Utf16String> finalized_navigation_id, bool ongoing_navigation_is_traversal, Optional<Web::HTML::NavigationSourceSnapshot> source_snapshot_params) override;
+    virtual void run_changing_navigable_history_job(Web::PageId page_id, Web::HTML::CrossProcessId operation_id, Web::HTML::CrossProcessId navigable_id, Web::HTML::SessionHistoryEntryDescriptor target_entry, Web::HTML::UserNavigationInvolvement user_involvement, Optional<Web::Bindings::NavigationType> navigation_type, Optional<Utf16String> finalized_navigation_id, bool ongoing_navigation_is_traversal, bool needs_population) override;
+    virtual void create_history_navigation_params(Web::PageId page_id, Web::HTML::CrossProcessId operation_id, Web::HTML::NavigationPopulationRequest request, bool allow_POST) override;
     virtual void clear_ongoing_history_traversal(Web::PageId page_id, Web::HTML::CrossProcessId operation_id, Web::HTML::CrossProcessId navigable_id) override;
-    virtual void apply_changing_navigable_continuation(Web::PageId page_id, Web::HTML::CrossProcessId operation_id, Web::HTML::CrossProcessId navigable_id, Web::HTML::SessionHistoryEntryIdentity target_entry, u64 script_history_length, u64 script_history_index, Vector<Web::HTML::SessionHistoryEntryDescriptor> entries_for_navigation_api) override;
-    virtual void unload_displayed_document_and_apply_changing_navigable_continuation(Web::PageId page_id, Web::HTML::CrossProcessId operation_id, Web::HTML::CrossProcessId navigable_id, Web::HTML::SessionHistoryEntryIdentity target_entry, u64 script_history_length, u64 script_history_index, Vector<Web::HTML::SessionHistoryEntryDescriptor> entries_for_navigation_api) override;
+    virtual void apply_changing_navigable_continuation(Web::PageId page_id, Web::HTML::CrossProcessId operation_id, Web::HTML::CrossProcessId navigable_id, Web::HTML::SessionHistoryEntryIdentity target_entry, u64 script_history_length, u64 script_history_index, Vector<Web::HTML::SessionHistoryEntryDescriptor> entries_for_navigation_api, bool clear_classic_history_api_state, bool clear_navigable_target_name) override;
+    virtual void unload_displayed_document_and_apply_changing_navigable_continuation(Web::PageId page_id, Web::HTML::CrossProcessId operation_id, Web::HTML::CrossProcessId navigable_id, Web::HTML::SessionHistoryEntryIdentity target_entry, u64 script_history_length, u64 script_history_index, Vector<Web::HTML::SessionHistoryEntryDescriptor> entries_for_navigation_api, bool clear_classic_history_api_state, bool clear_navigable_target_name) override;
     virtual void run_descendant_unload_task(Web::PageId page_id, Web::HTML::CrossProcessId unload_id, Web::HTML::CrossProcessId navigable_id, Web::HTML::ChildNavigableDestruction, Web::HTML::StopHostingAfterUnload) override;
     virtual void continue_child_navigable_destruction(Web::PageId page_id, Web::HTML::CrossProcessId navigable_id) override;
     virtual void abort_navigable_document(Web::PageId page_id, Web::HTML::CrossProcessId navigable_id) override;
@@ -230,6 +234,7 @@ private:
 
     virtual void set_listen_for_dom_mutations(Web::PageId page_id, bool) override;
     virtual void set_has_devtools_client(Web::PageId page_id, bool has_devtools_client) override;
+    virtual void start_sending_console_output(Web::PageId page_id, bool messages, bool errors) override;
     virtual void get_dom_node_inner_html(Web::PageId page_id, Web::UniqueNodeID node_id) override;
     virtual void get_dom_node_outer_html(Web::PageId page_id, Web::UniqueNodeID node_id) override;
     virtual void set_dom_node_outer_html(Web::PageId page_id, Web::UniqueNodeID node_id, String html) override;
@@ -246,6 +251,7 @@ private:
     virtual void set_content_blocking_policy(Web::PageId page_id, bool enabled, Vector<String> disabled_sites) override;
     virtual void set_content_blockers(Core::AnonymousBuffer patterns) override;
 
+    virtual void set_force_dark_settings(Web::PageId page_id, bool enabled, HashMap<String, bool> per_host) override;
     virtual void set_autoplay_settings(Web::PageId page_id, Web::HTML::AutoplayPolicy policy, Vector<Utf16String> allowlist) override;
     virtual void set_preferred_color_scheme(Web::PageId page_id, Web::CSS::PreferredColorScheme) override;
     virtual void set_preferred_contrast(Web::PageId page_id, Web::CSS::PreferredContrast) override;
@@ -258,6 +264,10 @@ private:
     virtual void set_geolocation_emulated_position(Web::PageId page_id, WebView::GeolocationPositionData, Optional<u16> error_code) override;
     virtual void geolocation_position_response(Web::PageId page_id, u64 request_id, WebView::GeolocationPositionData, Optional<u16> error_code) override;
     virtual void permission_request_completed(Web::PageId page_id, u64 request_id, Web::Permissions::EffectiveState state) override;
+    virtual void notification_shown(Web::PageId page_id, u64 notification_id) override;
+    virtual void notification_show_failed(Web::PageId page_id, u64 notification_id) override;
+    virtual void notification_clicked(Web::PageId page_id, u64 notification_id) override;
+    virtual void notification_closed(Web::PageId page_id, u64 notification_id, bool by_user) override;
     virtual void set_has_focus(Web::PageId page_id, bool) override;
     virtual void set_focused_navigable(Web::PageId page_id, Web::HTML::CrossProcessId navigable_id) override;
     virtual void consume_user_activation(Web::PageId page_id, Web::HTML::UserActivationConsumption) override;
@@ -293,6 +303,10 @@ private:
     virtual void retrieved_clipboard_entries(Web::PageId page_id, u64 request_id, Vector<Web::Clipboard::SystemClipboardItem>) override;
     virtual void did_check_spelling(Web::PageId page_id, u64 request_id, Vector<Web::SpellingError> errors) override;
     virtual void did_get_writing_suggestion(Web::PageId page_id, u64 request_id, Optional<Web::WritingSuggestion> suggestion) override;
+    virtual void request_translation_language_sample(Web::PageId page_id, u64 request_id) override;
+    virtual void start_translation(Web::PageId page_id, String source_language, String target_language) override;
+    virtual void stop_translation(Web::PageId page_id) override;
+    virtual void did_translate(Web::PageId page_id, Web::TranslatedUnit unit) override;
     virtual void replace_context_menu_misspelling(Web::PageId page_id, Utf16String replacement) override;
     virtual void accept_spelling_word(Web::PageId page_id, Utf16String word) override;
     virtual void forget_accepted_spelling_words(Web::PageId page_id) override;
@@ -325,7 +339,7 @@ private:
     virtual void find_in_page_end(Web::PageId page_id) override;
 
     virtual void paste(Web::PageId page_id, Utf16String text) override;
-    virtual void paste_from_clipboard(Web::PageId page_id) override;
+    virtual void paste_from_clipboard(Web::PageId page_id, Vector<Web::Clipboard::SystemClipboardItem> system_clipboard_data) override;
     virtual void set_marked_text_from_input_method(Web::PageId page_id, Utf16String text) override;
     virtual void commit_text_from_input_method(Web::PageId page_id, Utf16String text, i32 replacement_start, i32 replacement_length) override;
     virtual void unmark_text_from_input_method(Web::PageId page_id) override;
@@ -345,7 +359,6 @@ private:
     virtual void cookies_changed(Web::PageId page_id, Vector<HTTP::Cookie::Cookie>) override;
     virtual void broadcast_channel_message(Web::HTML::BroadcastChannelMessage message) override;
     virtual void did_worker_agent_fail_loading_script(Web::HTML::WorkerAgentOwnerToken owner_token) override;
-    virtual void did_worker_agent_report_exception(Web::HTML::WorkerAgentOwnerToken owner_token, Utf16String message, Utf16String filename, u32 lineno, u32 colno) override;
     virtual void did_worker_agent_report_content_security_policy_violation(Web::HTML::WorkerAgentOwnerToken owner_token, u64 policy_index, String effective_directive, URL::URL resource) override;
     virtual void did_worker_agent_close(Web::HTML::WorkerAgentOwnerToken owner_token) override;
     virtual void did_worker_agent_die(Web::HTML::WorkerAgentOwnerToken owner_token) override;

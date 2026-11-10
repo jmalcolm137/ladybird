@@ -297,7 +297,8 @@
                 flex-grow: 1;
             }
 
-            dialog .dialog-list-item {
+            dialog .dialog-list-item,
+            #force-dark-sites .dialog-list-item {
                 padding: 10px;
 
                 display: flex;
@@ -305,7 +306,8 @@
                 align-items: center;
             }
 
-            dialog .dialog-list-item:hover {
+            dialog .dialog-list-item:hover,
+            #force-dark-sites .dialog-list-item:hover {
                 background-color: var(--control);
             }
 
@@ -314,8 +316,22 @@
                 opacity: 0.6;
             }
 
-            dialog .dialog-list-item-label {
+            dialog .dialog-list-item-label,
+            #force-dark-sites .dialog-list-item-label {
                 flex-grow: 1;
+            }
+
+            #force-dark-sites .dialog-list-item {
+                gap: 16px;
+            }
+
+            #force-dark-sites .dialog-list-item-label {
+                min-width: 0;
+                overflow-wrap: anywhere;
+            }
+
+            #force-dark-sites button {
+                flex-shrink: 0;
             }
 
             dialog .dialog-controls {
@@ -344,6 +360,73 @@
                 border-bottom: 1px solid var(--border-color);
 
                 overflow-x: auto;
+            }
+
+            .crash-modes {
+                margin-top: 10px;
+
+                border-radius: 10px;
+                box-shadow: inset 0 0 0 1px var(--separator);
+                overflow: hidden;
+            }
+
+            .crash-mode {
+                display: flex;
+                align-items: center;
+                gap: 12px;
+
+                min-height: 40px;
+                margin: 0;
+                padding: 8px 14px;
+
+                cursor: pointer;
+            }
+
+            .crash-mode + .crash-mode {
+                border-top: 1px solid var(--separator-soft);
+            }
+
+            .crash-mode:has(input:checked) {
+                background: var(--choice-fill);
+            }
+
+            .crash-mode:has(input:focus-visible) {
+                box-shadow: inset 0 0 0 2px var(--focus-ring);
+            }
+
+            .crash-mode input {
+                position: absolute;
+                opacity: 0;
+                pointer-events: none;
+            }
+
+            .crash-mode-text {
+                flex: 1;
+                display: flex;
+                flex-direction: column;
+                gap: 1px;
+            }
+
+            .crash-mode .description {
+                margin: 0;
+                font-size: 12px;
+            }
+
+            .crash-mode svg {
+                visibility: hidden;
+                flex: none;
+                width: 14px;
+                height: 14px;
+
+                fill: none;
+                stroke: var(--choice);
+                stroke-width: 1.8;
+                stroke-linecap: round;
+                stroke-linejoin: round;
+            }
+
+            .crash-mode:has(input:checked) svg {
+                visibility: visible;
             }
 
             .tab-button {
@@ -491,8 +574,31 @@
                 background-color: var(--control);
             }
 
+            /* The focus ring appears only for keyboard focus, never after a click. */
+            .tab-button:focus {
+                outline: none;
+            }
+
+            .tab-button:focus-visible {
+                box-shadow:
+                    0 0 0 1px var(--focus-edge),
+                    0 0 0 3px var(--focus-ring);
+            }
+
+            /* A permission's default and its exceptions sit side by side. */
+            .permission-controls {
+                display: flex;
+                align-items: center;
+                gap: 12px;
+            }
+
+            /* The content column is centered in the room right of the sidebar, so a wide window doesn't leave it leaning
+               left. */
             .settings-content {
-                max-width: 712px;
+                box-sizing: border-box;
+                width: 100%;
+                max-width: 824px;
+                margin: 0 auto;
                 padding: 28px 56px;
             }
 
@@ -541,6 +647,13 @@
                 font-size: 12px;
             }
 
+            /* A group's subheading. At regular weight, it would read as a setting with a missing control. */
+            #tab-layout-title,
+            #crash-reports-title,
+            .list-heading > span:first-child {
+                font-weight: 600;
+            }
+
             .list-heading {
                 display: flex;
                 align-items: baseline;
@@ -587,12 +700,13 @@
                 border-radius: 5px;
                 background: transparent;
                 font-size: 12px;
-                color: var(--link);
+                font-weight: 500;
+                color: var(--text);
                 cursor: pointer;
             }
 
             button.link-button:hover {
-                background: var(--control);
+                text-decoration: underline;
             }
 
             .engine-choice {
@@ -673,7 +787,7 @@
                 margin: 24px 0 2px;
                 font-size: 13px;
                 font-weight: 600;
-                color: var(--muted);
+                color: var(--text);
             }
 
             .card,
@@ -742,11 +856,11 @@
                 <input id="settings-search" type="search" placeholder="Search settings" spellcheck="false" />
             </label>
             <div class="tab-bar" role="tablist" aria-label="Settings categories">
-                <button id="tab-button-general" class="tab-button active" data-tab="general" role="tab">General</button>
-                <button id="tab-button-search" class="tab-button" data-tab="search" role="tab">Search</button>
-                <button id="tab-button-appearance" class="tab-button" data-tab="appearance" role="tab">
+                <button id="tab-button-appearance" class="tab-button active" data-tab="appearance" role="tab">
                     Appearance
                 </button>
+                <button id="tab-button-search" class="tab-button" data-tab="search" role="tab">Search</button>
+                <button id="tab-button-tabs" class="tab-button" data-tab="tabs" role="tab">Tabs and startup</button>
                 <button id="tab-button-privacy" class="tab-button" data-tab="privacy" role="tab">
                     Privacy and security
                 </button>
@@ -757,87 +871,14 @@
                     Content blocking
                 </button>
                 <button id="tab-button-languages" class="tab-button" data-tab="languages" role="tab">Languages</button>
-                <button id="tab-button-services" class="tab-button" data-tab="services" role="tab">Services</button>
-                <button id="tab-button-network" class="tab-button" data-tab="network" role="tab">Network</button>
+                <button id="tab-button-feedback" class="tab-button" data-tab="feedback" role="tab">Feedback</button>
                 <button id="tab-button-advanced" class="tab-button" data-tab="advanced" role="tab">Advanced</button>
             </div>
         </nav>
 
         <main class="settings-content">
             <p id="search-empty" class="search-empty" hidden>No settings match this search.</p>
-            <div class="tab-panel active" id="tab-general" data-title="General">
-                <h3 class="card-title">Startup</h3>
-                <div class="card">
-                    <div class="card-body">
-                        <div class="card-group inline-container">
-                            <label for="restore-previous-session">Restore previous windows and tabs</label>
-                            <input id="restore-previous-session" type="checkbox" switch />
-                        </div>
-                        <div class="card-group inline-container">
-                            <label for="new-tab-page-url">New tab page URL</label>
-                            <div class="input-with-reset">
-                                <input id="new-tab-page-url" type="url" placeholder="about:blank" />
-                                <button id="new-tab-page-url-reset" class="input-reset-button" title="Restore default">
-                                    &times;
-                                </button>
-                            </div>
-                        </div>
-                    </div>
-                </div>
-
-                <h3 class="card-title">Content</h3>
-                <div class="card">
-                    <div class="card-body">
-                        <div class="card-group inline-container">
-                            <label for="enable-force-dark">
-                                Force dark mode
-                                <p class="description">
-                                    Darken web pages that don’t provide a dark theme of their own. Photos are left as
-                                    they are; icons and line art are darkened along with the page.
-                                </p>
-                            </label>
-                            <input id="enable-force-dark" type="checkbox" switch />
-                        </div>
-                    </div>
-                </div>
-
-                <h3 class="card-title">Browsing behavior</h3>
-                <div class="card">
-                    <div class="card-body">
-                        <div class="card-group inline-container">
-                            <label for="enable-autoscroll">
-                                Enable autoscrolling
-                                <p class="description">
-                                    Scroll pages by pressing the middle mouse button and moving the mouse.
-                                </p>
-                            </label>
-                            <input id="enable-autoscroll" type="checkbox" switch />
-                        </div>
-                        <div class="card-group inline-container" id="enable-primary-paste-group">
-                            <label for="enable-primary-paste">
-                                Enable primary pasting
-                                <p class="description">
-                                    Paste text from the clipboard when the middle mouse button is clicked.
-                                </p>
-                            </label>
-                            <input id="enable-primary-paste" type="checkbox" switch />
-                        </div>
-                    </div>
-                </div>
-
-                <h3 class="card-title">Crash reports</h3>
-                <div class="card">
-                    <div class="card-body">
-                        <div class="inline-container">
-                            <p>Open the folder containing saved crash reports.</p>
-                            <button id="open-crash-reports" class="secondary-button">Open folder</button>
-                        </div>
-                        <p id="crash-reports-status" class="description" role="status" hidden></p>
-                    </div>
-                </div>
-            </div>
-
-            <div class="tab-panel" id="tab-appearance" data-title="Appearance">
+            <div class="tab-panel active" id="tab-appearance" data-title="Appearance">
                 <div class="card">
                     <div class="card-body">
                         <div class="card-group inline-container">
@@ -846,6 +887,49 @@
                                 <label><input type="radio" name="interface-theme" value="system" />System</label>
                                 <label><input type="radio" name="interface-theme" value="light" />Light</label>
                                 <label><input type="radio" name="interface-theme" value="dark" />Dark</label>
+                            </div>
+                        </div>
+                        <div class="card-group inline-container">
+                            <span id="color-theme-title">
+                                Color theme
+                                <p class="description">The colors of tabs, toolbars, menus and highlights.</p>
+                            </span>
+                            <div
+                                id="color-theme"
+                                class="color-swatches"
+                                role="radiogroup"
+                                aria-labelledby="color-theme-title"
+                            >
+                                <label class="color-swatch" title="Neutral" style="--swatch: #8e8e93">
+                                    <input type="radio" name="color-theme" value="neutral" aria-label="Neutral" />
+                                </label>
+                                <label class="color-swatch" title="Harbor" style="--swatch: #2f6fd6">
+                                    <input type="radio" name="color-theme" value="harbor" aria-label="Harbor" />
+                                </label>
+                                <label class="color-swatch" title="Glacier" style="--swatch: #1798b8">
+                                    <input type="radio" name="color-theme" value="glacier" aria-label="Glacier" />
+                                </label>
+                                <label class="color-swatch" title="Lagoon" style="--swatch: #12957f">
+                                    <input type="radio" name="color-theme" value="lagoon" aria-label="Lagoon" />
+                                </label>
+                                <label class="color-swatch" title="Moss" style="--swatch: #3b8f3e">
+                                    <input type="radio" name="color-theme" value="moss" aria-label="Moss" />
+                                </label>
+                                <label class="color-swatch" title="Saffron" style="--swatch: #c99500">
+                                    <input type="radio" name="color-theme" value="saffron" aria-label="Saffron" />
+                                </label>
+                                <label class="color-swatch" title="Copper" style="--swatch: #d0631c">
+                                    <input type="radio" name="color-theme" value="copper" aria-label="Copper" />
+                                </label>
+                                <label class="color-swatch" title="Cherry" style="--swatch: #d1344b">
+                                    <input type="radio" name="color-theme" value="cherry" aria-label="Cherry" />
+                                </label>
+                                <label class="color-swatch" title="Blossom" style="--swatch: #d2459a">
+                                    <input type="radio" name="color-theme" value="blossom" aria-label="Blossom" />
+                                </label>
+                                <label class="color-swatch" title="Lavender" style="--swatch: #7563d4">
+                                    <input type="radio" name="color-theme" value="lavender" aria-label="Lavender" />
+                                </label>
                             </div>
                         </div>
                         <div class="card-group inline-container">
@@ -866,8 +950,18 @@
                                 <label><input type="radio" name="website-color-scheme" value="dark" />Dark</label>
                             </div>
                         </div>
+                        <div class="card-group inline-container">
+                            <label for="enable-force-dark">
+                                Force dark mode
+                                <p class="description">
+                                    Darken web pages that don’t provide a dark theme of their own.
+                                </p>
+                            </label>
+                            <input id="enable-force-dark" type="checkbox" switch />
+                        </div>
+                        <div id="force-dark-sites" class="card-group" aria-label="Sites with a force-dark choice"></div>
                         <div id="tab-layout-group" class="card-group">
-                            <span id="tab-layout-title">Tabs</span>
+                            <span id="tab-layout-title">Layout</span>
                             <div class="tab-options" role="radiogroup" aria-labelledby="tab-layout-title">
                                 <label class="tab-option">
                                     <input type="radio" name="tab-layout" value="horizontal" />
@@ -875,7 +969,7 @@
                                         <span class="preview-strip"><i class="active"></i><i></i><i></i></span>
                                         <span class="preview-toolbar"><i></i></span>
                                     </span>
-                                    <span class="tab-option-label">Along the top</span>
+                                    <span class="tab-option-label">Tabs on top</span>
                                 </label>
                                 <label class="tab-option">
                                     <input type="radio" name="tab-layout" value="vertical" />
@@ -885,9 +979,30 @@
                                             ><span class="preview-toolbar"><i></i></span
                                         ></span>
                                     </span>
-                                    <span class="tab-option-label">Down the side</span>
+                                    <span class="tab-option-label">Tabs on the side</span>
+                                </label>
+                                <label class="tab-option">
+                                    <input type="radio" name="tab-layout" value="sidebar" />
+                                    <span class="tab-preview vertical-preview" aria-hidden="true">
+                                        <span class="preview-sidebar"><b></b><i></i><i class="active"></i><i></i></span>
+                                        <span class="preview-main"></span>
+                                    </span>
+                                    <span class="tab-option-label">Everything in the sidebar</span>
                                 </label>
                             </div>
+                        </div>
+                        <div class="card-group inline-container hidden">
+                            <label for="vertical-tabs-expand-on-hover"
+                                >Expand vertical tabs on hover when collapsed</label
+                            >
+                            <input id="vertical-tabs-expand-on-hover" type="checkbox" switch />
+                        </div>
+                        <div class="card-group inline-container hidden">
+                            <label for="vertical-tabs-position">Sidebar on</label>
+                            <select id="vertical-tabs-position">
+                                <option value="left">Left</option>
+                                <option value="right">Right</option>
+                            </select>
                         </div>
                         <div class="card-group inline-container" id="show-menu-bar-group">
                             <label for="show-menu-bar">Show system menu bar</label>
@@ -899,19 +1014,6 @@
                                 <option value="always">Always</option>
                                 <option value="never">Never</option>
                                 <option value="onHover">Only when hovering the navigation toolbar</option>
-                            </select>
-                        </div>
-                        <div class="card-group inline-container hidden">
-                            <label for="vertical-tabs-expand-on-hover"
-                                >Expand vertical tabs on hover when collapsed</label
-                            >
-                            <input id="vertical-tabs-expand-on-hover" type="checkbox" switch />
-                        </div>
-                        <div class="card-group inline-container hidden">
-                            <label for="vertical-tabs-position">Vertical tabs side</label>
-                            <select id="vertical-tabs-position">
-                                <option value="left">Left</option>
-                                <option value="right">Right</option>
                             </select>
                         </div>
                         <div class="card-group inline-container">
@@ -955,92 +1057,52 @@
                 </div>
             </div>
 
-            <div class="tab-panel" id="tab-permissions" data-title="Permissions">
+            <div class="tab-panel" id="tab-tabs" data-title="Tabs and startup">
+                <h3 class="card-title">Startup</h3>
                 <div class="card">
                     <div class="card-body">
                         <div class="card-group inline-container">
-                            <span>Autoplay</span>
-                            <span id="autoplay-forcibly-enabled" class="forcibly-enabled hidden">
-                                This setting is controlled via the command line
-                            </span>
-                            <button id="autoplay-settings" class="secondary-button">Settings…</button>
+                            <label for="restore-previous-session">Restore previous windows and tabs</label>
+                            <input id="restore-previous-session" type="checkbox" switch />
+                        </div>
+                        <div class="card-group inline-container">
+                            <label for="new-tab-page-url">New tab page URL</label>
+                            <div class="input-with-reset">
+                                <input id="new-tab-page-url" type="url" placeholder="about:blank" />
+                                <button id="new-tab-page-url-reset" class="input-reset-button" title="Restore default">
+                                    &times;
+                                </button>
+                            </div>
                         </div>
                     </div>
                 </div>
 
+                <h3 class="card-title">Browsing</h3>
                 <div class="card">
                     <div class="card-body">
                         <div class="card-group inline-container">
-                            <label for="enable-geolocation">
-                                Sites can ask for your location
-                                <p class="description">When this is off, sites can't see your location.</p>
+                            <label for="enable-autoscroll">
+                                Use autoscrolling
+                                <p class="description">
+                                    Scroll pages by pressing the middle mouse button and moving the mouse.
+                                </p>
                             </label>
-                            <input id="enable-geolocation" type="checkbox" switch />
+                            <input id="enable-autoscroll" type="checkbox" switch />
                         </div>
-                    </div>
-                </div>
-
-                <div class="card">
-                    <div class="card-body">
-                        <div class="card-group inline-container">
-                            <span>
-                                Location
-                                <p class="description">The sites you allowed or blocked from knowing your location.</p>
-                            </span>
-                            <button id="location-permissions-settings" class="secondary-button">Settings…</button>
-                        </div>
-                        <div class="card-group inline-container">
-                            <span>
-                                Microphone
-                                <p class="description">The sites you allowed or blocked from using your microphone.</p>
-                            </span>
-                            <button id="microphone-permissions-settings" class="secondary-button">Settings…</button>
+                        <div class="card-group inline-container" id="enable-primary-paste-group">
+                            <label for="enable-primary-paste">
+                                Paste with the middle mouse button
+                                <p class="description">
+                                    Paste text from the clipboard when the middle mouse button is clicked.
+                                </p>
+                            </label>
+                            <input id="enable-primary-paste" type="checkbox" switch />
                         </div>
                     </div>
                 </div>
             </div>
 
             <div class="tab-panel" id="tab-privacy" data-title="Privacy and security">
-                <h3 class="card-title">Browsing data</h3>
-                <div class="card">
-                    <div class="card-body">
-                        <p id="browsing-data-total-size" class="card-group"></p>
-
-                        <div class="card-group">
-                            <div class="inline-container">
-                                <div>
-                                    <label for="browsing-data-settings-max-disk-cache-size">
-                                        Maximum disk cache size
-                                        <p class="description">Limit the space used for the HTTP disk cache.</p>
-                                    </label>
-                                </div>
-                                <div class="input-field-container">
-                                    <input
-                                        id="browsing-data-settings-max-disk-cache-size"
-                                        type="number"
-                                        min="1"
-                                        style="width: 150px"
-                                    />
-                                    <select id="browsing-data-settings-max-disk-cache-unit" style="width: 80px">
-                                        <option value="MiB">MiB</option>
-                                        <option value="GiB">GiB</option>
-                                    </select>
-                                </div>
-                            </div>
-                        </div>
-                    </div>
-                </div>
-
-                <div class="card">
-                    <div class="card-body">
-                        <div class="card-group inline-container">
-                            <span>Clear browsing data</span>
-                            <button id="browsing-data-settings" class="secondary-button">Clear…</button>
-                        </div>
-                    </div>
-                </div>
-
-                <h3 class="card-title">Privacy</h3>
                 <div class="card">
                     <div class="card-body">
                         <div class="card-group">
@@ -1054,8 +1116,105 @@
                         </div>
                     </div>
                 </div>
+
+                <h3 class="card-title">Browsing data</h3>
+                <div class="card">
+                    <div class="card-body">
+                        <p id="browsing-data-total-size" class="card-group"></p>
+                        <div class="card-group inline-container">
+                            <span>Clear browsing data</span>
+                            <button id="browsing-data-settings" class="secondary-button">Clear…</button>
+                        </div>
+                    </div>
+                </div>
+
+                <h3 class="card-title">Automatic connections</h3>
+                <p class="description">
+                    Services are automatic connections Ladybird makes for browser features in the background. These
+                    controls do not affect normal browsing or actions you explicitly request, such as updating filter
+                    lists.
+                </p>
+
+                <div class="card card-body">
+                    <div class="card-group inline-container">
+                        <label for="allow-services-network-access">
+                            Allow automatic service connections
+                            <p class="description">Let individually enabled services connect in the background.</p>
+                        </label>
+                        <input id="allow-services-network-access" type="checkbox" switch />
+                    </div>
+                    <div class="card-group inline-container">
+                        <label for="filter-list-updates">
+                            Filter list updates
+                            <p class="description">
+                                Periodically download updates for enabled filter list subscriptions.
+                            </p>
+                        </label>
+                        <input id="filter-list-updates" type="checkbox" switch />
+                    </div>
+                </div>
+                <p id="services-paused-note" class="description hidden" role="status">
+                    Automatic service connections are paused. Individual service choices are preserved.
+                </p>
             </div>
 
+            <div class="tab-panel" id="tab-permissions" data-title="Permissions">
+                <div class="card">
+                    <div class="card-body">
+                        <div class="card-group inline-container">
+                            <label for="autoplay-policy">
+                                Autoplay
+                                <p class="description">Whether sites can play audio and video on their own.</p>
+                            </label>
+                            <span id="autoplay-forcibly-enabled" class="forcibly-enabled hidden">
+                                This setting is controlled via the command line
+                            </span>
+                            <div id="autoplay-controls" class="permission-controls">
+                                <select id="autoplay-policy">
+                                    <option value="allow-audio-and-video">Allow audio and video</option>
+                                    <option value="block-audio">Block audio</option>
+                                    <option value="block-audio-and-video">Block audio and video</option>
+                                </select>
+                                <button id="autoplay-settings" class="secondary-button">Exceptions…</button>
+                            </div>
+                        </div>
+                        <div class="card-group inline-container">
+                            <label for="enable-geolocation">
+                                Location
+                                <p class="description">Sites can ask to know your location.</p>
+                            </label>
+                            <div class="permission-controls">
+                                <input id="enable-geolocation" type="checkbox" switch />
+                                <button id="location-permissions-settings" class="secondary-button">Exceptions…</button>
+                            </div>
+                        </div>
+                        <div class="card-group inline-container">
+                            <label for="enable-microphone">
+                                Microphone
+                                <p class="description">Sites can ask to use your microphone.</p>
+                            </label>
+                            <div class="permission-controls">
+                                <input id="enable-microphone" type="checkbox" switch />
+                                <button id="microphone-permissions-settings" class="secondary-button">
+                                    Exceptions…
+                                </button>
+                            </div>
+                        </div>
+                        <div class="card-group inline-container">
+                            <label for="enable-notifications">
+                                Notifications
+                                <p class="description">Sites can ask to send you notifications.</p>
+                            </label>
+                            <div class="permission-controls">
+                                <input id="enable-notifications" type="checkbox" switch />
+                                <button id="notifications-permissions-settings" class="secondary-button">
+                                    Exceptions…
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
             <div class="tab-panel" id="tab-blocking" data-title="Content blocking">
                 <div class="card card-body">
                     <div class="card-group inline-container">
@@ -1150,39 +1309,78 @@
                 </div>
             </div>
 
-            <div class="tab-panel" id="tab-services" data-title="Services">
-                <p class="description">
-                    Services are automatic connections Ladybird makes for browser features in the background. These
-                    controls do not affect normal browsing or actions you explicitly request, such as updating filter
-                    lists.
-                </p>
-
-                <div class="card card-body">
-                    <div class="card-group inline-container">
-                        <label for="allow-services-network-access">
-                            Allow automatic service connections
-                            <p class="description">Let individually enabled services connect in the background.</p>
-                        </label>
-                        <input id="allow-services-network-access" type="checkbox" switch />
+            <div class="tab-panel" id="tab-feedback" data-title="Feedback">
+                <div class="card">
+                    <div class="card-body">
+                        <div id="show-feedback-button-group" class="card-group inline-container hidden">
+                            <label for="show-feedback-button">Show Feedback button in toolbar</label>
+                            <input id="show-feedback-button" type="checkbox" switch />
+                        </div>
+                        <div class="card-group">
+                            <span id="crash-reports-title">Crash reports</span>
+                            <div class="crash-modes" role="radiogroup" aria-labelledby="crash-reports-title">
+                                <label class="crash-mode">
+                                    <input type="radio" name="crash-report-sending" value="ask" />
+                                    <span class="crash-mode-text">
+                                        Ask me
+                                        <span class="description"
+                                            >Reports are kept on this computer until you review them</span
+                                        >
+                                    </span>
+                                    <svg aria-hidden="true" viewBox="0 0 16 16"><path d="M3.5 8.5l3 3 6-7" /></svg>
+                                </label>
+                                <label class="crash-mode">
+                                    <input type="radio" name="crash-report-sending" value="never" />
+                                    <span class="crash-mode-text">
+                                        Never send
+                                        <span class="description">Nothing is kept</span>
+                                    </span>
+                                    <svg aria-hidden="true" viewBox="0 0 16 16"><path d="M3.5 8.5l3 3 6-7" /></svg>
+                                </label>
+                            </div>
+                        </div>
+                        <div id="crash-reports-waiting-group" class="card-group inline-container hidden">
+                            <span id="crash-reports-waiting" class="description"></span>
+                            <button id="review-crash-reports" class="secondary-button">Review reports</button>
+                        </div>
+                        <div class="card-group inline-container">
+                            <p>Open the folder containing saved crash reports.</p>
+                            <button id="open-crash-reports" class="secondary-button">Open folder</button>
+                        </div>
+                        <p id="crash-reports-status" class="description" role="status" hidden></p>
                     </div>
-                </div>
-
-                <p id="services-paused-note" class="description hidden" role="status">
-                    Automatic service connections are paused. Individual service choices are preserved.
-                </p>
-
-                <h3 class="card-title">Services</h3>
-                <div class="card card-body inline-container">
-                    <label for="filter-list-updates">
-                        Filter list updates
-                        <p class="description">Periodically download updates for enabled filter list subscriptions.</p>
-                    </label>
-                    <input id="filter-list-updates" type="checkbox" switch />
                 </div>
             </div>
 
-            <div class="tab-panel" id="tab-network" data-title="Network">
-                <h3 class="card-title">DNS settings</h3>
+            <div class="tab-panel" id="tab-advanced" data-title="Advanced">
+                <div class="card">
+                    <div class="card-body">
+                        <div class="card-group">
+                            <div class="inline-container">
+                                <div>
+                                    <label for="browsing-data-settings-max-disk-cache-size">
+                                        Maximum disk cache size
+                                        <p class="description">Limit the space used for the HTTP disk cache.</p>
+                                    </label>
+                                </div>
+                                <div class="input-field-container">
+                                    <input
+                                        id="browsing-data-settings-max-disk-cache-size"
+                                        type="number"
+                                        min="1"
+                                        style="width: 150px"
+                                    />
+                                    <select id="browsing-data-settings-max-disk-cache-unit" style="width: 80px">
+                                        <option value="MiB">MiB</option>
+                                        <option value="GiB">GiB</option>
+                                    </select>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <h3 class="card-title">DNS</h3>
                 <div class="card">
                     <div class="card-body">
                         <span id="dns-forcibly-enabled" class="forcibly-enabled hidden">
@@ -1220,9 +1418,8 @@
                         </div>
                     </div>
                 </div>
-            </div>
 
-            <div class="tab-panel" id="tab-advanced" data-title="Advanced">
+                <h3 class="card-title">Developer</h3>
                 <div class="search-container">
                     <svg
                         class="search-icon"
@@ -1327,17 +1524,22 @@
             </div>
         </dialog>
 
+        <dialog id="site-permissions-notifications" class="site-permissions" closedby="any">
+            <div class="dialog-header">
+                <h3 class="dialog-title">Notifications</h3>
+                <button class="close-button dialog-button">&times;</button>
+            </div>
+            <div class="dialog-body">
+                <div class="site-permissions-list dialog-list"></div>
+            </div>
+        </dialog>
+
         <dialog id="site-settings" closedby="any">
             <div class="dialog-header">
                 <h3 id="site-settings-title" class="dialog-title"></h3>
                 <button id="site-settings-close" class="close-button dialog-button">&times;</button>
             </div>
             <div class="dialog-body">
-                <div class="inline-container">
-                    <label for="site-settings-policy">Default for all sites</label>
-                    <select id="site-settings-policy"></select>
-                </div>
-                <hr />
                 <label>Allowlist</label>
                 <div id="site-settings-list" class="dialog-list"></div>
                 <div class="dialog-controls">
@@ -1417,9 +1619,12 @@
         <script src="resource://ladybird/about-pages/settings/blocking.js" type="module"></script>
         <script src="resource://ladybird/about-pages/settings/browsing-behavior.js" type="module"></script>
         <script src="resource://ladybird/about-pages/settings/content.js" type="module"></script>
+        <script src="resource://ladybird/about-pages/settings/feedback.js" type="module"></script>
         <script src="resource://ladybird/about-pages/settings/geolocation.js" type="module"></script>
         <script src="resource://ladybird/about-pages/settings/languages.js" type="module"></script>
         <script src="resource://ladybird/about-pages/settings/network.js" type="module"></script>
+        <script src="resource://ladybird/about-pages/settings/microphone.js" type="module"></script>
+        <script src="resource://ladybird/about-pages/settings/notifications.js" type="module"></script>
         <script src="resource://ladybird/about-pages/settings/permissions.js" type="module"></script>
         <script src="resource://ladybird/about-pages/settings/site-permissions.js" type="module"></script>
         <script src="resource://ladybird/about-pages/settings/privacy.js" type="module"></script>
@@ -1544,8 +1749,11 @@
                 });
             });
 
+            // Links to sections that were merged into others still open where their settings went.
+            const MOVED_SECTIONS = { general: "appearance", services: "privacy", network: "advanced" };
             const hash = location.hash.slice(1);
-            switchTab(hash ? tabForDeepLink(hash) : "general");
+            const section = hash ? tabForDeepLink(hash) : "appearance";
+            switchTab(MOVED_SECTIONS[section] ?? section);
 
             // FIXME: Remove this once closedby="any" triggers for Esc key.
             document.querySelectorAll("dialog").forEach(dialog => {

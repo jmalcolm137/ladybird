@@ -573,7 +573,11 @@ public:
             return;
         }
 
-        m_segmented_text = icu::UnicodeString { text.utf16_span().data(), static_cast<i32>(text.length_in_code_units()) };
+        // NB: Latin-1 that is not ASCII is segmented as UTF-16, so that the boundaries are code unit offsets.
+        if (text.has_latin1_storage())
+            m_segmented_text = icu_string(text);
+        else
+            m_segmented_text = icu::UnicodeString { text.utf16_span().data(), static_cast<i32>(text.length_in_code_units()) };
         m_segmenter->setText(m_segmented_text.get<icu::UnicodeString>());
     }
 
@@ -696,7 +700,7 @@ NonnullOwnPtr<Segmenter> Segmenter::create(Utf16View locale, SegmenterGranularit
 {
     UErrorCode status = U_ZERO_ERROR;
 
-    auto locale_data = LocaleData::for_locale(locale.bytes());
+    auto locale_data = LocaleData::for_locale(locale.ascii_bytes());
     VERIFY(locale_data.has_value());
 
     auto segmenter = adopt_own_if_nonnull([&]() {
@@ -834,7 +838,7 @@ extern "C" void* unicode_layout_line_segmenter_create(u16 const* text, size_t le
             ascii_storage.unchecked_append(static_cast<char>(text[index]));
         auto ascii_view = ascii_storage.is_empty()
             ? Utf16View {}
-            : Utf16View { StringView { ascii_storage.data(), ascii_storage.size() } };
+            : Utf16View::from_ascii(StringView { ascii_storage.data(), ascii_storage.size() });
         if (auto segmenter = Unicode::Segmenter::try_create_for_ascii_line(ascii_view)) {
             return new UnicodeLayoutSegmenterHandle {
                 .segmenter = segmenter.release_nonnull(),

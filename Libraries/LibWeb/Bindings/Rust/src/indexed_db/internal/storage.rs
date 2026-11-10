@@ -14,30 +14,14 @@ use core::ptr::NonNull;
 
 use ak::Utf16String;
 use libjs_rust::api::{EmbedderCell, EmbedderClass, EmbedderValue, Gc, GcRefCell, Trace, Vm};
-use liburl_rust::origin::Origin;
 
 use crate::indexed_db::internal::database::DatabaseRef;
 use crate::indexed_db::internal::request_list::RequestList;
+use crate::storage_api::storage_key::StorageKey;
 
 unsafe extern "C" {
     fn gc_root_create(cell: *mut c_void) -> *mut c_void;
-}
-
-// https://storage.spec.whatwg.org/#storage-keys
-#[derive(Clone)]
-pub(crate) struct StorageKey {
-    // A storage key is a tuple consisting of an origin (an origin). [HTML]
-    // NOTE: This is expected to change; see Client-Side Storage Partitioning https://privacycg.github.io/storage-partitioning/.
-    pub(crate) origin: Origin,
-}
-
-impl PartialEq for StorageKey {
-    fn eq(&self, other: &Self) -> bool {
-        // To determine whether a storage key A equals storage key B, run these steps:
-        // 1. If A’s origin is not same origin with B’s origin, then return false.
-        // 2. Return true.
-        self.origin.is_same_origin(&other.origin)
-    }
+    fn gc_root_destroy(root: *mut c_void);
 }
 
 // https://w3c.github.io/IndexedDB/#connection-queues
@@ -95,11 +79,19 @@ pub(crate) fn storage(vm: &Vm) -> StorageRef {
         databases: GcRefCell::new(Vec::new()),
         connection_queues: GcRefCell::new(Vec::new()),
     });
-    // NB: The storage lives as long as the thread, which roots its cell.
+    // NB: The storage lives as long as the agent of the thread, which roots its cell.
     // SAFETY: The cell is a live cell of the heap.
     let root = NonNull::new(unsafe { gc_root_create(storage.as_ptr().cast()) }).expect("a root is allocated");
     STORAGE.set(Some((storage, root)));
     storage
+}
+
+/// Releases the storage of the current thread's agent, which goes away with its heap.
+pub(crate) fn shut_down_storage() {
+    if let Some((_, root)) = STORAGE.take() {
+        // SAFETY: The root is the one storage() created, and the heap it is in is alive.
+        unsafe { gc_root_destroy(root.as_ptr()) };
+    }
 }
 
 impl Storage {
@@ -188,7 +180,7 @@ impl Storage {
         let new_queue = CONNECTION_QUEUE_CLASS.allocate(vm, |defer| ConnectionQueue {
             storage_key: key.clone(),
             name: name.clone(),
-            request_list: RequestList::new(defer),
+            request_list: RequestList::new_for_connection_queue(defer),
         });
         self.connection_queues.borrow_mut(vm).push(new_queue);
         new_queue

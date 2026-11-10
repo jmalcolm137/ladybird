@@ -93,6 +93,12 @@ public:
     RefPtr<WebContentPage> const& host() const { return m_host; }
     void set_host(RefPtr<WebContentPage>);
 
+    bool is_top_level() const;
+
+    // Whether this top-level document may be hosted by one process with the tabs of its origin. A cross-origin isolated
+    // document may not. Other opener policies only keep cross-origin windows away.
+    bool may_share_a_process_with_tabs_of_its_origin() const;
+
     // Whether this is local file content, whose process may read local files: a document created from a file: URL, or
     // from a blob: URL whose entry local file content added.
     bool is_local_file_content() const { return m_is_local_file_content; }

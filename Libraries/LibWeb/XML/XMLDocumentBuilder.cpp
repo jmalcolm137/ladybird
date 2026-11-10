@@ -16,7 +16,6 @@
 #include <LibWeb/HTML/Parser/Entities.h>
 #include <LibWeb/HTML/Parser/NamedCharacterReferences.h>
 #include <LibWeb/HTML/Scripting/Environments.h>
-#include <LibWeb/SVG/SVGScriptElement.h>
 #include <LibWeb/SVG/TagNames.h>
 #include <LibWeb/XML/XMLDocumentBuilder.h>
 
@@ -137,10 +136,10 @@ void XMLDocumentBuilder::element_start(Utf16FlyString const& name, Vector<XML::L
     // When an XML parser with XML scripting support enabled creates a script element,
     // it must have its parser document set and its "force async" flag must be unset.
     // FIXME: If the parser was created as part of the XML fragment parsing algorithm, then the element must be marked as "already started" also.
-    if (m_scripting_support == XMLScriptingSupport::Enabled && node->is_html_script_element()) {
-        auto& script_element = static_cast<HTML::HTMLScriptElement&>(*node);
-        script_element.set_parser_document(Badge<XMLDocumentBuilder> {}, m_document);
-        script_element.set_force_async(Badge<XMLDocumentBuilder> {}, false);
+    // AD-HOC: SVG script elements are processed like HTML script elements, since SVG defines them as equivalent.
+    if (auto* script_element = as_if<HTML::HTMLOrSVGScriptElement>(*node); script_element && m_scripting_support == XMLScriptingSupport::Enabled) {
+        script_element->set_parser_document(Badge<XMLDocumentBuilder> {}, m_document);
+        script_element->set_force_async(Badge<XMLDocumentBuilder> {}, false);
     }
 
     // AD-HOC: Let <link> elements know which document they were originally parsed for.
@@ -151,9 +150,9 @@ void XMLDocumentBuilder::element_start(Utf16FlyString const& name, Vector<XML::L
         link_element->set_was_enabled_when_created_by_parser(Badge<XMLDocumentBuilder> {}, !has_disabled_attribute);
     }
 
+    HTML::HTMLOrSVGScriptElement::ParserChildrenChangeScope script_children_change { *m_current_node };
     if (m_current_node->is_html_template_element()) {
         // When an XML parser would append a node to a template element, it must instead append it to the template element's template contents (a DocumentFragment node).
-        m_template_node_stack.append(*m_current_node);
         MUST(static_cast<HTML::HTMLTemplateElement&>(*m_current_node).content()->append_child(node));
     } else {
         MUST(m_current_node->append_child(node));
@@ -188,6 +187,7 @@ void XMLDocumentBuilder::element_start(Utf16FlyString const& name, Vector<XML::L
         }
     }
 
+    m_open_elements.append(node);
     m_current_node = node.ptr();
 }
 
@@ -203,12 +203,13 @@ void XMLDocumentBuilder::element_end(Utf16FlyString const& name)
     VERIFY(m_current_node->node_name().equals_ignoring_ascii_case(name));
     // When an XML parser with XML scripting support enabled creates a script element, [...]
     // When the element's end tag is subsequently parsed,
-    if (m_scripting_support == XMLScriptingSupport::Enabled && m_current_node->is_html_script_element()) {
+    if (auto* script_element = as_if<HTML::HTMLOrSVGScriptElement>(*m_current_node); script_element && m_scripting_support == XMLScriptingSupport::Enabled) {
         // the user agent must perform a microtask checkpoint,
         HTML::perform_a_microtask_checkpoint();
         // and then prepare the script element.
-        auto& script_element = static_cast<HTML::HTMLScriptElement&>(*m_current_node);
-        script_element.prepare_script(Badge<XMLDocumentBuilder> {});
+        // AD-HOC: Set the script text value for Trusted Types as the HTML parser does, matching other engines.
+        script_element->set_script_text_from_parser();
+        script_element->prepare_script(Badge<XMLDocumentBuilder> {});
 
         // If this causes there to be a pending parsing-blocking script, then the user agent must run the following steps:
         if (auto pending_parsing_blocking_script = m_document->pending_parsing_blocking_script()) {
@@ -217,8 +218,8 @@ void XMLDocumentBuilder::element_end(Utf16FlyString const& name)
 
             // 2. Spin the event loop until the parser's Document has no style sheet that is blocking scripts and the pending parsing-blocking script's "ready to be parser-executed" flag is set.
             if (m_document->has_a_style_sheet_that_is_blocking_scripts() || !pending_parsing_blocking_script->is_ready_to_be_parser_executed()) {
-                HTML::main_thread_event_loop().spin_until(GC::create_function(GC::Heap::the(), [&] {
-                    return !m_document->has_a_style_sheet_that_is_blocking_scripts() && pending_parsing_blocking_script->is_ready_to_be_parser_executed();
+                HTML::main_thread_event_loop().spin_until(GC::create_function(GC::Heap::the(), GC::captures(GC::Ref { *m_document }, pending_parsing_blocking_script->as_element()), [](GC::Ref<DOM::Document>& document, DOM::Element& script) {
+                    return !document->has_a_style_sheet_that_is_blocking_scripts() && as<HTML::HTMLOrSVGScriptElement>(script).is_ready_to_be_parser_executed();
                 }));
             }
 
@@ -231,21 +232,14 @@ void XMLDocumentBuilder::element_end(Utf16FlyString const& name)
             // 5. Set the pending parsing-blocking script to null.
             m_document->set_pending_parsing_blocking_script(nullptr);
         }
-    } else if (m_scripting_support == XMLScriptingSupport::Enabled && m_current_node->is_svg_script_element()) {
-        // https://www.w3.org/TR/SVGMobile12/struct.html#ProgressiveRendering
-        // When an end element event occurs for a 'script' element, that element is processed according to the
-        // Script processing section of the Scripting chapter. Further parsing of the document will be blocked
-        // until processing of the 'script' is complete.
-        auto& script_element = static_cast<SVG::SVGScriptElement&>(*m_current_node);
-        script_element.process_the_script_element();
-    };
-
-    auto* parent = m_current_node->parent_node();
-    if (parent && parent->is_document_fragment()) {
-        auto template_parent_node = m_template_node_stack.take_last();
-        parent = template_parent_node.ptr();
     }
-    m_current_node = parent;
+
+    (void)m_open_elements.take_last();
+    if (m_open_elements.is_empty()) {
+        m_current_node = m_document.ptr();
+    } else {
+        m_current_node = m_open_elements.last().ptr();
+    }
 }
 
 void XMLDocumentBuilder::text(StringView data)
@@ -253,6 +247,7 @@ void XMLDocumentBuilder::text(StringView data)
     if (m_has_error)
         return;
 
+    HTML::HTMLOrSVGScriptElement::ParserChildrenChangeScope script_children_change { *m_current_node };
     if (auto* last = m_current_node->last_child(); last && last->is_text()) {
         auto& text_node = static_cast<DOM::Text&>(*last);
         m_text_builder.append(text_node.data());
@@ -270,6 +265,7 @@ void XMLDocumentBuilder::comment(StringView data)
     if (m_has_error || !m_current_node)
         return;
 
+    HTML::HTMLOrSVGScriptElement::ParserChildrenChangeScope script_children_change { *m_current_node };
     MUST(m_current_node->append_child(m_document->create_comment(Utf16String::from_utf8(data))));
 }
 
@@ -279,6 +275,7 @@ void XMLDocumentBuilder::cdata_section(StringView data)
         return;
 
     auto section = MUST(m_document->create_cdata_section(Utf16String::from_utf8(data)));
+    HTML::HTMLOrSVGScriptElement::ParserChildrenChangeScope script_children_change { *m_current_node };
     MUST(m_current_node->append_child(section));
 }
 
@@ -288,13 +285,14 @@ void XMLDocumentBuilder::processing_instruction(Utf16FlyString const& target, Ut
         return;
 
     auto processing_instruction = MUST(m_document->create_processing_instruction(target, data));
+    HTML::HTMLOrSVGScriptElement::ParserChildrenChangeScope script_children_change { *m_current_node };
     MUST(m_current_node->append_child(processing_instruction));
 }
 
 void XMLDocumentBuilder::document_end()
 {
     // When an XML parser reaches the end of its input, it must stop parsing, following the same rules as the HTML parser.
-    m_template_node_stack.clear();
+    m_open_elements.clear();
     m_current_node = nullptr;
 
     HTML::HTMLParser::the_end(m_document, nullptr);

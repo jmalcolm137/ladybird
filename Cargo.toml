@@ -3,7 +3,9 @@ members = [
     "AK/Rust",
     "Libraries/LibCompositing/Rust",
     "Libraries/LibCompress/Rust",
+    "Libraries/LibCrypto/Rust",
     "Libraries/LibGfx/Rust",
+    "Libraries/LibHTTP/Rust",
     "Libraries/LibImageDecoders/Rust",
     "Libraries/LibIPC/Rust",
     "Libraries/LibJS/ABI",
@@ -23,7 +25,9 @@ members = [
     "Libraries/LibWeb/ContentBlocker/Rust",
     "Libraries/LibWeb/Rust",
     "Libraries/LibWeb/HTML/Parser/Rust",
+    "Libraries/LibWebRTC/Rust",
     "Libraries/RustAllocator",
+    "Services/WebRTCClient",
     "Tests/LibIPC/RustEchoServer",
 ]
 exclude = [
@@ -39,6 +43,10 @@ inherits = "release"
 incremental = false
 codegen-units = 1
 lto = true
+
+# Line tables keep file and line numbers in panic backtraces. Full debug info doubles the time to build the tests.
+[profile.test]
+debug = "line-tables-only"
 
 [workspace.lints.rust]
 unexpected_cfgs = { level = "deny", check-cfg = ["cfg(ladybird_gc_lints)"] }

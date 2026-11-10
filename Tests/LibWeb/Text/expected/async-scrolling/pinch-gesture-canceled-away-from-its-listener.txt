@@ -1,0 +1,2 @@
+compositor scale: 1.5
+main thread scale: 1.5

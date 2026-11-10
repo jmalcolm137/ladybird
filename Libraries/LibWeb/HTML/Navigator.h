@@ -21,7 +21,6 @@
 #include <LibWeb/HTML/UserActivation.h>
 #include <LibWeb/MediaCapabilitiesAPI/MediaCapabilities.h>
 #include <LibWeb/MediaCapture/MediaDevices.h>
-#include <LibWeb/Serial/Serial.h>
 #include <LibWeb/StorageAPI/NavigatorStorage.h>
 #include <LibWeb/WebLocks/NavigatorLocks.h>
 
@@ -66,12 +65,10 @@ public:
     [[nodiscard]] GC::Ref<PluginArray> plugins();
     [[nodiscard]] GC::Ref<Clipboard::Clipboard> clipboard();
     [[nodiscard]] GC::Ref<Geolocation::Geolocation> geolocation();
-    [[nodiscard]] GC::Ref<Serial::Serial> serial();
     [[nodiscard]] GC::Ref<UserActivation> user_activation();
     [[nodiscard]] GC::Ref<CredentialManagement::CredentialsContainer> credentials();
     GC::Ref<WebIDL::Promise> get_battery();
     void start_get_battery_steps(GC::Ref<WebIDL::Promise>);
-    [[nodiscard]] GC::Ref<WebXR::XRSystem> xr();
     [[nodiscard]] GC::Ref<PermissionsAPI::Permissions> permissions();
     void request_media_key_system_access(Utf16String key_system, Vector<EncryptedMediaExtensions::MediaKeySystemConfiguration> supported_configurations, GC::Ref<WebIDL::Promise>);
 
@@ -111,9 +108,6 @@ private:
     // https://w3c.github.io/geolocation/#navigator_interface
     GC::Ptr<Geolocation::Geolocation> m_geolocation;
 
-    // https://wicg.github.io/serial/#extensions-to-the-navigator-interface
-    GC::Ptr<Serial::Serial> m_serial;
-
     // https://html.spec.whatwg.org/multipage/interaction.html#dom-navigator-useractivation
     GC::Ptr<UserActivation> m_user_activation;
 
@@ -128,9 +122,6 @@ private:
 
     // https://w3c.github.io/webappsec-credential-management/#framework-credential-management
     GC::Ptr<CredentialManagement::CredentialsContainer> m_credentials;
-
-    // https://immersive-web.github.io/webxr/#dom-navigator-xr
-    GC::Ptr<WebXR::XRSystem> m_xr;
 
     // https://w3c.github.io/permissions/#navigator-and-workernavigator-extension
     GC::Ptr<PermissionsAPI::Permissions> m_permissions;

@@ -38,6 +38,7 @@
 #include <LibWebCommon/HTML/PreparedNavigationDescriptor.h>
 #include <LibWebCommon/HTML/ReplicatedNavigableState.h>
 #include <LibWebCommon/HTML/SameDocumentNavigationEntry.h>
+#include <LibWebCommon/NotificationsAPI/NotificationData.h>
 #include <LibWebCommon/HTML/SandboxingFlagSet.h>
 #include <LibWebCommon/HTML/Scripting/ScriptRegistryTypes.h>
 #include <LibWebCommon/HTML/SelectItem.h>
@@ -62,6 +63,7 @@
 #include <LibWebCommon/Page/PendingDialog.h>
 #include <LibWebCommon/Page/ScreenWakeLockState.h>
 #include <LibWebCommon/Page/SpellingError.h>
+#include <LibWebCommon/Page/Translation.h>
 #include <LibWebCommon/Page/WritingSuggestion.h>
 #include <LibWebCommon/ReferrerPolicy/ReferrerPolicy.h>
 #include <LibWebCommon/StorageAPI/StorageAreaId.h>
@@ -82,7 +84,7 @@ endpoint WebContentClient routed by Web::PageId page_id
 {
 
     [NotRouted] did_add_blob_url_entry(Web::PageId page_id, Web::HTML::EnvironmentId environment_id, Utf16String url, Web::FileAPI::SerializedBlobURLEntry entry) => (URL::BlobURLEntry::Token token)
-    did_remove_blob_url_entries(Web::PageId page_id, Web::HTML::EnvironmentId environment_id, Vector<Utf16String> urls) => ()
+    [NotRouted] did_remove_blob_url_entries(Web::PageId page_id, Web::HTML::EnvironmentId environment_id, Vector<Utf16String> urls) => ()
     did_request_blob_url_entry(Utf16String url, Optional<URL::BlobURLEntry::Token> token) => (Optional<Web::FileAPI::SerializedBlobURLEntry> entry)
     did_retain_blob_url_token(Web::HTML::CrossProcessId navigable_id, URL::BlobURLEntry::Token token) =|
 
@@ -98,7 +100,7 @@ endpoint WebContentClient routed by Web::PageId page_id
     did_request_focusing_steps_for_navigable(Web::PageId page_id, Web::HTML::CrossProcessId navigable_id, Web::HTML::FocusTrigger focus_trigger) =|
     did_request_window_focus_of_navigable(Web::PageId page_id, Web::HTML::CrossProcessId navigable_id) =|
     did_request_set_opener_of_navigable(Web::PageId page_id, Web::HTML::CrossProcessId navigable_id, Web::HTML::CrossProcessId opener_navigable_id) =|
-    did_finish_history_navigation_params_creation(Web::PageId page_id, Web::HTML::CrossProcessId operation_id, Web::HTML::HistoryNavigationPopulation population) =|
+    did_finish_history_navigation_params_creation(Web::PageId page_id, Web::HTML::CrossProcessId operation_id, Web::HTML::CrossProcessId navigable_id, Web::HTML::NavigationPopulationResult result) =|
     did_finish_navigation_params_creation(Web::PageId page_id, Web::HTML::CrossProcessId navigable_id, Utf16String navigation_id, Optional<Web::HTML::NavigationPopulationResult> result) =|
     did_fail_navigation_population(Web::PageId page_id, Web::HTML::CrossProcessId navigable_id, Utf16String navigation_id) =|
     did_create_populated_document_with_an_origin_of_its_own(Web::PageId page_id, Web::HTML::CrossProcessId navigable_id, Web::HTML::CrossProcessId document_id, Web::HTML::PopulatedDocumentOrigin origin, Web::HTML::EnvironmentId environment_id) =|
@@ -114,17 +116,14 @@ endpoint WebContentClient routed by Web::PageId page_id
     did_destroy_child_frame(Web::PageId page_id, Web::HTML::CrossProcessId frame_id) =|
     did_finish_loading(Web::PageId page_id, Web::HTML::CrossProcessId navigable_id, Web::HTML::CrossProcessId document_id) =|
     [NotRouted] did_start_download_without_request(Web::PageId page_id, URL::URL url, ByteString suggested_filename, Optional<u64> total_size) => (Optional<u64> download_id)
-    [NotRouted] did_start_download(Web::PageId page_id, Web::HTML::CrossProcessId navigable_id, Optional<Utf16String> navigation_id, URL::URL url, ByteString suggested_filename, Optional<u64> total_size, int request_server_client_id, u64 request_server_request_id, ByteBuffer initial_data, JsonValue network_response) => (Optional<u64> download_id)
+    [NotRouted] did_start_download(Web::PageId page_id, Web::HTML::CrossProcessId navigable_id, Optional<Utf16String> navigation_id, URL::URL url, ByteString suggested_filename, Optional<u64> total_size, HTTP::Cookie::SameSiteContext same_site_context, int request_server_client_id, u64 request_server_request_id, ByteBuffer initial_data, JsonValue network_response) => (Optional<u64> download_id)
     did_receive_download_data(Web::PageId page_id, u64 download_id, ByteBuffer data) =|
     did_finish_download(Web::PageId page_id, u64 download_id) =|
     did_fail_download(Web::PageId page_id, u64 download_id, String error) =|
-    did_request_refresh(Web::PageId page_id) =|
     did_request_cursor_change(Web::PageId page_id, Gfx::Cursor cursor) =|
     did_change_title(Web::PageId page_id, Utf16String title) =|
     did_update_editing_history_state(Web::PageId page_id, bool can_undo, bool can_redo) =|
     did_set_text_fragment_indication_visibility(Web::PageId page_id, bool visible) =|
-    did_request_tooltip_override(Web::PageId page_id, Gfx::IntPoint position, ByteString title) =|
-    did_stop_tooltip_override(Web::PageId page_id) =|
     did_enter_tooltip_area(Web::PageId page_id, ByteString title) =|
     did_leave_tooltip_area(Web::PageId page_id) =|
     did_hover_link(Web::PageId page_id, URL::URL url) =|
@@ -135,7 +134,7 @@ endpoint WebContentClient routed by Web::PageId page_id
     did_request_context_menu(Web::PageId page_id, Web::HTML::CrossProcessId local_root_id, Gfx::IntPoint content_position, Web::ContextMenuForInputEventsTarget for_input_events_target, Optional<Utf16String> misspelled_word, Optional<u64> text_fragment_generation_id) =|
     did_request_link_context_menu(Web::PageId page_id, Web::HTML::CrossProcessId local_root_id, Gfx::IntPoint content_position, Web::HTML::PreparedNavigationDescriptor navigation, ByteString target, unsigned modifiers, Optional<u64> text_fragment_generation_id) =|
     did_generate_text_fragment_url(Web::PageId page_id, u64 request_id, Optional<URL::URL> url) =|
-    did_request_image_context_menu(Web::PageId page_id, Web::HTML::CrossProcessId local_root_id, Gfx::IntPoint content_position, Web::HTML::PreparedNavigationDescriptor navigation, ByteString target, unsigned modifiers, Optional<Gfx::ShareableBitmap> bitmap) =|
+    did_request_image_context_menu(Web::PageId page_id, Web::HTML::CrossProcessId local_root_id, Gfx::IntPoint content_position, Web::HTML::PreparedNavigationDescriptor navigation, ByteString target, unsigned modifiers, Optional<Gfx::ShareableBitmap> bitmap, Optional<Web::HTML::PreparedNavigationDescriptor> link_navigation, Optional<String> image_mime_type) =|
     did_request_media_context_menu(Web::PageId page_id, Web::HTML::CrossProcessId local_root_id, Gfx::IntPoint content_position, ByteString target, unsigned modifiers, Web::MediaContextMenu menu, Optional<Web::HTML::PreparedNavigationDescriptor> navigation) =|
     did_request_alert(Web::PageId page_id, Utf16String message) =|
     did_request_before_unload(Web::PageId page_id, String source) =|
@@ -154,7 +153,8 @@ endpoint WebContentClient routed by Web::PageId page_id
     did_inspect_current_flexbox(Web::PageId page_id, String flexbox_layout) =|
     did_inspect_indexed_database(Web::PageId page_id, u64 request_id, String result) =|
     did_inspect_accessibility_tree(Web::PageId page_id, String accessibility_tree) =|
-    did_get_accessibility_tree(Web::PageId page_id, Vector<WebView::AccessibilityNodeData> nodes) =|
+    did_get_accessibility_tree(Web::PageId page_id, u64 sequence, Vector<WebView::AccessibilityNodeData> nodes) =|
+    did_change_accessibility_tree(Web::PageId page_id, u64 base_sequence, u64 sequence, WebView::AccessibilityTreeDelta delta) =|
     did_accessibility_focus_change(Web::PageId page_id, i64 focused_node_id) =|
     did_get_hovered_node_id(Web::PageId page_id, Web::UniqueNodeID node_id) =|
     did_get_node_id_at_position(Web::PageId page_id, u64 request_id, Web::UniqueNodeID node_id) =|
@@ -201,6 +201,9 @@ endpoint WebContentClient routed by Web::PageId page_id
     did_lose_request_server_connection(Optional<Utf16String> top_level_site) => (Optional<IPC::TransportHandle> handle)
     request_media_server_connection() => (Optional<IPC::TransportHandle> handle)
     request_audio_server_connection() => (Optional<IPC::TransportHandle> handle)
+    request_webrtc_client_connection() => (Optional<IPC::TransportHandle> handle)
+    request_image_decoder_connection() => (Optional<IPC::TransportHandle> handle)
+    did_release_image_decoder() =|
     request_video_presentation_channel() =|
 
     [NotRouted] did_request_storage_usage(Web::PageId page_id, Web::HTML::EnvironmentId environment_id) => (u64 usage)
@@ -218,6 +221,7 @@ endpoint WebContentClient routed by Web::PageId page_id
     did_complete_close_preflight(Web::PageId page_id, u64 request_id, bool approved) =|
     did_change_needs_beforeunload_check(Web::PageId page_id, bool needs_beforeunload_check) =|
     did_consume_user_activation(Web::PageId page_id, Web::HTML::UserActivationConsumption consumption) =|
+    did_notify_about_user_activation(Web::PageId page_id, Web::HTML::CrossProcessId document_id) =|
     webdriver_user_prompt_handling_complete(Web::PageId page_id, u64 request_id, Web::WebDriver::Response response) =|
     webdriver_did_set_current_browsing_context(Web::PageId page_id, u64 command_id, Web::HTML::CrossProcessId navigable_id) =|
     webdriver_command_complete(Web::PageId page_id, u64 command_id, Web::WebDriver::Response response) =|
@@ -242,6 +246,14 @@ endpoint WebContentClient routed by Web::PageId page_id
     did_stop_geolocation_position_watch(Web::PageId page_id, u64 request_id) =|
     did_request_permission(Web::PageId page_id, u64 request_id, Web::HTML::CrossProcessId document_id, Utf16String name) =|
     [NotRouted] did_request_permission_snapshot(Web::PageId page_id, URL::Origin top_level_origin) => (Web::Permissions::PermissionSnapshot snapshot)
+    did_request_show_notification(Web::PageId page_id, u64 notification_id, Web::HTML::CrossProcessId document_id, Web::NotificationsAPI::NotificationData data, Optional<Gfx::ShareableBitmap> icon) =|
+    did_request_close_notification(Web::PageId page_id, u64 notification_id) =|
+    did_abandon_notification(Web::PageId page_id, u64 notification_id) =|
+    did_handle_notification_click(Web::PageId page_id, u64 notification_id, bool into_focus) =|
+    [NotRouted] did_request_notifications_state_for_testing(Web::PageId page_id) => (String json)
+    did_request_click_notification_for_testing(Web::PageId page_id, u64 notification_id) =|
+    did_request_click_notification_by_id_for_testing(Web::PageId page_id, u64 browser_notification_id) =|
+    did_request_dismiss_notification_for_testing(Web::PageId page_id, u64 notification_id) =|
     did_request_file_picker(Web::PageId page_id, Web::HTML::FileFilter accepted_file_types, Web::HTML::AllowMultipleFiles allow_multiple_files) =|
     did_request_select_dropdown(Web::PageId page_id, Web::HTML::CrossProcessId local_root_id, Gfx::IntPoint content_position, i32 minimum_width, Vector<Web::HTML::SelectItem> items) =|
     did_start_drag(Web::PageId page_id, Web::DragData drag_data) =|
@@ -250,10 +262,14 @@ endpoint WebContentClient routed by Web::PageId page_id
     did_change_theme_color(Web::PageId page_id, Gfx::Color color) =|
     did_change_background_color(Web::PageId page_id, Gfx::Color color) =|
 
-    did_insert_clipboard_item(Web::PageId page_id, Web::Clipboard::SystemClipboardItem item, String presentation_style) =|
-    did_request_clipboard_entries(Web::PageId page_id, u64 request_id) =|
+    did_insert_clipboard_item(Web::PageId page_id, Web::Clipboard::SystemClipboardItem item, String presentation_style, Optional<Web::HTML::CrossProcessId> writing_document_id) =|
+    did_request_clipboard_entries_for_paste(Web::PageId page_id, u64 request_id) =|
+    did_request_clipboard_entries(Web::PageId page_id, u64 request_id, Web::HTML::CrossProcessId reading_document_id) =|
+    did_request_paste_from_clipboard_for_testing(Web::PageId page_id) =|
     did_request_spell_check(Web::PageId page_id, u64 request_id, Utf16String text) =|
     did_request_writing_suggestion(Web::PageId page_id, u64 request_id, Utf16String text, u32 caret_offset) =|
+    did_get_translation_language_sample(Web::PageId page_id, u64 request_id, Web::TranslationLanguageSample sample) =|
+    did_request_translation(Web::PageId page_id, Web::TranslationUnit unit) =|
     did_request_primary_paste(Web::PageId page_id) =|
     did_update_primary_selection(Web::PageId page_id, String text) =|
 
@@ -265,13 +281,15 @@ endpoint WebContentClient routed by Web::PageId page_id
     did_change_focused_navigable(Web::PageId page_id, Web::HTML::CrossProcessId navigable_id) =|
     did_request_key_event_for_testing(Web::PageId page_id, Web::KeyEvent event) =|
     did_request_spelling_menu_action_for_testing(Web::PageId page_id, Web::SpellingMenuActionForTesting action, u32 guess_index) =|
+    did_request_page_translation_for_testing(Web::PageId page_id, String target_language) =|
     did_request_webdriver_mouse_event(Web::PageId page_id, u64 request_id, Web::HTML::CrossProcessId local_root_id, Web::MouseEvent event) =|
     did_request_pinch_event_for_testing(Web::PageId page_id, Web::HTML::CrossProcessId local_root_id, Web::PinchEvent event) =|
     did_request_set_system_visibility_state(Web::PageId page_id, Web::HTML::VisibilityState visibility_state) =|
     request_history_operation(Web::PageId page_id, Web::HTML::CrossProcessId operation_id, Web::HistoryOperationParameters parameters) =|
     revoke_history_operation(Web::PageId page_id, Web::HTML::CrossProcessId operation_id) =|
     beforeunload_check_result(Web::PageId page_id, Web::HTML::CrossProcessId check_id, Web::HTML::CheckIfUnloadingIsCanceledResult result, Web::HTML::UnloadPromptShown unload_prompt_shown) =|
-    changing_navigable_history_job_ready(Web::PageId page_id, Web::HTML::CrossProcessId operation_id, Web::HTML::CrossProcessId navigable_id, Web::HTML::ChangingNavigableHistoryStepJobDisposition disposition, bool update_only, Optional<Web::HTML::CrossProcessId> target_document_id) =|
+    changing_navigable_history_job_reached_population(Web::PageId page_id, Web::HTML::CrossProcessId operation_id, Web::HTML::CrossProcessId navigable_id, Web::HTML::NavigationSourceSnapshot active_document_source_snapshot_params) =|
+    changing_navigable_history_job_ready(Web::PageId page_id, Web::HTML::CrossProcessId operation_id, Web::HTML::CrossProcessId navigable_id, Web::HTML::ChangingNavigableHistoryStepJobDisposition disposition, bool update_only) =|
     descendant_unload_task_complete(Web::PageId page_id, Web::HTML::CrossProcessId unload_id, Web::HTML::CrossProcessId navigable_id) =|
     request_child_navigable_unload(Web::PageId page_id, Web::HTML::CrossProcessId navigable_id) =|
     request_unload_check(Web::PageId page_id, Web::HTML::CrossProcessId navigable_id, Web::HTML::CrossProcessId check_id) =|
@@ -306,6 +324,7 @@ endpoint WebContentClient routed by Web::PageId page_id
 
     did_find_in_page(Web::PageId page_id, size_t current_match_index, Optional<size_t> total_match_count) =|
 
-    [NotRouted] start_worker_agent(Web::PageId page_id, Web::HTML::WorkerAgentStartRequest request) => (Web::HTML::WorkerAgentId agent_id)
-    close_worker_agent(Web::PageId page_id, Web::HTML::WorkerAgentId agent_id, Web::HTML::WorkerAgentOwnerToken owner_token) =|
+    [NotRouted] start_worker_agent(Web::PageId page_id, Web::HTML::WorkerAgentStartRequest request) => (Web::HTML::WorkerAgentId agent_id, Optional<IPC::TransportHandle> thread_transport, bool is_hosted_in_caller_process)
+    [NotRouted] close_worker_agent(Web::PageId page_id, Web::HTML::WorkerAgentId agent_id, Web::HTML::WorkerAgentOwnerToken owner_token) =|
+    [NotRouted] register_dedicated_worker(Web::PageId page_id, Web::HTML::WorkerAgentStartRequest request, IPC::TransportHandle worker_transport) =|
 }

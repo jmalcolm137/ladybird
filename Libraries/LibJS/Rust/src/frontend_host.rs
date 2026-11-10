@@ -8,9 +8,11 @@
 
 use libregex_rust::ast::Flags;
 use libregex_rust::regex::Regex;
+use num_bigint::BigInt;
 
 use crate::runtime::regexp_object::parse_regex_pattern;
 use crate::runtime::value::number_to_string;
+use crate::runtime::value_conversions;
 
 /// Number::toString(value), which the frontend uses for numeric property names.
 pub fn number_to_utf16(value: f64) -> Vec<u16> {
@@ -42,4 +44,19 @@ pub fn validate_regex(pattern: &[u16], flags: &[u16]) -> Result<(), String> {
     Regex::compile_chars(pattern_characters, compile_flags)
         .map_err(|error| format!("RegExp compile error: {error}"))?;
     Ok(())
+}
+
+/// StringToNumber(str), which the frontend uses to fold operations on string constants.
+pub fn string_to_number(string: &[u16]) -> f64 {
+    value_conversions::string_to_number(string)
+}
+
+/// StringToBigInt(str), which the frontend uses to fold operations on a string and a BigInt constant.
+pub fn string_to_bigint(string: &[u16]) -> Option<BigInt> {
+    value_conversions::string_to_bigint(string)
+}
+
+/// Number::exponentiate(base, exponent), which the frontend uses to fold `**`.
+pub fn exponentiate(base: f64, exponent: f64) -> f64 {
+    value_conversions::exp_double(base, exponent)
 }

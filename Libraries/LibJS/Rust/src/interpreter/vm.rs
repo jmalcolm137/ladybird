@@ -8,13 +8,18 @@ use core::cell::{Cell, OnceCell, Ref, RefCell};
 use core::ffi::c_void;
 use core::ops::ControlFlow;
 use core::ptr::NonNull;
+use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering, fence};
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::collections::VecDeque;
+use std::rc::Rc;
+use std::sync::{Arc, Mutex, PoisonError};
 
+use ak::waiter_list::AgentWaiter;
 use ak::{Utf16FlyString, Utf16String};
 use libjs_runtime_macros::Trace;
 
+use super::dispatch_tables::VmDispatchTables;
 use super::interpreter_stack::InterpreterStackMemory;
 use crate::build_configuration::VM_STACK_SPACE_LIMIT;
 use crate::bytecode::executable::{
@@ -74,7 +79,7 @@ use crate::runtime::module::{Module, finish_loading_imported_module};
 use crate::runtime::module_loading::{ImportedModulePayload, ImportedModuleReferrer};
 use crate::runtime::module_request::ModuleRequest;
 use crate::runtime::native_javascript_backed_function::NativeJavaScriptBackedFunction;
-use crate::runtime::object::IntrinsicAccessor;
+use crate::runtime::object::{IndexedDictionary, IntrinsicAccessor};
 use crate::runtime::primitive_string::PrimitiveString;
 use crate::runtime::promise::{Promise, PromiseState, RejectionOperation};
 use crate::runtime::property_key::PropertyKey;
@@ -170,13 +175,15 @@ pub type PromiseRejectionCallback = fn(&Vm, Gc<Promise>);
 /// Object::define_unimplemented_property.
 pub type OnUnimplementedPropertyAccess = fn(&Vm, &Object, &PropertyKey);
 
+static STACK_FRAME_SYNTAX: AtomicU8 = AtomicU8::new(StackFrameSyntax::Indented as u8);
+static NATIVE_FUNCTION_SOURCE_SYNTAX: AtomicU8 = AtomicU8::new(NativeFunctionSourceSyntax::SingleLine as u8);
+
 /// How a VM is set up, which is fixed once it is created.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct VmOptions {
-    /// Makes the VM's heap the one GC::Heap::the() returns, so that the embedder's C++ cells are allocated from it.
-    pub become_process_default_heap: bool,
-    /// Backs SharedArrayBuffers with shared memory, which other processes can map.
-    pub shared_memory_shared_array_buffers: bool,
+    /// Makes the VM's heap the one GC::Heap::the() returns on this thread, so that the embedder's C++ cells are
+    /// allocated from it.
+    pub become_thread_default_heap: bool,
 }
 
 /// An execution context stack that VM::save_execution_context_stack() set aside, with the TypeErrorRealmScope that
@@ -321,6 +328,12 @@ pub struct LoadedModules {
 }
 
 define_cell!(LoadedModules, Other);
+
+/// An exception, and where in its source code the instruction that threw it is.
+struct ThrowSite {
+    value: Value,
+    source_range: Option<SourceRange>,
+}
 
 /// HostResizeArrayBuffer, which hosts may override.
 pub type HostResizeArrayBuffer = fn(&Vm, &ArrayBuffer, usize) -> ThrowCompletionOr<HandledByHost>;
@@ -501,7 +514,18 @@ pub struct Vm {
     /// The lowest native stack address JIT code runs at, JIT_NATIVE_STACK_HEADROOM above the native stack limit.
     /// Below it, JIT code leaves calls to the interpreter, which runs JavaScript on its own stack, so that the code
     /// running after a stack overflow (catch blocks and the native functions they call) does not overflow again.
-    pub jit_native_stack_limit: Cell<usize>,
+    /// Atomic since request_interrupt() raises it past every stack pointer from any thread, which sends JIT code that
+    /// is entered from then on to the interpreter without JIT code ever having to check for that.
+    pub jit_native_stack_limit: AtomicUsize,
+    /// Set once script on this VM has to stop for good (see request_interrupt()). Any thread may set it.
+    interrupt_requested: AtomicBool,
+    /// This agent's node in the WaiterLists, which Atomics.wait() and memory.atomic.wait sleep on.
+    agent_waiter: Arc<AgentWaiter>,
+    /// The tables `VmHead::dispatch_tables` points to.
+    pub(crate) own_dispatch_tables: VmDispatchTables,
+    /// The word that stops the WebAssembly code of this VM's agent (see set_wasm_stack_limit_word()), if it has any.
+    /// The lock keeps the word from going away during an interrupt.
+    wasm_stack_limit_word: Mutex<*const AtomicU64>,
     heap: OnceCell<Heap>,
     _interpreter_stack_memory: InterpreterStackMemory,
     /// The storage of the execution context stack, whose length is its capacity. The head points into it and knows
@@ -513,9 +537,16 @@ pub struct Vm {
     native_function_count: Cell<u32>,
     /// The index of each function in the native function table, by its address and type.
     native_function_indices: RefCell<HashMap<(usize, u32), u32>>,
+    /// The indexed property dictionaries of the ECMAScript function objects that have one, by address. Those objects
+    /// have no pointer to their indexed elements (see `EcmascriptFunctionFields`), and hardly any of them has indexed
+    /// properties. The objects trace and free their dictionaries.
+    pub(crate) function_indexed_dictionaries:
+        RefCell<HashMap<usize, *mut IndexedDictionary, foldhash::fast::RandomState>>,
     roots: RootSet,
 
     pub names: CommonPropertyNames,
+    /// What functions without parameter names share, since an empty Rc slice is an allocation of its own.
+    pub(crate) no_parameter_names: Rc<[Utf16FlyString]>,
     /// The strings in these two caches are weak: the sweep callback drops the ones that die.
     string_to_atom_cache: RefCell<Box<[StringToAtomCacheEntry; STRING_TO_ATOM_CACHE_SIZE]>>,
     fly_string_cache: Box<[Cell<Option<Gc<PrimitiveString>>>; FLY_STRING_CACHE_SIZE]>,
@@ -530,6 +561,9 @@ pub struct Vm {
     cached_strings: OnceCell<CachedStrings>,
     single_ascii_character_strings: OnceCell<[Gc<PrimitiveString>; SINGLE_ASCII_CHARACTER_STRING_COUNT]>,
     well_known_symbols: OnceCell<WellKnownSymbols>,
+    /// What unwinds script after an interrupt (see request_interrupt()). Nothing can allocate it at that point, and
+    /// script never gets to see it.
+    interrupt_exception: OnceCell<Gc<Symbol>>,
     global_symbol_registry: OnceCell<Gc<GlobalSymbolRegistry>>,
 
     /// The executables whose inline caches the sweep callback prunes. The list is weak: the callback drops the
@@ -580,12 +614,14 @@ pub struct Vm {
     module_async_evaluation_count: Cell<u64>, // [[ModuleAsyncEvaluationCount]]
     /// The id the next PrivateEnvironment gives its names. It starts at one such that 0 can be invalid / default
     /// initialized.
-    next_private_environment_id: Cell<u64>,
     /// The properties defined with Object::define_intrinsic_accessor that have not been read yet, by the address of
     /// their object. The objects are weak: the sweep callback forgets the ones that die.
     intrinsic_accessors: RefCell<IntrinsicAccessorMap>,
     /// The debugger, which the head points to while it is attached.
     debugger: RefCell<Option<Box<Debugger>>>,
+    /// The last exception thrown, and where. A thrown value that is not an Error carries no location of its own, and
+    /// its frames are gone by the time the embedder reports it.
+    last_throw: RefCell<Option<ThrowSite>>,
     /// The properties defined with Object::define_unimplemented_property. The objects are weak: the sweep callback
     /// forgets the ones that die.
     unimplemented_properties: RefCell<UnimplementedPropertyMap>,
@@ -596,8 +632,6 @@ pub struct Vm {
     agent: Cell<AgentRecord>,
     /// How Error.prototype.stack writes its frames, and how Function.prototype.toString writes a built-in function:
     /// the embedder's choice, since scripts read both to tell engines apart.
-    stack_frame_syntax: Cell<StackFrameSyntax>,
-    native_function_source_syntax: Cell<NativeFunctionSourceSyntax>,
     saved_execution_context_stacks: RefCell<Vec<SavedExecutionContextStack>>,
     host_classes: RefCell<HostClassRegistry>,
     pub jit: JitState,
@@ -661,15 +695,21 @@ impl Vm {
                 keyed_property_lookup_cache_entries: Cell::new(core::ptr::null()),
                 dispatch_tables: [const { Cell::new(core::ptr::null()) }; DISPATCH_TABLE_COUNT],
             },
-            jit_native_stack_limit: Cell::new(0),
+            jit_native_stack_limit: AtomicUsize::new(0),
+            interrupt_requested: AtomicBool::new(false),
+            agent_waiter: AgentWaiter::new(),
+            own_dispatch_tables: VmDispatchTables::new(),
+            wasm_stack_limit_word: Mutex::new(core::ptr::null()),
             heap: OnceCell::new(),
             _interpreter_stack_memory: interpreter_stack_memory,
             execution_context_stack_storage: RefCell::new(execution_context_stack_storage),
             native_function_table: RefCell::new(native_function_table),
             native_function_count: Cell::new(0),
             native_function_indices: RefCell::new(HashMap::new()),
+            function_indexed_dictionaries: RefCell::default(),
             roots: RootSet::default(),
             names: CommonPropertyNames::new(),
+            no_parameter_names: Rc::from([]),
             string_to_atom_cache: RefCell::new(Box::new(core::array::from_fn(|_| StringToAtomCacheEntry::default()))),
             fly_string_cache: Box::new([const { Cell::new(None) }; FLY_STRING_CACHE_SIZE]),
             numeric_string_cache: Box::new([const { Cell::new(None) }; NUMERIC_STRING_CACHE_SIZE]),
@@ -688,6 +728,7 @@ impl Vm {
             cached_strings: OnceCell::new(),
             single_ascii_character_strings: OnceCell::new(),
             well_known_symbols: OnceCell::new(),
+            interrupt_exception: OnceCell::new(),
             global_symbol_registry: OnceCell::new(),
             executables: RefCell::new(Vec::new()),
             static_property_lookup_caches: StaticPropertyLookupCaches::new(),
@@ -725,16 +766,14 @@ impl Vm {
             loaded_modules: OnceCell::new(),
             module_execution_depth: Cell::new(0),
             module_async_evaluation_count: Cell::new(0),
-            next_private_environment_id: Cell::new(1),
             intrinsic_accessors: RefCell::new(HashMap::default()),
             debugger: RefCell::new(None),
+            last_throw: RefCell::new(None),
             unimplemented_properties: RefCell::new(HashMap::default()),
             on_unimplemented_property_access: Cell::new(None),
             options,
             embedder: Cell::new(None),
             agent: Cell::new(AgentRecord::default()),
-            stack_frame_syntax: Cell::new(StackFrameSyntax::default()),
-            native_function_source_syntax: Cell::new(NativeFunctionSourceSyntax::default()),
             saved_execution_context_stacks: RefCell::new(Vec::new()),
             host_classes: RefCell::new(HashMap::default()),
             jit: JitState::new(JitOptions::from_environment()),
@@ -747,17 +786,22 @@ impl Vm {
             .keyed_property_lookup_cache_entries
             .set(vm.keyed_property_lookup_cache.entries_for_interpreter());
         vm.update_dispatch_tables();
+        if options.become_thread_default_heap {
+            libregex_rust::vm::set_interrupt_flag_of_this_thread(&raw const vm.interrupt_requested);
+        }
         let context = storage.cast();
         // SAFETY: The VM stays at this address until it is dropped, and it destroys the heap before anything else.
-        let heap = unsafe { Heap::new(gather_roots, context, options.become_process_default_heap) };
+        let heap = unsafe { Heap::new(gather_roots, context, options.become_thread_default_heap) };
         // SAFETY: As above.
         unsafe { heap.register_sweep_callback(sweep, context) };
         vm.head.stack_base.set(heap.stack_bounds().0);
         vm.head
             .native_stack_limit
             .set(heap.stack_bounds().0 + VM_STACK_SPACE_LIMIT as usize);
-        vm.jit_native_stack_limit
-            .set(vm.head.native_stack_limit.get() + JIT_NATIVE_STACK_HEADROOM);
+        vm.jit_native_stack_limit.store(
+            vm.head.native_stack_limit.get() + JIT_NATIVE_STACK_HEADROOM,
+            Ordering::Relaxed,
+        );
         if vm.heap.set(heap).is_err() {
             unreachable!("the heap is created once");
         }
@@ -798,6 +842,11 @@ impl Vm {
         });
 
         let _ = self.well_known_symbols.set(WellKnownSymbols::create(self));
+        let _ = self.interrupt_exception.set(Symbol::create(
+            self,
+            Some(Utf16String::from_utf8("interrupt")),
+            symbol::Kind::Unique,
+        ));
         let _ = self.global_symbol_registry.set(GlobalSymbolRegistry::create(self));
         let _ = self.job_queues.set(self.heap().allocate(|_| JobQueues {
             header: CellHeader::for_class(JobQueues::CLASS),
@@ -832,6 +881,84 @@ impl Vm {
         let marker = 0u8;
         let current = core::ptr::from_ref(&marker) as usize;
         current < self.head.native_stack_limit.get()
+    }
+
+    /// The address below which did_reach_stack_space_limit().
+    pub fn native_stack_limit(&self) -> usize {
+        self.head.native_stack_limit.get()
+    }
+
+    /// Stops script on this VM for good. This and interrupt_requested() are the only methods of a VM that any thread
+    /// may call, as they stay away from everything else in it. The VM must stay alive until it returns, which an owner
+    /// that joins the VM's thread before destroying the VM ensures.
+    ///
+    /// Script costs nothing to run for this: the interpreter stops at its next dispatch, as every dispatch table entry
+    /// becomes the fallback handler, and JIT code stops at its next call or loop back edge, which compare the stack
+    /// pointer with a limit anyway, so raising the limit past every stack pointer does it. A thread that sleeps on a word
+    /// of shared memory gets woken.
+    ///
+    /// Script unwinds with interrupt_exception(), past every handler. The flag is never cleared: every later attempt to
+    /// run code fails at once, which is what makes the places in native code that catch exceptions harmless. They can
+    /// only ever try to run more code.
+    pub fn request_interrupt(&self) {
+        self.interrupt_requested.store(true, Ordering::SeqCst);
+        self.jit_native_stack_limit.store(usize::MAX, Ordering::Relaxed);
+        fence(Ordering::SeqCst);
+        self.own_dispatch_tables.stop_dispatching();
+        let word = self
+            .wasm_stack_limit_word
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        // SAFETY: Whoever set the word clears it before it goes away, which takes the lock.
+        if let Some(word) = unsafe { word.as_ref() } {
+            word.store(u64::MAX, Ordering::Relaxed);
+        }
+        self.agent_waiter.interrupt();
+    }
+
+    /// This agent's node in the WaiterLists.
+    pub fn agent_waiter(&self) -> &Arc<AgentWaiter> {
+        &self.agent_waiter
+    }
+
+    /// Has an interrupt also store the highest address to `word` (null for none), which is how the embedder's
+    /// WebAssembly store learns of it. Only the VM's thread may call this.
+    ///
+    /// # Safety
+    ///
+    /// `word` must be null, or point to a word that stays live until it is replaced or cleared by another call.
+    pub unsafe fn set_wasm_stack_limit_word(&self, word: *const AtomicU64) {
+        *self
+            .wasm_stack_limit_word
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = word;
+        // SAFETY: The caller guarantees that the word is live, or null.
+        if self.interrupt_requested()
+            && let Some(word) = unsafe { word.as_ref() }
+        {
+            word.store(u64::MAX, Ordering::Relaxed);
+        }
+    }
+
+    #[inline]
+    pub fn interrupt_requested(&self) -> bool {
+        self.interrupt_requested.load(Ordering::Relaxed)
+    }
+
+    /// What an interrupted VM throws.
+    pub fn interrupt_exception(&self) -> Value {
+        Value::from_symbol(
+            *self
+                .interrupt_exception
+                .get()
+                .expect("the VM allocates its interrupt exception"),
+        )
+    }
+
+    /// Throws interrupt_exception() from native code that noticed the interrupt.
+    #[cold]
+    pub fn throw_interrupt<T>(&self) -> ThrowCompletionOr<T> {
+        Err(Throw::new(self.interrupt_exception()))
     }
 
     pub fn push_execution_context(&self, context: NonNull<ExecutionContext>) {
@@ -1080,6 +1207,7 @@ impl Vm {
         self.json_stringify_cache.trace(visitor);
         self.cached_strings.trace(visitor);
         self.well_known_symbols.trace(visitor);
+        self.interrupt_exception.trace(visitor);
         self.global_symbol_registry.trace(visitor);
         self.head.type_error_realm_override.trace(visitor);
         self.job_queues.trace(visitor);
@@ -1087,6 +1215,9 @@ impl Vm {
         self.finalization_registries_with_dead_cells.trace(visitor);
         if let Some(debugger) = self.debugger.borrow().as_ref() {
             debugger.trace(visitor);
+        }
+        if let Some(throw_site) = self.last_throw.borrow().as_ref() {
+            throw_site.value.trace(visitor);
         }
     }
 
@@ -1235,20 +1366,17 @@ impl Vm {
     }
 
     pub fn stack_frame_syntax(&self) -> StackFrameSyntax {
-        self.stack_frame_syntax.get()
+        StackFrameSyntax::from_abi(STACK_FRAME_SYNTAX.load(Ordering::Relaxed))
     }
 
     pub fn native_function_source_syntax(&self) -> NativeFunctionSourceSyntax {
-        self.native_function_source_syntax.get()
+        NativeFunctionSourceSyntax::from_abi(NATIVE_FUNCTION_SOURCE_SYNTAX.load(Ordering::Relaxed))
     }
 
-    pub fn set_source_text_syntaxes(
-        &self,
-        stack_frames: StackFrameSyntax,
-        native_functions: NativeFunctionSourceSyntax,
-    ) {
-        self.stack_frame_syntax.set(stack_frames);
-        self.native_function_source_syntax.set(native_functions);
+    /// The embedder's choice for the whole process, as the engine that a page's script sees is the same in all its VMs.
+    pub fn set_source_text_syntaxes(stack_frames: StackFrameSyntax, native_functions: NativeFunctionSourceSyntax) {
+        STACK_FRAME_SYNTAX.store(stack_frames as u8, Ordering::Relaxed);
+        NATIVE_FUNCTION_SOURCE_SYNTAX.store(native_functions as u8, Ordering::Relaxed);
     }
 
     pub fn host_classes(&self) -> &RefCell<HostClassRegistry> {
@@ -1293,6 +1421,40 @@ impl Vm {
     pub fn restore_type_error_realm_override(&self, previous: TypeErrorRealmOverride) {
         self.head.type_error_realm_override.set(previous.realm);
         self.head.type_error_realm_override_depth.set(previous.depth);
+    }
+
+    /// Remembers that the running executable's instruction at `program_counter` threw `value`.
+    pub fn did_throw(&self, value: Value, program_counter: u32) {
+        *self.last_throw.borrow_mut() = Some(ThrowSite {
+            value,
+            source_range: self.current_executable().source_range_at(program_counter),
+        });
+    }
+
+    /// Whether `value` is the last exception thrown.
+    pub fn is_last_throw(&self, value: Value) -> bool {
+        self.last_throw
+            .borrow()
+            .as_ref()
+            .is_some_and(|throw_site| throw_site.value == value)
+    }
+
+    /// Forgets where `value` was thrown once a catch clause catches it or a report takes its location, so that reporting
+    /// an equal value later does not take its location from this throw.
+    pub fn forget_throw_site_of(&self, value: Value) {
+        let mut last_throw = self.last_throw.borrow_mut();
+        if last_throw.as_ref().is_some_and(|throw_site| throw_site.value == value) {
+            *last_throw = None;
+        }
+    }
+
+    /// Where `value` was thrown, if it is the last exception thrown.
+    pub fn throw_site_of(&self, value: Value) -> Option<SourceRange> {
+        self.last_throw
+            .borrow()
+            .as_ref()
+            .filter(|throw_site| throw_site.value == value)
+            .and_then(|throw_site| throw_site.source_range.clone())
     }
 
     /// The frames of every execution context, from the running one down, with where each is in its executable.
@@ -1403,6 +1565,10 @@ impl Vm {
 
     pub fn static_property_lookup_cache(&self, site: StaticPropertyLookupCacheSite) -> &PropertyLookupCache {
         self.static_property_lookup_caches.get(site)
+    }
+
+    pub fn is_static_property_lookup_cache(&self, cache: &PropertyLookupCache) -> bool {
+        self.static_property_lookup_caches.contains(cache)
     }
 
     pub fn keyed_property_lookup_cache(&self) -> &KeyedPropertyLookupCache {
@@ -1547,7 +1713,10 @@ impl Vm {
     pub fn run_queued_promise_jobs(&self) {
         // A reaction must finish settling its result promise before another job starts, even if its callback runs
         // bytecode that would otherwise trigger another checkpoint.
-        if self.running_promise_jobs.get() || self.job_queues().promise_jobs.borrow().is_empty() {
+        if self.running_promise_jobs.get()
+            || self.job_queues().promise_jobs.borrow().is_empty()
+            || self.interrupt_requested()
+        {
             return;
         }
         self.run_queued_promise_jobs_impl(|| false);
@@ -1562,7 +1731,7 @@ impl Vm {
     fn run_queued_promise_jobs_impl(&self, should_stop: impl Fn() -> bool) {
         let was_running_promise_jobs = self.running_promise_jobs.replace(true);
         let job_queues = self.job_queues();
-        while !should_stop() {
+        while !should_stop() && !self.interrupt_requested() {
             let Some(job) = job_queues.promise_jobs.borrow_mut(self).pop_front() else {
                 break;
             };
@@ -1583,7 +1752,8 @@ impl Vm {
 
     pub fn run_queued_finalization_registry_cleanup_jobs(&self) {
         let job_queues = self.job_queues();
-        loop {
+        // NB: A cleanup that fails is queued again, and it would fail forever once interrupted.
+        while !self.interrupt_requested() {
             let Some(finalization_registry) = job_queues.finalization_registry_cleanup_jobs.borrow_mut(self).pop()
             else {
                 break;
@@ -1701,10 +1871,6 @@ impl Vm {
             .loaded_modules
             .get()
             .expect("the VM allocates its list of loaded modules")
-    }
-
-    pub fn next_private_environment_id(&self) -> &Cell<u64> {
-        &self.next_private_environment_id
     }
 
     pub fn string_to_atom_cache(&self) -> &RefCell<Box<[StringToAtomCacheEntry; STRING_TO_ATOM_CACHE_SIZE]>> {
@@ -2020,8 +2186,14 @@ impl Vm {
 
 impl Drop for Vm {
     fn drop(&mut self) {
+        if self.options.become_thread_default_heap {
+            libregex_rust::vm::set_interrupt_flag_of_this_thread(core::ptr::null());
+        }
         // The debugger holds weak references to executables, which go away with the heap.
         drop(self.debugger.take());
+        // So do these caches of shapes. A weak reference that outlives the heap also keeps its weak block allocated.
+        self.json_parse_cache = JsonParseCache::default();
+        self.json_stringify_cache = JsonStringifyCache::new();
         // Compile jobs that are still running are abandoned; their results are dropped when they finish.
         self.jit.abandon_compile_jobs();
         // The heap's final collection destroys every cell, so it has to happen while the rest of the VM exists.

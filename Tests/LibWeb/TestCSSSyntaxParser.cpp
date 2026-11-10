@@ -392,19 +392,6 @@ TEST_CASE(style_engine_expands_presentation_hint_shorthands_in_rust)
     Vector<StyleProperty> hints { StyleProperty { Important::No, PropertyID::Border, inherited.properties()[0].value } };
     engine.set_element_presentational_hint_properties(node, StyleEngineFFI::FfiElementDeclarationKind::PresentationalHint, hints);
     EXPECT(!engine.css_transitions_may_observe_style_changes());
-    // Border expands through intermediate shorthands such as border-width. Each resulting
-    // longhand after the first must reuse the same immutable keyword value. The 17 longhands
-    // comprise four widths, four styles, four colors, and five border-image properties.
-    Layout::ForcedReadScope read { engine.render_document() };
-    for (size_t index = 0;; ++index) {
-        StringView name;
-        u64 value = 0;
-        VERIFY(engine.counter(read, index, name, value));
-        if (name == "specifiedValuesReused"sv) {
-            EXPECT_EQ(value, 16ull);
-            break;
-        }
-    }
     auto transitions = parse_native_declaration_block(u"transition-duration: 1s"sv);
     engine.set_element_presentational_hint_properties(node, StyleEngineFFI::FfiElementDeclarationKind::PresentationalHint, transitions.properties());
     EXPECT(engine.css_transitions_may_observe_style_changes());
@@ -426,8 +413,8 @@ TEST_CASE(native_declaration_block_specified_order_and_mutation)
 
     auto shared = block.share();
     auto value = block.properties()[4].value;
-    EXPECT(block.set(PropertyID::MarginLeft, *value, Important::No));
-    EXPECT(!block.set(PropertyID::MarginLeft, *value, Important::No));
+    EXPECT(block.set_expanding_shorthands(PropertyID::MarginLeft, *value, Important::No));
+    EXPECT(!block.set_expanding_shorthands(PropertyID::MarginLeft, *value, Important::No));
     EXPECT_EQ(shared.properties()[3].important, Important::Yes);
     EXPECT_EQ(shared.properties()[3].value->to_utf16_string(SerializationMode::Normal), u"2px"sv);
     EXPECT(block.remove_custom("--色"_utf16_fly_string));
@@ -436,7 +423,7 @@ TEST_CASE(native_declaration_block_specified_order_and_mutation)
 
     auto logical = parse_native_declaration_block(u"margin-left: 1px; margin-inline-start: 2px"sv);
     auto original_value = logical.properties()[0].value;
-    EXPECT(logical.set(PropertyID::MarginLeft, *original_value, Important::No));
+    EXPECT(logical.set_expanding_shorthands(PropertyID::MarginLeft, *original_value, Important::No));
     EXPECT_EQ(logical.properties()[0].property_id, PropertyID::MarginInlineStart);
     EXPECT_EQ(logical.properties()[1].property_id, PropertyID::MarginLeft);
 }
@@ -444,19 +431,20 @@ TEST_CASE(native_declaration_block_specified_order_and_mutation)
 TEST_CASE(native_declaration_block_merges_lists_without_expanding_again)
 {
     auto block = parse_native_declaration_block(u"margin: var(--gap); color: red !important; --色: first; @media all { width: 999px; } margin-left: 7px; color: blue; --色: last"sv);
-    EXPECT_EQ(block.properties().size(), 6u);
-    EXPECT_EQ(block.properties()[0].property_id, PropertyID::Margin);
-    EXPECT_EQ(block.properties()[4].property_id, PropertyID::Color);
-    EXPECT_EQ(block.properties()[4].important, Important::Yes);
-    EXPECT_EQ(block.properties()[5].property_id, PropertyID::MarginLeft);
-    EXPECT_EQ(block.properties()[5].value->to_utf16_string(SerializationMode::Normal), u"7px"sv);
+    // NB: margin-left no longer pends the margin shorthand, so the block drops that declaration.
+    EXPECT_EQ(block.properties().size(), 5u);
+    EXPECT_EQ(block.properties()[0].property_id, PropertyID::MarginTop);
+    EXPECT_EQ(block.properties()[3].property_id, PropertyID::Color);
+    EXPECT_EQ(block.properties()[3].important, Important::Yes);
+    EXPECT_EQ(block.properties()[4].property_id, PropertyID::MarginLeft);
+    EXPECT_EQ(block.properties()[4].value->to_utf16_string(SerializationMode::Normal), u"7px"sv);
     EXPECT_EQ(block.custom_properties().size(), 1u);
     EXPECT_EQ(block.custom_properties().begin()->value.value->to_utf16_string(SerializationMode::Normal), u"last"sv);
 
     auto shared = block.share();
-    EXPECT(block.remove(PropertyID::MarginLeft));
-    EXPECT_EQ(block.properties().size(), 5u);
-    EXPECT_EQ(shared.properties()[5].value->to_utf16_string(SerializationMode::Normal), u"7px"sv);
+    EXPECT(block.remove_expanding_shorthands(PropertyID::MarginLeft));
+    EXPECT_EQ(block.properties().size(), 4u);
+    EXPECT_EQ(shared.properties()[4].value->to_utf16_string(SerializationMode::Normal), u"7px"sv);
     EXPECT(parse_native_declaration_block(u"@media all { width: 999px; }"sv).is_empty());
     EXPECT(parse_native_declaration_block(u""sv).is_empty());
 }
@@ -466,9 +454,9 @@ TEST_CASE(native_declaration_block_preserves_unchanged_value_wrappers)
     auto block = parse_native_declaration_block(u"background-image: url(https://example.com/image.png); width: 3px"sv);
     auto image_value = block.properties()[0].value;
     auto width_value = block.properties()[1].value;
-    block.set(PropertyID::Height, *width_value, Important::No);
+    block.set_expanding_shorthands(PropertyID::Height, *width_value, Important::No);
     EXPECT_EQ(block.properties()[0].value.ptr(), image_value.ptr());
-    block.remove(PropertyID::Width);
+    block.remove_expanding_shorthands(PropertyID::Width);
     EXPECT_EQ(block.properties()[0].value.ptr(), image_value.ptr());
 }
 
@@ -483,15 +471,15 @@ TEST_CASE(retained_declaration_blocks_observe_mutations_and_replacement)
     EXPECT_EQ(retained.properties().size(), 1u);
     EXPECT_EQ(retained.custom_properties().size(), 1u);
     auto revision = retained.revision();
-    EXPECT(!block.set(PropertyID::Width, *retained.properties()[0].value, Important::No));
+    EXPECT(!block.set_expanding_shorthands(PropertyID::Width, *retained.properties()[0].value, Important::No));
     EXPECT_EQ(retained.revision(), revision);
 
-    EXPECT(block.remove(PropertyID::Width));
+    EXPECT(block.remove_expanding_shorthands(PropertyID::Width));
     EXPECT(retained.revision() > revision);
     EXPECT(retained.properties().is_empty());
     EXPECT_EQ(shared.properties().size(), 1u);
     revision = retained.revision();
-    EXPECT(!block.remove(PropertyID::Width));
+    EXPECT(!block.remove_expanding_shorthands(PropertyID::Width));
     EXPECT_EQ(retained.revision(), revision);
 
     retained.replace(parse_native_declaration_block(u"height: 7px; --色: blue"sv));

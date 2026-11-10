@@ -5,6 +5,7 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <AK/Array.h>
 #include <AK/ByteString.h>
 #include <LibCore/MappedFile.h>
 #include <LibGfx/ImageFormats/AVIFLoader.h>
@@ -83,6 +84,38 @@ static ErrorOr<ByteBuffer> make_webp_with_declared_but_missing_iccp_chunk(Readon
 
     TRY(extended_webp.try_append(vp8_chunk));
     return extended_webp;
+}
+
+TEST_CASE(test_frames_are_decoded_into_shareable_bitmaps)
+{
+    Array paths {
+        TEST_INPUT("avif/simple-lossy.avif"sv),
+        TEST_INPUT("bmp/bitmap.bmp"sv),
+        TEST_INPUT("gif/download-animation.gif"sv),
+        TEST_INPUT("ico/serenity.ico"sv),
+        TEST_INPUT("jpg/rgb24.jpg"sv),
+        TEST_INPUT("jpg/cmyk-no-adobe-marker.jpg"sv),
+        TEST_INPUT("jpg/ycck-1111.jpg"sv),
+        TEST_INPUT("jxl/modular_simple_tree_upsample2_10bits_rct.jxl"sv),
+        TEST_INPUT("png/buggie.png"sv),
+        TEST_INPUT("png/apng-blend.png"sv),
+        TEST_INPUT("png/corrupt-idat.png"sv),
+        TEST_INPUT("png/exif-orientation-5.png"sv),
+        TEST_INPUT("webp/simple-vp8.webp"sv),
+        TEST_INPUT("webp/extended-lossless-animated.webp"sv),
+    };
+    for (auto path : paths) {
+        auto file = TRY_OR_FAIL(Core::MappedFile::map(path));
+        auto decoder = TRY_OR_FAIL(Gfx::ImageDecoder::try_create_for_raw_bytes(file->bytes()));
+        EXPECT(decoder);
+        if (!decoder)
+            continue;
+        for (size_t index = 0; index < decoder->frame_count(); ++index) {
+            auto frame = TRY_OR_FAIL(decoder->frame(index));
+            if (!frame.image->anonymous_buffer().is_valid())
+                FAIL(ByteString::formatted("Frame {} of {} is not shareable", index, path));
+        }
+    }
 }
 
 TEST_CASE(test_bmp)
@@ -503,6 +536,21 @@ TEST_CASE(test_jpeg_cmyk_no_adobe_marker)
     EXPECT_EQ(plugin_decoder->frame(0).value().image->get_pixel(8, 1), Gfx::Color(44, 184, 97));
     EXPECT_EQ(plugin_decoder->frame(0).value().image->get_pixel(1, 8), Gfx::Color(184, 44, 97));
     EXPECT_EQ(plugin_decoder->frame(0).value().image->get_pixel(9, 9), Gfx::Color(24, 24, 194));
+}
+
+TEST_CASE(test_jpeg_cmyk_truncated)
+{
+    auto file = TRY_OR_FAIL(Core::MappedFile::map(TEST_INPUT("jpg/cmyk-no-adobe-marker.jpg"sv)));
+    auto truncated_file = file->bytes().slice(0, 450);
+    auto plugin_decoder = TRY_OR_FAIL(Gfx::JPEGImageDecoderPlugin::create(truncated_file));
+    TRY_OR_FAIL(expect_single_frame_of_size(*plugin_decoder, { 10, 10 }));
+
+    auto image = plugin_decoder->frame(0).value().image;
+    EXPECT_EQ(image->get_pixel(8, 1), Gfx::Color(44, 184, 97));
+    for (int y = 8; y < 10; ++y) {
+        for (int x = 0; x < 10; ++x)
+            EXPECT_EQ(image->get_pixel(x, y), Gfx::Color(0, 0, 0));
+    }
 }
 
 TEST_CASE(test_jpeg_cmyk_adobe_transform_0)

@@ -11,15 +11,18 @@
 namespace WebView {
 
 enum class ProcessType : u8 {
+    // The UI and the Hub in one process, or the Hub with no UI.
     Browser,
+    UI,
+    Hub,
     Compositor,
     WebContent,
-    WebWorker,
     RequestServer,
     ImageDecoder,
     MediaServer,
     AudioServer,
     VideoDecoderServer,
+    WebRTCClient,
 };
 
 }

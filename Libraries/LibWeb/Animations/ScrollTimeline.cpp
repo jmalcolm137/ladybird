@@ -145,6 +145,9 @@ Optional<ScrollTimeline::ScrollerMetrics> ScrollTimeline::scroller_metrics() con
 
     return ScrollerMetrics {
         .scroll_node = Painting::async_scroll_node_stable_id(*layout_node),
+        .scroller_style_node = propagated_source.visit(
+            [](GC::Ptr<DOM::Element const> const& element) { return element->style_node_id().value(); },
+            [](GC::Ptr<DOM::Document> const&) -> u32 { return 0; }),
         .is_vertical = computed_axis.is_vertical,
         .scroll_offset = computed_axis.is_vertical
             ? Painting::scroll_offset(*layout_node).y().to_double()
@@ -161,6 +164,13 @@ Optional<ScrollTimeline::ScrollerMetrics> ScrollTimeline::scroller_metrics() con
             ? (scrollport.bottom() - snapport.bottom()).to_double()
             : (scrollport.right() - snapport.right()).to_double(),
     };
+}
+
+Optional<ScrollTimeline::FollowedScroller> ScrollTimeline::followed_scroller_from(ScrollerMetrics const& metrics)
+{
+    if (!metrics.scroll_node.has_value())
+        return {};
+    return FollowedScroller { *metrics.scroll_node, metrics.scroller_style_node, metrics.is_vertical, metrics.scroll_offset, metrics.max_scroll_offset };
 }
 
 void ScrollTimeline::set_axis(ScrollAxis axis)
@@ -224,8 +234,7 @@ void ScrollTimeline::update_current_time(double)
     //     scroll offset ÷ (scrollable overflow size − scroll container size)
     auto progress = scroll_offset_data->scroll_offset / scroll_offset_data->max_scroll_offset;
 
-    if (scroll_offset_data->scroll_node.has_value())
-        m_followed_scroller = FollowedScroller { *scroll_offset_data->scroll_node, scroll_offset_data->is_vertical, scroll_offset_data->max_scroll_offset };
+    m_followed_scroller = followed_scroller_from(*scroll_offset_data);
 
     set_current_time(TimeValue { TimeValue::Type::Percentage, progress * 100 });
 }
@@ -248,6 +257,8 @@ ScrollTimeline::ScrollTimeline(DOM::Document& document, Source source, ScrollAxi
     , m_source(source)
     , m_axis(axis)
 {
+    static u64 s_next_clock_identity = 1;
+    m_clock_identity = s_next_clock_identity++;
 }
 
 void ScrollTimeline::visit_edges(GC::Cell::Visitor& visitor)

@@ -15,7 +15,6 @@
 #include <LibJS/Runtime/TypedArray.h>
 #include <LibWeb/Bindings/Intrinsics.h>
 #include <LibWeb/Bindings/Module.h>
-#include <LibWeb/Bindings/Serializable.h>
 #include <LibWeb/Crypto/CryptoKeySerializationTags.h>
 #include <LibWeb/FileAPI/File.h>
 #include <LibWeb/FileAPI/FileList.h>
@@ -27,7 +26,9 @@
 #include <LibWeb/HTML/ImageData.h>
 #include <LibWeb/HTML/MessagePort.h>
 #include <LibWeb/WebIDL/DOMException.h>
+#include <LibWeb/WebIDL/ExceptionOrUtils.h>
 #include <LibWeb/WebIDL/QuotaExceededError.h>
+#include <LibWeb/WebRTC/RTCEncodedAudioFrame.h>
 
 #if !defined(AK_OS_WINDOWS)
 #    include <fcntl.h>
@@ -68,58 +69,6 @@ static_assert(to_underlying(ValueTag::SerializableObject) == 24);
 static_assert(to_underlying(ValueTag::Int32Primitive) == 25);
 static_assert(to_underlying(ValueTag::EndObject) == 0xFF);
 
-template<typename Record>
-concept CanAppendToTransferDataEncoder = requires(Web::HTML::TransferDataEncoder encoder, Record record) {
-    encoder.append(move(record));
-};
-
-static_assert(CanAppendToTransferDataEncoder<Web::HTML::IPCSerializationRecord>);
-static_assert(!CanAppendToTransferDataEncoder<Web::HTML::StorageSerializationRecord>);
-
-TEST_CASE(storage_writer_uses_stable_header_and_leb128_encoding)
-{
-    auto writer = Web::HTML::StructuredSerializeWriter::create_storage();
-    EXPECT_EQ(writer.type(), Web::HTML::SerializationType::Storage);
-
-    writer.encode(true);
-    writer.encode(static_cast<u32>(0x01020304));
-    writer.encode(static_cast<i64>(-2));
-    writer.encode(1.0);
-
-    auto record = writer.take_storage_record();
-
-    Array<u8, 20> expected {
-        'L',
-        'B',
-        'S',
-        'C',
-        0x01, // version (varint)
-        0x00, // flags (varint)
-        0x01, // true
-        0x84, // u32 0x01020304 as LEB128
-        0x86,
-        0x88,
-        0x08,
-        0x7e, // i64 -2 as signed LEB128
-        0x00, // double 1.0, fixed little-endian
-        0x00,
-        0x00,
-        0x00,
-        0x00,
-        0x00,
-        0xf0,
-        0x3f,
-    };
-    EXPECT_EQ(record.data.span(), expected);
-
-    Web::HTML::StructuredSerializeReader reader { record };
-    EXPECT_EQ(reader.type(), Web::HTML::SerializationType::Storage);
-    EXPECT_EQ(MUST(reader.decode<bool>()), true);
-    EXPECT_EQ(MUST(reader.decode<u32>()), 0x01020304u);
-    EXPECT_EQ(MUST(reader.decode<i64>()), -2);
-    EXPECT_EQ(MUST(reader.decode<double>()), 1.0);
-}
-
 TEST_CASE(storage_writer_stores_int32_range_numbers_as_a_signed_varint_tag)
 {
     auto& vm = test_realm().vm();
@@ -151,165 +100,51 @@ TEST_CASE(storage_writer_stores_int32_range_numbers_as_a_signed_varint_tag)
     EXPECT_EQ(value_bytes(JS::Value(-0.0))[0], to_underlying(ValueTag::NumberPrimitive));
 }
 
-TEST_CASE(storage_writer_encodes_enum_like_values_as_stable_identifiers)
+// A storage record names the value of an enumeration by a stable identifier, which deserializing the record reads and
+// serializing the value it creates writes back.
+static void expect_identifiers_round_trip(Web::HTML::StorageSerializationRecord const& record, bool needs_principal_realm = false)
 {
-    expect_storage_identifier_encoding(Web::Bindings::KeyType::Public, "public"sv);
-    expect_storage_identifier_encoding(Web::Bindings::KeyType::Private, "private"sv);
-    expect_storage_identifier_encoding(Web::Bindings::KeyType::Secret, "secret"sv);
-
-    expect_storage_identifier_encoding(Web::Bindings::KeyUsage::Encrypt, "encrypt"sv);
-    expect_storage_identifier_encoding(Web::Bindings::KeyUsage::Decrypt, "decrypt"sv);
-    expect_storage_identifier_encoding(Web::Bindings::KeyUsage::Sign, "sign"sv);
-    expect_storage_identifier_encoding(Web::Bindings::KeyUsage::Verify, "verify"sv);
-    expect_storage_identifier_encoding(Web::Bindings::KeyUsage::DeriveKey, "deriveKey"sv);
-    expect_storage_identifier_encoding(Web::Bindings::KeyUsage::DeriveBits, "deriveBits"sv);
-    expect_storage_identifier_encoding(Web::Bindings::KeyUsage::WrapKey, "wrapKey"sv);
-    expect_storage_identifier_encoding(Web::Bindings::KeyUsage::UnwrapKey, "unwrapKey"sv);
-    expect_storage_identifier_encoding(Web::Bindings::KeyUsage::EncapsulateKey, "encapsulateKey"sv);
-    expect_storage_identifier_encoding(Web::Bindings::KeyUsage::EncapsulateBits, "encapsulateBits"sv);
-    expect_storage_identifier_encoding(Web::Bindings::KeyUsage::DecapsulateKey, "decapsulateKey"sv);
-    expect_storage_identifier_encoding(Web::Bindings::KeyUsage::DecapsulateBits, "decapsulateBits"sv);
-
-    expect_storage_identifier_encoding(Web::Bindings::PredefinedColorSpace::Srgb, "srgb"sv);
-    expect_storage_identifier_encoding(Web::Bindings::PredefinedColorSpace::SrgbLinear, "srgb-linear"sv);
-    expect_storage_identifier_encoding(Web::Bindings::PredefinedColorSpace::DisplayP3, "display-p3"sv);
-    expect_storage_identifier_encoding(Web::Bindings::PredefinedColorSpace::DisplayP3Linear, "display-p3-linear"sv);
-
-    expect_storage_identifier_encoding(Gfx::BitmapFormat::BGRx8888, "BGRx8888"sv);
-    expect_storage_identifier_encoding(Gfx::BitmapFormat::BGRA8888, "BGRA8888"sv);
-    expect_storage_identifier_encoding(Gfx::BitmapFormat::RGBx8888, "RGBx8888"sv);
-    expect_storage_identifier_encoding(Gfx::BitmapFormat::RGBA8888, "RGBA8888"sv);
-
-    expect_storage_identifier_encoding(Gfx::AlphaType::Premultiplied, "premultiplied"sv);
-    expect_storage_identifier_encoding(Gfx::AlphaType::Unpremultiplied, "unpremultiplied"sv);
-
-    expect_storage_identifier_encoding(Web::Bindings::InterfaceName::Blob, "Blob"sv);
-    expect_storage_identifier_encoding(Web::Bindings::InterfaceName::File, "File"sv);
-    expect_storage_identifier_encoding(Web::Bindings::InterfaceName::FileList, "FileList"sv);
-    expect_storage_identifier_encoding(Web::Bindings::InterfaceName::DOMException, "DOMException"sv);
-    expect_storage_identifier_encoding(Web::Bindings::InterfaceName::DOMMatrixReadOnly, "DOMMatrixReadOnly"sv);
-    expect_storage_identifier_encoding(Web::Bindings::InterfaceName::DOMMatrix, "DOMMatrix"sv);
-    expect_storage_identifier_encoding(Web::Bindings::InterfaceName::DOMPointReadOnly, "DOMPointReadOnly"sv);
-    expect_storage_identifier_encoding(Web::Bindings::InterfaceName::DOMPoint, "DOMPoint"sv);
-    expect_storage_identifier_encoding(Web::Bindings::InterfaceName::DOMRectReadOnly, "DOMRectReadOnly"sv);
-    expect_storage_identifier_encoding(Web::Bindings::InterfaceName::DOMRect, "DOMRect"sv);
-    expect_storage_identifier_encoding(Web::Bindings::InterfaceName::CryptoKey, "CryptoKey"sv);
-    expect_storage_identifier_encoding(Web::Bindings::InterfaceName::DOMQuad, "DOMQuad"sv);
-    expect_storage_identifier_encoding(Web::Bindings::InterfaceName::ImageData, "ImageData"sv);
-    expect_storage_identifier_encoding(Web::Bindings::InterfaceName::ImageBitmap, "ImageBitmap"sv);
-    expect_storage_identifier_encoding(Web::Bindings::InterfaceName::Module, "Module"sv);
-    expect_storage_identifier_encoding(Web::Bindings::InterfaceName::QuotaExceededError, "QuotaExceededError"sv);
+    auto value = MUST(needs_principal_realm ? principal_storage_deserialize(record) : storage_deserialize(record));
+    EXPECT_EQ(storage_serialize(GC::Ref { value.as_object() }).data.span(), record.data.span());
 }
 
-TEST_CASE(all_public_writer_reader_types_round_trip_through_ipc_and_storage)
+TEST_CASE(storage_writer_encodes_enum_like_values_as_stable_identifiers)
 {
-    expect_structured_round_trip(false);
-    expect_structured_round_trip(true);
-    expect_structured_round_trip(-12345);
-    expect_structured_round_trip(static_cast<u32>(0xfedcba98));
-    expect_structured_round_trip(static_cast<u64>(0x0102030405060708));
-    expect_structured_round_trip(static_cast<i64>(-0x0102030405060708));
-    expect_structured_round_trip(13.5);
+    auto handle = handle_byte_buffer("0123456789abcdef"sv.bytes());
+    for (auto type : { "public"sv, "private"sv, "secret"sv })
+        expect_identifiers_round_trip(crypto_key_full_record(type, "deriveKey"sv, alg_key_algorithm("HKDF"sv), handle), true);
+    for (auto usage : { "encrypt"sv, "decrypt"sv, "sign"sv, "verify"sv, "deriveKey"sv, "deriveBits"sv, "wrapKey"sv, "unwrapKey"sv, "encapsulateKey"sv, "encapsulateBits"sv, "decapsulateKey"sv, "decapsulateBits"sv })
+        expect_identifiers_round_trip(crypto_key_full_record("secret"sv, usage, alg_key_algorithm("HKDF"sv), handle), true);
 
-    auto utf16 = Utf16String::from_utf8("stored UTF-16 string"sv);
-    expect_utf16_equals(structured_ipc_round_trip(utf16), utf16);
-    expect_utf16_equals(structured_storage_round_trip(utf16), utf16);
-
-    // Non-ASCII forces 16-bit string storage rather than the ASCII fast path.
-    auto non_ascii = Utf16String::from_utf8("héllo 🦬"sv);
-    expect_utf16_equals(structured_ipc_round_trip(non_ascii), non_ascii);
-    expect_utf16_equals(structured_storage_round_trip(non_ascii), non_ascii);
-
-    expect_structured_round_trip(Web::Bindings::KeyType::Public);
-    expect_structured_round_trip(Web::Bindings::KeyType::Private);
-    expect_structured_round_trip(Web::Bindings::KeyType::Secret);
-
-    expect_structured_round_trip(Web::Bindings::KeyUsage::Encrypt);
-    expect_structured_round_trip(Web::Bindings::KeyUsage::Decrypt);
-    expect_structured_round_trip(Web::Bindings::KeyUsage::Sign);
-    expect_structured_round_trip(Web::Bindings::KeyUsage::Verify);
-    expect_structured_round_trip(Web::Bindings::KeyUsage::DeriveKey);
-    expect_structured_round_trip(Web::Bindings::KeyUsage::DeriveBits);
-    expect_structured_round_trip(Web::Bindings::KeyUsage::WrapKey);
-    expect_structured_round_trip(Web::Bindings::KeyUsage::UnwrapKey);
-    expect_structured_round_trip(Web::Bindings::KeyUsage::EncapsulateKey);
-    expect_structured_round_trip(Web::Bindings::KeyUsage::EncapsulateBits);
-    expect_structured_round_trip(Web::Bindings::KeyUsage::DecapsulateKey);
-    expect_structured_round_trip(Web::Bindings::KeyUsage::DecapsulateBits);
-
-    expect_structured_round_trip(Web::Bindings::PredefinedColorSpace::Srgb);
-    expect_structured_round_trip(Web::Bindings::PredefinedColorSpace::SrgbLinear);
-    expect_structured_round_trip(Web::Bindings::PredefinedColorSpace::DisplayP3);
-    expect_structured_round_trip(Web::Bindings::PredefinedColorSpace::DisplayP3Linear);
-
-    expect_structured_round_trip(Gfx::BitmapFormat::BGRx8888);
-    expect_structured_round_trip(Gfx::BitmapFormat::BGRA8888);
-    expect_structured_round_trip(Gfx::BitmapFormat::RGBx8888);
-    expect_structured_round_trip(Gfx::BitmapFormat::RGBA8888);
-
-    expect_structured_round_trip(Gfx::AlphaType::Premultiplied);
-    expect_structured_round_trip(Gfx::AlphaType::Unpremultiplied);
-
-    Optional<double> no_double;
-    expect_structured_round_trip(no_double);
-    expect_structured_round_trip(Optional<double> { -0.25 });
-
-    Optional<Utf16String> no_utf16;
-    expect_optional_utf16_equals(structured_ipc_round_trip(no_utf16), no_utf16);
-    expect_optional_utf16_equals(structured_storage_round_trip(no_utf16), no_utf16);
-
-    auto optional_utf16 = Optional<Utf16String> { utf16 };
-    expect_optional_utf16_equals(structured_ipc_round_trip(optional_utf16), optional_utf16);
-    expect_optional_utf16_equals(structured_storage_round_trip(optional_utf16), optional_utf16);
-
-    expect_structured_round_trip(Web::Bindings::InterfaceName::Blob);
-    expect_structured_round_trip(Web::Bindings::InterfaceName::File);
-    expect_structured_round_trip(Web::Bindings::InterfaceName::FileList);
-    expect_structured_round_trip(Web::Bindings::InterfaceName::DOMException);
-    expect_structured_round_trip(Web::Bindings::InterfaceName::DOMMatrixReadOnly);
-    expect_structured_round_trip(Web::Bindings::InterfaceName::DOMMatrix);
-    expect_structured_round_trip(Web::Bindings::InterfaceName::DOMPointReadOnly);
-    expect_structured_round_trip(Web::Bindings::InterfaceName::DOMPoint);
-    expect_structured_round_trip(Web::Bindings::InterfaceName::DOMRectReadOnly);
-    expect_structured_round_trip(Web::Bindings::InterfaceName::DOMRect);
-    expect_structured_round_trip(Web::Bindings::InterfaceName::CryptoKey);
-    expect_structured_round_trip(Web::Bindings::InterfaceName::DOMQuad);
-    expect_structured_round_trip(Web::Bindings::InterfaceName::ImageData);
-    expect_structured_round_trip(Web::Bindings::InterfaceName::ImageBitmap);
-    expect_structured_round_trip(Web::Bindings::InterfaceName::Module);
-    expect_structured_round_trip(Web::Bindings::InterfaceName::QuotaExceededError);
-
-    Array<u8, 4> raw_bytes { 0xde, 0xad, 0xbe, 0xef };
-    ReadonlyBytes readonly_bytes { raw_bytes.data(), raw_bytes.size() };
-    EXPECT_EQ(structured_ipc_buffer_round_trip(readonly_bytes).span(), raw_bytes);
-    EXPECT_EQ(structured_storage_buffer_round_trip(readonly_bytes).span(), raw_bytes);
-
-    auto byte_buffer = MUST(ByteBuffer::copy(raw_bytes.span()));
-    EXPECT_EQ(structured_ipc_buffer_round_trip(byte_buffer).span(), raw_bytes);
-    EXPECT_EQ(structured_storage_buffer_round_trip(byte_buffer).span(), raw_bytes);
+    Array<u8, 4> pixels { 1, 2, 3, 255 };
+    for (auto color_space : { "srgb"sv, "srgb-linear"sv, "display-p3"sv, "display-p3-linear"sv })
+        expect_identifiers_round_trip(frozen_image_data_record(pixels.span(), 1, 1, color_space));
+    for (auto format : { "BGRx8888"sv, "BGRA8888"sv, "RGBx8888"sv, "RGBA8888"sv }) {
+        for (auto alpha_type : { "premultiplied"sv, "unpremultiplied"sv })
+            expect_identifiers_round_trip(image_bitmap_record(1, 1, 4, format, alpha_type, pixels.span()));
+    }
 }
 
 TEST_CASE(storage_writer_encodes_js_strings_as_utf16_code_units)
 {
+    auto& vm = test_realm().vm();
     Array<char16_t, 3> code_units {
         u'A',
         static_cast<char16_t>(0xd800),
         u'B',
     };
-    auto value = Utf16String::from_utf16({ code_units.data(), code_units.size() });
+    auto value = JS::PrimitiveString::create(vm, Utf16String::from_utf16({ code_units.data(), code_units.size() }));
 
-    auto writer = Web::HTML::StructuredSerializeWriter::create_storage();
-    writer.encode(value);
+    auto record = MUST(Web::HTML::structured_serialize_for_storage(vm, value));
 
-    auto record = writer.take_storage_record();
-
-    Array<u8, 13> expected {
+    Array<u8, 14> expected {
         'L',
         'B',
         'S',
         'C',
         0x01, // version
         0x00, // flags
+        to_underlying(ValueTag::StringPrimitive),
         0x06, // string header: (3 << 1) | utf16
         0x41,
         0x00, // 'A'
@@ -320,8 +155,7 @@ TEST_CASE(storage_writer_encodes_js_strings_as_utf16_code_units)
     };
     EXPECT_EQ(record.data.span(), expected);
 
-    Web::HTML::StructuredSerializeReader reader { record };
-    auto decoded = MUST(reader.decode<Utf16String>());
+    auto decoded = MUST(storage_deserialize(record)).as_string().utf16_string();
     auto view = decoded.utf16_view();
     EXPECT_EQ(view.length_in_code_units(), 3u);
     EXPECT_EQ(view.code_unit_at(0), u'A');
@@ -331,68 +165,69 @@ TEST_CASE(storage_writer_encodes_js_strings_as_utf16_code_units)
 
 TEST_CASE(storage_writer_encodes_ascii_strings_as_one_byte_per_code_unit)
 {
+    auto& vm = test_realm().vm();
     auto value = Utf16String::from_utf8("AB"sv);
     EXPECT(value.utf16_view().has_ascii_storage());
 
-    auto writer = Web::HTML::StructuredSerializeWriter::create_storage();
-    writer.encode(value);
+    auto record = MUST(Web::HTML::structured_serialize_for_storage(vm, JS::PrimitiveString::create(vm, value)));
 
-    auto record = writer.take_storage_record();
-
-    Array<u8, 9> expected {
+    Array<u8, 10> expected {
         'L',
         'B',
         'S',
         'C',
         0x01, // version
         0x00, // flags
+        to_underlying(ValueTag::StringPrimitive),
         0x05, // string header: (2 << 1) | ascii
         'A',
         'B',
     };
     EXPECT_EQ(record.data.span(), expected);
 
-    Web::HTML::StructuredSerializeReader reader { record };
-    auto decoded = MUST(reader.decode<Utf16String>());
+    auto decoded = MUST(storage_deserialize(record)).as_string().utf16_string();
     EXPECT_EQ(decoded, value);
     EXPECT(decoded.utf16_view().has_ascii_storage());
 }
 
 TEST_CASE(storage_writer_encodes_the_string_length_as_a_leb128_varint)
 {
-    // Pin both sides of the folded-header LEB128 width boundary.
+    auto& vm = test_realm().vm();
+
+    // Pin both sides of the folded-header LEB128 width boundary. The string header follows the 6-byte record header
+    // and the value tag.
     {
         auto value = Utf16String::repeated('a', 63);
-        auto writer = Web::HTML::StructuredSerializeWriter::create_storage();
-        writer.encode(value);
-        auto record = writer.take_storage_record();
+        auto record = MUST(Web::HTML::structured_serialize_for_storage(vm, JS::PrimitiveString::create(vm, value)));
 
         Array<u8, 1> expected_framing { 0x7F };
-        EXPECT_EQ(record.data.span().slice(6, expected_framing.size()), expected_framing);
+        EXPECT_EQ(record.data.span().slice(7, expected_framing.size()), expected_framing);
 
-        Web::HTML::StructuredSerializeReader reader { record };
-        EXPECT_EQ(MUST(reader.decode<Utf16String>()), value);
+        EXPECT_EQ(MUST(storage_deserialize(record)).as_string().utf16_string(), value);
     }
 
     {
         auto value = Utf16String::repeated('a', 64);
-        auto writer = Web::HTML::StructuredSerializeWriter::create_storage();
-        writer.encode(value);
-        auto record = writer.take_storage_record();
+        auto record = MUST(Web::HTML::structured_serialize_for_storage(vm, JS::PrimitiveString::create(vm, value)));
 
         Array<u8, 2> expected_framing { 0x81, 0x01 };
-        EXPECT_EQ(record.data.span().slice(6, expected_framing.size()), expected_framing);
+        EXPECT_EQ(record.data.span().slice(7, expected_framing.size()), expected_framing);
 
-        Web::HTML::StructuredSerializeReader reader { record };
-        EXPECT_EQ(MUST(reader.decode<Utf16String>()), value);
+        EXPECT_EQ(MUST(storage_deserialize(record)).as_string().utf16_string(), value);
     }
 }
 
 TEST_CASE(empty_strings_round_trip)
 {
-    auto empty_utf16 = Utf16String {};
-    expect_utf16_equals(structured_ipc_round_trip(empty_utf16), empty_utf16);
-    expect_utf16_equals(structured_storage_round_trip(empty_utf16), empty_utf16);
+    auto& realm = test_realm();
+    auto& vm = realm.vm();
+    auto value = JS::PrimitiveString::create(vm, Utf16String {});
+
+    auto ipc_clone = MUST(Web::HTML::structured_deserialize(vm, MUST(Web::HTML::structured_serialize(vm, value)), realm));
+    EXPECT(ipc_clone.as_string().utf16_string().is_empty());
+
+    auto storage_clone = MUST(storage_deserialize(MUST(Web::HTML::structured_serialize_for_storage(vm, value))));
+    EXPECT(storage_clone.as_string().utf16_string().is_empty());
 }
 
 TEST_CASE(record_wrappers_round_trip_through_ipc)
@@ -454,14 +289,15 @@ TEST_CASE(ipc_serializable_object_has_no_version_framing)
     auto point = Web::Geometry::DOMPoint::create(1.0, 2.0, 3.0, 4.0);
 
     auto record = structured_serialize(test_realm().vm(), point);
-    Web::HTML::StructuredSerializeReader reader { record };
 
-    EXPECT_EQ(MUST(reader.decode<u8>()), to_underlying(ValueTag::SerializableObject));
-    EXPECT_EQ(MUST(reader.decode<Web::Bindings::InterfaceName>()), Web::Bindings::InterfaceName::DOMPoint);
-    EXPECT_EQ(MUST(reader.decode<double>()), 1.0);
-    EXPECT_EQ(MUST(reader.decode<double>()), 2.0);
-    EXPECT_EQ(MUST(reader.decode<double>()), 3.0);
-    EXPECT_EQ(MUST(reader.decode<double>()), 4.0);
+    Vector<u8> expected;
+    expected.append(to_underlying(ValueTag::SerializableObject));
+    append_little_endian_u16(expected, to_underlying(Web::Bindings::InterfaceName::DOMPoint));
+    append_little_endian_double(expected, 1.0);
+    append_little_endian_double(expected, 2.0);
+    append_little_endian_double(expected, 3.0);
+    append_little_endian_double(expected, 4.0);
+    EXPECT_EQ(record.data.span(), expected.span());
 }
 
 TEST_CASE(webassembly_module_encodes_to_frozen_ipc_bytes)
@@ -482,12 +318,18 @@ TEST_CASE(webassembly_module_encodes_to_frozen_ipc_bytes)
     while (vm.execution_context_stack().size() > depth)
         vm.pop_execution_context();
 
-    Web::HTML::StructuredSerializeReader reader { record };
-
-    EXPECT_EQ(MUST(reader.decode<u8>()), to_underlying(ValueTag::SerializableObject));
-    EXPECT_EQ(MUST(reader.decode<Web::Bindings::InterfaceName>()), Web::Bindings::InterfaceName::Module);
-    EXPECT_EQ(MUST(reader.decode<ByteBuffer>()).span(), module_bytes.span());
-    EXPECT_EQ(MUST(reader.decode<Optional<u64>>()), settings.agent_cluster_id());
+    Vector<u8> expected;
+    expected.append(to_underlying(ValueTag::SerializableObject));
+    append_little_endian_u16(expected, to_underlying(Web::Bindings::InterfaceName::Module));
+    append_little_endian_u32(expected, module_bytes.size());
+    expected.append(module_bytes.data(), module_bytes.size());
+    auto agent_cluster_id = settings.agent_cluster_id();
+    expected.append(agent_cluster_id.has_value() ? 1 : 0);
+    if (agent_cluster_id.has_value())
+        append_little_endian_u64(expected, *agent_cluster_id);
+    append_little_endian_u64(expected, 0);
+    expected.append(0);
+    EXPECT_EQ(record.data.span(), expected.span());
 }
 
 TEST_CASE(realm_helpers_share_vm_initialization)
@@ -501,6 +343,8 @@ TEST_CASE(realm_helpers_share_vm_initialization)
     auto simple = Web::Bindings::create_a_simple_javascript_realm();
     EXPECT_EQ(&simple->vm(), &vm);
 
+    // The simple realm hands its execution context to the stack, so it's freed once popped.
+    delete vm.pop_execution_context();
     while (vm.execution_context_stack().size() > depth)
         vm.pop_execution_context();
 }
@@ -642,20 +486,15 @@ static GC::Ref<Web::HTML::ImageBitmap> create_image_bitmap(NonnullRefPtr<Gfx::Bi
     return Web::HTML::ImageBitmap::create(move(bitmap));
 }
 
-// The transfer-receiving steps of an ImageBitmap, which create the ImageBitmap.
-static Web::WebIDL::ExceptionOr<GC::Ref<JS::HostObject>> receive_image_bitmap(JS::Realm& realm, Web::HTML::TransferDataDecoder& decoder)
-{
-    return Web::Bindings::create_transferred_platform_object(Web::HTML::TransferType::ImageBitmap, realm, decoder);
-}
+// The wire values of the types of the data holders.
+static constexpr u8 message_port_transfer_type = 1;
+static constexpr u8 image_bitmap_transfer_type = 7;
 
-static GC::RootVector<JS::Value> deserialize_transfer_data_holders(JS::Realm& realm, Web::HTML::SerializedTransferRecord& record)
+static GC::RootVector<JS::Value> deserialize_transferred_values(JS::Realm& realm, Web::HTML::SerializedTransferRecord& record)
 {
     GC::RootVector<JS::Value> values;
-    for (auto& holder : record.transfer_data_holders) {
-        Web::HTML::TransferDataDecoder decoder { move(holder) };
-        decoder.set_shared_buffers(record.shared_buffers);
-        values.append(MUST(Web::HTML::structured_deserialize_with_transfer_internal(decoder, realm)));
-    }
+    for (auto& value : MUST(Web::HTML::structured_deserialize_with_transfer(record, realm)).transferred_values)
+        values.append(value.ptr());
     return values;
 }
 
@@ -734,9 +573,9 @@ TEST_CASE(any_number_of_transferred_image_bitmaps_share_one_attachment)
         values.append(wrapper);
     }
     auto buffer = MUST(JS::ArrayBuffer::create(realm, 1));
-    auto port = Web::HTML::MessagePort::create(Web::DOM::EventTarget::create());
+    auto port = Web::HTML::MessagePort::create(realm);
     transfer.append(buffer);
-    transfer.append(Web::Bindings::message_port(realm, port));
+    transfer.append(Web::Bindings::wrap(Web::Bindings::host_defined_wrapper_world(realm), realm, port));
 
 #if !defined(AK_OS_WINDOWS)
     // Receiving the batch must not retain one descriptor per bitmap, even with a small descriptor limit.
@@ -776,12 +615,30 @@ TEST_CASE(image_bitmap_with_padded_rows_transfers_its_pixels)
     received.close();
 }
 
+// A message queued on a port goes with the data holder of the port, in which its data holders are not those of C++.
+static Web::HTML::SerializedTransferRecord decode_queued_message(IPC::Decoder& decoder)
+{
+    auto serialized = MUST(decoder.decode<Web::HTML::IPCSerializationRecord>());
+
+    Vector<Web::HTML::TransferDataEncoder> data_holders;
+    for (auto count = MUST(decoder.decode_size()); count > 0; --count) {
+        auto data = MUST(decoder.decode<IPC::MessageDataType>());
+        Vector<IPC::Attachment> attachments;
+        for (auto attachment_count = MUST(decoder.decode_size()); attachment_count > 0; --attachment_count)
+            attachments.append(decoder.attachments().dequeue());
+        EXPECT_EQ(MUST(decoder.decode_size()), 0u); // Channel ends.
+        data_holders.append(Web::HTML::TransferDataEncoder { carried_transfer_data_holder(IPC::MessageBuffer { move(data), move(attachments) }) });
+    }
+
+    auto shared_buffers = MUST(decoder.decode<Vector<Core::AnonymousBuffer>>());
+    auto shared_store_lifeline = MUST(decoder.decode<Web::HTML::SharedStoreLifeline>());
+    return { move(serialized), move(data_holders), move(shared_buffers), move(shared_store_lifeline) };
+}
+
 TEST_CASE(image_bitmaps_queued_on_a_transferred_message_port_keep_their_pixels)
 {
     auto& realm = test_realm();
-    auto* window = Web::HTML::window_from_global_object(realm.global_object());
-    VERIFY(window);
-    auto port = Web::HTML::MessagePort::create(*window);
+    auto port = Web::HTML::MessagePort::create(realm);
     static constexpr size_t count = IPC::MAX_MESSAGE_FD_COUNT + 1;
     auto bitmap = MUST(Gfx::Bitmap::create(Gfx::BitmapFormat::BGRA8888, Gfx::AlphaType::Premultiplied, { 1, 1 }));
     bitmap->set_pixel(0, 0, Gfx::Color::Blue);
@@ -795,18 +652,18 @@ TEST_CASE(image_bitmaps_queued_on_a_transferred_message_port_keep_their_pixels)
     MUST(port->post_message(realm, JS::Array::create_from(realm, values), transfer));
     EXPECT_EQ(port->pending_outgoing_message_count(), 1u);
 
-    auto port_wrapper = Web::Bindings::message_port(realm, port);
+    auto port_wrapper = Web::Bindings::wrap(Web::Bindings::host_defined_wrapper_world(realm), realm, port);
     Array<GC::Ref<JS::Object>, 1> port_transfer { port_wrapper };
     auto record = MUST(Web::HTML::structured_serialize_with_transfer(realm, port_wrapper, port_transfer));
-    EXPECT(port->is_detached());
+    EXPECT(Web::HTML::structured_serialize_with_transfer(realm, port_wrapper, port_transfer).is_error());
     EXPECT_EQ(record.transfer_data_holders[0].buffer().attachments().size(), 1u);
 
-    Web::HTML::TransferDataDecoder port_decoder { move(record.transfer_data_holders[0]) };
-    EXPECT_EQ(MUST(port_decoder.decode<Web::HTML::TransferType>()), Web::HTML::TransferType::MessagePort);
-    EXPECT(MUST(port_decoder.decode<Vector<Web::HTML::SerializedTransferRecord>>()).is_empty());
-    auto queued_messages = MUST(port_decoder.decode<Vector<Web::HTML::SerializedTransferRecord>>());
-    EXPECT_EQ(queued_messages.size(), 1u);
-    auto received_values = deserialize_transfer_data_holders(realm, queued_messages[0]);
+    TransferDataHolderReader port_holder { record.transfer_data_holders[0] };
+    EXPECT_EQ(MUST(port_holder.decoder.decode<u8>()), message_port_transfer_type);
+    EXPECT_EQ(MUST(port_holder.decoder.decode_size()), 0u);
+    EXPECT_EQ(MUST(port_holder.decoder.decode_size()), 1u);
+    auto queued_message = decode_queued_message(port_holder.decoder);
+    auto received_values = deserialize_transferred_values(realm, queued_message);
     EXPECT_EQ(received_values.size(), count);
     for (auto value : received_values) {
         auto& received = unwrap_wrappable<Web::HTML::ImageBitmap>(value);
@@ -853,7 +710,7 @@ TEST_CASE(image_bitmap_transfer_inlines_pixels_without_shared_memory)
     auto& transfer_record = record.value();
     EXPECT(transfer_record.shared_buffers.is_empty());
     EXPECT(transfer_record.transfer_data_holders[0].buffer().attachments().is_empty());
-    auto received_values = deserialize_transfer_data_holders(realm, transfer_record);
+    auto received_values = deserialize_transferred_values(realm, transfer_record);
     auto& received = unwrap_wrappable<Web::HTML::ImageBitmap>(received_values[0]);
     EXPECT_EQ(received.bitmap()->get_pixel(0, 0), Gfx::Color::Green);
     received.close();
@@ -862,23 +719,22 @@ TEST_CASE(image_bitmap_transfer_inlines_pixels_without_shared_memory)
 
 TEST_CASE(image_bitmap_transfer_rejects_invalid_shared_pixels)
 {
-    auto& realm = test_realm();
+    (void)test_realm();
     Vector<Core::AnonymousBuffer> shared_buffers;
     shared_buffers.append(MUST(Core::AnonymousBuffer::create_with_size(64)));
     auto receive = [&](Vector<Core::AnonymousBuffer> const* buffers, u32 buffer_index, u64 offset, Gfx::BitmapFormat format, int width) {
-        Web::HTML::TransferDataEncoder holder;
-        MUST(holder.encode(true));
-        MUST(holder.encode(buffer_index));
-        MUST(holder.encode(offset));
-        MUST(holder.encode(width));
-        MUST(holder.encode(1));
-        MUST(holder.encode(format));
-        MUST(holder.encode(Gfx::AlphaType::Premultiplied));
-        MUST(holder.encode(static_cast<u8>(0))); // sRGB
-        Web::HTML::TransferDataDecoder decoder { move(holder) };
-        if (buffers)
-            decoder.set_shared_buffers(*buffers);
-        return receive_image_bitmap(realm, decoder);
+        IPC::MessageBuffer holder;
+        IPC::Encoder encoder { holder };
+        MUST(encoder.encode(image_bitmap_transfer_type));
+        MUST(encoder.encode(true));
+        MUST(encoder.encode(buffer_index));
+        MUST(encoder.encode(offset));
+        MUST(encoder.encode(width));
+        MUST(encoder.encode(1));
+        MUST(encoder.encode(format));
+        MUST(encoder.encode(Gfx::AlphaType::Premultiplied));
+        MUST(encoder.encode(static_cast<u8>(0))); // sRGB
+        return receive_transfer_data_holder(move(holder), buffers ? *buffers : Vector<Core::AnonymousBuffer> {});
     };
     EXPECT(!receive(&shared_buffers, 0, 0, Gfx::BitmapFormat::BGRA8888, 16).is_error());
     EXPECT(receive(nullptr, 0, 0, Gfx::BitmapFormat::BGRA8888, 16).is_error());
@@ -910,12 +766,10 @@ TEST_CASE(image_bitmap_transfer_protects_against_backing_truncation)
     record.shared_buffers[0].bytes().copy_to({ backing.data<u8>(), backing.size() });
     record.shared_buffers[0] = move(backing);
 #    endif
-    auto const& buffer = record.shared_buffers[0];
-    Web::HTML::TransferDataDecoder decoder { move(record.transfer_data_holders[0]) };
-    EXPECT_EQ(MUST(decoder.decode<Web::HTML::TransferType>()), Web::HTML::TransferType::ImageBitmap);
-    decoder.set_shared_buffers(record.shared_buffers);
-    auto received = MUST(receive_image_bitmap(realm, decoder));
-    auto& receiver = unwrap_wrappable<Web::HTML::ImageBitmap>(JS::Value(static_cast<JS::Object*>(received.ptr())));
+    auto buffer = record.shared_buffers[0];
+    EXPECT_EQ(transfer_data_holder_bytes(record.transfer_data_holders[0].buffer())[0], image_bitmap_transfer_type);
+    auto received_values = deserialize_transferred_values(realm, record);
+    auto& receiver = unwrap_wrappable<Web::HTML::ImageBitmap>(received_values[0]);
 #    if defined(AK_OS_LINUX)
     auto const seals = fcntl(buffer.fd(), F_GET_SEALS);
     EXPECT(seals >= 0);
@@ -935,42 +789,42 @@ TEST_CASE(image_bitmap_transfer_protects_against_backing_truncation)
 #if defined(AK_OS_LINUX)
 TEST_CASE(image_bitmap_transfer_rejects_unsealed_backing)
 {
-    auto& realm = test_realm();
+    (void)test_realm();
     // Even a correctly sized descriptor with sealing permanently disabled must be rejected.
-    Vector<Core::AnonymousBuffer> shared_buffers;
     auto unsealable_fd = MUST(Core::System::anon_create(64, O_CLOEXEC, Core::System::AllowSealing::No));
-    shared_buffers.append(MUST(Core::AnonymousBuffer::create_from_anon_fd(unsealable_fd, 64)));
-    Web::HTML::TransferDataEncoder holder;
-    MUST(holder.encode(true));
-    MUST(holder.encode(0u));
-    MUST(holder.encode(static_cast<u64>(0)));
-    MUST(holder.encode(16));
-    MUST(holder.encode(1));
-    MUST(holder.encode(Gfx::BitmapFormat::BGRA8888));
-    MUST(holder.encode(Gfx::AlphaType::Premultiplied));
-    MUST(holder.encode(static_cast<u8>(0))); // sRGB
-    Web::HTML::TransferDataDecoder decoder { move(holder) };
-    decoder.set_shared_buffers(shared_buffers);
-    EXPECT(receive_image_bitmap(realm, decoder).is_error());
-    EXPECT_EQ(ftruncate(shared_buffers[0].fd(), 0), 0);
+    auto shared_buffer = MUST(Core::AnonymousBuffer::create_from_anon_fd(unsealable_fd, 64));
+    IPC::MessageBuffer holder;
+    IPC::Encoder encoder { holder };
+    MUST(encoder.encode(image_bitmap_transfer_type));
+    MUST(encoder.encode(true));
+    MUST(encoder.encode(0u));
+    MUST(encoder.encode(static_cast<u64>(0)));
+    MUST(encoder.encode(16));
+    MUST(encoder.encode(1));
+    MUST(encoder.encode(Gfx::BitmapFormat::BGRA8888));
+    MUST(encoder.encode(Gfx::AlphaType::Premultiplied));
+    MUST(encoder.encode(static_cast<u8>(0))); // sRGB
+    EXPECT(receive_transfer_data_holder(move(holder), { shared_buffer }).is_error());
+    EXPECT_EQ(ftruncate(shared_buffer.fd(), 0), 0);
 }
 #endif
 
 TEST_CASE(image_bitmap_transfer_rejects_invalid_inline_pixels)
 {
-    auto& realm = test_realm();
-    auto receive = [&](Gfx::BitmapFormat format, size_t pitch, ReadonlyBytes pixels) {
-        Web::HTML::TransferDataEncoder holder;
-        MUST(holder.encode(false));
-        MUST(holder.encode(true));
-        MUST(holder.encode(1));
-        MUST(holder.encode(1));
-        MUST(holder.encode(static_cast<u64>(pitch)));
-        MUST(holder.encode(format));
-        MUST(holder.encode(Gfx::AlphaType::Premultiplied));
-        MUST(holder.encode(pixels));
-        Web::HTML::TransferDataDecoder decoder { move(holder) };
-        return receive_image_bitmap(realm, decoder);
+    (void)test_realm();
+    auto receive = [](Gfx::BitmapFormat format, size_t pitch, ReadonlyBytes pixels) {
+        IPC::MessageBuffer holder;
+        IPC::Encoder encoder { holder };
+        MUST(encoder.encode(image_bitmap_transfer_type));
+        MUST(encoder.encode(false));
+        MUST(encoder.encode(true));
+        MUST(encoder.encode(1));
+        MUST(encoder.encode(1));
+        MUST(encoder.encode(static_cast<u64>(pitch)));
+        MUST(encoder.encode(format));
+        MUST(encoder.encode(Gfx::AlphaType::Premultiplied));
+        MUST(encoder.encode(pixels));
+        return receive_transfer_data_holder(move(holder));
     };
     Array<u8, 4> pixels {};
     EXPECT(!receive(Gfx::BitmapFormat::BGRA8888, 4, pixels).is_error());
@@ -1098,4 +952,96 @@ TEST_CASE(serializable_payload_version_bumps_require_migration_support)
     // interface names to storage identifiers. Keep this check focused on the registry's completeness.
     for (auto const& entry : Web::HTML::serializable_storage_registry())
         EXPECT(!entry.identifier.is_empty());
+}
+
+TEST_CASE(rtc_encoded_audio_frame_serialization_preserves_metadata_and_buffer_identity)
+{
+    auto& realm = test_realm();
+    auto& vm = realm.vm();
+    Array<u8, 4> payload { 0x12, 0x34, 0x56, 0x78 };
+    auto data = JS::ArrayBuffer::create(realm, MUST(ByteBuffer::copy(payload)));
+    Web::Bindings::RTCEncodedAudioFrameMetadata metadata;
+    metadata.synchronization_source = 0xfedcba98;
+    metadata.payload_type = 111;
+    metadata.contributing_sources = Vector<u32> { 0, 0xffffffff };
+    metadata.rtp_timestamp = 0x87654321;
+    metadata.receive_time = 1234.5;
+    metadata.capture_time = 1200.25;
+    metadata.sender_capture_time_offset = -34.25;
+    metadata.mime_type = "audio/opus; test=🎵"_utf16;
+    metadata.sequence_number = -1234;
+    metadata.audio_level = 0.5;
+    auto frame = Web::WebRTC::RTCEncodedAudioFrame::create(data, metadata);
+    auto wrapper = Web::Bindings::wrap(Web::Bindings::host_defined_wrapper_world(realm), realm, frame);
+    auto array = MUST(JS::Array::create(realm, 0));
+    MUST(array->create_data_property_or_throw(0, wrapper));
+    MUST(array->create_data_property_or_throw(1, data));
+    MUST(array->create_data_property_or_throw(2, wrapper));
+
+    auto record = MUST(Web::HTML::structured_serialize(vm, array));
+    auto clone = MUST(Web::HTML::structured_deserialize(vm, ipc_round_trip(record), realm));
+    auto cloned_frame_value = MUST(clone.as_object().get(0));
+    auto& cloned_frame = unwrap_wrappable<Web::WebRTC::RTCEncodedAudioFrame>(cloned_frame_value);
+    EXPECT(&cloned_frame != frame.ptr());
+    EXPECT(cloned_frame.data().ptr() != data.ptr());
+    auto cloned_payload = MUST(cloned_frame.data()->copy_to_byte_buffer());
+    EXPECT_EQ(cloned_payload.bytes(), payload.span());
+    EXPECT(cloned_frame.data().ptr() == &MUST(clone.as_object().get(1)).as_object());
+    EXPECT_EQ(cloned_frame_value, MUST(clone.as_object().get(2)));
+    auto cloned_metadata = cloned_frame.get_metadata();
+    EXPECT_EQ(cloned_metadata.synchronization_source, metadata.synchronization_source);
+    EXPECT_EQ(cloned_metadata.payload_type, metadata.payload_type);
+    EXPECT_EQ(cloned_metadata.contributing_sources, metadata.contributing_sources);
+    EXPECT_EQ(cloned_metadata.rtp_timestamp, metadata.rtp_timestamp);
+    EXPECT_EQ(cloned_metadata.receive_time, metadata.receive_time);
+    EXPECT_EQ(cloned_metadata.capture_time, metadata.capture_time);
+    EXPECT_EQ(cloned_metadata.sender_capture_time_offset, metadata.sender_capture_time_offset);
+    EXPECT_EQ(cloned_metadata.mime_type, metadata.mime_type);
+    EXPECT_EQ(cloned_metadata.sequence_number, metadata.sequence_number);
+    EXPECT_EQ(cloned_metadata.audio_level, metadata.audio_level);
+}
+
+TEST_CASE(rtc_encoded_audio_frame_serialization_preserves_missing_and_empty_metadata)
+{
+    auto& realm = test_realm();
+    auto& vm = realm.vm();
+    for (bool present : { false, true }) {
+        Web::Bindings::RTCEncodedAudioFrameMetadata metadata;
+        if (present) {
+            metadata.contributing_sources = Vector<u32> {};
+            metadata.mime_type = Utf16String {};
+            metadata.sequence_number = 0;
+        }
+        auto frame = Web::WebRTC::RTCEncodedAudioFrame::create(MUST(JS::ArrayBuffer::create(realm, 0)), metadata);
+        auto record = structured_serialize(vm, frame);
+        auto clone = MUST(Web::HTML::structured_deserialize(vm, record, realm));
+        auto& cloned_frame = unwrap_wrappable<Web::WebRTC::RTCEncodedAudioFrame>(clone);
+        auto cloned_metadata = cloned_frame.get_metadata();
+        EXPECT_EQ(cloned_metadata.contributing_sources, metadata.contributing_sources);
+        EXPECT_EQ(cloned_metadata.mime_type, metadata.mime_type);
+        EXPECT_EQ(cloned_metadata.sequence_number, metadata.sequence_number);
+        EXPECT(!cloned_metadata.synchronization_source.has_value());
+        EXPECT(!cloned_metadata.payload_type.has_value());
+        EXPECT(!cloned_metadata.rtp_timestamp.has_value());
+        EXPECT(!cloned_metadata.receive_time.has_value());
+        EXPECT(!cloned_metadata.capture_time.has_value());
+        EXPECT(!cloned_metadata.sender_capture_time_offset.has_value());
+        EXPECT(!cloned_metadata.audio_level.has_value());
+        EXPECT_EQ(cloned_frame.data()->byte_length(), 0u);
+    }
+}
+
+TEST_CASE(rtc_encoded_audio_frame_cannot_be_serialized_for_storage)
+{
+    auto& realm = test_realm();
+    auto frame = Web::WebRTC::RTCEncodedAudioFrame::create(MUST(JS::ArrayBuffer::create(realm, 0)), {});
+    auto wrapper = Web::Bindings::wrap(Web::Bindings::host_defined_wrapper_world(realm), realm, frame);
+    auto result = Web::WebIDL::throw_dom_exception_if_needed(realm.vm(), realm, [&] {
+        return Web::HTML::structured_serialize_for_storage(realm.vm(), wrapper);
+    });
+    EXPECT(result.is_error());
+    if (result.is_error()) {
+        auto& exception = unwrap_wrappable<Web::WebIDL::DOMException>(result.error_value());
+        EXPECT_EQ(exception.name(), "DataCloneError"_utf16);
+    }
 }

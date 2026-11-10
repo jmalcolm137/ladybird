@@ -24,13 +24,13 @@ class QGraphicsOpacityEffect;
 class QLabel;
 class QMouseEvent;
 class QResizeEvent;
-class QTimer;
 class QToolButton;
 class QVariantAnimation;
 
 namespace Ladybird {
 
 class Autocomplete;
+class InUseChip;
 
 class LocationEdit final
     : public NativeTextEditingLineEdit
@@ -55,13 +55,22 @@ public:
     // The knobs of the site settings icon slide past each other while the given popover is open.
     void follow_site_settings_popover(QWidget&);
     void set_zoom_action(QAction*);
-    // Shows, while the page uses the user's location, a chip that says so.
+    // The translate button stands in the field, before the bookmark star, while the page can be translated.
+    void set_translate_action(QAction*);
+    QWidget& translate_button() const;
+    // Shows, while the page uses the user's location or microphone, a chip that says so.
     void set_location_in_use(bool);
+    void set_microphone_in_use(bool);
 
     Optional<URL::URL const&> url() const { return m_url; }
     void set_url(Optional<URL::URL>);
     bool url_is_hidden() const { return m_url_is_hidden; }
     void set_url_is_hidden(bool);
+    // While idle, a website's address shows only up to its host, as where the field is narrow, in the sidebar.
+    void set_shows_host_only(bool);
+    // While a host is set, the suggestions are listed in it instead of in a popup below the field.
+    void set_suggestions_host(QWidget*);
+    bool is_editing_location() const { return m_is_editing_location; }
     void show_autocomplete();
     void park_editing_session();
     bool has_parked_editing_session() const { return m_parked_editing_session.has_value(); }
@@ -73,12 +82,15 @@ public:
     Function<void()> on_site_settings_requested;
     // Asks for the page's zoom controls, shown when the zoom level in the field is clicked.
     Function<void()> on_zoom_requested;
+    // Asks for the page's translation menu, shown when the translate button is clicked.
+    Function<void()> on_translate_requested;
     QWidget& trailing_action_button() const;
     QWidget& site_settings_button() const;
     Function<void(String, Optional<URL::URL>, WebView::OmniboxDestinationKind)> on_navigation;
 
 signals:
     void focus_return_requested();
+    void editing_location_changed();
 
 private:
     virtual void changeEvent(QEvent* event) override;
@@ -91,23 +103,30 @@ private:
     virtual void native_text_editing_command_will_execute(Web::TextEditingCommand const&) override;
     virtual void mouseReleaseEvent(QMouseEvent* event) override;
     virtual void resizeEvent(QResizeEvent* event) override;
+    virtual QSize sizeHint() const override;
+    virtual QSize minimumSizeHint() const override;
 
     virtual void search_engine_settings_changed() override;
 
     void show_full_url_preserving_display_selection();
     int serialized_url_position_for_display_position(int) const;
     void update_text_margins();
+    void fit_in_use_chips();
+    int in_use_chips_width_beyond_icons() const;
     int trailing_text_margin() const;
     void update_trailing_item_positions();
     void update_chrome_style();
     void update_location_icon();
     void update_zoom_indicator();
-    void update_location_in_use_chip();
+    void update_translate_button();
+    void update_in_use_chip_icons();
     void update_focus_ring(qreal opacity);
     void set_field_hovered(bool);
     void schedule_chrome_style_update();
     void show_focus_ring();
     void hide_focus_ring();
+    qreal focus_ring_opacity_while_editing() const;
+    void animate_focus_ring();
     void update_trailing_action_visibility();
     void slide_site_settings_knobs(qreal travel);
     void update_completion_title();
@@ -126,11 +145,15 @@ private:
     QVariantAnimation* m_site_settings_knob_animation { nullptr };
     qreal m_site_settings_knob_travel { 0 };
     QToolButton* m_trailing_action_button { nullptr };
+    QToolButton* m_translate_button { nullptr };
+    QAction* m_translate_action { nullptr };
+    QGraphicsOpacityEffect* m_translate_opacity { nullptr };
+    QVariantAnimation* m_translate_pulse { nullptr };
     QToolButton* m_zoom_indicator_button { nullptr };
     QGraphicsOpacityEffect* m_zoom_indicator_opacity { nullptr };
     QVariantAnimation* m_zoom_indicator_fade { nullptr };
-    QToolButton* m_location_in_use_button { nullptr };
-    QTimer* m_location_in_use_collapse_timer { nullptr };
+    InUseChip* m_location_in_use_chip { nullptr };
+    InUseChip* m_microphone_in_use_chip { nullptr };
     QLabel* m_completion_title { nullptr };
     QVariantAnimation* m_focus_ring_animation { nullptr };
     QGraphicsEffect* m_focus_ring_effect { nullptr };
@@ -138,6 +161,7 @@ private:
 
     Optional<URL::URL> m_url;
     bool m_url_is_hidden { false };
+    bool m_shows_host_only { false };
     bool m_is_editing_location { false };
 
     struct ParkedEditingSession {

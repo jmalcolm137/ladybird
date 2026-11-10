@@ -10,7 +10,6 @@ use super::layout_node_arena::IntrinsicSizeCacheKind;
 use super::node_data::{NodeFlag, NodeKind, NodeSlotId};
 use crate::render_state::DocumentHost;
 use crate::stage::MainThread;
-use std::cell::RefCell;
 use std::ffi::c_void;
 use std::fmt::Write;
 
@@ -44,8 +43,8 @@ struct Line {
 pub(crate) struct TraceRecord(Option<Trace>);
 
 /// What a layout pass records its events into: the trace it took over from the document.
-#[derive(Clone, Default)]
-pub(crate) struct LayoutTrace(RefCell<Option<Trace>>);
+#[derive(Default)]
+pub(crate) struct LayoutTrace(std::sync::Mutex<Option<Trace>>);
 
 /// The events traced while a scope lives nest under the line that opened it.
 pub(super) struct Scope<'a> {
@@ -56,7 +55,7 @@ pub(super) struct Scope<'a> {
 impl Scope<'_> {
     /// Adds `text` to the end of the line that opened the scope.
     pub(super) fn append(&self, text: &str) {
-        self.trace.0.borrow_mut().as_mut().unwrap().lines[self.line]
+        self.trace.state().as_mut().unwrap().lines[self.line]
             .text
             .push_str(text);
     }
@@ -64,7 +63,7 @@ impl Scope<'_> {
 
 impl Drop for Scope<'_> {
     fn drop(&mut self) {
-        self.trace.0.borrow_mut().as_mut().unwrap().depth -= 1;
+        self.trace.state().as_mut().unwrap().depth -= 1;
     }
 }
 
@@ -139,15 +138,19 @@ impl TraceRecord {
 }
 
 impl LayoutTrace {
+    fn state(&self) -> std::sync::MutexGuard<'_, Option<Trace>> {
+        self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     #[cfg(test)]
     fn begin(&self) {
-        let begun = begun_trace(self.0.borrow().as_ref());
-        *self.0.borrow_mut() = Some(begun);
+        let begun = begun_trace(self.state().as_ref());
+        *self.state() = Some(begun);
     }
 
     #[cfg(test)]
     fn take(&self) -> String {
-        text_of(self.0.borrow_mut().take())
+        text_of(self.state().take())
     }
 
     fn scope(
@@ -156,7 +159,7 @@ impl LayoutTrace {
         owner: Option<NodeSlotId>,
         text: impl FnOnce() -> String,
     ) -> Option<Scope<'_>> {
-        let mut state = self.0.borrow_mut();
+        let mut state = self.state();
         let trace = state.as_mut()?;
         let line = trace.lines.len();
         trace.lines.push(Line {
@@ -170,22 +173,18 @@ impl LayoutTrace {
         Some(Scope { trace: self, line })
     }
 
+    pub(super) fn is_recording(&self) -> bool {
+        self.state().is_some()
+    }
+
     /// Takes over the trace the document kept in `record`, for a pass to go on with it.
     pub(super) fn take_over_from(&self, record: &mut TraceRecord) {
-        *self.0.borrow_mut() = record.0.take();
+        *self.state() = record.0.take();
     }
 
     /// Hands the trace back to `record` once the pass is over.
     pub(super) fn hand_back_to(&self, record: &mut TraceRecord) {
-        record.0 = self.0.take();
-    }
-
-    /// Runs `untraced` with nothing it does traced.
-    pub(super) fn without_events<R>(&self, untraced: impl FnOnce() -> R) -> R {
-        let trace = self.0.take();
-        let result = untraced();
-        *self.0.borrow_mut() = trace;
-        result
+        record.0 = self.state().take();
     }
 
     pub(super) fn pass(&self, partial_root: Option<NodeSlotId>) -> Option<Scope<'_>> {
@@ -194,32 +193,56 @@ impl LayoutTrace {
             None => self.scope("layout FULL", None, String::new),
         }
     }
+}
+
+/// Where a pass view records the events of its runs: the pass's trace, or nowhere for the view of a run whose result is
+/// discarded.
+#[derive(Clone, Copy)]
+pub(crate) struct LayoutTraceTarget<'a>(Option<&'a LayoutTrace>);
+
+impl<'a> LayoutTraceTarget<'a> {
+    pub(super) fn recording_into(trace: &'a LayoutTrace) -> Self {
+        Self(Some(trace))
+    }
+
+    pub(super) fn recording_nothing() -> Self {
+        Self(None)
+    }
+
+    fn scope(
+        self,
+        prefix: &'static str,
+        owner: Option<NodeSlotId>,
+        text: impl FnOnce() -> String,
+    ) -> Option<Scope<'a>> {
+        self.0?.scope(prefix, owner, text)
+    }
 
     /// An in-flow block whose subtree is reused from the previous layout, moved to where the flow now puts it.
-    pub(super) fn reused_in_flow_subtree(&self, node: NodeSlotId) {
+    pub(super) fn reused_in_flow_subtree(self, node: NodeSlotId) {
         drop(self.scope("", Some(node), || " REUSE IN-FLOW SUBTREE".into()));
     }
 
     /// An intrinsic size of `node` that the measurement cache holds.
-    pub(super) fn intrinsic_size_hit(&self, node: NodeSlotId, kind: IntrinsicSizeCacheKind) {
+    pub(super) fn intrinsic_size_hit(self, node: NodeSlotId, kind: IntrinsicSizeCacheKind) {
         drop(self.scope("", Some(node), || {
             format!(" MEASURE {} (cache=hit)", intrinsic_size_name(kind))
         }));
     }
 
     /// An intrinsic size of `node` that the measurement cache does not hold. The work that measures it nests under it.
-    pub(super) fn intrinsic_size_miss(&self, node: NodeSlotId, kind: IntrinsicSizeCacheKind) -> Option<Scope<'_>> {
+    pub(super) fn intrinsic_size_miss(self, node: NodeSlotId, kind: IntrinsicSizeCacheKind) -> Option<Scope<'a>> {
         self.scope("", Some(node), || {
             format!(" MEASURE {} (cache=miss)", intrinsic_size_name(kind))
         })
     }
 
     pub(super) fn run(
-        &self,
+        self,
         root: NodeSlotId,
         fc_type: FormattingContextType,
         action: impl FnOnce() -> &'static str,
-    ) -> Option<Scope<'_>> {
+    ) -> Option<Scope<'a>> {
         self.scope("", Some(root), || {
             let context = match fc_type {
                 FormattingContextType::Block => "block",
@@ -230,6 +253,7 @@ impl LayoutTrace {
                 FormattingContextType::Math => "math",
                 FormattingContextType::ReplacedWithChildren => "replaced-with-children",
                 FormattingContextType::InternalReplaced => "internal-replaced",
+                FormattingContextType::FrameSet => "frameset",
             };
             format!("/{context} {}", action())
         })
@@ -381,14 +405,15 @@ mod tests {
         trace.begin();
         {
             let _pass = trace.scope("layout FULL", None, String::new);
+            let target = LayoutTraceTarget::recording_into(&trace);
             {
-                let miss = trace
+                let miss = target
                     .intrinsic_size_miss(NodeSlotId::new(1, 1), IntrinsicSizeCacheKind::MaxContentInline)
                     .unwrap();
-                drop(trace.intrinsic_size_miss(NodeSlotId::new(2, 1), IntrinsicSizeCacheKind::MaxContentInline));
+                drop(target.intrinsic_size_miss(NodeSlotId::new(2, 1), IntrinsicSizeCacheKind::MaxContentInline));
                 miss.append(" FROM ITEMS");
             }
-            trace.intrinsic_size_hit(NodeSlotId::new(1, 1), IntrinsicSizeCacheKind::MinContentInline);
+            target.intrinsic_size_hit(NodeSlotId::new(1, 1), IntrinsicSizeCacheKind::MinContentInline);
         }
         // The owners are not named, so each line starts with the indentation and the space before the event.
         assert_eq!(
@@ -436,7 +461,7 @@ mod tests {
         arena.begin_active_layout_pass();
         let recorder = LayoutTrace::default();
         recorder.take_over_from(&mut arena.layout_trace);
-        drop(recorder.run(owner.slot, FormattingContextType::Block, || "RUN"));
+        drop(LayoutTraceTarget::recording_into(&recorder).run(owner.slot, FormattingContextType::Block, || "RUN"));
         recorder.hand_back_to(&mut arena.layout_trace);
         assert!(arena.leave_active_layout_pass());
         let names = arena

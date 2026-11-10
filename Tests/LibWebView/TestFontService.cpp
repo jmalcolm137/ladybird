@@ -34,6 +34,13 @@ struct FontServiceTestAccess {
         MUST(service.wait_until_ready());
         return service.materialize(move(match), move(key));
     }
+
+    static Optional<u64> catalog_face_id(FontService& service, Gfx::SystemFontFile const& file)
+    {
+        MutexLocker locker(service.m_mutex);
+        MUST(service.wait_until_ready());
+        return service.m_face_id_by_source.get({ .path = file.path, .ttc_index = file.ttc_index, .format = file.format });
+    }
 };
 
 }
@@ -63,10 +70,15 @@ TEST_CASE(dynamic_matches_of_one_face_share_its_id)
     EXPECT_NE(platform_font.face_id, 0u);
     EXPECT_EQ(platform_font.face_id, repeated_platform_font.face_id);
     EXPECT_NE(platform_font.face_id, first.face_id);
-    EXPECT(platform_font.source.has<Gfx::PlatformFontName>());
+
+    // A match names the face, which the renderer opens where it does not hold it yet.
+    auto generation = MUST(service->clone_catalog()).generation;
+    EXPECT(first.source.has<Empty>());
+    EXPECT(service->open_font(generation, platform_font.face_id).source.has<Gfx::PlatformFontName>());
 
     // The renderer gets the file itself, not a copy of its data.
-    auto* font_file = first.source.get_pointer<Gfx::BrokeredFontFile>();
+    auto opened = service->open_font(generation, first.face_id);
+    auto* font_file = opened.source.get_pointer<Gfx::BrokeredFontFile>();
     EXPECT(font_file);
     auto mapped_file = MUST(Core::MappedFile::map_from_fd_and_close(font_file->file.take_fd(), "brokered font"sv));
     auto original_file = MUST(Core::MappedFile::map("../LibGfx/test-inputs/fonts/text.ttf"sv));
@@ -78,12 +90,10 @@ TEST_CASE(dynamic_matches_of_a_catalog_face_use_its_catalog_id)
     auto directory = MUST(FileSystem::real_path("../LibGfx/test-inputs/fonts"sv));
     auto service = WebView::FontService::create({ MUST(String::from_byte_string(directory)) });
 
-    auto file = MUST(Core::MappedFile::map("../LibGfx/test-inputs/fonts/text.ttf"sv));
-    auto postscript_name = MUST(Gfx::Typeface::try_load_from_temporary_memory(file->bytes()))->postscript_name();
-    EXPECT(postscript_name.has_value());
-    auto catalog_face = service->match_local_font(*postscript_name);
-    EXPECT_NE(catalog_face.face_id, 0u);
+    // NB: The face is found by its file, as its name may belong to the same font installed on the system.
+    auto catalog_face_id = WebView::FontServiceTestAccess::catalog_face_id(*service, test_font_file("text.ttf"sv));
+    EXPECT(catalog_face_id.has_value());
 
     auto match = WebView::FontServiceTestAccess::materialize(*service, test_font_file("text.ttf"sv), "catalog-face"_string);
-    EXPECT_EQ(match.face_id, catalog_face.face_id);
+    EXPECT_EQ(match.face_id, *catalog_face_id);
 }

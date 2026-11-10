@@ -46,6 +46,7 @@
 #include <LibWebCommon/Forward.h>
 #include <LibWebCommon/HTML/ActivateTab.h>
 #include <LibWebCommon/HTML/ColorPickerUpdateState.h>
+#include <LibWebCommon/HTML/CrossProcessId.h>
 #include <LibWebCommon/HTML/FileFilter.h>
 #include <LibWebCommon/HTML/HistoryOperation.h>
 #include <LibWebCommon/HTML/MuteState.h>
@@ -69,19 +70,20 @@
 #include <LibWebCommon/WebView/PageInfo.h>
 #include <LibWebCommon/WebView/StorageSetResult.h>
 #include <LibWebCommon/WebView/ZoomLevel.h>
-#include <LibWebView/AudibilityHold.h>
-#include <LibWebView/BookmarkStore.h>
 #include <LibWebView/BrowsingSession.h>
 #include <LibWebView/CanonicalTraversable.h>
 #include <LibWebView/ContentBlocking.h>
+#include <LibWebView/ContextMenuRequest.h>
 #include <LibWebView/ExternalURLHandler.h>
 #include <LibWebView/Forward.h>
 #include <LibWebView/HistoryVisitTransition.h>
+#include <LibWebView/MicrophoneAuthorizer.h>
+#include <LibWebView/PageBackingStores.h>
 #include <LibWebView/PermissionManager.h>
 #include <LibWebView/SessionHistory.h>
-#include <LibWebView/SessionStore.h>
 #include <LibWebView/Settings.h>
 #include <LibWebView/SpellChecker.h>
+#include <LibWebView/TabIndicators.h>
 #include <LibWebView/TabPerformanceStats.h>
 #include <LibWebView/WebContentClient.h>
 #include <LibWebView/WebContentPage.h>
@@ -89,11 +91,19 @@
 
 namespace WebView {
 
+class MicrophoneAuthorizerForTesting;
+
 struct GeolocationRequestKey {
     NonnullRefPtr<WebContentPage> page;
     u64 request_id { 0 };
 
     bool operator==(GeolocationRequestKey const&) const = default;
+};
+
+enum class PermissionPromptKind : u8 {
+    Question,
+    // Tells the user the system keeps the feature from the browser, so no site can have it. Its answer decides nothing.
+    SystemDeniedNotice,
 };
 
 // What the UI shows the user when a site asks for a permission. The origin is the top-level one the decision is kept
@@ -103,10 +113,11 @@ struct PermissionPromptRequest {
     URL::Origin top_level_origin;
     bool is_file { false };
     bool show_os_hint { false };
+    PermissionPromptKind kind { PermissionPromptKind::Question };
 
     bool is_same_request_as(PermissionPromptRequest const& other) const
     {
-        return name == other.name && is_file == other.is_file && top_level_origin.is_same_origin(other.top_level_origin);
+        return name == other.name && kind == other.kind && is_file == other.is_file && top_level_origin.is_same_origin(other.top_level_origin);
     }
 };
 
@@ -122,7 +133,6 @@ struct SitePermissionRow {
 
 class WEBVIEW_API ViewImplementation
     : public SettingsObserver
-    , public BookmarkStoreObserver
     , public Weakable<ViewImplementation> {
     friend class WebContentClient;
     friend class WebContentPage;
@@ -154,7 +164,24 @@ public:
     void reset_site_permissions(URL::Origin const&);
     void did_request_permission(Badge<WebContentPage>, Web::Permissions::PermissionName);
 
-    bool location_in_use() const { return m_location_in_use; }
+    MicrophoneAuthorization microphone_authorization() const;
+    // Calls back with whether the system lets the browser use the microphone, once the system has asked the user if it
+    // never has. The user is told why when it doesn't.
+    void ensure_microphone_authorization(Function<void(bool authorized)>);
+    // Tells the user the system keeps the microphone from the browser, unless this tab has already shown them that for
+    // the site it shows.
+    void show_microphone_denied_notice();
+    // The UI calls this each time a prompt comes up on screen.
+    void did_show_permission_prompt(PermissionPromptRequest const&);
+
+    // The system answers with answer when it's asked, which it is while authorization is NotDetermined. A held answer
+    // waits for release_system_microphone_answer_for_testing().
+    void set_microphone_authorization_for_testing(MicrophoneAuthorization authorization, MicrophoneAuthorization answer, bool held);
+    void release_system_microphone_answer_for_testing();
+    u64 system_microphone_requests_for_testing() const;
+    u64 microphone_denied_notices_shown_for_testing() const { return m_microphone_denied_notices_shown; }
+
+    bool location_in_use() const { return m_tab_indicators.is_active(TabIndicator::UsingLocation); }
 
     // Ends every location request and watch whose document the user has since taken the permission away from.
     void revoke_geolocation_without_permission();
@@ -165,6 +192,12 @@ public:
     // A view that shows a page on behalf of another view, such as a Picture-in-Picture window, is part of that view's
     // tab rather than a tab or window of its own.
     Optional<u64> owner_view_id() const { return m_owner_view_id; }
+    // The view whose tab this view is part of, which is none for a view whose owner is gone or that has left its tab.
+    Optional<ViewImplementation&> tab_view();
+    // The owner's document that this view acts for, which limits what the view is allowed, until it leaves the tab.
+    CanonicalDocument const* owner_document() const { return m_owner_document.ptr(); }
+    void set_owner_document(Badge<PictureInPictureWindow>, CanonicalDocument const& document) { m_owner_document = document; }
+    void did_leave_owners_tab(Badge<PictureInPictureWindow>);
 
     CanonicalTraversable& traversable() const;
     bool has_traversable() const { return m_top_level_traversable != nullptr; }
@@ -188,7 +221,6 @@ public:
     Utf16String const& title() const { return m_title; }
 
     void set_favicon(Badge<WebContentPage>, Optional<Gfx::Bitmap const&> favicon) { set_favicon(favicon); }
-    Optional<String> const& favicon_hash() const { return m_favicon_hash; }
 
     String const& handle() const { return m_window_handle; }
 
@@ -210,9 +242,6 @@ public:
     void set_has_system_focus(bool);
 
     void load(URL::URL const&, Web::Bindings::NavigationHistoryBehavior = Web::Bindings::NavigationHistoryBehavior::Auto);
-    void load_from_user_input(URL::URL const&);
-    void load_from_user_input(StringView);
-    void load_from_user_input(StringView, Optional<URL::URL> fallback_url);
     void open_url_in_new_tab(URL::URL const&, Web::HTML::ActivateTab);
     void open_url_in_new_window(URL::URL const&, IsPrivate);
     void load(Web::HTML::PreparedNavigationDescriptor);
@@ -220,7 +249,6 @@ public:
     void open_navigation_in_new_window(Web::HTML::PreparedNavigationDescriptor, IsPrivate);
     void set_next_history_visit_transition(HistoryVisitTransition transition) { m_history_visit_transition_for_next_load = transition; }
     void load_html(StringView);
-    void load_navigation_error_page(StringView);
 
     void reload(BypassCache = BypassCache::No);
     void reload_for_webdriver_bidi(BypassCache, Utf16String navigation_id);
@@ -232,11 +260,9 @@ public:
     Optional<ByteString> crash_report_name() const;
     Optional<String> crash_report_website() const;
 
-    struct SessionHistoryTraversalMenuItem {
+    struct SessionHistoryTraversalItem {
         i32 step { 0 };
-        String title;
-        String url;
-        Optional<ByteBuffer> favicon_png;
+        URL::URL url;
     };
     static Web::UIEvents::KeyModifier history_traversal_key_modifier();
     void traverse_the_history_by_delta(
@@ -247,15 +273,13 @@ public:
         i32 step,
         CheckForCancelation = CheckForCancelation::Yes,
         Function<void()> on_ready = nullptr);
-    [[nodiscard]] Vector<SessionHistoryTraversalMenuItem> session_history_traversal_menu_items(int direction) const;
-    Vector<HistoryEntry> recent_history_entries(size_t limit) const;
+    [[nodiscard]] Vector<SessionHistoryTraversalItem> session_history_traversal_items(int direction) const;
 
     [[nodiscard]] SessionHistorySnapshot session_history_snapshot() const;
     [[nodiscard]] ErrorOr<void> restore_session_history_from_snapshot(SessionHistorySnapshot);
 
-    Optional<SessionTabId> session_tab_id() const { return m_session_tab_id; }
-    void set_session_tab_id(SessionTabId session_tab_id) { m_session_tab_id = session_tab_id; }
-    void clear_session_tab_id() { m_session_tab_id = {}; }
+    // A view whose windows and tabs the application keeps tells it of each change to its session history.
+    void set_reports_session_history(bool);
 
     void zoom_in();
     void zoom_out();
@@ -288,6 +312,10 @@ public:
     void did_forward_pinch_event(Badge<WebContentPage>, WebContentPage const& reporting_page, Web::PinchEvent const&, WebContentPage& endpoint);
     // Whether the page has yet to finish handling input that gives it user activation.
     bool is_delivering_user_activation_to(WebContentPage const&) const;
+    bool take_paste_shortcut_handled_by(Badge<WebContentPage>, WebContentPage const&);
+
+    void did_insert_clipboard_item_written_by(URL::Origin, Web::Clipboard::SystemClipboardItem);
+    bool is_clipboard_data_written_by(Web::Clipboard::SystemClipboardItem const&, URL::Origin const&) const;
     // Consumes the activation of the earliest input giving the page activation that the page has yet to finish
     // handling, which leaves the input queued behind it the activation it gives.
     void consume_user_activation_of_input_in_flight_to(Badge<WebContentPage>, WebContentPage const&);
@@ -298,9 +326,8 @@ public:
     void did_lose_input_event_endpoint(Badge<WebContentPage>, WebContentPage&);
     void did_consume_input_event_in_compositor(Badge<WebContentPage>, u64 event_id);
     void did_not_dispatch_input_event_through_compositor(Badge<WebContentPage>, u64 event_id);
-    void did_dispatch_input_event_through_compositor(Badge<WebContentPage>, u64 event_id, bool async_scroll_performed_default_action);
+    void did_dispatch_input_event_through_compositor(Badge<WebContentPage>, u64 event_id, bool performed_default_action);
     void discard_input_events_routed_through_lost_compositor(Badge<Application>);
-    size_t pending_input_event_count_for_testing() const { return m_pending_input_events.size(); }
     void handle_external_url(Badge<WebContentPage>, URL::URL, URL::Origin, bool has_transient_activation);
     void did_request_cursor_change(Badge<WebContentPage>, Gfx::Cursor);
     void did_enter_tooltip_area(Badge<WebContentPage>, ByteString title);
@@ -312,8 +339,13 @@ public:
     Optional<ByteString> const& page_tooltip_for_testing() const { return m_page_tooltip; }
     Optional<double> displayed_frame_device_pixel_ratio_for_testing() const
     {
-        return displayed_frame().map([](auto const& frame) { return frame.device_pixel_ratio; });
+        return m_backing_stores->displayed_frame().map([](auto const& frame) { return frame.device_pixel_ratio; });
     }
+
+    String force_dark_host() const;
+    bool force_dark_enabled() const;
+    bool can_set_force_dark() const;
+    void set_force_dark_enabled(bool);
 
     void set_preferred_color_scheme(Web::CSS::PreferredColorScheme);
     // Sends the interface theme to the pages showing the browser's own pages, which follow it.
@@ -366,6 +398,8 @@ public:
     void find_in_page_end();
 
     void get_source();
+    bool can_view_source() const;
+    void did_start_showing_page_source();
 
     bool can_report_website_issue() const;
     void report_website_issue();
@@ -421,6 +455,7 @@ public:
     void set_listen_for_dom_mutations(bool);
     void did_connect_devtools_client();
     void did_disconnect_devtools_client();
+    void start_sending_console_output(bool messages, bool errors);
     void get_dom_node_inner_html(Web::UniqueNodeID node_id);
     void get_dom_node_outer_html(Web::UniqueNodeID node_id);
     void set_dom_node_outer_html(Web::UniqueNodeID node_id, String const& html);
@@ -447,6 +482,7 @@ public:
     void run_javascript(String const&);
     void js_console_input(String const&);
     void exit_fullscreen();
+    void deny_fullscreen_window();
 
     void set_is_fullscreen(Web::ViewportIsFullscreen is_fullscreen);
     Web::ViewportIsFullscreen is_fullscreen() const { return m_is_fullscreen; }
@@ -460,7 +496,7 @@ public:
     void file_picker_closed(Vector<Web::HTML::SelectedFile> selected_files);
     void select_dropdown_closed(Optional<u32> const& selected_item_id);
 
-    void paste_from_clipboard();
+    void paste_from_clipboard(Web::Clipboard::PasteMode);
 
     // Used by platform input methods to drive marked/preedit-text composition, and to query the on-screen caret
     // position for placing IME overlays.
@@ -482,20 +518,24 @@ public:
     Web::HTML::MuteState page_mute_state() const { return m_mute_state; }
     void toggle_page_mute_state();
 
-    // The tab is audible while the AudioServer has recently heard any page of it, and for a while after a page leaves it
-    // while heard. A page lost along with its process doesn't leave.
+    // The tab plays audio while the AudioServer has recently heard any page of it.
     void update_audibility(Badge<WebContentPage>) { update_audibility(); }
-    void did_release_page(Badge<CanonicalTraversable>, WebContentPage const& page) { page_left(page); }
-    void did_close_page(Badge<WebContentPage>, Web::PageId page_id) { m_audibility_hold.page_closed(page_id); }
-    Audio::Audibility audibility() const { return m_audibility; }
-    u64 audibility_change_count() const { return m_audibility_change_count; }
+    void did_release_page(Badge<CanonicalTraversable>);
+    bool is_playing_audio() const { return m_tab_indicators.is_active(TabIndicator::PlayingAudio); }
+
+    // The tab captures while the AudioServer holds a capture stream for any page of it.
+    void update_microphone_capture(Badge<WebContentPage>) { update_microphone_capture(); }
+    bool is_capturing_audio() const { return m_tab_indicators.is_active(TabIndicator::UsingMicrophone); }
+
+    bool tab_indicator_visible(TabIndicator indicator) const { return m_tab_indicators.is_visible(indicator); }
+    u64 playing_audio_indicator_change_count() const { return m_playing_audio_indicator_change_count; }
     void did_change_screen_wake_lock_state(Badge<WebContentPage>, Web::ScreenWakeLockState);
 
     void did_reset_state_for_testing(Badge<WebContentPage>, Web::HTML::SessionHistoryEntryDescriptor);
     bool capture_session_history_snapshot_for_testing(Badge<WebContentPage>);
     bool restore_captured_session_history_snapshot_for_testing(Badge<WebContentPage>);
-    bool register_session_store_tab_for_testing(Badge<WebContentPage>);
-    String session_store_tab_state_for_testing(Badge<WebContentPage>) const;
+    void record_reported_session_history_for_testing(Badge<WebContentPage>);
+    String reported_session_history_for_testing(Badge<WebContentPage>) const;
     void did_start_webdriver_navigation();
     void load_for_webdriver_navigation(URL::URL const&);
     String ui_process_session_history_for_testing(Badge<WebContentPage>) const;
@@ -522,6 +562,7 @@ public:
     void did_change_background_color(Badge<WebContentPage>, Gfx::Color);
     Gfx::Color page_background_color() const { return m_page_background_color; }
 
+    PageBackingStores const& backing_stores() const { return *m_backing_stores; }
     void did_allocate_backing_stores(Badge<WebContentPage>, Vector<i32> bitmap_ids, Vector<Gfx::SharedImage> backing_stores);
     void did_add_backing_stores(Badge<WebContentPage>, Vector<i32> bitmap_ids, Vector<Gfx::SharedImage> backing_stores);
     void did_retire_backing_stores(Badge<WebContentPage>, ReadonlySpan<i32> bitmap_ids);
@@ -547,7 +588,8 @@ public:
     void did_complete_close_preflight(Badge<WebContentPage>, u64 request_id, bool approved);
     Function<void()> prepare_for_close_without_prompting();
     void force_close();
-    Function<void()> prepare_for_immediate_close();
+    void prepare_for_immediate_close();
+    void close_tab_for_testing();
     bool needs_beforeunload_check() const;
 
     struct NavigationListener {
@@ -575,8 +617,6 @@ public:
     Function<void(Optional<Gfx::Bitmap const&>)> on_favicon_change;
     Function<void(Gfx::Cursor const&)> on_cursor_change;
     Function<void()> on_input_method_state_change;
-    Function<void(Gfx::IntPoint, ByteString const&)> on_request_tooltip_override;
-    Function<void()> on_stop_tooltip_override;
     Function<void(ByteString const&)> on_enter_tooltip_area;
     Function<void()> on_leave_tooltip_area;
     Function<void(ContentBlockingSnapshot const&)> on_content_blocking_change;
@@ -598,7 +638,8 @@ public:
     Function<void(Optional<JsonObject>)> on_received_current_grid;
     Function<void(Optional<JsonObject>)> on_received_current_flexbox;
     Function<void(JsonObject)> on_received_accessibility_tree;
-    Function<void(Vector<AccessibilityNodeData>)> on_accessibility_tree_received;
+    Function<void(u64 sequence, Vector<AccessibilityNodeData>)> on_accessibility_tree_received;
+    Function<void(u64 base_sequence, u64 sequence, AccessibilityTreeDelta)> on_accessibility_tree_changed;
     Function<void(i64)> on_accessibility_focus_changed;
     Function<void(Web::UniqueNodeID)> on_received_hovered_node_id;
     Function<void(Mutation)> on_dom_mutation_received;
@@ -636,7 +677,7 @@ public:
     Function<void(WebContentPage& requesting_page, u64 request_id)> on_stop_geolocation_position_watch;
     Function<void(PermissionPromptRequest const&, PermissionPromptCallback)> on_request_permission;
     Function<void(PermissionPromptRequest const&)> on_cancel_permission_prompt;
-    Function<void(bool)> on_location_in_use_change;
+    Function<void(TabIndicator, bool visible)> on_tab_indicator_change;
     Function<void(Web::HTML::FileFilter const& accepted_file_types, Web::HTML::AllowMultipleFiles)> on_request_file_picker;
     Function<void(Gfx::IntPoint content_position, i32 minimum_width, Vector<Web::HTML::SelectItem> items)> on_request_select_dropdown;
     Function<void(Web::KeyEvent const&)> on_finish_handling_key_event;
@@ -650,7 +691,6 @@ public:
     Function<void(size_t current_match_index, Optional<size_t> const& total_match_count)> on_find_in_page;
     Function<void(Gfx::Color)> on_theme_color_change;
     Function<void(Gfx::Color)> on_page_background_color_change;
-    Function<void(Audio::Audibility)> on_audibility_changed;
     Function<void(Web::ScreenWakeLockState)> on_screen_wake_lock_state_changed;
     enum class WebContentCrashReason {
         ProcessCrash,
@@ -661,16 +701,6 @@ public:
     Function<void()> on_crash_report_saved;
     Function<void()> on_web_content_process_change_for_cross_site_navigation;
 
-    Menu& page_context_menu() { return *m_page_context_menu; }
-    Menu& link_context_menu() { return *m_link_context_menu; }
-    Menu& selected_text_link_context_menu() { return *m_selected_text_link_context_menu; }
-    Menu& image_context_menu() { return *m_image_context_menu; }
-    Menu& media_context_menu() { return *m_media_context_menu; }
-
-    Menu& bookmarks_bar_context_menu() { return *m_bookmarks_bar_context_menu; }
-    Menu& bookmark_context_menu() { return *m_bookmark_context_menu; }
-    Menu& bookmark_folder_context_menu() { return *m_bookmark_folder_context_menu; }
-
     void did_request_page_context_menu(Badge<WebContentPage>, WebContentPage& requesting_page, Gfx::IntPoint content_position, Web::ContextMenuForInputEventsTarget for_input_events_target, Optional<Utf16String> misspelled_word, Optional<u64> text_fragment_generation_id);
     void activate_spelling_menu_action_for_testing(Badge<WebContentPage>, WebContentPage& requesting_page, Web::SpellingMenuActionForTesting, u32 guess_index);
 
@@ -679,19 +709,39 @@ public:
     void reset_spell_checking();
     void did_request_link_context_menu(Badge<WebContentPage>, Gfx::IntPoint content_position, Web::HTML::PreparedNavigationDescriptor, Optional<u64> text_fragment_generation_id);
     void did_generate_text_fragment_url(u64 request_id, Optional<URL::URL>);
-    void did_request_image_context_menu(Badge<WebContentPage>, Gfx::IntPoint content_position, Web::HTML::PreparedNavigationDescriptor, Optional<Gfx::ShareableBitmap> bitmap);
-    void did_request_media_context_menu(Badge<WebContentPage>, WebContentPage& requesting_page, Gfx::IntPoint content_position, Web::MediaContextMenu menu, Optional<Web::HTML::PreparedNavigationDescriptor>);
-    void send_to_media_context_menu_page(Function<void(WebContentPage&)> const&);
+    void did_request_image_context_menu(Badge<WebContentPage>, Gfx::IntPoint content_position, Web::HTML::PreparedNavigationDescriptor, Optional<Gfx::ShareableBitmap> bitmap, Optional<Web::HTML::PreparedNavigationDescriptor> link_navigation, Optional<String> image_mime_type);
+    void did_request_media_context_menu(Badge<WebContentPage>, WebContentPage& requesting_page, Gfx::IntPoint content_position, Web::MediaContextMenu, Optional<Web::HTML::PreparedNavigationDescriptor>);
 
     void did_request_color_picker(Badge<WebContentPage>, WebContentPage& requesting_page, Color current_color);
     void did_request_date_picker(Badge<WebContentPage>, WebContentPage& requesting_page, Utf16String input_type, Utf16String value, Utf16String minimum, Utf16String maximum);
     void did_request_file_picker(Badge<WebContentPage>, WebContentPage& requesting_page, Web::HTML::FileFilter const& accepted_file_types, Web::HTML::AllowMultipleFiles);
     void did_request_select_dropdown(Badge<WebContentPage>, WebContentPage& requesting_page, Gfx::IntPoint content_position, i32 minimum_width, Vector<Web::HTML::SelectItem> items);
 
-    Action& navigate_back_action() { return *m_navigate_back_action; }
-    Action& navigate_forward_action() { return *m_navigate_forward_action; }
-    Action& toggle_bookmark_action() { return *m_toggle_bookmark_action; }
-    Action& reset_zoom_action() { return *m_reset_zoom_action; }
+    // Something the UI shows about this view may have changed, like whether it can undo or show its source.
+    virtual void did_change_state() { }
+
+    virtual void did_change_session_history(SessionHistorySnapshot const&, URL::URL const&) { }
+
+    // The application keeps browsing history: this view visited a page, or learned the title of one it visited.
+    virtual void did_visit_page(URL::URL const&, Optional<String> const&, HistoryVisitTransition) { }
+    virtual void did_change_visited_page_title(URL::URL const&, String const&) { }
+
+    bool can_navigate_back() const { return m_can_navigate_back; }
+    bool can_navigate_forward() const { return m_can_navigate_forward; }
+
+    // What the application offers in a context menu, it asks the view to do.
+    void inspect_context_menu_element();
+    void replace_context_menu_misspelling(Utf16String const&);
+    void ignore_misspelling(Utf16String const&);
+    void learn_misspelling(Utf16String const&);
+    void do_context_menu_media_action(ContextMenuMediaAction);
+    enum class PromptForPath : u8 {
+        No,
+        Yes,
+    };
+    void download_url(URL::URL const&, PromptForPath, Optional<String> const& image_mime_type = {});
+
+    PageTranslation& page_translation() { return *m_page_translation; }
 
     WebContentPage& page() const;
 
@@ -700,12 +750,16 @@ public:
     virtual Gfx::IntPoint to_widget_position(Gfx::IntPoint content_position) const = 0;
 
 protected:
+    virtual void did_request_context_menu(ContextMenuRequest) { }
+    virtual void did_make_link_to_highlight(Optional<URL::URL>) { }
+
     void will_apply_history_traversal_step(Web::HTML::CrossProcessId operation_id);
     void did_apply_top_level_history_traversal_step(Web::HTML::CrossProcessId operation_id);
     void did_finish_history_traversal(Web::HTML::CrossProcessId operation_id);
     void did_commit_history_step();
 
     virtual Web::Clipboard::SystemClipboardItem clipboard_item() const;
+    virtual void read_clipboard_item(Function<void(Web::Clipboard::SystemClipboardItem)>) const;
     virtual void insert_clipboard_item(Web::Clipboard::SystemClipboardItem);
 
     virtual void did_accept_presented_backing_store(i32, Gfx::IntRect) { }
@@ -749,6 +803,8 @@ protected:
     void complete_webdriver_history_traversal(Web::HTML::CrossProcessId operation_id);
     void update_navigation_action_state();
     void did_not_apply_reload();
+    void did_not_activate_history_traversal_load();
+    void notify_load_finish();
     void notify_session_history_changed();
     enum class SessionHistoryDumpMode {
         IfDebuggingEnabled,
@@ -771,11 +827,6 @@ protected:
     bool handle_picture_in_picture_controls_mouse_event(Web::MouseEvent const&);
     void set_picture_in_picture_controls_shown(bool);
     bool picture_in_picture_controls_are_shown() const { return m_picture_in_picture_controls_shown || m_picture_in_picture_player_controls_shown; }
-    struct DisplayedFrame {
-        Gfx::IntSize size;
-        double device_pixel_ratio { 1.0 };
-    };
-    Optional<DisplayedFrame> displayed_frame() const;
     struct UIOverlayPosition {
         Gfx::IntPoint position;
         Gfx::IntSize viewport_size;
@@ -801,7 +852,7 @@ protected:
     WebContentPage& focused_navigable_host() const;
     void reset_page_media_state();
     void update_audibility();
-    void page_left(WebContentPage const&);
+    void update_microphone_capture();
 
     // A navigation to make again on reload: one the user stopped before its document was activated, or one a crash cut
     // short. It's made again from the source it was first made from, when it has one (a javascript: URL has none).
@@ -828,38 +879,19 @@ protected:
     virtual void geolocation_settings_changed() override;
     virtual void global_privacy_control_changed() override;
 
-    virtual void bookmarks_changed() override;
-    void update_bookmark_action();
-
-    void initialize_context_menus();
-    void update_report_website_issue_action();
-    void handle_external_url(URL::URL, URL::Origin, bool has_transient_activation, Function<void()> on_handler_unavailable = {});
-    void handle_external_url_from_user_input(URL::URL const&, Function<void()> on_handler_unavailable = {});
+    void send_context_menu_request(ContextMenuRequest, Gfx::IntPoint content_position);
+    void handle_external_url(URL::URL, URL::Origin, bool has_transient_activation);
+    void handle_external_url_from_user_input(URL::URL const&);
     void complete_external_url_request();
     void process_next_external_url_request();
-    void update_look_up_selected_text_action(Optional<DictionaryLookup> const& lookup, Gfx::IntPoint content_position);
     void request_text_fragment_url(Optional<u64> generation_id);
-    void set_context_menu_url_actions_enabled(bool);
     void request_context_menu_dictionary_lookup(Function<void(Optional<DictionaryLookup> const&)> on_complete);
     NonnullRefPtr<Core::Promise<bool>> select_word_for_dictionary_lookup(Gfx::IntPoint widget_position);
     void reject_pending_selection_requests();
-    enum class PromptForPath : u8 {
-        No,
-        Yes,
-    };
-    void download_context_menu_url(PromptForPath);
-
-    struct SharedBitmap {
-        i32 id { -1 };
-        Web::DevicePixelSize last_painted_size;
-        double last_painted_device_pixel_ratio { 1.0 };
-        OwnPtr<Gfx::SharedImageBuffer> shared_image_buffer;
-    };
 
     String m_window_handle;
-    SharedBitmap m_front_bitmap;
-    Vector<SharedBitmap> m_other_bitmaps;
-    bool m_has_usable_bitmap { false };
+    NonnullOwnPtr<PageBackingStores> m_backing_stores { make<PageBackingStores>() };
+    bool m_pinch_gesture_was_canceled { false };
     Gfx::IntRect m_last_presented_damage_rect;
     bool m_presents_from_cpu_memory { false };
 
@@ -879,7 +911,6 @@ protected:
     URL::URL m_displayed_url { URL::about_blank() };
     bool m_text_fragment_indication_is_visible { false };
     Utf16String m_title;
-    Optional<String> m_favicon_hash;
 
     struct CrashState {
         URL::URL failed_url;
@@ -896,35 +927,17 @@ protected:
     bool m_frame_rate_capped { false };
     bool m_scales_frames_to_fit { false };
 
-    RefPtr<Menu> m_page_context_menu;
-    RefPtr<Menu> m_link_context_menu;
-    RefPtr<Menu> m_selected_text_link_context_menu;
-    RefPtr<Menu> m_image_context_menu;
-    RefPtr<Menu> m_media_context_menu;
     u64 m_context_menu_request_id { 0 };
+    RefPtr<WebContentPage> m_media_context_menu_page;
 
     SpellChecker::DocumentTag spell_document_tag();
     Optional<SpellChecker::DocumentTag> m_spell_document_tag;
 
-    RefPtr<Menu> m_bookmarks_bar_context_menu;
-    RefPtr<Menu> m_bookmark_context_menu;
-    RefPtr<Menu> m_bookmark_folder_context_menu;
+    bool m_can_navigate_back { false };
+    bool m_can_navigate_forward { false };
 
-    RefPtr<Action> m_navigate_back_action;
-    RefPtr<Action> m_navigate_forward_action;
+    OwnPtr<PageTranslation> m_page_translation;
 
-    RefPtr<Action> m_toggle_bookmark_action;
-
-    RefPtr<Action> m_reset_zoom_action;
-
-    RefPtr<Action> m_look_up_selected_text_action;
-    Optional<DictionaryLookup> m_look_up;
-    Gfx::IntPoint m_look_up_position;
-
-    RefPtr<Action> m_search_selected_text_action;
-    RefPtr<Action> m_copy_link_to_highlight_action;
-    Optional<String> m_search_text;
-    Optional<URL::URL> m_text_fragment_url;
     u64 m_next_text_fragment_url_request_id { 1 };
     Optional<u64> m_pending_text_fragment_url_request_id;
 
@@ -934,41 +947,10 @@ protected:
     HashMap<u64, NonnullRefPtr<Core::Promise<bool>>> m_pending_select_word_for_dictionary_lookup_requests;
     HashMap<u64, NonnullRefPtr<Core::Promise<ByteString>>> m_pending_cut_selected_text_requests;
 
-    RefPtr<Action> m_take_screenshot_action;
-
-    void prepare_inspect_element_action(Gfx::IntPoint content_position);
-    RefPtr<Action> m_inspect_element_action;
+    void prepare_inspect_element(Gfx::IntPoint content_position);
     Optional<u64> m_inspect_element_hit_test_request_id;
     Optional<Web::UniqueNodeID> m_inspect_element_node_id;
     bool m_inspect_element_activated_before_hit_test { false };
-
-    RefPtr<Action> m_open_in_new_tab_action;
-    RefPtr<Action> m_open_in_new_window_action;
-    RefPtr<Action> m_open_in_new_private_window_action;
-    RefPtr<Action> m_download_linked_file_action;
-    RefPtr<Action> m_download_linked_file_as_action;
-    RefPtr<Action> m_copy_url_action;
-    URL::URL m_context_menu_url;
-    Optional<Web::HTML::PreparedNavigationDescriptor> m_context_menu_navigation;
-
-    RefPtr<Action> m_open_image_action;
-    RefPtr<Action> m_save_image_action;
-    RefPtr<Action> m_copy_image_action;
-    Optional<Gfx::ShareableBitmap> m_image_context_menu_bitmap;
-
-    RefPtr<Action> m_open_audio_action;
-    RefPtr<Action> m_open_video_action;
-    RefPtr<Action> m_media_play_action;
-    RefPtr<Action> m_media_pause_action;
-    RefPtr<Action> m_media_mute_action;
-    RefPtr<Action> m_media_unmute_action;
-    RefPtr<Action> m_media_show_controls_action;
-    RefPtr<Action> m_media_hide_controls_action;
-    RefPtr<Action> m_media_loop_action;
-    RefPtr<Action> m_media_enter_fullscreen_action;
-    RefPtr<Action> m_media_exit_fullscreen_action;
-    RefPtr<Action> m_media_enter_picture_in_picture_action;
-    RefPtr<Action> m_media_exit_picture_in_picture_action;
 
     struct PendingInputEvent {
         Web::InputEvent event;
@@ -987,14 +969,26 @@ protected:
         // that dies forwards none of the events still marked this way.
         bool routed_through_compositor { false };
 
+        // Set while an answer of the compositor is still to come for a trip through it that WebContent already finished.
+        bool expects_stale_compositor_answer { false };
+
         // A key event stays routed through the compositor until it forwards the event or hands it back. Later input
         // waits until then.
         bool awaits_compositor_dispatch() const { return routed_through_compositor && event.has<Web::KeyEvent>(); }
 
         // When the view delivered an event that gives user activation, until something consumes that activation.
         Optional<MonotonicTime> user_activation_time {};
+
+        // When the view delivered a paste shortcut, until the page reads the clipboard for it.
+        Optional<MonotonicTime> paste_shortcut_time {};
     };
     Vector<PendingInputEvent> m_pending_input_events;
+
+    struct ClipboardWrite {
+        URL::Origin writer;
+        Web::Clipboard::SystemClipboardItem item;
+    };
+    Optional<ClipboardWrite> m_last_clipboard_write_by_a_page;
     void send_queued_input_events();
     void send_input_event(size_t index);
     bool may_scroll_for_key_event_in_compositor(size_t index) const;
@@ -1021,7 +1015,6 @@ protected:
     struct PendingExternalURLRequest {
         URL::URL url;
         URL::Origin initiator_origin;
-        Function<void()> on_handler_unavailable;
     };
     Queue<PendingExternalURLRequest> m_pending_external_url_requests;
     ExternalURLRequestPolicy m_external_url_request_policy;
@@ -1029,9 +1022,6 @@ protected:
 
     RefPtr<Core::Timer> m_backing_store_shrink_timer;
 
-    OwnPtr<Gfx::SharedImageBuffer> m_backup_shared_image_buffer;
-    Web::DevicePixelSize m_backup_bitmap_size;
-    double m_backup_bitmap_device_pixel_ratio { 1.0 };
     Gfx::Color m_page_background_color { 255, 255, 255 };
     Gfx::Color m_system_canvas_background_color { 255, 255, 255 };
     Web::CSS::PreferredColorScheme m_preferred_color_scheme { Web::CSS::PreferredColorScheme::Auto };
@@ -1059,6 +1049,12 @@ protected:
     };
     Optional<WebDriverNavigationObservation> m_webdriver_navigation_observation;
     Optional<NavigationToRetry> m_last_stopped_navigation;
+
+    // A view that shows the source of a page offers no source of its own to view: Each view of the source of a source
+    // page would wrap the one before in another layer of markup, without end. The source is the document of one
+    // document state, which a fragment navigation keeps and history traversal brings back.
+    bool m_page_source_pending { false };
+    Optional<Web::HTML::CrossProcessId> m_page_source_document_state;
 
     size_t m_crash_count = 0;
     RefPtr<Core::Timer> m_repeated_crash_timer;
@@ -1118,16 +1114,20 @@ protected:
     // https://w3c.github.io/webdriver/#dfn-current-parent-browsing-context
     Optional<Web::HTML::CrossProcessId> m_webdriver_current_parent_navigable_id;
 
-    Audio::Audibility m_audibility { Audio::Audibility::Inaudible };
-    u64 m_audibility_change_count { 0 };
-    AudibilityHold m_audibility_hold;
-    RefPtr<Core::Timer> m_audibility_hold_timer;
+    TabIndicators m_tab_indicators;
+    u64 m_playing_audio_indicator_change_count { 0 };
     Web::ScreenWakeLockState m_screen_wake_lock_state { Web::ScreenWakeLockState::Released };
 
     Web::HTML::MuteState m_mute_state { Web::HTML::MuteState::Unmuted };
 
     CanonicalTraversable* m_top_level_traversable { nullptr };
-    Optional<SessionTabId> m_session_tab_id;
+    bool m_reports_session_history { false };
+    struct ReportedSessionHistory {
+        SessionHistorySnapshot history;
+        URL::URL url;
+    };
+    Optional<ReportedSessionHistory> m_reported_session_history_for_testing;
+    bool m_records_reported_session_history_for_testing { false };
     Optional<SessionHistorySnapshot> m_captured_session_history_snapshot_for_testing;
     RefPtr<Core::Promise<Empty>> m_pending_test_state_reset;
     RefPtr<Core::Promise<Empty>> m_pending_test_state_reset_queue_promise;
@@ -1150,18 +1150,10 @@ protected:
     RefPtr<WebContentPage> m_date_picker_page;
     RefPtr<WebContentPage> m_file_picker_page;
     RefPtr<WebContentPage> m_select_dropdown_page;
-    RefPtr<WebContentPage> m_media_context_menu_page;
 
     static constexpr size_t MAX_SPELLING_GUESSES = 5;
-    void update_spelling_menu_actions(Optional<Utf16String> misspelled_word);
-    void ignore_context_menu_misspelling();
-    void learn_context_menu_misspelling();
-    String describe_spelling_menu_for_testing() const;
+    void update_context_menu_misspelling(Optional<Utf16String> misspelled_word, Function<void()> on_complete);
 
-    Vector<NonnullRefPtr<Action>> m_spelling_guess_actions;
-    RefPtr<Action> m_no_spelling_guesses_action;
-    RefPtr<Action> m_ignore_spelling_action;
-    RefPtr<Action> m_learn_spelling_action;
     Optional<Utf16String> m_context_menu_misspelled_word;
     Vector<Utf16String> m_spelling_guesses;
     RefPtr<WebContentPage> m_spelling_context_menu_page;
@@ -1169,12 +1161,12 @@ protected:
     HashMap<GeolocationRequestKey, Core::GeolocationProvider::RequestId> m_geolocation_position_request_ids;
     HashMap<GeolocationRequestKey, Core::GeolocationProvider::WatchId> m_geolocation_watch_ids;
     HashMap<GeolocationRequestKey, Web::HTML::CrossProcessId> m_geolocation_request_documents;
-    bool m_location_in_use { false };
     Vector<Web::Permissions::PermissionName> m_permissions_requested_by_page;
 
     struct PendingPermissionPrompt {
         PermissionPromptRequest request;
         Vector<PermissionPromptCallback> waiters;
+        bool shown { false };
     };
     Vector<PendingPermissionPrompt> m_pending_permission_prompts;
 
@@ -1187,6 +1179,12 @@ protected:
     Web::Permissions::PromptOutcome m_held_permission_prompt_outcome_for_testing { Web::Permissions::PromptOutcome::Cancelled };
     Optional<u32> m_held_permission_prompt_release_waiters_for_testing;
     void release_held_permission_prompt_if_ready_for_testing();
+
+    MicrophoneAuthorizer& microphone_authorizer() const;
+    bool has_shown_microphone_denied_notice(URL::Origin const& top_level_origin) const;
+    OwnPtr<MicrophoneAuthorizerForTesting> m_microphone_authorizer_for_testing;
+    Vector<URL::Origin> m_sites_shown_microphone_denied_notice;
+    u64 m_microphone_denied_notices_shown { 0 };
 
     Core::AnonymousBuffer m_document_cookie_version_buffer;
     HashMap<String, Core::SharedVersionIndex> m_document_cookie_version_indices;
@@ -1223,6 +1221,7 @@ protected:
     //        is required to be globally unique for Firefox DevTools.
     u64 m_view_id { 0 };
     Optional<u64> m_owner_view_id;
+    WeakPtr<CanonicalDocument const> m_owner_document;
 
     HashMap<u64, NavigationListener> m_navigation_listeners;
     u64 m_next_navigation_listener_id { 1 };
@@ -1246,6 +1245,8 @@ protected:
     DevTools::DevToolsDelegate::OnNodePickerEvent m_on_node_picker_event;
 
     bool m_devtools_connected { false };
+    bool m_devtools_takes_console_messages { false };
+    bool m_devtools_takes_console_errors { false };
 };
 
 }

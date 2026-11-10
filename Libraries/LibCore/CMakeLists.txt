@@ -8,7 +8,6 @@ set(SOURCES
     DirectoryEntry.cpp
     ElapsedTimer.cpp
     Environment.cpp
-    Futex.cpp
     EventLoop.cpp
     EventLoopImplementation.cpp
     EventReceiver.cpp
@@ -114,6 +113,21 @@ endif()
 
 ladybird_lib(LibCore core EXPLICIT_SYMBOL_EXPORT)
 target_link_libraries(LibCore PRIVATE Threads::Threads LibUnicode LibTextCodec mimalloc)
+
+# Development builds are in no stage of development, and leave it out of their product name.
+set(browser_is_final_release 0)
+if (NOT LADYBIRD_VERSION STREQUAL "")
+    set(browser_release_stage "${LADYBIRD_RELEASE_STAGE}")
+    if (browser_release_stage STREQUAL "")
+        set(browser_is_final_release 1)
+    endif()
+endif()
+string(JOIN " " browser_product_name "Ladybird" ${browser_release_stage})
+configure_file(BrowserVersion.h.in BrowserVersion.h @ONLY)
+if (ENABLE_INSTALL_HEADERS)
+    install(FILES "${CMAKE_CURRENT_BINARY_DIR}/BrowserVersion.h" COMPONENT Lagom_Development
+        DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/LibCore")
+endif()
 
 if (${CMAKE_SYSTEM_NAME} MATCHES "NetBSD")
     # NetBSD has its shm_open and shm_unlink functions in librt so we need to link that

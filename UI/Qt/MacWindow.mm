@@ -12,9 +12,11 @@
 #include <LibGfx/Point.h>
 #include <LibGfx/Size.h>
 #include <QAbstractNativeEventFilter>
+#include <QColor>
 #include <QCoreApplication>
 #include <QDrag>
 #include <QGuiApplication>
+#include <QMargins>
 #include <QMouseEvent>
 #include <QPointer>
 #include <QWheelEvent>
@@ -23,6 +25,7 @@
 #include <UI/Qt/WebContentView.h>
 
 #import <Cocoa/Cocoa.h>
+#import <QuartzCore/QuartzCore.h>
 #import <UI/Qt/DictionaryLookup.h>
 #import <dlfcn.h>
 #import <objc/runtime.h>
@@ -133,6 +136,18 @@
 - (void)windowDidResize:(NSNotification*)notification
 {
     [self applyWindowControlOffsets];
+}
+
+@end
+
+@interface LadybirdShadowView : NSView
+@end
+
+@implementation LadybirdShadowView
+
+- (NSView*)hitTest:(NSPoint)point
+{
+    return nil;
 }
 
 @end
@@ -494,6 +509,8 @@ void keep_appkit_window_visible_while_inactive(QWidget& widget)
 
 void disable_appkit_window_animations(QWidget& widget)
 {
+    if (QGuiApplication::platformName() != "cocoa")
+        return;
     auto* view = reinterpret_cast<NSView*>(widget.winId());
     if (!view || !view.window)
         return;
@@ -633,17 +650,10 @@ void round_appkit_view_corners(QWidget& widget, qreal radius, QColor const& bord
     CGColorRelease(color);
 }
 
-void stack_appkit_view_below(QWidget& widget, QWidget& sibling)
-{
-    auto* view = reinterpret_cast<NSView*>(widget.winId());
-    auto* sibling_view = reinterpret_cast<NSView*>(sibling.winId());
-    if (!view || !sibling_view || !sibling_view.superview)
-        return;
-    [sibling_view.superview addSubview:view positioned:NSWindowBelow relativeTo:sibling_view];
-}
-
 void round_appkit_view_bottom_corners(QWidget& widget, qreal radius)
 {
+    if (QGuiApplication::platformName() != "cocoa")
+        return;
     auto* view = reinterpret_cast<NSView*>(widget.winId());
     if (!view)
         return;
@@ -656,8 +666,131 @@ void round_appkit_view_bottom_corners(QWidget& widget, qreal radius)
     layer.masksToBounds = YES;
 }
 
+void cast_appkit_view_shadow(QWidget& widget, qreal corner_radius, qreal blur_radius, qreal y_offset, QColor const& color)
+{
+    if (QGuiApplication::platformName() != "cocoa")
+        return;
+    auto* view = reinterpret_cast<NSView*>(widget.winId());
+    if (!view)
+        return;
+    view.wantsLayer = YES;
+    auto* layer = view.layer;
+    layer.masksToBounds = NO;
+    layer.shadowOpacity = 1;
+    layer.shadowRadius = blur_radius;
+    // NB: The layer of a view is flipped with it, and Qt's views are, so a positive offset points down.
+    layer.shadowOffset = CGSizeMake(0, y_offset);
+    auto* shadow_color = CGColorCreateSRGB(color.redF(), color.greenF(), color.blueF(), color.alphaF());
+    layer.shadowColor = shadow_color;
+    CGColorRelease(shadow_color);
+    auto* shadow_path = CGPathCreateWithRoundedRect(view.bounds, corner_radius, corner_radius, nullptr);
+    layer.shadowPath = shadow_path;
+    CGPathRelease(shadow_path);
+}
+
+AppKitViewShadow::AppKitViewShadow()
+{
+    auto* view = [[LadybirdShadowView alloc] initWithFrame:NSZeroRect];
+    view.wantsLayer = YES;
+    view.layer.masksToBounds = YES;
+    view.hidden = YES;
+    auto* caster = [[CALayer alloc] init];
+    [view.layer addSublayer:caster];
+    auto* focus_edge = [[CALayer alloc] init];
+    auto* focus_ring = [[CALayer alloc] init];
+    for (CALayer* layer in @[ focus_edge, focus_ring ]) {
+        layer.cornerCurve = kCACornerCurveContinuous;
+        layer.hidden = YES;
+        [view.layer addSublayer:layer];
+    }
+    m_view = view;
+    m_caster = caster;
+    m_focus_edge = focus_edge;
+    m_focus_ring = focus_ring;
+}
+
+AppKitViewShadow::~AppKitViewShadow()
+{
+    auto* view = static_cast<NSView*>(m_view);
+    [view removeFromSuperview];
+    [view release];
+    [static_cast<CALayer*>(m_caster) release];
+    [static_cast<CALayer*>(m_focus_edge) release];
+    [static_cast<CALayer*>(m_focus_ring) release];
+}
+
+void AppKitViewShadow::follow(QWidget& widget, QMargins const& room, qreal corner_radius, qreal blur_radius, qreal y_offset, QColor const& shadow_color, QColor const& fill_color, Optional<AppKitViewFocusRing> const& focus_ring)
+{
+    if (QGuiApplication::platformName() != "cocoa")
+        return;
+    auto* surface = reinterpret_cast<NSView*>(widget.winId());
+    if (!surface || !surface.superview)
+        return;
+    auto* view = static_cast<NSView*>(m_view);
+    auto* caster = static_cast<CALayer*>(m_caster);
+
+    [CATransaction begin];
+    [CATransaction setDisableActions:YES];
+
+    auto surface_frame = surface.frame;
+    auto room_at_origin = surface.superview.isFlipped ? room.top() : room.bottom();
+    view.frame = NSMakeRect(surface_frame.origin.x - room.left(), surface_frame.origin.y - room_at_origin,
+        surface_frame.size.width + room.left() + room.right(), surface_frame.size.height + room.top() + room.bottom());
+    [surface.superview addSubview:view positioned:NSWindowBelow relativeTo:surface];
+    view.hidden = NO;
+
+    // NB: This view is not flipped, unlike Qt's, so the bottom of the room comes first and a shadow falls to lower y.
+    auto caster_frame = CGRectMake(room.left(), room.bottom(), surface_frame.size.width, surface_frame.size.height);
+    caster.frame = caster_frame;
+    caster.cornerRadius = corner_radius;
+    auto* fill = CGColorCreateSRGB(fill_color.redF(), fill_color.greenF(), fill_color.blueF(), fill_color.alphaF());
+    caster.backgroundColor = fill;
+    CGColorRelease(fill);
+    auto* shadow = CGColorCreateSRGB(shadow_color.redF(), shadow_color.greenF(), shadow_color.blueF(), shadow_color.alphaF());
+    caster.shadowColor = shadow;
+    CGColorRelease(shadow);
+    caster.shadowOpacity = 1;
+    caster.shadowRadius = blur_radius;
+    caster.shadowOffset = CGSizeMake(0, -y_offset);
+    auto* shadow_path = CGPathCreateWithRoundedRect(CGRectMake(0, 0, caster_frame.size.width, caster_frame.size.height), corner_radius, corner_radius, nullptr);
+    caster.shadowPath = shadow_path;
+    CGPathRelease(shadow_path);
+
+    // NB: Both parts of the ring are borders, around the surface that covers what is inside them.
+    auto* focus_edge = static_cast<CALayer*>(m_focus_edge);
+    auto* focus_ring_layer = static_cast<CALayer*>(m_focus_ring);
+    focus_edge.hidden = !focus_ring.has_value();
+    focus_ring_layer.hidden = !focus_ring.has_value();
+    if (focus_ring.has_value()) {
+        auto set_ring_part = [&](CALayer* layer, qreal outset, qreal width, QColor const& color) {
+            layer.frame = CGRectInset(caster_frame, -outset, -outset);
+            layer.cornerRadius = corner_radius + outset;
+            layer.borderWidth = width;
+            auto* border_color = CGColorCreateSRGB(color.redF(), color.greenF(), color.blueF(), color.alphaF());
+            layer.borderColor = border_color;
+            CGColorRelease(border_color);
+        };
+        set_ring_part(focus_edge, 1, 1, focus_ring->edge_color);
+        set_ring_part(focus_ring_layer, 1 + focus_ring->ring_width, focus_ring->ring_width, focus_ring->ring_color);
+    }
+
+    [CATransaction commit];
+}
+
+void AppKitViewShadow::hide()
+{
+    static_cast<NSView*>(m_view).hidden = YES;
+}
+
+void AppKitViewShadow::set_opacity(qreal opacity)
+{
+    static_cast<NSView*>(m_view).alphaValue = opacity;
+}
+
 void set_appkit_view_opacity(QWidget& widget, qreal opacity)
 {
+    if (QGuiApplication::platformName() != "cocoa")
+        return;
     auto* view = reinterpret_cast<NSView*>(widget.winId());
     if (!view)
         return;

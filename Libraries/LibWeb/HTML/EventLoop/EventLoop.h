@@ -12,6 +12,7 @@
 #include <AK/Noncopyable.h>
 #include <AK/OwnPtr.h>
 #include <AK/Queue.h>
+#include <AK/Time.h>
 #include <LibCore/Forward.h>
 #include <LibGC/Ptr.h>
 #include <LibGC/Weak.h>
@@ -28,6 +29,13 @@ enum class FfiFlightBlocker : uint8_t;
 }
 
 namespace Web::HTML {
+
+// Where the event loop follows the pointer at rest: between two tasks, or as a rendering update begins, which brings
+// the style and layout up to date itself.
+enum class HoverUpdatePoint : u8 {
+    BetweenTasks,
+    RenderingUpdateBegins,
+};
 
 // What the render clock's lanes do with a document's running animations.
 enum class ClockAnimations : u8 {
@@ -60,7 +68,7 @@ class WEB_API EventLoop : public JS::Cell {
     };
 
 public:
-    // Whether the style transaction of a document in a rendering update may fly beside the event loop, or what keeps it
+    // Whether the style update of a document in a rendering update may fly beside the event loop, or what keeps it
     // in step.
     Layout::RustFFI::FfiFlightBlocker style_flight_blocker(DOM::Document&) const;
 
@@ -120,6 +128,7 @@ public:
     };
     bool rendering_opportunity(HighResolutionTime::DOMHighResTimeStamp frame_time, RenderingOpportunitySource);
     bool rendering_task_queued_or_running() const { return m_rendering_task_queued || m_running_rendering_task; }
+    double last_render_opportunity_time() const { return m_last_render_opportunity_time; }
     void queue_task_to_process_input_events();
     bool running_synchronous_rendering_update() const { return m_running_synchronous_rendering_update; }
 
@@ -133,8 +142,23 @@ public:
     u64 task_generation() const { return m_task_generation; }
 
     void schedule();
+    void schedule_for_queued_task();
+
+    // A worker event loop is destroyed once its worker's closing flag is set and the script on it has finished, which
+    // is what resumes the run a worker steps.
+    void set_on_destroyed(Function<void()> on_destroyed) { m_on_destroyed = move(on_destroyed); }
+    void destroy_once_script_has_finished();
 
     void perform_a_microtask_checkpoint();
+
+    // NB: Style and layout run no script. A temporary execution context they use ends with an empty stack, which would
+    //     otherwise perform a checkpoint in the middle of them, for microtasks queued outside any script.
+    void defer_microtask_checkpoints() { ++m_microtask_checkpoint_deferrals; }
+    void resume_microtask_checkpoints()
+    {
+        VERIFY(m_microtask_checkpoint_deferrals > 0);
+        --m_microtask_checkpoint_deferrals;
+    }
 
     void register_document(Badge<DOM::Document>, DOM::Document&);
     void unregister_document(Badge<DOM::Document>, DOM::Document&);
@@ -157,6 +181,11 @@ public:
 
     double compute_deadline() const;
 
+    void did_reject_promise_without_handler() { m_has_rejected_promises_to_notify_about = true; }
+
+    void did_run_idle_callback() { m_task_generation_of_last_idle_callback = m_task_generation; }
+    void did_request_idle_callback();
+
     enum class UpdateTheRendering {
         No,
         Yes,
@@ -168,8 +197,8 @@ public:
 
     bool running_rendering_task() const { return m_running_rendering_task; }
 
-    // A rendering update's style transaction and its frame fly beside the event loop until the event loop takes them in
-    // between two tasks. A rendering update whose style transaction flies runs its steps from its style and layout on
+    // A rendering update's style update and its frame fly beside the event loop until the event loop takes them in
+    // between two tasks. A rendering update whose style update flies runs its steps from its style and layout on
     // once the transaction is taken in.
     void did_commit_frame(LocalNavigable&, CommittedFrameRecords);
     void did_take_frame_in(LocalNavigable&);
@@ -180,15 +209,20 @@ public:
     void ensure_frame_completion_registered();
     // Whether a frame flies beside the event loop, which has not taken it in yet.
     bool has_frame_in_flight() const;
+    // Notes that the hover of `navigable` may be stale, which the event loop updates between two tasks, or as the next
+    // rendering update begins.
+    void note_hover_may_be_stale(LocalNavigable&);
     // Whether a rendering update has let its frame fly and has not run its steps from its style and layout on yet.
     bool has_rendering_update_in_flight() const { return m_rendering_update_in_flight; }
     // Whether the layout of the rendering update in flight runs, or ran, beside the event loop.
     bool lays_out_rendering_update_in_flight() const;
-    // Runs the steps of the rendering update whose style transaction flies, which take the transaction in.
+    // Runs the steps of the rendering update whose style update flies, which take the transaction in.
     void finish_rendering_update_in_flight();
     // The serial number of the first rendering update that may gather a resize observation of `document` made now. A
     // task beside a rendering update whose style and layout of the document have yet to run comes after the whole of it.
     u64 first_rendering_update_to_gather_resize_observations_of(DOM::Document const&) const;
+    // Whether the rendering task lets the tasks behind it go first, for a document to finish loading.
+    bool rendering_task_yields_to_document_loading() const;
     // A rendering task that would find a rendering update not yet finished keeps its place in the queue until the update
     // has finished, rather than wait for it. One that finds a frame still in flight runs beside it.
     bool holds_rendering_opportunity() const;
@@ -211,8 +245,10 @@ private:
 
     virtual void visit_edges(Visitor&) override;
 
+    [[nodiscard]] bool run_one_turn_of_the_processing_model();
+
     void process_input_events() const;
-    Vector<GC::Root<DOM::Document>> take_clock_lanes_and_input_events_in(u64 update_serial);
+    Vector<GC::Root<DOM::Document>> take_clock_lanes_and_input_events_in(Optional<u64> update_serial);
     void update_the_rendering();
     // How the steps after style and layout take the layout of the docs: up to date, or as the update's layout that flew
     // left it, whatever was written since.
@@ -231,6 +267,8 @@ private:
     void note_script_ran_beside_rendering_update_in_flight();
     // Goes on with the rendering update in flight where it has landed, and presents the recordings that have landed.
     void take_finished_frames_in();
+    void update_hovers_that_may_be_stale(HoverUpdatePoint);
+    bool queue_hover_that_may_be_stale(LocalNavigable&);
     bool let_layout_of_rendering_update_fly();
     void note_clock_lanes(ClockAnimations);
 
@@ -253,9 +291,15 @@ private:
 
     GC::Ptr<Platform::Timer> m_system_event_loop_timer;
     GC::Ptr<Platform::Timer> m_idle_period_timer;
+    u64 m_task_generation_of_last_idle_callback { 0 };
+    bool m_idle_callback_requested_outside_idle_period { false };
+    bool m_may_have_idle_callbacks { false };
+    bool m_turn_requested_without_a_task { false };
 
     // https://html.spec.whatwg.org/multipage/webappapis.html#performing-a-microtask-checkpoint
     bool m_performing_a_microtask_checkpoint { false };
+    bool m_has_rejected_promises_to_notify_about { false };
+    u32 m_microtask_checkpoint_deferrals { 0 };
 
     mutable Vector<GC::Weak<DOM::Document>> m_documents;
     mutable bool m_documents_sort_dirty { false };
@@ -278,6 +322,7 @@ private:
     bool m_rendering_task_queued { false };
     bool m_input_events_task_queued { false };
     bool m_rendering_update_requested { false };
+    MonotonicTime m_rendering_task_queued_time { MonotonicTime::now_coarse() };
 
     RenderingSchedulerCounters m_rendering_scheduler_counters;
     RenderingSchedulerCounters m_rendering_scheduler_counters_at_last_update;
@@ -287,6 +332,8 @@ private:
 
     // The navigables whose committed frame flies beside the event loop, which has not taken it in yet.
     Vector<GC::Ref<LocalNavigable>> m_navigables_with_frames_in_flight;
+    // The navigables whose hover may be stale: what is under their pointer at rest may have moved, or changed its cursor.
+    Vector<GC::Root<LocalNavigable>> m_navigables_with_hover_that_may_be_stale;
     // The navigables whose active document a rendering update left a plan for the lane of its frame, which the event
     // loop tells whether it runs a task.
     Vector<GC::Ref<LocalNavigable>> m_navigables_with_clock_lanes;
@@ -300,9 +347,20 @@ private:
     u64 m_rendering_update_serial { 0 };
     // How deep the event loop is spun inside a task.
     size_t m_spin_depth { 0 };
+
+    bool destroy_if_requested();
+
+    bool m_destruction_requested { false };
+    Function<void()> m_on_destroyed;
 };
 
+// The event loop of the window agent, from that agent's thread only. Code that a worker can reach has to use
+// current_event_loop().
 WEB_API EventLoop& main_thread_event_loop();
+
+// The event loop of the agent on the current thread.
+WEB_API EventLoop& current_event_loop();
+
 WEB_API void run_when_event_loop_reaches_step_1(GC::Ref<GC::Function<void()>> steps);
 WEB_API TaskID queue_a_task(HTML::Task::Source, GC::Ptr<EventLoop>, GC::Ptr<DOM::Document>, GC::Ref<GC::Function<void()>> steps, Task::Priority = Task::Priority::Normal, GC::Ptr<GC::Function<void()>> discard_steps = {});
 WEB_API TaskID queue_global_task(HTML::Task::Source, JS::Object&, GC::Ref<GC::Function<void()>> steps, Task::Priority = Task::Priority::Normal, GC::Ptr<GC::Function<void()>> discard_steps = {});

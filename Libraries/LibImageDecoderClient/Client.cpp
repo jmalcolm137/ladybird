@@ -19,11 +19,13 @@ void Client::die()
     verify_event_loop();
     auto pending_promises = move(m_token_promises);
 
-    for (auto& promise : pending_promises)
-        promise.value->reject(Error::from_string_literal("ImageDecoder disconnected"));
-
+    // NB: A rejection may start another decode, so whoever holds this client must have let go of it by then. That may also
+    //     be the last reference to this client, so nothing here touches it after this.
     if (auto on_death = move(this->on_death))
         on_death();
+
+    for (auto& promise : pending_promises)
+        promise.value->reject(Error::from_string_literal("ImageDecoder disconnected"));
 }
 
 NonnullRefPtr<Core::Promise<DecodedImage>> Client::decode_image(ReadonlyBytes encoded_data, Function<ErrorOr<void>(DecodedImage&)> on_resolved, Function<void(Error&)> on_rejected, Optional<Gfx::IntSize> ideal_size, Optional<ByteString> mime_type)
@@ -86,18 +88,30 @@ void Client::did_decode_image(i64 request_id, bool is_animated, u32 loop_count, 
 
     Optional<NonnullRefPtr<Core::Promise<DecodedImage>>> maybe_promise = m_token_promises.take(request_id);
 
+    // NB: A decode that is turned down here leaves nobody to stop the animation it opened, so that is done right away.
+    auto stop_animation = [&] {
+        if (session_id != 0)
+            async_stop_animation_decode(session_id);
+    };
+
     if (!maybe_promise.has_value()) {
         dbgln("ImageDecoderClient: No pending image with request token {}", request_id);
+        stop_animation();
         return;
     }
     auto promise = maybe_promise.release_value();
+
+    auto reject = [&](StringView message) {
+        stop_animation();
+        promise->reject(Error::from_string_view(message));
+    };
 
     // The decoder parses untrusted data, so its replies are checked rather than trusted. Every frame has a duration,
     // even in a streaming decode, which sends the durations of all frames but only the first batch of bitmaps.
     auto has_durations_for_bitmaps = session_id != 0 ? durations.size() >= bitmaps.size() : durations.size() == bitmaps.size();
     if (bitmaps.is_empty() || !has_durations_for_bitmaps) {
         dbgln("ImageDecoderClient: Malformed reply for request {}", request_id);
-        promise->reject(Error::from_string_literal("Malformed image decoder reply"));
+        reject("Malformed image decoder reply"sv);
         return;
     }
 
@@ -119,7 +133,7 @@ void Client::did_decode_image(i64 request_id, bool is_animated, u32 loop_count, 
     for (size_t i = 0; i < bitmaps.size(); ++i) {
         if (!bitmaps[i]) {
             dbgln("ImageDecoderClient: Invalid bitmap for request {} at index {}", request_id, i);
-            promise->reject(Error::from_string_literal("Invalid bitmap"));
+            reject("Invalid bitmap"sv);
             return;
         }
 
@@ -127,6 +141,8 @@ void Client::did_decode_image(i64 request_id, bool is_animated, u32 loop_count, 
         image.frames.empend(bitmaps[i].release_nonnull(), duration);
     }
 
+    if (session_id != 0)
+        m_animation_sessions.set(session_id);
     promise->resolve(move(image));
 }
 
@@ -178,6 +194,7 @@ void Client::request_animation_frames(i64 session_id, u32 start_frame_index, u32
 void Client::stop_animation_decode(i64 session_id)
 {
     verify_event_loop();
+    m_animation_sessions.remove(session_id);
     async_stop_animation_decode(session_id);
 }
 

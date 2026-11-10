@@ -14,7 +14,6 @@ use super::node_data::{
 use crate::css::computed_value_views::ComputedValuesView;
 use crate::css::css_string::CssString;
 use crate::css::style::RetainedState;
-use crate::css::style::fast_hash::FastMap as HashMap;
 use crate::css::style::tree::StyleNodeID;
 use crate::painting::paint_read::PaintRead;
 use std::sync::Arc;
@@ -111,7 +110,7 @@ type CountersSet = Arc<Vec<Counter>>;
 /// Every non-empty counters set, keyed by its owner. An empty set is simply absent.
 #[derive(Clone, Default)]
 pub(crate) struct CountersSets {
-    sets: HashMap<CounterOwner, CountersSet>,
+    sets: crate::cow_map::CowMap<CounterOwner, CountersSet>,
     list_item_counter_name: Option<CssString>,
 }
 
@@ -200,9 +199,7 @@ pub(crate) fn style_of<'a>(
             if row.is_invalid() {
                 return None;
             }
-            arena
-                .style_payloads(row)
-                .map(|payloads| ComputedValuesView::new(&payloads.groups))
+            arena.style_view(row)
         }
         generated_for => engine.published_style_view(owner.element, Some(pseudo_kind_of(generated_for))),
     }
@@ -213,10 +210,9 @@ fn parent_element(engine: &RetainedState, owner: CounterOwner) -> Option<StyleNo
     if owner.generated_for != 0 {
         return Some(owner.element);
     }
-    let tree = engine.tree();
-    let parent = tree.parent(owner.element)?;
+    let parent = engine.dom_parent(owner.element)?;
     // A shadow root and the document stand in the style tree, but neither is an element.
-    if tree.host_of(parent).is_some() || tree.is_relation_only(parent) {
+    if engine.host_of(parent).is_some() || engine.is_relation_only(parent) {
         return None;
     }
     Some(parent)
@@ -454,10 +450,9 @@ fn walk_reversed_counter_sibling_run(
     state: &mut ReversedScopeWalkState<'_>,
     first: Option<StyleNodeID>,
 ) -> ReversedScopeWalkDecision {
-    let tree = engine.tree();
     let mut element = first;
     while let Some(current) = element {
-        element = tree.next_element_sibling(current);
+        element = engine.next_element_sibling(current);
         let Some(style) = engine.published_style_view(current, None) else {
             continue;
         };
@@ -470,7 +465,7 @@ fn walk_reversed_counter_sibling_run(
         if apply_reversed_counter_contribution(state, style) == ReversedScopeWalkDecision::Stop {
             return ReversedScopeWalkDecision::Stop;
         }
-        if walk_reversed_counter_sibling_run(engine, state, tree.first_element_child(current))
+        if walk_reversed_counter_sibling_run(engine, state, engine.first_element_child(current))
             == ReversedScopeWalkDecision::Stop
         {
             return ReversedScopeWalkDecision::Stop;
@@ -507,11 +502,10 @@ fn reversed_counter_start_value(
     // FIXME: Counters reset on pseudo-elements don't walk a scope yet; only the pseudo-element's own
     //        contribution is taken into account.
     if decision == ReversedScopeWalkDecision::Continue && originating_element.generated_for == 0 {
-        let tree = engine.tree();
         let element = originating_element.element;
-        decision = walk_reversed_counter_sibling_run(engine, &mut state, tree.first_element_child(element));
+        decision = walk_reversed_counter_sibling_run(engine, &mut state, engine.first_element_child(element));
         if decision == ReversedScopeWalkDecision::Continue {
-            walk_reversed_counter_sibling_run(engine, &mut state, tree.next_element_sibling(element));
+            walk_reversed_counter_sibling_run(engine, &mut state, engine.next_element_sibling(element));
         }
     }
     (state.num + state.last_nonzero_increment_negated).clamp(i64::from(CounterValue::MIN), i64::from(CounterValue::MAX))

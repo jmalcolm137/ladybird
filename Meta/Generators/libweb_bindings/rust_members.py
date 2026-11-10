@@ -28,6 +28,7 @@ from Utils.webidl_parser import IDLType
 from Utils.webidl_parser import Interface
 from Utils.webidl_parser import Operation
 from Utils.webidl_parser import OperationParameter
+from Utils.webidl_parser import SpecialOperation
 
 RUST_METHOD_NAME = re.compile(r"[a-z][a-z0-9_]*")
 
@@ -35,14 +36,22 @@ RUST_METHOD_NAME = re.compile(r"[a-z][a-z0-9_]*")
 # NB: The context of an attribute or an operation that is [NeedsCallerRealm] has the current realm, not the realm of
 #     the object.
 SUPPORTED_ATTRIBUTE_EXTENDED_ATTRIBUTES = {
+    "AttributeCallbackName",
     "CachedAccessor",
+    "CEReactions",
     "FIXME",
     "ImplementedAs",
+    "LegacyNullToEmptyString",
     "NeedsCallerRealm",
     "NewObject",
+    "PutForwards",
+    "ReturnsJSValue",
     "SameObject",
+    "SecureContext",
 }
 SUPPORTED_OPERATION_EXTENDED_ATTRIBUTES = {
+    "CreatesPromise",
+    "CEReactions",
     "Default",
     "Exposed",
     "FIXME",
@@ -50,6 +59,7 @@ SUPPORTED_OPERATION_EXTENDED_ATTRIBUTES = {
     "NeedsCallerRealm",
     "NewObject",
     "SameObject",
+    "SecureContext",
 }
 SUPPORTED_STRINGIFIER_EXTENDED_ATTRIBUTES = {"Exposed"}
 
@@ -69,11 +79,19 @@ class RustAttribute:
     attribute: Attribute
     # The method of the implementation that the getter calls.
     getter_method: str
-    # The method of the implementation that the setter calls, for an attribute that is not read only.
+    # The method of the implementation that the setter calls, for an attribute that is not read only. An event handler
+    # IDL attribute has one only when the IDL names it with [ImplementedAs]: the setter of an interface that does more
+    # than set the event handler, which the method does itself.
     setter_method: Optional[str]
     # The event type of an event handler IDL attribute, whose getter and setter work on the C++ EventTarget that the
     # object owns: https://html.spec.whatwg.org/multipage/webappapis.html#event-handler-idl-attributes
     event_type: Optional[str] = None
+
+    @property
+    def put_forwards(self) -> Optional[str]:
+        """The attribute of the attribute's value that the setter of a read only attribute forwards to: [PutForwards],
+        https://webidl.spec.whatwg.org/#PutForwards"""
+        return self.attribute.extended_attributes.get("PutForwards")
 
     @property
     def is_cached(self) -> bool:
@@ -82,14 +100,25 @@ class RustAttribute:
         return "CachedAccessor" in self.attribute.extended_attributes
 
     @property
+    def returns_js_value(self) -> bool:
+        return "ReturnsJSValue" in self.attribute.extended_attributes
+
+    @property
+    def function_stem(self) -> str:
+        """What the generated native functions are named after. [AttributeCallbackName] tells apart the attributes that
+        name the same methods."""
+        callback_name = self.attribute.extended_attributes.get("AttributeCallbackName")
+        return callback_name or generated_function_stem(self.getter_method)
+
+    @property
     def getter_function(self) -> str:
         """The generated native function of the getter."""
-        return f"{generated_function_stem(self.getter_method)}_getter"
+        return f"{self.function_stem}_getter"
 
     @property
     def setter_function(self) -> str:
         """The generated native function of the setter."""
-        return f"{generated_function_stem(self.getter_method)}_setter"
+        return f"{self.function_stem}_setter"
 
 
 @dataclass
@@ -99,6 +128,9 @@ class RustOperation:
     # for a [Default] toJSON operation: the bindings run the default toJSON steps instead,
     # https://webidl.spec.whatwg.org/#default-tojson-steps
     method: str
+    omitted_parameter: Optional[OperationParameter] = None
+    omitted_parameter_index: Optional[int] = None
+    implementation_parameters: Optional[List[OperationParameter]] = None
 
     @property
     def length(self) -> int:
@@ -112,7 +144,8 @@ class RustOperation:
     def steps_function(self) -> str:
         """The generated function of the steps of the operation, when the operation is one of several overloads that
         the function of the prototype chooses between."""
-        return f"{generated_function_stem(self.method)}_steps"
+        suffix = f"_{len(self.operation.parameters)}" if self.omitted_parameter is not None else ""
+        return f"{generated_function_stem(self.method)}{suffix}_steps"
 
 
 @dataclass
@@ -130,6 +163,10 @@ class RustOperationSet:
     @property
     def length(self) -> int:
         return min(overload.length for overload in self.overloads)
+
+    @property
+    def is_secure_context_only(self) -> bool:
+        return "SecureContext" in self.overloads[0].operation.extended_attributes
 
     @property
     def is_window_only(self) -> bool:
@@ -163,12 +200,41 @@ class RustStringifier:
 class RustIndexedPropertyGetter:
     """The indexed property getter of an interface, which has an identifier: the operation of that identifier, whose
     method the getter steps of a supported property index call as well, https://webidl.spec.whatwg.org/#idl-indexed-properties
-    An index for which the method returns nothing is not a supported property index."""
+    An index for which a nullable method returns nothing is not a supported property index, nor is an index that is not
+    less than the length attribute of an interface whose method does not return a nullable type. An unnamed getter
+    defines no operation, and the method of the implementation is item() unless the IDL names it."""
 
     operation: RustOperation
+    # The getter of the length attribute of the interface.
+    length_method: str
     # Whether the interface declares a value iterator, which it implements through the indexed properties,
     # https://webidl.spec.whatwg.org/#dfn-value-iterator
     has_value_iterator: bool
+
+
+@dataclass
+class RustIndexedPropertySetter:
+    """The unnamed indexed property setter of an interface, whose steps the implementation defines as the methods
+    set_value_of_new_indexed_property() and set_value_of_existing_indexed_property(),
+    https://webidl.spec.whatwg.org/#legacy-platform-object-set"""
+
+    value_parameter: OperationParameter
+
+
+@dataclass
+class RustNamedProperties:
+    """The named property getter of an interface and its named property setter and deleter, if it has them, each of
+    which has an identifier: the operation of that identifier, whose method the legacy platform object algorithms call
+    as well, https://webidl.spec.whatwg.org/#idl-named-properties. The implementation gives its supported property names
+    through its method supported_property_names."""
+
+    getter: RustOperation
+    setter: Optional[RustOperation]
+    deleter: Optional[RustOperation]
+
+    @property
+    def operations(self) -> List[RustOperation]:
+        return [operation for operation in (self.getter, self.setter, self.deleter) if operation is not None]
 
 
 @dataclass
@@ -181,6 +247,29 @@ class RustPairIterator:
 
     # The names of the functions that the interface prototype object holds, in the order of the C++ bindings.
     function_names = ["entries", "forEach", "keys", "values"]
+
+
+@dataclass
+class RustSetlike:
+    """The setlike declaration of an interface, https://webidl.spec.whatwg.org/#idl-setlike. The names say which
+    operations of a read-write declaration the bindings define, as the interface can declare them itself."""
+
+    value_type: IDLType
+    writable_operations: list[str]
+
+    function_names = ["size", "entries", "values", "keys", "forEach", "has"]
+
+
+@dataclass
+class RustMaplike:
+    """The maplike declaration of an interface, whose keys are strings, https://webidl.spec.whatwg.org/#idl-maplike.
+    The names say which operations of a read-write declaration the bindings define, as the interface can declare them
+    itself."""
+
+    value_type: IDLType
+    writable_operations: list[str]
+
+    function_names = ["size", "entries", "keys", "values", "forEach", "get", "has"]
 
 
 @dataclass
@@ -232,7 +321,11 @@ class RustMembers:
     static_operation_sets: List[RustOperationSet] = field(default_factory=list)
     stringifier: Optional[RustStringifier] = None
     indexed_property_getter: Optional[RustIndexedPropertyGetter] = None
+    indexed_property_setter: Optional[RustIndexedPropertySetter] = None
+    named_properties: Optional[RustNamedProperties] = None
     pair_iterator: Optional[RustPairIterator] = None
+    setlike: Optional[RustSetlike] = None
+    maplike: Optional[RustMaplike] = None
     async_iterator: Optional[RustAsyncIterator] = None
     constructors: List[RustConstructor] = field(default_factory=list)
     constants: List[RustConstant] = field(default_factory=list)
@@ -255,10 +348,14 @@ class RustMembers:
         names.extend(operation_set.name for operation_set in self.operation_sets)
         if self.stringifier is not None:
             names.append("toString")
-        if self.indexed_property_getter is not None:
+        if self.indexed_property_getter is not None and self.indexed_property_getter.operation.operation.name:
             names.append(self.indexed_property_getter.operation.operation.name)
         if self.pair_iterator is not None:
             names.extend(self.pair_iterator.function_names)
+        if self.setlike is not None:
+            names.extend(self.setlike.function_names + self.setlike.writable_operations)
+        if self.maplike is not None:
+            names.extend(self.maplike.function_names + self.maplike.writable_operations)
         if self.async_iterator is not None:
             names.append("values")
         names.extend(constant.name for constant in self.constants)
@@ -289,18 +386,21 @@ def rust_members(interface: Interface) -> RustMembers:
             return rust_identifier(member_name)
         if not RUST_METHOD_NAME.fullmatch(method):
             fail(f"[ImplementedAs={method}] of {member_name} does not name a Rust method")
-        return method
+        return rust_identifier(method)
 
-    special_operations = [
-        interface.named_property_getter,
-        interface.named_property_setter,
-        interface.indexed_property_setter,
-        interface.named_property_deleter,
-    ]
-    if any(special_operations):
-        fail("it has special operations other than an indexed property getter")
-    if interface.maplike or interface.setlike:
-        fail("it is a maplike or setlike")
+    def event_handler_attribute(attribute: Attribute) -> RustAttribute:
+        """An event handler IDL attribute, which the bindings get and set on the EventTarget that the object owns. The
+        IDL names the method of its setter with [ImplementedAs] when the interface's setter does more than set the
+        event handler."""
+        if attribute.readonly or not attribute.name.startswith("on"):
+            fail(f"its event handler IDL attribute {attribute.name} is not a plain attribute named on<event type>")
+        check_extended_attributes(attribute.name, attribute.extended_attributes, {"ImplementedAs", "SecureContext"})
+        setter_method = None
+        if "ImplementedAs" in attribute.extended_attributes:
+            setter_method = method_of(attribute.name, attribute.extended_attributes)
+        event_type = attribute.name.removeprefix("on")
+        return RustAttribute(attribute, rust_identifier(attribute.name), setter_method, event_type)
+
     if interface.async_iterable is not None and interface.async_iterable.key_type is not None:
         fail("it has a pair asynchronously iterable declaration")
     has_value_iterator = interface.iterable is not None and interface.iterable.key_type is None
@@ -315,21 +415,82 @@ def rust_members(interface: Interface) -> RustMembers:
     if interface.iterable is not None and interface.iterable.key_type is not None:
         members.pair_iterator = RustPairIterator(interface.iterable.key_type, interface.iterable.value_type)
 
+    def writable_operations(declaration, names: list[str]) -> list[str]:
+        """The operations of a read-write declaration that the interface does not declare itself."""
+        if declaration.readonly:
+            return []
+        declared = set(operation_overload_sets(interface))
+        return [name for name in names if name not in declared]
+
+    if interface.setlike is not None:
+        members.setlike = RustSetlike(
+            interface.setlike.value_type, writable_operations(interface.setlike, ["add", "delete", "clear"])
+        )
+    if interface.maplike is not None:
+        if interface.maplike.key_type.name not in ("DOMString", "CSSOMString"):
+            fail("its maplike declaration has keys that are not strings")
+        members.maplike = RustMaplike(
+            interface.maplike.value_type, writable_operations(interface.maplike, ["set", "delete", "clear"])
+        )
+
     getter = interface.indexed_property_getter
     if has_value_iterator and getter is None:
         fail("it declares a value iterator and supports no indexed properties")
     if getter is not None:
-        if not getter.name:
-            fail("its indexed property getter has no identifier, which the Rust bindings do not handle yet")
-        if interface.parent_name:
-            fail("it supports indexed properties and inherits from another interface")
-        if not any(attribute.name == "length" for attribute in interface.regular_attributes):
+        length_attribute = next(
+            (attribute for attribute in interface.regular_attributes if attribute.name == "length"), None
+        )
+        if length_attribute is None:
             fail("it supports indexed properties and has no length attribute")
+        assert length_attribute is not None
         check_extended_attributes(getter.name, getter.extended_attributes, {"ImplementedAs"})
         getter_operation = Operation(getter.name, getter.return_type, getter.parameters, getter.extended_attributes)
         members.indexed_property_getter = RustIndexedPropertyGetter(
-            RustOperation(getter_operation, method_of(getter.name, getter.extended_attributes)), has_value_iterator
+            RustOperation(getter_operation, method_of(getter.name or "item", getter.extended_attributes)),
+            method_of(length_attribute.name, length_attribute.extended_attributes),
+            has_value_iterator,
         )
+
+    setter = interface.indexed_property_setter
+    if setter is not None:
+        if getter is None:
+            fail("it has an indexed property setter and no indexed property getter")
+        if setter.name:
+            fail("its indexed property setter has an identifier, which the Rust bindings do not handle yet")
+        members.indexed_property_setter = RustIndexedPropertySetter(setter.parameters[1])
+
+    def named_property_operation(special_operation: Optional[SpecialOperation], kind: str) -> Optional[RustOperation]:
+        if special_operation is None:
+            return None
+        if not special_operation.name:
+            fail(f"its named property {kind} has no identifier, which the Rust bindings do not handle yet")
+        check_extended_attributes(special_operation.name, special_operation.extended_attributes, {"ImplementedAs"})
+        operation = Operation(
+            special_operation.name,
+            special_operation.return_type,
+            special_operation.parameters,
+            special_operation.extended_attributes,
+        )
+        return RustOperation(operation, method_of(special_operation.name, special_operation.extended_attributes))
+
+    named_getter = named_property_operation(interface.named_property_getter, "getter")
+    named_setter = named_property_operation(interface.named_property_setter, "setter")
+    named_deleter = named_property_operation(interface.named_property_deleter, "deleter")
+    if named_getter is None and (named_setter is not None or named_deleter is not None):
+        fail("it has a named property setter or deleter and no named property getter")
+    if named_getter is not None:
+        if getter is not None:
+            fail("it supports both indexed and named properties, which the Rust bindings do not handle yet")
+        if interface.parent_name:
+            fail("it supports named properties and inherits from another interface")
+        if not named_getter.operation.return_type.nullable:
+            fail(
+                "its named property getter does not return a nullable type, by which the Rust bindings tell the "
+                "names that are not supported property names"
+            )
+        if named_deleter is not None and named_deleter.operation.return_type.name != "undefined":
+            fail("its named property deleter returns a value, which the Rust bindings do not handle yet")
+        members.named_properties = RustNamedProperties(named_getter, named_setter, named_deleter)
 
     def check_exposure(member_name: str, extended_attributes: dict) -> None:
         exposure = extended_attributes.get("Exposed")
@@ -383,14 +544,14 @@ def rust_members(interface: Interface) -> RustMembers:
             continue
         if "CachedAccessor" in attribute.extended_attributes and not attribute.readonly:
             fail(f"its attribute {attribute.name} is [CachedAccessor] and not read only")
-        getter_method = method_of(attribute.name, attribute.extended_attributes)
-        setter_method = None if attribute.readonly else f"set_{generated_function_stem(getter_method)}"
-        event_type = None
+        if "PutForwards" in attribute.extended_attributes and not attribute.readonly:
+            fail(f"its attribute {attribute.name} is [PutForwards] and not read only")
         if attribute.type.name in ("EventHandler", "EventHandlerNonNull"):
-            if attribute.readonly or not attribute.name.startswith("on") or attribute.extended_attributes:
-                fail(f"its event handler IDL attribute {attribute.name} is not a plain attribute named on<event type>")
-            event_type = attribute.name.removeprefix("on")
-        rust_attribute = RustAttribute(attribute, getter_method, setter_method, event_type)
+            rust_attribute = event_handler_attribute(attribute)
+        else:
+            getter_method = method_of(attribute.name, attribute.extended_attributes)
+            setter_method = None if attribute.readonly else f"set_{generated_function_stem(getter_method)}"
+            rust_attribute = RustAttribute(attribute, getter_method, setter_method)
         members.attributes.append(rust_attribute)
         members.attributes_in_order.append(rust_attribute)
 
@@ -400,6 +561,10 @@ def rust_members(interface: Interface) -> RustMembers:
             check_extended_attributes(
                 operation.name, operation.extended_attributes, SUPPORTED_OPERATION_EXTENDED_ATTRIBUTES
             )
+            if "CreatesPromise" in operation.extended_attributes and (
+                not operation.return_type_is_promise() or operation.return_type.nullable
+            ):
+                fail(f"its operation {operation.name} is [CreatesPromise] but does not return a non-nullable promise")
             check_exposure(operation.name, operation.extended_attributes)
             if "Default" in operation.extended_attributes and (
                 static or operation.name != "toJSON" or operation.return_type.name != "object" or operation.parameters
@@ -422,11 +587,40 @@ def rust_members(interface: Interface) -> RustMembers:
                     )
                 if len({operation.return_type_is_promise() for operation in operations}) > 1:
                     fail(f"some overloads of its operation {name} return a promise type and others do not")
-                if len({operation.extended_attributes.get("Exposed") for operation in operations}) > 1:
+                exposure = {
+                    (operation.extended_attributes.get("Exposed"), "SecureContext" in operation.extended_attributes)
+                    for operation in operations
+                }
+                if len(exposure) > 1:
                     fail(f"the overloads of its operation {name} are exposed differently")
             overloads = [
                 RustOperation(operation, method_of(name, operation.extended_attributes)) for operation in operations
             ]
+            for method in {overload.method for overload in overloads}:
+                shared = [overload for overload in overloads if overload.method == method]
+                if len(shared) == 1:
+                    continue
+                if static or len(shared) != 2:
+                    fail(f"the overloads sharing the Rust method {method} must differ by one required parameter")
+                shorter, longer = sorted(shared, key=lambda overload: len(overload.operation.parameters))
+                short_parameters = shorter.operation.parameters
+                long_parameters = longer.operation.parameters
+                if len(long_parameters) != len(short_parameters) + 1:
+                    fail(f"the overloads sharing the Rust method {method} must differ by one required parameter")
+                indices = [
+                    index
+                    for index, parameter in enumerate(long_parameters)
+                    if not parameter.optional
+                    and not parameter.variadic
+                    and long_parameters[:index] + long_parameters[index + 1 :] == short_parameters
+                ]
+                if len(indices) != 1 or shorter.operation.return_type != longer.operation.return_type:
+                    fail(f"the overloads sharing the Rust method {method} must differ by one required parameter")
+                index = indices[0]
+                for overload in shared:
+                    overload.omitted_parameter = long_parameters[index]
+                    overload.omitted_parameter_index = index
+                    overload.implementation_parameters = long_parameters
             sets.append(RustOperationSet(name, overloads))
         if static and any("FIXME" in operation.extended_attributes for operation in operations_of_interface):
             fail("it has static operations marked [FIXME], which the Rust bindings do not record yet")
@@ -438,6 +632,10 @@ def rust_members(interface: Interface) -> RustMembers:
         return sets
 
     members.operation_sets = operation_sets(static=False)
+    if members.named_properties is not None:
+        members.operation_sets.extend(
+            RustOperationSet(operation.operation.name, [operation]) for operation in members.named_properties.operations
+        )
     members.static_operation_sets = operation_sets(static=True)
 
     for constant in interface.constants:
@@ -447,22 +645,23 @@ def rust_members(interface: Interface) -> RustMembers:
         else:
             members.constants.append(RustConstant(constant.name, value))
 
-    methods = [attribute.getter_method for attribute in members.attributes if attribute.event_type is None]
-    methods.extend(
-        attribute.setter_method
-        for attribute in members.attributes
-        if attribute.setter_method is not None and attribute.event_type is None
+    # NB: The spellings of a CSS descriptor or property are attributes with the same steps, which name the same methods.
+    attribute_methods = {attribute.getter_method for attribute in members.attributes if attribute.event_type is None}
+    attribute_methods.update(
+        attribute.setter_method for attribute in members.attributes if attribute.setter_method is not None
     )
+    methods = sorted(attribute_methods)
     methods.extend(
-        overload.method
+        method
         for operation_set in members.operation_sets + members.static_operation_sets
-        for overload in operation_set.overloads
-        if not overload.is_default_to_json
+        for method in {overload.method for overload in operation_set.overloads if not overload.is_default_to_json}
     )
     if members.stringifier is not None and members.stringifier.defines_method:
         methods.append(members.stringifier.method)
     if members.indexed_property_getter is not None:
         methods.append(members.indexed_property_getter.operation.method)
+    if members.indexed_property_setter is not None:
+        methods.extend(["set_value_of_new_indexed_property", "set_value_of_existing_indexed_property"])
     methods.extend(constructor.method for constructor in members.constructors)
     repeated_methods = sorted({method for method in methods if methods.count(method) > 1})
     if repeated_methods:

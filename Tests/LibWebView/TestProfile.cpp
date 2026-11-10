@@ -4,7 +4,6 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-#include <AK/ByteBuffer.h>
 #include <AK/LexicalPath.h>
 #include <AK/Time.h>
 #include <LibCore/Directory.h>
@@ -12,6 +11,8 @@
 #include <LibCore/System.h>
 #include <LibDatabase/Database.h>
 #include <LibFileSystem/FileSystem.h>
+#include <LibHTTP/Cache/CacheEntry.h>
+#include <LibHTTP/Cache/CacheRequest.h>
 #include <LibHTTP/Cache/DiskCache.h>
 #include <LibHTTP/Cookie/ParsedCookie.h>
 #include <LibHTTP/HSTS/ParsedHSTSPolicy.h>
@@ -19,7 +20,6 @@
 #include <LibHTTP/NetworkIsolationKey.h>
 #include <LibTest/TestCase.h>
 #include <LibURL/Parser.h>
-#include <LibWebView/BookmarkStore.h>
 #include <LibWebView/CookieJar.h>
 #include <LibWebView/FaviconStore.h>
 #include <LibWebView/HSTSStore.h>
@@ -154,7 +154,7 @@ TEST_CASE(temporary_profiles_are_unique_and_removed)
     remove_test_root();
 }
 
-TEST_CASE(profile_settings_and_bookmarks_are_isolated)
+TEST_CASE(profile_settings_are_isolated)
 {
     remove_test_root();
     auto first_profile = MUST(WebView::Profile::create({ .name = "first" }, roots()));
@@ -170,17 +170,6 @@ TEST_CASE(profile_settings_and_bookmarks_are_isolated)
     EXPECT_NE(first_settings_background_networking_enabled, second_settings.background_networking_enabled());
     EXPECT_EQ(first_settings_background_networking_enabled, WebView::Settings::create(first_settings_path).background_networking_enabled());
 
-    auto first_bookmarks_path = LexicalPath::join(first_profile.paths().config, "Bookmarks.json"sv).string();
-    auto second_bookmarks_path = LexicalPath::join(second_profile.paths().config, "Bookmarks.json"sv).string();
-    auto url = URL::Parser::basic_parse("https://profile-isolation.example/"sv).release_value();
-    auto first_bookmarks = WebView::BookmarkStore::create(first_bookmarks_path);
-    first_bookmarks.add_bookmark(url, {}, "favicon-hash"_string);
-    EXPECT(first_bookmarks.favicon_hashes().contains("favicon-hash"sv));
-    auto second_bookmarks = WebView::BookmarkStore::create(second_bookmarks_path);
-    EXPECT(!second_bookmarks.is_bookmarked(url));
-    auto reloaded_first_bookmarks = WebView::BookmarkStore::create(first_bookmarks_path);
-    EXPECT(reloaded_first_bookmarks.is_bookmarked(url));
-    EXPECT(reloaded_first_bookmarks.favicon_hashes().contains("favicon-hash"sv));
     remove_test_root();
 }
 
@@ -203,7 +192,7 @@ TEST_CASE(profile_databases_are_isolated)
             .value = "first"_string,
             .expiry_time_from_expires_attribute = UnixDateTime::now() + AK::Duration::from_seconds(3600),
         };
-        cookie_jar->set_cookie(url, cookie, HTTP::Cookie::Source::Http, {});
+        cookie_jar->set_cookie(url, cookie, HTTP::Cookie::Source::Http, {}, HTTP::Cookie::SameSiteContext::same_site());
 
         auto hsts_store = TRY_OR_FAIL(WebView::HSTSStore::create(*database));
         hsts_store->store_policy("profile-isolation.example"_string, HTTP::HSTS::ParsedHSTSPolicy { AK::Duration::from_seconds(3600), false });
@@ -261,6 +250,11 @@ TEST_CASE(profile_databases_are_isolated)
     remove_test_root();
 }
 
+struct TestCacheRequest final : public HTTP::CacheRequest {
+    virtual bool is_revalidation_request() const override { return false; }
+    virtual void notify_request_unblocked(Badge<HTTP::DiskCache>) override { }
+};
+
 TEST_CASE(profile_caches_are_isolated)
 {
     remove_test_root();
@@ -268,7 +262,7 @@ TEST_CASE(profile_caches_are_isolated)
     auto second_profile = MUST(WebView::Profile::create({ .name = "second" }, roots()));
     auto url = parse_url("https://profile-isolation.example/script.js"sv);
     auto request_headers = HTTP::HeaderList::create({});
-    auto bytecode = TRY_OR_FAIL(ByteBuffer::copy("first-profile-bytecode"sv.bytes()));
+    auto response_headers = HTTP::HeaderList::create({ { "Cache-Control"sv, "max-age=60"sv } });
     auto partition = HTTP::NetworkIsolationKey {
         .top_level_site = "https://profile-isolation.example"_utf16,
         .frame_site = "https://profile-isolation.example"_utf16,
@@ -276,25 +270,31 @@ TEST_CASE(profile_caches_are_isolated)
                          .disk_cache_partition()
                          .release_value();
 
+    TestCacheRequest request;
+    auto has_stored_response = [&](HTTP::DiskCache& cache) {
+        return cache.open_entry(request, partition, url, "GET"sv, *request_headers, HTTP::CacheMode::Default, HTTP::DiskCache::OpenMode::Read)
+            .visit(
+                [](Optional<HTTP::CacheEntryReader&> reader) { return reader.has_value(); },
+                [](HTTP::DiskCache::CacheHasOpenEntry) { return false; });
+    };
+
     {
         auto cache = TRY_OR_FAIL(HTTP::DiskCache::create(HTTP::DiskCache::Mode::Normal, LexicalPath { first_profile.paths().cache })).release_value();
-        EXPECT(TRY_OR_FAIL(cache.create_synthetic_entry(partition, url, "GET"sv)));
-        auto stored = TRY_OR_FAIL(cache.store_associated_data(partition, url, "GET"sv, *request_headers, {}, HTTP::CacheEntryAssociatedData::JavaScriptBytecode, bytecode.bytes()));
-        EXPECT(stored.has_value());
-        if (stored.has_value())
-            (void)Core::System::close(stored->fd);
+        auto writer = cache.create_entry(request, partition, url, "GET"sv, *request_headers, UnixDateTime::now()).get<Optional<HTTP::CacheEntryWriter&>>();
+        VERIFY(writer.has_value());
+        TRY_OR_FAIL(writer->write_status_and_reason(200, "OK"_string, *request_headers, *response_headers));
+        TRY_OR_FAIL(writer->write_data("first-profile-script"sv.bytes()));
+        TRY_OR_FAIL(writer->flush(request_headers));
     }
 
     {
         auto cache = TRY_OR_FAIL(HTTP::DiskCache::create(HTTP::DiskCache::Mode::Normal, LexicalPath { second_profile.paths().cache })).release_value();
-        EXPECT(!TRY_OR_FAIL(cache.retrieve_associated_data(partition, url, "GET"sv, *request_headers, {}, HTTP::CacheEntryAssociatedData::JavaScriptBytecode)).has_value());
+        EXPECT(!has_stored_response(cache));
     }
 
     {
         auto cache = TRY_OR_FAIL(HTTP::DiskCache::create(HTTP::DiskCache::Mode::Normal, LexicalPath { first_profile.paths().cache })).release_value();
-        auto retrieved_bytecode = TRY_OR_FAIL(cache.retrieve_associated_data(partition, url, "GET"sv, *request_headers, {}, HTTP::CacheEntryAssociatedData::JavaScriptBytecode));
-        VERIFY(retrieved_bytecode.has_value());
-        EXPECT_EQ(retrieved_bytecode->bytes(), bytecode.bytes());
+        EXPECT(has_stored_response(cache));
     }
 
     remove_test_root();

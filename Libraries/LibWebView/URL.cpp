@@ -7,10 +7,12 @@
  */
 
 #include <AK/CharacterTypes.h>
+#include <AK/Debug.h>
 #include <AK/IPv4Address.h>
 #include <AK/IPv6Address.h>
 #include <AK/String.h>
 #include <AK/StringBuilder.h>
+#include <LibCore/MimeData.h>
 #include <LibFileSystem/FileSystem.h>
 #include <LibURL/Parser.h>
 #include <LibURL/PublicSuffixData.h>
@@ -306,11 +308,8 @@ Vector<URL::URL> sanitize_urls(ReadonlySpan<ByteString> raw_urls)
     return sanitized_urls;
 }
 
-String url_for_display(URL::URL const& url)
+String authority_for_display(URL::URL const& url)
 {
-    if (!url.scheme().is_one_of("http"sv, "https"sv))
-        return url.serialize();
-
     StringBuilder builder;
 
     if (!url.username().is_empty() || !url.password().is_empty()) {
@@ -329,6 +328,17 @@ String url_for_display(URL::URL const& url)
 
     if (url.port().has_value())
         builder.appendff(":{}", *url.port());
+
+    return MUST(builder.to_string());
+}
+
+String url_for_display(URL::URL const& url)
+{
+    if (!url.scheme().is_one_of("http"sv, "https"sv))
+        return url.serialize();
+
+    StringBuilder builder;
+    builder.append(authority_for_display(url));
 
     auto path = url.serialize_path();
     if (path != "/"sv || url.query().has_value() || url.fragment().has_value())
@@ -442,6 +452,53 @@ ByteString url_text_to_copy(URL::URL const& url)
     if (url.scheme() == "tel"sv)
         return url_text.substring("tel:"sv.length());
     return url_text;
+}
+
+ByteString image_filename_with_extension(ByteString filename, StringView image_mime_type)
+{
+    // NB: The type comes from the page's process, so only an image's type may pick an extension here.
+    if (!image_mime_type.starts_with("image/"sv))
+        return filename;
+    auto extension = Core::common_extension_for_mime_type(image_mime_type);
+    if (!extension.has_value())
+        return filename;
+
+    // A name with an extension we know stays as the server gave it.
+    if (Core::guess_mime_type_based_on_filename(filename) != "application/octet-stream"sv)
+        return filename;
+
+    if (filename.is_empty())
+        filename = "download"sv;
+    return ByteString::formatted("{}{}", filename, *extension);
+}
+
+// History records web pages and local files only. The browser opens what its history lists, and a javascript: URL would
+// run in whatever document opened it, such as about:history. A store holds other URLs only if something other than the
+// browser wrote to it, so the queries listing and suggesting entries skip them too.
+static bool is_browsable_url(URL::URL const& url)
+{
+    return url.scheme().is_one_of("http"sv, "https"sv, "file"sv);
+}
+
+Optional<String> normalize_url_for_history(URL::URL const& url)
+{
+    if (url.scheme().is_empty()) {
+        dbgln_if(WEBVIEW_HISTORY_DEBUG, "[History] Skipping history entry without a scheme: {}", url);
+        return {};
+    }
+
+    if (!is_browsable_url(url)) {
+        dbgln_if(WEBVIEW_HISTORY_DEBUG, "[History] Skipping non-browsable history URL: {}", url);
+        return {};
+    }
+
+    auto normalized_url = url.serialize(URL::ExcludeFragment::Yes);
+    if (normalized_url.is_empty()) {
+        dbgln_if(WEBVIEW_HISTORY_DEBUG, "[History] Skipping history entry with an empty normalized URL: {}", url);
+        return {};
+    }
+
+    return normalized_url;
 }
 
 }

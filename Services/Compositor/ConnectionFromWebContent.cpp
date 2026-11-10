@@ -27,6 +27,7 @@ ConnectionFromWebContent::ConnectionFromWebContent(NonnullOwnPtr<IPC::Transport>
 void ConnectionFromWebContent::die()
 {
     auto protector = NonnullRefPtr { *this };
+    drop_image_decoder();
     m_compositor_state->destroy_contexts_for_web_content_client(*this);
     if (m_on_death)
         m_on_death(*this);
@@ -81,6 +82,86 @@ void ConnectionFromWebContent::pointer_left(Web::CompositorContextId context_id,
 {
     if (m_render_clock_connection)
         m_render_clock_connection->async_pointer_left(context_id, input_event_id);
+}
+
+void ConnectionFromWebContent::pointer_rests_on_moving_content(Web::CompositorContextId context_id)
+{
+    if (m_render_clock_connection)
+        m_render_clock_connection->async_pointer_rests_on_moving_content(context_id);
+}
+
+void ConnectionFromWebContent::drop_image_decoder()
+{
+    if (!m_image_decoder)
+        return;
+    m_image_decoder->on_death = nullptr;
+    m_image_decoder->on_animation_frames_decoded = nullptr;
+    m_image_decoder->on_animation_decode_failed = nullptr;
+    m_image_decoder = nullptr;
+}
+
+void ConnectionFromWebContent::connect_to_image_decoder(IPC::TransportHandle handle)
+{
+    // NB: A new channel means a new decoder, whose sessions the ones of the old decoder must not be confused with.
+    m_compositor_state->animated_image_decoder_lost(*this);
+    drop_image_decoder();
+
+    auto transport_or_error = handle.create_transport();
+    if (transport_or_error.is_error()) {
+        dbgln("Compositor: Could not take up an image decoder channel: {}", transport_or_error.error());
+        return;
+    }
+    m_image_decoder = make_ref_counted<ImageDecoderClient::Client>(transport_or_error.release_value());
+    m_image_decoder->on_death = [this] {
+        m_compositor_state->animated_image_decoder_lost(*this);
+        drop_image_decoder();
+    };
+    m_image_decoder->on_animation_frames_decoded = [this](i64 session_id, Vector<NonnullRefPtr<Gfx::Bitmap>> bitmaps) {
+        m_compositor_state->animated_image_frames_decoded(*this, session_id, move(bitmaps));
+    };
+    m_image_decoder->on_animation_decode_failed = [this](i64 session_id, String) {
+        m_compositor_state->animated_image_decode_failed(*this, session_id);
+    };
+}
+
+void ConnectionFromWebContent::add_animated_image(u64 frame_id, i64 session_id, Gfx::IntSize size, Gfx::ColorSpace color_space, Vector<u32> frame_durations_in_milliseconds, u32 loop_count)
+{
+    if (frame_durations_in_milliseconds.is_empty()) {
+        did_misbehave("WebContent added an animated image with no frames");
+        return;
+    }
+    m_compositor_state->add_animated_image(*this, Compositing::ImageFrameResourceId { frame_id },
+        { .session_id = session_id, .size = size, .color_space = move(color_space), .frame_durations_in_milliseconds = move(frame_durations_in_milliseconds), .loop_count = loop_count });
+}
+
+void ConnectionFromWebContent::remove_animated_image(u64 frame_id)
+{
+    m_compositor_state->remove_animated_image(*this, Compositing::ImageFrameResourceId { frame_id });
+}
+
+void ConnectionFromWebContent::start_animated_image(u64 frame_id)
+{
+    m_compositor_state->start_animated_image(*this, Compositing::ImageFrameResourceId { frame_id });
+}
+
+void ConnectionFromWebContent::stop_animated_image(u64 frame_id)
+{
+    m_compositor_state->stop_animated_image(*this, Compositing::ImageFrameResourceId { frame_id });
+}
+
+Messages::CompositorWebContentServer::AnimatedImageStateForTestingResponse ConnectionFromWebContent::animated_image_state_for_testing(u64 frame_id)
+{
+    auto const* image = m_compositor_state->animated_image(*this, Compositing::ImageFrameResourceId { frame_id });
+    if (!image)
+        return { false, 0, 0, 0 };
+    auto now = MonotonicTime::now();
+    return { image->is_animating(now), image->frame_index_at(now), image->shown_frame_index(), image->loops_completed_at(now) };
+}
+
+void ConnectionFromWebContent::request_animated_image_frames(AnimatedImage::FrameRequest const& request)
+{
+    if (m_image_decoder)
+        m_image_decoder->request_animation_frames(request.session_id, request.start_frame_index, request.count);
 }
 
 void ConnectionFromWebContent::add_video_sink(Media::VideoSinkHandle video_sink_handle, NonnullRefPtr<Compositing::VideoFramePresentationPage> presentation_page)
@@ -152,6 +233,11 @@ void ConnectionFromWebContent::rendering_opportunity(Web::CompositorContextId co
 void ConnectionFromWebContent::async_scroll_updates(Web::CompositorContextId context_id, Compositing::PendingAsyncScrollUpdates const& updates)
 {
     async_async_scroll_updates(context_id, updates);
+}
+
+void ConnectionFromWebContent::animated_content_moved_under_pointer(Web::CompositorContextId context_id, i64 frame_time_nanoseconds)
+{
+    async_animated_content_moved_under_pointer(context_id, frame_time_nanoseconds);
 }
 
 void ConnectionFromWebContent::overlay_scrollbar_visibilities_changed(Vector<Web::OverlayScrollbarVisibility> const& visibilities)
@@ -485,14 +571,44 @@ void ConnectionFromWebContent::invalidate_wheel_event_listener_state(Web::Compos
     m_compositor_state->invalidate_wheel_event_listener_state(context_id, generation);
 }
 
-Messages::CompositorWebContentServer::AsyncScrollByResponse ConnectionFromWebContent::async_scroll_by(Web::CompositorContextId context_id, Web::UniqueNodeID document_id, Gfx::FloatPoint position, Gfx::FloatPoint delta, Gfx::IntRect viewport_rect, Web::WheelDeltaPrecision wheel_delta_precision, Web::ScrollGesturePhase scroll_gesture_phase, u32 modifiers, Compositing::AsyncScrollOperationTracking operation_tracking, Compositing::WheelStepDispatch wheel_step_dispatch, u64 input_event_id)
+// Wheel deltas are scrolled by as floats.
+static bool is_valid_wheel_delta(double delta)
+{
+    return isfinite(delta) && fabs(delta) <= NumericLimits<float>::max();
+}
+
+static bool is_valid_wheel_event(Web::MouseEvent const& event)
+{
+    return event.type == Web::MouseEvent::Type::MouseWheel
+        && is_valid_wheel_delta(event.wheel_delta_x)
+        && is_valid_wheel_delta(event.wheel_delta_y);
+}
+
+static bool is_valid_wheel_step_let_through(Compositing::WheelStepLetThrough const& step)
+{
+    return isfinite(step.position.x()) && isfinite(step.position.y())
+        && isfinite(step.delta_in_css_pixels.x()) && isfinite(step.delta_in_css_pixels.y());
+}
+
+Messages::CompositorWebContentServer::TakeWheelEventFromMainThreadResponse ConnectionFromWebContent::take_wheel_event_from_main_thread(Web::CompositorContextId context_id, Web::MouseEvent event, Compositing::AsyncScrollOperationTracking operation_tracking, Compositing::WheelEventRouting routing)
+{
+    if (!context_is_owned_by_this_connection(context_id) || !is_valid_wheel_event(event))
+        return Compositing::WheelEventAnswer {};
+    return m_compositor_state->take_wheel_event_from_main_thread(context_id, event, operation_tracking, routing);
+}
+
+Messages::CompositorWebContentServer::WheelEventLetThroughResponse ConnectionFromWebContent::wheel_event_let_through(Web::CompositorContextId context_id, Compositing::WheelStepLetThrough step, Compositing::AsyncScrollOperationTracking operation_tracking)
+{
+    if (!context_is_owned_by_this_connection(context_id) || !is_valid_wheel_step_let_through(step))
+        return Compositing::WheelEventAnswer {};
+    return m_compositor_state->scroll_for_wheel_event_the_page_let_through(context_id, step, operation_tracking, *this);
+}
+
+void ConnectionFromWebContent::wheel_event_canceled(Web::CompositorContextId context_id, u64 wheel_gesture_id)
 {
     if (!context_is_owned_by_this_connection(context_id))
-        return Compositing::AsyncScrollEnqueueResult {};
-    auto result = m_compositor_state->async_scroll_by(context_id, document_id, position, delta, viewport_rect, wheel_delta_precision, scroll_gesture_phase, modifiers, operation_tracking, wheel_step_dispatch, input_event_id);
-    if (result.accepted)
-        async_request_rendering_update();
-    return result;
+        return;
+    m_compositor_state->forget_wheel_gesture_the_page_canceled(context_id, wheel_gesture_id);
 }
 
 static bool is_valid_scroll_request(Compositing::ScrollRequest const& scroll_request)

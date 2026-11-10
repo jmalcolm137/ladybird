@@ -6,10 +6,16 @@
 
 //! Rust views of shared AK data structures.
 
+mod generic_lexer;
+pub mod math;
 pub mod perf_map;
 mod scope_guard;
 mod slice;
+pub mod waiter_list;
+#[cfg(all(windows, target_arch = "x86_64"))]
+pub mod windows_code_memory;
 
+pub use generic_lexer::GenericLexer;
 pub use scope_guard::ScopeGuard;
 pub use slice::{Span, SpanMut, slice_from_raw_parts, slice_from_raw_parts_mut};
 
@@ -21,8 +27,11 @@ use std::sync::atomic::{AtomicU32, Ordering};
 pub const SHORT_STRING_FLAG: usize = 1;
 /// The byte count of a short string is stored in its tag byte, above the flag.
 pub const SHORT_STRING_BYTE_COUNT_SHIFT: u32 = 2;
-/// Set in `Utf16StringDataHeader::flags` when the storage holds UTF-16 code units rather than ASCII bytes.
+/// Set in `Utf16StringDataHeader::flags` when the storage holds UTF-16 code units rather than Latin-1 bytes.
 pub const HAS_UTF16_STORAGE: u32 = 1;
+/// Set in `Utf16StringDataHeader::flags` when Latin-1 storage holds a byte above 0x7F. Without it, Latin-1 storage is
+/// ASCII.
+pub const CONTAINS_NON_ASCII: u32 = 1 << 3;
 const UNKNOWN_CODE_POINT_LENGTH: u32 = u32::MAX;
 
 /// Mirrors `AK::Detail::Utf16StringDataHeader`. The string's storage follows it directly.
@@ -45,12 +54,29 @@ const _: () = assert!(std::mem::offset_of!(Utf16StringDataHeader, flags) == 16);
 
 /// A borrowed view of an `AK::Utf16String` or `AK::Utf16FlyString`.
 pub enum Utf16StringUnits<'a> {
+    /// One byte per code unit, all of them ASCII.
     Ascii(&'a [u8]),
+    /// One byte per code unit, at least one of them above U+007F.
+    Latin1(&'a [u8]),
     Utf16(&'a [u16]),
 }
 
+/// The storage of a long string: one byte per code unit, all of them ASCII or not, or two bytes per code unit.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StorageKind {
+    Ascii,
+    Latin1,
+    Utf16,
+}
+
+impl StorageKind {
+    fn one_byte(is_ascii: bool) -> Self {
+        if is_ascii { Self::Ascii } else { Self::Latin1 }
+    }
+}
+
 unsafe extern "C" {
-    fn ladybird_utf16_string_create_uninitialized(length: usize, has_ascii_storage: bool) -> usize;
+    fn ladybird_utf16_string_create_uninitialized(length: usize, has_latin1_storage: bool) -> usize;
     fn ladybird_utf16_fly_string_from_utf8(data: *const u8, length: usize) -> usize;
     fn ladybird_utf16_fly_string_from_utf16(data: *const u16, length: usize) -> usize;
     fn ladybird_utf16_fly_string_from_utf16_string(raw: usize) -> usize;
@@ -61,11 +87,11 @@ unsafe extern "C" {
     fn ladybird_convert_valid_utf16_to_utf8(data: *const u16, length: usize, output: *mut u8) -> usize;
     fn ladybird_utf16_string_from_utf8(data: *const u8, length: usize) -> usize;
     fn ladybird_utf16_string_to_well_formed(data: *const u16, length: usize) -> usize;
-    fn ladybird_size_required_to_decode_base64(data: *const u8, length: usize, has_ascii_storage: bool) -> usize;
+    fn ladybird_size_required_to_decode_base64(data: *const u8, length: usize, has_latin1_storage: bool) -> usize;
     fn ladybird_decode_base64_into(
         data: *const u8,
         length: usize,
-        has_ascii_storage: bool,
+        has_latin1_storage: bool,
         url: bool,
         last_chunk_handling: u8,
         output: *mut u8,
@@ -74,6 +100,8 @@ unsafe extern "C" {
     ) -> u8;
     fn ladybird_encode_base64_to_utf16(data: *const u8, length: usize, url: bool, omit_padding: bool) -> usize;
     fn ladybird_release_unused_allocator_memory();
+    fn ladybird_enter_scratch_heap() -> *mut core::ffi::c_void;
+    fn ladybird_leave_scratch_heap(previous_heap: *mut core::ffi::c_void);
     fn ladybird_convert_to_decimal_exponential_form(
         value: f64,
         sign: *mut bool,
@@ -204,16 +232,18 @@ macro_rules! impl_utf16_string_owner {
                 self.0.raw.get()
             }
 
-            /// Borrows the shared ASCII or UTF-16 character storage directly.
+            /// Borrows the shared Latin-1 or UTF-16 character storage directly.
             #[inline]
             pub fn as_units(&self) -> Utf16StringUnits<'_> {
                 self.0.as_units()
             }
 
-            /// Borrows UTF-16 storage, widening ASCII only when a UTF-16 slice is needed.
+            /// Borrows UTF-16 storage, widening Latin-1 only when a UTF-16 slice is needed.
             pub fn to_utf16(&self) -> std::borrow::Cow<'_, [u16]> {
                 match self.as_units() {
-                    Utf16StringUnits::Ascii(units) => units.iter().map(|&unit| u16::from(unit)).collect(),
+                    Utf16StringUnits::Ascii(units) | Utf16StringUnits::Latin1(units) => {
+                        units.iter().map(|&unit| u16::from(unit)).collect()
+                    }
                     Utf16StringUnits::Utf16(units) => std::borrow::Cow::Borrowed(units),
                 }
             }
@@ -224,11 +254,11 @@ macro_rules! impl_utf16_string_owner {
                 self.length_in_code_units() == 0
             }
 
-            /// Returns the number of UTF-16 code units, which is the number of bytes of ASCII storage.
+            /// Returns the number of UTF-16 code units, which is the number of bytes of Latin-1 storage.
             #[inline]
             pub fn length_in_code_units(&self) -> usize {
                 match self.as_units() {
-                    Utf16StringUnits::Ascii(units) => units.len(),
+                    Utf16StringUnits::Ascii(units) | Utf16StringUnits::Latin1(units) => units.len(),
                     Utf16StringUnits::Utf16(units) => units.len(),
                 }
             }
@@ -266,10 +296,12 @@ impl Utf16String {
         unsafe { Self::from_raw_owned(raw) }
     }
 
-    /// Creates a string in AK's native representation and initializes its storage from UTF-16.
+    /// Creates a string in AK's native representation and initializes its storage from UTF-16, with one byte per
+    /// code unit if none is above U+00FF.
     pub fn from_utf16(string: &[u16]) -> Self {
-        if string.iter().all(|code_unit| *code_unit <= 0x7f) {
-            if string.len() < size_of::<usize>() {
+        let is_ascii = string.iter().all(|code_unit| *code_unit <= 0x7f);
+        if is_ascii || string.iter().all(|code_unit| *code_unit <= 0xff) {
+            if is_ascii && string.len() < size_of::<usize>() {
                 let mut bytes = [0; size_of::<usize>() - 1];
                 for (index, code_unit) in string.iter().enumerate() {
                     bytes[index] = *code_unit as u8;
@@ -277,16 +309,16 @@ impl Utf16String {
                 return Self::from_short_ascii(&bytes[..string.len()]);
             }
 
-            let result = Self::create_uninitialized(string.len(), true);
+            let result = Self::create_uninitialized(string.len(), StorageKind::one_byte(is_ascii));
             let storage = result.long_storage();
             for (index, code_unit) in string.iter().enumerate() {
-                // SAFETY: The allocation has space for exactly `string.len()` ASCII bytes.
+                // SAFETY: The allocation has space for exactly `string.len()` Latin-1 bytes.
                 unsafe { storage.add(index).write(*code_unit as u8) };
             }
             return result;
         }
 
-        let result = Self::create_uninitialized(string.len(), false);
+        let result = Self::create_uninitialized(string.len(), StorageKind::Utf16);
         // SAFETY: The source and destination are non-overlapping and the allocation has space for
         // exactly `string.len()` UTF-16 code units.
         unsafe { std::ptr::copy_nonoverlapping(string.as_ptr(), result.long_storage().cast(), string.len()) };
@@ -300,10 +332,28 @@ impl Utf16String {
         Self::from_ascii_without_validation(string)
     }
 
-    /// Creates a string in AK's native representation from the ASCII bytes of `pieces` one after the other, which
-    /// add up to `length` bytes, copying each piece into the string's storage directly.
-    pub fn from_ascii_concatenation<'a>(length: usize, pieces: impl IntoIterator<Item = &'a [u8]>) -> Self {
-        if length < size_of::<usize>() {
+    /// Creates a string in AK's native representation from Latin-1 bytes, one per code unit.
+    pub fn from_latin1(string: &[u8]) -> Self {
+        if string.is_ascii() {
+            return Self::from_ascii_without_validation(string);
+        }
+
+        let result = Self::create_uninitialized(string.len(), StorageKind::Latin1);
+        // SAFETY: The source and destination are non-overlapping and the allocation has space for
+        // exactly `string.len()` Latin-1 bytes.
+        unsafe { std::ptr::copy_nonoverlapping(string.as_ptr(), result.long_storage(), string.len()) };
+        result
+    }
+
+    /// Creates a string in AK's native representation from the Latin-1 bytes of `pieces` one after the other, which
+    /// add up to `length` bytes, copying each piece into the string's storage directly. `is_ascii` tells whether
+    /// every byte is ASCII.
+    pub fn from_latin1_concatenation<'a>(
+        length: usize,
+        is_ascii: bool,
+        pieces: impl IntoIterator<Item = &'a [u8]>,
+    ) -> Self {
+        if is_ascii && length < size_of::<usize>() {
             let mut bytes = [0; size_of::<usize>() - 1];
             let mut byte_count = 0;
             for piece in pieces {
@@ -314,7 +364,7 @@ impl Utf16String {
             return Self::from_ascii(&bytes[..length]);
         }
 
-        let result = Self::create_uninitialized(length, true);
+        let result = Self::create_uninitialized(length, StorageKind::one_byte(is_ascii));
         let storage = result.long_storage();
         let mut byte_count = 0;
         for piece in pieces {
@@ -322,13 +372,15 @@ impl Utf16String {
                 piece.len() <= length - byte_count,
                 "the pieces add up to the length of the string"
             );
-            assert!(piece.is_ascii(), "an ASCII string holds ASCII bytes");
-            // SAFETY: The allocation has space for `length` ASCII bytes, of which `byte_count` are written, and the
+            // SAFETY: The allocation has space for `length` Latin-1 bytes, of which `byte_count` are written, and the
             // piece fits in the rest.
             unsafe { std::ptr::copy_nonoverlapping(piece.as_ptr(), storage.add(byte_count), piece.len()) };
             byte_count += piece.len();
         }
         assert_eq!(byte_count, length, "the pieces add up to the length of the string");
+        // SAFETY: Every byte of the allocation is written.
+        let bytes = unsafe { crate::slice_from_raw_parts(storage.cast_const(), length) };
+        assert_eq!(bytes.is_ascii(), is_ascii, "an ASCII string holds ASCII bytes");
         result
     }
 
@@ -341,7 +393,7 @@ impl Utf16String {
             return Self::from_ascii(&bytes[..length]);
         }
 
-        let result = Self::create_uninitialized(length, true);
+        let result = Self::create_uninitialized(length, StorageKind::Ascii);
         // SAFETY: The allocation has space for exactly `length` ASCII bytes, which are zeroed before they are lent out.
         let storage = unsafe {
             std::ptr::write_bytes(result.long_storage(), 0, length);
@@ -358,7 +410,7 @@ impl Utf16String {
             return Self::from_short_ascii(string);
         }
 
-        let result = Self::create_uninitialized(string.len(), true);
+        let result = Self::create_uninitialized(string.len(), StorageKind::Ascii);
         // SAFETY: The source and destination are non-overlapping and the allocation has space for
         // exactly `string.len()` ASCII bytes.
         unsafe { std::ptr::copy_nonoverlapping(string.as_ptr(), result.long_storage(), string.len()) };
@@ -384,9 +436,10 @@ impl Utf16String {
         unsafe { Self::from_raw_owned(usize::from_ne_bytes(bytes)) }
     }
 
-    fn create_uninitialized(length: usize, has_ascii_storage: bool) -> Self {
+    fn create_uninitialized(length: usize, kind: StorageKind) -> Self {
         assert!(length < UNKNOWN_CODE_POINT_LENGTH as usize);
-        let unit_size = if has_ascii_storage { 1 } else { size_of::<u16>() };
+        let has_latin1_storage = kind != StorageKind::Utf16;
+        let unit_size = if has_latin1_storage { 1 } else { size_of::<u16>() };
         assert!(
             size_of::<Utf16StringDataHeader>()
                 .checked_add(
@@ -398,7 +451,12 @@ impl Utf16String {
         );
         // SAFETY: C++ returns a fully initialized native string owner with trailing storage sized
         // for `length` units. The caller initializes that storage before publishing the owner.
-        let raw = unsafe { ladybird_utf16_string_create_uninitialized(length, has_ascii_storage) };
+        let raw = unsafe { ladybird_utf16_string_create_uninitialized(length, has_latin1_storage) };
+        if kind == StorageKind::Latin1 {
+            // SAFETY: The new string is the address of its data, which starts with this header and is not shared yet.
+            let header = unsafe { &*std::ptr::with_exposed_provenance::<Utf16StringDataHeader>(raw) };
+            header.flags.fetch_or(CONTAINS_NON_ASCII, Ordering::Relaxed);
+        }
         // SAFETY: The allocator transfers one ownership reference.
         unsafe { Self::from_raw_owned(raw) }
     }
@@ -425,6 +483,30 @@ impl Utf16String {
 pub fn release_unused_allocator_memory() {
     // SAFETY: Takes no arguments, and any thread may call it.
     unsafe { ladybird_release_unused_allocator_memory() }
+}
+
+/// While this lives, what the calling thread allocates goes to a heap of its own. Work that frees
+/// nearly everything it allocates uses it to keep its temporary data out of the pages of what
+/// outlives it. Blocks stay valid after it ends. Scopes end in the reverse order they were entered in.
+/// It holds a pointer so that it stays on its thread.
+pub struct ScratchHeapScope {
+    previous_heap: *mut core::ffi::c_void,
+}
+
+impl ScratchHeapScope {
+    #[must_use = "the scratch heap is only in use while the scope lives"]
+    pub fn enter() -> Self {
+        // SAFETY: Takes no arguments, and any thread may call it.
+        let previous_heap = unsafe { ladybird_enter_scratch_heap() };
+        Self { previous_heap }
+    }
+}
+
+impl Drop for ScratchHeapScope {
+    fn drop(&mut self) {
+        // SAFETY: The heap is the one this thread entered the scratch heap from.
+        unsafe { ladybird_leave_scratch_heap(self.previous_heap) }
+    }
 }
 
 pub fn validate_utf16(string: &[u16]) -> bool {
@@ -542,7 +624,7 @@ pub struct Base64DecodeResult {
 
 fn raw_units(string: Utf16StringUnits<'_>) -> (*const u8, usize, bool) {
     match string {
-        Utf16StringUnits::Ascii(bytes) => (bytes.as_ptr(), bytes.len(), true),
+        Utf16StringUnits::Ascii(bytes) | Utf16StringUnits::Latin1(bytes) => (bytes.as_ptr(), bytes.len(), true),
         Utf16StringUnits::Utf16(units) => (units.as_ptr().cast(), units.len(), false),
     }
 }
@@ -553,10 +635,10 @@ pub fn decode_base64(
     last_chunk_handling: LastChunkHandling,
     max_length: Option<usize>,
 ) -> Base64DecodeResult {
-    let (data, length, has_ascii_storage) = raw_units(input);
+    let (data, length, has_latin1_storage) = raw_units(input);
     let capacity = max_length.unwrap_or_else(|| {
         // SAFETY: The string's storage remains alive for the duration of the call.
-        unsafe { ladybird_size_required_to_decode_base64(data, length, has_ascii_storage) }
+        unsafe { ladybird_size_required_to_decode_base64(data, length, has_latin1_storage) }
     });
 
     let mut bytes = Vec::with_capacity(capacity);
@@ -568,7 +650,7 @@ pub fn decode_base64(
         ladybird_decode_base64_into(
             data,
             length,
-            has_ascii_storage,
+            has_latin1_storage,
             alphabet == Base64Alphabet::Base64Url,
             last_chunk_handling as u8,
             bytes.as_mut_ptr(),
@@ -688,10 +770,13 @@ impl PartialEq for Utf16String {
             return false;
         }
         match (self.as_units(), other.as_units()) {
-            (Utf16StringUnits::Ascii(left), Utf16StringUnits::Ascii(right)) => left == right,
+            (
+                Utf16StringUnits::Ascii(left) | Utf16StringUnits::Latin1(left),
+                Utf16StringUnits::Ascii(right) | Utf16StringUnits::Latin1(right),
+            ) => left == right,
             (Utf16StringUnits::Utf16(left), Utf16StringUnits::Utf16(right)) => left == right,
-            (Utf16StringUnits::Ascii(left), Utf16StringUnits::Utf16(right))
-            | (Utf16StringUnits::Utf16(right), Utf16StringUnits::Ascii(left)) => {
+            (Utf16StringUnits::Ascii(left) | Utf16StringUnits::Latin1(left), Utf16StringUnits::Utf16(right))
+            | (Utf16StringUnits::Utf16(right), Utf16StringUnits::Ascii(left) | Utf16StringUnits::Latin1(left)) => {
                 left.len() == right.len() && left.iter().zip(right).all(|(left, right)| u16::from(*left) == *right)
             }
         }
@@ -699,6 +784,38 @@ impl PartialEq for Utf16String {
 }
 
 impl Eq for Utf16String {}
+
+impl std::fmt::Debug for Utf16String {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let string = match self.as_units() {
+            Utf16StringUnits::Ascii(units) | Utf16StringUnits::Latin1(units) => {
+                units.iter().map(|&unit| char::from(unit)).collect::<String>()
+            }
+            Utf16StringUnits::Utf16(units) => String::from_utf16_lossy(units),
+        };
+        std::fmt::Debug::fmt(&string, formatter)
+    }
+}
+
+impl std::hash::Hash for Utf16String {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        // Equal strings can be kept in different storage, so the code units are hashed as UTF-16 whichever it is.
+        match self.as_units() {
+            Utf16StringUnits::Ascii(units) | Utf16StringUnits::Latin1(units) => {
+                state.write_usize(units.len());
+                for &unit in units {
+                    state.write_u16(u16::from(unit));
+                }
+            }
+            Utf16StringUnits::Utf16(units) => {
+                state.write_usize(units.len());
+                for &unit in units {
+                    state.write_u16(unit);
+                }
+            }
+        }
+    }
+}
 
 impl PartialEq for Utf16FlyString {
     #[inline]
@@ -837,9 +954,15 @@ pub unsafe fn utf16_string_units(raw: &usize) -> Utf16StringUnits<'_> {
     let storage = std::ptr::from_ref(header)
         .cast::<u8>()
         .wrapping_add(size_of::<Utf16StringDataHeader>());
-    if header.flags.load(Ordering::Acquire) & HAS_UTF16_STORAGE == 0 {
-        // SAFETY: Long ASCII storage starts immediately after the header and contains `length` bytes.
-        Utf16StringUnits::Ascii(unsafe { crate::slice_from_raw_parts(storage, length) })
+    let flags = header.flags.load(Ordering::Acquire);
+    if flags & HAS_UTF16_STORAGE == 0 {
+        // SAFETY: Long Latin-1 storage starts immediately after the header and contains `length` bytes.
+        let units = unsafe { crate::slice_from_raw_parts(storage, length) };
+        if flags & CONTAINS_NON_ASCII == 0 {
+            Utf16StringUnits::Ascii(units)
+        } else {
+            Utf16StringUnits::Latin1(units)
+        }
     } else {
         // SAFETY: Long UTF-16 storage starts immediately after the aligned header and contains
         // `length` u16 code units.

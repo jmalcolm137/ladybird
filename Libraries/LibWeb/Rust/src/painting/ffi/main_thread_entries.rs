@@ -9,6 +9,7 @@
 //! a token nor call an entry that does.
 
 use super::*;
+use crate::painting::hit_test::caret::HostNodeScopes;
 use crate::painting::host::FfiCaretAt;
 use crate::painting::host::FfiVisualContextTreeInputs;
 use crate::painting::paint_passes::{PassEffect, pending_preparation, run as run_paint_pass};
@@ -139,7 +140,7 @@ pub extern "C" fn render_state_scroll_target_for_text_position(
             super::node_read(),
             (text, offset, affinity_is_downstream, scroll_block_axis),
             |arena, (text, offset, affinity_is_downstream, scroll_block_axis)| {
-                arena.measure_scrollable_overflow();
+                arena.settle_scrollable_overflow();
                 crate::painting::scroll_chain::scroll_target_for_text_position(
                     &arena.paintable_rows(),
                     text,
@@ -155,66 +156,6 @@ pub extern "C" fn render_state_scroll_target_for_text_position(
     };
     *offset_out = scroll_offset.into();
     container
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn render_state_scrolling_box_for_scroll_step(
-    host: &crate::render_state::DocumentHost,
-    target: NodeSlotId,
-    viewport: NodeSlotId,
-    delta: FfiCssPixelPoint,
-) -> NodeSlotId {
-    read_arena(
-        host,
-        super::node_read(),
-        (target, viewport, delta),
-        |arena, (target, viewport, delta)| {
-            arena.measure_scrollable_overflow();
-            crate::painting::scroll_chain::scrolling_box_for_scroll_step(
-                &arena.paintable_rows(),
-                target,
-                viewport,
-                delta.into(),
-            )
-        },
-    )
-}
-
-/// # Safety
-///
-/// `host` must be a live document host, on its document's thread. The host callback receives the slots of live rows.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn render_state_for_each_wheel_scrollable_box_in_containing_block_chain(
-    host: &crate::render_state::DocumentHost,
-    start: NodeSlotId,
-    wheel_delta_x: f64,
-    wheel_delta_y: f64,
-    context: *mut c_void,
-    push_scrollable_box: unsafe extern "C" fn(*mut c_void, NodeSlotId, f64, f64),
-) {
-    let boxes = {
-        read_arena(
-            host,
-            super::node_read(),
-            (start, wheel_delta_x, wheel_delta_y),
-            |arena, (start, wheel_delta_x, wheel_delta_y)| {
-                arena.measure_scrollable_overflow();
-                let mut boxes = Vec::new();
-                crate::painting::scroll_chain::for_each_wheel_scrollable_box_in_containing_block_chain(
-                    &arena.paintable_rows(),
-                    start,
-                    wheel_delta_x,
-                    wheel_delta_y,
-                    |node, accepted_delta_x, accepted_delta_y| boxes.push((node, accepted_delta_x, accepted_delta_y)),
-                );
-                boxes
-            },
-        )
-    };
-    for (node, accepted_delta_x, accepted_delta_y) in boxes {
-        // SAFETY: The C++ callback appends the slot and deltas to a caller-owned collection.
-        unsafe { push_scrollable_box(context, node, accepted_delta_x, accepted_delta_y) };
-    }
 }
 
 #[unsafe(no_mangle)]
@@ -240,7 +181,7 @@ pub extern "C" fn render_state_first_wheel_scrollable_box_in_containing_block_ch
     start: NodeSlotId,
 ) -> NodeSlotId {
     read_arena(host, node_read(), start, |arena, start| {
-        arena.measure_scrollable_overflow();
+        arena.settle_scrollable_overflow();
         crate::painting::scroll_chain::first_wheel_scrollable_box_in_containing_block_chain(
             &arena.paintable_rows(),
             start,
@@ -751,6 +692,20 @@ pub extern "C" fn render_state_hold_next_recording_for_testing() {
     crate::painting::recording_slot::hold_next_recording_for_testing();
 }
 
+/// Keeps the Render thread from claiming the next style update that flies, until the test releases it or the host waits
+/// for it, which then takes it back.
+#[unsafe(no_mangle)]
+pub extern "C" fn render_state_hold_next_style_flight_claim_for_testing() {
+    crate::painting::recording_slot::hold_next_style_flight_claim_for_testing();
+}
+
+/// Holds the next style update that flies before it reads anything, until the test releases it or the host waits
+/// for it.
+#[unsafe(no_mangle)]
+pub extern "C" fn render_state_hold_next_style_flight_for_testing() {
+    crate::painting::recording_slot::hold_next_style_flight_for_testing();
+}
+
 /// Lets the recording held for the test go.
 #[unsafe(no_mangle)]
 pub extern "C" fn render_state_release_held_recording_for_testing() {
@@ -944,6 +899,21 @@ fn with_hit_test_list_spatial_indexes_and_visual_context_tree<R>(
     .unwrap_or(default)
 }
 
+/// `tree` with the compositor's animations sampled at the time the query reads them at, where it reads them so, kept in
+/// `sampled`; otherwise `tree` itself.
+fn tree_as_the_query_reads_it<'tree>(
+    tree: &'tree crate::painting::visual_context::VisualContextTree,
+    callbacks: &crate::painting::host::FfiHitTestQueryCallbacks,
+    sampled: &'tree mut Option<crate::painting::visual_context::VisualContextTree>,
+) -> &'tree crate::painting::visual_context::VisualContextTree {
+    match callbacks.visual_animation_sample_time_ns() {
+        Some(sample_time_ns) if tree.has_visual_animations() => {
+            sampled.insert(tree.with_visual_animation_samples(sample_time_ns))
+        }
+        _ => tree,
+    }
+}
+
 fn ffi_topmost(item: Option<crate::painting::hit_test::query::TopmostItem>) -> crate::painting::host::FfiTopmostItem {
     match item {
         Some(item) => crate::painting::host::FfiTopmostItem {
@@ -1052,7 +1022,11 @@ pub unsafe extern "C" fn layout_hit_test_find_topmost_item(
         read,
         false,
         Default::default(),
-        |list, tree, arena| ffi_topmost(list.find_topmost_item(arena, tree, &callbacks, point.into())),
+        |list, tree, arena| {
+            let mut sampled = None;
+            let tree = tree_as_the_query_reads_it(tree, &callbacks, &mut sampled);
+            ffi_topmost(list.find_topmost_item(arena, tree, &callbacks, point.into()))
+        },
     );
 }
 
@@ -1073,7 +1047,11 @@ pub unsafe extern "C" fn layout_hit_test_all(
         read,
         false,
         Vec::new(),
-        |list, tree, arena| list.hit_test_all(arena, tree, &callbacks, point.into()),
+        |list, tree, arena| {
+            let mut sampled = None;
+            let tree = tree_as_the_query_reads_it(tree, &callbacks, &mut sampled);
+            list.hit_test_all(arena, tree, &callbacks, point.into())
+        },
     );
     for index in indices {
         // SAFETY: The C++ sink consumes the index synchronously.
@@ -1102,7 +1080,10 @@ pub unsafe extern "C" fn layout_hit_test_caret_position_from_point(
     let mode = crate::painting::hit_test::caret::CaretPositionMode::from_u8(mode);
     *out = with_hit_test_list_spatial_indexes_and_visual_context_tree(host, read, true, None, |list, tree, arena| {
         list.caret_position_from_point(
-            &main_thread,
+            &HostNodeScopes {
+                main_thread: &main_thread,
+                callbacks: &callbacks,
+            },
             arena,
             tree,
             &callbacks,
@@ -1138,9 +1119,11 @@ pub unsafe extern "C" fn layout_hit_test_caret_at_line_edge(
     let main_thread = unsafe { main_thread(host) };
     *out = with_hit_test_list_and_caret_lines(host, read, None, |list, arena| {
         list.caret_at_line_edge(
-            &main_thread,
+            &HostNodeScopes {
+                main_thread: &main_thread,
+                callbacks: &callbacks,
+            },
             arena,
-            &callbacks,
             &query,
             offset,
             affinity_is_downstream,
@@ -1181,9 +1164,11 @@ pub unsafe extern "C" fn layout_hit_test_caret_on_adjacent_line(
     let main_thread = unsafe { main_thread(host) };
     *out = with_hit_test_list_and_caret_lines(host, read, None, |list, arena| {
         list.caret_on_adjacent_line(
-            &main_thread,
+            &HostNodeScopes {
+                main_thread: &main_thread,
+                callbacks: &callbacks,
+            },
             arena,
-            &callbacks,
             &query,
             offset,
             affinity_is_downstream,

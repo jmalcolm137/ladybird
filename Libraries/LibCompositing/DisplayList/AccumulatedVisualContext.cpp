@@ -130,6 +130,12 @@ bool AccumulatedVisualContextTree::has_active_visual_animation_at(i64 monotonic_
     return Compositing::RustFFI::visual_context_tree_has_active_visual_animation_at(m_rust_tree, monotonic_time_ns);
 }
 
+bool AccumulatedVisualContextTree::running_transform_animation_covers_point(i64 monotonic_time_ns, Gfx::FloatPoint screen_point, ScrollStateSnapshot const& scroll_state) const
+{
+    auto scroll_offsets = scroll_state.device_offsets();
+    return Compositing::RustFFI::visual_context_tree_running_transform_animation_covers_point(m_rust_tree, monotonic_time_ns, screen_point, scroll_offsets.data(), scroll_offsets.size());
+}
+
 VisualAnimationSummary AccumulatedVisualContextTree::visual_animation_summary() const
 {
     auto summary = Compositing::RustFFI::visual_context_tree_visual_animation_summary(m_rust_tree);
@@ -162,6 +168,11 @@ Optional<Gfx::Color> AccumulatedVisualContextTree::sampled_background_color(Effe
     return color;
 }
 
+bool AccumulatedVisualContextTree::can_snap_composited_context_origin(SpatialNodeIndex spatial_node_index) const
+{
+    return Compositing::RustFFI::visual_context_tree_can_snap_composited_context_origin(m_rust_tree, spatial_node_index);
+}
+
 Optional<Gfx::FloatPoint> AccumulatedVisualContextTree::transform_point_for_hit_test(ContextRef context, Gfx::FloatPoint screen_point, ScrollStateSnapshot const& scroll_state, ClipBehavior clip_behavior) const
 {
     auto scroll_offsets = scroll_state.device_offsets();
@@ -184,14 +195,6 @@ Gfx::FloatRect AccumulatedVisualContextTree::transform_rect_to_viewport(SpatialN
     Gfx::FloatRect rect;
     Compositing::RustFFI::visual_context_tree_transform_rect_to_viewport(m_rust_tree, index, source_rect, scroll_offsets.data(), scroll_offsets.size(), include_visual_viewport_transform == IncludeVisualViewportTransform::Yes, &rect);
     return rect;
-}
-
-Gfx::FloatPoint AccumulatedVisualContextTree::cumulative_scroll_chain_offset(SpatialNodeIndex index, ScrollStateSnapshot const& scroll_state) const
-{
-    auto scroll_offsets = scroll_state.device_offsets();
-    Gfx::FloatPoint offset;
-    Compositing::RustFFI::visual_context_tree_cumulative_scroll_chain_offset(m_rust_tree, index, scroll_offsets.data(), scroll_offsets.size(), &offset);
-    return offset;
 }
 
 Gfx::FloatMatrix4x4 AccumulatedVisualContextTree::accumulated_matrix(SpatialNodeIndex index, ScrollStateSnapshot const& scroll_state, IncludeVisualViewportTransform include_visual_viewport_transform) const

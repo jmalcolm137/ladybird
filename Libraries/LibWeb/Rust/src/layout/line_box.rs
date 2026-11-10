@@ -134,7 +134,7 @@ impl LineBoxData {
         content_block_size: CssPixels,
         border_box_block_start: CssPixels,
         border_box_block_end: CssPixels,
-        glyphs: Option<line_box_fragment::GlyphData>,
+        glyphs: Option<line_box_fragment::ItemGlyphRun<'_>>,
         facts: line_box_fragment::FragmentBuildFacts,
         text_align_is_justify: bool,
         trailing_whitespace: line_box_fragment::TrailingWhitespace,
@@ -145,7 +145,7 @@ impl LineBoxData {
                     !last.has_soft_wrap_opportunity_after
                         && last.layout_node == layout_node
                         && last.glyphs.as_ref().is_some_and(|last_glyphs| {
-                            last_glyphs.font == glyphs.font && last_glyphs.is_upright == glyphs.is_upright
+                            last_glyphs.font == *glyphs.font && last_glyphs.is_upright == glyphs.is_upright
                         })
                         && last.start + last.length_in_code_units == start
                 })
@@ -153,7 +153,7 @@ impl LineBoxData {
         if can_merge {
             let last = self.fragments.last_mut().unwrap();
             last.length_in_code_units += length;
-            last.append_glyph_run(glyphs.unwrap(), content_inline_size, start - last.start);
+            last.append_glyph_run(&glyphs.unwrap(), content_inline_size, start - last.start);
             if trailing_whitespace.length_in_code_units == length {
                 last.trailing_whitespace.length_in_code_units += trailing_whitespace.length_in_code_units;
                 last.trailing_whitespace.inline_size += trailing_whitespace.inline_size;
@@ -173,7 +173,7 @@ impl LineBoxData {
                 border_box_block_start,
                 self.direction,
                 self.writing_mode,
-                glyphs,
+                glyphs.map(line_box_fragment::ItemGlyphRun::into_glyph_data),
                 facts,
             );
             fragment.trailing_whitespace = trailing_whitespace;
@@ -189,6 +189,10 @@ impl LineBoxData {
         self.block_length = self
             .block_length
             .max(content_block_size + border_box_block_start + border_box_block_end);
+    }
+
+    pub(crate) fn advance_inline_length(&mut self, inline_size: CssPixels) {
+        self.record.inline_length += inline_size;
     }
 
     pub(crate) fn add_static_position_marker(&mut self, box_: Node, preceded_by_inline_box_start_edges: bool) {

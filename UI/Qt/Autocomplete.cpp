@@ -8,50 +8,41 @@
 
 #include <AK/AnyOf.h>
 #include <AK/GenericShorthands.h>
-#include <AK/Platform.h>
 #include <AK/kmalloc.h>
 #include <LibWebView/Autocomplete.h>
 #include <UI/Qt/Autocomplete.h>
 #include <UI/Qt/ChromeStyle.h>
 #include <UI/Qt/Icon.h>
-#include <UI/Qt/Motion.h>
-#include <UI/Qt/Popover.h>
 #include <UI/Qt/StringUtils.h>
-#include <UI/Qt/SystemAppearance.h>
 #include <UI/Qt/Theme.h>
 
 #include <QAbstractListModel>
 #include <QApplication>
+#include <QColor>
 #include <QEvent>
 #include <QFontMetrics>
 #include <QFrame>
 #include <QIcon>
 #include <QKeyEvent>
+#include <QLayout>
 #include <QLineEdit>
 #include <QListView>
 #include <QMouseEvent>
 #include <QPainter>
 #include <QPalette>
-#include <QPixmap>
 #include <QPoint>
 #include <QStyle>
 #include <QStyleOption>
 #include <QStyledItemDelegate>
 #include <QTextLayout>
 #include <QTimer>
-#include <QVBoxLayout>
-#include <QVariantAnimation>
-#include <QWindow>
 
 namespace Ladybird {
 
-// The suggestions float in a card a little below the address field, as wide as the field.
-static constexpr int POPUP_ANCHOR_GAP = 4;
-static constexpr int POPUP_PADDING = 6;
-static constexpr int POPUP_CORNER_RADIUS = 12;
-// The card's shadow is drawn in a window of its own, with this much room around the card.
-// NB: The shadow falls downward, so it needs less room above the card.
-static constexpr QMargins POPUP_SHADOW_MARGINS { 60, 36, 60, 90 };
+// The suggestions are listed in the address field's surface, below the field, with this much room around them. The
+// surface also draws the line between the field and the list, which is this tall.
+static constexpr int LIST_PADDING = 6;
+static constexpr int FIELD_DIVIDER_HEIGHT = 1;
 static constexpr int ROW_HEIGHT = 34;
 static constexpr int ROW_CORNER_RADIUS = 6;
 static constexpr int CELL_HORIZONTAL_PADDING = 12;
@@ -61,7 +52,6 @@ static constexpr int CELL_SPACING = 12;
 static constexpr int GROUP_SEPARATOR_MARGIN = 5;
 static constexpr int GROUP_SEPARATOR_INSET = 8;
 static constexpr int GROUP_SEPARATOR_HEIGHT = (2 * GROUP_SEPARATOR_MARGIN) + 1;
-static constexpr int MINIMUM_POPUP_WIDTH = 100;
 
 static constexpr size_t MAXIMUM_VISIBLE_AUTOCOMPLETE_SUGGESTIONS = 8;
 
@@ -74,26 +64,6 @@ enum AutocompleteRole {
     SuggestionIndexRole,
     HighlightInputRole,
     StartsGroupRole,
-};
-
-// The popup window is this card, with transparent corners.
-class AutocompleteCard final : public QFrame {
-    AK_ALLOC_WITH_KMALLOC;
-
-public:
-    using QFrame::QFrame;
-
-protected:
-    virtual void paintEvent(QPaintEvent*) override
-    {
-        auto opaque_pixels_only = ChromeStyle::shows_opaque_pixels_only(*this);
-        QPainter painter(this);
-        painter.setRenderHint(QPainter::Antialiasing, !opaque_pixels_only);
-        auto const& panel = Theme::panel();
-        painter.setBrush(panel.surface);
-        painter.setPen(QPen(opaque_pixels_only ? ChromeStyle::opaque_panel_edge() : panel.edge, 1));
-        painter.drawRoundedRect(QRectF(rect()).adjusted(0.5, 0.5, -0.5, -0.5), POPUP_CORNER_RADIUS, POPUP_CORNER_RADIUS);
-    }
 };
 
 static QFont autocomplete_title_font()
@@ -169,10 +139,10 @@ public:
             auto const& suggestion = m_suggestions[index];
             if (!suggestion.favicon_png.has_value())
                 continue;
-            QPixmap pixmap;
-            if (!pixmap.loadFromData(suggestion.favicon_png->data(), static_cast<uint>(suggestion.favicon_png->size())))
+            auto icon = icon_from_png(suggestion.favicon_png->bytes(), CELL_ICON_SIZE);
+            if (icon.isNull())
                 continue;
-            m_favicon_cache.append({ index, QIcon(pixmap) });
+            m_favicon_cache.append({ index, move(icon) });
         }
 
         endResetModel();
@@ -361,99 +331,65 @@ Autocomplete::Autocomplete(QLineEdit* anchor)
 {
     m_model = new AutocompleteModel(this);
     m_delegate = new AutocompleteDelegate(this);
-    create_popup();
     qApp->installEventFilter(this);
 }
 
-void Autocomplete::create_popup()
+QListView* Autocomplete::create_list_view(QWidget& parent)
 {
-    // Use a non-activating top-level widget for its own translucent backing store. Its native window is embedded in the
-    // browser window in position_popup().
-    m_popup = new AutocompleteCard(m_anchor->window(), Qt::ToolTip | Qt::FramelessWindowHint | Qt::NoDropShadowWindowHint);
-    connect(m_popup, &QObject::destroyed, this, [this] {
-        // The popup dies with its parent window, which can go away while this object lives on (for
-        // example when the tab is moved to another window); it is recreated on the next show.
-        m_popup = nullptr;
-        m_list_view = nullptr;
-        m_opening_animation = nullptr;
-        set_anchor_popup_open(false);
-    });
-    m_popup->setObjectName("LadybirdAutocompletePopup");
-    m_popup->setAttribute(Qt::WA_TranslucentBackground);
-#if defined(AK_OS_MACOS)
-    // The web content view is a native QRhiWidget on macOS, so the popup must
-    // also be native to receive mouse events while overlapping it.
-    m_popup->setAttribute(Qt::WA_NativeWindow);
-#endif
-    m_popup->setAttribute(Qt::WA_ShowWithoutActivating);
-    m_popup->setAttribute(Qt::WA_X11DoNotAcceptFocus);
-    m_popup->setFocusPolicy(Qt::NoFocus);
-    m_popup->setFrameShape(QFrame::NoFrame);
-    m_popup->hide();
+    auto* list_view = new QListView(&parent);
+    list_view->setObjectName("LadybirdAutocompleteList");
+    list_view->setFocusPolicy(Qt::NoFocus);
+    list_view->setSelectionMode(QAbstractItemView::SingleSelection);
+    list_view->setMouseTracking(true);
+    list_view->setFrameShape(QFrame::NoFrame);
+    list_view->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+    list_view->setVerticalScrollBarPolicy(Qt::ScrollBarAsNeeded);
+    list_view->setModel(m_model);
+    list_view->setItemDelegate(m_delegate);
+    list_view->installEventFilter(this);
 
-    // The card casts the same shadow as popovers. The shadow is a window of its own behind the card, and it lets the
-    // mouse through to the page, which a transparent room around the card in the card's window would not.
-    m_shadow = new QWidget(m_anchor->window(), Qt::ToolTip | Qt::FramelessWindowHint | Qt::NoDropShadowWindowHint | Qt::WindowTransparentForInput);
-    m_shadow->setAttribute(Qt::WA_TranslucentBackground);
-#if defined(AK_OS_MACOS)
-    m_shadow->setAttribute(Qt::WA_NativeWindow);
-#endif
-    m_shadow->setAttribute(Qt::WA_ShowWithoutActivating);
-    m_shadow->setAttribute(Qt::WA_X11DoNotAcceptFocus);
-    m_shadow->setAttribute(Qt::WA_TransparentForMouseEvents);
-    auto* shadow_layout = new QVBoxLayout(m_shadow);
-    shadow_layout->setContentsMargins(POPUP_SHADOW_MARGINS);
-    auto* shadow_caster = new AutocompleteCard(m_shadow);
-    cast_popover_shadow(*shadow_caster);
-    shadow_layout->addWidget(shadow_caster);
-    m_shadow->hide();
-
-    m_list_view = new QListView(m_popup);
-    m_list_view->setObjectName("LadybirdAutocompleteList");
-    m_list_view->setFocusPolicy(Qt::NoFocus);
-    m_list_view->setSelectionMode(QAbstractItemView::SingleSelection);
-    m_list_view->setMouseTracking(true);
-    m_list_view->setFrameShape(QFrame::NoFrame);
-    m_list_view->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
-    m_list_view->setVerticalScrollBarPolicy(Qt::ScrollBarAsNeeded);
-    m_list_view->setModel(m_model);
-    m_list_view->setItemDelegate(m_delegate);
-    update_chrome_style();
-
-    auto* layout = new QVBoxLayout(m_popup);
-    layout->setContentsMargins(POPUP_PADDING, POPUP_PADDING, POPUP_PADDING, POPUP_PADDING);
-    layout->setSpacing(0);
-    layout->addWidget(m_list_view);
-
-    connect(m_list_view, &QAbstractItemView::clicked, this, [this](QModelIndex const& index) {
+    connect(list_view, &QAbstractItemView::clicked, this, [this](QModelIndex const& index) {
         if (!is_selectable_row(index.row()))
             return;
         emit suggestion_clicked(index.data(SuggestionIndexRole).toInt());
     });
+    return list_view;
+}
+
+void Autocomplete::set_host(QWidget* host)
+{
+    if (m_host == host)
+        return;
+
+    auto was_visible = close();
+    delete m_list_view.data();
+
+    m_host = host;
+    if (host) {
+        m_list_view = create_list_view(*host);
+        m_list_view->hide();
+        host->layout()->addWidget(m_list_view);
+        update_chrome_style();
+    }
+    if (was_visible)
+        show_current_suggestions();
 }
 
 Autocomplete::~Autocomplete()
 {
     qApp->removeEventFilter(this);
-    if (m_popup) {
-        disconnect(m_popup, nullptr, this, nullptr);
-        delete m_popup;
-    }
-    delete m_shadow.data();
+    delete m_list_view.data();
 }
 
 void Autocomplete::update_chrome_style()
 {
-    if (!m_popup || m_is_updating_chrome_style)
+    if (!m_list_view || m_is_updating_chrome_style)
         return;
 
     m_is_updating_chrome_style = true;
     auto palette = QApplication::palette();
-    m_popup->setPalette(palette);
     m_list_view->setPalette(palette);
-    m_popup->setStyleSheet(ChromeStyle::autocomplete_popup_style_sheet(palette));
-    m_popup->update();
-    m_shadow->update();
+    m_list_view->setStyleSheet(ChromeStyle::autocomplete_popup_style_sheet(palette));
     m_list_view->viewport()->update();
     m_is_updating_chrome_style = false;
 }
@@ -472,52 +408,29 @@ void Autocomplete::schedule_chrome_style_update()
 
 void Autocomplete::show_with_suggestions(Vector<WebView::AutocompleteSuggestion> suggestions, Optional<size_t> selected_suggestion_index)
 {
-    if (!m_popup)
-        create_popup();
-
     m_model->set_suggestions(move(suggestions));
-    if (m_model->rowCount() == 0) {
+    show_current_suggestions();
+    set_selected_suggestion(selected_suggestion_index);
+}
+
+void Autocomplete::show_current_suggestions()
+{
+    // NB: Only a field with a host, which is the field that is shown, lists suggestions.
+    if (m_model->rowCount() == 0 || !m_list_view) {
         close();
         return;
     }
 
     update_chrome_style();
-    position_popup();
-    if (!m_popup->isVisible()) {
-        // The panel fades in from 4 px above its place, unless the system asks for less motion.
-        if (!m_opening_animation) {
-            m_opening_animation = new QVariantAnimation(m_popup);
-            m_opening_animation->setDuration(Motion::FAST);
-            m_opening_animation->setEasingCurve(Motion::enter_easing());
-            m_opening_animation->setStartValue(0.0);
-            m_opening_animation->setEndValue(1.0);
-            QObject::connect(m_opening_animation, &QVariantAnimation::valueChanged, m_popup, [this](QVariant const& value) {
-                auto progress = value.toReal();
-                m_opening_offset = SystemAppearance::prefers_reduced_motion() ? 0 : -4 * (1 - progress);
-                set_floating_window_opacity(*m_popup, progress);
-                set_floating_window_opacity(*m_shadow, progress);
-                position_popup();
-            });
-        }
-        auto reduce_motion = SystemAppearance::prefers_reduced_motion();
-        m_opening_offset = reduce_motion ? 0 : -4;
-        set_floating_window_opacity(*m_popup, 0);
-        set_floating_window_opacity(*m_shadow, 0);
-        m_shadow->show();
-        m_popup->show();
-        position_popup();
-        m_opening_animation->stop();
-        m_opening_animation->start();
-    }
-    m_shadow->raise();
-    m_popup->raise();
-
-    set_selected_suggestion(selected_suggestion_index);
+    // NB: The host may be hidden until it sees the list is open, so the list's own visibility isn't watched.
+    m_list_view->setFixedHeight(list_height());
+    m_list_view->show();
+    set_anchor_popup_open(true);
 }
 
 void Autocomplete::set_selected_suggestion(Optional<size_t> suggestion_index)
 {
-    if (!m_popup)
+    if (!m_list_view)
         return;
 
     int table_row = suggestion_index.has_value()
@@ -536,10 +449,10 @@ void Autocomplete::set_selected_suggestion(Optional<size_t> suggestion_index)
 
 bool Autocomplete::close()
 {
-    if (!m_popup || !m_popup->isVisible())
+    if (!is_visible())
         return false;
-    m_popup->hide();
-    m_shadow->hide();
+    m_list_view->hide();
+    set_anchor_popup_open(false);
     return true;
 }
 
@@ -555,36 +468,27 @@ void Autocomplete::set_anchor_popup_open(bool open)
 
 bool Autocomplete::is_visible() const
 {
-    return m_popup && m_popup->isVisible();
+    return m_list_view && !m_list_view->isHidden();
 }
 
 bool Autocomplete::eventFilter(QObject* watched, QEvent* event)
 {
     auto type = event->type();
-    if (watched == m_popup && (type == QEvent::Show || type == QEvent::Hide))
-        set_anchor_popup_open(type == QEvent::Show);
-
-    // Qt still considers the embedded popup a top-level widget. Close it before application shutdown attempts to close
-    // its native child window directly.
     if ((watched == m_anchor->window() && first_is_one_of(type, QEvent::Hide, QEvent::Resize)) || (watched == qApp && type == QEvent::Quit)) {
         if (close())
             emit dismissed();
     }
 
-    if (is_visible() && (watched == m_anchor || watched == m_anchor->window())
-        && (type == QEvent::Move || type == QEvent::Resize))
-        position_popup();
-
     if (type == QEvent::ApplicationPaletteChange || type == QEvent::ThemeChange
-        || (type == QEvent::PaletteChange && (watched == m_anchor || watched == m_popup || watched == m_list_view)))
+        || (type == QEvent::PaletteChange && (watched == m_anchor || watched == m_list_view)))
         schedule_chrome_style_update();
 
     if (event->type() == QEvent::MouseButtonPress && is_visible()) {
         auto* mouse_event = static_cast<QMouseEvent*>(event);
         auto global = mouse_event->globalPosition().toPoint();
-        auto popup_global = QRect(m_popup->mapToGlobal(QPoint(0, 0)), m_popup->size());
+        auto host_global = QRect(m_host->mapToGlobal(QPoint(0, 0)), m_host->size());
         auto anchor_global = QRect(m_anchor->mapToGlobal(QPoint(0, 0)), m_anchor->size());
-        if (!popup_global.contains(global) && !anchor_global.contains(global)) {
+        if (!host_global.contains(global) && !anchor_global.contains(global)) {
             if (close())
                 emit dismissed();
         }
@@ -592,57 +496,21 @@ bool Autocomplete::eventFilter(QObject* watched, QEvent* event)
     return QObject::eventFilter(watched, event);
 }
 
-void Autocomplete::position_popup()
+int Autocomplete::list_height() const
 {
     int visible_count = static_cast<int>(min(m_model->visible_suggestion_count(), MAXIMUM_VISIBLE_AUTOCOMPLETE_SUGGESTIONS));
-    if (visible_count == 0)
-        return;
-
     int total_height = 0;
-    int seen_suggestions = 0;
-    int row_count = m_model->rowCount();
-    for (int i = 0; i < row_count; ++i) {
-        auto index = m_model->index(i, 0);
+    for (int i = 0; i < visible_count; ++i) {
         QStyleOptionViewItem option;
         option.initFrom(m_list_view);
-        int h = m_delegate->sizeHint(option, index).height();
-        total_height += h;
-        ++seen_suggestions;
-        if (seen_suggestions >= visible_count)
-            break;
+        total_height += m_delegate->sizeHint(option, m_model->index(i, 0)).height();
     }
 
+    // The list ends a little above the window's bottom edge.
     auto* top_window = m_anchor->window();
-    if (!top_window)
-        return;
-    for (QWidget* window : { static_cast<QWidget*>(m_shadow.data()), static_cast<QWidget*>(m_popup) }) {
-        if (window->parentWidget() != top_window) {
-            window->setParent(top_window, window->windowFlags());
-            window->setAttribute(Qt::WA_ShowWithoutActivating);
-            window->setAttribute(Qt::WA_X11DoNotAcceptFocus);
-        }
-
-        // Embed the native window so it stacks above native web content without being animated independently of the
-        // location field by the window system.
-        (void)window->winId();
-        window->windowHandle()->setParent(top_window->windowHandle());
-    }
-
-    // The card is as wide as the field and sits a little below it.
-    int card_width = max(m_anchor->width(), MINIMUM_POPUP_WIDTH);
-    auto card_position = m_anchor->mapTo(top_window, QPoint(0, m_anchor->height() + POPUP_ANCHOR_GAP + qRound(m_opening_offset)));
-    int vertical_overhead = 2 * POPUP_PADDING;
-    int available_height = max(0, top_window->height() - card_position.y() - vertical_overhead);
-    int list_height = min(total_height, available_height);
-
-    m_list_view->setFixedHeight(list_height);
-    m_popup->setFixedSize(card_width, list_height + vertical_overhead);
-
-    auto card = QRect(card_position, m_popup->size());
-    m_shadow->setGeometry(card.marginsAdded(POPUP_SHADOW_MARGINS));
-    m_popup->setGeometry(card);
-    m_shadow->raise();
-    m_popup->raise();
+    auto list_top = m_anchor->mapTo(top_window, QPoint(0, m_anchor->height() + FIELD_DIVIDER_HEIGHT + LIST_PADDING)).y();
+    int available_height = max(0, top_window->height() - list_top - LIST_PADDING);
+    return min(total_height, available_height);
 }
 
 bool Autocomplete::is_selectable_row(int row) const

@@ -16,6 +16,7 @@
 #include <core/SkColorSpace.h>
 #include <core/SkMaskFilter.h>
 #include <core/SkPath.h>
+#include <core/SkPathBuilder.h>
 #include <core/SkPathEffect.h>
 #include <core/SkPathUtils.h>
 #include <core/SkPicture.h>
@@ -42,6 +43,7 @@
 #include <LibGfx/Bitmap.h>
 #include <LibGfx/ColorSpace.h>
 #include <LibGfx/DecodedImageFrame.h>
+#include <LibGfx/Gradients.h>
 
 namespace Compositor {
 
@@ -105,20 +107,6 @@ static void clip_to_rounded_rect(SkCanvas& canvas, auto const& rect, Gfx::Corner
         canvas.clipRect(to_skia_rect(rect), clip_op, true);
 }
 
-static SkMatrix to_skia_matrix(Gfx::AffineTransform const& affine_transform)
-{
-    SkScalar affine[6];
-    affine[0] = affine_transform.a();
-    affine[1] = affine_transform.b();
-    affine[2] = affine_transform.c();
-    affine[3] = affine_transform.d();
-    affine[4] = affine_transform.e();
-    affine[5] = affine_transform.f();
-
-    SkMatrix matrix;
-    matrix.setAffine(affine);
-    return matrix;
-}
 static SkM44 to_skia_matrix4x4(Gfx::FloatMatrix4x4 const& matrix)
 {
     return SkM44(
@@ -202,12 +190,11 @@ static void paint_scrollbar_into_surface(Gfx::PaintingSurface& surface, Scrollba
     thumb_fill_paint.setAntiAlias(!rect_is_pixel_aligned(thumb_rect));
     canvas.drawRRect(thumb_rrect, thumb_fill_paint);
 
-    auto stroke_color = scrollbar.thumb_color.lightened();
     SkPaint stroke_paint;
     stroke_paint.setStroke(true);
     stroke_paint.setStrokeWidth(1);
     stroke_paint.setAntiAlias(true);
-    stroke_paint.setColor(to_skia_color(stroke_color));
+    stroke_paint.setColor(to_skia_color(scrollbar.thumb_outline_color));
     stroke_paint.setAlphaf(stroke_paint.getAlphaf() * opacity);
     canvas.drawRRect(thumb_rrect, stroke_paint);
 }
@@ -300,7 +287,16 @@ void DisplayListPlayerSkia::play_command(DrawCompositedContext const& command)
     if (!m_composited_context_resolver)
         return;
 
-    auto composited_context = (*m_composited_context_resolver)(command.child_context_id, command.dst_rect, canvas_matrix());
+    auto destination_rect = command.dst_rect;
+
+    // Snap iframe origins to device pixels for browser compatibility when transforms are absent or identity.
+    // Preserve fractional placement under other transforms to retain the raster phase of surrounding content.
+    if (command.snap_origin_if_untransformed && active_visual_context_tree().can_snap_composited_context_origin(command.spatial_node_index)) {
+        destination_rect.set_x(roundf(destination_rect.x()));
+        destination_rect.set_y(roundf(destination_rect.y()));
+    }
+
+    auto composited_context = (*m_composited_context_resolver)(command.child_context_id, destination_rect, canvas_matrix());
     if (!composited_context.surface || composited_context.content_rect.is_empty())
         return;
 
@@ -308,7 +304,7 @@ void DisplayListPlayerSkia::play_command(DrawCompositedContext const& command)
     if (!image)
         return;
 
-    auto dst_rect = to_skia_rect(command.dst_rect);
+    auto dst_rect = to_skia_rect(destination_rect);
     auto src_rect = to_skia_rect(composited_context.content_rect);
     auto& canvas = surface().canvas();
     SkPaint paint;
@@ -791,7 +787,7 @@ void DisplayListPlayerSkia::play_command(PaintOuterBoxShadow const& command)
 // shadows are.
 void DisplayListPlayerSkia::play_command(PaintPathBoxShadow const& command)
 {
-    auto shape = Gfx::to_skia_path(path_from_data(command.shape_path_data));
+    auto shape = path_from_data(command.shape_path_data);
 
     // The spread distance grows the shape of an outer shadow, and shrinks the shape whose outside casts an inner one,
     // by the outline of a stroke along the shape twice as wide.
@@ -988,7 +984,19 @@ void DisplayListPlayerSkia::play_command(FillRoundedRectRing const& command)
         inner_corner(command.corner_radii.bottom_right, right_width, bottom_width),
         inner_corner(command.corner_radii.bottom_left, left_width, bottom_width),
     };
-    canvas.drawDRRect(outer_rounded_rect, to_skia_rrect(inner_rect, inner_corner_radii), paint);
+    if (top_width > 0 && right_width > 0 && bottom_width > 0 && left_width > 0) {
+        canvas.drawDRRect(outer_rounded_rect, to_skia_rrect(inner_rect, inner_corner_radii), paint);
+        return;
+    }
+
+    // Skia's GPU drawDRRect leaves ghost edges where the outlines coincide. A single path cancels those edges.
+    auto path = SkPathBuilder(SkPathFillType::kEvenOdd)
+                    .addRRect(outer_rounded_rect)
+                    .addRRect(to_skia_rrect(inner_rect, inner_corner_radii))
+                    .setIsVolatile(true)
+                    .detach();
+
+    canvas.drawPath(path, paint);
 }
 
 static SkTileMode to_skia_tile_mode(DisplayListGradientSpreadMethod spread_method)
@@ -1101,15 +1109,14 @@ SkPaint DisplayListPlayerSkia::paint_style_to_skia_paint(DisplayListPaintStyle c
     VERIFY_NOT_REACHED();
 }
 
-Gfx::Path DisplayListPlayerSkia::path_from_data(DisplayListDataSpan path_data) const
+SkPath DisplayListPlayerSkia::path_from_data(DisplayListDataSpan path_data) const
 {
-    auto bytes = inline_data(path_data);
-    return Gfx::Path::from_serialized_bytes(bytes);
+    return Gfx::skia_path_from_serialized_bytes(inline_data(path_data));
 }
 
 void DisplayListPlayerSkia::play_command(FillPath const& command)
 {
-    auto path = Gfx::to_skia_path(path_from_data(command.path_data));
+    auto path = path_from_data(command.path_data);
     path.setFillType(to_skia_path_fill_type(command.winding_rule));
 
     SkPaint paint;
@@ -1126,7 +1133,7 @@ void DisplayListPlayerSkia::play_command(FillPath const& command)
 
 void DisplayListPlayerSkia::play_command(StrokePath const& command)
 {
-    auto path = Gfx::to_skia_path(path_from_data(command.path_data));
+    auto path = path_from_data(command.path_data);
     SkPaint paint;
     if (command.paint_kind == PathPaintKind::PaintStyle) {
         paint = paint_style_to_skia_paint(command.paint_style, command.path_bounding_rect);
@@ -1450,10 +1457,6 @@ void DisplayListPlayerSkia::play_command(CompositorSnapArea const&)
 {
 }
 
-void DisplayListPlayerSkia::play_command(CompositorScrollChainingBarrier const&)
-{
-}
-
 void DisplayListPlayerSkia::play_command(CompositorNestedContextWheelRegion const&)
 {
 }
@@ -1461,7 +1464,7 @@ void DisplayListPlayerSkia::play_command(CompositorNestedContextWheelRegion cons
 void DisplayListPlayerSkia::play_command(PaintScrollBar const& command)
 {
     if (m_scrollbar_controller) {
-        if (auto scrollbar = m_scrollbar_controller->presented_scrollbar_painted_by_display_list(command.scroll_node_index, command.vertical, command.thumb_color, command.track_color, active_scroll_state()); scrollbar.has_value()) {
+        if (auto scrollbar = m_scrollbar_controller->presented_scrollbar_painted_by_display_list(command.scroll_node_index, command.vertical, command.thumb_color, command.thumb_outline_color, command.track_color, active_scroll_state()); scrollbar.has_value()) {
             paint_scrollbar_into_surface(surface(), *scrollbar);
             return;
         }
@@ -1470,6 +1473,7 @@ void DisplayListPlayerSkia::play_command(PaintScrollBar const& command)
         .gutter_rect = command.gutter_rect.to_type<float>(),
         .thumb_rect = ScrollbarController::thumb_rect_kept_inside_track(command.thumb_rect, command.track_rect, command.vertical).to_type<float>(),
         .thumb_color = command.thumb_color,
+        .thumb_outline_color = command.thumb_outline_color,
         .track_color = command.track_color,
     };
     paint_scrollbar_into_surface(surface(), scrollbar);
@@ -1492,7 +1496,7 @@ void DisplayListPlayerSkia::push_clip_path(Gfx::PathData const& path, u64 path_i
 void DisplayListPlayerSkia::push_clip_path_bytes(ReadonlyBytes path_bytes, Gfx::WindingRule winding_rule)
 {
     surface().canvas().save();
-    clip_path(Gfx::to_skia_path(Gfx::Path::from_serialized_bytes(path_bytes)), winding_rule, true);
+    clip_path(Gfx::skia_path_from_serialized_bytes(path_bytes), winding_rule, true);
 }
 
 void DisplayListPlayerSkia::push_transform(Gfx::AffineTransform const& transform)
@@ -1553,13 +1557,43 @@ void DisplayListPlayerSkia::push_layer(ReplayLayer const& layer)
     canvas.saveLayer(SkCanvas::SaveLayerRec(nullptr, &paint, backdrop_image_filter(layer, true).get(), 0));
 }
 
-// With `limited_to_region`, the filtered backdrop is cropped to the rounded region inside the filter
-// graph, which also bounds what the filter reads.
+// Replay gives the edge as the clips around the box leave it. What lies beyond the surface cannot be read, so the edge
+// stops there too, which keeps a box larger than the surface cheap to read. Skia keeps only whole pixels of a mirroring
+// crop, so the edge has to span the pixels it touches; otherwise, a region thinner than a pixel would vanish.
+static Gfx::FloatRect backdrop_blur_edge_on_surface(SkCanvas const& canvas, Gfx::FloatRect clipped_region)
+{
+    auto const& matrix = canvas.getTotalMatrix();
+    SkMatrix inverse;
+    if (!matrix.invert(&inverse))
+        return clipped_region;
+    auto edge = to_skia_rect(clipped_region);
+    auto surface_bounds = SkRect::Make(canvas.getBaseLayerSize());
+    if (matrix.rectStaysRect()) {
+        edge = SkRect::Make(matrix.mapRect(edge).roundOut());
+        if (!edge.intersect(surface_bounds))
+            return {};
+        edge = inverse.mapRect(edge);
+    } else {
+        if (!edge.intersect(inverse.mapRect(surface_bounds)))
+            return {};
+        // Skia picks the pixels of a turned box in a space of its own, so only their largest possible size is known.
+        if (auto scale = matrix.getMinScale(); scale > 0) {
+            auto pixel = 1 / scale;
+            edge.outset(edge.width() < 2 * pixel ? pixel : 0, edge.height() < 2 * pixel ? pixel : 0);
+        }
+    }
+    return { edge.x(), edge.y(), edge.width(), edge.height() };
+}
+
+// With `limited_to_region`, the filtered backdrop is cropped to the rounded region inside the filter graph.
 sk_sp<SkImageFilter> DisplayListPlayerSkia::backdrop_image_filter(ReplayLayer const& layer, bool limited_to_region)
 {
     ReadonlyBytes filter_bytes { layer.backdrop_filter_bytes, layer.backdrop_filter_bytes_size };
-    return raster_cache().backdrop_image_filter(active_visual_context_tree().structural_epoch(), layer, limited_to_region, [&] {
-        auto image_filter = image_filter_from_bytes(filter_bytes);
+    Optional<Gfx::FloatRect> blur_edge;
+    if (layer.backdrop_blur_edge.has_value())
+        blur_edge = backdrop_blur_edge_on_surface(surface().canvas(), *layer.backdrop_blur_edge);
+    return raster_cache().backdrop_image_filter(active_visual_context_tree().structural_epoch(), layer, blur_edge, limited_to_region, [&] {
+        auto image_filter = image_filter_from_bytes(filter_bytes, blur_edge);
         if (layer.backdrop_base_color.alpha() != 0) {
             auto base = SkImageFilters::Shader(SkShaders::Color(to_skia_color(layer.backdrop_base_color)));
             image_filter = SkImageFilters::Compose(move(image_filter), SkImageFilters::Blend(SkBlendMode::kSrcOver, move(base), nullptr));
@@ -1589,11 +1623,9 @@ sk_sp<SkImageFilter> DisplayListPlayerSkia::layer_image_filter(ReplayLayer const
     });
 }
 
-sk_sp<SkImageFilter> DisplayListPlayerSkia::image_filter_from_bytes(ReadonlyBytes filter_bytes)
+sk_sp<SkImageFilter> DisplayListPlayerSkia::image_filter_from_bytes(ReadonlyBytes filter_bytes, Optional<Gfx::FloatRect> blur_edge)
 {
-    return Gfx::to_skia_image_filter(filter_bytes, [&](u64 image_id) -> Gfx::DecodedImageFrame const& {
-        return resource_storage().image_frame(ImageFrameResourceId { image_id });
-    });
+    return Gfx::to_skia_image_filter(filter_bytes, [&](u64 image_id) -> Gfx::DecodedImageFrame const& { return resource_storage().image_frame(ImageFrameResourceId { image_id }); }, blur_edge);
 }
 
 // A mask that applies to a box's filtered backdrop starts its layer with that backdrop, read from the
@@ -1640,12 +1672,17 @@ void DisplayListPlayerSkia::pop()
     surface().canvas().restore();
 }
 
-void DisplayListPlayerSkia::push_device_space_plane_clip(Gfx::Path const& path)
+void DisplayListPlayerSkia::push_device_space_plane_clip(ReadonlySpan<Gfx::FloatVector3> polygon_vertices)
 {
+    Vector<SkPoint, 8> polygon_points;
+    polygon_points.ensure_capacity(polygon_vertices.size());
+    for (auto const& vertex : polygon_vertices)
+        polygon_points.unchecked_append(Gfx::to_skia_point(vertex));
+
     auto& canvas = surface().canvas();
     canvas.save();
     canvas.setMatrix(SkM44());
-    clip_path(Gfx::to_skia_path(path), Gfx::WindingRule::Nonzero, false);
+    clip_path(SkPath::Polygon({ polygon_points.data(), polygon_points.size() }, true), Gfx::WindingRule::Nonzero, false);
 }
 
 void DisplayListPlayerSkia::set_matrix(Gfx::FloatMatrix4x4 const& matrix)

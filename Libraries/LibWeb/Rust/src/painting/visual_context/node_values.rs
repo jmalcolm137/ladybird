@@ -10,6 +10,7 @@ use crate::css::computed_value_views::{ComputedValuesView, LengthPercentageRef};
 use crate::css::css_enums;
 use crate::css::css_pixels::CssPixelRect;
 use crate::css::css_pixels::CssPixels;
+use crate::css::style_value::BorderRadiusPayload;
 use crate::css::style_value::StyleValueData;
 use crate::layout::node_data::NodeSlotId;
 use crate::layout::node_facts::{self, NodeShape};
@@ -46,6 +47,66 @@ pub(crate) fn visual_viewport_transform_data(inputs: &FfiVisualContextTreeInputs
         role: TransformDataRole::CssTransform,
         synthetic_plane: false,
         establishes_sorting_context: false,
+        bounds: libgfx_rust::FloatRect::default(),
+    }
+}
+
+pub(crate) trait TransformGeometry {
+    fn content_box(&self) -> CssPixelRect;
+    fn border_box(&self) -> CssPixelRect;
+    fn scrollable_overflow_rect(&self) -> Option<CssPixelRect>;
+    fn nearest_svg_viewport_user_rect(&self) -> Option<CssPixelRect>;
+    fn containing_block_box(&self, coord_box: u16) -> CssPixelRect;
+    fn svg_additional_element_transform(&self) -> Option<AffineTransform>;
+}
+
+pub(crate) struct CommittedTransformGeometry<'arena, Arena> {
+    pub(crate) arena: &'arena Arena,
+    pub(crate) node: NodeSlotId,
+}
+
+impl<Arena: PaintRead> TransformGeometry for CommittedTransformGeometry<'_, Arena> {
+    fn content_box(&self) -> CssPixelRect {
+        paintable_geometry::absolute_rect(self.arena, self.node)
+    }
+
+    fn border_box(&self) -> CssPixelRect {
+        paintable_geometry::absolute_border_box_rect(self.arena, self.node)
+    }
+
+    fn scrollable_overflow_rect(&self) -> Option<CssPixelRect> {
+        paintable_geometry::scrollable_overflow_rect(self.arena, self.node)
+    }
+
+    fn nearest_svg_viewport_user_rect(&self) -> Option<CssPixelRect> {
+        crate::painting::svg_viewport::nearest_svg_viewport_user_rect(self.arena, self.node).map(|rect| {
+            CssPixelRect::new(
+                CssPixels::default(),
+                CssPixels::default(),
+                CssPixels::nearest_value_for(rect.width as f64),
+                CssPixels::nearest_value_for(rect.height as f64),
+            )
+        })
+    }
+
+    fn containing_block_box(&self, coord_box: u16) -> CssPixelRect {
+        use crate::css::css_enums::keyword;
+        let Some(containing_block) = self.arena.node_containing_block_if_live(self.node) else {
+            return CssPixelRect::default();
+        };
+        match coord_box {
+            keyword::CONTENT_BOX | keyword::FILL_BOX => paintable_geometry::absolute_rect(self.arena, containing_block),
+            keyword::PADDING_BOX => paintable_geometry::absolute_padding_box_rect(self.arena, containing_block),
+            _ => paintable_geometry::absolute_border_box_rect(self.arena, containing_block),
+        }
+    }
+
+    fn svg_additional_element_transform(&self) -> Option<AffineTransform> {
+        let kind = self.arena.node_kind_if_live(self.node)?;
+        if !style_queries::kind_is_svg_element_box(kind) {
+            return None;
+        }
+        paintable_geometry::committed_svg_additional_element_transform(self.arena, self.node).map(Into::into)
     }
 }
 
@@ -54,9 +115,25 @@ pub(crate) fn transform_reference_box(
     layout_arena: &impl PaintRead,
     slot: NodeSlotId,
 ) -> CssPixelRect {
+    let is_svg = layout_arena.node_kind_if_live(slot).is_some_and(node_painting::is_svg);
+    transform_reference_box_of(
+        style,
+        is_svg,
+        &CommittedTransformGeometry {
+            arena: layout_arena,
+            node: slot,
+        },
+    )
+}
+
+pub(crate) fn transform_reference_box_of(
+    style: ComputedValuesView<'_>,
+    is_svg: bool,
+    geometry: &impl TransformGeometry,
+) -> CssPixelRect {
     use css_enums::transform_box::{BORDER_BOX, CONTENT_BOX, FILL_BOX, STROKE_BOX, VIEW_BOX};
     let mut transform_box = style.transform().transform_box;
-    if layout_arena.node_kind_if_live(slot).is_some_and(node_painting::is_svg) {
+    if is_svg {
         transform_box = match transform_box {
             CONTENT_BOX => FILL_BOX,
             BORDER_BOX => STROKE_BOX,
@@ -70,18 +147,11 @@ pub(crate) fn transform_reference_box(
         };
     }
     match transform_box {
-        CONTENT_BOX | FILL_BOX => paintable_geometry::absolute_rect(layout_arena, slot),
-        VIEW_BOX => crate::painting::svg_viewport::nearest_svg_viewport_user_rect(layout_arena, slot)
-            .map(|rect| {
-                CssPixelRect::new(
-                    CssPixels::default(),
-                    CssPixels::default(),
-                    CssPixels::nearest_value_for(rect.width as f64),
-                    CssPixels::nearest_value_for(rect.height as f64),
-                )
-            })
-            .unwrap_or_else(|| paintable_geometry::absolute_border_box_rect(layout_arena, slot)),
-        _ => paintable_geometry::absolute_border_box_rect(layout_arena, slot),
+        CONTENT_BOX | FILL_BOX => geometry.content_box(),
+        VIEW_BOX => geometry
+            .nearest_svg_viewport_user_rect()
+            .unwrap_or_else(|| geometry.border_box()),
+        _ => geometry.border_box(),
     }
 }
 
@@ -139,15 +209,27 @@ pub(crate) fn compute_transform(
     node: NodeSlotId,
     pixel_ratio: f64,
 ) -> Option<(TransformData, bool)> {
+    compute_transform_against(
+        layout_arena,
+        node,
+        &CommittedTransformGeometry {
+            arena: layout_arena,
+            node,
+        },
+        pixel_ratio,
+    )
+}
+
+pub(crate) fn compute_transform_against(
+    layout_arena: &impl PaintRead,
+    node: NodeSlotId,
+    geometry: &impl TransformGeometry,
+    pixel_ratio: f64,
+) -> Option<(TransformData, bool)> {
     let row = layout_arena.node(node)?;
     let (style, node_kind) = (row.style()?, row.kind());
 
-    let additional_element_transform = if style_queries::kind_is_svg_element_box(node_kind) {
-        crate::painting::paintable_geometry::committed_svg_additional_element_transform(layout_arena, node)
-            .map(Into::into)
-    } else {
-        None
-    };
+    let additional_element_transform = geometry.svg_additional_element_transform();
 
     let transform_values = style.transform();
     let style_has_transform = transform_values.resolved_transforms.length != 0 || transform_values.has_offset_path;
@@ -160,7 +242,7 @@ pub(crate) fn compute_transform(
 
     // The transformation matrix is computed from the transform, transform-origin, translate, rotate, scale, and
     // offset properties as follows:
-    let reference_box = transform_reference_box(style, layout_arena, node);
+    let reference_box = transform_reference_box_of(style, node_painting::is_svg(node_kind), geometry);
     let origin_lp = |handle: &ComputedStyleValueHandle| {
         handle
             .length_percentage()
@@ -198,6 +280,7 @@ pub(crate) fn compute_transform(
             style,
             layout_arena,
             node,
+            geometry,
             reference_box,
             (origin_x.to_double(), origin_y.to_double()),
         ) {
@@ -224,6 +307,11 @@ pub(crate) fn compute_transform(
     };
     let matrix = scale_matrix_for_device_pixels(matrix, scale);
     let is_invertible = matrix.is_invertible();
+    let mut bounds = geometry.border_box();
+    bounds.unite(reference_box);
+    if let Some(scrollable_overflow_rect) = geometry.scrollable_overflow_rect() {
+        bounds.unite(scrollable_overflow_rect);
+    }
     Some((
         TransformData {
             matrix,
@@ -233,6 +321,12 @@ pub(crate) fn compute_transform(
             role: TransformDataRole::CssTransform,
             synthetic_plane: false,
             establishes_sorting_context: false,
+            bounds: libgfx_rust::FloatRect {
+                x: bounds.x.to_float() * scale,
+                y: bounds.y.to_float() * scale,
+                width: bounds.width.to_float() * scale,
+                height: bounds.height.to_float() * scale,
+            },
         },
         is_invertible,
     ))
@@ -341,14 +435,14 @@ fn border_radius_pair(handle: &ComputedStyleValueHandle) -> (LengthPercentageRef
 pub(crate) fn border_radius_pair_of_value(
     value: &StyleValueData,
 ) -> (LengthPercentageRef<'_>, LengthPercentageRef<'_>) {
-    let StyleValueData::BorderRadius {
+    let StyleValueData::BorderRadius(border_radius_payload) = value else {
+        unreachable!("computed border-radius is a border-radius value");
+    };
+    let BorderRadiusPayload {
         horizontal_radius,
         vertical_radius,
         ..
-    } = value
-    else {
-        unreachable!("computed border-radius is a border-radius value");
-    };
+    } = &**border_radius_payload;
     (
         LengthPercentageRef::over(horizontal_radius.data()),
         LengthPercentageRef::over(vertical_radius.data()),
@@ -356,14 +450,14 @@ pub(crate) fn border_radius_pair_of_value(
 }
 
 fn border_radius_is_initial(handle: &ComputedStyleValueHandle) -> bool {
-    let Some(StyleValueData::BorderRadius {
+    let Some(StyleValueData::BorderRadius(border_radius_payload)) = style_queries::handle_value(handle) else {
+        unreachable!("computed border-radius lost its style value");
+    };
+    let BorderRadiusPayload {
         horizontal_radius,
         vertical_radius,
         ..
-    }) = style_queries::handle_value(handle)
-    else {
-        unreachable!("computed border-radius lost its style value");
-    };
+    } = &**border_radius_payload;
     let is_zero_px = |value: &StyleValueData| {
         matches!(value, StyleValueData::Length { value, unit }
             if *value == 0.0 && *unit == crate::css::style_compute::px_length_unit())
@@ -533,7 +627,7 @@ fn overflow_clip_edge_rect(
     slot: NodeSlotId,
 ) -> CssPixelRect {
     use crate::css::css_enums::background_box::{BORDER_BOX, CONTENT_BOX};
-    let overflow_clip_margin = &style.misc_reset().overflow_clip_margin;
+    let overflow_clip_margin = &style.misc_layout().overflow_clip_margin;
     // https://drafts.csswg.org/css-overflow-4/#overflow-clip-margin
     // Values are defined as follows:
     // '<visual-box>'
@@ -876,8 +970,8 @@ pub(crate) fn may_have_clip(layout_arena: &impl PaintRead, node: NodeSlotId) -> 
         return false;
     };
     let box_values = style.box_values();
-    box_values.overflow_x != overflow::VISIBLE
-        || box_values.overflow_y != overflow::VISIBLE
+    style.overflow_x() != overflow::VISIBLE
+        || style.overflow_y() != overflow::VISIBLE
         || box_values.paint_containment
         || style.content_visibility() == content_visibility::AUTO
 }
@@ -900,8 +994,8 @@ fn used_overflow(
     use crate::css::css_enums::{content_visibility, overflow};
     let node = slot;
     let box_values = style.box_values();
-    let mut overflow_x = box_values.overflow_x;
-    let mut overflow_y = box_values.overflow_y;
+    let mut overflow_x = style.overflow_x();
+    let mut overflow_y = style.overflow_y();
 
     let style_has_paint_containment =
         box_values.paint_containment || style.content_visibility() == content_visibility::AUTO;

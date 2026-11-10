@@ -79,24 +79,37 @@ static Optional<Gfx::SystemUIFontKind> macos_system_ui_font_kind_from_family_nam
 }
 #endif
 
+// https://drafts.csswg.org/css-fonts-4/#font-synthesis-weight
+// How a face of the snapshot registered under `key` is synthesized for the request: never bolder where its font-weight
+// descriptor claims bold weights, nor slanted where its font-style descriptor claims a slant, whatever its file holds.
+static Gfx::FontSynthesis synthesis_for_face(FontFaceSnapshot::Face const& face, FontFaceKey const& key, Gfx::Typeface const& typeface, Gfx::FontSynthesisRequest const& request, Gfx::FontVariationSettings const& variations)
+{
+    auto synthesis = typeface.synthesis_for(request, variations);
+    if (!face.weight_descriptor_is_auto && key.weight.max >= 600)
+        synthesis.bold = false;
+    if (key.slope != 0)
+        synthesis.oblique_angle = 0;
+    return synthesis;
+}
+
 // What one face of the snapshot renders with. A face still waiting on its load becomes a pending entry: a cascade is
 // frozen and laid out on whichever thread resolves it, so the entry reads the snapshot and the typeface the face
 // publishes, and only selecting it for a rendered code point, on the document thread, reaches the face, by its number
 // through the document's registry.
-static RefPtr<Gfx::FontCascadeList const> font_for_face(FontFaceSnapshot::Face const& face, float point_size, Gfx::FontVariationSettings const& variations, Gfx::ShapeFeatures const& shape_features)
+static RefPtr<Gfx::FontCascadeList const> font_for_face(FontFaceSnapshot::Face const& face, FontFaceKey const& key, float point_size, Gfx::FontVariationSettings const& variations, Gfx::ShapeFeatures const& shape_features, Gfx::FontSynthesisRequest const& synthesis_request)
 {
     if (face.is_unusable)
         return {};
     auto font_list = Gfx::FontCascadeList::create();
     if (face.typeface) {
-        font_list->add(face.typeface->font(point_size, variations, shape_features), face.unicode_ranges);
+        font_list->add(face.typeface->font(point_size, variations, shape_features, synthesis_for_face(face, key, *face.typeface, synthesis_request, variations)), face.unicode_ranges);
     } else if (face.has_urls) {
         font_list->add_pending_face(face.unicode_ranges, [face_id = face.id] {
             if (auto face = FontFaceState::with_id(face_id))
                 return face->resolve_for_rendering();
-            return Gfx::PendingFontState::Failed; }, [rendering_typeface = face.rendering_typeface, point_size, variations, shape_features]() -> RefPtr<Gfx::Font const> {
+            return Gfx::PendingFontState::Failed; }, [face, key, rendering_typeface = face.rendering_typeface, point_size, variations, shape_features, synthesis_request]() -> RefPtr<Gfx::Font const> {
             if (auto typeface = rendering_typeface->get())
-                return typeface->font(point_size, variations, shape_features);
+                return typeface->font(point_size, variations, shape_features, synthesis_for_face(face, key, *typeface, synthesis_request, variations));
             return {}; }, [state = face.rendering_state] { return state; }, face.id);
     }
     if (font_list->is_empty())
@@ -145,11 +158,11 @@ struct MatchingFontCandidate {
     unsigned width { Gfx::FontWidth::Normal };
     Gfx::Typeface const* system_typeface { nullptr };
 
-    [[nodiscard]] RefPtr<Gfx::FontCascadeList const> font_with_point_size(FontFaceSnapshot const& snapshot, float point_size, Gfx::FontVariationSettings const& variations, WeightAxisFollowsFontWeight weight_axis_follows_font_weight, Gfx::ShapeFeatures const& shape_features) const
+    [[nodiscard]] RefPtr<Gfx::FontCascadeList const> font_with_point_size(FontFaceSnapshot const& snapshot, float point_size, Gfx::FontVariationSettings const& variations, WeightAxisFollowsFontWeight weight_axis_follows_font_weight, Gfx::ShapeFeatures const& shape_features, Gfx::FontSynthesisRequest const& synthesis_request) const
     {
         if (system_typeface) {
             auto font_list = Gfx::FontCascadeList::create();
-            font_list->add(system_typeface->font(point_size, variations, shape_features));
+            font_list->add(system_typeface->font(point_size, variations, shape_features, system_typeface->synthesis_for(synthesis_request, variations)));
             return font_list;
         }
 
@@ -170,7 +183,7 @@ struct MatchingFontCandidate {
             //     afterwards, and does nothing for a face past "unloaded" already.
             if (face.has_urls && !face.has_non_default_unicode_range)
                 note_wanted_web_face(face.id);
-            if (auto face_fonts = font_for_face(face, point_size, variations_for_face(face, variations, clamped_variations), shape_features)) {
+            if (auto face_fonts = font_for_face(face, key, point_size, variations_for_face(face, variations, clamped_variations), shape_features, synthesis_request)) {
                 font_list->extend(*face_fonts);
                 continue;
             }
@@ -192,7 +205,7 @@ struct MatchingFontCandidate {
 
 // Partial implementation of the font-matching algorithm: https://www.w3.org/TR/css-fonts-4/#font-matching-algorithm
 // FIXME: This should be replaced by the full CSS font selection algorithm.
-static RefPtr<Gfx::FontCascadeList const> font_matching_algorithm(FontFaceSnapshot const& snapshot, Utf16FlyString const& family_name, int weight, Percentage const& font_width, int slope, float font_size_in_pt, Gfx::FontVariationSettings const& variations, WeightAxisFollowsFontWeight weight_axis_follows_font_weight, Gfx::ShapeFeatures const& shape_features)
+static RefPtr<Gfx::FontCascadeList const> font_matching_algorithm(FontFaceSnapshot const& snapshot, Utf16FlyString const& family_name, int weight, Percentage const& font_width, int slope, float font_size_in_pt, Gfx::FontVariationSettings const& variations, WeightAxisFollowsFontWeight weight_axis_follows_font_weight, Gfx::ShapeFeatures const& shape_features, Gfx::FontSynthesisRequest const& synthesis_request)
 {
     // If a font family match occurs, the user agent assembles the set of font faces in that family and then
     // narrows the set to a single face using other font properties in the order given below.
@@ -229,7 +242,7 @@ static RefPtr<Gfx::FontCascadeList const> font_matching_algorithm(FontFaceSnapsh
     order.resize(matching_family_fonts.size());
     auto order_length = Parser::ValueParserFFI::rust_font_matching_order(weighed_candidates.span(), weight, font_width_bucket_from_percentage(font_width.value()), slope, order.span());
     for (auto index : order.span().trim(order_length)) {
-        if (auto found_font = matching_family_fonts[index].font_with_point_size(snapshot, font_size_in_pt, variations, weight_axis_follows_font_weight, shape_features))
+        if (auto found_font = matching_family_fonts[index].font_with_point_size(snapshot, font_size_in_pt, variations, weight_axis_follows_font_weight, shape_features, synthesis_request))
             return found_font;
     }
     return {};
@@ -310,6 +323,18 @@ NonnullRefPtr<Gfx::FontCascadeList const> resolve_font_cascade(FontFaceSnapshot 
 
     // FIXME: We round to int here as that is what is expected by our font infrastructure below
     auto weight = round_to<int>(font_weight);
+    // https://drafts.csswg.org/css-fonts-4/#font-synthesis-style
+    // "oblique-only: Synthesis of an oblique face is allowed when the requested style is oblique, but not when it is
+    // italic."
+    auto synthesis_style = (key.font_synthesis >> StyleEngineFFI::FONT_SYNTHESIS_STYLE_SHIFT) & 3;
+    Gfx::FontSynthesisRequest synthesis_request {
+        .weight = weight,
+        .slope = slope,
+        // NB: An italic request is synthesized with the default oblique angle.
+        .oblique_angle = slope == 2 ? static_cast<float>(key.font_oblique_angle) : 14.0f,
+        .allows_weight = !(key.font_synthesis & StyleEngineFFI::FONT_SYNTHESIS_NO_WEIGHT),
+        .allows_style = synthesis_style == 0 || (synthesis_style == StyleEngineFFI::FONT_SYNTHESIS_STYLE_OBLIQUE_ONLY && slope == 2),
+    };
 
     // The size the lookups below select fonts at, which font-size-adjust can change for each family.
     Gfx::FontVariationSettings variation;
@@ -393,7 +418,7 @@ NonnullRefPtr<Gfx::FontCascadeList const> resolve_font_cascade(FontFaceSnapshot 
             return {};
 
         auto font_list = Gfx::FontCascadeList::create();
-        font_list->add(typeface->font(font_size_in_pt, variation, shape_features));
+        font_list->add(typeface->font(font_size_in_pt, variation, shape_features, typeface->synthesis_for(synthesis_request, variation)));
         return font_list;
     };
 #endif
@@ -413,7 +438,7 @@ NonnullRefPtr<Gfx::FontCascadeList const> resolve_font_cascade(FontFaceSnapshot 
             auto clamped_variations = variations_clamped_to_weight_descriptor(variation, weight_axis_follows_font_weight, lookup_key.weight);
             auto result = Gfx::FontCascadeList::create();
             for (auto const& face : *faces) {
-                if (auto face_fonts = font_for_face(face, font_size_in_pt, variations_for_face(face, variation, clamped_variations), shape_features))
+                if (auto face_fonts = font_for_face(face, lookup_key, font_size_in_pt, variations_for_face(face, variation, clamped_variations), shape_features, synthesis_request))
                     result->extend(*face_fonts);
             }
             if (!result->is_empty())
@@ -429,7 +454,7 @@ NonnullRefPtr<Gfx::FontCascadeList const> resolve_font_cascade(FontFaceSnapshot 
         }
 #endif
 
-        if (auto found_font = font_matching_algorithm(snapshot, family, weight, font_width, slope, font_size_in_pt, variation, weight_axis_follows_font_weight, shape_features); found_font && !found_font->is_empty())
+        if (auto found_font = font_matching_algorithm(snapshot, family, weight, font_width, slope, font_size_in_pt, variation, weight_axis_follows_font_weight, shape_features, synthesis_request); found_font && !found_font->is_empty())
             return found_font;
 
         return {};
@@ -521,17 +546,25 @@ NonnullRefPtr<Gfx::FontCascadeList const> resolve_font_cascade(FontFaceSnapshot 
                 font_list->extend_fallback(*other_font_list);
         }
     } else {
+        // NB: The system fallback is asked for the style the cascade requests, not that of whichever font comes first,
+        //     so a face finishing its load leaves it as it was.
         // FIXME: Normalize the size of each system fallback font by font-size-adjust as well, rather than giving it
-        //        the size of the cascade's first font.
-        font_list->set_system_font_fallback_callback([](u32 code_point, Gfx::EmojiPresentation presentation, Gfx::Font const& reference_font) -> RefPtr<Gfx::Font const> {
+        //        the requested size.
+        Gfx::FontCascadeList::SystemFallbackRequest request {
+            .point_size = font_size_in_pt,
+            .weight = static_cast<u16>(clamp(weight, 1, 1000)),
+            .width = static_cast<u16>(font_width_bucket_from_percentage(font_width.value())),
+            .slope = static_cast<u8>(slope),
+        };
+        font_list->set_system_font_fallback_callback(request, [](u32 code_point, Gfx::EmojiPresentation presentation, Gfx::FontCascadeList::SystemFallbackRequest const& request) -> RefPtr<Gfx::Font const> {
             Gfx::SystemFallbackFontKey key {
                 .code_point = code_point,
-                .weight = static_cast<u16>(reference_font.weight()),
-                .width = reference_font.width(),
-                .slope = static_cast<u8>(reference_font.slope()),
+                .weight = request.weight,
+                .width = request.width,
+                .slope = request.slope,
                 .prefer_color_emoji = presentation == Gfx::EmojiPresentation::Emoji,
             };
-            return Gfx::system_fallback_font(key, reference_font.point_size());
+            return Gfx::system_fallback_font(key, request.point_size);
         });
     }
 
@@ -577,30 +610,51 @@ NonnullRefPtr<Gfx::FontCascadeList const> resolve_font_for_style_values(FontComp
 NonnullRefPtr<Gfx::FontCascadeList const> FontCascadeMemo::resolve(FontFaceSnapshot const& snapshot, ComputedFontCacheKey const& key, FontFeatureValuesProvider const& font_feature_values_for_family) const
 {
     MutexLocker locker(m_mutex);
-    // A style transaction that flew resolves against the snapshot it was sealed with, which a change to the
-    // @font-face table beside it leaves older than the memo: its answers are its own, and stay out of the memo, retired
+    // A style update that flew resolves against the snapshot it was sealed with, which a change to the
+    // @font-face table beside it leaves older than the memo. Where the memo keeps a cascade that answers for that
+    // table as well, it is the answer; any other answer is the transaction's own, and stays out of the memo, retired
     // with the cascades the change forgot.
     if (snapshot.generation() < m_generation) {
+        if (auto font_list = cascade_resolved_by(snapshot.generation(), key))
+            return font_list.release_nonnull();
         auto font_list = resolve_font_cascade(snapshot, key, font_feature_values_for_family);
         m_retired.append(font_list);
         m_resolutions_against_older_tables.append({ key, font_list });
         return font_list;
     }
-    m_generation = snapshot.generation();
-    return m_cascades.ensure(key, [&] {
-        return resolve_font_cascade(snapshot, key, font_feature_values_for_family);
-    });
+    return resolve_into_memo(snapshot, key, font_feature_values_for_family);
 }
 
 NonnullRefPtr<Gfx::FontCascadeList const> FontCascadeMemo::resolve_for_fork(FontFaceSnapshot const& snapshot, ComputedFontCacheKey const& key, FontFeatureValuesProvider const& font_feature_values_for_family) const
 {
     MutexLocker locker(m_mutex);
-    if (snapshot.generation() < m_generation)
+    if (snapshot.generation() < m_generation) {
+        if (auto font_list = cascade_resolved_by(snapshot.generation(), key))
+            return font_list.release_nonnull();
         return resolve_font_cascade(snapshot, key, font_feature_values_for_family);
+    }
+    return resolve_into_memo(snapshot, key, font_feature_values_for_family);
+}
+
+NonnullRefPtr<Gfx::FontCascadeList const> FontCascadeMemo::resolve_into_memo(FontFaceSnapshot const& snapshot, ComputedFontCacheKey const& key, FontFeatureValuesProvider const& font_feature_values_for_family) const
+{
+    VERIFY(snapshot.generation() >= m_generation);
     m_generation = snapshot.generation();
-    return m_cascades.ensure(key, [&] {
-        return resolve_font_cascade(snapshot, key, font_feature_values_for_family);
+    auto const& cascade = m_cascades.ensure(key, [&] {
+        return MemoizedCascade { resolve_font_cascade(snapshot, key, font_feature_values_for_family), m_generation };
     });
+    return cascade.font_list;
+}
+
+RefPtr<Gfx::FontCascadeList const> FontCascadeMemo::cascade_resolved_by(u64 generation, ComputedFontCacheKey const& key) const
+{
+    // NB: Each change to the @font-face table since a cascade was resolved forgot it unless it resolves the same under
+    //     the changed table, so a cascade the memo keeps answers for every table from the one it was resolved against
+    //     on. A transaction that flew, or a fork of the render state, then names the same cascade as the memo.
+    auto it = m_cascades.find(key);
+    if (it == m_cascades.end() || it->value.resolved_at_generation > generation)
+        return {};
+    return it->value.font_list;
 }
 
 void FontCascadeMemo::forget_matching(u64 environment_generation, Function<bool(ComputedFontCacheKey const&, NonnullRefPtr<Gfx::FontCascadeList const> const&)> const& predicate)
@@ -608,10 +662,10 @@ void FontCascadeMemo::forget_matching(u64 environment_generation, Function<bool(
     MutexLocker locker(m_mutex);
     VERIFY(environment_generation > m_generation);
     m_generation = environment_generation;
-    m_cascades.remove_all_matching([&](auto const& key, auto const& font_list) {
-        if (!predicate(key, font_list))
+    m_cascades.remove_all_matching([&](auto const& key, auto const& cascade) {
+        if (!predicate(key, cascade.font_list))
             return false;
-        m_retired.append(font_list);
+        m_retired.append(cascade.font_list);
         return true;
     });
 }
@@ -620,11 +674,9 @@ void FontCascadeMemo::release_retired() const
 {
     // NB: A cascade's destructor releases fonts into the document thread's caches, so it runs outside the lock.
     Vector<NonnullRefPtr<Gfx::FontCascadeList const>> retired;
-    Vector<ResolutionAgainstOlderTable> resolutions_against_older_tables;
     {
         MutexLocker locker(m_mutex);
         retired = move(m_retired);
-        resolutions_against_older_tables = move(m_resolutions_against_older_tables);
     }
 }
 
@@ -632,6 +684,22 @@ Vector<FontCascadeMemo::ResolutionAgainstOlderTable> FontCascadeMemo::take_resol
 {
     MutexLocker locker(m_mutex);
     return exchange(m_resolutions_against_older_tables, {});
+}
+
+bool FontCascadeMemo::adopt_resolution_against_older_table(FontFaceSnapshot const& snapshot, ResolutionAgainstOlderTable const& resolution, FontFeatureValuesProvider const& font_feature_values_for_family) const
+{
+    MutexLocker locker(m_mutex);
+    VERIFY(snapshot.generation() >= m_generation);
+    if (auto it = m_cascades.find(resolution.key); it != m_cascades.end())
+        return it->value.font_list.ptr() == resolution.font_list.ptr();
+    // NB: No element holds a cascade of the memo for the request yet, so the one the transaction resolved, where it
+    //     answers the same under the newest table, is the memo's answer from here on, and the elements holding it keep
+    //     it.
+    m_generation = snapshot.generation();
+    auto font_list = resolve_font_cascade(snapshot, resolution.key, font_feature_values_for_family);
+    auto adopted = font_list->equals(*resolution.font_list);
+    m_cascades.set(resolution.key, MemoizedCascade { adopted ? resolution.font_list : move(font_list), m_generation });
+    return adopted;
 }
 
 }
@@ -658,6 +726,8 @@ static StyleEngineFFI::FfiResolvedFont resolve_font_for_style_engine(void const*
         .font_width = Percentage(request.font_width),
         .feature_values = {},
         .font_feature_values_scope = TreeScopeID { request.font_feature_values_scope },
+        .font_oblique_angle = request.font_oblique_angle,
+        .font_synthesis = request.font_synthesis,
     };
     if (request.font_size_adjust == StyleEngineFFI::FontSizeAdjustKind::Number)
         key.font_size_adjust = FontSizeAdjust { static_cast<FontSizeAdjustMetric>(request.font_size_adjust_metric), request.font_size_adjust_value };
