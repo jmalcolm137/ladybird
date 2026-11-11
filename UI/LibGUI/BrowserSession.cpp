@@ -768,6 +768,12 @@ void BrowserSession::window_will_close(BrowserWindow& window)
 {
     window.close_engine_tabs();
 
+    // Record the reason now, not only in the deferred teardown below. A window
+    // close can otherwise race the event loop's exit and leave the log looking
+    // like an unexplained "event loop returned 0".
+    if (m_windows.size() <= 1)
+        note_exit_reason("last window closed"sv);
+
     Core::deferred_invoke([this, &window] {
         auto window_count = m_windows.size();
         m_windows.remove_first_matching([&](auto const& candidate) {

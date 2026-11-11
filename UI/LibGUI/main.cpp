@@ -15,6 +15,13 @@ ErrorOr<int> serenity_main(Main::Arguments arguments)
 {
     auto app = TRY(GUI::Application::create(arguments));
 
+    // Closing the window must be handled by BrowserSession: it closes the
+    // engine tabs, saves the session, and then quits. LibGUI's default is to
+    // quit as soon as the last Window is hidden, which happens inside
+    // Window::close() *before* Window::on_close() runs, so the session would
+    // otherwise look like an unexplained "event loop returned 0" exit.
+    app->set_quit_when_last_window_deleted(false);
+
     LadybirdSDE::BrowserSession* session_pointer = nullptr;
 
     // A session logout or SIGTERM ends like File -> Quit: save the session before leaving instead of disappearing

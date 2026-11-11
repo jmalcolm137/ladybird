@@ -188,6 +188,15 @@ ErrorOr<void> BrowserWindow::initialize(Vector<InitialTab> initial_tabs, Optiona
         }
     };
 
+    m_window->on_close_request = [this] {
+        // Do not let Window::close() hide the last window first: hiding destroys
+        // the toplevel and can quit the event loop before on_close() gets to run
+        // the session's save-and-exit path. Handle the request here instead and
+        // leave the actual teardown to BrowserSession.
+        m_session.window_will_close(*this);
+        return GUI::Window::CloseRequestDecision::StayOpen;
+    };
+
     m_window->on_close = [this] {
         m_session.window_will_close(*this);
     };
