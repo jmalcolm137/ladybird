@@ -154,6 +154,26 @@ void EngineClient::accept_connection(NonnullOwnPtr<Core::LocalSocket> socket)
 
 void EngineClient::read_available()
 {
+    if (m_in_read_callback)
+        return;
+    m_in_read_callback = true;
+    read_available_impl();
+    m_in_read_callback = false;
+
+    if (m_close_pending) {
+        m_close_pending = false;
+        // The read callback has returned (any dialog it opened is gone). It is
+        // now safe to destroy the socket and clear its on_ready_to_read
+        // Function; doing it from inside the callback trips AK::Function.
+        Core::deferred_invoke([weak_this = make_weak_ptr()] {
+            if (auto* client = weak_this.ptr())
+                client->close_socket();
+        });
+    }
+}
+
+void EngineClient::read_available_impl()
+{
     if (!m_socket)
         return;
 
@@ -440,6 +460,14 @@ void EngineClient::close_socket()
     if (m_write_notifier) {
         m_write_notifier->close();
         m_write_notifier.clear();
+    }
+    if (m_socket && m_in_read_callback) {
+        // on_ready_to_read is on the stack. Stop notifications now and let
+        // read_available() destroy the socket after the callback returns.
+        m_socket->set_notifications_enabled(false);
+        m_close_pending = true;
+        m_write_buffer.clear();
+        return;
     }
     if (m_socket) {
         m_socket->close();

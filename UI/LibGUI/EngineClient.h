@@ -137,6 +137,7 @@ private:
     ErrorOr<void> spawn_engine(ByteString const& engine_path);
     void accept_connection(NonnullOwnPtr<Core::LocalSocket>);
     void read_available();
+    void read_available_impl();
     void schedule_disconnect();
     void dispatch_line(StringView);
     void handle_frame_buffer(JsonObject const&);
@@ -159,6 +160,8 @@ private:
     RefPtr<Core::Notifier> m_write_notifier;
     HashMap<u64, NonnullOwnPtr<FrameBuffer>> m_frame_buffers;
     bool m_disconnect_scheduled { false };
+    bool m_in_read_callback { false };
+    bool m_close_pending { false };
     bool m_quitting { false };
 };
 
