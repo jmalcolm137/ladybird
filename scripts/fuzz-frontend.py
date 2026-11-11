@@ -14,6 +14,9 @@
 #   scripts/fuzz-frontend.py                      # 10 seeds, 8 s each
 #   scripts/fuzz-frontend.py --seeds 1-50 --duration 15
 #   scripts/fuzz-frontend.py --seed 123 --keep    # replay one seed, keep logs
+#   scripts/fuzz-frontend.py --scenario lifecycle --duration 15
+#   scripts/fuzz-frontend.py --scenario modals --duration 6
+#   scripts/fuzz-frontend.py --scenario close      # compositor close button
 #   scripts/fuzz-frontend.py --modals             # include dialog-opening events
 #   FUZZ_TITLE_LENGTH=65536 scripts/fuzz-frontend.py --only title --only-once
 #                                                 # long-title regression probe
@@ -25,6 +28,7 @@ import argparse
 import json
 import os
 import random
+import re
 import shutil
 import signal
 import socket
@@ -383,6 +387,16 @@ class FakeEngine:
                 break
             self.send(event)
             time.sleep(0.5)
+            if event.get("type") == "fullscreen":
+                # Toggle repeatedly: each pass tears down and rebuilds the
+                # window backing store through the synchronous portal path.
+                for _ in range(6):
+                    if self.stop.is_set():
+                        break
+                    self.send({"type": "fullscreen", "tab": tab1, "fullscreen": True})
+                    time.sleep(0.15)
+                    self.send({"type": "fullscreen", "tab": tab1, "fullscreen": False})
+                    time.sleep(0.15)
         while not self.stop.is_set():
             time.sleep(0.1)
 
@@ -399,6 +413,9 @@ class FakeEngine:
 
         if self.scenario == "lifecycle":
             self.run_lifecycle()
+        elif self.scenario == "close":
+            while not self.stop.is_set():
+                time.sleep(0.1)
         else:
             deadline = time.time() + self.duration
             while time.time() < deadline and not self.stop.is_set():
@@ -523,6 +540,50 @@ def escape_keypresses(socket_name, runtime, stop, duration):
             pass
 
 
+def window_geometry(runtime):
+    try:
+        compositor = open(os.path.join(runtime, "compositor.log"), "r", errors="replace").read()
+    except OSError:
+        return None
+    positions = re.findall(r"placed new window '[^']*' at (\d+),(\d+)", compositor)
+    if not positions:
+        return None
+    x, y = (int(part) for part in positions[-1])
+    try:
+        chrome = open(os.path.join(runtime, "chrome.log"), "r", errors="replace").read()
+    except OSError:
+        return None
+    match = re.search(r"create_window[^\n]*rect=[-0-9]+,[-0-9]+,(\d+)x(\d+)", chrome)
+    if not match:
+        return None
+    return x, y, int(match.group(1)), int(match.group(2))
+
+
+def click_at(socket_name, runtime, x, y):
+    vi = os.path.join(SDE_ROOT, "build/input-test/virtual-input-test")
+    if not os.access(vi, os.X_OK):
+        return
+    env = dict(os.environ)
+    env.update({
+        "WAYLAND_DISPLAY": socket_name,
+        "XDG_RUNTIME_DIR": os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}"),
+        "SDE_STATE_DIR": os.path.join(runtime, "state"),
+        "SDE_WM_PORTAL_PATH": os.path.join(runtime, "wm"),
+        "SERENITY_RES_ROOT": SERENITY_RES,
+        "LD_LIBRARY_PATH": os.path.join(LAGOM, "lib"),
+    })
+    env.pop("DISPLAY", None)
+    try:
+        subprocess.run(
+            [vi, "--extent", "1280", "720",
+             "--move", str(x), str(y), "--sleep", "200",
+             "--button", "0x110", "press", "--sleep", "80",
+             "--button", "0x110", "release", "--linger", "300"],
+            env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=6)
+    except Exception:
+        pass
+
+
 def last_exit_reason(log_path):
     try:
         with open(log_path, "r", errors="replace") as f:
@@ -610,6 +671,12 @@ def run_one(seed, duration, args):
         else:
             # Let the window map and the first tab get created.
             time.sleep(1.0)
+            if args.scenario == "close":
+                geometry = window_geometry(runtime)
+                if geometry:
+                    x, y, width, height = geometry
+                    click_at(socket_name, runtime, x + width - 4, y + 10)
+                    time.sleep(0.3)
             status = "ok"
             deadline = time.time() + duration + 4
             stalled_since = None
@@ -617,7 +684,7 @@ def run_one(seed, duration, args):
                 if chrome.poll() is not None:
                     reason = last_exit_reason(chrome_log_path)
                     if "last window closed" in reason or "quit action" in reason:
-                        status = "expected-exit" if args.scenario in ("lifecycle", "modals") else "unexpected-exit"
+                        status = "expected-exit" if args.scenario in ("lifecycle", "modals", "close") else "unexpected-exit"
                     else:
                         status = "crashed"
                     break
@@ -633,10 +700,12 @@ def run_one(seed, duration, args):
                 else:
                     stalled_since = None
                 time.sleep(0.1)
+            if status == "ok" and args.scenario == "close" and chrome.poll() is None:
+                status = "close-not-delivered"
             if status == "ok" and chrome.poll() is not None:
                 reason = last_exit_reason(chrome_log_path)
                 if "last window closed" in reason or "quit action" in reason:
-                    status = "expected-exit" if args.scenario in ("lifecycle", "modals") else "unexpected-exit"
+                    status = "expected-exit" if args.scenario in ("lifecycle", "modals", "close") else "unexpected-exit"
                 else:
                     status = "crashed"
 
@@ -703,7 +772,7 @@ def orchestrator_main(argv):
     parser.add_argument("--seed", type=int, help="run one seed")
     parser.add_argument("--duration", type=float, default=8.0, help="seconds of fuzzing per seed")
     parser.add_argument("--mode", choices=["mutate", "raw", "quiet"], default="mutate")
-    parser.add_argument("--scenario", choices=["protocol", "lifecycle", "modals"], default="protocol",
+    parser.add_argument("--scenario", choices=["protocol", "lifecycle", "modals", "close"], default="protocol",
                         help="protocol = event fuzz; lifecycle = window/tab/dialog sequence; modals = protocol with dialogs")
     parser.add_argument("--modals", action="store_true", help="include dialog-opening events")
     parser.add_argument("--only", default="", help="send only this event type (diagnostic)")
