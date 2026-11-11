@@ -80,6 +80,11 @@ Useful environment variables:
   process.
 - The compositor's close request path is exercised directly; it must record
   `last window closed`, not `event loop returned 0`.
+- A clipboard change callback that fetches the clipboard re-entered itself
+  through a synchronous clipboard event. Nested notifications are dropped.
+- A broken engine write discovered inside the engine socket's read callback
+  destroyed the socket, clearing `on_ready_to_read` from inside its own call.
+  The socket is now closed after the callback returns.
 
 ## Sanitizer build
 

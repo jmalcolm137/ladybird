@@ -59,6 +59,7 @@ SOURCES := \
 	ClipboardBridge.cpp \
 	DownloadsWindow.cpp \
 	EngineClient.cpp \
+	PermissionsWindow.cpp \
 	WebContentView.cpp \
 	main.cpp
 

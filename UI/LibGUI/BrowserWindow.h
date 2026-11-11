@@ -8,6 +8,7 @@
 
 #include "BrowserTab.h"
 #include "DownloadsWindow.h"
+#include "PermissionsWindow.h"
 #include "EngineClient.h"
 
 #include <AK/ByteString.h>
@@ -104,6 +105,7 @@ private:
     void update_bookmark_action();
     void navigate_active(String const& url);
     void show_downloads();
+    void show_permissions();
     void update_downloads(JsonObject const&);
     void handle_download_event(JsonObject const&);
     void show_tab_context_menu(BrowserTab&, Gfx::IntPoint);
@@ -177,6 +179,7 @@ private:
     RefPtr<GUI::Action> m_reset_zoom_action;
     RefPtr<GUI::Action> m_view_source_action;
     RefPtr<GUI::Action> m_downloads_action;
+    RefPtr<GUI::Action> m_permissions_action;
     RefPtr<GUI::Action> m_site_info_action;
     RefPtr<GUI::Action> m_report_website_issue_action;
     RefPtr<GUI::Action> m_toggle_devtools_action;
@@ -195,6 +198,7 @@ private:
     Vector<BookmarkEntry> m_bookmarks;
     Vector<DownloadEntry> m_downloads;
     RefPtr<DownloadsWindow> m_downloads_window;
+    RefPtr<PermissionsWindow> m_permissions_window;
     RefPtr<GUI::Menu> m_tab_context_menu;
     RefPtr<GUI::Menu> m_bookmarks_menu;
     RefPtr<GUI::Menu> m_tabs_menu;

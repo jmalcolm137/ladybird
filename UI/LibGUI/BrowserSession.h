@@ -87,6 +87,15 @@ public:
     bool remembered_permission(String const& origin, String const& name, bool& granted) const;
     String permission_summary(String const& origin) const;
     void forget_permissions(String const& origin);
+
+    struct OriginPermission {
+        String origin;
+        String summary;
+        bool persisted { false };
+    };
+    Vector<OriginPermission> origin_permissions() const;
+    void clear_all_permissions();
+
     void load_permissions();
 
     // Called by a BrowserWindow when its native window is closing.

@@ -11,6 +11,7 @@
 
 #include <AK/JsonArray.h>
 #include <AK/JsonParser.h>
+#include <AK/QuickSort.h>
 #include <AK/LexicalPath.h>
 #include <LibCore/Directory.h>
 #include <LibCore/Environment.h>
@@ -483,6 +484,45 @@ void BrowserSession::forget_permissions(String const& origin)
 {
     if (m_permissions.remove(permission_key(origin)))
         save_permissions();
+}
+
+Vector<BrowserSession::OriginPermission> BrowserSession::origin_permissions() const
+{
+    Vector<OriginPermission> result;
+
+    for (auto const& [origin, entries] : m_permissions) {
+        if (entries.is_empty())
+            continue;
+
+        StringBuilder summary;
+        bool persisted = false;
+        for (size_t i = 0; i < entries.size(); ++i) {
+            if (i)
+                summary.append(", "sv);
+            summary.appendff("{} ({}{})", entries[i].name, entries[i].granted ? "allowed" : "blocked",
+                entries[i].persisted ? "" : ", this session");
+            persisted |= entries[i].persisted;
+        }
+
+        OriginPermission item;
+        item.origin = origin;
+        item.summary = summary.to_string().release_value();
+        item.persisted = persisted;
+        result.append(move(item));
+    }
+
+    quick_sort(result, [](auto const& a, auto const& b) {
+        return a.origin.bytes_as_string_view() < b.origin.bytes_as_string_view();
+    });
+    return result;
+}
+
+void BrowserSession::clear_all_permissions()
+{
+    if (m_permissions.is_empty())
+        return;
+    m_permissions.clear();
+    save_permissions();
 }
 
 ByteString BrowserSession::permissions_path() const

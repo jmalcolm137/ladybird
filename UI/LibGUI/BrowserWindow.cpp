@@ -388,6 +388,11 @@ void BrowserWindow::create_actions()
     }, m_window.ptr());
     m_downloads_action->set_status_tip("Show downloads"_string);
 
+    m_permissions_action = GUI::Action::create("&Permissions…"sv, [this](auto&) {
+        show_permissions();
+    }, m_window.ptr());
+    m_permissions_action->set_status_tip("Manage saved site permissions"_string);
+
     m_site_info_action = GUI::Action::create("Site &Information"sv, [this](auto&) {
         if (auto* tab = active_tab())
             tab->show_site_info_dialog();
@@ -568,6 +573,8 @@ void BrowserWindow::create_menus()
     tools_menu.add_action(*m_user_agent_action);
     tools_menu.add_action(*m_navigator_compatibility_action);
     tools_menu.add_action(*m_process_manager_action);
+    tools_menu.add_separator();
+    tools_menu.add_action(*m_permissions_action);
 
     m_report_website_issue_action = GUI::Action::create("Report Website &Issue…"sv, [this](auto&) {
         if (auto* tab = active_tab(); tab && tab->is_attached())
@@ -1358,6 +1365,13 @@ void BrowserWindow::show_downloads()
     m_downloads_window->set_downloads(m_downloads);
     m_downloads_window->set_private_filter(m_private);
     m_downloads_window->show();
+}
+
+void BrowserWindow::show_permissions()
+{
+    if (!m_permissions_window)
+        m_permissions_window = PermissionsWindow::create(m_session);
+    m_permissions_window->show();
 }
 
 void BrowserWindow::add_bookmark_menu_items(GUI::Menu& menu, Vector<BookmarkEntry> const& items)
