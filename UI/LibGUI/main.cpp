@@ -9,7 +9,9 @@
 #include <LibCore/EventLoop.h>
 #include <LibCore/Timer.h>
 #include <LibGUI/Application.h>
+#include <LibIPC/Connection.h>
 #include <LibMain/Main.h>
+#include <WaylandClient.h>
 #include <signal.h>
 #include <unistd.h>
 
@@ -82,8 +84,36 @@ ErrorOr<int> serenity_main(Main::Arguments arguments)
     auto* session = created_session.value().ptr();
     session_pointer = session;
 
+    // The compositor and window-manager connections are not optional: without
+    // them there is no window to paint into. Their default failure path calls
+    // exit(0) without running any destructor, which looks exactly like a crash
+    // (no exit line, no session save). Record why the session ended and save it
+    // instead. Both hooks run from the event loop, where the session is valid.
+    IPC::ConnectionBase::connection_lost_handler() = [&session_pointer](StringView name) {
+        if (!session_pointer) {
+            GUI::Application::the()->quit(0);
+            return;
+        }
+        session_pointer->note_exit_reason(ByteString::formatted("lost the connection to {} (the window manager is gone)", name));
+        session_pointer->quit();
+    };
+    LibWM::WaylandClient::the().set_connection_lost_callback([&session_pointer](ByteString const& reason) {
+        if (!session_pointer) {
+            GUI::Application::the()->quit(0);
+            return;
+        }
+        session_pointer->note_exit_reason(ByteString::formatted("lost the Wayland connection: {}", reason));
+        session_pointer->quit();
+    });
+
     session->show();
     auto exit_status = app->exec();
+
+    // The hooks live in process-wide singletons and outlive this stack frame;
+    // clear them before `session_pointer` (and the session) go away.
+    IPC::ConnectionBase::connection_lost_handler() = {};
+    LibWM::WaylandClient::the().set_connection_lost_callback({});
+
     session->note_exit_reason(ByteString::formatted("event loop returned {}", exit_status));
     return exit_status;
 }

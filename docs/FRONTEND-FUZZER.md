@@ -85,6 +85,13 @@ Useful environment variables:
 - A broken engine write discovered inside the engine socket's read callback
   destroyed the socket, clearing `on_ready_to_read` from inside its own call.
   The socket is now closed after the callback returns.
+- A lost compositor connection (EPIPE on the Wayland socket) ended the app
+  through the default `ConnectionToServer::die()` / `WaylandClient::dispatch()`
+  paths, i.e. `exit(0)` with no exit line and no session save: indistinguishable
+  from a crash. Dispatch failures now read the queued protocol error before
+  closing, and both paths report the reason and save the session.
+  `scripts/test-compositor-loss.sh` kills the compositor and requires the exit
+  line plus a written session.
 
 ## Sanitizer build
 
