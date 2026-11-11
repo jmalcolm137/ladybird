@@ -17,6 +17,10 @@
 #   scripts/fuzz-frontend.py --scenario lifecycle --duration 15
 #   scripts/fuzz-frontend.py --scenario modals --duration 6
 #   scripts/fuzz-frontend.py --scenario close      # compositor close button
+#   scripts/fuzz-frontend.py --scenario disconnect # engine drops mid-session
+#   scripts/fuzz-frontend.py --scenario windows    # nine-window stress
+#   scripts/fuzz-frontend.py --scenario resize     # maximize/restore storm
+#   scripts/fuzz-frontend.py --scenario session    # session-plan restore + save
 #   scripts/fuzz-frontend.py --modals             # include dialog-opening events
 #   FUZZ_TITLE_LENGTH=65536 scripts/fuzz-frontend.py --only title --only-once
 #                                                 # long-title regression probe
@@ -400,6 +404,61 @@ class FakeEngine:
         while not self.stop.is_set():
             time.sleep(0.1)
 
+    def run_session(self):
+        windows = []
+        for window_index in range(3):
+            tabs = [
+                {"url": "about:blank", "session_tab": 100 + window_index * 10 + tab_index, "pinned": False}
+                for tab_index in range(3)
+            ]
+            windows.append({
+                "window": window_index + 1,
+                "active": 0,
+                "x": 40 + window_index * 30,
+                "y": 80 + window_index * 30,
+                "width": 900,
+                "height": 600,
+                "maximized": False,
+                "tabs": tabs,
+            })
+        self.send({"type": "session_plan", "windows": windows})
+        while not self.stop.is_set():
+            time.sleep(0.1)
+
+    def run_disconnect(self):
+        if not self.wait_for_tab():
+            return
+        tab = self.tabs[0]
+        self.send({"type": "url", "tab": tab, "url": "about:blank", "bookmarked": False})
+        self.send({"type": "title", "tab": tab, "title": "disconnect"})
+        time.sleep(0.5)
+        try:
+            if self.sock:
+                self.sock.shutdown(socket.SHUT_RDWR)
+                self.sock.close()
+        except OSError:
+            pass
+        self.sock = None
+        self.stop.set()
+
+    def run_windows(self):
+        if not self.wait_for_tab():
+            return
+        for _ in range(8):
+            if self.stop.is_set():
+                break
+            self.send({"type": "open_window", "url": "about:blank"})
+            time.sleep(0.3)
+        end = time.time() + 2
+        while len(self.tabs) < 9 and time.time() < end and not self.stop.is_set():
+            time.sleep(0.05)
+        for index, tab in enumerate(self.tabs):
+            self.send({"type": "title", "tab": tab, "title": f"window {index}"})
+            self.send({"type": "url", "tab": tab, "url": "about:blank", "bookmarked": False})
+            time.sleep(0.05)
+        while not self.stop.is_set():
+            time.sleep(0.1)
+
     def run(self):
         if not self.connect():
             return 1
@@ -414,6 +473,16 @@ class FakeEngine:
         if self.scenario == "lifecycle":
             self.run_lifecycle()
         elif self.scenario == "close":
+            while not self.stop.is_set():
+                time.sleep(0.1)
+        elif self.scenario == "session":
+            self.run_session()
+        elif self.scenario == "disconnect":
+            self.run_disconnect()
+        elif self.scenario == "windows":
+            self.run_windows()
+        elif self.scenario == "resize":
+            self.wait_for_tab()
             while not self.stop.is_set():
                 time.sleep(0.1)
         else:
@@ -584,6 +653,52 @@ def click_at(socket_name, runtime, x, y):
         pass
 
 
+def resize_storm(socket_name, runtime):
+    geometry = window_geometry(runtime)
+    if not geometry:
+        return
+    x, y, width, height = geometry
+    vi = os.path.join(SDE_ROOT, "build/input-test/virtual-input-test")
+    if not os.access(vi, os.X_OK):
+        return
+    env = dict(os.environ)
+    env.update({
+        "WAYLAND_DISPLAY": socket_name,
+        "XDG_RUNTIME_DIR": os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}"),
+        "SDE_STATE_DIR": os.path.join(runtime, "state"),
+        "SDE_WM_PORTAL_PATH": os.path.join(runtime, "wm"),
+        "SERENITY_RES_ROOT": SERENITY_RES,
+        "LD_LIBRARY_PATH": os.path.join(LAGOM, "lib"),
+    })
+    env.pop("DISPLAY", None)
+    args = [vi, "--extent", "1280", "720"]
+    for _ in range(8):
+        args += [
+            "--move", str(x + width // 2), str(y + 10), "--sleep", "80",
+            "--button", "0x110", "press", "--sleep", "30",
+            "--button", "0x110", "release", "--sleep", "70",
+            "--button", "0x110", "press", "--sleep", "30",
+            "--button", "0x110", "release", "--sleep", "300",
+        ]
+    args += ["--linger", "400"]
+    try:
+        subprocess.run(args, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=20)
+    except Exception:
+        pass
+
+
+def session_window_count(runtime, seed):
+    import glob
+    pattern = os.path.join(runtime, "config", "ladybird-sde", f"session-fuzz-{os.getpid()}-{seed}.json")
+    for path in glob.glob(pattern) or glob.glob(os.path.join(runtime, "config", "**", "session-*.json"), recursive=True):
+        try:
+            with open(path) as f:
+                return len(json.load(f).get("windows", []))
+        except Exception:
+            continue
+    return 0
+
+
 def last_exit_reason(log_path):
     try:
         with open(log_path, "r", errors="replace") as f:
@@ -650,6 +765,10 @@ def run_one(seed, duration, args):
             "FUZZ_ONLY": args.only,
             "FUZZ_ONLY_ONCE": "1" if args.only_once else "0",
         })
+        if args.scenario == "session":
+            chrome_env.pop("LADYBIRD_SDE_DISABLE_SESSION_RESTORE", None)
+        else:
+            chrome_env["LADYBIRD_SDE_DISABLE_SESSION_RESTORE"] = "1"
         chrome_env.pop("LD_LIBRARY_PATH", None)
         chrome_log_path = os.path.join(runtime, "chrome.log")
         chrome_log = open(chrome_log_path, "wb")
@@ -677,6 +796,8 @@ def run_one(seed, duration, args):
                     x, y, width, height = geometry
                     click_at(socket_name, runtime, x + width - 4, y + 10)
                     time.sleep(0.3)
+            elif args.scenario == "resize":
+                resize_storm(socket_name, runtime)
             status = "ok"
             deadline = time.time() + duration + 4
             stalled_since = None
@@ -737,6 +858,15 @@ def run_one(seed, duration, args):
         else:
             result["exit"] = chrome.returncode
 
+        if args.scenario == "windows" and result["status"] == "ok":
+            reason = last_exit_reason(chrome_log_path)
+            match = re.search(r"\((\d+) window\(s\)", reason)
+            if not match or int(match.group(1)) < 2:
+                result["status"] = "windows-not-created"
+        if args.scenario == "session" and result["status"] == "ok":
+            if session_window_count(runtime, seed) < 3:
+                result["status"] = "session-not-saved"
+
         if result["status"] != "ok":
             result["log"] = chrome_log_path
             result["core_hint"] = f"coredumpctl dump {chrome.pid} -o {runtime}/core"
@@ -772,7 +902,7 @@ def orchestrator_main(argv):
     parser.add_argument("--seed", type=int, help="run one seed")
     parser.add_argument("--duration", type=float, default=8.0, help="seconds of fuzzing per seed")
     parser.add_argument("--mode", choices=["mutate", "raw", "quiet"], default="mutate")
-    parser.add_argument("--scenario", choices=["protocol", "lifecycle", "modals", "close"], default="protocol",
+    parser.add_argument("--scenario", choices=["protocol", "lifecycle", "modals", "close", "disconnect", "windows", "resize", "session"], default="protocol",
                         help="protocol = event fuzz; lifecycle = window/tab/dialog sequence; modals = protocol with dialogs")
     parser.add_argument("--modals", action="store_true", help="include dialog-opening events")
     parser.add_argument("--only", default="", help="send only this event type (diagnostic)")

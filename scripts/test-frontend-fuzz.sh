@@ -23,4 +23,16 @@ echo "== modal fuzz"
 echo "== close request"
 "$FUZZ" --scenario close --seed 1 --duration 8
 
+echo "== disconnect"
+"$FUZZ" --scenario disconnect --seed 1 --duration 6
+
+echo "== multi-window"
+"$FUZZ" --scenario windows --seed 1 --duration 6
+
+echo "== resize"
+"$FUZZ" --scenario resize --seed 1 --duration 6
+
+echo "== session restore"
+"$FUZZ" --scenario session --seed 1 --duration 8
+
 echo "==> frontend fuzz smoke PASSED"
