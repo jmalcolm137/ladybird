@@ -58,6 +58,7 @@ class FakeEngine:
         self.log_path = log_path
         self.command_log = command_log
         self.modals = modals
+        self.scenario = os.environ.get("FUZZ_SCENARIO", "protocol")
         self.sock = None
         self.write_lock = threading.Lock()
         self.stop = threading.Event()
@@ -343,6 +344,48 @@ class FakeEngine:
             event = {"type": "title", "tab": tab, "title": "fuzz"}
         self.send(event)
 
+    def wait_for_tab(self, timeout=6):
+        end = time.time() + timeout
+        while time.time() < end and not self.tabs and not self.stop.is_set():
+            time.sleep(0.05)
+        return bool(self.tabs)
+
+    def run_lifecycle(self):
+        if not self.wait_for_tab():
+            return
+        tab1 = self.tabs[0]
+        self.send({"type": "open_window", "url": "about:blank"})
+        end = time.time() + 3
+        while len(self.tabs) < 2 and time.time() < end and not self.stop.is_set():
+            time.sleep(0.05)
+        tab2 = self.tabs[-1]
+
+        sequence = [
+            {"type": "session_window", "window": 1, "session_window": 1},
+            {"type": "session_window", "window": 2, "session_window": 2},
+            {"type": "title", "tab": tab1, "title": "lifecycle one"},
+            {"type": "url", "tab": tab2, "url": "about:blank", "bookmarked": False},
+            {"type": "fullscreen", "tab": tab1, "fullscreen": True},
+            {"type": "fullscreen", "tab": tab1, "fullscreen": False},
+            {"type": "history_search_results", "query": "lifecycle", "items": []},
+            {"type": "certificate_info", "tab": tab1, "valid": False},
+            {"type": "file_picker", "tab": tab1, "multiple": False, "filters": []},
+            {"type": "permission", "tab": tab1, "request": 1, "name": "geolocation", "origin": "https://example.com"},
+            {"type": "context_menu", "tab": tab1, "x": 10, "y": 10, "items": []},
+            {"type": "select_dropdown", "tab": tab1, "x": 10, "y": 10, "min_width": 100, "items": []},
+            {"type": "dialog", "tab": tab2, "kind": "alert", "message": "lifecycle", "default": ""},
+            {"type": "clipboard", "tab": tab1, "text": "lifecycle"},
+            {"type": "tab_closed", "tab": tab1},
+            {"type": "open_window", "url": "about:blank"},
+        ]
+        for event in sequence:
+            if self.stop.is_set():
+                break
+            self.send(event)
+            time.sleep(0.5)
+        while not self.stop.is_set():
+            time.sleep(0.1)
+
     def run(self):
         if not self.connect():
             return 1
@@ -354,10 +397,13 @@ class FakeEngine:
         reader = threading.Thread(target=self.reader, daemon=True)
         reader.start()
 
-        deadline = time.time() + self.duration
-        while time.time() < deadline and not self.stop.is_set():
-            self.fuzz_once()
-            time.sleep(self.random.choice([0.0002, 0.001, 0.005, 0.02]))
+        if self.scenario == "lifecycle":
+            self.run_lifecycle()
+        else:
+            deadline = time.time() + self.duration
+            while time.time() < deadline and not self.stop.is_set():
+                self.fuzz_once()
+                time.sleep(self.random.choice([0.0002, 0.001, 0.005, 0.02]))
 
         # Stay attached so the frontend sees a live peer while it shuts down.
         hard_deadline = time.time() + 30
@@ -439,6 +485,56 @@ def sample_threads(pid):
     return out
 
 
+def escape_keypresses(socket_name, runtime, stop, duration):
+    # One virtual-input connection for the whole run. Creating a virtual
+    # keyboard per press destroys the seat's keyboard focus between presses,
+    # so after the first Escape the rest would go nowhere.
+    vi = os.path.join(SDE_ROOT, "build/input-test/virtual-input-test")
+    if not os.access(vi, os.X_OK):
+        return
+    env = dict(os.environ)
+    env.update({
+        "WAYLAND_DISPLAY": socket_name,
+        "XDG_RUNTIME_DIR": os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}"),
+        "SDE_STATE_DIR": os.path.join(runtime, "state"),
+        "SDE_WM_PORTAL_PATH": os.path.join(runtime, "wm"),
+        "SERENITY_RES_ROOT": SERENITY_RES,
+        "LD_LIBRARY_PATH": os.path.join(LAGOM, "lib"),
+    })
+    env.pop("DISPLAY", None)
+    args = [vi, "--extent", "1280", "720"]
+    for _ in range(max(1, int(duration / 0.5) + 2)):
+        args += ["--key", "1", "press", "--sleep", "60", "--key", "1", "release", "--sleep", "350"]
+    args += ["--linger", "500"]
+    try:
+        process = subprocess.Popen(args, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except OSError:
+        return
+    while not stop.wait(0.2):
+        if process.poll() is not None:
+            break
+    try:
+        process.terminate()
+        process.wait(timeout=2)
+    except Exception:
+        try:
+            process.kill()
+        except Exception:
+            pass
+
+
+def last_exit_reason(log_path):
+    try:
+        with open(log_path, "r", errors="replace") as f:
+            lines = f.readlines()
+    except OSError:
+        return ""
+    for line in reversed(lines):
+        if "Ladybird: exiting:" in line:
+            return line.strip()
+    return ""
+
+
 def run_one(seed, duration, args):
     runtime = tempfile.mkdtemp(prefix=f"ladybird-fuzz-{seed}-")
     try:
@@ -488,7 +584,8 @@ def run_one(seed, duration, args):
             "FUZZ_ACTION_LOG": os.path.join(runtime, "events.jsonl"),
             "FUZZ_COMMAND_LOG": os.path.join(runtime, "commands.jsonl"),
             "FUZZ_READY_FILE": os.path.join(runtime, "engine-connected"),
-            "FUZZ_MODALS": "1" if args.modals else "0",
+            "FUZZ_MODALS": "1" if (args.modals or args.scenario in ("modals", "lifecycle")) else "0",
+            "FUZZ_SCENARIO": args.scenario,
             "FUZZ_ONLY": args.only,
             "FUZZ_ONLY_ONCE": "1" if args.only_once else "0",
         })
@@ -501,6 +598,13 @@ def run_one(seed, duration, args):
             start_new_session=True,
         )
 
+        escape_stop = threading.Event()
+        escape_thread = None
+        if args.scenario in ("lifecycle", "modals") or args.modals:
+            escape_thread = threading.Thread(
+                target=escape_keypresses, args=(socket_name, runtime, escape_stop, duration), daemon=True)
+            escape_thread.start()
+
         if not wait_for_path(os.path.join(runtime, "engine-connected"), 15):
             status = "engine-not-connected"
         else:
@@ -511,7 +615,11 @@ def run_one(seed, duration, args):
             stalled_since = None
             while time.time() < deadline:
                 if chrome.poll() is not None:
-                    status = "crashed"
+                    reason = last_exit_reason(chrome_log_path)
+                    if "last window closed" in reason or "quit action" in reason:
+                        status = "expected-exit" if args.scenario in ("lifecycle", "modals") else "unexpected-exit"
+                    else:
+                        status = "crashed"
                     break
                 stalled = False
                 for _, _, state, wchan in sample_threads(chrome.pid):
@@ -525,9 +633,17 @@ def run_one(seed, duration, args):
                 else:
                     stalled_since = None
                 time.sleep(0.1)
-            if status == "ok":
-                if chrome.poll() is not None:
+            if status == "ok" and chrome.poll() is not None:
+                reason = last_exit_reason(chrome_log_path)
+                if "last window closed" in reason or "quit action" in reason:
+                    status = "expected-exit" if args.scenario in ("lifecycle", "modals") else "unexpected-exit"
+                else:
                     status = "crashed"
+
+        # Let a final Escape close any dialog left open by the scenario.
+        escape_stop.set()
+        if escape_thread:
+            escape_thread.join(timeout=2)
 
         # Try a graceful stop, then a core dump if it will not leave.
         result = {"seed": seed, "status": status, "runtime": runtime}
@@ -559,6 +675,10 @@ def run_one(seed, duration, args):
 
     finally:
         try:
+            escape_stop.set()
+        except Exception:
+            pass
+        try:
             compositor.terminate()
         except Exception:
             pass
@@ -583,6 +703,8 @@ def orchestrator_main(argv):
     parser.add_argument("--seed", type=int, help="run one seed")
     parser.add_argument("--duration", type=float, default=8.0, help="seconds of fuzzing per seed")
     parser.add_argument("--mode", choices=["mutate", "raw", "quiet"], default="mutate")
+    parser.add_argument("--scenario", choices=["protocol", "lifecycle", "modals"], default="protocol",
+                        help="protocol = event fuzz; lifecycle = window/tab/dialog sequence; modals = protocol with dialogs")
     parser.add_argument("--modals", action="store_true", help="include dialog-opening events")
     parser.add_argument("--only", default="", help="send only this event type (diagnostic)")
     parser.add_argument("--only-once", action="store_true", help="send the --only event once")
@@ -610,8 +732,9 @@ def orchestrator_main(argv):
         started = time.time()
         result = run_one(seed, args.duration, args)
         elapsed = time.time() - started
-        if result["status"] == "ok":
-            print(f"ok   seed={seed} {elapsed:.1f}s")
+        if result["status"] in ("ok", "expected-exit"):
+            note = " (window closed)" if result["status"] == "expected-exit" else ""
+            print(f"ok   seed={seed} {elapsed:.1f}s{note}")
             if not args.keep:
                 shutil.rmtree(result["runtime"], ignore_errors=True)
         else:
