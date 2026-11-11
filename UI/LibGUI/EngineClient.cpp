@@ -413,9 +413,11 @@ void EngineClient::flush_writes()
             }
 
             warnln("Ladybird: could not write to engine: {}", result.error());
-            close_socket();
-            if (on_disconnected)
-                on_disconnected();
+            // This can run from inside the engine socket's on_ready_to_read
+            // callback: an event opens a dialog, a key action sends a command,
+            // and the write discovers the peer is gone. Destroying the socket
+            // there would clear the callback Function from inside its own call.
+            schedule_disconnect();
             return;
         }
 

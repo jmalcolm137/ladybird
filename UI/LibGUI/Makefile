@@ -19,8 +19,8 @@ CXX ?= c++
 CXXFLAGS ?= -std=c++26 -fno-exceptions -O2 -g -Wall -Wextra -Wno-literal-suffix
 ASAN ?= 0
 ifeq ($(ASAN),1)
-CXXFLAGS += -fsanitize=address -fno-omit-frame-pointer
-LDFLAGS += -fsanitize=address
+CXXFLAGS += -fsanitize=address,undefined -fno-omit-frame-pointer
+LDFLAGS += -fsanitize=address,undefined
 endif
 CPPFLAGS += \
 	-I$(SERENITY) \
