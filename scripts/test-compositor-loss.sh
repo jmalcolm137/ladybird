@@ -14,6 +14,10 @@ SDE_ROOT="${SDE_ROOT:-$ROOT/../serenity-desktop-environment}"
 LIBGUI_WAYLAND_ROOT="${LIBGUI_WAYLAND_ROOT:-$ROOT/../libgui-wayland}"
 SERENITY="${SERENITY:-$LIBGUI_WAYLAND_ROOT/serenity}"
 LAGOM="${LAGOM:-$LIBGUI_WAYLAND_ROOT/build/lagom}"
+# The compositor runs on the normal framework even in a sanitizer run: it is not
+# built with ASAN, and loading instrumented libraries without the runtime aborts
+# at startup. Only the browser uses LAGOM.
+COMP_LAGOM="${COMP_LAGOM:-$LIBGUI_WAYLAND_ROOT/build/lagom}"
 COMP="${COMP:-$SDE_ROOT/build/WindowServer/WindowServer}"
 CHROME="${LADYBIRD_CHROME:-$ROOT/build/chrome/Ladybird}"
 
@@ -42,7 +46,7 @@ env -u WAYLAND_DISPLAY -u DISPLAY \
     XDG_DATA_HOME="$RUNTIME/data" XDG_CONFIG_HOME="$RUNTIME/config" \
     SDE_STATE_DIR="$RUNTIME/state" SDE_WM_PORTAL_PATH="$RUNTIME/wm" \
     SERENITY_RES_ROOT="$SERENITY/Base/res" \
-    LD_LIBRARY_PATH="$LAGOM/lib" \
+    LD_LIBRARY_PATH="$COMP_LAGOM/lib" \
     "$COMP" -n "$SOCK" >"$RUNTIME/compositor.log" 2>&1 &
 COMP_PID=$!
 for _ in $(seq 1 100); do [[ -e "$XDG_RUNTIME_DIR/$SOCK" ]] && break; sleep 0.1; done
