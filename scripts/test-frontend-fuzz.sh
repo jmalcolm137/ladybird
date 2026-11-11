@@ -32,6 +32,9 @@ echo "== multi-window"
 echo "== resize"
 "$FUZZ" --scenario resize --seed 1 --duration 6
 
+echo "== edge resize"
+"$FUZZ" --scenario resize-edge --seed 1 --duration 6
+
 echo "== session restore"
 "$FUZZ" --scenario session --seed 1 --duration 8
 

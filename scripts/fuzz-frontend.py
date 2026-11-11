@@ -481,7 +481,7 @@ class FakeEngine:
             self.run_disconnect()
         elif self.scenario == "windows":
             self.run_windows()
-        elif self.scenario == "resize":
+        elif self.scenario in ("resize", "resize-edge"):
             self.wait_for_tab()
             while not self.stop.is_set():
                 time.sleep(0.1)
@@ -653,6 +653,53 @@ def click_at(socket_name, runtime, x, y):
         pass
 
 
+def presented_size(runtime):
+    try:
+        text = open(os.path.join(runtime, "chrome.log"), "r", errors="replace").read()
+    except OSError:
+        return None
+    matches = re.findall(r"LibWM: window \d+ presented \((\d+)x(\d+)", text)
+    if not matches:
+        return None
+    return int(matches[-1][0]), int(matches[-1][1])
+
+
+def drag_resize(socket_name, runtime):
+    geometry = window_geometry(runtime)
+    if not geometry:
+        return
+    x, y, width, height = geometry
+    vi = os.path.join(SDE_ROOT, "build/input-test/virtual-input-test")
+    if not os.access(vi, os.X_OK):
+        return
+    env = dict(os.environ)
+    env.update({
+        "WAYLAND_DISPLAY": socket_name,
+        "XDG_RUNTIME_DIR": os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}"),
+        "SDE_STATE_DIR": os.path.join(runtime, "state"),
+        "SDE_WM_PORTAL_PATH": os.path.join(runtime, "wm"),
+        "SERENITY_RES_ROOT": SERENITY_RES,
+        "LD_LIBRARY_PATH": os.path.join(LAGOM, "lib"),
+    })
+    env.pop("DISPLAY", None)
+    for _ in range(5):
+        size = presented_size(runtime) or (width, height)
+        corner_x = x + size[0] + 4
+        corner_y = y + 22 + size[1] // 2
+        args = [
+            vi, "--extent", "1280", "720",
+            "--move", str(corner_x), str(corner_y), "--sleep", "120",
+            "--button", "0x110", "press", "--sleep", "80",
+            "--move", str(min(corner_x + 80, 1270)), str(corner_y), "--sleep", "200",
+            "--button", "0x110", "release", "--linger", "250",
+        ]
+        try:
+            subprocess.run(args, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=6)
+        except Exception:
+            pass
+        time.sleep(0.4)
+
+
 def resize_storm(socket_name, runtime):
     geometry = window_geometry(runtime)
     if not geometry:
@@ -798,6 +845,8 @@ def run_one(seed, duration, args):
                     time.sleep(0.3)
             elif args.scenario == "resize":
                 resize_storm(socket_name, runtime)
+            elif args.scenario == "resize-edge":
+                drag_resize(socket_name, runtime)
             status = "ok"
             deadline = time.time() + duration + 4
             stalled_since = None
@@ -866,6 +915,11 @@ def run_one(seed, duration, args):
         if args.scenario == "session" and result["status"] == "ok":
             if session_window_count(runtime, seed) < 3:
                 result["status"] = "session-not-saved"
+        if args.scenario == "resize-edge" and result["status"] == "ok":
+            geometry = window_geometry(runtime)
+            size = presented_size(runtime)
+            if not geometry or not size or (size[0] <= geometry[2] and size[1] <= geometry[3]):
+                result["status"] = "resize-not-delivered"
 
         if result["status"] != "ok":
             result["log"] = chrome_log_path
@@ -902,7 +956,7 @@ def orchestrator_main(argv):
     parser.add_argument("--seed", type=int, help="run one seed")
     parser.add_argument("--duration", type=float, default=8.0, help="seconds of fuzzing per seed")
     parser.add_argument("--mode", choices=["mutate", "raw", "quiet"], default="mutate")
-    parser.add_argument("--scenario", choices=["protocol", "lifecycle", "modals", "close", "disconnect", "windows", "resize", "session"], default="protocol",
+    parser.add_argument("--scenario", choices=["protocol", "lifecycle", "modals", "close", "disconnect", "windows", "resize", "resize-edge", "session"], default="protocol",
                         help="protocol = event fuzz; lifecycle = window/tab/dialog sequence; modals = protocol with dialogs")
     parser.add_argument("--modals", action="store_true", help="include dialog-opening events")
     parser.add_argument("--only", default="", help="send only this event type (diagnostic)")

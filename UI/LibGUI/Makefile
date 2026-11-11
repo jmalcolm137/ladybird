@@ -12,11 +12,16 @@ ROOT := $(abspath $(CURDIR)/../..)
 LIBGUI_WAYLAND_ROOT ?= $(ROOT)/../libgui-wayland
 LAGOM ?= $(abspath $(LIBGUI_WAYLAND_ROOT)/build/lagom)
 SERENITY ?= $(abspath $(LIBGUI_WAYLAND_ROOT)/serenity)
-BIN_DIR := $(ROOT)/build/chrome
+BIN_DIR ?= $(ROOT)/build/chrome
 TARGET := $(BIN_DIR)/Ladybird
 
 CXX ?= c++
 CXXFLAGS ?= -std=c++26 -fno-exceptions -O2 -g -Wall -Wextra -Wno-literal-suffix
+ASAN ?= 0
+ifeq ($(ASAN),1)
+CXXFLAGS += -fsanitize=address -fno-omit-frame-pointer
+LDFLAGS += -fsanitize=address
+endif
 CPPFLAGS += \
 	-I$(SERENITY) \
 	-I$(SERENITY)/Userland \
