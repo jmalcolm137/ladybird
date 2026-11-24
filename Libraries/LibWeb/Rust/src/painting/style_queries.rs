@@ -195,6 +195,16 @@ pub(crate) fn has_layout_containment(arena: &impl PaintRead, node: NodeSlotId, s
     contained && containment_applies_to_display(arena, node, style)
 }
 
+/// Whether the box itself shows: it is visible, and not fully transparent unless an animation of its opacity or
+/// transform keeps its content for the compositor to reveal.
+pub(crate) fn is_visible(arena: &impl PaintRead, node: NodeSlotId) -> bool {
+    arena.node_style_if_live(node).is_some_and(|style| {
+        style.visibility() == crate::css::css_enums::visibility::VISIBLE
+            && (style.effects().opacity != 0.0
+                || arena.node_flags_if_live(node) & NodeFlag::HasAnimatedOpacityOrTransform as u32 != 0)
+    })
+}
+
 pub(crate) fn is_scroll_container(arena: &impl PaintRead, node: NodeSlotId) -> bool {
     arena
         .node(node)
@@ -234,7 +244,11 @@ pub(crate) fn document_element_box_under(arena: &impl PaintRead, parent: NodeSlo
 
 pub(crate) fn node_is_root_element(arena: &impl PaintRead, node: NodeSlotId) -> bool {
     let flags = arena.node_flags_if_live(node);
-    flags & NodeFlag::Anonymous as u32 == 0 && flags & NodeFlag::IsHtmlHtmlElement as u32 != 0
+    // NB: Only the document element is the root: An html element anywhere else, e.g. in a shadow tree, is an
+    //     ordinary element.
+    flags & NodeFlag::Anonymous as u32 == 0
+        && flags & NodeFlag::IsHtmlHtmlElement as u32 != 0
+        && flags & NodeFlag::IsDocumentElement as u32 != 0
 }
 
 fn style_establishes_fixed_positioning_containing_block(
@@ -310,7 +324,7 @@ fn style_establishes_fixed_positioning_containing_block(
     false
 }
 
-pub(crate) fn inline_establishes_absolute_position_containing_block(style: ComputedValuesView<'_>) -> bool {
+fn inline_establishes_absolute_position_containing_block(style: ComputedValuesView<'_>) -> bool {
     let effects = style.effects();
     style.position() != positioning::STATIC
         || filter_has_filters(&effects.filter)
@@ -318,11 +332,45 @@ pub(crate) fn inline_establishes_absolute_position_containing_block(style: Compu
         || will_change_has_any_property(style, &[b"position", b"filter", b"backdrop-filter"])
 }
 
+/// Whether a box with `style` may establish a containing block for absolutely or fixed positioned boxes, which
+/// [`establishes_positioning_containing_blocks`] answers for the box. A box this answers no for establishes neither,
+/// unless it is the viewport or a `<foreignObject>`'s box, which establish them whatever their style.
+pub(crate) fn style_may_establish_positioning_containing_blocks(style: ComputedValuesView<'_>) -> bool {
+    use crate::css::css_enums::{backface_visibility, content_visibility};
+    let transform = style.transform();
+    let effects = style.effects();
+    let box_values = style.box_values();
+    let misc = style.misc_interaction();
+    style.position() != positioning::STATIC
+        || !misc.implicit_will_change.as_slice().is_empty()
+        || matches!(handle_value(&misc.will_change), Some(StyleValueData::ValueList { .. }))
+        || !transform.transformations.pointer.is_null()
+        || !transform.translate.pointer.is_null()
+        || !transform.rotate.pointer.is_null()
+        || !transform.scale.pointer.is_null()
+        || transform.has_offset_path
+        || transform.has_perspective
+        || filter_has_filters(&effects.filter)
+        || filter_has_filters(&effects.backdrop_filter)
+        || box_values.layout_containment
+        || box_values.paint_containment
+        || style.content_visibility() == content_visibility::AUTO
+        || transform.transform_style == transform_style::PRESERVE_3D
+        || transform.backface_visibility == backface_visibility::HIDDEN
+}
+
 pub(crate) fn establishes_positioning_containing_blocks(arena: &impl PaintRead, node: NodeSlotId) -> (bool, bool) {
     let Some(row) = arena.node(node) else {
         return (false, false);
     };
     let kind = row.kind();
+    if kind == NodeKind::InlineNode {
+        let absolute = !node_facts::has_flag(&row, NodeFlag::Anonymous)
+            && row
+                .style()
+                .is_some_and(inline_establishes_absolute_position_containing_block);
+        return (absolute, false);
+    }
     if !node_facts::kind_is_box(kind) {
         return (false, false);
     }
@@ -376,10 +424,6 @@ pub(crate) fn has_css_transform(arena: &impl PaintRead, node: NodeSlotId, style:
     has_transform && is_transformable(arena, node)
 }
 
-pub(crate) fn is_atomic_inline(arena: &impl PaintRead, node: NodeSlotId) -> bool {
-    arena.node(node).is_some_and(PaintRow::is_atomic_inline)
-}
-
 pub(crate) fn is_transformable(arena: &impl PaintRead, node: NodeSlotId) -> bool {
     let Some(row) = arena.node(node) else {
         return false;
@@ -412,6 +456,10 @@ pub(crate) fn is_transformable(arena: &impl PaintRead, node: NodeSlotId) -> bool
         && !node_facts::kind_is_text(kind)
         && kind != NodeKind::Viewport;
     let is_element_or_pseudo_element = is_dom_element || row.generated_for() != 0;
+    // NB: A table's wrapper box takes the transform of the table (see LayoutStyle::copy_table_properties).
+    if kind == NodeKind::TableWrapper {
+        return true;
+    }
     if is_element_or_pseudo_element && node_facts::kind_is_box(kind) {
         let Some(style) = row.style() else {
             return false;

@@ -28,11 +28,11 @@ pub const NO_YIELD_CONTINUATION: u32 = u32::MAX;
 
 /// The `kind` of a `CreateArguments` that creates a mapped arguments object
 /// (`ArgumentsKind::Mapped` in `Libraries/LibJS/ABI`).
-pub const MAPPED_ARGUMENTS: u32 = 0;
+pub const MAPPED_ARGUMENTS: u8 = 0;
 
 /// The `kind` of a `PutByValue` or `PutById` of a plain assignment
 /// (`PutKind::Normal` in `Libraries/LibJS/ABI`).
-pub const PUT_KIND_NORMAL: u32 = 0;
+pub const PUT_KIND_NORMAL: u8 = 0;
 
 /// How an executable's flat slot indices are partitioned. Operands index the
 /// frame's value array laid out as `[registers | locals | constants | arguments]`.
@@ -165,25 +165,25 @@ pub(crate) mod test_support {
     }
 
     impl Program {
-        pub fn instructions(&self) -> Vec<DecodedInstruction> {
-            decode_all(&self.bytes).unwrap()
+        pub fn instructions(&self) -> &'static [DecodedInstruction<'static>] {
+            decode_all(&self.bytes, crate::test_zone()).unwrap()
         }
 
-        pub fn cfg(&self) -> Cfg {
-            Cfg::new(&self.instructions(), &self.handlers, &test_layout()).unwrap()
+        pub fn cfg(&self) -> Cfg<'static> {
+            Cfg::new(self.instructions(), &self.handlers, &test_layout(), crate::test_zone()).unwrap()
         }
     }
 
     /// Encodes the instructions returned by `build`, which receives a function
     /// that turns an instruction index into a label pointing at that instruction.
-    pub fn assemble(build: impl Fn(&dyn Fn(usize) -> Label) -> Vec<Instruction>) -> Program {
+    pub fn assemble(build: impl Fn(&dyn Fn(usize) -> Label) -> Vec<Instruction<'static>>) -> Program {
         assemble_with_handlers(build, &[])
     }
 
     /// Like `assemble()`, with exception handlers given as instruction indices
     /// `(start, end, handler)`, where `end` is exclusive.
     pub fn assemble_with_handlers(
-        build: impl Fn(&dyn Fn(usize) -> Label) -> Vec<Instruction>,
+        build: impl Fn(&dyn Fn(usize) -> Label) -> Vec<Instruction<'static>>,
         handlers: &[(usize, usize, usize)],
     ) -> Program {
         let mut offsets = Vec::new();
@@ -196,7 +196,7 @@ pub(crate) mod test_support {
 
         let mut bytes = Vec::new();
         for instruction in build(&|index| Label(offsets[index])) {
-            instruction.encode(false, &mut bytes);
+            instruction.encode(&mut bytes);
         }
         assert_eq!(bytes.len(), offset as usize);
 

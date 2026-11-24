@@ -64,6 +64,7 @@ enum class ActionID {
     ToggleBookmarksBar,
     ShowBookmarksBar,
     BookmarkItem,
+    EmptyBookmarkFolder,
 
     OpenAllBookmarksInTabs,
     AddBookmark,
@@ -139,6 +140,7 @@ enum class ActionID {
     ReportLeakedDocuments,
     ShowLineBoxBorders,
     ShowCaretHitTestDebugOverlay,
+    ShowCompositorLayers,
     ShowTabPerformanceMonitor,
     CollectGarbage,
     CrashCurrentPage,
@@ -168,7 +170,6 @@ public:
     StringView text() const { return action_text_to_string_view(m_text); }
     void set_text(ActionText);
 
-    bool has_tooltip() const { return m_tooltip.has_value(); }
     StringView tooltip() const { return action_text_to_string_view(*m_tooltip); }
     void set_tooltip(ActionText);
 
@@ -189,13 +190,17 @@ public:
     bool engaged() const { return m_engaged; }
     void set_engaged(bool);
 
+    bool is_checkable() const { return m_checked.has_value(); }
+    bool checked() const { return *m_checked; }
+    void set_checked(bool);
+
     // Work the action started is under way, e.g. a download, which its button shows by pulsing.
     bool busy() const { return m_busy; }
     void set_busy(bool);
 
-    bool is_checkable() const { return m_checked.has_value(); }
-    bool checked() const { return *m_checked; }
-    void set_checked(bool);
+    // Show another action's shortcut as a menu hint.
+    Optional<ActionID> shortcut_hint() const { return m_shortcut_hint; }
+    void set_shortcut_hint(Optional<ActionID>);
 
     struct Observer {
         AK_ALLOC_WITH_KMALLOC;
@@ -209,6 +214,7 @@ public:
         virtual void on_engaged_state_changed(Action&) { }
         virtual void on_busy_state_changed(Action&) { }
         virtual void on_checked_state_changed(Action&) { }
+        virtual void on_shortcut_hint_changed(Action&) { }
     };
 
     void add_observer(NonnullOwnPtr<Observer>);
@@ -238,6 +244,7 @@ private:
     bool m_engaged { false };
     bool m_busy { false };
     Optional<bool> m_checked;
+    Optional<ActionID> m_shortcut_hint;
 
     Function<void()> m_action;
     Vector<NonnullOwnPtr<Observer>, 1> m_observers;
@@ -273,8 +280,6 @@ public:
 
     void set_render_group_icon(bool render_group_icon) { m_render_group_icon = render_group_icon; }
     bool render_group_icon() const { return m_render_group_icon; }
-
-    bool is_group() const { return m_is_group; }
 
     bool visible() const { return m_visible; }
     void set_visible(bool);

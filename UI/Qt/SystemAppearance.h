@@ -6,9 +6,15 @@
 
 #pragma once
 
+#include <AK/Platform.h>
+#include <AK/StringView.h>
 #include <LibWebView/Settings.h>
 
 #include <QObject>
+
+#if defined(AK_OS_LINUX)
+typedef struct _GVariant GVariant;
+#endif
 
 namespace Ladybird {
 
@@ -24,14 +30,24 @@ public:
     static SystemAppearance& the();
 
     bool prefers_dark() const { return m_prefers_dark; }
-    // Whether the system asks for less motion. The chrome then moves nothing, though it still fades.
+    // Whether the system asks for less motion. The chrome then moves nothing, though it still fades, and pages whose
+    // motion preference is Auto see prefers-reduced-motion: reduce.
     static bool prefers_reduced_motion();
 
     void apply_interface_theme(WebView::ThemePreference);
     void apply_color_theme(WebView::ColorTheme);
 
+#if defined(AK_OS_LINUX)
+    // Takes in a setting that the desktop's settings portal reported.
+    void apply_portal_setting(StringView namespace_, StringView key, GVariant* value);
+#endif
+
 signals:
     void changed();
+    // The system started or stopped asking for less motion.
+    void reduced_motion_changed();
+    // The system started or stopped asking for more contrast.
+    void contrast_changed();
     // Our windows switched between the light and dark appearance, whether the system or the interface theme switched
     // them.
     void interface_appearance_changed();

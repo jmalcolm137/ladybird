@@ -43,8 +43,11 @@ public:
     Vector<Gfx::SharedImageBuffer const*> shared_image_buffers() const;
 
     // Replaces every backing store. The first of the new ones becomes the front backing store.
-    virtual void install(Vector<i32> bitmap_ids, Vector<Gfx::SharedImage>);
-    virtual void add(Vector<i32> bitmap_ids, Vector<Gfx::SharedImage>);
+    // When one of the images can't be imported, this fails without changing any backing store, and the backing stores
+    // stay as they were until an installation succeeds: Additions and retirements are refused, and every presentation is
+    // handed straight back, since they're all for the backing stores that were refused.
+    virtual ErrorOr<void> install(Vector<i32> bitmap_ids, Vector<Gfx::SharedImage>);
+    virtual ErrorOr<void> add(Vector<i32> bitmap_ids, Vector<Gfx::SharedImage>);
     virtual void retire(ReadonlySpan<i32> bitmap_ids);
 
     struct PresentationResult {
@@ -54,6 +57,9 @@ public:
     };
     // Makes the backing store with this ID the front backing store, unless it is no longer one of ours.
     virtual PresentationResult present(i32 bitmap_id, Gfx::IntSize, double device_pixel_ratio);
+
+    // Records a frame that the Compositor shows itself, in a remote layer, rather than in one of these backing stores.
+    void present_frame_shown_in_remote_layer(Gfx::IntSize, double device_pixel_ratio);
 
     // Keeps the frame on display, so there is something to show until a new frame arrives.
     virtual void keep_front_as_backup();
@@ -66,6 +72,12 @@ protected:
     // These keep track of backing stores whose images another process holds.
     void track_installed_backing_stores(ReadonlySpan<i32> bitmap_ids);
     void track_added_backing_stores(ReadonlySpan<i32> bitmap_ids);
+
+    // Fails when one of these images can't be imported, and refuses the installation they're for, as install() does.
+    ErrorOr<void> check_installed_backing_stores(ReadonlySpan<Gfx::SharedImage>);
+    // Fails when one of these images can't be imported, or while an installation stays refused, as add() does.
+    ErrorOr<void> check_added_backing_stores(ReadonlySpan<Gfx::SharedImage>) const;
+    bool refuses_backing_stores() const { return m_refuses_backing_stores; }
 
 private:
     struct SharedBitmap {
@@ -80,6 +92,13 @@ private:
     bool m_has_usable_front_bitmap { false };
     SharedBitmap m_backup;
     bool m_has_backup { false };
+    bool m_refuses_backing_stores { false };
+
+    struct FrameShownInRemoteLayer {
+        Gfx::IntSize size;
+        double device_pixel_ratio { 1.0 };
+    };
+    Optional<FrameShownInRemoteLayer> m_frame_shown_in_remote_layer;
 };
 
 }

@@ -148,6 +148,15 @@ DecoderErrorOr<void> Reader::parse_child_boxes(Streamer& streamer, BoxHeader con
         return DecoderError::format(DecoderErrorCategory::Corrupted, "Read past the end of the {} box", parent.type);
 
     while (!parent_end.has_value() || streamer.position() < parent_end.value()) {
+        // A box header takes at least a 32-bit size and a four-character type, so fewer bytes than that at the end of
+        // the parent can't start another box. Skip them, leaving the streamer at the parent's end: QuickTime files may
+        // end a sample entry's child boxes with a 32-bit zero as a terminator.
+        static constexpr size_t MINIMUM_BOX_HEADER_SIZE = sizeof(u32) + sizeof(FourCC);
+        if (parent_end.has_value() && parent_end.value() - streamer.position() < MINIMUM_BOX_HEADER_SIZE) {
+            TRY(streamer.seek_to_position(parent_end.value()));
+            break;
+        }
+
         auto child_or_error = read_box_header(streamer);
         if (child_or_error.is_error()) {
             if (!parent_end.has_value() && child_or_error.error().category() == DecoderErrorCategory::EndOfStream)
@@ -700,6 +709,33 @@ DecoderErrorOr<SampleEntry> Reader::parse_sample_entry(Streamer& streamer, BoxHe
             entry.codec_initialization_data = TRY(parse_elementary_stream_descriptor_box(streamer, child, entry.codec_id, object_type_indication));
             if (entry.codec_id == CodecID::AAC)
                 adopt_parameters(Codecs::AAC::parse_configuration_record(entry.codec_initialization_data.span(), object_type_indication));
+        } else if (child.type == MASTERING_DISPLAY_COLOUR_VOLUME_BOX && entry.video.has_value()) {
+            // The box holds the fields of the H.265 mastering display colour volume SEI message, whose primaries are
+            // in the order green, blue, red, with chromaticities in units of 0.00002 and luminances of 0.0001 cd/m².
+            static constexpr size_t MASTERING_DISPLAY_COLOUR_VOLUME_BOX_SIZE = 24;
+            if (child.content_size.value() < MASTERING_DISPLAY_COLOUR_VOLUME_BOX_SIZE)
+                return IterationDecision::Continue;
+            auto read_chromaticity = [&] -> DecoderErrorOr<Chromaticity> {
+                auto x = TRY(streamer.read<u16>());
+                auto y = TRY(streamer.read<u16>());
+                return Chromaticity { x * 0.00002f, y * 0.00002f };
+            };
+            MasteringDisplayColorVolume volume;
+            volume.green = TRY(read_chromaticity());
+            volume.blue = TRY(read_chromaticity());
+            volume.red = TRY(read_chromaticity());
+            volume.white_point = TRY(read_chromaticity());
+            volume.maximum_luminance = TRY(streamer.read<u32>()) * 0.0001f;
+            volume.minimum_luminance = TRY(streamer.read<u32>()) * 0.0001f;
+            entry.video->mastering_display_color_volume = volume;
+        } else if (child.type == CONTENT_LIGHT_LEVEL_BOX && entry.video.has_value()) {
+            static constexpr size_t CONTENT_LIGHT_LEVEL_BOX_SIZE = 4;
+            if (child.content_size.value() < CONTENT_LIGHT_LEVEL_BOX_SIZE)
+                return IterationDecision::Continue;
+            entry.video->content_light_level_information = ContentLightLevelInformation {
+                .maximum_content_light_level = TRY(streamer.read<u16>()),
+                .maximum_frame_average_light_level = TRY(streamer.read<u16>()),
+            };
         } else if (child.type == COLOUR_INFORMATION_BOX && entry.video.has_value()) {
             if (TRY(streamer.read_four_cc()) == NCLX_COLOUR_TYPE) {
                 auto colour_primaries = TRY(streamer.read<u16>());

@@ -103,7 +103,7 @@ pub(super) struct TextRenderingKey {
     locale: Option<Vec<u16>>,
 }
 
-fn transform_uses_locale(transform: u8) -> bool {
+pub(super) fn transform_uses_locale(transform: u8) -> bool {
     matches!(
         transform,
         text_transform::LOWERCASE | text_transform::UPPERCASE | text_transform::CAPITALIZE
@@ -159,6 +159,7 @@ pub(crate) struct TextChunkCacheKey {
     pub(crate) word_break: u8,
     pub(crate) line_break: u8,
     pub(crate) line_break_language: super::text_chunker::LineBreakLanguage,
+    pub(crate) breaks_after_soft_hyphen: bool,
     pub(crate) font_variant_emoji: u8,
     /// A frozen cascade only moves when a load fills one of its faces in. The chunks made against it hold it.
     pub(crate) frozen_font_list: crate::css::style::pointer_key::PointerLookup,
@@ -171,6 +172,8 @@ pub(crate) struct TextChunkCacheKey {
 pub(crate) struct CachedTextChunks {
     key: TextChunkCacheKey,
     chunks: super::text_chunker::ChunkedText,
+    /// Spacing for which horizontal LTR preparation kept every original chunk separate.
+    pub(super) independent_chunks_for_spacing: std::sync::OnceLock<(u32, u32)>,
 }
 
 impl CachedTextChunks {
@@ -205,6 +208,10 @@ impl TextContent {
     /// The rendered text, as a text row publishes it.
     pub(crate) fn rendered(&self) -> &Arc<RenderedText> {
         &self.rendered
+    }
+
+    pub(super) fn rendered_text_edits(&self) -> &[RenderedTextEdit] {
+        &self.edits
     }
 
     pub(super) fn is_password_input(&self) -> bool {
@@ -281,6 +288,7 @@ impl TextMemos {
         let entry = Arc::new(CachedTextChunks {
             key: key.clone(),
             chunks: compute(),
+            independent_chunks_for_spacing: Default::default(),
         });
         self.chunks.with_row_mut(index, |memo| {
             *memo = Some(ChunksOfText {
@@ -521,6 +529,7 @@ fn sync_text_content(arena: &mut LayoutNodeArena, id: NodeSlotId) {
     let source_range = arena.text_source_range(id, source_length);
     let options = TextRenderingOptions {
         text_transform: inherited.text_transform,
+        text_security: inherited.text_security,
         white_space_collapse: parent_style.white_space_collapse(),
         is_password_input: input.is_password_input,
         dom_start_offset: source_range.start,
@@ -536,10 +545,14 @@ fn sync_text_content(arena: &mut LayoutNodeArena, id: NodeSlotId) {
         .is_some_and(|content| content.rendering_key.as_ref() == Some(&key))
     {
         let source = input.data.to_utf16().into_owned();
-        let untransformed_text_is_ascii_whitespace = source.iter().all(|unit| matches!(unit, 0x09..=0x0d | 0x20));
-        let svg_source_text =
-            super::node_facts::kind_is_svg_box(arena.data(parent).kind.get()).then(|| Box::from(&source[..]));
+        let masks_text =
+            options.text_security != crate::css::css_enums::text_security::NONE || options.is_password_input;
+        let untransformed_text_is_ascii_whitespace =
+            !masks_text && source.iter().all(|unit| matches!(unit, 0x09..=0x0d | 0x20));
+        let is_svg = super::node_facts::kind_is_svg_box(arena.data(parent).kind.get());
+        let svg_source_text = (is_svg && !masks_text).then(|| Box::from(&source[..]));
         let rendered = render_text(source, key.locale.as_deref(), key.options);
+        let svg_source_text = svg_source_text.or_else(|| is_svg.then(|| Box::from(&rendered.text[..])));
         let content = TextContent {
             rendered: Arc::new(RenderedText {
                 svg_source_text,
@@ -592,6 +605,7 @@ mod tests {
             word_break: 0,
             line_break: crate::css::css_enums::line_break::LOOSE,
             line_break_language: LineBreakLanguage::Japanese,
+            breaks_after_soft_hyphen: true,
             font_variant_emoji: 0,
             frozen_font_list: crate::css::style::pointer_key::PointerLookup::new(&frozen_font_list, ()),
             frozen_font_list_fill_generation: 0,
@@ -649,6 +663,7 @@ mod tests {
             word_break: 0,
             line_break: crate::css::css_enums::line_break::AUTO,
             line_break_language: crate::layout::text_chunker::LineBreakLanguage::Other,
+            breaks_after_soft_hyphen: true,
             font_variant_emoji: 0,
             frozen_font_list: crate::css::style::pointer_key::PointerLookup::new(&frozen_font_list, ()),
             frozen_font_list_fill_generation: 0,
@@ -754,6 +769,7 @@ mod tests {
                 box_events: Box::default(),
                 fonts: Box::default(),
                 tab_stops: Box::default(),
+                soft_wraps: Box::default(),
             });
             scratch.prepared_inline_content_memos().keep(block, prepared.clone());
             (validity, Arc::downgrade(&prepared))
@@ -863,6 +879,7 @@ mod tests {
             options: TextRenderingOptions {
                 text_transform: text_transform::UPPERCASE,
                 white_space_collapse: crate::css::css_enums::white_space_collapse::PRESERVE,
+                text_security: crate::css::css_enums::text_security::NONE,
                 is_password_input: false,
                 dom_start_offset: 0,
                 dom_length_in_code_units: 3,
@@ -923,6 +940,7 @@ mod tests {
             options: TextRenderingOptions {
                 text_transform: text_transform::NONE,
                 white_space_collapse: crate::css::css_enums::white_space_collapse::COLLAPSE,
+                text_security: crate::css::css_enums::text_security::NONE,
                 is_password_input: false,
                 dom_start_offset: 0,
                 dom_length_in_code_units: 5,

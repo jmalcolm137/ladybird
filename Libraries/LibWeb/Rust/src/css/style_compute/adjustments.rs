@@ -43,6 +43,8 @@ pub struct FfiBoxTypeTransformationInput {
     pub force_position_static: bool,
     pub force_symbol_display_inline: bool,
     pub webkit_box_layout_transformation_applies: bool,
+    /// The element is rendered in the top layer, and isn't the document element, or the subject is its ::backdrop.
+    pub in_top_layer: bool,
 }
 
 /// Whether element-specific adjustments apply to the subject being computed.
@@ -50,6 +52,8 @@ pub struct FfiBoxTypeTransformationInput {
 pub enum StyleAdjustmentTarget {
     Element,
     PseudoElement,
+    /// A ::backdrop, which exists only for an element rendered in the top layer.
+    Backdrop,
 }
 
 /// Build the shared adjustment inputs from element facts. The caller supplies the first
@@ -91,6 +95,11 @@ pub(crate) fn rust_box_type_transformation_input(
         force_position_static: adjust_element && has(fact::FORCE_POSITION_STATIC),
         force_symbol_display_inline: adjust_element && has(fact::FORCE_SYMBOL_DISPLAY_INLINE),
         webkit_box_layout_transformation_applies: false,
+        in_top_layer: match target {
+            StyleAdjustmentTarget::Element => has(fact::RENDERED_IN_TOP_LAYER) && !has(fact::IS_DOCUMENT_ELEMENT),
+            StyleAdjustmentTarget::PseudoElement => false,
+            StyleAdjustmentTarget::Backdrop => true,
+        },
     }
 }
 
@@ -126,6 +135,7 @@ pub extern "C" fn rust_animated_box_type_transformation_input(
 #[derive(Clone, Copy)]
 pub struct FfiBoxTypeTransformation {
     pub set_float_none: bool,
+    pub set_position_absolute: bool,
     pub changed_display: bool,
     pub display: FfiDisplay,
 }
@@ -183,6 +193,7 @@ pub(super) fn adjust_element_style(
         new_display = FfiDisplay::inline_block();
     }
     if input.is_button_element
+        && new_display != FfiDisplay::block()
         && !(new_display.is_flex_inside()
             || new_display.is_grid_inside()
             || new_display.is_none()
@@ -213,7 +224,7 @@ pub(super) fn adjust_element_style(
     let new_text_align = if input.is_table_element
         && matches!(
             text_align,
-            keyword::_LIBWEB_LEFT | keyword::_LIBWEB_CENTER | keyword::_LIBWEB_RIGHT
+            keyword::_WEBKIT_LEFT | keyword::_WEBKIT_CENTER | keyword::_WEBKIT_RIGHT
         ) {
         keyword::START
     } else {
@@ -286,6 +297,23 @@ pub(super) fn transform_box_type(input: &FfiBoxTypeTransformationInput) -> FfiBo
     let display_before_transformation = input.display;
     let mut display = display_before_transformation;
 
+    // https://drafts.csswg.org/css-position-4/#top-styling
+    // Every element rendered in the top layer, as well as its corresponding ::backdrop pseudo-element, are rendered
+    // with the following qualities:
+    // - If its specified 'display' property is 'display/contents', it computes to 'display/block'.
+    // - If its specified 'position' property is not 'position/absolute' or 'position/fixed', it computes to
+    //   'position/absolute'.
+    let set_position_absolute =
+        input.in_top_layer && input.position != keyword::ABSOLUTE && input.position != keyword::FIXED;
+    let mut adjusted_input = *input;
+    if set_position_absolute {
+        adjusted_input.position = keyword::ABSOLUTE;
+    }
+    let input = &adjusted_input;
+    if input.in_top_layer && display.is_contents() {
+        display = FfiDisplay::block();
+    }
+
     // https://drafts.csswg.org/css-overflow-4/#webkit-line-clamp
     // If the specified value of the 'display' property is '-webkit-box', the computed value becomes 'flow-root'
     // and the box establishes a BFC.
@@ -298,6 +326,7 @@ pub(super) fn transform_box_type(input: &FfiBoxTypeTransformationInput) -> FfiBo
     }
     let unchanged = |set_float_none: bool| FfiBoxTypeTransformation {
         set_float_none,
+        set_position_absolute,
         changed_display: display != display_before_transformation,
         display,
     };
@@ -314,6 +343,7 @@ pub(super) fn transform_box_type(input: &FfiBoxTypeTransformationInput) -> FfiBo
     if input.is_document_element && !display.is_block_outside() {
         return FfiBoxTypeTransformation {
             set_float_none: false,
+            set_position_absolute,
             changed_display: true,
             display: FfiDisplay::block(),
         };
@@ -400,6 +430,7 @@ pub(super) fn transform_box_type(input: &FfiBoxTypeTransformationInput) -> FfiBo
 
     FfiBoxTypeTransformation {
         set_float_none,
+        set_position_absolute,
         changed_display: new_display != display_before_transformation,
         display: new_display,
     }
@@ -593,6 +624,7 @@ pub(super) fn finalize_animated_box_type(
     box_type.position = effective_keyword(longhands, view, prop::POSITION);
     box_type.float_value = effective_keyword(longhands, view, prop::FLOAT);
     box_type.writing_mode = longhands.effective_writing_mode(view);
+    box_type.force_line_height_normal &= effective_keyword(longhands, view, prop::APPEARANCE) != keyword::NONE;
     box_type.webkit_box_layout_transformation_applies = webkit_box_layout_transformation_applies(longhands, view);
     // An axis the overlay does not animate is adjusted from its keyword before the base adjusted it against the other
     // axis, which the overlay may animate out of that adjustment.
@@ -632,6 +664,9 @@ pub(super) fn finalize_animated_box_type(
     }
     if adjustments.box_type.set_float_none {
         adjust(prop::FLOAT, keyword(keyword::NONE));
+    }
+    if adjustments.box_type.set_position_absolute {
+        adjust(prop::POSITION, keyword(keyword::ABSOLUTE));
     }
     if adjustments.box_type.changed_display {
         adjust(prop::DISPLAY, display(adjustments.box_type.display));

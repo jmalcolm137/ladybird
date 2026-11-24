@@ -824,14 +824,16 @@ impl RetainedState {
         .then_some(previous)
     }
 
-    /// The custom properties in a dependency cycle through what an element's animations declare, as
+    /// Mark cyclic endpoints in `intervals` and return the names of cyclic element declarations.
+    /// Cycles can pass through the selected animation intervals, as with
     /// `--p: var(--q)` in a keyframe beside `--q: var(--p)` on the element. An animated value wins
-    /// the cascade over a declared one, so a name it animates reads as its keyframes do. What a value
+    /// the cascade over a declared one. Retained unregistered intervals shadow declarations without
+    /// adding dependencies; other intervals read as their selected endpoints do. What a value
     /// reads is what substituting it looks up, over `base`, the element's environment beneath its
     /// animations, with their values `animated`, and `inheritance`, the environment it inherits:
     /// which branch of an `if()` or fallback that takes depends on the values, and what decides that
     /// is itself read, so that a cycle through it is found whichever way it went.
-    pub(crate) fn custom_properties_in_an_animated_cycle(
+    pub(crate) fn check_custom_property_animation_cycles(
         &self,
         node: StyleNodeID,
         pseudo: Option<u8>,
@@ -841,25 +843,22 @@ impl RetainedState {
             crate::css::retained_fly_string::RetainedUtf16FlyString,
             RetainedStyleValueData,
         )],
+        intervals: &mut [crate::css::animation::CustomPropertyInterval],
     ) -> Vec<crate::css::retained_fly_string::RetainedUtf16FlyString> {
         type Name = crate::css::retained_fly_string::RetainedUtf16FlyString;
-        let slot = pseudo.map_or(0, |kind| kind + 1);
         let mut written: Vec<(Name, &StyleValueData)> = Vec::new();
-        for effect in self.element_animation_effects(node, slot) {
-            for keyframe in effect.keyframes() {
-                for declaration in effect.custom_declarations_of(keyframe) {
-                    let crate::css::style::effect_descriptions::PublishedValue::Declared(value) = &declaration.value
-                    else {
-                        continue;
-                    };
-                    written.push((declaration.name.clone(), value.data()));
+        for interval in intervals.iter() {
+            for value in &interval.declared_values {
+                if let Some(value) = value.optional_data() {
+                    written.push((interval.name.clone(), value));
                 }
             }
         }
+        let keyframe_declaration_count = written.len();
         if !written.iter().any(|(_, value)| substitutes(value)) {
             return Vec::new();
         }
-        let written_names: HashSet<usize> = written.iter().map(|(name, _)| name.raw()).collect();
+        let written_names: HashSet<usize> = intervals.iter().map(|interval| interval.name.raw()).collect();
         let declarations = self
             .live_style
             .as_ref()
@@ -922,13 +921,18 @@ impl RetainedState {
             resolution_context.attributes,
             resolution_context.custom_functions,
         );
-        let mut reads: Vec<(&Name, Vec<usize>)> = Vec::new();
-        let mut reads_of_name: HashMap<usize, usize> = HashMap::default();
-        for (name, value) in &written {
-            let index = *reads_of_name.entry(name.raw()).or_insert_with(|| {
-                reads.push((name, Vec::new()));
-                reads.len() - 1
-            });
+        let declaration_count = written.len();
+        let mut property_vertices: HashMap<usize, usize> = HashMap::default();
+        for (name, _) in &written {
+            let property_vertex = declaration_count + property_vertices.len();
+            property_vertices.entry(name.raw()).or_insert(property_vertex);
+        }
+        // NB: Declaration vertices come first, followed by one vertex per property.
+        //     A property points to its declarations, which point to the properties they read.
+        let mut edges = vec![Vec::new(); declaration_count + property_vertices.len()];
+        for (declaration_index, (name, value)) in written.iter().enumerate() {
+            let property_vertex = property_vertices[&name.raw()];
+            edges[property_vertex].push(declaration_index);
             let StyleValueData::Unresolved(unresolved) = substituted_tokens(value) else {
                 continue;
             };
@@ -942,23 +946,35 @@ impl RetainedState {
                 unresolved,
                 &mut environment,
             );
-            reads[index].1.extend(names.iter().map(|name| name.raw_identity()));
+            // NB: A name nothing writes reads nothing, so no cycle goes through it.
+            edges[declaration_index].extend(
+                names
+                    .iter()
+                    .filter_map(|name| property_vertices.get(&name.raw_identity()).copied()),
+            );
         }
-        // NB: A name nothing writes reads nothing, so no cycle goes through it.
-        let edges: Vec<Vec<usize>> = reads
-            .iter()
-            .map(|(_, read)| {
-                read.iter()
-                    .filter_map(|read| reads_of_name.get(read).copied())
-                    .collect()
-            })
-            .collect();
+        let declaration_names: Vec<_> = written.into_iter().map(|(name, _)| name).collect();
         let on_a_cycle = nodes_on_a_cycle(&edges);
-        reads
+        let (keyframe_declaration_cycles, element_declaration_cycles) =
+            on_a_cycle[..declaration_count].split_at(keyframe_declaration_count);
+        let mut keyframe_declaration_cycles = keyframe_declaration_cycles.iter().copied();
+        // NB: Neutral endpoints have no declaration vertex, so they do not consume a cycle flag.
+        for interval in intervals {
+            interval.cyclic = interval.declared_values.each_ref().map(|value| {
+                if value.optional_data().is_some() {
+                    keyframe_declaration_cycles
+                        .next()
+                        .expect("declared endpoints have cycle vertices")
+                } else {
+                    false
+                }
+            });
+        }
+        declaration_names[keyframe_declaration_count..]
             .iter()
-            .zip(on_a_cycle)
+            .zip(element_declaration_cycles.iter().copied())
             .filter(|(_, on_a_cycle)| *on_a_cycle)
-            .map(|((name, _), _)| (*name).clone())
+            .map(|(name, _)| name.clone())
             .collect()
     }
 

@@ -384,12 +384,6 @@ public:
     bool has_animated_values() const { return m_borrowed_base_values || m_base_values; }
     AnimatedProperties const* animated_properties() const { return m_animated_properties.ptr(); }
 
-    struct Statistics {
-        u64 live_instance_count { 0 };
-        u64 total_instances_created { 0 };
-    };
-    static Statistics const& statistics() { return s_statistics; }
-
     // Returns the Rust-owned payload for direct read-only layout access. The
     // pointer is borrowed from this immutable ComputedValues instance.
     void const* style_group_payload(StyleGroupIndex) const;
@@ -439,6 +433,7 @@ public:
     ReadonlySpan<ShadowData> text_shadow() const { return m_inherited.text->text_shadow_span(); }
     Positioning position() const { return position_from_reset_bits(m_noninherited.reset_bits); }
     Appearance appearance() const { return static_cast<Appearance>(m_noninherited.misc_layout->appearance); }
+    bool native_appearance_disabled() const { return m_noninherited.misc_layout->native_appearance_disabled; }
     float opacity() const { return m_noninherited.effects->opacity; }
     Visibility visibility() const { return visibility_from_inherited_bits(m_inherited.values.bits); }
     ComputedFilterView backdrop_filter() const { return m_noninherited.effects->backdrop_filter_value(); }
@@ -517,6 +512,7 @@ public:
 
     Gfx::FontCascadeList const& font_list() const { return m_inherited.font->font_list_value(); }
     CSSPixels font_size() const { return m_inherited.font->font_size; }
+    double font_size_for_lengths() const { return m_inherited.font->font_size_for_lengths(); }
     double font_weight() const { return m_inherited.font->font_weight; }
     CSSPixels line_height() const { return m_inherited.font->line_height_used_value(); }
 
@@ -569,8 +565,6 @@ private:
             length_percentage_or_auto(box.left),
         };
     }
-
-    static Statistics s_statistics;
 
     static size_t property_bitmap_index(PropertyID property_id)
     {
@@ -648,6 +642,7 @@ public:
         WEB_API Gfx::FontCascadeList const& font_list_value() const;
         FontStyleKeyword font_style_keyword() const;
         CSSPixels line_height_used_value() const { return CSSPixels::from_raw(ComputedValuesFFI::rust_font_values_line_height_used_raw(this)); }
+        double font_size_for_lengths() const { return ComputedValuesFFI::rust_font_values_font_size_for_lengths(this); }
     };
 
 private:
@@ -893,7 +888,6 @@ private:
     bool m_depends_on_viewport_metrics { false };
     bool m_font_metrics_depend_on_viewport_metrics { false };
     bool m_in_display_none_subtree { false };
-    bool m_is_style_record_view { false };
 };
 
 // Reads one group of the style whose groups `record` points at: a style record's, or a style layout

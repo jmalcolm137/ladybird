@@ -167,7 +167,7 @@ impl AsyncFunctionDriverWrapper {
             // Already-settled native Promises whose constructor is the intrinsic %Promise%.
             if is_settled_intrinsic_promise(vm, realm, &promise) {
                 Self::schedule_resume(this, vm, promise.result(), promise.state() == PromiseState::Fulfilled);
-                promise.set_is_handled();
+                promise.mark_handled(vm);
                 return Ok(());
             }
         }
@@ -204,7 +204,7 @@ impl AsyncFunctionDriverWrapper {
 
                     // b. Suspend prevContext.
                     // c. Push asyncContext onto the execution context stack; asyncContext is now the running execution context.
-                    vm.push_execution_context_checking_stack_space(this.suspended_execution_context())?;
+                    vm.push_resumed_execution_context_checking_stack_space(this.suspended_execution_context())?;
 
                     // 3.d. Resume the suspended evaluation of asyncContext using NormalCompletion(v) as the result of the operation that
                     //      suspended it.
@@ -248,7 +248,7 @@ impl AsyncFunctionDriverWrapper {
             vm,
             (this, value, is_fulfilled),
             |vm, &(this, value, is_fulfilled): &(Gc<AsyncFunctionDriverWrapper>, Value, bool)| {
-                vm.push_execution_context_checking_stack_space(this.suspended_execution_context())?;
+                vm.push_resumed_execution_context_checking_stack_space(this.suspended_execution_context())?;
                 Self::continue_async_execution(this, vm, value, is_fulfilled);
                 vm.pop_execution_context();
                 Ok(Value::UNDEFINED)
@@ -304,7 +304,7 @@ impl AsyncFunctionDriverWrapper {
                     && is_settled_intrinsic_promise(vm, realm, &promise)
                 {
                     let is_fulfilled = promise.state() == PromiseState::Fulfilled;
-                    promise.set_is_handled();
+                    promise.mark_handled(vm);
                     generator_result = if is_fulfilled {
                         generator_object.resume(vm, promise.result(), None)
                     } else {

@@ -93,6 +93,68 @@ test("for-in var initializer keeps the resolved with binding through initializer
     expect(forInId).toBeUndefined();
 });
 
+test("var patterns resolve their names before getting their values", () => {
+    const object = { forOfId: 1 };
+    var forOfId = "var";
+
+    with (object) {
+        for (var { forOfId = (delete object.forOfId, 2) } of [{}]);
+    }
+
+    expect(object.forOfId).toBe(2);
+    expect(forOfId).toBe("var");
+
+    const other = { evalId: 1 };
+    var evalId = "var";
+
+    with (other) {
+        eval("var [evalId = (delete other.evalId, 2)] = [];");
+    }
+
+    expect(other.evalId).toBe(2);
+    expect(evalId).toBe("var");
+
+    const added = {};
+    var forOfAddedId = "var";
+
+    with (added) {
+        for (var { forOfAddedId = ((added.forOfAddedId = 1), 2) } of [{}]);
+    }
+
+    expect(added.forOfAddedId).toBe(1);
+    expect(forOfAddedId).toBe(2);
+
+    const addedByEval = {};
+    var evalAddedId = "var";
+
+    with (addedByEval) {
+        eval("var [evalAddedId = ((addedByEval.evalAddedId = 1), 2)] = [];");
+    }
+
+    expect(addedByEval.evalAddedId).toBe(1);
+    expect(evalAddedId).toBe(2);
+});
+
+test("var without an initializer does not resolve its name", () => {
+    const names = [];
+    const object = new Proxy(
+        {},
+        {
+            has(target, name) {
+                names.push(name);
+                return false;
+            },
+        }
+    );
+
+    with (object) {
+        var noInitializerId;
+        for (var noInitializerLoopId; false; );
+    }
+
+    expect(names).toEqual([]);
+});
+
 test("with statement updates empty abrupt completions to undefined", () => {
     expect(eval("1; do { 2; with ({}) { 3; break; } 4; } while (false);")).toBe(3);
     expect(eval("5; do { 6; with ({}) { break; } 7; } while (false);")).toBeUndefined();

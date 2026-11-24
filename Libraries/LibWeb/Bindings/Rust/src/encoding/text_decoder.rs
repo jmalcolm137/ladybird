@@ -15,6 +15,7 @@ use libtextcodec_rust::{DecodingFailed, StreamingDecoder, encoding_for_label};
 use crate::bindings::conversions::{BufferSource, UsvString};
 use crate::bindings::interface::Wrappable;
 use crate::bindings::{CallContext, Exception, WebIdlResult};
+use crate::webidl::buffers::AllowSharedBufferSource;
 
 /// The dictionary TextDecoderOptions of Encoding/TextDecoder.idl, whose members the bindings convert.
 pub(crate) struct TextDecoderOptions {
@@ -86,7 +87,7 @@ impl TextDecoder {
     pub(crate) fn decode(
         &self,
         _: &mut CallContext,
-        input: Option<BufferSource>,
+        input: Option<AllowSharedBufferSource>,
         options: TextDecodeOptions,
     ) -> WebIdlResult<UsvString> {
         // 1. If this's do not flush is false, then set this's decoder to a new instance of this's encoding's decoder,
@@ -98,15 +99,16 @@ impl TextDecoder {
         //     1. Let item be the result of reading from this's I/O queue.
         //     2. If item is end-of-queue and this's do not flush is true, then return the result of running
         //        serialize I/O queue with this and output.
-        //     3. Otherwise:
-        //         1. Let result be the result of processing an item with item, this's decoder, this's I/O queue,
-        //            output, and this's error mode.
-        //         2. If result is finished, then return the result of running serialize I/O queue with this and
-        //            output.
-        //         3. Otherwise, if result is error, throw a TypeError.
-        // NB: The decoder holds the I/O queue and whether the BOM was seen, and is replaced when a call that does not
-        //     stream returns, where step 1 replaces it in the next call.
+        //     3. Let result be the result of processing an item with item, this's decoder, this's I/O queue, output,
+        //        and this's error mode.
+        //     4. If result is finished, then return the result of running serialize I/O queue with this and output.
+        //     5. If result is error:
+        //         1. Set this's do not flush to false.
+        //         2. Throw a TypeError.
+        // NB: The decoder holds the I/O queue and whether the BOM was seen, and is replaced at the end of a call that
+        //     does not stream or that throws, where step 1 replaces it in the next call.
         let mut decoder = self.decoder.borrow_mut();
+        let input = input.map(BufferSource::from);
         let decoded = match &input {
             // SAFETY: Decoding runs no script and allocates no cell, so nothing detaches, resizes or frees the
             //         buffer of the input while its bytes are read.

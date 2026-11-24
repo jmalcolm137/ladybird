@@ -21,11 +21,13 @@
 #include <LibWeb/DOM/Event.h>
 #include <LibWeb/Fetch/Fetching/Fetching.h>
 #include <LibWeb/Fetch/Infrastructure/FetchAlgorithms.h>
+#include <LibWeb/Fetch/Infrastructure/HTTP/Bodies.h>
 #include <LibWeb/Fetch/Infrastructure/HTTP/MIME.h>
 #include <LibWeb/Fetch/Infrastructure/HTTP/Requests.h>
 #include <LibWeb/Fetch/Infrastructure/HTTP/ResponseView.h>
 #include <LibWeb/HTML/BrowsingContext.h>
 #include <LibWeb/HTML/DecodedImageData.h>
+#include <LibWeb/HTML/HTMLEmbedElement.h>
 #include <LibWeb/HTML/HTMLMediaElement.h>
 #include <LibWeb/HTML/HTMLObjectElement.h>
 #include <LibWeb/HTML/ImageRequest.h>
@@ -88,6 +90,7 @@ void HTMLObjectElement::visit_edges(Cell::Visitor& visitor)
     Base::visit_edges(visitor);
     visitor.visit(m_resource_request);
     visitor.visit(m_document_observer);
+    visitor.visit(m_document_of_queued_object_representation_task);
 }
 
 void HTMLObjectElement::adopted_from(DOM::Document& old_document)
@@ -225,14 +228,25 @@ void HTMLObjectElement::queue_element_task_to_run_object_representation_steps()
     if (!document().is_fully_active())
         return;
 
+    // OPTIMIZATION: A queued task that has not started yet reads the element's state when it runs, so another task
+    //               would only repeat its work. It would also fetch the resource a second time.
+    // NB: A task queued before the element moved to another document stays with that document, which may never run
+    //     it, so the element's new document queues a task of its own.
+    if (m_document_of_queued_object_representation_task.ptr() == &document())
+        return;
+    m_document_of_queued_object_representation_task = document();
+    auto task_number = ++m_object_representation_task_count;
+
     // This task being queued or actively running must delay the load event of the element's node document.
     m_document_load_event_delayer_for_object_representation_task.empend(document());
     auto release_load_event_delay = GC::create_function(GC::Heap::the(), GC::captures(*this), [](auto& self) {
         self.m_document_load_event_delayer_for_object_representation_task.take_last();
     });
 
-    auto steps = GC::create_function(GC::Heap::the(), GC::captures(*this, release_load_event_delay), [](auto& self, auto& release_load_event_delay) {
+    auto steps = GC::create_function(GC::Heap::the(), GC::captures(*this, release_load_event_delay, task_number), [](auto& self, auto& release_load_event_delay, auto task_number) {
         ScopeGuard guard { [&] { release_load_event_delay->function()(); } };
+        if (self.m_object_representation_task_count == task_number)
+            self.m_document_of_queued_object_representation_task = nullptr;
 
         auto& realm = HTML::relevant_realm(self);
         // FIXME: 1. If the user has indicated a preference that this object element's fallback content be shown instead of the
@@ -282,12 +296,17 @@ void HTMLObjectElement::queue_element_task_to_run_object_representation_steps()
             request->set_use_url_credentials(true);
 
             Fetch::Infrastructure::FetchAlgorithms::Input fetch_algorithms_input { Fetch::Engine::BodyIntent::DeliverStreamToConsumerAgent };
-            fetch_algorithms_input.process_response = GC::create_function(GC::Heap::the(), GC::captures(self), [](auto& self, GC::Ref<Fetch::Infrastructure::ResponseView> response) {
+            // NB: Each fetch releases its load event delay once, when its response is handled or when it's stopped,
+            //     whichever comes first. Anything that arrives for it after that is ignored.
+            auto fetch_id = ++self.m_last_resource_fetch_id;
+            self.m_pending_resource_fetches.set(fetch_id);
+
+            fetch_algorithms_input.process_response = GC::create_function(GC::Heap::the(), GC::captures(self, fetch_id), [](auto& self, auto fetch_id, GC::Ref<Fetch::Infrastructure::ResponseView> response) {
                 auto& realm = HTML::relevant_realm(self);
                 auto& global = self.document().relevant_settings_object().realm().global_object();
 
                 if (response->is_network_error()) {
-                    self.resource_did_fail();
+                    self.resource_did_fail(fetch_id);
                     return;
                 }
 
@@ -300,30 +319,41 @@ void HTMLObjectElement::queue_element_task_to_run_object_representation_steps()
                         auto ignore_body_error = GC::create_function(GC::Heap::the(), [](JS::Value) { });
                         (void)body->incrementally_read(realm, ignore_chunk, ignore_end_of_body, ignore_body_error, GC::Ref { global });
                     }
-                    self.resource_did_fail();
+                    self.resource_did_fail(fetch_id);
                     return;
                 }
 
                 if (response->type() == Fetch::Infrastructure::Response::Type::Opaque || response->type() == Fetch::Infrastructure::Response::Type::OpaqueRedirect)
                     response = response->unsafe_response();
 
-                auto on_data_read = GC::create_function(GC::Heap::the(), GC::captures(self, response), [](auto& self, auto& response, ByteBuffer data) {
-                    self.resource_did_load(response, data);
+                auto on_data_read = GC::create_function(GC::Heap::the(), GC::captures(self, response, fetch_id), [](auto& self, auto& response, auto fetch_id, ByteBuffer data) {
+                    self.resource_did_load(fetch_id, response, data);
                 });
-                auto on_error = GC::create_function(GC::Heap::the(), GC::captures(self), [](auto& self, JS::Value) {
-                    self.resource_did_fail();
+                auto on_error = GC::create_function(GC::Heap::the(), GC::captures(self, fetch_id), [](auto& self, auto fetch_id, JS::Value) {
+                    self.resource_did_fail(fetch_id);
                 });
 
-                VERIFY(response->body());
+                // NB: A response without a body, such as a 204, has nothing to read: Its data is empty.
+                if (!response->body()) {
+                    self.resource_did_load(fetch_id, response, {});
+                    return;
+                }
                 response->body()->fully_read(realm, on_data_read, on_error, GC::Ref { global });
             });
 
             // 5. Fetch request.
-            (void)Fetch::Fetching::fetch(realm, request, Fetch::Infrastructure::FetchAlgorithms::create(move(fetch_algorithms_input)));
+            auto fetch_controller = Fetch::Fetching::fetch(realm, request, Fetch::Infrastructure::FetchAlgorithms::create(move(fetch_algorithms_input)));
 
             //    Fetching the resource must delay the load event of the element's node document until the task that is
             //    queued by the networking task source once the resource has been fetched (defined next) has been run.
             self.m_document_load_event_delayer_for_resource_load.empend(self.document());
+
+            // AD-HOC: A stopped fetch, such as one of a document that was stopped, never processes its response. Stop
+            //         delaying the load event on it then, as if the user agent had given up on loading it.
+            fetch_controller->set_stop_steps(GC::create_function(GC::Heap::the(), GC::captures(GC::Weak { self }, fetch_id), [](auto& weak_self, auto fetch_id) {
+                if (auto object = weak_self.ptr(); object && object->m_pending_resource_fetches.remove(fetch_id))
+                    object->m_document_load_event_delayer_for_resource_load.take_last();
+            }));
 
             // 6. If the resource is not yet available (e.g. because the resource was not available in the cache, so that
             //    loading the resource required making a request over the network), then jump to the step below labeled
@@ -334,15 +364,25 @@ void HTMLObjectElement::queue_element_task_to_run_object_representation_steps()
             // NOTE: The request is always asynchronous, even if it is cached or succeeded/failed immediately. Allow the
             //       response callback to invoke the fallback steps. This prevents the fallback layout from flashing very
             //       briefly between here and the resource loading.
+            return;
         }
+
+        self.run_object_representation_fallback_steps();
     });
 
-    queue_an_element_task(HTML::Task::Source::DOMManipulation, move(steps), release_load_event_delay);
+    auto discard_steps = GC::create_function(GC::Heap::the(), GC::captures(*this, release_load_event_delay, task_number), [](auto& self, auto& release_load_event_delay, auto task_number) {
+        if (self.m_object_representation_task_count == task_number)
+            self.m_document_of_queued_object_representation_task = nullptr;
+        release_load_event_delay->function()();
+    });
+    queue_an_element_task(HTML::Task::Source::DOMManipulation, move(steps), discard_steps);
 }
 
 // https://html.spec.whatwg.org/multipage/iframe-embed-object.html#the-object-element:concept-event-fire-2
-void HTMLObjectElement::resource_did_fail()
+void HTMLObjectElement::resource_did_fail(u64 fetch_id)
 {
+    if (!m_pending_resource_fetches.remove(fetch_id))
+        return;
     ScopeGuard guard { [&]() { m_document_load_event_delayer_for_resource_load.take_last(); } };
 
     // 3.7. If the load failed (e.g. there was an HTTP 404 error, there was a DNS error), fire an event named error at
@@ -352,8 +392,10 @@ void HTMLObjectElement::resource_did_fail()
 }
 
 // https://html.spec.whatwg.org/multipage/iframe-embed-object.html#object-type-detection
-void HTMLObjectElement::resource_did_load(Fetch::Infrastructure::ResponseView const& response, ReadonlyBytes data)
+void HTMLObjectElement::resource_did_load(u64 fetch_id, Fetch::Infrastructure::ResponseView const& response, ReadonlyBytes data)
 {
+    if (!m_pending_resource_fetches.remove(fetch_id))
+        return;
     ScopeGuard guard { [&]() { m_document_load_event_delayer_for_resource_load.take_last(); } };
 
     // 3.8. Determine the resource type, as follows:
@@ -458,7 +500,12 @@ void HTMLObjectElement::run_object_representation_handler_steps(Fetch::Infrastru
         }
 
         // If the object element's content navigable is null, then create a new child navigable for the element.
-        if (!m_content_navigable && in_a_document_tree()) {
+        // AD-HOC: The spec only gets here for an element "in a document", a legacy term that its use here hasn't been
+        //         updated for shadow trees:
+        //         https://dom.spec.whatwg.org/#in-a-document
+        //         So an object in a shadow tree gets its navigable once it's connected, the same as one in the document
+        //         tree.
+        if (!m_content_navigable && is_connected()) {
             create_new_child_navigable();
         }
 
@@ -492,7 +539,10 @@ void HTMLObjectElement::run_object_representation_handler_steps(Fetch::Infrastru
         // The object element represents the specified image.
         // If the image cannot be rendered, e.g. because it is malformed or in an unsupported format, jump to the step
         // below labeled fallback.
+        // AD-HOC: The spec only jumps to fallback here. But an empty image is a resource that failed to load, so fire
+        //         error first, as for any other.
         if (data.is_empty()) {
+            dispatch_event(create_event_for_element(*this, HTML::EventNames::error));
             run_object_representation_fallback_steps();
             return;
         }
@@ -581,6 +631,12 @@ void HTMLObjectElement::update_layout_and_child_objects(Representation represent
             object.queue_element_task_to_run_object_representation_steps();
             return IterationDecision::Continue;
         });
+        if (m_representation != Representation::Children) {
+            for_each_in_subtree_of_type<HTMLEmbedElement>([](auto& embed) {
+                embed.ancestor_object_started_showing_fallback_content();
+                return TraversalDecision::Continue;
+            });
+        }
     }
 
     m_representation = representation;
@@ -588,8 +644,9 @@ void HTMLObjectElement::update_layout_and_child_objects(Representation represent
     CSS::record_element_box_kind(*this);
     CSS::record_element_replaced_content_input(*this);
 
-    if (auto parent_element = this->parent_element())
-        parent_element->set_needs_layout_tree_update(true, DOM::SetNeedsLayoutTreeUpdateReason::HTMLObjectElementUpdateLayoutAndChildObjects);
+    // NB: The parent is a shadow root for an object at the top of a shadow tree, so it's not always an element.
+    if (auto parent = this->parent())
+        parent->set_needs_layout_tree_update(true, DOM::SetNeedsLayoutTreeUpdateReason::HTMLObjectElementUpdateLayoutAndChildObjects);
 }
 
 // https://html.spec.whatwg.org/multipage/interaction.html#dom-tabindex
@@ -603,7 +660,7 @@ void HTMLObjectElement::set_natural_size_of_content_document(CSS::SizeWithAspect
 {
     m_natural_size_of_content_document = natural_size;
     CSS::record_element_replaced_content_input(*this);
-    set_needs_layout_update(DOM::SetNeedsLayoutReason::HTMLObjectElementContentDocumentResized);
+    set_needs_layout_update(DOM::SetNeedsLayoutReason::EmbeddedDocumentResized);
 }
 
 GC::Ptr<DecodedImageData> HTMLObjectElement::image_data() const

@@ -243,6 +243,34 @@ TEST_CASE(missing_or_malformed_capture_produces_a_minimal_report)
     EXPECT(!text.contains(private_text));
 }
 
+TEST_CASE(helper_reports_carry_the_platform_features_they_were_launched_with)
+{
+    cleanup();
+    ScopeGuard guard = cleanup;
+    auto report = MUST(WebView::CrashReport::create(WebView::ProcessType::Compositor));
+    constexpr auto description = "Platform features: [{\"id\":\"gpu_painting\",\"state\":\"Enabled\"}]\nGPU device: NVIDIA GeForce RTX 3090 (10de:2204)\nPlatform facts: {\"gpu\":{\"vendor_id\":4318}}\n"sv;
+    report->set_platform_features_description(description);
+    MUST(report->save(SIGSEGV, test_directory()));
+    auto paths = report_paths();
+    EXPECT_EQ(paths.size(), 1u);
+    auto file = MUST(Core::File::open(paths[0], Core::File::OpenMode::Read));
+    auto contents = MUST(file->read_until_eof());
+    EXPECT(StringView { contents }.contains(description));
+}
+
+TEST_CASE(reports_of_processes_without_platform_features_say_so)
+{
+    cleanup();
+    ScopeGuard guard = cleanup;
+    auto report = MUST(WebView::CrashReport::create(WebView::ProcessType::WebContent));
+    MUST(report->save(SIGSEGV, test_directory()));
+    auto paths = report_paths();
+    EXPECT_EQ(paths.size(), 1u);
+    auto file = MUST(Core::File::open(paths[0], Core::File::OpenMode::Read));
+    auto contents = MUST(file->read_until_eof());
+    EXPECT(StringView { contents }.contains("\nPlatform features: []\n"sv));
+}
+
 TEST_CASE(invalid_frame_lengths_are_ignored)
 {
     cleanup();
@@ -394,6 +422,43 @@ TEST_CASE(assertion_text_and_source_location)
     EXPECT(stack.contains(" at Tests/LibWebView/TestCrashReport.cpp:"sv));
     EXPECT(!stack.contains("ak_trap"sv));
 #endif
+}
+
+static void report_sandbox_violation(int, siginfo_t* info, void* context)
+{
+    Core::CrashHandler::handle_sandbox_violation(info, context, "disallowed syscall fcntl (72), args [0x5, 0x406]");
+}
+
+TEST_CASE(sandbox_violations_name_the_refused_call)
+{
+    cleanup();
+    ScopeGuard guard = cleanup;
+    auto report = MUST(WebView::CrashReport::create(WebView::ProcessType::WebContent));
+    auto pid = fork();
+    VERIFY(pid >= 0);
+    if (pid == 0) {
+        struct rlimit limit { 0, 0 };
+        setrlimit(RLIMIT_CORE, &limit);
+        MUST(Core::CrashHandler::initialize(report->fd()));
+        struct sigaction action {};
+        action.sa_sigaction = report_sandbox_violation;
+        action.sa_flags = SA_SIGINFO;
+        sigemptyset(&action.sa_mask);
+        sigaction(SIGSYS, &action, nullptr);
+        raise(SIGSYS);
+        _exit(0);
+    }
+    int status;
+    VERIFY(waitpid(pid, &status, 0) == pid);
+    EXPECT(WIFSIGNALED(status));
+    EXPECT_EQ(WTERMSIG(status), SIGSYS);
+    MUST(report->save(status, test_directory()));
+    auto paths = report_paths();
+    VERIFY(paths.size() == 1);
+    auto file = MUST(Core::File::open(paths[0], Core::File::OpenMode::Read));
+    auto contents = MUST(file->read_until_eof());
+    EXPECT(StringView { contents }.contains("Sandbox violation: disallowed syscall fcntl (72), args [0x5, 0x406]\n"sv));
+    EXPECT(StringView { contents }.contains("Captured signal: SIGSYS"sv));
 }
 
 TEST_CASE(assertion_locations_outside_the_checkout)

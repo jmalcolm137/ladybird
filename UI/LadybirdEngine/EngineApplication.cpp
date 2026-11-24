@@ -30,8 +30,11 @@ EngineApplication::~EngineApplication() = default;
 Ladybird::BookmarkStore& EngineApplication::bookmark_store()
 {
     if (!m_bookmark_store) {
+        (void)history_store();
+        if (!m_favicon_store)
+            m_favicon_store = WebView::FaviconStore::create();
         auto path = LexicalPath::join(profile().paths().config, "Bookmarks.json"sv).string();
-        m_bookmark_store = make<Ladybird::BookmarkStore>(Ladybird::BookmarkStore::create(move(path)));
+        m_bookmark_store = make<Ladybird::BookmarkStore>(Ladybird::BookmarkStore::create(move(path), *m_favicon_store));
     }
     return *m_bookmark_store;
 }
@@ -128,7 +131,7 @@ void EngineApplication::resolve_external_url_handler(URL::URL const&, WebView::E
 
 Function<void()> EngineApplication::fetch_remote_suggestions(WebView::SearchEngine const& engine, String const& query, WebView::IsPrivate is_private, Function<void(WebView::AutocompleteHost::RemoteResponse)> on_response)
 {
-    if (!engine.suggestions.has_value())
+    if (!engine.suggestions_url.has_value())
         return {};
 
     auto url = engine.suggestions_url_for_query(query);

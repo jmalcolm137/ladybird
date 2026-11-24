@@ -15,10 +15,15 @@ ak = { path = "../../../AK/Rust" }
 foldhash = "0.2"
 ladybird_allocator = { path = "../../RustAllocator", optional = true }
 libgfx_rust = { path = "../../LibGfx/Rust", default-features = false }
+libipc_rust = { path = "../../LibIPC/Rust" }
 rustc-demangle = "0.1"
 
 [build-dependencies]
 cbindgen = "0.29"
+serde_json = { version = "1", features = ["float_roundtrip", "preserve_order"] }
+
+[dev-dependencies]
+serde_json = { version = "1", features = ["float_roundtrip", "preserve_order"] }
 
 [lints]
 workspace = true

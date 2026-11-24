@@ -9,7 +9,7 @@
 //! damage and the player make of it are sound. The tape of a page and that of a 2D canvas each hold only the
 //! commands of their own kind.
 
-use super::builder::{COMMAND_ALIGNMENT, HEADER_SIZE, read_header};
+use super::builder::{COMMAND_ALIGNMENT, HEADER_SIZE, bounding_rect_computed_from_payload, read_header};
 use super::commands::*;
 use libgfx_rust::{
     CapStyle, Color, CompositingAndBlendingOperator, GradientInterpolationMethod, GradientInterpolationType,
@@ -47,7 +47,6 @@ macro_rules! tape_enum {
 
 tape_enum!(InlineClipKind as u8 { Rect, RoundedRect, Path });
 tape_enum!(ClipMode as u8 { Intersect, Difference });
-tape_enum!(CompositorScrollNodeKind as u8 { Viewport, Element, PseudoElement });
 tape_enum!(PathPaintKind as u8 { Color, PaintStyle });
 tape_enum!(DisplayListPaintStyleType as u8 { None, LinearGradient, RadialGradient, Pattern });
 tape_enum!(DisplayListGradientSpreadMethod as u8 { Pad, Repeat, Reflect });
@@ -93,10 +92,6 @@ impl TapeEnum for CompositingAndBlendingOperator {
     }
 }
 
-// The values of SnapStrictness and SnapAlign in LibCompositing/Scrolling/ScrollSnapSelection.h.
-const SNAP_STRICTNESS_COUNT: u8 = 3;
-const SNAP_ALIGN_COUNT: u8 = 4;
-
 // The bytes of one command payload. Offsets are relative to the payload start, where the command struct begins.
 #[derive(Clone, Copy)]
 struct Payload<'a> {
@@ -138,13 +133,6 @@ impl Payload<'_> {
             _ => unreachable!(),
         };
         if !E::is_valid(raw) {
-            return Err("Display list command has an invalid enum value");
-        }
-        Ok(())
-    }
-
-    fn u8_below(self, offset: usize, count: u8) -> Result<(), ValidationError> {
-        if self.u8_at(offset) >= count {
             return Err("Display list command has an invalid enum value");
         }
         Ok(())
@@ -357,18 +345,15 @@ fn command_struct_size(command_type: DisplayListCommandType) -> usize {
         T::DrawLine => size_of::<DrawLine>(),
         T::BackdropFilterRegion => size_of::<BackdropFilterRegion>(),
         T::DrawRect => size_of::<DrawRect>(),
-        T::PaintNestedDisplayList => size_of::<PaintNestedDisplayList>(),
+        T::PaintVectorImage => size_of::<PaintVectorImage>(),
         T::DrawIsolatedGroup => size_of::<DrawIsolatedGroup>(),
         T::DeclareMaskContent => size_of::<DeclareMaskContent>(),
-        T::CompositorScrollNode => size_of::<CompositorScrollNode>(),
         T::CompositorWheelHitTestTarget => size_of::<CompositorWheelHitTestTarget>(),
         T::CompositorWheelHitTestTargetWithCornerRadii => size_of::<CompositorWheelHitTestTargetWithCornerRadii>(),
         T::CompositorMainThreadWheelEventRegion => size_of::<CompositorMainThreadWheelEventRegion>(),
         T::CompositorScrollbar => size_of::<CompositorScrollbar>(),
         T::CompositorBlockingWheelEventRegion => size_of::<CompositorBlockingWheelEventRegion>(),
         T::PaintScrollBar => size_of::<PaintScrollBar>(),
-        T::CompositorSnapContainer => size_of::<CompositorSnapContainer>(),
-        T::CompositorSnapArea => size_of::<CompositorSnapArea>(),
         T::CompositorNestedContextWheelRegion => size_of::<CompositorNestedContextWheelRegion>(),
         T::Canvas2DFillPath => size_of::<Canvas2DFillPath>(),
         T::Canvas2DStrokePath => size_of::<Canvas2DStrokePath>(),
@@ -397,6 +382,10 @@ fn validate_command_fields(
     let p = payload;
     match command_type {
         T::DrawGlyphRun => {
+            let stroke_width = p.f32_at(offset_of!(DrawGlyphRun, stroke_width));
+            if !stroke_width.is_finite() || stroke_width < 0.0 {
+                return Err("Glyph run stroke width must be finite and nonnegative");
+            }
             p.array_span_at::<DisplayListGlyph>(offset_of!(DrawGlyphRun, glyphs))?;
             p.enum_at::<Orientation>(offset_of!(DrawGlyphRun, orientation))?;
         }
@@ -540,35 +529,12 @@ fn validate_command_fields(
             p.enum_at::<MaskKind>(offset_of!(DrawIsolatedGroup, mask_kind))?;
         }
         T::DeclareMaskContent => nested.add(offset_of!(DeclareMaskContent, content))?,
-        T::CompositorScrollNode => {
-            p.enum_at::<CompositorScrollNodeKind>(offset_of!(CompositorScrollNode, scroll_node_kind))?;
-            p.bool_at(offset_of!(CompositorScrollNode, is_viewport))?;
-            p.bool_at(offset_of!(CompositorScrollNode, can_be_wheel_scrolled_horizontally))?;
-            p.bool_at(offset_of!(CompositorScrollNode, can_be_wheel_scrolled_vertically))?;
-            p.bool_at(offset_of!(
-                CompositorScrollNode,
-                chains_scroll_to_ancestors_horizontally
-            ))?;
-            p.bool_at(offset_of!(CompositorScrollNode, chains_scroll_to_ancestors_vertically))?;
-            p.bool_at(offset_of!(CompositorScrollNode, shows_overscroll_effect_horizontally))?;
-            p.bool_at(offset_of!(CompositorScrollNode, shows_overscroll_effect_vertically))?;
+        T::PaintVectorImage => {
+            nested.add(offset_of!(PaintVectorImage, records))?;
+            p.bool_at(offset_of!(PaintVectorImage, requires_direct_replay))?;
         }
-        T::CompositorScrollbar => {
-            p.bool_at(offset_of!(CompositorScrollbar, vertical))?;
-            p.bool_at(offset_of!(CompositorScrollbar, is_painted_by_compositor))?;
-        }
+        T::CompositorScrollbar => p.bool_at(offset_of!(CompositorScrollbar, vertical))?,
         T::PaintScrollBar => p.bool_at(offset_of!(PaintScrollBar, vertical))?,
-        T::CompositorSnapContainer => {
-            p.u8_below(offset_of!(CompositorSnapContainer, strictness), SNAP_STRICTNESS_COUNT)?;
-            p.bool_at(offset_of!(CompositorSnapContainer, snaps_x))?;
-            p.bool_at(offset_of!(CompositorSnapContainer, snaps_y))?;
-            p.bool_at(offset_of!(CompositorSnapContainer, horizontal_writing_mode))?;
-        }
-        T::CompositorSnapArea => {
-            p.u8_below(offset_of!(CompositorSnapArea, align_x), SNAP_ALIGN_COUNT)?;
-            p.u8_below(offset_of!(CompositorSnapArea, align_y), SNAP_ALIGN_COUNT)?;
-            p.bool_at(offset_of!(CompositorSnapArea, always_stop))?;
-        }
         T::Canvas2DFillPath => {
             p.span_at(offset_of!(Canvas2DFillPath, path_data))?;
             validate_canvas_2d_paint(p, offset_of!(Canvas2DFillPath, paint))?;
@@ -610,7 +576,6 @@ fn validate_command_fields(
         | T::FillRoundedRectRing
         | T::DrawEllipse
         | T::BackdropFilterRegion
-        | T::PaintNestedDisplayList
         | T::CompositorWheelHitTestTarget
         | T::CompositorWheelHitTestTargetWithCornerRadii
         | T::CompositorMainThreadWheelEventRegion
@@ -636,19 +601,25 @@ fn validate_inline_clip(payload: Payload, offset: usize) -> Result<(), Validatio
     Ok(())
 }
 
-// What a run says about its records, recomputed by the rules the builder summarizes them with.
+// What a run says about its records, recomputed from their payloads by the rules the builder summarizes them with.
 #[derive(Default)]
 struct RunSummary {
     ink_bounds: IntRect,
     has_compositor_metadata: bool,
+    record_count: usize,
+    holds_a_record_that_is_alone_in_its_run: bool,
 }
 
 impl RunSummary {
-    fn note(&mut self, header: &DisplayListCommandHeader) {
+    fn note(&mut self, header: &DisplayListCommandHeader, payload: &[u8]) {
+        self.record_count += 1;
+        self.holds_a_record_that_is_alone_in_its_run |= header.command_type.is_alone_in_its_run();
         if header.command_type.is_compositor_metadata() {
             self.has_compositor_metadata = true;
         } else {
-            self.ink_bounds = self.ink_bounds.united(header.bounding_rect);
+            self.ink_bounds = self
+                .ink_bounds
+                .united(bounding_rect_computed_from_payload(header, payload).unwrap_or_default());
         }
     }
 
@@ -665,6 +636,7 @@ impl RunSummary {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum TapeKind {
     DisplayList,
+    RecordsNestedInDisplayListRecord,
     Canvas2D,
 }
 
@@ -675,19 +647,23 @@ fn validate_header_bytes(bytes: &[u8], kind: TapeKind) -> Result<DisplayListComm
     if DisplayListCommandType::from_u8(bytes[offset_of!(DisplayListCommandHeader, command_type)]).is_none() {
         return Err("Display list command has an invalid type");
     }
-    if bytes[offset_of!(DisplayListCommandHeader, has_bounding_rect)] > 1
-        || bytes[offset_of!(DisplayListCommandHeader, has_inline_transform)] > 1
-    {
+    if bytes[offset_of!(DisplayListCommandHeader, has_inline_transform)] > 1 {
         return Err("Display list command header has an invalid bool");
     }
     let header = read_header(bytes);
     match kind {
-        TapeKind::DisplayList => {
+        TapeKind::DisplayList | TapeKind::RecordsNestedInDisplayListRecord => {
             if header.command_type.is_canvas_2d() {
                 return Err("Display list holds a command of the canvas 2D stream");
             }
-            if !header.has_bounding_rect && !header.command_type.is_compositor_metadata() {
-                return Err("Display list draw command has no bounding rect");
+            // Tile keys and caret blinks find carets and scroll bars only among top-level records.
+            if kind == TapeKind::RecordsNestedInDisplayListRecord
+                && matches!(
+                    header.command_type,
+                    DisplayListCommandType::PaintCaret | DisplayListCommandType::PaintScrollBar
+                )
+            {
+                return Err("Display list holds a caret or scroll bar inside another record");
             }
         }
         TapeKind::Canvas2D => {
@@ -697,10 +673,6 @@ fn validate_header_bytes(bytes: &[u8], kind: TapeKind) -> Result<DisplayListComm
             // The canvas player plays commands one by one under the state of the canvas.
             if header.inline_clip_count != 0 || header.has_inline_transform {
                 return Err("Canvas 2D stream command has inline clips or an inline transform");
-            }
-            // A command of the canvas draws under the state that the commands before it left, so no rect bounds it.
-            if header.has_bounding_rect {
-                return Err("Canvas 2D stream command has a bounding rect");
             }
         }
     }
@@ -759,7 +731,7 @@ fn validate_records<'a>(
             pending.push(&payload.bytes[start..start + size]);
         }
         if let Some(summary) = summary.as_deref_mut() {
-            summary.note(&header);
+            summary.note(&header, payload.bytes);
         }
         offset = payload_start + payload_size;
     }
@@ -815,12 +787,6 @@ pub fn validate_tape(tape: &[u8], run_bytes: &[u8]) -> Result<Vec<DisplayListCom
         if size > tape.len() - next_offset {
             return Err("Display list command runs exceed the tape");
         }
-        if runs
-            .last()
-            .is_some_and(|previous: &DisplayListCommandRun| previous.context == run.context)
-        {
-            return Err("Adjacent display list command runs share a visual context");
-        }
         let mut summary = RunSummary::default();
         validate_records(
             &tape[next_offset..next_offset + size],
@@ -829,10 +795,13 @@ pub fn validate_tape(tape: &[u8], run_bytes: &[u8]) -> Result<Vec<DisplayListCom
             Some(&mut summary),
         )?;
         while let Some(records) = pending.pop() {
-            validate_records(records, TapeKind::DisplayList, &mut pending, None)?;
+            validate_records(records, TapeKind::RecordsNestedInDisplayListRecord, &mut pending, None)?;
         }
         if !summary.matches(&run) {
             return Err("Display list command run summary disagrees with its records");
+        }
+        if summary.holds_a_record_that_is_alone_in_its_run && summary.record_count != 1 {
+            return Err("Display list command run holds a record that is alone in its run with other records");
         }
         next_offset += size;
         runs.push(run);
@@ -862,8 +831,7 @@ pub fn validate_canvas_2d_tape(tape: &[u8]) -> Result<(), ValidationError> {
 mod tests {
     use super::*;
     use crate::display_list::builder::DisplayListBuilder;
-    use crate::display_list::storage::write_run;
-    use libgfx_rust::FloatRect;
+    use crate::display_list::storage::write_run_with_zeroed_padding;
 
     fn fill_rect() -> FillRect {
         FillRect {
@@ -877,25 +845,119 @@ mod tests {
     fn run_table_bytes(runs: &[DisplayListCommandRun]) -> Vec<u8> {
         let mut bytes = vec![0; runs.len() * RUN_SIZE];
         for (run, out) in runs.iter().zip(bytes.chunks_exact_mut(RUN_SIZE)) {
-            write_run(run, out);
+            write_run_with_zeroed_padding(run, out);
         }
         bytes
     }
 
+    // A list from another process can hold records whose rects, clips and shadows reach past where coordinates fit.
     #[test]
-    fn a_draw_command_without_a_bounding_rect_is_rejected_at_any_depth() {
-        let context = ContextRef::default();
+    fn records_reaching_past_where_coordinates_fit_validate_with_bounds_whose_edges_fit() {
+        use crate::display_list::builder::PendingInlineClip;
+        use crate::display_list::commands::PaintOuterBoxShadow;
+        use libgfx_rust::{CornerRadii, FloatRect};
         let mut builder = DisplayListBuilder::new();
-        builder.append(&fill_rect(), &[], context);
-        let nested_record_offset =
-            builder.byte_size() + HEADER_SIZE + size_of::<DrawIsolatedGroup>().next_multiple_of(COMMAND_ALIGNMENT);
-        let group = builder.begin_group::<DrawIsolatedGroup>(Vec::new());
-        builder.append(&fill_rect(), &[], context);
-        let content = builder.group_content_span(&group);
-        builder.finish_group(
+        let fill_past_the_right_edge = FillRect {
+            rect: IntRect::new(2_147_483_000, 0, 1000, 10),
+            ..fill_rect()
+        };
+        builder.append(&fill_past_the_right_edge, &[], ContextRef::default());
+        builder.append(&fill_past_the_right_edge, &[], ContextRef::default());
+        builder.append_with_inline_clips(
+            &fill_rect(),
+            &[],
+            ContextRef::default(),
+            &[PendingInlineClip::intersecting_float_rect(FloatRect::new(
+                2.0e9, 0.0, 2.0e8, 10.0,
+            ))],
+        );
+        builder.append(
+            &PaintOuterBoxShadow {
+                color: Color::default(),
+                blur_radius: i32::MAX,
+                device_content_rect: IntRect::new(0, 0, 10, 10),
+                content_corner_radii: CornerRadii::default(),
+                shadow_rect: IntRect::new(0, 0, 10, 10),
+                shadow_corner_radii: CornerRadii::default(),
+            },
+            &[],
+            ContextRef::default(),
+        );
+        let recorded = builder.finish();
+        assert!(validate_tape(&recorded.bytes, &run_table_bytes(&recorded.command_runs)).is_ok());
+        let edge_fits = |near: i32, length: i32| i32::try_from(i64::from(near) + i64::from(length)).is_ok();
+        assert!(recorded.command_runs.iter().all(|run| {
+            edge_fits(run.ink_bounds.x, run.ink_bounds.width) && edge_fits(run.ink_bounds.y, run.ink_bounds.height)
+        }));
+        // The blur of the shadow reaches as far as bounds do.
+        assert!(
+            recorded.command_runs[0]
+                .ink_bounds
+                .contains_rect(IntRect::new(0, 0, 10, 10))
+        );
+    }
+
+    #[test]
+    fn run_ink_bounds_are_checked_against_the_payloads_of_their_records() {
+        let mut builder = DisplayListBuilder::new();
+        builder.append(&fill_rect(), &[], ContextRef::default());
+        let recorded = builder.finish();
+        let run_bytes = run_table_bytes(&recorded.command_runs);
+        assert!(validate_tape(&recorded.bytes, &run_bytes).is_ok());
+
+        let mut widened_tape = recorded.bytes.clone();
+        let width_offset = HEADER_SIZE + offset_of!(FillRect, rect) + offset_of!(IntRect, width);
+        widened_tape[width_offset..width_offset + 4].copy_from_slice(&20i32.to_ne_bytes());
+        assert_eq!(
+            validate_tape(&widened_tape, &run_bytes),
+            Err("Display list command run summary disagrees with its records")
+        );
+
+        let widened_runs = [DisplayListCommandRun {
+            ink_bounds: IntRect::new(0, 0, 20, 10),
+            ..recorded.command_runs[0]
+        }];
+        assert!(validate_tape(&widened_tape, &run_table_bytes(&widened_runs)).is_ok());
+    }
+
+    #[test]
+    fn a_caret_or_scroll_bar_is_refused_inside_another_record() {
+        let caret = PaintCaret {
+            rect: IntRect::new(0, 0, 1, 10),
+            color: Color::default(),
+            blink_cycle_start_time_ns: 0,
+            should_blink: true,
+        };
+        let scroll_bar = PaintScrollBar {
+            scroll_node_index: SpatialNodeIndex(1),
+            gutter_rect: IntRect::new(90, 0, 10, 100),
+            thumb_rect: IntRect::new(90, 0, 10, 20),
+            track_rect: IntRect::new(90, 0, 10, 100),
+            expanded_gutter_rect: IntRect::new(86, 0, 14, 100),
+            scroll_size: 0.5,
+            thumb_color: Color::default(),
+            thumb_outline_color: Color::default(),
+            track_color: Color::default(),
+            vertical: true,
+        };
+        let validate = |builder: DisplayListBuilder| {
+            let recorded = builder.finish();
+            validate_tape(&recorded.bytes, &run_table_bytes(&recorded.command_runs))
+        };
+
+        let mut top_level = DisplayListBuilder::new();
+        top_level.append(&caret, &[], ContextRef::default());
+        top_level.append(&scroll_bar, &[], ContextRef::default());
+        assert!(validate(top_level).is_ok());
+
+        let mut caret_in_group = DisplayListBuilder::new();
+        let group = caret_in_group.begin_group::<DrawIsolatedGroup>(Vec::new());
+        caret_in_group.append(&caret, &[], ContextRef::default());
+        let content = caret_in_group.group_content_span(&group);
+        caret_in_group.finish_group(
             group,
             &DrawIsolatedGroup {
-                clip_rect: FloatRect::new(0.0, 0.0, 10.0, 10.0),
+                clip_rect: IntRect::new(0, 0, 10, 10).to_float(),
                 content,
                 mask: DisplayListDataSpan::default(),
                 filter: DisplayListDataSpan::default(),
@@ -903,19 +965,29 @@ mod tests {
                 compositing_and_blending_operator: CompositingAndBlendingOperator::Normal,
                 mask_kind: MaskKind::Alpha,
             },
-            context,
+            ContextRef::default(),
         );
-        let recorded = builder.finish();
-        let run_bytes = run_table_bytes(&recorded.command_runs);
-        assert!(validate_tape(&recorded.bytes, &run_bytes).is_ok());
+        assert_eq!(
+            validate(caret_in_group),
+            Err("Display list holds a caret or scroll bar inside another record")
+        );
 
-        for record_offset in [0, nested_record_offset] {
-            let mut tape = recorded.bytes.clone();
-            tape[record_offset + offset_of!(DisplayListCommandHeader, has_bounding_rect)] = 0;
-            assert_eq!(
-                validate_tape(&tape, &run_bytes),
-                Err("Display list draw command has no bounding rect")
-            );
-        }
+        let mut scroll_bar_in_mask_content = DisplayListBuilder::new();
+        let declaration = scroll_bar_in_mask_content.begin_group::<DeclareMaskContent>(Vec::new());
+        scroll_bar_in_mask_content.append(&scroll_bar, &[], ContextRef::default());
+        let content = scroll_bar_in_mask_content.group_content_span(&declaration);
+        scroll_bar_in_mask_content.finish_group(
+            declaration,
+            &DeclareMaskContent {
+                rect: IntRect::new(0, 0, 100, 100),
+                effect: EffectNodeIndex(1),
+                content,
+            },
+            ContextRef::default(),
+        );
+        assert_eq!(
+            validate(scroll_bar_in_mask_content),
+            Err("Display list holds a caret or scroll bar inside another record")
+        );
     }
 }

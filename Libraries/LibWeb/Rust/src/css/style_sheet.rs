@@ -592,6 +592,14 @@ pub extern "C" fn rust_style_release_kept_data() {
     crate::render_state::process_style().release_kept_past_release();
 }
 
+/// Lets go of the shaped texts that the calling thread and the style and layout threads keep, for a process short of
+/// memory.
+#[unsafe(no_mangle)]
+pub extern "C" fn rust_style_release_shaped_texts() {
+    libgfx_rust::text_layout::clear_shaping_cache();
+    crate::render_state::release_caches_of_style_layout_threads();
+}
+
 /// Writes whether the conditions of each rule hold, for the rules the engine has.
 fn write_rule_conditions(host: &crate::render_state::DocumentHost, conditions: Vec<(u64, bool)>) {
     if conditions.is_empty() {
@@ -646,6 +654,53 @@ fn cascade_layer_order<'a>(sheets: impl IntoIterator<Item = &'a NativeStyleSheet
     let mut result = Vec::with_capacity(children.len());
     flatten(0, &children, &mut qualified, &mut result);
     result
+}
+
+/// Visit font-face rules in document order and report each rule's normal cascade layer precedence.
+///
+/// # Safety
+/// The array and its sheets must be live for this call. The callback must not mutate the sheets.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rust_style_sheets_visit_font_face_rules(
+    sheets: *const *const NativeStyleSheet,
+    count: usize,
+    context: *mut c_void,
+    visit: unsafe extern "C" fn(*mut c_void, u64, usize),
+) {
+    if count == 0 {
+        return;
+    }
+    let sheets = unsafe { ak::slice_from_raw_parts(sheets, count) };
+    let active_sheets = || {
+        sheets
+            .iter()
+            .map(|&sheet| unsafe { &*sheet })
+            .filter(|sheet| sheet.media.matches())
+    };
+    let mut ranks = None;
+    for sheet in active_sheets() {
+        sheet.visit_effective_rule_data(FfiRuleTraversalOrder::Preorder, &[], &mut |rule, prefix, _| {
+            if rule.rule_type() != NativeRuleType::FontFace {
+                return;
+            }
+            let rank = if prefix.is_empty() {
+                usize::MAX
+            } else {
+                let ranks = ranks.get_or_insert_with(|| {
+                    cascade_layer_order(active_sheets())
+                        .into_iter()
+                        .enumerate()
+                        .map(|(rank, name)| (name, rank))
+                        .collect::<HashMap<_, _>>()
+                });
+                let Some(&rank) = ranks.get(prefix) else {
+                    return;
+                };
+                rank
+            };
+            unsafe { visit(context, rule.identity(), rank) };
+        });
+    }
 }
 
 /// Publish the layer order of the host's ordered, active author sheets.

@@ -4,10 +4,12 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-#include <LibGC/Heap.h>
+#include <LibJS/HostClassBuilder.h>
+#include <LibJS/Runtime/VM.h>
 #include <LibWeb/DOM/Document.h>
 #include <LibWeb/DOM/Element.h>
 #include <LibWeb/DOM/Text.h>
+#include <LibWeb/EventTiming/EventTiming.h>
 #include <LibWeb/HTML/LocalNavigable.h>
 #include <LibWeb/HTML/Scripting/Environments.h>
 #include <LibWeb/HTML/Window.h>
@@ -16,57 +18,26 @@
 #include <LibWeb/PaintTiming/PaintTiming.h>
 #include <LibWeb/Painting/BoxModelMetrics.h>
 #include <LibWeb/Painting/BoxViews.h>
-#include <LibWeb/PerformanceTimeline/EntryTypes.h>
 
 namespace Web::LargestContentfulPaint {
 
-GC_DEFINE_ALLOCATOR(LargestContentfulPaint);
+extern "C" {
+// Defined in Bindings/Rust/src/largest_contentful_paint/largest_contentful_paint.rs.
+LargestContentfulPaint* web_rust_largest_contentful_paint_create(JSVM*, double rendering_update_end_time, bool has_presentation_time, double presentation_time, u32 size, FlatPtr url, FlatPtr id, double load_time, DOM::Element*);
+}
 
 GC::Ref<LargestContentfulPaint> LargestContentfulPaint::create(PaintTiming::PaintTimingInfo paint_timing_info, WebIDL::UnsignedLong size, Utf16String url, Utf16String id, HighResolutionTime::DOMHighResTimeStamp load_time, GC::Ref<DOM::Element> element)
 {
-    return GC::Heap::the().allocate<LargestContentfulPaint>(paint_timing_info, size, move(url), move(id), load_time, element);
-}
-
-// https://w3c.github.io/largest-contentful-paint/#sec-largest-contentful-paint-interface
-LargestContentfulPaint::LargestContentfulPaint(PaintTiming::PaintTimingInfo paint_timing_info, WebIDL::UnsignedLong size, Utf16String url, Utf16String id, HighResolutionTime::DOMHighResTimeStamp load_time, GC::Ref<DOM::Element> element)
-    // The name attribute's getter must return the empty string.
-    // The startTime attribute's getter must return the value of this's renderTime.
-    // The duration attribute's getter must return 0.
-    : PerformanceTimeline::PerformanceEntry(Utf16String {}, PaintTiming::default_paint_timestamp(paint_timing_info), 0)
-    , PaintTiming::PaintTimingMixin(paint_timing_info)
-    , m_size(size)
-    , m_load_time(load_time)
-    , m_id(move(id))
-    , m_url(move(url))
-    , m_element(element)
-{
-}
-
-LargestContentfulPaint::~LargestContentfulPaint() = default;
-
-Utf16FlyString const& LargestContentfulPaint::entry_type() const
-{
-    // The entryType attribute's getter must return the DOMString "largest-contentful-paint".
-    return PerformanceTimeline::EntryTypes::largest_contentful_paint;
-}
-
-// https://w3c.github.io/largest-contentful-paint/#dom-largestcontentfulpaint-rendertime
-HighResolutionTime::DOMHighResTimeStamp LargestContentfulPaint::render_time() const
-{
-    // The renderTime attribute must return the default paint timestamp given this's paint timing info.
-    return PaintTiming::default_paint_timestamp(paint_timing_info());
-}
-
-// https://w3c.github.io/largest-contentful-paint/#dom-largestcontentfulpaint-element
-GC::Ptr<DOM::Element> LargestContentfulPaint::element() const
-{
-    // 1. If this's element is not exposed for paint timing given null, return null.
-    auto element = m_element.ptr();
-    if (!element || !PaintTiming::is_exposed_for_paint_timing(*element, nullptr))
-        return nullptr;
-
-    // 2. Return this's element.
-    return element;
+    return *web_rust_largest_contentful_paint_create(
+        JS::HostABI::vm_to_abi(JS::VM::the()),
+        paint_timing_info.rendering_update_end_time,
+        paint_timing_info.implementation_defined_presentation_time.has_value(),
+        paint_timing_info.implementation_defined_presentation_time.value_or(0),
+        size,
+        move(url).into_raw(),
+        move(id).into_raw(),
+        load_time,
+        element.ptr());
 }
 
 // https://w3c.github.io/largest-contentful-paint/#effective-visual-size-result
@@ -240,7 +211,7 @@ static Optional<PaintTiming::LargestContentfulPaintCandidate> compute_a_new_larg
 
     // 5. For each textNode of paintedTextNodes,
     Layout::ForcedReadScope read { document };
-    auto rect_to_viewport_transform = Painting::rect_to_viewport_transform(document, document.visual_context_tree());
+    auto viewport_mapping = Painting::viewport_mapping(document);
     for (auto const& [text_node, owned_text_nodes] : painted_text_nodes) {
         // 1. If textNode is not exposed for paint timing, given document, continue.
         if (!PaintTiming::is_exposed_for_paint_timing(*text_node, document))
@@ -265,7 +236,7 @@ static Optional<PaintTiming::LargestContentfulPaintCandidate> compute_a_new_larg
             auto const* text_layout_node = text->layout_node(read);
             if (!text_layout_node)
                 continue;
-            auto rect = PaintTiming::client_rect_of_box(*text_layout_node, rect_to_viewport_transform);
+            auto rect = PaintTiming::client_rect_of_box(*text_layout_node, viewport_mapping);
             if (rect.is_empty())
                 continue;
             text_rect = text_rect.is_empty() ? rect : text_rect.united(rect);
@@ -352,7 +323,7 @@ void report_largest_contentful_paint(DOM::Document& document, PaintTiming::Paint
     auto& window = HTML::relevant_window(document);
 
     // 2. If either of window's has dispatched scroll event or has dispatched input event is true, return.
-    if (window.has_dispatched_scroll_event() || window.event_timing_state().has_dispatched_input_event)
+    if (window.has_dispatched_scroll_event() || EventTiming::has_dispatched_input_event(window))
         return;
 
     // 3. Let newCandidate be the result of computing a new largest contentful paint candidate given document,

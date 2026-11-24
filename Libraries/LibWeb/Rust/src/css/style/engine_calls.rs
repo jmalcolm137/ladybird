@@ -125,6 +125,12 @@ pub(crate) enum EngineWrite {
         slot: super::animations::AnimationSlot,
         effects: Box<[super::effect_descriptions::PublishedEffect]>,
     },
+    /// The CSS animations one of an element's animation lists holds, in its order.
+    CssDefinedAnimations {
+        node: StyleNodeID,
+        slot: super::animations::AnimationSlot,
+        animations: Box<[super::animations::CssDefinedAnimation]>,
+    },
     /// The timing the host sampled each of an element's own effects with, by identity, where it sampled without asking.
     AnimationEffectTimings {
         node: StyleNodeID,
@@ -261,6 +267,9 @@ impl EngineWrite {
             Self::PositionTryRules { tree_scope, row } => engine.position_try_rules.set(tree_scope, row),
             Self::AnimationEffectDescriptions { node, slot, effects } => {
                 engine.animation_effect_descriptions.set(node, slot, effects);
+            }
+            Self::CssDefinedAnimations { node, slot, animations } => {
+                engine.set_element_css_defined_animations(node, slot, animations);
             }
             Self::AnimationEffectTimings { node, timings } => {
                 for (identity, timing) in timings {
@@ -897,8 +906,6 @@ pub(crate) struct EngineMemo {
     pub(crate) held: std::cell::RefCell<HeldEnvironments>,
     /// The element style inputs the engine defers.
     pub(crate) deferred: std::cell::RefCell<DeferredInputs>,
-    /// The versions of the animation effects the host described to the engine.
-    pub(crate) described: std::cell::RefCell<super::effect_descriptions::DescribedVersions>,
     /// The transition baselines the host recorded in the engine.
     pub(crate) baselines: std::cell::RefCell<super::TransitionBaselines>,
     /// The atoms the host interned for the engine.
@@ -934,7 +941,6 @@ impl EngineMemo {
         let bytes = size_of::<Memo<*const c_void>>()
             + self.held.borrow().heap_size()
             + self.deferred.borrow().heap_size()
-            + self.described.borrow().heap_size()
             + self.baselines.borrow().heap_size()
             + self.atoms.borrow().heap_size()
             + vec_bytes(&unpublished.backing_elements)
@@ -977,7 +983,6 @@ impl EngineMemo {
             return;
         }
         self.held.borrow_mut().forget(released);
-        self.described.borrow_mut().forget(released);
         self.baselines.borrow_mut().forget(released);
         self.identities.borrow_mut().release(released);
     }
@@ -1012,7 +1017,6 @@ impl Default for EngineMemo {
             views: Memo::new(std::ptr::null()),
             held: Default::default(),
             deferred: Default::default(),
-            described: Default::default(),
             baselines: Default::default(),
             atoms: Default::default(),
             identities: Default::default(),
@@ -1290,6 +1294,17 @@ pub extern "C" fn style_engine_for_each_element_custom_property_environment(
 }
 
 #[unsafe(no_mangle)]
+pub extern "C" fn style_engine_begin_composition_settling(host: &DocumentHost, read: &BegunRead, node: u32) {
+    let node = StyleNodeID::from_raw(node).expect("a composition settles for an element");
+    with_engine(read, host, |engine| engine.begin_composition_settling(node));
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn style_engine_end_composition_settling(host: &DocumentHost, read: &BegunRead) {
+    with_engine(read, host, |engine| engine.end_composition_settling());
+}
+
+#[unsafe(no_mangle)]
 pub extern "C" fn style_engine_has_pending_transaction(host: &DocumentHost, read: &BegunRead) -> bool {
     match host.known_engine_facts() {
         Some(facts) => facts.has_pending_style_update,
@@ -1509,6 +1524,13 @@ pub unsafe extern "C" fn style_engine_memory_report(
     MemoryOwner::COUNT
 }
 
+/// Lets go of what the style passes of `host`'s document work in and keep for the next one, for a document that has not
+/// styled in a while.
+#[unsafe(no_mangle)]
+pub extern "C" fn style_engine_trim_scratch(host: &DocumentHost, read: &crate::render_state::BegunRead) {
+    with_engine(read, host, StyleEngine::trim_scratch);
+}
+
 /// A record of the allocations reports have counted, for [`style_engine_memory_beyond`].
 #[unsafe(no_mangle)]
 pub extern "C" fn style_engine_memory_sizer_create() -> *mut c_void {
@@ -1570,32 +1592,26 @@ pub extern "C" fn style_engine_counter(
     name.as_ptr()
 }
 
-/// Decides what the transition step of `input`'s target does to its transitions, as the target's style changes from the
-/// record `before` to the record `after` it installed, and hands `on_actions` one action per property it decided over.
-/// The style update the host drains decided the step beside the row of an element whose step nothing but the
-/// engine's records decides; any other the render owner decides, reading the transform reference box of the target's
-/// element's box as it does.
+/// Decides what the transition step of the target `input` names, which holds the transitions `existing`, does to its
+/// transitions, as the target's style changes from the record `before` to the record `after` it installed, and hands
+/// `on_actions` one action per property it decided over. The style update the host drains decided the step beside the
+/// row of an element whose step nothing but the engine's records decides; any other the render owner decides, reading
+/// the transform reference box of the target's element's box as it does.
 ///
 /// # Safety
 ///
-/// `host` must be a live document host, on its document's thread, `before` and `after` records the host holds, and
-/// `input` must be valid. The values the actions point at live until `on_actions` returns.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn style_engine_decide_transitions(
+/// `before` and `after` must be records the host holds. The values the actions point at live until `on_actions`
+/// returns.
+pub(crate) unsafe fn decide_transitions(
     host: &DocumentHost,
     read: &crate::render_state::BegunRead,
     before: *const c_void,
     after: *const c_void,
     input: &FfiTransitionInput,
-    on_actions: unsafe extern "C" fn(*mut c_void, *const FfiTransitionAction, usize),
-    context: *mut c_void,
+    existing: &[crate::css::transition::FfiExistingTransition],
+    mut on_actions: impl FnMut(&[FfiTransitionAction]),
 ) {
-    crate::css::ffi_stats::note_transition_decision();
     // SAFETY: Guaranteed by the caller.
-    let existing = unsafe { ak::slice_from_raw_parts(input.existing_transitions, input.existing_transition_count) };
-    // SAFETY: As above.
-    let hand_over = |actions: &[FfiTransitionAction]| unsafe { on_actions(context, actions.as_ptr(), actions.len()) };
-    // SAFETY: As above.
     let (Some(before), Some(after)) = (unsafe { super::bridge::retain_host_record(before) }, unsafe {
         super::bridge::retain_host_record(after)
     }) else {
@@ -1610,7 +1626,7 @@ pub unsafe extern "C" fn style_engine_decide_transitions(
             .flatten(),
     };
     if decision.element.is_some()
-        && host.answer_decided_transition_step(input.target_node, &decision, existing, hand_over)
+        && host.answer_decided_transition_step(input.target_node, &decision, existing, &mut on_actions)
     {
         return;
     }
@@ -1626,7 +1642,7 @@ pub unsafe extern "C" fn style_engine_decide_transitions(
         )
     });
     actions.extend_from_slice(&custom_properties.actions);
-    hand_over(&actions);
+    on_actions(&actions);
 }
 
 #[cfg(test)]

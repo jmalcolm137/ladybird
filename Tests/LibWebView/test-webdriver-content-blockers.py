@@ -138,11 +138,11 @@ with tempfile.TemporaryDirectory() as directory:
         )
         command("window", {"handle": settings_window})
         command("url", {"url": "about:about"})
-        command("url", {"url": "about:services"})
+        command("url", {"url": "about:settings#privacy"})
         settings()
         command("back", {})
         assert command("execute/sync", {"script": "return location.href", "args": []}) == "about:about"
-        command("url", {"url": "about:blocking"})
+        command("url", {"url": "about:settings#blocking"})
         state = settings()
         assert command(
             "execute/sync",

@@ -8,6 +8,7 @@
 #include <AK/Utf16StringBuilder.h>
 #include <LibWeb/ARIA/Roles.h>
 #include <LibWeb/CSS/Invalidation/ElementStateInvalidator.h>
+#include <LibWeb/CSS/Invalidation/FormControlInvalidator.h>
 #include <LibWeb/DOM/Document.h>
 #include <LibWeb/DOM/DocumentFragment.h>
 #include <LibWeb/DOM/ElementFactory.h>
@@ -73,7 +74,7 @@ void HTMLOptionElement::update_label_sizer_text()
     if (!label_sizer)
         return;
 
-    auto text = label();
+    auto text = display_label();
     if (text.is_empty()) {
         if (m_label_sizer_text) {
             if (auto* row = m_label_sizer_text->parent())
@@ -212,6 +213,14 @@ static void concatenate_descendants_text_content(DOM::Node const* node, Utf16Str
     });
 }
 
+// https://html.spec.whatwg.org/multipage/form-elements.html#concept-option-label
+Utf16String HTMLOptionElement::display_label() const
+{
+    if (auto label = get_attribute_ns({}, HTML::AttributeNames::label); label.has_value() && !label->is_empty())
+        return label.release_value();
+    return text();
+}
+
 // https://html.spec.whatwg.org/multipage/form-elements.html#dom-option-label
 Utf16String HTMLOptionElement::label() const
 {
@@ -320,6 +329,16 @@ GC::Ptr<HTMLFormElement const> HTMLOptionElement::form() const
     return select->form();
 }
 
+// Whether option comes before every other option in select's list of options.
+static bool is_first_listed_option(HTMLOptionElement const& option, HTMLSelectElement const& select)
+{
+    for (auto const* node = option.previous_in_pre_order(); node && node != &select; node = node->previous_in_pre_order()) {
+        if (auto const* other = as_if<HTMLOptionElement>(*node); other && other->nearest_select_element().ptr() == &select)
+            return false;
+    }
+    return true;
+}
+
 // https://html.spec.whatwg.org/multipage/form-elements.html#update-an-option's-nearest-ancestor-select
 void HTMLOptionElement::update_nearest_select_element()
 {
@@ -351,8 +370,14 @@ void HTMLOptionElement::update_nearest_select_element()
             old_select->update_selectedness();
 
         // 2. If newSelect is not null, then run the selectedness setting algorithm given newSelect.
-        if (new_select && !new_select->can_skip_selectedness_update_for_inserted_option(*this))
+        if (new_select && !new_select->can_skip_selectedness_update_for_inserted_option(*this)) {
             new_select->update_selectedness();
+        } else if (new_select && new_select->has_attribute(AttributeNames::required) && new_select->display_size() == 1 && is_first_listed_option(*this, *new_select)) {
+            // AD-HOC: Skipping the algorithm skips the validity update it ends with. But an option that isn't selected
+            //         changes which option is the placeholder label option when it comes first in the list of options,
+            //         and so whether a required select is suffering from being missing.
+            CSS::Invalidation::invalidate_style_after_validity_change(*new_select);
+        }
     }
 
     // 4. Set option's cached nearest ancestor select element to newSelect.

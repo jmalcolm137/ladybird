@@ -6,26 +6,43 @@
 
 #include <AK/JsonArray.h>
 #include <AK/JsonObject.h>
-#include <AK/Mutex.h>
-#include <AK/NeverDestroyed.h>
 #include <AK/StringBuilder.h>
+#include <LibURL/Parser.h>
 #include <LibWebCommon/Loader/SiteCompatibility.h>
 
 namespace Web {
 
-static ErrorOr<Vector<String>> parse_patterns(JsonObject const& object)
+// Only a site's own serialization is accepted, such as "https://example.com", so a rule can't name a subdomain, port or
+// path that matching would ignore.
+static ErrorOr<URL::Site> parse_site(StringView serialized_site)
 {
-    auto patterns = object.get_array("matches"sv);
-    if (!patterns.has_value() || patterns->is_empty())
-        return Error::from_string_literal("Site-compatibility rule must contain a non-empty 'matches' array");
+    auto url = URL::Parser::basic_parse(serialized_site);
+    if (!url.has_value())
+        return Error::from_string_literal("Site-compatibility rule sites must be URLs");
+
+    auto origin = url->origin();
+    if (origin.is_opaque())
+        return Error::from_string_literal("Site-compatibility rule sites must not be opaque");
+
+    auto site = URL::Site::obtain(origin);
+    if (site.serialize() != serialized_site)
+        return Error::from_string_literal("Site-compatibility rule sites must be serialized sites, such as https://example.com");
+    return site;
+}
+
+static ErrorOr<Vector<String>> parse_sites(JsonObject const& object)
+{
+    auto sites = object.get_array("sites"sv);
+    if (!sites.has_value() || sites->is_empty())
+        return Error::from_string_literal("Site-compatibility rule must contain a non-empty 'sites' array");
 
     Vector<String> result;
-    TRY(result.try_ensure_capacity(patterns->size()));
-    for (size_t i = 0; i < patterns->size(); ++i) {
-        auto const& pattern = patterns->at(i);
-        if (!pattern.is_string() || pattern.as_string().is_empty())
-            return Error::from_string_literal("Site-compatibility rule patterns must be non-empty strings");
-        TRY(result.try_append(pattern.as_string()));
+    TRY(result.try_ensure_capacity(sites->size()));
+    for (size_t i = 0; i < sites->size(); ++i) {
+        auto const& site = sites->at(i);
+        if (!site.is_string())
+            return Error::from_string_literal("Site-compatibility rule sites must be strings");
+        TRY(result.try_append(site.as_string()));
     }
     return result;
 }
@@ -49,6 +66,8 @@ static ErrorOr<Vector<UserAgentTransformation>> parse_user_agent_transformations
             return Error::from_string_literal("User-Agent transformations must be strings");
         if (transformation.as_string() == "hide_Ladybird"sv)
             TRY(result.try_append(UserAgentTransformation::HideLadybird));
+        else if (transformation.as_string() == "hide_Chromium"sv)
+            TRY(result.try_append(UserAgentTransformation::HideChromium));
         else
             return Error::from_string_literal("Unknown User-Agent transformation");
     }
@@ -90,27 +109,21 @@ ErrorOr<SiteCompatibilityRule> SiteCompatibilityRule::from_json(JsonValue const&
     if (transformations.is_empty() && exposed_interfaces.is_empty())
         return Error::from_string_literal("Site-compatibility rule must contain a 'user_agent' or an 'expose_experimental_interfaces' array");
 
-    return create(TRY(parse_patterns(object)), move(transformations), move(exposed_interfaces));
+    return create(TRY(parse_sites(object)), move(transformations), move(exposed_interfaces));
 }
 
-ErrorOr<SiteCompatibilityRule> SiteCompatibilityRule::create(Vector<String> patterns, Vector<UserAgentTransformation> transformations, Vector<String> exposed_interfaces)
+ErrorOr<SiteCompatibilityRule> SiteCompatibilityRule::create(Vector<String> serialized_sites, Vector<UserAgentTransformation> transformations, Vector<String> exposed_interfaces)
 {
-    Vector<URL::RustIntegration::URLPattern> compiled_patterns;
-    TRY(compiled_patterns.try_ensure_capacity(patterns.size()));
+    Vector<URL::Site> sites;
+    TRY(sites.try_ensure_capacity(serialized_sites.size()));
+    for (auto const& serialized_site : serialized_sites)
+        TRY(sites.try_append(TRY(parse_site(serialized_site))));
 
-    for (auto const& pattern : patterns) {
-        auto compiled_pattern = URL::RustIntegration::URLPattern::create(pattern);
-        if (compiled_pattern.is_error())
-            return Error::from_string_literal("Site-compatibility rule contains an invalid URL pattern");
-        TRY(compiled_patterns.try_append(compiled_pattern.release_value()));
-    }
-
-    return SiteCompatibilityRule { move(patterns), move(compiled_patterns), move(transformations), move(exposed_interfaces) };
+    return SiteCompatibilityRule { move(sites), move(transformations), move(exposed_interfaces) };
 }
 
-SiteCompatibilityRule::SiteCompatibilityRule(Vector<String> patterns, Vector<URL::RustIntegration::URLPattern> compiled_patterns, Vector<UserAgentTransformation> transformations, Vector<String> exposed_interfaces)
-    : m_patterns(move(patterns))
-    , m_compiled_patterns(move(compiled_patterns))
+SiteCompatibilityRule::SiteCompatibilityRule(Vector<URL::Site> sites, Vector<UserAgentTransformation> transformations, Vector<String> exposed_interfaces)
+    : m_sites(move(sites))
     , m_user_agent_transformations(move(transformations))
     , m_exposed_interfaces(move(exposed_interfaces))
 {
@@ -121,29 +134,17 @@ bool SiteCompatibilityRule::exposes_experimental_interface(StringView name) cons
     return m_exposed_interfaces.contains_slow(name);
 }
 
-bool SiteCompatibilityRule::matches(URL::URL const& url) const
+bool SiteCompatibilityRule::matches(URL::Site const& site) const
 {
-    auto serialized_url = url.serialize();
-
-    // NB: Agents on different threads share these rules, and a compiled pattern keeps non-atomic state: each regex has
-    //     a reference count and the scratch space of its matcher. A match is short, and a fetch makes few of them.
-    static NeverDestroyed<Mutex> s_match_mutex;
-    MutexLocker locker(*s_match_mutex);
-
-    for (auto const& pattern : m_compiled_patterns) {
-        auto result = pattern.match(serialized_url, {});
-        if (!result.is_error() && result.value().has_value())
-            return true;
-    }
-    return false;
+    return m_sites.contains_slow(site);
 }
 
-static String remove_ladybird_product(StringView user_agent)
+static String remove_product(StringView user_agent, StringView name)
 {
     StringBuilder builder;
     bool first = true;
     for (auto product : user_agent.split_view(' ')) {
-        if (product.starts_with("Ladybird/"sv))
+        if (product.starts_with(name) && product.substring_view(name.length()).starts_with('/'))
             continue;
         if (!first)
             builder.append(' ');
@@ -159,37 +160,41 @@ String SiteCompatibilityRule::apply_user_agent_transformations(StringView user_a
     for (auto transformation : m_user_agent_transformations) {
         switch (transformation) {
         case UserAgentTransformation::HideLadybird:
-            transformed_user_agent = remove_ladybird_product(transformed_user_agent);
+            transformed_user_agent = remove_product(transformed_user_agent, "Ladybird"sv);
+            break;
+        case UserAgentTransformation::HideChromium:
+            transformed_user_agent = remove_product(transformed_user_agent, "Chrome"sv);
             break;
         }
     }
     return transformed_user_agent;
 }
 
-String SiteCompatibilityData::user_agent_for_url(URL::URL const& url, StringView default_user_agent) const
+static bool rule_applies(SiteCompatibilityRule const& rule, URL::Site const& top_level_site, URL::Site const& site)
 {
+    return rule.matches(top_level_site) || rule.matches(site);
+}
+
+String SiteCompatibilityData::user_agent_for(URL::Origin const& top_level_origin, URL::Origin const& origin, StringView default_user_agent) const
+{
+    auto top_level_site = URL::Site::obtain(top_level_origin);
+    auto site = URL::Site::obtain(origin);
+
     auto user_agent = MUST(String::from_utf8(default_user_agent));
     for (auto const& rule : m_rules) {
-        if (rule.matches(url))
+        if (rule_applies(rule, top_level_site, site))
             user_agent = rule.apply_user_agent_transformations(user_agent);
     }
     return user_agent;
 }
 
-String SiteCompatibilityData::user_agent_for_websocket_url(URL::URL const& url, StringView default_user_agent) const
+bool SiteCompatibilityData::exposes_experimental_interface(URL::Origin const& top_level_origin, URL::Origin const& origin, StringView name) const
 {
-    auto http_url = url;
-    if (http_url.scheme() == "ws"sv)
-        http_url.set_scheme("http"sv);
-    else if (http_url.scheme() == "wss"sv)
-        http_url.set_scheme("https"sv);
-    return user_agent_for_url(http_url, default_user_agent);
-}
+    auto top_level_site = URL::Site::obtain(top_level_origin);
+    auto site = URL::Site::obtain(origin);
 
-bool SiteCompatibilityData::exposes_experimental_interface(URL::URL const& url, StringView name) const
-{
     for (auto const& rule : m_rules) {
-        if (rule.exposes_experimental_interface(name) && rule.matches(url))
+        if (rule.exposes_experimental_interface(name) && rule_applies(rule, top_level_site, site))
             return true;
     }
     return false;

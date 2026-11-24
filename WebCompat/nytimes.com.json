@@ -1,8 +1,0 @@
-{
-    "matches": [
-        "https://www.nytimes.com/*"
-    ],
-    "user_agent": [
-        "hide_Ladybird"
-    ]
-}

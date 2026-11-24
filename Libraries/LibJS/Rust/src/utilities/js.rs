@@ -28,7 +28,7 @@ use crate::console::{Console, ConsoleClient, ConsoleClientMethods, LogLevel, Pri
 use crate::contrib::test262::global_object::Test262GlobalObject;
 use crate::debugger::{Debugger, PauseInfo, PauseOnExceptions, PauseReason, ResumeMode, UpdateOriginalBindings};
 use crate::gc::class::{GcCell, cast_ref, define_cell};
-use crate::gc::root::Root;
+use crate::gc::root::{CellRoot, Root};
 use crate::hash_table::HashTable;
 use crate::interpreter::run::set_dump_bytecode;
 use crate::interpreter::vm::Vm;
@@ -37,7 +37,7 @@ use crate::layout::object::Object;
 use crate::layout::value::Value;
 use crate::lexical_path;
 use crate::parser_error::ParserError;
-use crate::runtime::completion::ThrowCompletionOr;
+use crate::runtime::completion::{Throw, ThrowCompletionOr};
 use crate::runtime::error::{Error, ErrorKind};
 use crate::runtime::error_data::CompactTraceback;
 use crate::runtime::error_types::ErrorType;
@@ -47,7 +47,7 @@ use crate::runtime::native_function::raw_native;
 use crate::runtime::object::{ORDINARY_OBJECT_METHODS, PropertyLookupPhase, allocate_object, define_object_class};
 use crate::runtime::primitive_string::PrimitiveString;
 use crate::runtime::print::{PrintContext, print};
-use crate::runtime::promise::Promise;
+use crate::runtime::promise::{Promise, PromiseState};
 use crate::runtime::property_attributes::{Attribute, PropertyAttributes};
 use crate::runtime::property_key::PropertyKey;
 use crate::runtime::realm::Realm;
@@ -417,6 +417,9 @@ thread_local! {
     static REPL_STATEMENTS: RefCell<Vec<Vec<u8>>> = const { RefCell::new(Vec::new()) };
     /// The completion value of the last script that ran, which `_` of the REPL reads.
     static LAST_VALUE: RefCell<Option<Root<'static, Value>>> = const { RefCell::new(None) };
+    /// The promises that were rejected without handlers and have had none added since, which js warns about once the
+    /// code that rejected them and its promise jobs have run.
+    static UNHANDLED_REJECTIONS: RefCell<Vec<CellRoot<Promise>>> = const { RefCell::new(Vec::new()) };
 }
 
 /// The Error of AK's String::from_utf8() for bytes that are not UTF-8.
@@ -1090,6 +1093,7 @@ fn print_inline(vm: &Vm, value: Value, stream: &mut dyn Write) -> io::Result<()>
         stream,
         strip_ansi: STRIP_ANSI.load(Ordering::Relaxed),
         raw_strings: RAW_STRINGS.load(Ordering::Relaxed),
+        compact: false,
     };
     print(value, &mut print_context)
 }
@@ -1135,6 +1139,17 @@ fn warn_about_promise(vm: &Vm, warning: &str, promise: Gc<Promise>) {
     eprint!(" (result: ");
     let _ = print_value(vm, promise.result(), PrintTarget::StandardError, PrintEnd::None);
     eprintln!(")");
+}
+
+/// Warns about the promises that are still rejected without handlers, as browsers do once their microtasks have run.
+fn warn_about_unhandled_rejections(vm: &Vm) {
+    for promise in UNHANDLED_REJECTIONS.take() {
+        warn_about_promise(
+            vm,
+            "WARNING: A promise was rejected without any handlers",
+            promise.cell(),
+        );
+    }
 }
 
 fn print_all_arguments(vm: &Vm, target: PrintTarget, end: PrintEnd) -> io::Result<()> {
@@ -1230,8 +1245,10 @@ fn parse_and_run(
     source: &[u8],
     source_name: &str,
     parse_only: bool,
+    sleep_for_async_waits: bool,
 ) -> Result<bool, String> {
     let mut result: ThrowCompletionOr<Value> = Ok(Value::UNDEFINED);
+    let mut module_evaluation = None;
     // Like Utf16String::from_utf8(), this stops the process for a source that is not valid UTF-8, which the caller
     // has ruled out.
     let source_text = Utf16String::from_utf8(core::str::from_utf8(source).expect("the source is valid UTF-8"));
@@ -1271,8 +1288,38 @@ fn parse_and_run(
         } else {
             let module = SourceTextModule::create_from_parsed(vm, parsed, source_code, realm, source_name);
             if !parse_only {
-                result = vm.run_module(module);
+                result = vm.run_module(module).map(|evaluation| {
+                    module_evaluation = Some(Root::new(vm, evaluation));
+                    Value::UNDEFINED
+                });
             }
+        }
+    }
+
+    if result.is_ok() && !parse_only {
+        if sleep_for_async_waits {
+            if let Err(error) = vm.run_async_wait_jobs_until(|| {
+                module_evaluation
+                    .as_ref()
+                    .is_some_and(|evaluation| evaluation.get().state() == PromiseState::Rejected)
+            }) {
+                result = Err(error);
+            }
+        } else {
+            vm.run_ready_async_wait_jobs();
+        }
+    }
+
+    if let Some(evaluation) = module_evaluation {
+        match evaluation.get().state() {
+            PromiseState::Pending if sleep_for_async_waits && result.is_ok() => {
+                return Err("Module evaluation did not complete".to_string());
+            }
+            PromiseState::Rejected => {
+                evaluation.get().mark_handled(vm);
+                result = Err(Throw::new(evaluation.get().result()));
+            }
+            _ => {}
         }
     }
 
@@ -1280,19 +1327,21 @@ fn parse_and_run(
         LAST_VALUE.set(Some(Root::new(vm, value)));
     }
 
-    match result {
+    let ran_without_throwing = match result {
         Err(throw) => {
             handle_exception(vm, throw.value()).map_err(|error| write_error_string(&error))?;
-            Ok(false)
+            false
         }
         Ok(value) => {
             if options.print_last_result {
                 print_value(vm, value, PrintTarget::StandardOutput, PrintEnd::Newline)
                     .map_err(|error| write_error_string(&error))?;
             }
-            Ok(true)
+            true
         }
-    }
+    };
+    warn_about_unhandled_rejections(vm);
+    Ok(ran_without_throwing)
 }
 
 /// How AK formats the Error of a failed write.
@@ -1913,7 +1962,7 @@ mod repl {
             }
 
             REPL_STATEMENTS.with_borrow_mut(|statements| statements.push(piece.clone()));
-            parse_and_run(vm, realm, options, &piece, "REPL", false)?;
+            parse_and_run(vm, realm, options, &piece, "REPL", false, false)?;
         }
         Ok(())
     }
@@ -2084,19 +2133,21 @@ fn ladybird_main(arguments: &[String], line_editor: Option<JSLineEditor>) -> c_i
     }
 
     if !options.disable_debug_printing {
-        // NOTE: These will print out both warnings when using something like Promise.reject().catch(...) -
-        // which is, as far as I can tell, correct - a promise is created, rejected without handler, and a
-        // handler then attached to it. The Node.js REPL doesn't warn in this case, so it's something we
-        // might want to revisit at a later point and disable warnings for promises created this way.
-        vm.set_on_promise_unhandled_rejection(Some(|vm, promise| {
-            warn_about_promise(vm, "WARNING: A promise was rejected without any handlers", promise);
+        vm.set_on_promise_unhandled_rejection(Some(|_, promise| {
+            UNHANDLED_REJECTIONS.with_borrow_mut(|promises| promises.push(CellRoot::new(promise)));
         }));
         vm.set_on_promise_rejection_handled(Some(|vm, promise| {
-            warn_about_promise(
-                vm,
-                "WARNING: A handler was added to an already rejected promise",
-                promise,
-            );
+            let was_pending = UNHANDLED_REJECTIONS.with_borrow_mut(|promises| {
+                let index = promises.iter().rposition(|rejected| rejected.cell() == promise);
+                index.map(|index| promises.remove(index)).is_some()
+            });
+            if !was_pending {
+                warn_about_promise(
+                    vm,
+                    "WARNING: A handler was added to an already rejected promise",
+                    promise,
+                );
+            }
         }));
     }
 
@@ -2157,7 +2208,7 @@ fn ladybird_main(arguments: &[String], line_editor: Option<JSLineEditor>) -> c_i
 
     // We resolve modules as if it is the first file
 
-    let result = parse_and_run(vm, realm, &options, &builder, source_name, options.parse_only);
+    let result = parse_and_run(vm, realm, &options, &builder, source_name, options.parse_only, true);
     // NB: The VM lives until the process exits.
     vm.jit.flush_coverage();
     match result {

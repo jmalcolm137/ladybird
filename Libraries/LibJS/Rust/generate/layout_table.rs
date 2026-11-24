@@ -262,6 +262,7 @@ pub fn generate(configuration: &LayoutConfiguration) -> LayoutWriter {
     field!(w, "EXECUTABLE_REGISTERS_AND_LOCALS_AND_CONSTANTS_COUNT", "Executable.registers_and_locals_and_constants_count", "u32", ExecutableHead, registers_and_locals_and_constants_count, 4, "nullable", "scalar", "slot_counts");
     field!(w, "EXECUTABLE_CONSTANTS_DATA", "Executable.constants_data", "Sequence<Value>", ExecutableHead, constants, 8, "nullable", "scalar");
     field!(w, "EXECUTABLE_TIER_UP_BUDGET", "Executable.tier_up_budget", "i32", ExecutableHead, tier_up_budget, 4, "nullable", "scalar");
+    field!(w, "EXECUTABLE_IDLE_COLLECTION_COUNT", "Executable.idle_collection_count", "u8", ExecutableHead, idle_collection_count, 1, "nullable", "scalar");
     field!(w, "EXECUTABLE_JIT_COMPILE_STATE", "Executable.jit_compile_state", "u8", ExecutableHead, jit_compile_state, 1, "nullable", "scalar");
     w.constant("JIT_COMPILE_STATE_INSTALLED", JIT_COMPILE_STATE_INSTALLED);
     w.constant("TIER_UP_FUNCTION_ENTRY_COST", tier_up_costs::FUNCTION_ENTRY);
@@ -289,6 +290,9 @@ pub fn generate(configuration: &LayoutConfiguration) -> LayoutWriter {
         size_of::<CallFeedback>()
     ));
     w.line("field CallFeedback.flags u8 CALL_FEEDBACK_FLAGS nullable scalar");
+    offset!(w, "CALL_FEEDBACK_VALUE_BUCKET", CallFeedback, value_bucket);
+    assert_eq!(size_of_field(|feedback: &CallFeedback| &feedback.value_bucket), 2);
+    w.line("field CallFeedback.value_bucket u16 CALL_FEEDBACK_VALUE_BUCKET nullable scalar");
     w.constant("CALL_FEEDBACK_SIZE", size_of::<CallFeedback>());
     w.constant("CALL_FEEDBACK_POLYMORPHIC", call_feedback_flags::POLYMORPHIC);
     w.constant("CALL_FEEDBACK_SAW_NATIVE", call_feedback_flags::SAW_NATIVE);
@@ -328,12 +332,11 @@ pub fn generate(configuration: &LayoutConfiguration) -> LayoutWriter {
     w.section("ExecutionContext layout");
     assert_eq!(align_of::<ExecutionContext>(), value_size);
     field!(w, "EXECUTION_CONTEXT_FUNCTION", "ExecutionContext.function", "Object", ExecutionContext, function, 8, "nullable", "cell", "function_and_realm");
-    field!(w, "EXECUTION_CONTEXT_REALM", "ExecutionContext.realm", "Realm", ExecutionContext, realm, 8, "nullable", "cell", "function_and_realm");
-    field!(w, "EXECUTION_CONTEXT_SCRIPT_OR_MODULE", "ExecutionContext.script_or_module", "u64", ExecutionContext, script_or_module, 8, "nullable", "scalar");
+    field!(w, "EXECUTION_CONTEXT_REALM_WITHOUT_FUNCTION", "ExecutionContext.realm_without_function", "Realm", ExecutionContext, realm_without_function, 8, "nullable", "cell", "function_and_realm");
+    field!(w, "EXECUTION_CONTEXT_SCRIPT_OR_MODULE_WITHOUT_FUNCTION", "ExecutionContext.script_or_module_without_function", "u64", ExecutionContext, script_or_module_without_function, 8, "nullable", "scalar");
     field!(w, "EXECUTION_CONTEXT_LEXICAL_ENVIRONMENT", "ExecutionContext.lexical_environment", "Environment", ExecutionContext, lexical_environment, 8, "nullable", "cell", "environments");
-    field!(w, "EXECUTION_CONTEXT_VARIABLE_ENVIRONMENT", "ExecutionContext.variable_environment", "Environment", ExecutionContext, variable_environment, 8, "nullable", "cell", "environments");
-    field!(w, "EXECUTION_CONTEXT_PRIVATE_ENVIRONMENT", "ExecutionContext.private_environment", "PrivateEnvironment", ExecutionContext, private_environment, 8, "nullable", "cell");
-    field!(w, "EXECUTION_CONTEXT_SKIP_WHEN_DETERMINING_INCUMBENT_COUNTER", "ExecutionContext.skip_when_determining_incumbent_counter", "u32", ExecutionContext, skip_when_determining_incumbent_counter, 4, "nullable", "scalar");
+    field!(w, "EXECUTION_CONTEXT_VARIABLE_ENVIRONMENT", "ExecutionContext.variable_environment", "Environment", ExecutionContext, variable_environment_in_frame, 8, "nullable", "cell", "environments");
+    field!(w, "EXECUTION_CONTEXT_PRIVATE_ENVIRONMENT", "ExecutionContext.private_environment", "PrivateEnvironment", ExecutionContext, private_environment_in_frame, 8, "nullable", "cell");
     field!(w, "EXECUTION_CONTEXT_YIELD_CONTINUATION", "ExecutionContext.yield_continuation", "u32", ExecutionContext, yield_continuation, 4, "nullable", "scalar");
     field!(w, "EXECUTION_CONTEXT_YIELD_IS_AWAIT", "ExecutionContext.yield_is_await", "bool", ExecutionContext, yield_is_await, 1, "nullable", "scalar");
     field!(w, "EXECUTION_CONTEXT_YIELD_VALUE_IS_ITERATOR_RESULT", "ExecutionContext.yield_value_is_iterator_result", "bool", ExecutionContext, yield_value_is_iterator_result, 1, "nullable", "scalar");
@@ -351,6 +354,8 @@ pub fn generate(configuration: &LayoutConfiguration) -> LayoutWriter {
     field!(w, "EXECUTION_CONTEXT_ARGUMENT_COUNT", "ExecutionContext.argument_count", "u32", ExecutionContext, argument_count, 4, "nullable", "scalar", "counts");
     field!(w, "EXECUTION_CONTEXT_RETURNS_TO_NATIVE_CALLER", "ExecutionContext.returns_to_native_caller", "bool", ExecutionContext, returns_to_native_caller, 1, "nullable", "scalar");
     field!(w, "EXECUTION_CONTEXT_RUNS_JIT_CODE", "ExecutionContext.runs_jit_code", "bool", ExecutionContext, runs_jit_code, 1, "nullable", "scalar");
+    field!(w, "EXECUTION_CONTEXT_CALLER_IS_DERIVED_CONSTRUCT", "ExecutionContext.caller_is_derived_construct", "bool", ExecutionContext, caller_is_derived_construct, 1, "nullable", "scalar");
+    field!(w, "EXECUTION_CONTEXT_NEW_TARGET", "ExecutionContext.new_target", "Value", ExecutionContext, new_target, 8, "nullable", "scalar");
     let sizeof_execution_context = size!(w, "SIZEOF_EXECUTION_CONTEXT", ExecutionContext);
     w.line("field ExecutionContext.slots Sequence<Value> SIZEOF_EXECUTION_CONTEXT embedded scalar");
     let slot_offset = |index: u32| sizeof_execution_context + index as usize * value_size;
@@ -395,6 +400,7 @@ pub fn generate(configuration: &LayoutConfiguration) -> LayoutWriter {
     w.line("field VM.native_function_table Sequence<NativeFunctionTableEntry> VM_NATIVE_FUNCTION_TABLE_DATA nonnull scalar");
     offset!(w, "VM_DISPATCH_TABLES", VmHead, dispatch_tables);
     w.line("field VM.dispatch_tables Sequence<u64> VM_DISPATCH_TABLES embedded scalar");
+    field!(w, "VM_CURRENT_REALM", "VM.current_realm", "Realm", VmHead, current_realm, 8, "nullable", "cell");
     w.constant("DISPATCH_TABLE_INDEX_MASK", DISPATCH_TABLE_INDEX_MASK);
     offset!(w, "VM_INTERPRETER_STACK_TOP", VmHead, interpreter_stack.top);
     offset!(w, "VM_INTERPRETER_STACK_LIMIT", VmHead, interpreter_stack.limit);
@@ -403,7 +409,6 @@ pub fn generate(configuration: &LayoutConfiguration) -> LayoutWriter {
     w.line("field VM.running_execution_context ExecutionContext VM_RUNNING_EXECUTION_CONTEXT nullable scalar");
     w.line("field VM.interpreter_stack_top u64 VM_INTERPRETER_STACK_TOP nonnull scalar interpreter_stack_bounds");
     w.line("field VM.interpreter_stack_limit u64 VM_INTERPRETER_STACK_LIMIT nonnull scalar interpreter_stack_bounds");
-    w.line("field VM.interpreter_stack_next_frame_id u64 VM_INTERPRETER_STACK_NEXT_FRAME_ID nonnull scalar");
     w.line("field VM.stack_base u64 VM_STACK_INFO_BASE nullable scalar");
     w.constant("VM_STACK_SPACE_LIMIT", configuration.vm_stack_space_limit);
 
@@ -435,6 +440,17 @@ pub fn generate(configuration: &LayoutConfiguration) -> LayoutWriter {
     w.line("field Executable.global_variable_caches GlobalVariableCaches EXECUTABLE_GLOBAL_VARIABLE_CACHES_DATA nonnull scalar");
     offset!(w, "EXECUTABLE_ENVIRONMENT_COORDINATE_CACHES_DATA", ExecutableHead, environment_coordinate_caches.data);
     w.line("field Executable.environment_coordinate_caches Sequence<EnvironmentCoordinateEntry> EXECUTABLE_ENVIRONMENT_COORDINATE_CACHES_DATA nullable scalar");
+    field!(w, "EXECUTABLE_CALL_CACHES", "Executable.call_caches", "u64", ExecutableHead, call_caches, 8, "nullable", "scalar");
+    field!(w, "EXECUTABLE_CALL_METADATA", "Executable.call_metadata", "u64", ExecutableHead, call_metadata, 8, "nullable", "scalar");
+    w.section("CallCache layout");
+    offset!(w, "CALL_CACHE_CALLEE", CallCache, callee);
+    offset!(w, "CALL_CACHE_TARGET", CallCache, target);
+    size!(w, "CALL_CACHE_SIZE", CallCache);
+    w.line("field CallCache.callee u64 CALL_CACHE_CALLEE nullable scalar");
+    w.line("field CallCache.target u64 CALL_CACHE_TARGET nullable scalar");
+    w.constant("CALL_CACHE_TARGET_TAG_MASK", CALL_CACHE_TARGET_TAG_MASK);
+    w.constant("CALL_CACHE_TARGET_NATIVE_FUNCTION", CALL_CACHE_TARGET_NATIVE_FUNCTION);
+    w.constant("CALL_CACHE_TARGET_INDEX_SHIFT", CALL_CACHE_TARGET_INDEX_SHIFT);
     offset!(w, "OBJECT_PROPERTY_ITERATOR_CACHE_DATA_PROPERTY_VALUES_DATA", ObjectPropertyIteratorCacheData, property_values.data);
     offset!(w, "OBJECT_PROPERTY_ITERATOR_CACHE_DATA_PROPERTY_VALUES_SIZE", ObjectPropertyIteratorCacheData, property_values.size);
     w.line("field ObjectPropertyIteratorCacheData.property_values Sequence<Value> OBJECT_PROPERTY_ITERATOR_CACHE_DATA_PROPERTY_VALUES_DATA nullable scalar");
@@ -573,6 +589,8 @@ pub fn generate(configuration: &LayoutConfiguration) -> LayoutWriter {
     let environment_coordinate_size = size!(w, "ENVIRONMENT_COORDINATE_SIZE", EnvironmentCoordinate);
     w.line(&format!("field EnvironmentCoordinateEntry.hops u32 ENVIRONMENT_COORDINATE_HOPS nullable scalar environment_coordinate stride {environment_coordinate_size}"));
     w.line("field EnvironmentCoordinateEntry.binding_index u32 ENVIRONMENT_COORDINATE_INDEX nullable scalar environment_coordinate");
+    w.line("field BytecodeEnvironmentCoordinate.hops u8 0 nullable scalar");
+    w.line("field BytecodeEnvironmentCoordinate.binding_index u16 1 nullable scalar");
 
     w.section("TypedArrayBase layout");
     offset!(w, "TYPED_ARRAY_ELEMENT_SIZE", TypedArrayBase, element_size);

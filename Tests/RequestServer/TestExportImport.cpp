@@ -92,13 +92,13 @@ public:
 
     void start_request(u64 request_id, URL::URL url, HTTP::NetworkIsolationKey network_isolation_key, bool create_transfer_lease)
     {
-        auto message = make<Messages::RequestServer::StartRequest>(request_id, ByteString { "GET" }, move(url), cacheable_request_headers(), ByteBuffer {}, HTTP::CacheMode::Default, move(network_isolation_key), HTTP::Cookie::IncludeCredentials::No, create_transfer_lease, Optional<u32> {}, false, 0, 0, HTTP::Cookie::SameSiteContext {});
+        auto message = make<Messages::RequestServer::StartRequest>(request_id, ByteString { "GET" }, move(url), cacheable_request_headers(), ByteBuffer {}, HTTP::CacheMode::Default, move(network_isolation_key), HTTP::Cookie::IncludeCredentials::No, create_transfer_lease, Optional<u32> {}, false, 0, HTTP::Cookie::SameSiteContext {});
         VERIFY(!dispatch(move(message)));
     }
 
-    void adopt_request(int source_client_id, u64 source_request_id, u64 target_request_id, bool preserve_transfer_lease)
+    void adopt_request(int source_client_id, u64 source_request_id, u64 target_request_id, bool preserve_transfer_lease, int owner_client_id)
     {
-        auto message = make<Messages::RequestServer::AdoptRequest>(source_client_id, source_request_id, target_request_id, preserve_transfer_lease);
+        auto message = make<Messages::RequestServer::AdoptRequest>(source_client_id, source_request_id, target_request_id, preserve_transfer_lease, owner_client_id);
         VERIFY(!dispatch(move(message)));
     }
 
@@ -353,10 +353,10 @@ TEST_CASE(exported_response_is_delivered_and_cached_by_the_importing_request_ser
     TestConnection source_ui { source_server, ReadsBodies::No };
     navigator.start_request(1, url, key, true);
     (void)navigator.wait_for<Messages::RequestClient::HeadersBecameAvailable>(event_loop, 1);
-    source_ui.adopt_request(navigator.client_id(), 1, 10, true);
+    source_ui.adopt_request(navigator.client_id(), 1, 10, true, navigator.client_id());
     (void)source_ui.wait_for<Messages::RequestClient::HeadersBecameAvailable>(event_loop, 10);
 
-    // Transfer through the target site's UI client before the target document adopts the response.
+    // Transfer through the target site's UI client before another client adopts the response.
     auto exported = source_ui.export_request(10);
     EXPECT(exported.has_value());
     (void)source_ui.wait_for<Messages::RequestClient::RequestTransferred>(event_loop, 10);
@@ -365,7 +365,7 @@ TEST_CASE(exported_response_is_delivered_and_cached_by_the_importing_request_ser
     TestConnection target { target_server };
     target_ui.import_request(20, exported.release_value(), true);
     (void)target_ui.wait_for<Messages::RequestClient::HeadersBecameAvailable>(event_loop, 20);
-    target.adopt_request(target_ui.client_id(), 20, 30, false);
+    target.adopt_request(target_ui.client_id(), 20, 30, false, target_ui.client_id());
 
     auto headers = target.wait_for<Messages::RequestClient::HeadersBecameAvailable>(event_loop, 30);
     EXPECT_EQ(headers->status_code(), 200u);
@@ -402,7 +402,7 @@ TEST_CASE(imported_response_whose_transfer_failed_is_not_cached)
     TestConnection source_ui { source_server, ReadsBodies::No };
     navigator.start_request(1, url, key, true);
     (void)navigator.wait_for<Messages::RequestClient::HeadersBecameAvailable>(event_loop, 1);
-    source_ui.adopt_request(navigator.client_id(), 1, 10, true);
+    source_ui.adopt_request(navigator.client_id(), 1, 10, true, navigator.client_id());
     (void)source_ui.wait_for<Messages::RequestClient::HeadersBecameAvailable>(event_loop, 10);
 
     auto exported = source_ui.export_request(10);
@@ -411,7 +411,7 @@ TEST_CASE(imported_response_whose_transfer_failed_is_not_cached)
     TestConnection target_ui { target_server, ReadsBodies::No };
     TestConnection target { target_server };
     target_ui.import_request(20, exported.release_value(), true);
-    target.adopt_request(target_ui.client_id(), 20, 30, false);
+    target.adopt_request(target_ui.client_id(), 20, 30, false, target_ui.client_id());
 
     auto finished = target.wait_for<Messages::RequestClient::RequestFinished>(event_loop, 30);
     EXPECT(finished->network_error().has_value());
@@ -461,7 +461,7 @@ TEST_CASE(stopping_an_imported_request_aborts_the_transfer)
     TestConnection source_ui { source_server, ReadsBodies::No };
     navigator.start_request(1, url, key, true);
     (void)navigator.wait_for<Messages::RequestClient::HeadersBecameAvailable>(event_loop, 1);
-    source_ui.adopt_request(navigator.client_id(), 1, 10, true);
+    source_ui.adopt_request(navigator.client_id(), 1, 10, true, navigator.client_id());
     (void)source_ui.wait_for<Messages::RequestClient::HeadersBecameAvailable>(event_loop, 10);
 
     auto exported = source_ui.export_request(10);
@@ -470,7 +470,7 @@ TEST_CASE(stopping_an_imported_request_aborts_the_transfer)
     TestConnection target_ui { target_server, ReadsBodies::No };
     TestConnection target { target_server };
     target_ui.import_request(20, exported.release_value(), true);
-    target.adopt_request(target_ui.client_id(), 20, 30, false);
+    target.adopt_request(target_ui.client_id(), 20, 30, false, target_ui.client_id());
     (void)target.wait_for<Messages::RequestClient::HeadersBecameAvailable>(event_loop, 30);
 
     event_loop.spin_until([&] {

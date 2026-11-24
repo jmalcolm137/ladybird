@@ -582,7 +582,12 @@ pub(crate) struct DeclarationBlockBuilder {
 }
 
 impl DeclarationBlockBuilder {
-    pub(crate) fn finish(self) -> SharedDeclarationBlock {
+    pub(crate) fn finish(mut self) -> SharedDeclarationBlock {
+        self.finish_and_reuse()
+    }
+
+    /// Freezes the declarations into a block, and keeps the memory of the builder for the next one.
+    pub(crate) fn finish_and_reuse(&mut self) -> SharedDeclarationBlock {
         let property_count = u32::try_from(self.properties.len()).expect("declaration block too large");
         let custom_property_count = u32::try_from(self.custom_properties.len()).expect("declaration block too large");
         let layout = block_layout(self.properties.len(), self.custom_properties.len());
@@ -620,11 +625,11 @@ impl DeclarationBlockBuilder {
             let entries = base.add(layout.entries).cast::<DeclarationEntry>();
             let custom_properties = self
                 .custom_properties
-                .into_iter()
+                .drain(..)
                 .map(|property| (Some(property.name), property.declaration));
             let declarations = self
                 .properties
-                .into_iter()
+                .drain(..)
                 .map(|property| (None, property))
                 .chain(custom_properties);
             for (index, (name, declaration)) in declarations.enumerate() {
@@ -983,29 +988,6 @@ pub extern "C" fn rust_declaration_block_prefetch_header(block: &DeclarationBloc
 #[unsafe(no_mangle)]
 pub extern "C" fn rust_declaration_block_is_empty(block: &DeclarationBlock) -> bool {
     block.is_empty()
-}
-
-/// Whether a declaration of the block holds an image or a gradient, as its value or as an item of its list.
-#[unsafe(no_mangle)]
-pub extern "C" fn rust_declaration_block_has_abstract_image_values(block: &DeclarationBlock) -> bool {
-    use crate::css::style_value::StyleValueData;
-    let is_abstract_image = |value: &StyleValueData| {
-        matches!(
-            value,
-            StyleValueData::Image { .. }
-                | StyleValueData::ImageSet { .. }
-                | StyleValueData::LinearGradient { .. }
-                | StyleValueData::ConicGradient { .. }
-                | StyleValueData::RadialGradient { .. }
-        )
-    };
-    block.data().properties().values().iter().any(|value| match &**value {
-        StyleValueData::ValueList { values, .. } => values
-            .as_slice()
-            .iter()
-            .any(|item| item.optional_data().is_some_and(is_abstract_image)),
-        value => is_abstract_image(value),
-    })
 }
 
 #[unsafe(no_mangle)]

@@ -11,14 +11,23 @@ inline fn max(lhs: u32, rhs: u32) -> u32 {
     }
 }
 
+inline fn call_length(
+    argument_count: u8
+) -> u32 {
+    let mut count: u32;
+    load8(count, [pb, pc, argument_count]);
+    # NB: 7 is what a Call takes up before its arguments, which are a byte each. Any call breaks if it goes out of date.
+    let length: u32 = 7 + count;
+    length
+}
+
 inline fn call_site_info(
-    length: u32,
+    argument_count: u8,
     dst: out Operand
 ) -> (u32, u32, u32) {
-    let [instruction_length, destination_index] = load_pair32(
-        [pb, pc, length],
-        [pb, pc, dst]
-    );
+    let instruction_length: u32 = call_length(argument_count);
+    let mut destination_index: u32;
+    load8(destination_index, [pb, pc, dst]);
     let current_pc: u32 = pc;
     let return_pc: u32 = current_pc + instruction_length;
     (current_pc, return_pc, destination_index)
@@ -111,7 +120,10 @@ inline fn load_direct_getter_value(
 }
 
 inline fn move_operand(dst: out Operand, src: in Operand) {
-    let [dst_index, src_index] = load_pair32([pb, pc, dst], [pb, pc, src]);
+    let mut dst_index: u32;
+    load8(dst_index, [pb, pc, dst]);
+    let mut src_index: u32;
+    load8(src_index, [pb, pc, src]);
     values[dst_index] = values[src_index];
 }
 
@@ -214,8 +226,8 @@ inline fn walk_environment_chain(
 ) -> (DeclarativeEnvironment, u32) {
     let mut environment = initial_environment;
     let coordinate = &coordinate;
-    let mut hops = coordinate.hops;
-    let binding_index = coordinate.binding_index;
+    let mut hops = u32(coordinate.hops);
+    let binding_index = u32(coordinate.binding_index);
     assert(environment != 0);
     if hops != 0 {
         do {
@@ -414,9 +426,16 @@ inline fn return_to_caller(
     let caller_frame = exec_ctx.caller_frame;
     guard caller_frame != 0 else top_level;
     let mut result = return_value;
+    # NB: The frame of a derived constructor returns its this value only for undefined.
     if exec_ctx.caller_is_construct {
         if result is not Value<Object> {
-            result = exec_ctx.this_value;
+            if exec_ctx.caller_is_derived_construct {
+                if result is Value<Undefined> {
+                    result = exec_ctx.this_value;
+                }
+            } else {
+                result = exec_ctx.this_value;
+            }
         }
     }
     let return_pc = exec_ctx.caller_return_pc;
@@ -1079,16 +1098,41 @@ inline fn record_value_feedback(slot: ValueFeedbackIndex, value: Value) @profili
     buckets[0] = value;
 }
 
+# The value buckets of the sites of property lookup caches lie before the
+# others, in reverse order: the bucket of cache 0 is the last of them.
+inline fn record_cache_value_feedback(cache: ProfiledPropertyLookupCacheIndex, value: Value) @profiling {
+    let feedback = feedback_base();
+    let index: u64 = alias(load(cache));
+    let unmasked: u64 = feedback.value_buckets - (index << 3) - 8;
+    let cage_base = primitive_storage_cage_base();
+    let buckets: Sequence<Value> = alias(
+        cage_base + ((unmasked << PRIMITIVE_STORAGE_CAGE_OFFSET_SHIFT) >> PRIMITIVE_STORAGE_CAGE_OFFSET_SHIFT)
+    );
+    buckets[0] = value;
+}
+
+# A call site keeps the tag of the value a call returned in its call feedback,
+# which holds its value bucket.
+inline fn record_call_value_feedback(slot: CallFeedbackIndex, value: Value) @profiling {
+    let feedback = feedback_base();
+    let call_feedback: CallFeedback = alias(
+        feedback_address(primitive_storage_cage_base(), feedback.call, load(slot), CALL_FEEDBACK_SIZE)
+    );
+    call_feedback.value_bucket = truncate_u16(i32(extract_tag(value)));
+}
+
 # Call feedback only does work when the callee differs from the first one
 # recorded at the site.
-inline fn record_call_target(slot: CallFeedbackIndex, function: Object) @profiling {
+# Records `function` as a target of the call site, and gives the site's call
+# feedback flags in `site_flags`.
+inline fn record_call_target(slot: CallFeedbackIndex, function: Object, site_flags: inout i32) @profiling {
     let feedback = feedback_base();
     let call_feedback: CallFeedback = alias(
         feedback_address(primitive_storage_cage_base(), feedback.call, load(slot), CALL_FEEDBACK_SIZE)
     );
     let function_pointer: u64 = alias(function);
+    let mut flags: i32 = alias(call_feedback.flags);
     if call_feedback.target != function_pointer {
-        let mut flags: i32 = alias(call_feedback.flags);
         if call_feedback.target == 0 {
             call_feedback.target = function_pointer;
         } else {
@@ -1117,6 +1161,7 @@ inline fn record_call_target(slot: CallFeedbackIndex, function: Object) @profili
         }
         call_feedback.flags = truncate_u8(flags);
     }
+    site_flags = flags;
 }
 
 inline fn record_keyed_feedback(slot: KeyedFeedbackIndex, bits: u32) @profiling {
@@ -1233,10 +1278,14 @@ inline fn count_loop_iteration() {
 
 # Bytecode handlers are kept in native layout order.
 
-handler Enter() {
+inline fn enter_frame() {
     consume_tier_up_budget(TIER_UP_FUNCTION_ENTRY_COST, pc, 0);
     let executable = exec_ctx.executable;
     assert(executable != 0);
+    # NB: Only a collection makes the count nonzero, so the store is rare.
+    if executable.idle_collection_count != 0 {
+        executable.idle_collection_count = 0;
+    }
     let registers_and_locals_count = executable.registers_and_locals_count;
     let empty_tag: Value = Value<Empty>;
     let mut slot_index: u64 = RESERVED_REGISTER_COUNT;
@@ -1260,6 +1309,64 @@ handler Enter() {
         write_index = write_index + 1;
     }
     exec_ctx.frame_initialized = true;
+}
+
+handler Enter() {
+    enter_frame();
+    dispatch_next;
+}
+
+# NB: Callers pass the this value as it is, and the runtime binds it for a sloppy function that uses it: to an object,
+#     or the global this value for null and undefined.
+inline fn coerce_this() {
+    let _: i32 = call_helper(asm_helper_coerce_this, current_vm());
+}
+
+# NB: Sloppy functions that use their this value start with this. Null and undefined become the global this value of
+#     the current realm, which is the function's, as a call of an ECMAScript function of another realm goes through
+#     the runtime.
+handler EnterCoercingThis() {
+    let this_value = exec_ctx.this_value_register;
+    if this_value is not Value<Object> {
+        if this_value is Value<Nullish> {
+            let realm_vm = current_vm();
+            let global_this: Value = alias(box_object(realm_vm.current_realm.global_environment.global_this_value));
+            exec_ctx.this_value_register = global_this;
+            exec_ctx.this_value = global_this;
+        } else {
+            coerce_this();
+        }
+    }
+    enter_frame();
+    dispatch_next;
+}
+
+# NB: Code that makes private or variable environments starts with this, and its frames keep their running private
+#     and variable environments from here on. Others read them from their function.
+handler EnterWithOwnEnvironments() {
+    if exec_ctx.this_value_register is not Value<Object> {
+        let this_function = exec_ctx.function;
+        if this_function != 0 {
+            let this_ecmascript_function: ECMAScriptFunctionObject = alias(this_function);
+            let metadata = this_ecmascript_function.shared_data.asm_call_metadata;
+            if metadata has SHARED_FUNCTION_INSTANCE_DATA_ASM_CALL_METADATA_USES_THIS {
+                if metadata lacks SHARED_FUNCTION_INSTANCE_DATA_ASM_CALL_METADATA_STRICT {
+                    coerce_this();
+                }
+            }
+        }
+    }
+    let function = exec_ctx.function;
+    if function != 0 {
+        let ecmascript_function: ECMAScriptFunctionObject = alias(function);
+        exec_ctx.private_environment = null;
+        if function.class_bits has ECMASCRIPT_FUNCTION_FLAG_HAS_RARE_DATA {
+            exec_ctx.private_environment = ecmascript_function.private_environment;
+        }
+        # NB: The variable environment of a frame starts out as its lexical environment.
+        exec_ctx.variable_environment = exec_ctx.lexical_environment;
+    }
+    enter_frame();
     dispatch_next;
 }
 
@@ -1272,6 +1379,24 @@ handler Mov(
 }
 
 specialize Mov(src: Undefined);
+
+# NB: The only way to reach the frame slots that no other instruction can name.
+handler MovWide(
+    dst_slot: u32,
+    src_slot: u32
+) {
+    values[load(dst_slot)] = values[load(src_slot)];
+    dispatch_next;
+}
+
+# The name table indices of the next instruction that are too large for its fields. Only what reads that instruction
+# looks at them.
+handler WideNameIndices(
+    first: u32,
+    second: u32
+) {
+    dispatch_next;
+}
 
 specialize Add(lhs: Int32);
 specialize Add(rhs: Int32);
@@ -1498,10 +1623,10 @@ handler ConcatString(
 ) @cold = call_slow_path(concat_string);
 
 handler CopyObjectExcludingProperties(
-    length: u32,
     dst: out Operand,
     from_object: Operand,
-    excluded_names_count: u32,
+    excluded_names_are_in_array: bool,
+    excluded_names_count: u8,
     excluded_names: Operand[]
 ) @cold = call_slow_path(copy_object_excluding_properties);
 
@@ -1521,7 +1646,6 @@ handler GetClassProtoParent(
 ) @cold = call_slow_path(get_class_proto_parent);
 
 handler NewClass(
-    length: u32,
     dst: out Operand,
     super_class: Optional<Operand>,
     proto_parent: Optional<Operand>,
@@ -1529,7 +1653,8 @@ handler NewClass(
     class_blueprint_index: u32,
     lhs_name: Optional<IdentifierTableIndex>,
     computed_name: Optional<Operand>,
-    element_keys_count: u32,
+    element_keys_are_in_array: bool,
+    element_keys_count: u8,
     element_keys: Optional<Operand>[]
 ) @cold = call_slow_path(new_class);
 
@@ -2278,6 +2403,15 @@ handler DynamicSetLexicalBinding(
     dispatch_next;
 }
 
+# Evaluates a block function in the code of a script or an eval, which stores it into the var of its name if the checks
+# of declaration instantiation still pass. program_environment_depth is how many environments out from the running one
+# the environment of the program's own code is.
+handler SetVariableBindingOfBlockFunction(
+    identifier: IdentifierTableIndex,
+    src: in Operand,
+    program_environment_depth: u32
+) @cold = call_slow_path(asm_slow_path_set_variable_binding_of_block_function);
+
 handler DynamicSetVariableBinding(
     identifier: IdentifierTableIndex,
     src: in Operand,
@@ -2553,7 +2687,34 @@ handler ThrowNotAFunction(
 
 handler GetArgumentCount(
     dst: out Operand
-) @cold = call_slow_path(get_argument_count);
+) {
+    let count = exec_ctx.passed_argument_count;
+    guard count <= INT32_MAX else {
+        call_slow_path(get_argument_count);
+    };
+    store(dst, box_i32(assume_i32(count)));
+    dispatch_next;
+}
+
+# `arguments[index]` of a function that has no arguments object, which reads the passed argument from the frame.
+handler GetArgument(
+    dst: out Operand,
+    index: in Operand,
+    kind: ArgumentsKind
+) {
+    let slow = || @cold {
+        call_slow_path(get_argument);
+    };
+    let key = load(index);
+    guard extract_tag(key) == INT32_TAG else slow;
+    let signed_index = unbox_i32(key);
+    guard signed_index >= 0 else slow;
+    let argument_index = assume_u32(signed_index);
+    guard argument_index < exec_ctx.passed_argument_count else slow;
+    let first_argument: u32 = exec_ctx.slot_count - exec_ctx.argument_count;
+    store(dst, values[first_argument + argument_index]);
+    dispatch_next;
+}
 
 handler Throw(
     src: Operand
@@ -2919,7 +3080,6 @@ handler PutByValue(
     property: in Operand,
     src: in Operand,
     kind: PutKind,
-    base_identifier: Optional<IdentifierTableIndex>,
     cache: PropertyLookupCacheIndex
 ) {
     let slow = || @cold {
@@ -3129,12 +3289,10 @@ handler PutByValue(
 }
 
 handler GetById(
-    value_feedback: ValueFeedbackIndex,
     dst: out Operand,
     base: in Operand,
     property: PropertyKeyTableIndex,
-    base_identifier: Optional<IdentifierTableIndex>,
-    cache: PropertyLookupCacheIndex
+    cache: ProfiledPropertyLookupCacheIndex
 ) {
     let try_cache = || @cold {
         let executable = exec_ctx.executable;
@@ -3144,7 +3302,7 @@ handler GetById(
         let result: Value = call_helper_with_two_arguments(asm_try_get_by_id_cache, load(base), cache_pointer);
         guard result is not Value<Empty> else slow;
         store(dst, result);
-        record_value_feedback(value_feedback, result);
+        record_cache_value_feedback(cache, result);
         dispatch_next;
     };
 
@@ -3173,7 +3331,7 @@ handler GetById(
         let getter = accessor.getter;
         guard getter != 0 else {
             let produced: Value = Value<Undefined>;
-            record_value_feedback(value_feedback, produced);
+            record_cache_value_feedback(cache, produced);
             store(dst, produced);
             dispatch_next;
         };
@@ -3184,7 +3342,7 @@ handler GetById(
         if flags has OBJECT_FLAG_IS_DIRECT_GETTER_FUNCTION {
             if property_cache.getter == getter {
                 guard let result = load_direct_getter_value(function, receiver_object) else invoke_accessor_slow;
-                record_value_feedback(value_feedback, result);
+                record_cache_value_feedback(cache, result);
                 store(dst, result);
                 dispatch_next;
             }
@@ -3216,34 +3374,25 @@ handler GetById(
         native_frame.slot_count = native_function_type;
         native_frame.argument_count = native_function_type;
         native_frame.passed_argument_count = 0;
-        let realm = function.shape.realm;
         native_frame.function = function;
-        native_frame.realm = realm;
         let lexical_environment = exec_ctx.lexical_environment;
-        let variable_environment = exec_ctx.variable_environment;
         assert(lexical_environment != 0);
-        assert(variable_environment != 0);
         native_frame.lexical_environment = lexical_environment;
-        native_frame.variable_environment = variable_environment;
-        native_frame.private_environment = exec_ctx.private_environment;
         let receiver: Value = alias(box_object(receiver_object));
         native_frame.this_value = receiver;
-        native_frame.script_or_module = 0;
         native_frame.executable = null;
         native_frame.program_counter = 0;
-        native_frame.skip_when_determining_incumbent_counter = 0;
-        native_frame.yield_continuation = EXECUTION_CONTEXT_NO_YIELD_CONTINUATION;
-        native_frame.yield_is_await = false;
-        native_frame.yield_value_is_iterator_result = false;
+        native_frame.frame_id = 0;
         native_frame.caller_is_construct = false;
         native_frame.frame_initialized = false;
         native_frame.returns_to_native_caller = false;
         native_frame.runs_jit_code = false;
+        native_frame.caller_is_derived_construct = false;
+        let undefined_new_target_1: Value = Value<Undefined>;
+        native_frame.new_target = undefined_new_target_1;
         let native_pc: u32 = pc;
-        let [destination_offset, _] = load_pair32(
-            [pb, pc, dst],
-            [pb, pc, base]
-        );
+        let mut destination_offset: u32;
+        load8(destination_offset, [pb, pc, dst]);
         exec_ctx.program_counter = native_pc;
         native_frame.caller_frame = exec_ctx;
         # The exception helper only needs a PC within the current instruction.
@@ -3251,6 +3400,9 @@ handler GetById(
         native_frame.caller_dst_raw = destination_offset;
         let native_running_vm = current_vm();
         native_running_vm.running_execution_context = native_frame;
+        # The getter runs in its own realm, as in call_raw_native_function().
+        native_frame.realm_without_function = native_running_vm.current_realm;
+        native_running_vm.current_realm = function.shape.realm;
         exec_ctx = native_frame;
         values = exec_ctx.slots;
         let native_function = native_function_entry.function;
@@ -3283,10 +3435,11 @@ handler GetById(
         assert(caller_frame != 0);
         let return_vm = current_vm();
         return_vm.running_execution_context = caller_frame;
+        return_vm.current_realm = exec_ctx.realm_without_function;
         return_vm.interpreter_stack_top = alias(exec_ctx);
         exec_ctx = caller_frame;
         values = exec_ctx.slots;
-        record_value_feedback(value_feedback, native_payload);
+        record_cache_value_feedback(cache, native_payload);
         store(dst, native_payload);
         dispatch_next;
     };
@@ -3327,7 +3480,7 @@ handler GetById(
     let load_polymorphic_value = |holder: Object, entry: PropertyLookupCache| {
         let polymorphic_value = holder.named_properties[entry.property_offset];
         guard polymorphic_value is not Value<Accessor> else try_cache;
-        record_value_feedback(value_feedback, polymorphic_value);
+        record_cache_value_feedback(cache, polymorphic_value);
         store(dst, polymorphic_value);
         dispatch_next;
     };
@@ -3347,7 +3500,7 @@ handler GetById(
         guard property_cache.shape_dictionary_generation == shape.dictionary_generation else try_cache;
         let value = holder.named_properties[property_cache.property_offset];
         guard value is not Value<Accessor> else invoke_accessor(value, object, property_cache);
-        record_value_feedback(value_feedback, value);
+        record_cache_value_feedback(cache, value);
         store(dst, value);
         dispatch_next;
     };
@@ -3363,21 +3516,48 @@ handler GetById(
 }
 
 handler GetByIdWithThis(
-    value_feedback: ValueFeedbackIndex,
     dst: out Operand,
-    base: Operand,
+    base: in Operand,
     property: PropertyKeyTableIndex,
     this_value: Operand,
-    cache: PropertyLookupCacheIndex
-) @cold = call_slow_path(get_by_id_with_this);
+    cache: ProfiledPropertyLookupCacheIndex
+) {
+    let slow = || @cold {
+        call_slow_path(get_by_id_with_this);
+    };
+
+    # Data properties found through the cache of the base, whose value does not depend on the receiver. Getters run in
+    # the slow path with the this value.
+    let load_cached_value = |holder: Object, property_cache: PropertyLookupCache| {
+        let value = holder.named_properties[property_cache.property_offset];
+        guard value is not Value<Accessor> else slow;
+        record_cache_value_feedback(cache, value);
+        store(dst, value);
+        dispatch_next;
+    };
+
+    guard let Value<Object>(object) = load(base) else slow;
+    let shape = object.shape;
+    guard let property_cache = load_property_lookup_cache(cache) else slow;
+    guard property_cache.shape == shape else slow;
+    guard property_cache.entry_type != PROPERTY_LOOKUP_CACHE_ENTRY_TYPE_GET_MISSING_PROPERTY else slow;
+    guard property_cache.shape_dictionary_generation == shape.dictionary_generation else slow;
+    let cached_prototype = property_cache.prototype;
+    guard cached_prototype == 0 else @cold {
+        let prototype_chain_validity = property_cache.prototype_chain_validity;
+        guard prototype_chain_validity != 0 else slow;
+        guard prototype_chain_validity.valid != 0 else slow;
+        goto load_cached_value(cached_prototype, property_cache);
+    };
+    goto load_cached_value(object, property_cache);
+}
 
 handler PutById(
     base: in Operand,
     property: PropertyKeyTableIndex,
     src: in Operand,
     kind: PutKind,
-    cache: PropertyLookupCacheIndex,
-    base_identifier: Optional<IdentifierTableIndex>
+    cache: PropertyLookupCacheIndex
 ) {
     let slow = || @cold {
         call_slow_path(put_by_id);
@@ -3411,13 +3591,11 @@ handler PutByIdWithThis(
 ) @cold = call_slow_path(put_by_id_with_this);
 
 handler GetByValue(
-    value_feedback: ValueFeedbackIndex,
     keyed_feedback: KeyedFeedbackIndex,
     dst: out Operand,
     base: in Operand,
     property: in Operand,
-    base_identifier: Optional<IdentifierTableIndex>,
-    cache: PropertyLookupCacheIndex
+    cache: ProfiledPropertyLookupCacheIndex
 ) {
     let slow = || @cold {
         call_slow_path(get_by_value);
@@ -3449,7 +3627,7 @@ handler GetByValue(
         guard keyed_value is not Value<Accessor> else slow_without_cache;
         # NB: The runtime recorded multiple keys before the access gave up on its own cache.
         record_keyed_feedback(keyed_feedback, KEYED_FEEDBACK_MULTIPLE_STRING_KEYS);
-        record_value_feedback(value_feedback, keyed_value);
+        record_cache_value_feedback(cache, keyed_value);
         store(dst, keyed_value);
         dispatch_next;
     };
@@ -3482,7 +3660,7 @@ handler GetByValue(
         guard property_cache.prototype == 0 else try_cache;
         let value = object.named_properties[property_cache.property_offset];
         guard value is not Value<Accessor> else slow;
-        record_value_feedback(value_feedback, value);
+        record_cache_value_feedback(cache, value);
         store(dst, value);
         dispatch_next;
     };
@@ -3501,7 +3679,7 @@ handler GetByValue(
         let result: Value = call_helper_with_two_arguments(asm_helper_single_ascii_character_string, current_vm(), signed_code_unit);
         assert(extract_tag(result) == STRING_TAG);
         record_keyed_feedback(keyed_feedback, KEYED_FEEDBACK_PRIMITIVE_BASE);
-        record_value_feedback(value_feedback, result);
+        record_cache_value_feedback(cache, result);
         store(dst, result);
         dispatch_next;
     };
@@ -3521,7 +3699,7 @@ handler GetByValue(
                 guard index < indexed_elements.capacity else slow;
                 let value = indexed_elements[index];
                 record_keyed_feedback(keyed_feedback, KEYED_FEEDBACK_INT32_INDEX_PACKED);
-                record_value_feedback(value_feedback, value);
+                record_cache_value_feedback(cache, value);
                 store(dst, value);
                 dispatch_next;
             },
@@ -3534,7 +3712,7 @@ handler GetByValue(
                 let value = indexed_elements[index];
                 guard value is not Value<Empty> else slow;
                 record_keyed_feedback(keyed_feedback, KEYED_FEEDBACK_INT32_INDEX_HOLEY);
-                record_value_feedback(value_feedback, value);
+                record_cache_value_feedback(cache, value);
                 store(dst, value);
                 dispatch_next;
             },
@@ -3558,14 +3736,14 @@ handler GetByValue(
 
     let typed_array_f64_as_int = |raw: i32| {
         let produced: Value = box_i32(raw);
-        record_value_feedback(value_feedback, produced);
+        record_cache_value_feedback(cache, produced);
         store(dst, produced);
         dispatch_next;
     };
 
     let typed_array_f64_as_double = |slot_f64: f64| {
         let result = canonicalize_nan(slot_f64);
-        record_value_feedback(value_feedback, result);
+        record_cache_value_feedback(cache, result);
         store(dst, result);
         dispatch_next;
     };
@@ -3575,7 +3753,7 @@ handler GetByValue(
     #        in this hot handler. Revisit with profile data or cost-aware layout.
     let typed_array_box_int32 = |raw: i32| {
         let produced: Value = box_i32(raw);
-        record_value_feedback(value_feedback, produced);
+        record_cache_value_feedback(cache, produced);
         store(dst, produced);
         dispatch_next;
     };
@@ -3585,7 +3763,7 @@ handler GetByValue(
             let value = load_caged_u8(elements, cached_offset, index);
             let widened: i32 = alias(value);
             let produced: Value = box_i32(widened);
-            record_value_feedback(value_feedback, produced);
+            record_cache_value_feedback(cache, produced);
             store(dst, produced);
             dispatch_next;
         },
@@ -3611,7 +3789,7 @@ handler GetByValue(
             let uint32_to_double = || @cold {
                 let slot_f64 = u32_to_f64(raw_u32);
                 let result = box_f64(slot_f64);
-                record_value_feedback(value_feedback, result);
+                record_cache_value_feedback(cache, result);
                 store(dst, result);
                 dispatch_next;
             };
@@ -3665,12 +3843,10 @@ handler PutBySpread(
 ) @cold = call_slow_path(put_by_spread);
 
 handler GetLength(
-    value_feedback: ValueFeedbackIndex,
     keyed_feedback: KeyedFeedbackIndex,
     dst: out Operand,
     base: in Operand,
-    base_identifier: Optional<IdentifierTableIndex>,
-    cache: PropertyLookupCacheIndex
+    cache: ProfiledPropertyLookupCacheIndex
 ) {
     let slow = || @cold {
         call_slow_path(get_length);
@@ -3682,7 +3858,7 @@ handler GetLength(
         let length = string.length_in_utf16_code_units;
         guard length <= INT32_MAX else slow;
         let produced: Value = box_i32(assume_i32(length));
-        record_value_feedback(value_feedback, produced);
+        record_cache_value_feedback(cache, produced);
         store(dst, produced);
         dispatch_next;
     };
@@ -3693,14 +3869,14 @@ handler GetLength(
         let length = object.indexed_array_like_size;
         let length_double = || @cold {
             let produced: Value = box_f64(u32_to_f64(length));
-            record_value_feedback(value_feedback, produced);
+            record_cache_value_feedback(cache, produced);
             store(dst, produced);
             dispatch_next;
         };
 
         guard length <= INT32_MAX else length_double;
         let produced: Value = box_i32(assume_i32(length));
-        record_value_feedback(value_feedback, produced);
+        record_cache_value_feedback(cache, produced);
         store(dst, produced);
         dispatch_next;
     }
@@ -3714,17 +3890,16 @@ handler GetLength(
     guard property_cache.shape_dictionary_generation == shape.dictionary_generation else slow;
     let value = object.named_properties[property_cache.property_offset];
     guard value is not Value<Accessor> else slow;
-    record_value_feedback(value_feedback, value);
+    record_cache_value_feedback(cache, value);
     store(dst, value);
     dispatch_next;
 }
 
 handler GetLengthWithThis(
-    value_feedback: ValueFeedbackIndex,
     dst: out Operand,
     base: Operand,
     this_value: Operand,
-    cache: PropertyLookupCacheIndex
+    cache: ProfiledPropertyLookupCacheIndex
 ) @cold = call_slow_path(get_length_with_this);
 
 handler GetMethod(
@@ -3754,7 +3929,8 @@ handler GetGlobal(
         call_slow_path(get_global);
     };
 
-    let realm = exec_ctx.realm;
+    let realm_vm = current_vm();
+    let realm = realm_vm.current_realm;
     let global_object = realm.global_object;
     let environment = realm.global_declarative_environment;
     let global_cache = load_global_variable_cache(cache);
@@ -3791,7 +3967,8 @@ handler ResolveGlobalBinding(
     };
 
     # A binding the cache of the SetGlobal or GetGlobal of the identifier still finds exists.
-    let realm = exec_ctx.realm;
+    let realm_vm = current_vm();
+    let realm = realm_vm.current_realm;
     let global_object = realm.global_object;
     let environment = realm.global_declarative_environment;
     let global_cache = load_global_variable_cache(cache);
@@ -3819,7 +3996,8 @@ handler SetGlobal(
         call_slow_path(set_global);
     };
 
-    let realm = exec_ctx.realm;
+    let realm_vm = current_vm();
+    let realm = realm_vm.current_realm;
     let global_object = realm.global_object;
     let environment = realm.global_declarative_environment;
     let global_cache = load_global_variable_cache(cache);
@@ -3844,44 +4022,41 @@ handler SetGlobal(
     dispatch_next;
 }
 
-handler Call(
-    value_feedback: ValueFeedbackIndex,
-    call_feedback: CallFeedbackIndex,
-    length: u32,
-    dst: out Operand,
-    callee: in Operand,
-    this_value: in Operand,
-    argument_count: u32,
-    expression_string: Optional<StringTableIndex>,
-    arguments: Operand[]
-) {
-    let slow = || @cold {
-        call_slow_path(asm_slow_path_call);
-    };
+# The argument count of the call instruction whose argument_count field is
+# `argument_count`.
+inline fn call_argument_count(
+    argument_count: u8
+) -> u32 {
+    let mut count: u32;
+    load8(count, [pb, pc, argument_count]);
+    count
+}
 
-    guard let Value<Object>(function) = load(callee) else slow;
-    let flags = function.flags;
-    guard flags has OBJECT_FLAG_IS_FUNCTION else slow;
-    record_call_target(call_feedback, function);
-    guard flags has OBJECT_FLAG_IS_ECMASCRIPT_FUNCTION_OBJECT else invoke_try_native;
+# Constructs the frame of a call of the ECMAScript function `function`, whose
+# executable is `executable_pointer` and asm call metadata `metadata`, and
+# enters it.
+inline fn enter_ecmascript_function_call(
+    function: Object,
+    executable_pointer: Executable,
+    metadata: u64,
+    dst: out Operand,
+    this_value: in Operand,
+    argument_count: u8,
+    argument_operand_indices: Sequence<u8>,
+    slow: Label
+) {
     let ecmascript_function: ECMAScriptFunctionObject = alias(function);
-    let shared_data = ecmascript_function.shared_data;
-    let executable_pointer = shared_data.executable;
-    let metadata = shared_data.asm_call_metadata;
-    guard metadata has SHARED_FUNCTION_INSTANCE_DATA_ASM_CALL_METADATA_CAN_INLINE_CALL else slow;
-    guard metadata lacks SHARED_FUNCTION_INSTANCE_DATA_ASM_CALL_METADATA_NEEDS_ENVIRONMENT_OR_THIS_VALUE_RESOLUTION else invoke_interp_inline;
     let mut receiver: Value = Value<Empty>;
+    # NB: A sloppy callee binds it itself (see EnterCoercingThis).
     if metadata has SHARED_FUNCTION_INSTANCE_DATA_ASM_CALL_METADATA_USES_THIS {
         receiver = load(this_value);
-        if metadata lacks SHARED_FUNCTION_INSTANCE_DATA_ASM_CALL_METADATA_STRICT {
-            if receiver is Value<Nullish> {
-                receiver = alias(box_object(function.shape.realm.global_environment.global_this_value));
-            } else {
-                guard receiver is Value<Object> else invoke_interp_inline;
-            }
-        }
     }
-    let formal_count: u32 = max(u32(metadata), load(argument_count));
+    # NB: This form keeps the extra arguments case on the fallthrough path.
+    let passed_count = call_argument_count(argument_count);
+    let mut formal_count: u32 = u32(metadata);
+    if passed_count > formal_count {
+        formal_count = passed_count;
+    }
     # Construct an interpreter frame for an inline ECMAScript call.
     assert(executable_pointer != 0);
     let registers_and_locals_count = executable_pointer.registers_and_locals_count;
@@ -3906,19 +4081,11 @@ handler Call(
     let frame_values = frame.slots;
     frame.slot_count = frame_slot_count;
     frame.argument_count = formal_count;
-    frame.passed_argument_count = load(argument_count);
-    let realm = function.shape.realm;
+    frame.passed_argument_count = call_argument_count(argument_count);
     frame.function = function;
-    frame.realm = realm;
     let lexical_environment = ecmascript_function.environment;
     assert(lexical_environment != 0);
     frame.lexical_environment = lexical_environment;
-    frame.variable_environment = lexical_environment;
-    frame.private_environment = null;
-    let class_bits = function.class_bits;
-    if class_bits has ECMASCRIPT_FUNCTION_FLAG_HAS_RARE_DATA {
-        frame.private_environment = ecmascript_function.private_environment;
-    }
     frame.this_value = receiver;
     frame.executable = executable_pointer;
     let empty_tag: Value = Value<Empty>;
@@ -3927,35 +4094,30 @@ handler Call(
     frame.this_value_register = receiver;
     frame.return_value = empty_tag;
     frame.saved_lexical_environment = empty_tag;
-    let frame_shared_data = ecmascript_function.shared_data;
-    frame.script_or_module = frame_shared_data.script_or_module;
     frame.program_counter = 0;
-    let frame_id_vm = current_vm();
-    let frame_id = frame_id_vm.interpreter_stack_next_frame_id;
-    frame.frame_id = frame_id;
-    frame_id_vm.interpreter_stack_next_frame_id = frame_id + 1;
-    frame.skip_when_determining_incumbent_counter = 0;
-    frame.yield_continuation = EXECUTION_CONTEXT_NO_YIELD_CONTINUATION;
-    frame.yield_is_await = false;
-    frame.yield_value_is_iterator_result = false;
+    # NB: Frames get their id when something first asks (see Vm::frame_id_of()).
+    frame.frame_id = 0;
+    # NB: Only frames of code that can yield or await have yield fields, and the runtime makes those.
     frame.caller_is_construct = false;
     frame.frame_initialized = false;
     frame.returns_to_native_caller = false;
     frame.runs_jit_code = false;
+    frame.caller_is_derived_construct = false;
+    let undefined_new_target_3: Value = Value<Undefined>;
+    frame.new_target = undefined_new_target_3;
     frame.caller_frame = exec_ctx;
-    let [current_pc, return_pc, return_destination] = call_site_info(length, dst);
+    let [current_pc, return_pc, return_destination] = call_site_info(argument_count, dst);
     # NB: Stack traces show the caller at its program counter.
     exec_ctx.program_counter = current_pc;
     frame.caller_return_pc = return_pc;
     frame.caller_dst_raw = return_destination;
-    let actual_argument_count = load(argument_count);
+    let actual_argument_count = call_argument_count(argument_count);
     assert(formal_count >= actual_argument_count);
     let mut write_index: u64 = alias(callee_slot_count);
     let caller_values = exec_ctx.slots;
-    let argument_operand_indices = &arguments;
     let mut argument_index: u32 = 0;
     while argument_index < actual_argument_count {
-        frame_values[write_index] = caller_values[argument_operand_indices[argument_index]];
+        frame_values[write_index] = caller_values[u32(argument_operand_indices[argument_index])];
         argument_index = argument_index + 1;
         write_index = write_index + 1;
     }
@@ -3978,6 +4140,213 @@ handler Call(
     exec_ctx = frame;
     values = exec_ctx.slots;
     enter_new_frame(direct_executable);
+}
+
+# Calls the raw native function `function`, whose entry in the native function
+# table is `native_function_index`, on the lightweight frame of raw native
+# functions.
+inline fn call_raw_native_function(
+    function: Object,
+    native_function_index: u32,
+    call_feedback: CallFeedbackIndex,
+    dst: out Operand,
+    this_value: in Operand,
+    argument_count: u8,
+    argument_operand_indices: Sequence<u8>,
+    else slow: Label
+) {
+    let actual_argument_count = call_argument_count(argument_count);
+    let native_frame_size: u64 = alias(actual_argument_count) * SIZEOF_VALUE + SIZEOF_EXECUTION_CONTEXT;
+    let native_stack_vm = current_vm();
+    let frame_base = native_stack_vm.interpreter_stack_top;
+    let native_stack_limit = native_stack_vm.interpreter_stack_limit;
+    let native_frame: ExecutionContext = alias(frame_base);
+    let native_frame_end: u64 = frame_base + native_frame_size;
+    assert(native_frame_end >= frame_base);
+    guard native_frame_end <= native_stack_limit else slow;
+    let native_limit_vm = current_vm();
+    let machine_stack_limit: u64 = native_limit_vm.stack_base + VM_STACK_SPACE_LIMIT;
+    assert(machine_stack_limit >= native_limit_vm.stack_base);
+    guard machine_stack_limit <= fp else slow;
+    let native_stack_update_vm = current_vm();
+    native_stack_update_vm.interpreter_stack_top = native_frame_end;
+    native_frame.slot_count = actual_argument_count;
+    native_frame.argument_count = actual_argument_count;
+    native_frame.passed_argument_count = actual_argument_count;
+    native_frame.function = function;
+    let lexical_environment = exec_ctx.lexical_environment;
+    assert(lexical_environment != 0);
+    native_frame.lexical_environment = lexical_environment;
+    let receiver = load(this_value);
+    native_frame.this_value = receiver;
+    # Raw native frames deliberately have no executable.
+    native_frame.executable = null;
+    native_frame.program_counter = 0;
+    native_frame.frame_id = 0;
+    native_frame.caller_is_construct = false;
+    native_frame.frame_initialized = false;
+    native_frame.returns_to_native_caller = false;
+    native_frame.runs_jit_code = false;
+    native_frame.caller_is_derived_construct = false;
+    let undefined_new_target_2: Value = Value<Undefined>;
+    native_frame.new_target = undefined_new_target_2;
+    let [native_pc, after_pc, destination_offset] = call_site_info(argument_count, dst);
+    exec_ctx.program_counter = native_pc;
+    native_frame.caller_frame = exec_ctx;
+    native_frame.caller_return_pc = after_pc;
+    native_frame.caller_dst_raw = destination_offset;
+    let native_caller_values = exec_ctx.slots;
+    let native_frame_values = native_frame.slots;
+    let mut argument_index: u32 = 0;
+    while argument_index < actual_argument_count {
+        native_frame_values[argument_index] = native_caller_values[u32(argument_operand_indices[argument_index])];
+        argument_index = argument_index + 1;
+    }
+    let native_running_vm = current_vm();
+    native_running_vm.running_execution_context = native_frame;
+    # The function runs in its own realm, which may be another one. The
+    # frame keeps the caller's realm, which the return makes current again,
+    # as does the runtime when it unwinds the frame of a function that threw.
+    native_frame.realm_without_function = native_running_vm.current_realm;
+    native_running_vm.current_realm = function.shape.realm;
+    exec_ctx = native_frame;
+    values = exec_ctx.slots;
+    let native_function_entry = &native_running_vm.native_function_table[native_function_index & NATIVE_FUNCTION_TABLE_INDEX_MASK];
+    assert(native_function_entry.type < NATIVE_FUNCTION_TYPE_COUNT);
+    let native_function = native_function_entry.function;
+    # FIXME: Bind native_payload directly once the allocator can keep the
+    #        ABI-pinned result live alongside the native result variant.
+    let mut [native_return, variant] = call_raw_native(native_function);
+    let native_payload = native_return;
+    variant = variant & 255;
+    assert(variant < 2);
+    guard variant == 0 else @cold {
+        # FIXME: Pass native_payload directly once the allocator can
+        #        satisfy the helper ABI without conflicting with variant.
+        let helper_argument = native_payload;
+        let exception_pc: i32 = call_helper_with_two_arguments(
+            asm_helper_handle_raw_native_exception,
+            current_vm(),
+            helper_argument
+        );
+        guard exception_pc >= 0 else @cold {
+            exit;
+        };
+        let exception_vm = current_vm();
+        exec_ctx = exception_vm.running_execution_context;
+        assert(exec_ctx != 0);
+        values = exec_ctx.slots;
+        let exception_executable = exec_ctx.executable;
+        assert(exception_executable != 0);
+        pb = exception_executable.bytecode_data;
+        switch_dispatch_table(exception_executable);
+        pc = exec_ctx.program_counter;
+        goto_handler(pc);
+    };
+    let caller_frame = exec_ctx.caller_frame;
+    assert(caller_frame != 0);
+    let return_vm = current_vm();
+    return_vm.running_execution_context = caller_frame;
+    return_vm.current_realm = exec_ctx.realm_without_function;
+    return_vm.interpreter_stack_top = alias(exec_ctx);
+    exec_ctx = caller_frame;
+    values = exec_ctx.slots;
+    store(dst, native_payload);
+    record_call_value_feedback(call_feedback, native_payload);
+    let length: u32 = call_length(argument_count);
+    dispatch_variable(length);
+}
+
+# The call cache of a call site of a frame that runs the profiling handlers:
+# the function that the site called last, which it calls again with no
+# checks. Frames of executables in the plain tier have no call caches, and
+# their calls do all the checks.
+inline fn call_cache_of_site(slot: CallFeedbackIndex) -> CallCache {
+    let call_caches = exec_ctx.executable.call_caches;
+    assert(call_caches != 0);
+    let index: u32 = load(slot);
+    let call_cache: CallCache = alias(call_caches + alias(index) * CALL_CACHE_SIZE);
+    call_cache
+}
+
+# Calls the function that the site's call cache is linked to, if that is
+# `callee`, with no checks.
+inline fn call_through_call_cache(
+    call_feedback: CallFeedbackIndex,
+    callee: in Operand,
+    dst: out Operand,
+    this_value: in Operand,
+    argument_count: u8,
+    arguments: Operand[],
+    slow: Label
+) @profiling {
+    let call_cache = call_cache_of_site(call_feedback);
+    let callee_value = load(callee);
+    let mut callee_bits: u64;
+    mov(callee_bits, callee_value);
+    if callee_bits == call_cache.callee {
+        let function: Object = unbox_object(callee_value);
+        let target = call_cache.target;
+        if target has CALL_CACHE_TARGET_NATIVE_FUNCTION {
+            let native_function_index: u32 = u32(target >> CALL_CACHE_TARGET_INDEX_SHIFT);
+            let argument_operand_indices = &arguments;
+            call_raw_native_function(function, native_function_index, call_feedback, dst, this_value, argument_count, argument_operand_indices) else slow;
+        }
+        let mut executable: Executable;
+        mov(executable, target);
+        let argument_operand_indices = &arguments;
+        enter_ecmascript_function_call(function, executable, executable.call_metadata, dst, this_value, argument_count, argument_operand_indices, slow);
+    }
+}
+
+# Links the site's call cache to `callee`, whose call target is `target`,
+# unless the call feedback flags `site_flags` mark the site as polymorphic:
+# relinking there would cost every call a store.
+inline fn link_call_cache(call_feedback: CallFeedbackIndex, callee: in Operand, target: u64, site_flags: i32) @profiling {
+    if site_flags lacks CALL_FEEDBACK_POLYMORPHIC {
+        let call_cache = call_cache_of_site(call_feedback);
+        let mut callee_bits: u64;
+        mov(callee_bits, load(callee));
+        call_cache.target = target;
+        call_cache.callee = callee_bits;
+    }
+}
+
+handler Call(
+    call_feedback: CallFeedbackIndex,
+    dst: out Operand,
+    callee: in Operand,
+    this_value: in Operand,
+    argument_count: u8,
+    arguments: Operand[]
+) {
+    let slow = || @cold {
+        call_slow_path(asm_slow_path_call);
+    };
+
+    call_through_call_cache(call_feedback, callee, dst, this_value, argument_count, arguments, slow);
+
+    guard let Value<Object>(function) = load(callee) else slow;
+    let flags = function.flags;
+    guard flags has OBJECT_FLAG_IS_FUNCTION else slow;
+    let mut call_site_flags: i32 = 0;
+    record_call_target(call_feedback, function, call_site_flags);
+    guard flags has OBJECT_FLAG_IS_ECMASCRIPT_FUNCTION_OBJECT else invoke_try_native;
+    let ecmascript_function: ECMAScriptFunctionObject = alias(function);
+    let shared_data = ecmascript_function.shared_data;
+    let executable_pointer = shared_data.executable;
+    let metadata = shared_data.asm_call_metadata;
+    guard metadata has SHARED_FUNCTION_INSTANCE_DATA_ASM_CALL_METADATA_CAN_INLINE_CALL else slow;
+    guard metadata lacks SHARED_FUNCTION_INSTANCE_DATA_ASM_CALL_METADATA_NEEDS_ENVIRONMENT_OR_THIS_VALUE_RESOLUTION else invoke_interp_inline;
+    # NB: A call of an ECMAScript function of another realm is the runtime's,
+    #     which changes the current realm. A site's call cache is never linked
+    #     to such a callee.
+    let callee_realm = function.shape.realm;
+    let realm_vm = current_vm();
+    guard callee_realm == realm_vm.current_realm else slow;
+    link_call_cache(call_feedback, callee, alias(executable_pointer), call_site_flags);
+    let argument_operand_indices = &arguments;
+    enter_ecmascript_function_call(function, executable_pointer, metadata, dst, this_value, argument_count, argument_operand_indices, slow);
     let invoke_interp_inline = || {
         # Let the interpreter resolve the cases that cannot use the direct
         # frame construction above, then enter the resolved callee.
@@ -3996,114 +4365,12 @@ handler Call(
         # Construct the lightweight frame used by raw native functions.
         let flags = function.flags;
         guard flags has OBJECT_FLAG_IS_RAW_NATIVE_FUNCTION else slow;
-        let actual_argument_count = load(argument_count);
-        let native_frame_size: u64 = alias(actual_argument_count) * SIZEOF_VALUE + SIZEOF_EXECUTION_CONTEXT;
-        let native_stack_vm = current_vm();
-        let frame_base = native_stack_vm.interpreter_stack_top;
-        let native_stack_limit = native_stack_vm.interpreter_stack_limit;
-        let native_frame: ExecutionContext = alias(frame_base);
-        let native_frame_end: u64 = frame_base + native_frame_size;
-        assert(native_frame_end >= frame_base);
-        guard native_frame_end <= native_stack_limit else slow;
-        let native_limit_vm = current_vm();
-        let machine_stack_limit: u64 = native_limit_vm.stack_base + VM_STACK_SPACE_LIMIT;
-        assert(machine_stack_limit >= native_limit_vm.stack_base);
-        guard machine_stack_limit <= fp else slow;
-        let native_stack_update_vm = current_vm();
-        native_stack_update_vm.interpreter_stack_top = native_frame_end;
-        native_frame.slot_count = actual_argument_count;
-        native_frame.argument_count = actual_argument_count;
-        native_frame.passed_argument_count = actual_argument_count;
-        let realm = function.shape.realm;
-        native_frame.function = function;
-        native_frame.realm = realm;
-        let lexical_environment = exec_ctx.lexical_environment;
-        let variable_environment = exec_ctx.variable_environment;
-        assert(lexical_environment != 0);
-        assert(variable_environment != 0);
-        native_frame.lexical_environment = lexical_environment;
-        native_frame.variable_environment = variable_environment;
-        let private_environment = exec_ctx.private_environment;
-        native_frame.private_environment = private_environment;
-        let receiver = load(this_value);
-        native_frame.this_value = receiver;
-        native_frame.script_or_module = 0;
-        # Raw native frames deliberately have no executable.
-        native_frame.executable = null;
-        native_frame.program_counter = 0;
-        let native_frame_id_vm = current_vm();
-        let native_frame_id = native_frame_id_vm.interpreter_stack_next_frame_id;
-        native_frame.frame_id = native_frame_id;
-        native_frame_id_vm.interpreter_stack_next_frame_id = native_frame_id + 1;
-        native_frame.skip_when_determining_incumbent_counter = 0;
-        native_frame.yield_continuation = EXECUTION_CONTEXT_NO_YIELD_CONTINUATION;
-        native_frame.yield_is_await = false;
-        native_frame.yield_value_is_iterator_result = false;
-        native_frame.caller_is_construct = false;
-        native_frame.frame_initialized = false;
-        native_frame.returns_to_native_caller = false;
-        native_frame.runs_jit_code = false;
-        let [native_pc, after_pc, destination_offset] = call_site_info(length, dst);
-        exec_ctx.program_counter = native_pc;
-        native_frame.caller_frame = exec_ctx;
-        native_frame.caller_return_pc = after_pc;
-        native_frame.caller_dst_raw = destination_offset;
-        let native_caller_values = exec_ctx.slots;
-        let native_argument_operand_indices = &arguments;
-        let native_frame_values = native_frame.slots;
-        let mut argument_index: u32 = 0;
-        while argument_index < actual_argument_count {
-            native_frame_values[argument_index] = native_caller_values[native_argument_operand_indices[argument_index]];
-            argument_index = argument_index + 1;
-        }
-        let native_running_vm = current_vm();
-        native_running_vm.running_execution_context = native_frame;
-        exec_ctx = native_frame;
-        values = exec_ctx.slots;
         let raw_native_function: RawNativeFunction = alias(function);
         let native_function_index = raw_native_function.native_function_index;
-        let native_function_entry = &native_running_vm.native_function_table[native_function_index & NATIVE_FUNCTION_TABLE_INDEX_MASK];
-        assert(native_function_entry.type < NATIVE_FUNCTION_TYPE_COUNT);
-        let native_function = native_function_entry.function;
-        # FIXME: Bind native_payload directly once the allocator can keep the
-        #        ABI-pinned result live alongside the native result variant.
-        let mut [native_return, variant] = call_raw_native(native_function);
-        let native_payload = native_return;
-        variant = variant & 255;
-        assert(variant < 2);
-        guard variant == 0 else @cold {
-            # FIXME: Pass native_payload directly once the allocator can
-            #        satisfy the helper ABI without conflicting with variant.
-            let helper_argument = native_payload;
-            let exception_pc: i32 = call_helper_with_two_arguments(
-                asm_helper_handle_raw_native_exception,
-                current_vm(),
-                helper_argument
-            );
-            guard exception_pc >= 0 else @cold {
-                exit;
-            };
-            let exception_vm = current_vm();
-            exec_ctx = exception_vm.running_execution_context;
-            assert(exec_ctx != 0);
-            values = exec_ctx.slots;
-            let exception_executable = exec_ctx.executable;
-            assert(exception_executable != 0);
-            pb = exception_executable.bytecode_data;
-            switch_dispatch_table(exception_executable);
-            pc = exec_ctx.program_counter;
-            goto_handler(pc);
-        };
-        let caller_frame = exec_ctx.caller_frame;
-        assert(caller_frame != 0);
-        let return_vm = current_vm();
-        return_vm.running_execution_context = caller_frame;
-        return_vm.interpreter_stack_top = alias(exec_ctx);
-        exec_ctx = caller_frame;
-        values = exec_ctx.slots;
-        store(dst, native_payload);
-        record_value_feedback(value_feedback, native_payload);
-        dispatch_variable(load(length));
+        let native_target: u64 = (alias(native_function_index) << CALL_CACHE_TARGET_INDEX_SHIFT) | CALL_CACHE_TARGET_NATIVE_FUNCTION;
+        link_call_cache(call_feedback, callee, native_target, call_site_flags);
+        let argument_operand_indices = &arguments;
+        call_raw_native_function(function, native_function_index, call_feedback, dst, this_value, argument_count, argument_operand_indices) else slow;
     };
 }
 
@@ -4197,7 +4464,8 @@ handler IteratorClose(
     # In fast array mode, the iterator register holds a number. A watchpoint set of the realm tells if array
     # iterators have a return method.
     if extract_tag(load(iterator_object)) == INT32_TAG {
-        let return_watchpoint_set = exec_ctx.realm.array_iterator_return_watchpoint_set;
+        let watchpoint_vm = current_vm();
+        let return_watchpoint_set = watchpoint_vm.current_realm.array_iterator_return_watchpoint_set;
         guard return_watchpoint_set != 0 else slow;
         guard return_watchpoint_set.valid else slow;
         dispatch_next;
@@ -4219,6 +4487,14 @@ handler IteratorNext(
     iterator_next: Operand,
     iterator_done: inout Operand
 ) @cold = call_slow_path(asm_slow_path_iterator_next);
+
+# IteratorStep, which unlike IteratorNextUnpack does not read the value of the result.
+handler IteratorStep(
+    dst_done: out Operand,
+    iterator_object: inout Operand,
+    iterator_next: Operand,
+    iterator_done: inout Operand
+) @cold = call_slow_path(asm_slow_path_iterator_step);
 
 handler IteratorNextUnpack(
     dst_value: out Operand,
@@ -4282,66 +4558,70 @@ handler IteratorToArray(
 ) @cold = call_slow_path(iterator_to_array);
 
 handler CallConstruct(
-    value_feedback: ValueFeedbackIndex,
     call_feedback: CallFeedbackIndex,
-    length: u32,
     dst: out Operand,
     callee: Operand,
-    argument_count: u32,
-    expression_string: Optional<StringTableIndex>,
+    argument_count: u8,
     arguments: Operand[]
 ) @cold = call_slow_path(call_construct);
 
 handler CallDirectEval(
-    value_feedback: ValueFeedbackIndex,
     call_feedback: CallFeedbackIndex,
-    length: u32,
     dst: out Operand,
     callee: Operand,
     this_value: Operand,
-    argument_count: u32,
-    expression_string: Optional<StringTableIndex>,
+    argument_count: u8,
     arguments: Operand[]
 ) @cold = call_slow_path(call_direct_eval);
 
 handler CallWithArgumentArray(
-    value_feedback: ValueFeedbackIndex,
     call_feedback: CallFeedbackIndex,
     dst: out Operand,
     callee: Operand,
     this_value: Operand,
-    arguments: Operand,
-    expression_string: Optional<StringTableIndex>
+    arguments: Operand
 ) @cold = call_slow_path(call_with_argument_array);
 
 handler CallDirectEvalWithArgumentArray(
-    value_feedback: ValueFeedbackIndex,
     call_feedback: CallFeedbackIndex,
     dst: out Operand,
     callee: Operand,
     this_value: Operand,
-    arguments: Operand,
-    expression_string: Optional<StringTableIndex>
+    arguments: Operand
 ) @cold = call_slow_path(call_direct_eval_with_argument_array);
 
 handler CallConstructWithArgumentArray(
-    value_feedback: ValueFeedbackIndex,
     call_feedback: CallFeedbackIndex,
     dst: out Operand,
     callee: Operand,
     this_value: Operand,
-    arguments: Operand,
-    expression_string: Optional<StringTableIndex>
+    arguments: Operand
 ) @cold = call_slow_path(call_construct_with_argument_array);
 
 handler SuperCallWithArgumentArray(
-    value_feedback: ValueFeedbackIndex,
     call_feedback: CallFeedbackIndex,
     dst: out Operand,
     super_constructor: Operand,
-    arguments: Operand,
-    is_synthetic: bool
+    arguments: Operand
 ) @cold = call_slow_path(super_call_with_argument_array);
+
+handler SuperCall(
+    call_feedback: CallFeedbackIndex,
+    dst: out Operand,
+    super_constructor: Operand,
+    argument_count: u8,
+    arguments: Operand[]
+) @cold = call_slow_path(super_call);
+
+handler SuperCallWithForwardedArguments(
+    call_feedback: CallFeedbackIndex,
+    dst: out Operand,
+    super_constructor: Operand
+) @cold = call_slow_path(super_call_with_forwarded_arguments);
+
+handler BindThisFromSuperCall(
+    result: Operand
+) @cold = call_slow_path(bind_this_from_super_call);
 
 handler NewObject(
     dst: out Operand,
@@ -4361,19 +4641,17 @@ handler InitObjectLiteralProperty(
     object: Operand,
     property: PropertyKeyTableIndex,
     src: Operand,
-    shape_cache_index: u32,
-    property_slot: u32
+    shape_cache_index: ObjectShapeCacheIndex,
+    property_slot: u16
 ) @cold = call_slow_path(init_object_literal_property);
 
 handler NewArray(
-    length: u32,
     dst: out Operand,
-    element_count: u32,
+    element_count: u8,
     elements: Operand[]
 ) @cold = call_slow_path(new_array);
 
 handler NewPrimitiveArray(
-    length: u32,
     dst: out Operand,
     element_count: u32,
     elements: Value[]
@@ -4537,19 +4815,27 @@ handler SetCompletionType(
 ) @cold = call_slow_path(set_completion_type);
 
 handler GetTemplateObject(
-    length: u32,
     dst: out Operand,
-    strings_count: u32,
+    strings_are_in_array: bool,
+    strings_count: u8,
     cache: TemplateObjectCacheIndex,
     strings: Operand[]
 ) @cold = call_slow_path(get_template_object);
 
 handler NewFunction(
     dst: out Operand,
-    shared_function_data_index: u32,
+    shared_function_data_index: u16,
     lhs_name: Optional<IdentifierTableIndex>,
     home_object: Optional<Operand>
 ) @cold = call_slow_path(new_function);
+
+# NB: A NewFunction for the functions of an executable past its first 65536, whose index takes four bytes.
+handler NewFunctionWide(
+    dst: out Operand,
+    shared_function_data_index: u32,
+    lhs_name: Optional<IdentifierTableIndex>,
+    home_object: Optional<Operand>
+) @cold = call_slow_path(new_function_wide);
 
 handler Typeof(
     dst: out Operand,

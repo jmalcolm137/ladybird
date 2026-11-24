@@ -1,7 +1,7 @@
 <!doctype html>
 <html id="html">
 <script src="../include.js"></script>
-<script src="recording-test.js"></script>
+<script src="../work-test.js"></script>
 <style>
     @keyframes fade { from { opacity: 1; } to { opacity: 0.5; } }
     body { margin: 0; }
@@ -25,7 +25,6 @@ displayListTest({
         {
             name: "quiet while the animation runs on the compositor",
             expect: `
-                damage: rows=0 moved=0 order=0 eligibility=0 all=false
                 @canvas RECORD (empty)
                 @viewport COPY
             `
@@ -34,46 +33,36 @@ displayListTest({
             name: "a selection pass after the animation started",
             mutate: () => { internals.updateCompositorAnimations(); },
             expect: `
-                damage: rows=4 moved=0 order=0 eligibility=1 all=false
                 @canvas RECORD (empty)
                 @viewport ASSEMBLE
                   @viewport/preamble COPY
-                  @viewport/background/hit-test COPY
                   @viewport/scroll-metadata COPY
                   @viewport/background COPY
                   @viewport/border COPY
                   BlockContainer<HTML>#html/descendants(background-and-borders) ASSEMBLE
-                  @viewport/foreground/hit-test COPY
                   @viewport/foreground COPY
                   BlockContainer<HTML>#html/descendants(foreground) ASSEMBLE
                   BlockContainer<HTML>#html ASSEMBLE
                     BlockContainer<HTML>#html/preamble COPY
-                    BlockContainer<HTML>#html/background/hit-test COPY
                     BlockContainer<HTML>#html/scroll-metadata COPY
                     BlockContainer<HTML>#html/background COPY
                     BlockContainer<HTML>#html/border COPY
                     BlockContainer<BODY>#body/descendants(background-and-borders) ASSEMBLE
-                      BlockContainer<BODY>#body/background/hit-test COPY
                       BlockContainer<BODY>#body/scroll-metadata COPY
                       BlockContainer<BODY>#body/background COPY
                       BlockContainer<BODY>#body/border COPY
-                      BlockContainer<DIV>#box/descendants(background-and-borders) ASSEMBLE
-                    BlockContainer<HTML>#html/foreground/hit-test COPY
+                      BlockContainer<DIV>#box/descendants(background-and-borders) REPLAN
                     BlockContainer<HTML>#html/foreground COPY
                     BlockContainer<BODY>#body/descendants(foreground) ASSEMBLE
-                      BlockContainer<BODY>#body/foreground/hit-test COPY
                       BlockContainer<BODY>#body/foreground COPY
-                      BlockContainer<DIV>#box/descendants(foreground) ASSEMBLE
+                      BlockContainer<DIV>#box/descendants(foreground) REPLAN
                       BlockContainer<BODY>#body/outline COPY
-                      BlockContainer<BODY>#body/overlay/hit-test COPY
                       BlockContainer<BODY>#body/overlay COPY
                     BlockContainer<DIV>#box REPLAN
                       BlockContainer<DIV>#box/preamble RECORD (empty)
-                      BlockContainer<DIV>#box/background/hit-test RECORD
                       BlockContainer<DIV>#box/scroll-metadata RECORD (empty)
                       BlockContainer<DIV>#box/background RECORD
                       BlockContainer<DIV>#box/border SKIP
-                      BlockContainer<DIV>#box/foreground/hit-test RECORD (empty)
                       BlockContainer<DIV>#box/foreground RECORD (empty)
                       BlockContainer<DIV>#box/outline SKIP
                     BlockContainer<HTML>#html/outline COPY
@@ -84,7 +73,6 @@ displayListTest({
             name: "a selection pass that keeps the animation on the compositor",
             mutate: () => { internals.updateCompositorAnimations(); },
             expect: `
-                damage: rows=0 moved=0 order=0 eligibility=0 all=false
                 @canvas RECORD (empty)
                 @viewport COPY
             `
@@ -93,38 +81,30 @@ displayListTest({
             name: "remove the animation",
             mutate: () => { box.style.animation = "none"; box.getBoundingClientRect(); internals.updateCompositorAnimations(); },
             expect: `
-                damage: rows=4 moved=0 order=0 eligibility=1 all=false
                 @canvas RECORD (empty)
                 @viewport ASSEMBLE
                   @viewport/preamble COPY
-                  @viewport/background/hit-test COPY
                   @viewport/scroll-metadata COPY
                   @viewport/background COPY
                   @viewport/border COPY
                   BlockContainer<HTML>#html/descendants(background-and-borders) ASSEMBLE
-                  @viewport/foreground/hit-test COPY
                   @viewport/foreground COPY
                   BlockContainer<HTML>#html/descendants(foreground) ASSEMBLE
                   BlockContainer<HTML>#html ASSEMBLE
                     BlockContainer<HTML>#html/preamble COPY
-                    BlockContainer<HTML>#html/background/hit-test COPY
                     BlockContainer<HTML>#html/scroll-metadata COPY
                     BlockContainer<HTML>#html/background COPY
                     BlockContainer<HTML>#html/border COPY
                     BlockContainer<BODY>#body/descendants(background-and-borders) ASSEMBLE
-                      BlockContainer<BODY>#body/background/hit-test COPY
                       BlockContainer<BODY>#body/scroll-metadata COPY
                       BlockContainer<BODY>#body/background COPY
                       BlockContainer<BODY>#body/border COPY
-                      BlockContainer<DIV>#box/descendants(background-and-borders) ASSEMBLE
-                    BlockContainer<HTML>#html/foreground/hit-test COPY
+                      BlockContainer<DIV>#box/descendants(background-and-borders) REPLAN
                     BlockContainer<HTML>#html/foreground COPY
                     BlockContainer<BODY>#body/descendants(foreground) ASSEMBLE
-                      BlockContainer<BODY>#body/foreground/hit-test COPY
                       BlockContainer<BODY>#body/foreground COPY
-                      BlockContainer<DIV>#box/descendants(foreground) ASSEMBLE
+                      BlockContainer<DIV>#box/descendants(foreground) REPLAN
                       BlockContainer<BODY>#body/outline COPY
-                      BlockContainer<BODY>#body/overlay/hit-test COPY
                       BlockContainer<BODY>#body/overlay COPY
                     BlockContainer<DIV>#box SKIP
                     BlockContainer<HTML>#html/outline COPY
@@ -134,7 +114,6 @@ displayListTest({
         {
             name: "quiet after the animation",
             expect: `
-                damage: rows=0 moved=0 order=0 eligibility=0 all=false
                 @canvas RECORD (empty)
                 @viewport COPY
             `

@@ -14,6 +14,13 @@ endif()
 
 set(ladybird_applications ladybird WebDriver ${ladybird_helper_processes})
 
+# Builds with vcpkg ship the shared libraries it built, which are found by what the installed binaries link.
+include(install_vcpkg_libraries)
+set(vcpkg_runtime_dependencies "")
+if (LADYBIRD_INSTALLS_VCPKG_LIBRARIES)
+    set(vcpkg_runtime_dependencies RUNTIME_DEPENDENCY_SET ladybird_vcpkg_libraries)
+endif()
+
 # CMake installs the binaries unstripped when it has no strip tool, or ignores the failure to run it, for instance when
 # packaging in a different environment than the build. Refuse to install anything in that case. MSVC-style toolchains
 # have no strip tool to begin with.
@@ -28,6 +35,7 @@ endif()
 
 install(TARGETS ladybird WebDriver
   EXPORT ladybirdTargets
+  ${vcpkg_runtime_dependencies}
   RUNTIME
     COMPONENT ladybird_Runtime
     DESTINATION ${ladybird_executable_install_dir}
@@ -46,6 +54,7 @@ install(TARGETS ladybird WebDriver
 
 install(TARGETS ${ladybird_helper_processes}
   EXPORT ladybirdTargets
+  ${vcpkg_runtime_dependencies}
   RUNTIME
     COMPONENT ladybird_Runtime
     DESTINATION ${ladybird_helper_install_dir}
@@ -93,6 +102,7 @@ endif()
 
 install(TARGETS ${all_required_lagom_libraries}
   EXPORT ladybirdTargets
+  ${vcpkg_runtime_dependencies}
   COMPONENT ladybird_Runtime
   LIBRARY
     COMPONENT ladybird_Runtime
@@ -103,6 +113,102 @@ install(TARGETS ${all_required_lagom_libraries}
   FILE_SET ladybird
     DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
 )
+
+if (vcpkg_runtime_dependencies)
+    set(vcpkg_library_install_dir ${CMAKE_INSTALL_LIBDIR})
+    set(qt_plugins "")
+    if (APPLE)
+        set(vcpkg_library_install_dir bundle/Ladybird.app/Contents/lib)
+        set(qt_plugins_dir bundle/Ladybird.app/Contents/PlugIns)
+        set(qt_conf_dir bundle/Ladybird.app/Contents/Resources)
+        set(qt_conf_plugins PlugIns)
+
+        get_target_property(qt_core_type Qt6::Core TYPE)
+        if (qt_core_type STREQUAL "SHARED_LIBRARY")
+            set(qt_plugins
+                imageformats/QGifPlugin
+                imageformats/QICOPlugin
+                imageformats/QJpegPlugin
+                platforms/QCocoaIntegrationPlugin
+                styles/QMacStylePlugin
+            )
+        endif()
+    elseif (LINUX AND "qt" IN_LIST VCPKG_MANIFEST_FEATURES)
+        # Keep the vcpkg plugin layout, whose relative runtime paths point to lib/.
+        set(qt_plugins_dir Qt6/plugins)
+
+        # Add the installed plugin directory at startup without overriding Qt for other applications.
+        cmake_path(ABSOLUTE_PATH ladybird_executable_install_dir BASE_DIRECTORY "${CMAKE_INSTALL_PREFIX}"
+            NORMALIZE OUTPUT_VARIABLE qt_executable_dir)
+        cmake_path(ABSOLUTE_PATH qt_plugins_dir BASE_DIRECTORY "${CMAKE_INSTALL_PREFIX}"
+            NORMALIZE OUTPUT_VARIABLE qt_plugins_path)
+        cmake_path(RELATIVE_PATH qt_plugins_path BASE_DIRECTORY "${qt_executable_dir}")
+        target_compile_definitions(ladybird PRIVATE "LADYBIRD_QT_PLUGINS_PATH=\"${qt_plugins_path}\"")
+
+        set(qt_plugins
+            iconengines/QSvgIconPlugin
+            imageformats/QGifPlugin
+            imageformats/QICOPlugin
+            imageformats/QJpegPlugin
+            imageformats/QSvgPlugin
+            platforminputcontexts/QComposePlatformInputContextPlugin
+            platforminputcontexts/QIbusPlatformInputContextPlugin
+            platforms/QOffscreenIntegrationPlugin
+            platforms/QWaylandIntegrationPlugin
+            platforms/QXcbIntegrationPlugin
+            platformthemes/QXdgDesktopPortalThemePlugin
+            position/QGeoPositionInfoSourceFactoryGeoclue2Plugin
+            position/QGeoPositionInfoSourceFactoryNmeaPlugin
+            wayland-decoration-client/QWaylandBradientDecorationPlugin
+            wayland-graphics-integration-client/QWaylandEglClientBufferPlugin
+            wayland-shell-integration/QWaylandXdgShellIntegrationPlugin
+            xcbglintegrations/QXcbEglIntegrationPlugin
+            xcbglintegrations/QXcbGlxIntegrationPlugin
+        )
+        install(DIRECTORY "${VCPKG_INSTALLED_DIR}/${VCPKG_TARGET_TRIPLET}/sbom/"
+            DESTINATION ${CMAKE_INSTALL_DATADIR}/doc/ladybird/qt
+            COMPONENT ladybird_Runtime
+            FILES_MATCHING PATTERN "qt*.spdx"
+        )
+    endif()
+
+    # Qt loads these at runtime. Add them to the dependency set to collect their shared libraries as well.
+    if (qt_plugins)
+        foreach (plugin IN LISTS qt_plugins)
+            cmake_path(GET plugin PARENT_PATH plugin_type)
+            cmake_path(GET plugin FILENAME plugin_target)
+            if (NOT TARGET Qt6::${plugin_target})
+                message(FATAL_ERROR "Ladybird needs the Qt plugin ${plugin_target}, which Qt was built without.")
+            endif()
+            set(plugin_install_dir "${qt_plugins_dir}/${plugin_type}")
+            install(IMPORTED_RUNTIME_ARTIFACTS Qt6::${plugin_target}
+                RUNTIME_DEPENDENCY_SET ladybird_vcpkg_libraries
+                LIBRARY DESTINATION ${plugin_install_dir} COMPONENT ladybird_Runtime
+            )
+            if (LINUX AND NOT vcpkg_library_install_dir STREQUAL "lib")
+                # Make the imported plugin's runpath relative to the actual library destination.
+                find_program(PATCHELF_EXECUTABLE patchelf REQUIRED)
+                install(CODE "
+                    set(qt_library_dir \"${vcpkg_library_install_dir}\")
+                    set(qt_plugin_dir \"\${CMAKE_INSTALL_PREFIX}/${plugin_install_dir}\")
+                    cmake_path(ABSOLUTE_PATH qt_library_dir BASE_DIRECTORY \"\${CMAKE_INSTALL_PREFIX}\" NORMALIZE)
+                    cmake_path(RELATIVE_PATH qt_library_dir BASE_DIRECTORY \"\${qt_plugin_dir}\")
+                    execute_process(COMMAND \"${PATCHELF_EXECUTABLE}\" --set-rpath \"\$ORIGIN:\$ORIGIN/\${qt_library_dir}\"
+                        \"\$ENV{DESTDIR}\${qt_plugin_dir}/$<TARGET_FILE_NAME:Qt6::${plugin_target}>\"
+                        COMMAND_ERROR_IS_FATAL ANY)
+                " COMPONENT ladybird_Runtime)
+            endif()
+        endforeach()
+
+        if (APPLE)
+            file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/qt.conf" "[Paths]\nPlugins = ${qt_conf_plugins}\n")
+            install(FILES "${CMAKE_CURRENT_BINARY_DIR}/qt.conf" DESTINATION ${qt_conf_dir} COMPONENT ladybird_Runtime)
+        endif()
+    endif()
+
+    ladybird_install_vcpkg_libraries(ladybird_vcpkg_libraries
+        DESTINATION ${vcpkg_library_install_dir} COMPONENT ladybird_Runtime)
+endif()
 
 if (LADYBIRD_GENERATE_SYMBOL_FILES)
     set(symbol_files_dir "${CMAKE_BINARY_DIR}/symbols")

@@ -13,7 +13,6 @@
 //! Nothing constructs these yet; the FFI construction surface follows with
 //! the C++ staging.
 
-use crate::css::ffi_support::OwnedArc;
 use crate::css::style_value::{
     AnchorPayload, AnchorSizePayload, CalculatedPayload, RandomValueSharingPayload, StyleValueBox,
 };
@@ -337,6 +336,7 @@ pub(crate) fn simplify_parsed_calculation(
         percentage_basis: None,
         length_resolution: LengthResolution::default(),
         random_base_value: None,
+        evaluates_arithmetic: false,
     };
     let callbacks = CalcSimplifyCallbacks {
         resolve_non_math_function: &|_| None,
@@ -940,12 +940,6 @@ unsafe impl Send for CalcNodeHandle where CalcNode: Send + Sync {}
 unsafe impl Sync for CalcNodeHandle where CalcNode: Send + Sync {}
 
 impl CalcNodeHandle {
-    /// # Safety
-    /// `raw` must be a handle from one of the construction functions below.
-    pub(crate) unsafe fn from_raw(raw: *const CalcNode) -> Self {
-        Self { node: raw }
-    }
-
     pub(crate) fn from_arc(node: Arc<CalcNode>) -> Self {
         Self {
             node: Arc::into_raw(node),
@@ -982,9 +976,9 @@ impl Clone for CalcNodeHandle {
 pub(crate) fn interpolate_length_percentage_calculations(
     from: Arc<CalcNode>,
     to: Arc<CalcNode>,
-    delta: f32,
+    delta: f64,
 ) -> Option<(Arc<CalcNode>, FfiNumericType)> {
-    combine_calculations(from, to, 1.0 - delta as f64, delta as f64, Some(ResolveAs::Base(0)))
+    combine_calculations(from, to, 1.0 - delta, delta, Some(ResolveAs::Base(0)))
 }
 
 /// Interpolates two calc-size() calculations as calc((1 - p) * A + p * B).
@@ -992,9 +986,9 @@ pub(crate) fn interpolate_length_percentage_calculations(
 pub(crate) fn interpolate_calc_size_calculations(
     from: Arc<CalcNode>,
     to: Arc<CalcNode>,
-    delta: f32,
+    delta: f64,
 ) -> Option<(Arc<CalcNode>, FfiNumericType)> {
-    combine_calculations_keeping_zero_lengths(from, to, 1.0 - delta as f64, delta as f64, Some(ResolveAs::Base(0)))
+    combine_calculations_keeping_zero_lengths(from, to, 1.0 - delta, delta, Some(ResolveAs::Base(0)))
 }
 
 /// https://drafts.csswg.org/css-values-4/#combine-math
@@ -1117,7 +1111,7 @@ pub(crate) fn add_length_percentage_calculations(
 pub(crate) fn interpolate_calculations(
     from: Arc<CalcNode>,
     to: Arc<CalcNode>,
-    delta: f32,
+    delta: f64,
     has_percentages_resolve_as: bool,
     resolve_as_is_number: bool,
     resolve_as_base: u8,
@@ -1125,8 +1119,8 @@ pub(crate) fn interpolate_calculations(
     combine_calculations(
         from,
         to,
-        1.0 - delta as f64,
-        delta as f64,
+        1.0 - delta,
+        delta,
         resolve_as_from_fields(has_percentages_resolve_as, resolve_as_is_number, resolve_as_base),
     )
 }
@@ -1184,6 +1178,7 @@ fn simplify_combined_calculation(
         percentage_basis: None,
         length_resolution: LengthResolution::default(),
         random_base_value: None,
+        evaluates_arithmetic: false,
     };
     let callbacks = CalcSimplifyCallbacks {
         resolve_non_math_function: &|_| None,
@@ -1264,27 +1259,6 @@ pub(crate) fn calc_node_create_numeric_dimension(kind: u8, value: f64, unit: u8)
     handle(CalcNode::Numeric(numeric))
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn rust_calc_node_release(node: OwnedArc<CalcNode>) {
-    drop(node);
-}
-
-/// https://drafts.csswg.org/css-values-4/#determine-the-type-of-a-calculation
-/// Determines the type of the calculation rooted at `node` under the given
-/// resolve-as target. The result's valid flag is false when the tree does not
-/// type-check.
-#[unsafe(no_mangle)]
-pub extern "C" fn rust_calc_node_determine_type(
-    node: &CalcNode,
-    has_percentages_resolve_as: bool,
-    resolve_as_is_number: bool,
-    resolve_as_base: u8,
-) -> FfiNumericType {
-    let resolve_as = resolve_as_from_fields(has_percentages_resolve_as, resolve_as_is_number, resolve_as_base);
-    let percentage_leaf_type = percentage_leaf_type_for(resolve_as);
-    FfiNumericType::from_calc(node.numeric_type(&percentage_leaf_type))
-}
-
 /// Whether any leaf of the calculation is a percentage.
 #[unsafe(no_mangle)]
 pub extern "C" fn rust_calc_node_contains_percentage(node: &CalcNode) -> bool {
@@ -1312,6 +1286,9 @@ pub(crate) struct CalcEvaluationContext<'a> {
     /// Produces the random base value for a random() node's sharing options,
     /// when the resolution context can (it needs per-element state).
     pub random_base_value: Option<RandomBaseValueResolver<'a>>,
+    /// Whether a product that simplification can't reduce, but whose value is fully determined, becomes that value.
+    /// Set when computing or resolving a value; a specified value keeps the form its author wrote.
+    pub evaluates_arithmetic: bool,
 }
 
 /// Produces the random base value for a random() node's sharing options.
@@ -1367,6 +1344,53 @@ impl CalcNode {
             value: value.to_canonical_number(context.length_resolution),
             numeric_type: self.numeric_type(context.percentage_leaf_type),
         })
+    }
+
+    /// The value of a tree that combines canonical numeric leaves with sums, negations, products and inversions only.
+    /// Simplification leaves some of those trees unreduced although their value is fully determined: It never
+    /// distributes an Invert node over a product, so 64px / (300px / 1s) stays a product holding an inverted product,
+    /// rather than becoming the time it is.
+    fn try_evaluate_arithmetic(&self, context: &CalcEvaluationContext) -> Option<CalcResult> {
+        match self {
+            CalcNode::Numeric(..) => self.try_canonical_result(context),
+            CalcNode::Negate(child) => {
+                let mut result = child.try_evaluate_arithmetic(context)?;
+                result.value = -result.value;
+                Some(result)
+            }
+            CalcNode::Invert(child) => {
+                let mut result = child.try_evaluate_arithmetic(context)?;
+                result.invert();
+                Some(result)
+            }
+            CalcNode::Product(children) => {
+                let mut result: Option<CalcResult> = None;
+                for child in children {
+                    let child_result = child.try_evaluate_arithmetic(context)?;
+                    match &mut result {
+                        Some(result) => result.multiply_by(&child_result),
+                        None => result = Some(child_result),
+                    }
+                    result.as_ref()?.numeric_type?;
+                }
+                result
+            }
+            CalcNode::Sum(children) => {
+                let mut result: Option<CalcResult> = None;
+                for child in children {
+                    let child_result = child.try_evaluate_arithmetic(context)?;
+                    result = Some(match result {
+                        None => child_result,
+                        Some(previous) => CalcResult {
+                            value: previous.value + child_result.value,
+                            numeric_type: Some(previous.numeric_type?.added_to(&child_result.numeric_type?)?),
+                        },
+                    });
+                }
+                result
+            }
+            _ => None,
+        }
     }
 
     /// Mirrors try_get_number: a plain number leaf.
@@ -2383,6 +2407,7 @@ impl CalcNode {
                                         ..context.length_resolution
                                     },
                                     random_base_value: context.random_base_value,
+                                    evaluates_arithmetic: context.evaluates_arithmetic,
                                 };
                                 return shared(CalcNode::Sum(multiplied)).simplify(&neutral_context, callbacks);
                             }
@@ -2445,7 +2470,19 @@ impl CalcNode {
                 {
                     return shared(node);
                 }
-                shared(CalcNode::Product(flattened))
+                let product = shared(CalcNode::Product(flattened));
+                // NB: The steps above never look into an Invert node holding a product, so 64px / (300px / 1s) stays a
+                //     product here although its value is the time 0.213333s. Where the value is computed or resolved,
+                //     take that value, so that the math functions around the product can fold it like any other leaf.
+                if context.evaluates_arithmetic
+                    && !product.contains_percentage()
+                    && let Some(node) = product
+                        .try_evaluate_arithmetic(context)
+                        .and_then(|result| make_calc_result_node(&result, context.resolve_as))
+                {
+                    return shared(node);
+                }
+                product
             }
             _ => root,
         }
@@ -2952,6 +2989,7 @@ fn with_ffi_evaluation<R>(
             fallback: Some(&resolve_length_fallback),
         },
         random_base_value: Some(&random_base_value),
+        evaluates_arithmetic: true,
     };
     let absolutize_random_sharing = |sharing: &RetainedStyleValueData| -> Option<RetainedStyleValueData> {
         external_resolutions
@@ -3114,6 +3152,7 @@ fn resolve_calculated_with_channels_options(
         percentage_basis,
         length_resolution,
         random_base_value: Some(&fixed_random_base_value),
+        evaluates_arithmetic: true,
     };
     let callbacks = CalcSimplifyCallbacks {
         absolutize_random_sharing: &|_| None,

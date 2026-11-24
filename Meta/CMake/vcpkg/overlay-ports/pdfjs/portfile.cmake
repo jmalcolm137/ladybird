@@ -4,7 +4,7 @@ set(VCPKG_BUILD_TYPE release)
 vcpkg_download_distfile(ARCHIVE
     URLS "https://github.com/mozilla/pdf.js/releases/download/v${VERSION}/pdfjs-${VERSION}-dist.zip"
     FILENAME "pdfjs-${VERSION}-dist.zip"
-    SHA512 ed520ebaa60242f68c27c47eece48887fb862bea977f873212f1bf7556ef562adcb33e4a1daac9fbb63e5fe882dc16ba9226e29d467fda25ee0101ba2ea930de
+    SHA512 708da0d1e90058bfb974991c39fa46dbd81fa1882003d05964071be753866dc2502ff21c135170b42a915ad4704f9969863f2d0ce78f55658adc4a67b776779e
 )
 
 vcpkg_extract_source_archive_ex(
@@ -19,7 +19,7 @@ z_vcpkg_apply_patches(
     PATCHES 0001-ladybird-embed.patch
 )
 
-# build/: pdf.mjs, pdf.worker.mjs, pdf.sandbox.mjs (no .map files)
+# build/: pdf.mjs, pdf.worker.mjs, pdf.renderer.mjs, pdf.sandbox.mjs (no .map files)
 file(GLOB BUILD_MJS "${SOURCE_PATH}/build/*.mjs")
 file(INSTALL ${BUILD_MJS} DESTINATION "${CURRENT_PACKAGES_DIR}/share/pdfjs/build")
 
@@ -47,6 +47,5 @@ file(WRITE "${CURRENT_PACKAGES_DIR}/share/pdfjs/web/locale/locale.json"
 
 set(VCPKG_POLICY_EMPTY_PACKAGE enabled)
 
-file(WRITE "${CURRENT_PACKAGES_DIR}/share/pdfjs/copyright"
-    "pdf.js is licensed under the Apache 2.0 License.\n"
-    "See https://github.com/mozilla/pdf.js/blob/master/LICENSE\n")
+file(GLOB WASM_LICENSES "${SOURCE_PATH}/web/wasm/LICENSE_*")
+vcpkg_install_copyright(FILE_LIST "${SOURCE_PATH}/LICENSE" ${WASM_LICENSES})

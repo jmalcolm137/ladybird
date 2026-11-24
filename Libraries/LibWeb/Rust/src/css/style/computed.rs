@@ -200,6 +200,11 @@ impl<'a> ViewLonghands<'a> {
         self.0.payloads.inherited_values().effective_zoom()
     }
 
+    /// The physical sides whose margins the user agent's style sheet sets, in a quirks-mode document.
+    pub(crate) fn user_agent_margin_sides(self) -> u8 {
+        self.0.rare().value_facts.user_agent_margin_sides()
+    }
+
     /// The dependency flags of the record's table, without whether it is in a `display: none`
     /// subtree.
     pub(crate) fn dependency_flags(self) -> u8 {
@@ -388,6 +393,10 @@ impl<'a> ViewLonghands<'a> {
                     && crate::css::animated_overlay::overlay_wins(entry, self.is_important(entry.property))
             })
             .map(|entry| (entry.property, entry.clone_value()))
+    }
+
+    pub(crate) fn uncoordinated_background_value(self, property: u16) -> Option<&'a RetainedStyleValueData> {
+        self.0.rare().value_facts.uncoordinated_background_value(property)
     }
 
     /// The recorded specified values of the longhands whose computed values depend on what the
@@ -1025,6 +1034,19 @@ impl ComputedGroupSets {
 
     pub(super) fn take_released_animation_overlay_records(&mut self) -> ReleasedAnimationOverlayRecords {
         std::mem::take(&mut self.released_animation_overlay_records)
+    }
+
+    /// Whether no record the engine installed, and no animation overlay, may have an effect on generated content
+    /// elsewhere: change a counter or open or close quotes.
+    pub(super) fn holds_no_records_affecting_generated_content(&self) -> bool {
+        self.installed.holds_no_records_affecting_generated_content()
+            && self.live_animation_overlay_records() == 0
+            && self.retired_animation_overlay_records() == 0
+    }
+
+    /// Whether the node holds a record for no pseudo-element.
+    pub(super) fn has_no_pseudo_rows(&self, node: StyleNodeID) -> bool {
+        self.pseudo_rows(node).is_empty()
     }
 
     fn pseudo_rows(&self, node: StyleNodeID) -> &[PseudoComputedRow] {
@@ -1912,9 +1934,14 @@ impl ComputedGroupSets {
     }
 
     pub fn pin_style_record(&mut self, raw_style_record: u64) {
+        self.pin_style_record_times(raw_style_record, 1);
+    }
+
+    /// Pins the record `times` times, as many calls of [`Self::pin_style_record`] would.
+    pub fn pin_style_record_times(&mut self, raw_style_record: u64, times: u32) {
         let final_style_record = FinalStyleRecordID(raw_style_record);
         if let Some(installed) = final_style_record.installed_record() {
-            self.installed.hold(installed);
+            self.installed.hold_times(installed, times);
             return;
         }
         let slot = *self
@@ -1927,7 +1954,7 @@ impl ComputedGroupSets {
             .expect("animation-overlay slot is live");
         record.pin_count = record
             .pin_count
-            .checked_add(1)
+            .checked_add(u64::from(times))
             .expect("animation-overlay pin count overflow");
     }
 

@@ -10,6 +10,7 @@
 //! is only read from the source once something asks for its value.
 
 use std::marker::PhantomData;
+use std::ops::Deref;
 use std::sync::Arc;
 
 use ak::Utf16String;
@@ -17,17 +18,28 @@ use ak::Utf16String;
 use crate::parser::FunctionRow;
 use crate::parser::OuterResolutions;
 use crate::parser::ScriptData;
-use crate::parser::columns::Ast;
-use crate::parser::columns::NONE;
-use crate::parser::columns::function_flag;
-use crate::parser::columns::tag;
 use crate::parser::literals;
 use crate::parser::literals::EscapeMode;
-use crate::parser::token::N_PROTO;
-use crate::parser::token::T;
 use crate::u32_from_usize;
 use crate::utf16::Utf16StringBuilder;
 use crate::utf16::Utf16View;
+use libjs_parser::columns::NONE;
+use libjs_parser::columns::function_flag;
+use libjs_parser::columns::tag;
+use libjs_parser::token::N_PROTO;
+use libjs_parser::token::T;
+pub use libjs_parser::tree::DeclarationKind;
+pub use libjs_parser::tree::LocalBinding;
+pub use libjs_parser::tree::LocalType;
+pub use libjs_parser::tree::LocalVarKind;
+pub use libjs_parser::tree::LocalVariable;
+pub use libjs_parser::tree::Name;
+pub use libjs_parser::tree::PatternMode;
+pub(crate) use libjs_parser::tree::Resolution;
+pub(crate) use libjs_parser::tree::ScopeRow;
+pub(crate) use libjs_parser::tree::ScopeTable;
+pub use libjs_parser::tree::TreeView;
+use libjs_parser::tree::is_optional_link;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Position {
@@ -127,14 +139,6 @@ pub enum AssignmentOp {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
-pub enum DeclarationKind {
-    Var = 1,
-    Let = 2,
-    Const = 3,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[repr(u8)]
 pub enum FunctionKind {
     Normal = 0,
     Generator = 1,
@@ -164,13 +168,6 @@ pub enum ProgramType {
 pub enum MetaPropertyType {
     NewTarget,
     ImportMeta,
-}
-
-/// Scope analysis result: how this identifier is resolved.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum LocalType {
-    Argument,
-    Variable,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -245,25 +242,9 @@ pub enum ForInOfKind {
     ForAwaitOf,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[repr(u8)]
-pub enum LocalVarKind {
-    Var = 0,
-    LetOrConst = 1,
-    Function = 2,
-    ArgumentsObject = 3,
-    CatchClauseParameter = 4,
-    /// A parameter that a binding pattern binds.
-    PatternParameter = 5,
-}
-
 // =============================================================================
 // Names
 // =============================================================================
-
-/// An interned name of a [`SyntaxTree`]. Equal names of a tree have equal ids.
-#[derive(Clone, Copy, Debug, Hash, Eq, PartialEq)]
-pub struct Name(pub(crate) u32);
 
 #[derive(Clone, Copy)]
 struct NameSpan {
@@ -276,61 +257,70 @@ struct NameSpan {
 /// for the others, along with the UTF-8 that a parser knows them by.
 #[derive(Default)]
 pub(crate) struct NameTable {
-    spans: Vec<NameSpan>,
-    ascii_text: Vec<u8>,
-    utf16_text: Vec<u16>,
-    utf8_text: Vec<u8>,
+    spans: Box<[NameSpan]>,
+    ascii_text: Box<[u8]>,
+    utf16_text: Box<[u16]>,
+    utf8_text: Box<[u8]>,
     /// Where the UTF-8 of each non-ASCII name starts and ends, in the order of the names.
-    utf8_spans: Vec<(u32, u32)>,
+    utf8_spans: Box<[(u32, u32)]>,
 }
 
 impl NameTable {
+    /// The table of `names`, in the order of their ids, which works out the size of each list first.
     pub(crate) fn from_parser_names<'a>(names: impl ExactSizeIterator<Item = &'a [u8]> + Clone) -> Self {
-        let ascii_bytes = names.clone().filter(|name| name.is_ascii()).map(<[u8]>::len).sum();
-        let mut table = Self {
-            spans: Vec::with_capacity(names.len()),
-            ascii_text: Vec::with_capacity(ascii_bytes),
-            ..Self::default()
-        };
-        for name in names {
-            table.push(name);
+        let (mut ascii_bytes, mut utf16_units, mut utf8_bytes, mut utf8_names) = (0, 0, 0, 0);
+        for name in names.clone() {
+            if name.is_ascii() {
+                ascii_bytes += name.len();
+            } else {
+                utf16_units += String::from_utf8_lossy(name).encode_utf16().count();
+                utf8_bytes += name.len();
+                utf8_names += 1;
+            }
         }
-        table
+        let mut spans = Vec::with_capacity(names.len());
+        let mut ascii_text = Vec::with_capacity(ascii_bytes);
+        let mut utf16_text = Vec::with_capacity(utf16_units);
+        let mut utf8_text = Vec::with_capacity(utf8_bytes);
+        let mut utf8_spans = Vec::with_capacity(utf8_names);
+        for name in names {
+            let span = if name.is_ascii() {
+                let start = ascii_text.len();
+                ascii_text.extend_from_slice(name);
+                NameSpan {
+                    start: u32_from_usize(start),
+                    length: u32_from_usize(name.len()),
+                    is_ascii: true,
+                }
+            } else {
+                let start = utf16_text.len();
+                utf16_text.extend(String::from_utf8_lossy(name).encode_utf16());
+                let utf8_start = u32_from_usize(utf8_text.len());
+                utf8_text.extend_from_slice(name);
+                utf8_spans.push((utf8_start, u32_from_usize(utf8_text.len())));
+                NameSpan {
+                    start: u32_from_usize(start),
+                    length: u32_from_usize(utf16_text.len() - start),
+                    is_ascii: false,
+                }
+            };
+            spans.push(span);
+        }
+        Self {
+            spans: spans.into_boxed_slice(),
+            ascii_text: ascii_text.into_boxed_slice(),
+            utf16_text: utf16_text.into_boxed_slice(),
+            utf8_text: utf8_text.into_boxed_slice(),
+            utf8_spans: utf8_spans.into_boxed_slice(),
+        }
     }
 
     pub(crate) fn memory_size(&self) -> usize {
-        self.spans.capacity() * size_of::<NameSpan>()
-            + self.ascii_text.capacity()
-            + self.utf16_text.capacity() * size_of::<u16>()
-            + self.utf8_text.capacity()
-            + self.utf8_spans.capacity() * size_of::<(u32, u32)>()
-    }
-
-    pub(crate) fn push(&mut self, text: &[u8]) {
-        let is_ascii = text.is_ascii();
-        let start = if is_ascii {
-            self.ascii_text.len()
-        } else {
-            self.utf16_text.len()
-        };
-        if is_ascii {
-            self.ascii_text.extend_from_slice(text);
-        } else {
-            self.utf16_text.extend(String::from_utf8_lossy(text).encode_utf16());
-            let utf8_start = u32_from_usize(self.utf8_text.len());
-            self.utf8_text.extend_from_slice(text);
-            self.utf8_spans.push((utf8_start, u32_from_usize(self.utf8_text.len())));
-        }
-        let end = if is_ascii {
-            self.ascii_text.len()
-        } else {
-            self.utf16_text.len()
-        };
-        self.spans.push(NameSpan {
-            start: u32_from_usize(start),
-            length: u32_from_usize(end - start),
-            is_ascii,
-        });
+        size_of_val(&*self.spans)
+            + size_of_val(&*self.ascii_text)
+            + size_of_val(&*self.utf16_text)
+            + size_of_val(&*self.utf8_text)
+            + size_of_val(&*self.utf8_spans)
     }
 
     /// The names as a parser knows them, in the order of their ids.
@@ -358,267 +348,35 @@ impl NameTable {
 }
 
 // =============================================================================
-// Resolution
-// =============================================================================
-
-/// What scope analysis found out about one identifier, packed into a `u32` of the tree's resolution column. An
-/// identifier that it did not look at has the value zero.
-#[derive(Clone, Copy, Default)]
-pub(crate) struct Resolution(pub(crate) u32);
-
-impl Resolution {
-    const LOCAL_TYPE_MASK: u32 = 0b11;
-    const LOCAL_ARGUMENT: u32 = 1;
-    const LOCAL_VARIABLE: u32 = 2;
-    const DECLARATION_KIND_SHIFT: u32 = 2;
-    const DECLARATION_KIND_MASK: u32 = 0b11 << Self::DECLARATION_KIND_SHIFT;
-    const IS_GLOBAL: u32 = 1 << 4;
-    const IS_INSIDE_SCOPE_WITH_EVAL: u32 = 1 << 5;
-    const IS_HOISTED: u32 = 1 << 6;
-    const IS_DECLARED_FUNCTION: u32 = 1 << 7;
-    const IS_INSIDE_TREE_SCOPE_WITH_EVAL: u32 = 1 << 8;
-    const LOCAL_INDEX_SHIFT: u32 = 9;
-    /// A binding with a higher index stays in its environment.
-    pub(crate) const MAX_LOCAL_INDEX: u32 = u32::MAX >> Self::LOCAL_INDEX_SHIFT;
-
-    pub(crate) fn set_local(&mut self, binding: LocalBinding) {
-        let local_type = match binding.local_type {
-            LocalType::Argument => Self::LOCAL_ARGUMENT,
-            LocalType::Variable => Self::LOCAL_VARIABLE,
-        };
-        self.0 = (self.0 & !Self::LOCAL_TYPE_MASK & ((1 << Self::LOCAL_INDEX_SHIFT) - 1))
-            | local_type
-            | (binding.index << Self::LOCAL_INDEX_SHIFT);
-    }
-
-    pub(crate) fn set_declaration_kind(&mut self, kind: DeclarationKind) {
-        self.0 = (self.0 & !Self::DECLARATION_KIND_MASK) | ((kind as u32) << Self::DECLARATION_KIND_SHIFT);
-    }
-
-    pub(crate) fn set_is_global(&mut self) {
-        self.0 |= Self::IS_GLOBAL;
-    }
-
-    pub(crate) fn set_is_inside_scope_with_eval(&mut self) {
-        self.0 |= Self::IS_INSIDE_SCOPE_WITH_EVAL;
-    }
-
-    pub(crate) fn is_inside_scope_with_eval(self) -> bool {
-        self.0 & Self::IS_INSIDE_SCOPE_WITH_EVAL != 0
-    }
-
-    /// Whether a scope with an eval around the identifier is one of the tree being resolved.
-    pub(crate) fn set_is_inside_tree_scope_with_eval(&mut self) {
-        self.0 |= Self::IS_INSIDE_TREE_SCOPE_WITH_EVAL;
-    }
-
-    pub(crate) fn is_inside_tree_scope_with_eval(self) -> bool {
-        self.0 & Self::IS_INSIDE_TREE_SCOPE_WITH_EVAL != 0
-    }
-
-    pub(crate) fn clear_is_global(&mut self) {
-        self.0 &= !Self::IS_GLOBAL;
-    }
-
-    pub(crate) fn set_is_hoisted(&mut self) {
-        self.0 |= Self::IS_HOISTED;
-    }
-
-    pub(crate) fn is_hoisted(self) -> bool {
-        self.0 & Self::IS_HOISTED != 0
-    }
-
-    /// Marks the resolution of a function node as being that of the name of its declaration.
-    pub(crate) fn set_is_declared_function(&mut self) {
-        self.0 |= Self::IS_DECLARED_FUNCTION;
-    }
-
-    pub(crate) fn is_declared_function(self) -> bool {
-        self.0 & Self::IS_DECLARED_FUNCTION != 0
-    }
-
-    pub(crate) fn local_type(self) -> Option<LocalType> {
-        match self.0 & Self::LOCAL_TYPE_MASK {
-            Self::LOCAL_ARGUMENT => Some(LocalType::Argument),
-            Self::LOCAL_VARIABLE => Some(LocalType::Variable),
-            _ => None,
-        }
-    }
-
-    pub(crate) fn local_index(self) -> u32 {
-        self.0 >> Self::LOCAL_INDEX_SHIFT
-    }
-
-    pub(crate) fn declaration_kind(self) -> Option<DeclarationKind> {
-        match (self.0 & Self::DECLARATION_KIND_MASK) >> Self::DECLARATION_KIND_SHIFT {
-            1 => Some(DeclarationKind::Var),
-            2 => Some(DeclarationKind::Let),
-            3 => Some(DeclarationKind::Const),
-            _ => None,
-        }
-    }
-
-    pub(crate) fn is_global(self) -> bool {
-        self.0 & Self::IS_GLOBAL != 0
-    }
-}
-
-/// A local that scope analysis gave a function, a static block or a program.
-#[derive(Clone, Copy)]
-pub struct LocalVariable {
-    pub name: Name,
-    pub kind: LocalVarKind,
-    pub is_mutable: bool,
-    /// Where the block that declares it starts and ends, if a block does.
-    pub(crate) scope_offsets: Option<(u32, u32)>,
-    /// How many loops of its function the scope that declares it is in the body of, which is how often that scope can
-    /// start again.
-    pub(crate) enclosing_loops: u32,
-}
-
-/// A resolved local binding: the operand type and index assigned by scope analysis.
-#[derive(Clone, Copy, Debug)]
-pub struct LocalBinding {
-    pub local_type: LocalType,
-    pub index: u32,
-}
-
-/// A `var` binding that needs initialization during function entry.
-#[derive(Clone, Copy)]
-pub struct VarToInit {
-    pub name: Name,
-    pub is_parameter: bool,
-    pub is_function_name: bool,
-    /// If the scope analysis optimized this var to a local, stores the binding info.
-    pub local: Option<LocalBinding>,
-}
-
-/// A function declaration that needs hoisting: its index among the children of the scope.
-#[derive(Clone, Copy)]
-pub struct FunctionToInit {
-    pub child_index: u32,
-}
-
-/// A range of one of the columns of scope analysis results.
-#[derive(Clone, Copy, Default)]
-pub(crate) struct ColumnRange {
-    pub(crate) start: u32,
-    pub(crate) end: u32,
-}
-
-impl ColumnRange {
-    pub(crate) fn of<T>(self, column: &[T]) -> &[T] {
-        &column[self.start as usize..self.end as usize]
-    }
-}
-
-/// What scope analysis found out about a function, a static block or a program.
-#[derive(Clone, Copy, Default)]
-pub(crate) struct ScopeRow {
-    pub(crate) local_variables: ColumnRange,
-    pub(crate) vars_to_initialize: ColumnRange,
-    pub(crate) functions_to_initialize: ColumnRange,
-    pub(crate) annexb_function_names: ColumnRange,
-    pub(crate) non_local_var_count: u32,
-    pub(crate) non_local_var_count_for_parameter_expressions: u32,
-    pub(crate) has_function_scope_data: bool,
-    pub(crate) has_function_named_arguments: bool,
-    pub(crate) has_argument_parameter: bool,
-    pub(crate) has_lexically_declared_arguments: bool,
-    pub(crate) uses_this: bool,
-    pub(crate) uses_this_from_environment: bool,
-    pub(crate) contains_direct_call_to_eval: bool,
-    pub(crate) contains_access_to_arguments_object: bool,
-    /// Whether the code of the scope, which is everything but what its declaration instantiation does, can change the
-    /// running environment. The code of nested functions has its own.
-    pub(crate) creates_environment: bool,
-}
-
-/// The results of scope analysis, which are the same for the whole life of a tree.
-#[derive(Default)]
-pub(crate) struct ScopeTable {
-    /// One per function of the function index, then one per static block, then the program's.
-    pub(crate) rows: Vec<ScopeRow>,
-    pub(crate) local_variables: Vec<LocalVariable>,
-    pub(crate) vars_to_initialize: Vec<VarToInit>,
-    pub(crate) functions_to_initialize: Vec<FunctionToInit>,
-    pub(crate) annexb_function_names: Vec<Name>,
-}
-
-impl ScopeTable {
-    pub(crate) fn clear(&mut self) {
-        self.rows.clear();
-        self.local_variables.clear();
-        self.vars_to_initialize.clear();
-        self.functions_to_initialize.clear();
-        self.annexb_function_names.clear();
-    }
-}
-
-// =============================================================================
 // The tree
 // =============================================================================
 
 /// What a compile job works from: the tree of the code it compiles, and the results of scope analysis on that code. The
 /// tree of a program holds its top-level code and the functions it is likely to call right away, and the tree of a
 /// function holds that function, in both cases with nothing but a function node for every other function nested in it.
-pub struct SyntaxTree {
+///
+/// The tree is made of slices in the work zone of the compile job, and lives no longer than the job.
+pub struct SyntaxTree<'t> {
     /// What stays of the source once the tree is gone.
     pub(crate) script: Arc<ScriptData>,
-    pub(crate) ast: Ast,
-    pub(crate) root: u32,
-    pub(crate) first_token_start: u32,
-    pub(crate) is_strict_mode: bool,
-    pub(crate) has_top_level_await: bool,
-    pub(crate) eval_referenced_private_names: Vec<Name>,
-    /// The resolution of the identifier at each node, if there is one.
-    pub(crate) resolutions: Vec<Resolution>,
-    pub(crate) scopes: ScopeTable,
-    /// The row of the program in `scopes`.
-    pub(crate) program_scope_row: u32,
-    /// The row in `scopes` of each function node of the tree whose code the tree holds, sorted by node.
-    pub(crate) function_scope_rows: Vec<(u32, u32)>,
+    /// The text of the source, which stays as it is for as long as the tree holds it.
+    pub(crate) source: ak::Utf16String,
+    /// The tree itself, and what scope analysis found out about it.
+    pub(crate) view: TreeView<'t>,
     /// What scope analysis found out for the functions that the code of the tree goes on to compile.
     pub(crate) outer_resolutions: Option<OuterResolutions>,
 }
 
-impl SyntaxTree {
-    fn tag(&self, node: u32) -> u8 {
-        self.ast.tag[node as usize]
-    }
+impl<'t> Deref for SyntaxTree<'t> {
+    type Target = TreeView<'t>;
 
-    pub(crate) fn a(&self, node: u32) -> u32 {
-        self.ast.a[node as usize]
+    #[inline(always)]
+    fn deref(&self) -> &TreeView<'t> {
+        &self.view
     }
+}
 
-    pub(crate) fn b(&self, node: u32) -> u32 {
-        self.ast.b[node as usize]
-    }
-
-    fn pos(&self, node: u32) -> u32 {
-        self.ast.pos[node as usize]
-    }
-
-    fn extra(&self, index: u32) -> u32 {
-        self.ast.extra[index as usize]
-    }
-
-    fn list(&self, start: u32) -> &[u32] {
-        let start = start as usize;
-        let count = self.ast.extra[start] as usize;
-        &self.ast.extra[start + 1..start + 1 + count]
-    }
-
-    /// Where the code after a block starts, given the list of the block's statements.
-    /// Where the block statement at `node` ends.
-    pub(crate) fn end_of_block(&self, node: u32) -> u32 {
-        self.block_end(self.a(node))
-    }
-
-    fn block_end(&self, list: u32) -> u32 {
-        self.extra(list + 1 + self.extra(list))
-    }
-
+impl SyntaxTree<'_> {
     fn range(&self, offset: u32) -> SourceRange {
         let position = self.script.positions.lines.position(offset);
         SourceRange {
@@ -635,7 +393,7 @@ impl SyntaxTree {
     }
 
     fn source_text(&self) -> Utf16View<'_> {
-        Utf16View::of_string(&self.script.positions.source)
+        Utf16View::of_string(&self.source)
     }
 
     pub(crate) fn source_units(&self, start: u32, end: u32) -> Utf16View<'_> {
@@ -645,10 +403,6 @@ impl SyntaxTree {
 
     pub fn name_text(&self, name: Name) -> Utf16View<'_> {
         self.script.names.text(name)
-    }
-
-    fn resolution(&self, node: u32) -> Resolution {
-        self.resolutions[node as usize]
     }
 
     fn identifier(&self, name: Name, offset: u32, node: u32) -> Identifier<'_> {
@@ -696,18 +450,6 @@ impl SyntaxTree {
         Statement::new(self, self.root)
     }
 
-    fn scope_row(&self, row: u32) -> &ScopeRow {
-        &self.scopes.rows[row as usize]
-    }
-
-    pub(crate) fn function_scope(&self, function: u32) -> &ScopeRow {
-        let index = self
-            .function_scope_rows
-            .binary_search_by_key(&function, |&(node, _)| node)
-            .expect("the tree holds the code of the function");
-        self.scope_row(self.function_scope_rows[index].1)
-    }
-
     fn string_units(&self, node: u32) -> Utf16View<'_> {
         self.source_units(self.pos(node) + 1, self.a(node) - 1)
     }
@@ -719,10 +461,7 @@ impl SyntaxTree {
     fn is_proto_key(&self, key: u32) -> bool {
         match self.tag(key) {
             tag::IDENT => self.a(key) == N_PROTO,
-            tag::STR => {
-                self.string_units(key).length_in_code_units() >= 9
-                    && self.string_value(key).to_utf16().as_ref() == utf16!("__proto__")
-            }
+            tag::STR => literals::string_literal_text(self.string_units(key)).view() == "__proto__",
             _ => false,
         }
     }
@@ -828,30 +567,6 @@ impl SyntaxTree {
         }
     }
 
-    /// Whether the pattern at `node` has a computed key or an initializer, nested patterns included.
-    pub(crate) fn pattern_contains_expression(&self, node: u32) -> bool {
-        self.list(self.a(node)).iter().any(|&item| {
-            let item_tag = self.tag(item);
-            if item_tag == tag::COMPUTED_PROPERTY {
-                return true;
-            }
-            let mut value = match item_tag {
-                tag::HOLE => return false,
-                tag::REST => self.a(item),
-                tag::PROPERTY | tag::SHORTHAND => self.b(item),
-                _ => item,
-            };
-            if matches!(self.tag(value), tag::ASSIGN_PATTERN | tag::ASSIGN_BASE) {
-                if self.b(value) != 0 {
-                    return true;
-                }
-                value = self.a(value);
-            }
-            matches!(self.tag(value), tag::ARRAY_PATTERN | tag::OBJECT_PATTERN)
-                && self.pattern_contains_expression(value)
-        })
-    }
-
     fn function_kind(&self, function: u32) -> FunctionKind {
         let flags = self.script.index.flags[self.b(function) as usize];
         FunctionKind::from_async_generator(flags & function_flag::ASYNC != 0, flags & function_flag::GENERATOR != 0)
@@ -869,11 +584,6 @@ impl SyntaxTree {
             kind: self.function_kind(function),
             is_hoisted: self.resolution(function).is_hoisted(),
         }
-    }
-
-    /// What scope analysis found out about the program.
-    pub(crate) fn program_scope(&self) -> &ScopeRow {
-        self.scope_row(self.program_scope_row)
     }
 
     /// The row of the function behind `id`.
@@ -952,7 +662,7 @@ impl SyntaxTree {
                 let extra = self.b(node);
                 let start = self.pos(node);
                 let has_super_class = self.extra(extra) != 0;
-                self.synthetic_function(
+                let mut function = self.synthetic_function(
                     (name != NONE).then(|| self.plain_identifier(Name(name), start)),
                     start,
                     self.extra(extra + 4),
@@ -963,7 +673,10 @@ impl SyntaxTree {
                         first_position: 0,
                         rest_of_default_constructor: has_super_class.then_some(start),
                     },
-                )
+                );
+                // NB: A default constructor reads neither `this` nor `super` through an environment.
+                function.parsing_insights.uses_this_from_environment = false;
+                function
             }
             FunctionSource::ClassFieldInitializer => {
                 let initializer = self.b(node);
@@ -1108,12 +821,12 @@ macro_rules! impl_sequence_into_iterator {
 /// A view that one list item of the tree turns into.
 pub trait ListItem<'a>: Sized {
     type Context: Copy;
-    fn read(tree: &'a SyntaxTree, node: u32, context: Self::Context) -> Self;
+    fn read(tree: &'a SyntaxTree<'a>, node: u32, context: Self::Context) -> Self;
 }
 
 /// A list of the tree, read as views of type `T`.
 pub struct List<'a, T: ListItem<'a>> {
-    tree: &'a SyntaxTree,
+    tree: &'a SyntaxTree<'a>,
     items: &'a [u32],
     context: T::Context,
     item_type: PhantomData<T>,
@@ -1128,11 +841,11 @@ impl<'a, T: ListItem<'a>> Clone for List<'a, T> {
 impl<'a, T: ListItem<'a>> Copy for List<'a, T> {}
 
 impl<'a, T: ListItem<'a>> List<'a, T> {
-    fn new(tree: &'a SyntaxTree, start: u32, context: T::Context) -> Self {
+    fn new(tree: &'a SyntaxTree<'a>, start: u32, context: T::Context) -> Self {
         Self::of_items(tree, tree.list(start), context)
     }
 
-    fn of_items(tree: &'a SyntaxTree, items: &'a [u32], context: T::Context) -> Self {
+    fn of_items(tree: &'a SyntaxTree<'a>, items: &'a [u32], context: T::Context) -> Self {
         Self {
             tree,
             items,
@@ -1172,21 +885,21 @@ impl<'a, T: ListItem<'a>> IntoIterator for &List<'a, T> {
 
 impl<'a> ListItem<'a> for Expression<'a> {
     type Context = ();
-    fn read(tree: &'a SyntaxTree, node: u32, _: ()) -> Self {
+    fn read(tree: &'a SyntaxTree<'a>, node: u32, _: ()) -> Self {
         Expression::new(tree, node)
     }
 }
 
 impl<'a> ListItem<'a> for Option<Expression<'a>> {
     type Context = ();
-    fn read(tree: &'a SyntaxTree, node: u32, _: ()) -> Self {
+    fn read(tree: &'a SyntaxTree<'a>, node: u32, _: ()) -> Self {
         (tree.tag(node) != tag::HOLE).then(|| Expression::new(tree, node))
     }
 }
 
 impl<'a> ListItem<'a> for Statement<'a> {
     type Context = ();
-    fn read(tree: &'a SyntaxTree, node: u32, _: ()) -> Self {
+    fn read(tree: &'a SyntaxTree<'a>, node: u32, _: ()) -> Self {
         Statement::new(tree, node)
     }
 }
@@ -1198,7 +911,7 @@ impl<'a> ListItem<'a> for Statement<'a> {
 /// An identifier reference or binding name, with what scope analysis found out about it.
 #[derive(Clone, Copy)]
 pub struct Identifier<'a> {
-    tree: &'a SyntaxTree,
+    tree: &'a SyntaxTree<'a>,
     pub name: Name,
     offset: u32,
     pub local_type: Option<LocalType>,
@@ -1209,7 +922,7 @@ pub struct Identifier<'a> {
 }
 
 impl<'a> Identifier<'a> {
-    fn new(tree: &'a SyntaxTree, name: Name, offset: u32, resolution: Resolution) -> Self {
+    fn new(tree: &'a SyntaxTree<'a>, name: Name, offset: u32, resolution: Resolution) -> Self {
         Self {
             tree,
             name,
@@ -1237,7 +950,7 @@ impl<'a> Identifier<'a> {
 
 #[derive(Clone, Copy)]
 pub struct PrivateIdentifier<'a> {
-    tree: &'a SyntaxTree,
+    tree: &'a SyntaxTree<'a>,
     name: Name,
     offset: u32,
 }
@@ -1318,7 +1031,7 @@ pub struct FunctionData<'a> {
 
 #[derive(Clone, Copy)]
 pub struct FunctionParameters<'a> {
-    tree: &'a SyntaxTree,
+    tree: &'a SyntaxTree<'a>,
     parameters: &'a [u32],
     /// Where the names of parameters count as being.
     first_position: u32,
@@ -1327,7 +1040,7 @@ pub struct FunctionParameters<'a> {
 }
 
 impl<'a> FunctionParameters<'a> {
-    fn empty(tree: &'a SyntaxTree) -> Self {
+    fn empty(tree: &'a SyntaxTree<'a>) -> Self {
         Self {
             tree,
             parameters: &[],
@@ -1406,7 +1119,7 @@ pub struct ClassData<'a> {
 /// The elements of a class, other than its constructor.
 #[derive(Clone, Copy)]
 pub struct ClassElements<'a> {
-    tree: &'a SyntaxTree,
+    tree: &'a SyntaxTree<'a>,
     elements: &'a [u32],
     constructor_index: Option<usize>,
     class_start: u32,
@@ -1434,7 +1147,7 @@ impl<'a> Sequence for ClassElements<'a> {
 
 #[derive(Clone, Copy)]
 pub struct ClassElementNode<'a> {
-    tree: &'a SyntaxTree,
+    tree: &'a SyntaxTree<'a>,
     node: u32,
     class_start: u32,
 }
@@ -1539,14 +1252,6 @@ pub enum ClassElement<'a> {
 // Binding patterns
 // =============================================================================
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum PatternMode {
-    /// The pattern of a declaration, a parameter or a catch clause.
-    Binding,
-    /// The target of a destructuring assignment.
-    Assignment,
-}
-
 #[derive(Clone, Copy)]
 pub struct BindingPattern<'a> {
     pub kind: BindingPatternKind,
@@ -1554,7 +1259,7 @@ pub struct BindingPattern<'a> {
 }
 
 impl<'a> BindingPattern<'a> {
-    pub(crate) fn new(tree: &'a SyntaxTree, node: u32, mode: PatternMode) -> Self {
+    pub(crate) fn new(tree: &'a SyntaxTree<'a>, node: u32, mode: PatternMode) -> Self {
         let is_array = tree.tag(node) == tag::ARRAY_PATTERN;
         Self {
             kind: if is_array {
@@ -1590,7 +1295,7 @@ pub enum BindingEntryName<'a> {
 /// The key of a property in a pattern, which refers to no binding.
 #[derive(Clone, Copy)]
 pub struct PropertyKey<'a> {
-    tree: &'a SyntaxTree,
+    tree: &'a SyntaxTree<'a>,
     node: u32,
 }
 
@@ -1630,7 +1335,7 @@ pub enum BindingEntryAlias<'a> {
     MemberExpression(Expression<'a>),
 }
 
-fn pattern_alias(tree: &SyntaxTree, value: u32, mode: PatternMode) -> BindingEntryAlias<'_> {
+fn pattern_alias<'a>(tree: &'a SyntaxTree<'a>, value: u32, mode: PatternMode) -> BindingEntryAlias<'a> {
     match tree.tag(value) {
         tag::ARRAY_PATTERN | tag::OBJECT_PATTERN => {
             BindingEntryAlias::BindingPattern(BindingPattern::new(tree, value, mode))
@@ -1651,7 +1356,7 @@ fn pattern_alias(tree: &SyntaxTree, value: u32, mode: PatternMode) -> BindingEnt
 impl<'a> ListItem<'a> for BindingEntry<'a> {
     type Context = (bool, PatternMode);
 
-    fn read(tree: &'a SyntaxTree, item: u32, (is_array, mode): Self::Context) -> Self {
+    fn read(tree: &'a SyntaxTree<'a>, item: u32, (is_array, mode): Self::Context) -> Self {
         let item_tag = tree.tag(item);
         if item_tag == tag::HOLE {
             return BindingEntry {
@@ -1721,7 +1426,7 @@ impl<'a> ListItem<'a> for BindingEntry<'a> {
 
 #[derive(Clone, Copy)]
 pub struct ObjectProperty<'a> {
-    tree: &'a SyntaxTree,
+    tree: &'a SyntaxTree<'a>,
     offset: u32,
     pub property_type: ObjectPropertyType,
     pub key: Expression<'a>,
@@ -1740,7 +1445,7 @@ impl<'a> ListItem<'a> for ObjectProperty<'a> {
     /// Where the object starts.
     type Context = u32;
 
-    fn read(tree: &'a SyntaxTree, property: u32, object_start: u32) -> Self {
+    fn read(tree: &'a SyntaxTree<'a>, property: u32, object_start: u32) -> Self {
         let property_tag = tree.tag(property);
         let (a, b) = (tree.a(property), tree.b(property));
         match property_tag {
@@ -1810,7 +1515,7 @@ pub struct CallArgument<'a> {
 impl<'a> ListItem<'a> for CallArgument<'a> {
     type Context = ();
 
-    fn read(tree: &'a SyntaxTree, argument: u32, _: ()) -> Self {
+    fn read(tree: &'a SyntaxTree<'a>, argument: u32, _: ()) -> Self {
         let is_spread = tree.tag(argument) == tag::SPREAD;
         CallArgument {
             value: Expression::new(tree, if is_spread { tree.a(argument) } else { argument }),
@@ -1882,48 +1587,15 @@ pub enum OptionalChainReference<'a> {
 
 #[derive(Clone, Copy)]
 pub struct OptionalChainData<'a> {
-    tree: &'a SyntaxTree,
+    tree: &'a SyntaxTree<'a>,
     node: u32,
 }
 
 impl<'a> OptionalChainData<'a> {
-    fn is_link(tag: u8) -> bool {
-        matches!(
-            tag,
-            tag::MEMBER
-                | tag::INDEX
-                | tag::PRIVATE_MEMBER
-                | tag::CALL
-                | tag::OPT_MEMBER
-                | tag::OPT_INDEX
-                | tag::OPT_PRIVATE_MEMBER
-                | tag::OPT_CALL
-        )
-    }
-
-    fn is_optional(tag: u8) -> bool {
-        matches!(
-            tag,
-            tag::OPT_MEMBER | tag::OPT_INDEX | tag::OPT_PRIVATE_MEMBER | tag::OPT_CALL
-        )
-    }
-
-    /// The chain reaches down to its innermost optional link, and what is below that is its base. Returns the base and
-    /// the links, outermost first.
-    pub(crate) fn links(tree: &SyntaxTree, node: u32) -> (u32, Vec<u32>) {
+    /// The base of the chain and its links, outermost first (see `TreeView::optional_chain()`).
+    fn links(tree: &SyntaxTree<'_>, node: u32) -> (u32, Vec<u32>) {
         let mut links = Vec::new();
-        let mut base = node;
-        let mut remaining_optional_links = 0;
-        let mut probe = node;
-        while Self::is_link(tree.tag(probe)) {
-            remaining_optional_links += u32::from(Self::is_optional(tree.tag(probe)));
-            probe = tree.a(probe);
-        }
-        while remaining_optional_links > 0 {
-            remaining_optional_links -= u32::from(Self::is_optional(tree.tag(base)));
-            links.push(base);
-            base = tree.a(base);
-        }
+        let base = tree.optional_chain(node, |link| links.push(link));
         (base, links)
     }
 
@@ -1939,7 +1611,7 @@ impl<'a> OptionalChainData<'a> {
             .into_iter()
             .map(|link| {
                 let link_tag = tree.tag(link);
-                let mode = if Self::is_optional(link_tag) {
+                let mode = if is_optional_link(link_tag) {
                     OptionalChainMode::Optional
                 } else {
                     OptionalChainMode::NotOptional
@@ -2018,7 +1690,7 @@ pub struct TemplateElementContext {
 impl<'a> ListItem<'a> for TemplateElement<'a> {
     type Context = TemplateElementContext;
 
-    fn read(tree: &'a SyntaxTree, node: u32, context: TemplateElementContext) -> Self {
+    fn read(tree: &'a SyntaxTree<'a>, node: u32, context: TemplateElementContext) -> Self {
         TemplateElement(if tree.tag(node) == tag::TEMPLATE_CHUNK {
             Expression::with_form(
                 tree,
@@ -2039,7 +1711,7 @@ pub struct TemplateElement<'a>(pub Expression<'a>);
 
 #[derive(Clone, Copy)]
 pub struct TemplateLiteralData<'a> {
-    tree: &'a SyntaxTree,
+    tree: &'a SyntaxTree<'a>,
     items: &'a [u32],
     pub expressions: List<'a, TemplateElement<'a>>,
 }
@@ -2056,7 +1728,7 @@ impl TemplateLiteralData<'_> {
     }
 }
 
-fn template_chunk_units(tree: &SyntaxTree, chunk: u32) -> Utf16View<'_> {
+fn template_chunk_units<'a>(tree: &'a SyntaxTree<'a>, chunk: u32) -> Utf16View<'a> {
     let start = tree.a(chunk);
     tree.source_units(start, start + (tree.b(chunk) >> 1))
 }
@@ -2067,7 +1739,7 @@ fn template_chunk_units(tree: &SyntaxTree, chunk: u32) -> Utf16View<'_> {
 
 #[derive(Clone, Copy)]
 pub struct VariableDeclarator<'a> {
-    tree: &'a SyntaxTree,
+    tree: &'a SyntaxTree<'a>,
     offset: u32,
     pub target: VariableDeclaratorTarget<'a>,
     pub init: Option<Expression<'a>>,
@@ -2089,7 +1761,7 @@ impl<'a> ListItem<'a> for VariableDeclarator<'a> {
     /// Where the declaration starts.
     type Context = u32;
 
-    fn read(tree: &'a SyntaxTree, declarator: u32, offset: u32) -> Self {
+    fn read(tree: &'a SyntaxTree<'a>, declarator: u32, offset: u32) -> Self {
         let (target, init) = (tree.a(declarator), tree.b(declarator));
         VariableDeclarator {
             tree,
@@ -2220,7 +1892,7 @@ pub struct TryStatementData<'a> {
 
 #[derive(Clone, Copy)]
 pub struct CatchClause<'a> {
-    tree: &'a SyntaxTree,
+    tree: &'a SyntaxTree<'a>,
     offset: u32,
     pub parameter: Option<CatchBinding<'a>>,
     pub body: Statement<'a>,
@@ -2246,7 +1918,7 @@ pub struct SwitchStatementData<'a> {
 
 #[derive(Clone, Copy)]
 pub struct SwitchCase<'a> {
-    tree: &'a SyntaxTree,
+    tree: &'a SyntaxTree<'a>,
     offset: u32,
     pub scope: Scope<'a>,
     pub test: Option<Expression<'a>>,
@@ -2261,7 +1933,7 @@ impl SwitchCase<'_> {
 impl<'a> ListItem<'a> for SwitchCase<'a> {
     type Context = ();
 
-    fn read(tree: &'a SyntaxTree, case: u32, _: ()) -> Self {
+    fn read(tree: &'a SyntaxTree<'a>, case: u32, _: ()) -> Self {
         let test = tree.a(case);
         SwitchCase {
             tree,
@@ -2274,7 +1946,7 @@ impl<'a> ListItem<'a> for SwitchCase<'a> {
 
 #[derive(Clone, Copy)]
 pub struct ImportStatementData<'a> {
-    tree: &'a SyntaxTree,
+    tree: &'a SyntaxTree<'a>,
     node: u32,
 }
 
@@ -2304,7 +1976,7 @@ impl ImportStatementData<'_> {
 
 #[derive(Clone, Copy)]
 pub struct ExportStatementData<'a> {
-    tree: &'a SyntaxTree,
+    tree: &'a SyntaxTree<'a>,
     node: u32,
     pub statement: Option<Statement<'a>>,
     pub is_default_export: bool,
@@ -2441,14 +2113,14 @@ impl<'a> Sequence for ScopeChildren<'a> {
 /// A scope with statements of its own: a program, a function body, a block or a case of a switch.
 #[derive(Clone, Copy)]
 pub struct Scope<'a> {
-    tree: &'a SyntaxTree,
+    tree: &'a SyntaxTree<'a>,
     pub children: ScopeChildren<'a>,
     /// What scope analysis found out if this is the scope of a function, a static block or a program.
     row: Option<&'a ScopeRow>,
 }
 
 impl<'a> Scope<'a> {
-    fn new(tree: &'a SyntaxTree, children: ScopeChildren<'a>) -> Self {
+    fn new(tree: &'a SyntaxTree<'a>, children: ScopeChildren<'a>) -> Self {
         Self {
             tree,
             children,
@@ -2456,11 +2128,11 @@ impl<'a> Scope<'a> {
         }
     }
 
-    fn of_list(tree: &'a SyntaxTree, list: u32) -> Self {
+    fn of_list(tree: &'a SyntaxTree<'a>, list: u32) -> Self {
         Self::new(tree, ScopeChildren::List(List::new(tree, list, ())))
     }
 
-    fn of_function(tree: &'a SyntaxTree, children: ScopeChildren<'a>, row: &'a ScopeRow) -> Self {
+    fn of_function(tree: &'a SyntaxTree<'a>, children: ScopeChildren<'a>, row: &'a ScopeRow) -> Self {
         Self {
             tree,
             children,
@@ -2470,14 +2142,14 @@ impl<'a> Scope<'a> {
 
     pub fn local_variables(&self) -> &'a [LocalVariable] {
         self.row
-            .map_or(&[], |row| row.local_variables.of(&self.tree.scopes.local_variables))
+            .map_or(&[], |row| row.local_variables.of(self.tree.scopes.local_variables))
     }
 
     /// Function names hoisted from inner blocks via Annex B.3.3. The FDI should create `var` bindings initialized to
     /// `undefined` for each name.
     pub fn annexb_function_names(&self) -> &'a [Name] {
         self.row.map_or(&[], |row| {
-            row.annexb_function_names.of(&self.tree.scopes.annexb_function_names)
+            row.annexb_function_names.of(self.tree.scopes.annexb_function_names)
         })
     }
 
@@ -2528,7 +2200,7 @@ enum ExpressionForm {
 
 #[derive(Clone, Copy)]
 pub struct Expression<'a> {
-    tree: &'a SyntaxTree,
+    tree: &'a SyntaxTree<'a>,
     node: u32,
     form: ExpressionForm,
 }
@@ -2711,14 +2383,14 @@ pub(crate) const ASSIGNMENT_OPERATORS: [AssignmentOp; 16] = [
 
 impl<'a> Expression<'a> {
     /// The expression at `node`, which a pair of parentheses leaves as it is.
-    pub(crate) fn new(tree: &'a SyntaxTree, mut node: u32) -> Self {
+    pub(crate) fn new(tree: &'a SyntaxTree<'a>, mut node: u32) -> Self {
         while tree.tag(node) == tag::PAREN {
             node = tree.a(node);
         }
         Self::with_form(tree, node, ExpressionForm::Node)
     }
 
-    fn with_form(tree: &'a SyntaxTree, node: u32, form: ExpressionForm) -> Self {
+    fn with_form(tree: &'a SyntaxTree<'a>, node: u32, form: ExpressionForm) -> Self {
         Self { tree, node, form }
     }
 
@@ -2987,7 +2659,7 @@ enum StatementForm {
 
 #[derive(Clone, Copy)]
 pub struct Statement<'a> {
-    tree: &'a SyntaxTree,
+    tree: &'a SyntaxTree<'a>,
     node: u32,
     form: StatementForm,
 }
@@ -3036,11 +2708,11 @@ pub enum StatementKind<'a> {
 }
 
 impl<'a> Statement<'a> {
-    pub(crate) fn new(tree: &'a SyntaxTree, node: u32) -> Self {
+    pub(crate) fn new(tree: &'a SyntaxTree<'a>, node: u32) -> Self {
         Self::with_form(tree, node, StatementForm::Node)
     }
 
-    fn with_form(tree: &'a SyntaxTree, node: u32, form: StatementForm) -> Self {
+    fn with_form(tree: &'a SyntaxTree<'a>, node: u32, form: StatementForm) -> Self {
         Self { tree, node, form }
     }
 

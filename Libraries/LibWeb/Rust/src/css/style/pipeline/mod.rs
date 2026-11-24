@@ -13,7 +13,6 @@ pub(crate) mod allocation_count;
 mod allocation_tests;
 mod bloom;
 mod cascade;
-mod cold_pass;
 pub(in crate::css::style) mod compute;
 pub(super) mod counters;
 pub(in crate::css::style) mod custom_properties;
@@ -57,6 +56,7 @@ use super::*;
 use bloom::{attribute_hash, class_hash, id_hash, tag_hash};
 pub(super) use cascade::DeclaredOnly;
 pub(super) use live::Live;
+pub(super) use live::SettlingComposition;
 #[cfg(test)]
 pub(super) use records::PseudoElementStyles;
 pub(super) use records::PseudoElementTarget;
@@ -64,7 +64,6 @@ pub(crate) use records::Record;
 pub(crate) use records::{CustomDeclarations, RareSetFacts, RareStyleFacts};
 pub(super) use records::{RecordFacts, Sample};
 
-pub(super) use cold_pass::{Report, ReportField};
 pub(super) use rules::ProcessRuleIndexes;
 #[cfg(test)]
 pub(super) use rules::entries_of;

@@ -109,6 +109,7 @@ CanvasRenderingContext2D
 CaretPosition
 ChannelMergerNode
 ChannelSplitterNode
+ChapterInformation
 CharacterData
 Clipboard
 ClipboardEvent
@@ -293,6 +294,7 @@ IIRFilterNode
 IdleDeadline
 Image
 ImageBitmap
+ImageBitmapRenderingContext
 ImageData
 InputEvent
 Int16Array
@@ -320,8 +322,10 @@ MediaElementAudioSourceNode
 MediaError
 MediaKeySystemAccess
 MediaList
+MediaMetadata
 MediaQueryList
 MediaQueryListEvent
+MediaSession
 MediaSource
 MediaSourceHandle
 MediaStream
@@ -680,6 +684,7 @@ timeout
 uniqueID
 uniqueLocalhostHostname
 uniqueTestHostname
+webkitRTCPeerConnection
 webkitURL
 wheelTargetToString
 withCollectedWrapper

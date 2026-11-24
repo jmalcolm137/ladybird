@@ -6,6 +6,7 @@
 
 #pragma once
 
+#include <AK/Optional.h>
 #include <AK/Types.h>
 
 #include <QColor>
@@ -35,6 +36,7 @@ struct ChromeColors {
     QColor icon;          // Toolbar icons
     QColor disabled;      // Disabled controls
     QColor hover;         // Hover fills
+    QColor strip_hover;   // Hover fill of controls on the tab strip
     QColor row_title;     // Unselected tab titles in the sidebar
     QColor separator;     // Between inactive tabs
     QColor divider;       // Chrome / page edge
@@ -91,13 +93,33 @@ bool is_dark(QPalette const&);
 bool is_dark(QWidget const&);
 PanelColors const& panel();
 
+// The palette for widgets that take the interface theme's appearance, such as the reviews of reports. Some platform
+// themes keep the system's palette whatever color scheme is asked for, and the panel colors then stand in for it.
+QPalette interface_palette(QPalette);
+
+// The accent color the desktop's settings portal reports, as Qt's palette does not follow it.
+void set_desktop_accent(Optional<QColor>);
+Optional<QColor> const& desktop_accent();
+
 // The color theme's accent, or the system's accent color if the theme has none, adjusted so it stays clear on the chrome
 // in light and dark appearances. It is used only for focus rings, selection and load progress.
 QColor accent();
 // A focus ring is a fine line of the focus edge color right outside the focused control, in a wider, fainter halo.
 QColor focus_edge();
 QColor focus_ring();
-QColor selection();
+
+// Selected text in a field. A color theme tints it with its accent and keeps the text in its normal color, so it stays
+// readable on every theme and looks unlike a selected row. A window in the background shows a gray tint instead.
+// Without a color theme or a desktop accent, it is the system's own text selection color.
+struct TextSelectionColors {
+    QColor background;
+    QColor text;
+};
+TextSelectionColors address_field_text_selection(QPalette const&, QPalette::ColorGroup);
+TextSelectionColors panel_text_selection(QPalette::ColorGroup, QColor const& text);
+
+// The accent, deep enough that white text on it stays clear.
+QColor accent_fill();
 
 // The fill of a primary button, a blue that white text stays clear on.
 QColor primary();

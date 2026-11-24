@@ -31,13 +31,14 @@ pub use crate::layout::object::{INDEXED_ELEMENTS_HEADER_SIZE, IndexedStorageKind
 use crate::layout::value::Value;
 use crate::layout_forward::RawNativeFunctionPointer;
 use crate::runtime::abstract_operations::{
-    call, call_function_object, function_object_as_object, validate_and_apply_property_descriptor,
+    call, call_function_object, function_object_as_object, get_prototype_from_constructor,
+    validate_and_apply_property_descriptor,
 };
 use crate::runtime::accessor::Accessor;
 use crate::runtime::array::{ARRAY_OBJECT_METHODS, Array};
 use crate::runtime::class_field_definition::{ClassElementName, ClassFieldDefinition, ClassFieldInitializer};
 use crate::runtime::completion::{Must, ThrowCompletionOr};
-use crate::runtime::ecmascript_function_object::ECMASCRIPT_FUNCTION_OBJECT_METHODS;
+use crate::runtime::ecmascript_function_object::{ECMASCRIPT_FUNCTION_OBJECT_METHODS, as_ecmascript_function_object};
 use crate::runtime::error::{ErrorKind, error_data_of_error};
 use crate::runtime::error_data::ErrorData;
 use crate::runtime::error_types::ErrorType;
@@ -238,7 +239,9 @@ pub struct ObjectMethods {
     pub name_for_call_stack: fn(&Object) -> Utf16String,
     /// The virtual methods of NativeFunction, which only native functions have.
     pub native_function: Option<&'static NativeFunctionMethods>,
-    pub is_cacheable_for_property_absence: fn(&Object) -> bool,
+    /// Whether the absence of a property from the shape of an object of this class may be cached: false for classes
+    /// whose objects have other properties than those of their shape. JIT code reads it (see RuntimeLayout).
+    pub is_cacheable_for_property_absence: bool,
     /// Whether the absence of a property from objects of this object's shape may be cached, for objects that answer
     /// for a few names whatever their shape holds.
     pub is_cacheable_for_absence_of: fn(&Object, &Vm, &PropertyKey) -> bool,
@@ -254,6 +257,8 @@ pub struct ObjectMethods {
     /// [[PrivateElements]], for a class whose fields do not tell: one whose fields only cache, or one with a slot that
     /// holds nothing. None leaves it to the fields, which Object::has_internal_slots() reads.
     pub has_internal_slots: Option<bool>,
+    /// What Object::preserve_identity() runs, for the objects of an embedder that drops objects it can recreate.
+    pub preserve_identity: Option<fn(&Object)>,
 }
 
 /// [[GetPrototypeOf]].
@@ -282,7 +287,7 @@ pub static ORDINARY_OBJECT_METHODS: ObjectMethods = ObjectMethods {
     function_realm: |_| None,
     name_for_call_stack: |_| unreachable!("FunctionObject::name_for_call_stack is pure virtual"),
     native_function: None,
-    is_cacheable_for_property_absence: |_| true,
+    is_cacheable_for_property_absence: true,
     is_cacheable_for_absence_of: |object, _, _| object.is_cacheable_for_property_absence(),
     is_cacheable_for_inherited_property: |_| true,
     is_cacheable_across_realms: |_| true,
@@ -290,6 +295,7 @@ pub static ORDINARY_OBJECT_METHODS: ObjectMethods = ObjectMethods {
     as_builtin_iterator_if_next_is_not_redefined: |_, _| None,
     error_data: error_data_of_error,
     has_internal_slots: None,
+    preserve_identity: None,
 };
 
 define_cell!(
@@ -310,6 +316,16 @@ impl ExternalMemorySize for Object {
 // cells an object reaches.
 unsafe impl Trace for Object {
     fn trace(&self, visitor: &mut Visitor) {
+        // NB: The VM keeps the intrinsic accessors and unimplemented properties of objects by their address, and
+        //     compiled code depends on the slots of global objects by theirs, so such objects stay where they are.
+        if self.flags.get()
+            & (object_flag::HAS_INTRINSIC_ACCESSORS
+                | object_flag::HAS_UNIMPLEMENTED_PROPERTIES
+                | object_flag::IS_GLOBAL_OBJECT)
+            != 0
+        {
+            visitor.pin(self.as_gc());
+        }
         self.shape.trace(visitor);
         let property_count = self.shape().property_count() as usize;
         let named_properties = self.named_properties.get();
@@ -317,14 +333,26 @@ unsafe impl Trace for Object {
             debug_assert!(property_count <= self.named_storage_capacity() as usize);
             // SAFETY: The storage holds at least one slot per property of the shape, and nothing writes it during
             // a collection.
-            visitor.visit_values(unsafe { ak::slice_from_raw_parts(named_properties, property_count) });
+            let values = unsafe { ak::slice_from_raw_parts(named_properties, property_count) };
+            if self.has_flag(object_flag::HAS_MALLOC_NAMED_STORAGE) {
+                // SAFETY: Malloc storage is the object's own, which only the object's own methods change, and only its
+                //         destructor frees.
+                unsafe { visitor.visit_owned_values(values) };
+            } else {
+                visitor.visit_values(values);
+            }
         }
-        if !named_properties.is_null()
-            && !self.named_storage_is_inline()
-            // SAFETY: Out-of-line named storage is storage value_storage::allocate() returned.
-            && let Some(storage) = unsafe { value_storage::cell(named_properties) }
-        {
-            visitor.visit(storage);
+        // NB: The pointers to the storage are visited as slots, so that a collection that moves the object or its
+        //     storage cell keeps them pointing into it.
+        if !named_properties.is_null() {
+            if self.named_storage_is_inline() {
+                visitor.visit_self_pointer(&self.named_properties);
+            } else if let Some(storage) =
+                // SAFETY: Out-of-line named storage is storage value_storage::allocate() returned.
+                unsafe { value_storage::cell(named_properties) }
+            {
+                visitor.visit_interior_pointer(&self.named_properties, storage);
+            }
         }
 
         match self.indexed_storage_kind() {
@@ -334,7 +362,14 @@ unsafe impl Trace for Object {
                 self.indexed_array_like_size().min(self.indexed_elements_capacity()),
                 visitor,
             ),
-            IndexedStorageKind::Dictionary => self.indexed_dictionary().trace(visitor),
+            IndexedStorageKind::Dictionary => {
+                // NB: The VM keeps the indexed dictionaries of ECMAScript function objects by the address of the
+                //     function, so such a function stays where it is.
+                if self.is_ecmascript_function_object() {
+                    visitor.pin(self.as_gc());
+                }
+                self.indexed_dictionary().trace(visitor);
+            }
         }
         let indexed_elements = self.indexed_elements.get();
         if matches!(
@@ -344,7 +379,7 @@ unsafe impl Trace for Object {
             // SAFETY: Packed and holey indexed storage is storage value_storage::allocate() returned.
             && let Some(storage) = unsafe { value_storage::cell(indexed_elements) }
         {
-            visitor.visit(storage);
+            visitor.visit_interior_pointer(&self.indexed_elements, storage);
         }
     }
 }
@@ -513,6 +548,10 @@ pub fn plain_object_size_classes(heap: &Heap) -> &[SizeClassAllocator] {
 
 const SPARSE_ARRAY_HOLE_THRESHOLD: u32 = 200;
 
+/// Holey elements whose storage grows stay holey while at least one in this many of them is filled. At that density,
+/// their storage takes about twice as much memory as a dictionary of the filled elements would.
+const SPARSE_ARRAY_DENSITY_RATIO: usize = 8;
+
 /// Whether elements with `filled` of their `length` indices filled are dense enough for holey storage: three quarters.
 fn are_dense_enough(filled: usize, length: usize) -> bool {
     filled >= length - length / 4
@@ -569,7 +608,7 @@ impl Object {
         let object = Object {
             shape: Member::new(shape),
             indexed_array_like_size: Cell::new(0),
-            mark: Cell::new(false),
+            identity_hash_state: Cell::new(0),
             state: Cell::new(CellState::Live),
             kind: CellKind::Object,
             indexed_storage_kind: Cell::new(IndexedStorageKind::None),
@@ -690,6 +729,40 @@ impl Object {
         }
         let reserve = shared_data.construct_reserve(shape);
         Self::create_in_size_class(vm, shape, reserve)
+    }
+
+    /// OrdinaryCreateFromConstructor(constructor, "%Object.prototype%") for the `this` of a construction of the
+    /// function with `shared_data` and `constructor` as the new target, in the current realm (see
+    /// create_for_construct()).
+    pub fn create_from_constructor_for_construct(
+        vm: &Vm,
+        constructor: Gc<FunctionObject>,
+        shared_data: Gc<SharedFunctionInstanceData>,
+    ) -> ThrowCompletionOr<Gc<Object>> {
+        let realm = vm.current_realm().expect("a construction runs in a realm");
+        let constructor_object = function_object_as_object(constructor);
+        // OPTIMIZATION: The shape a construct with the constructor gave its object before, while the constructor's
+        //               "prototype" still holds its prototype. Reading the own data property has no side effects.
+        let cache = vm.construct_shape_cache();
+        if let Some(shape) = cache.get(constructor_object, realm) {
+            let reserve = shared_data.construct_reserve(shape);
+            return Ok(Self::create_in_size_class(vm, shape, reserve));
+        }
+        let prototype = get_prototype_from_constructor(
+            vm,
+            constructor,
+            crate::runtime::intrinsics::Intrinsics::object_prototype,
+        )?;
+        let object = Self::create_for_construct(vm, realm, prototype, shared_data);
+        if as_ecmascript_function_object(constructor).is_some()
+            && let Some(metadata) = constructor_object.shape().lookup(&vm.names.prototype)
+            && let value = constructor_object.get_direct(metadata.offset)
+            && value.is_object()
+            && value.as_object() == prototype
+        {
+            cache.set(constructor_object, metadata.offset, object.shape());
+        }
+        Ok(object)
     }
 
     /// Like create_with_premade_shape(), in the size class for at least `reserve` properties, for properties that will
@@ -1709,6 +1782,8 @@ impl Object {
             &name.property_key(),
             ValueAndAttributes::new(value, PropertyAttributes::new(Attribute::WRITABLE)),
         );
+        // NB: The private element is state of the object that the embedder can't recreate.
+        self.preserve_identity();
 
         // 5. Return unused.
         Ok(())
@@ -1741,6 +1816,8 @@ impl Object {
             &element.key.property_key(),
             ValueAndAttributes::new(element.value, PropertyAttributes::default()),
         );
+        // NB: The private element is state of the object that the embedder can't recreate.
+        self.preserve_identity();
 
         // 6. Return unused.
         Ok(())
@@ -1910,6 +1987,11 @@ impl Object {
 
     // The internal methods, which dispatch through the object's class.
 
+    /// Whether [[GetPrototypeOf]] of the object is OrdinaryGetPrototypeOf(), which reads the prototype of its shape.
+    pub fn has_ordinary_get_prototype_of(&self) -> bool {
+        self.methods().internal_get_prototype_of.is_none()
+    }
+
     pub fn internal_get_prototype_of(&self, vm: &Vm) -> ThrowCompletionOr<Option<Gc<Object>>> {
         match self.methods().internal_get_prototype_of {
             Some(internal_get_prototype_of) => internal_get_prototype_of(self, vm),
@@ -2015,7 +2097,7 @@ impl Object {
     }
 
     pub fn is_cacheable_for_property_absence(&self) -> bool {
-        (self.methods().is_cacheable_for_property_absence)(self)
+        self.methods().is_cacheable_for_property_absence
     }
 
     pub fn is_cacheable_for_absence_of(&self, vm: &Vm, property_key: &PropertyKey) -> bool {
@@ -2054,6 +2136,15 @@ impl Object {
 
     pub fn error_data(&self) -> Option<&ErrorData> {
         (self.methods().error_data)(self)
+    }
+
+    /// Tells the object that script made its identity outlive the references to it: it is held weakly, or has a
+    /// private element. An embedder may drop an object of its own while script holds no reference to it and create an
+    /// equal one when script asks for it again, which is unobservable only until then.
+    pub fn preserve_identity(&self) {
+        if let Some(preserve_identity) = self.methods().preserve_identity {
+            preserve_identity(self);
+        }
     }
 
     /// Whether the object has an [[ErrorData]] internal slot.
@@ -3878,10 +3969,13 @@ impl Object {
 
     fn indexed_dictionary_pointer(&self) -> *mut IndexedDictionary {
         if self.is_ecmascript_function_object() {
-            return *self
-                .vm()
-                .function_indexed_dictionaries
-                .borrow()
+            // NB: Marker threads read the dictionaries of functions while they trace them, all at once, so this reads
+            //     the map without touching its borrow count.
+            // SAFETY: Only the thread that owns the heap changes the map, and never while the map is read here: not
+            //         while its collections mark, nor while the map is borrowed mutably, which this checks.
+            let dictionaries = unsafe { self.vm().function_indexed_dictionaries.try_borrow_unguarded() }
+                .expect("the indexed dictionaries of functions are not being changed");
+            return *dictionaries
                 .get(&core::ptr::from_ref(self).addr())
                 .expect("a function in dictionary mode has a dictionary");
         }
@@ -3950,7 +4044,14 @@ impl Object {
             return;
         }
         // SAFETY: The count is within the elements buffer, and nothing writes it during a collection.
-        visitor.visit_values(unsafe { ak::slice_from_raw_parts(self.indexed_elements.get(), count as usize) });
+        let values = unsafe { ak::slice_from_raw_parts(self.indexed_elements.get(), count as usize) };
+        if self.has_flag(object_flag::HAS_MALLOC_INDEXED_STORAGE) {
+            // SAFETY: Malloc storage is the object's own, which only the object's own methods change, and only its
+            //         destructor frees.
+            unsafe { visitor.visit_owned_values(values) };
+        } else {
+            visitor.visit_values(values);
+        }
     }
 
     /// Storage for at least `capacity` elements, all empty.
@@ -4136,7 +4237,7 @@ impl Object {
                 && dictionary
                     .sparse_elements()
                     .values()
-                    .all(|element| element.attributes == DEFAULT_ATTRIBUTES && !element.value.is_empty())
+                    .all(|element| element.attributes == DEFAULT_ATTRIBUTES)
             {
                 Some(if dictionary.size() == length {
                     IndexedStorageKind::Packed
@@ -4166,14 +4267,34 @@ impl Object {
         if index < self.indexed_elements_capacity() {
             return true;
         }
-        let filled = match kind {
+        are_dense_enough(
+            self.filled_dense_elements(materialized_elements) + 1,
+            index as usize + 1,
+        )
+    }
+
+    /// Whether holey elements whose storage grows for a store at `index`, past their first `materialized_elements`,
+    /// stay holey instead of becoming a dictionary: where they have no more than SPARSE_ARRAY_HOLE_THRESHOLD holes, or
+    /// where at least one in SPARSE_ARRAY_DENSITY_RATIO of them is filled.
+    ///
+    /// NB: Stores that each leave fewer holes than SPARSE_ARRAY_HOLE_THRESHOLD would otherwise make the elements
+    ///     arbitrarily sparse, like {50, 100, 200, ..., 900} does. The storage grows by half at least, and copies the
+    ///     elements anyway, so counting their holes takes linear time overall.
+    fn keeps_holey_storage_growing_for(&self, index: u32, materialized_elements: u32) -> bool {
+        let filled = self.filled_dense_elements(materialized_elements) + 1;
+        let length = index as usize + 1;
+        length - filled <= SPARSE_ARRAY_HOLE_THRESHOLD as usize || filled >= length / SPARSE_ARRAY_DENSITY_RATIO
+    }
+
+    /// The number of the first `materialized_elements` of packed or holey elements that are not holes.
+    fn filled_dense_elements(&self, materialized_elements: u32) -> usize {
+        match self.indexed_storage_kind() {
             IndexedStorageKind::Packed => materialized_elements as usize,
             IndexedStorageKind::Holey => (0..materialized_elements)
                 .filter(|index| !self.indexed_element(*index).is_empty())
                 .count(),
             IndexedStorageKind::None | IndexedStorageKind::Dictionary => unreachable!(),
-        };
-        are_dense_enough(filled + 1, index as usize + 1)
+        }
     }
 
     fn indexed_put_dictionary_and_update_size(&self, index: u32, value: Value, attributes: PropertyAttributes) {
@@ -4203,9 +4324,15 @@ impl Object {
         }
 
         // Check for sparse threshold
-        if u64::from(index) > u64::from(materialized_elements) + u64::from(SPARSE_ARRAY_HOLE_THRESHOLD)
-            && !self.keeps_dense_storage_for(index, materialized_elements)
-        {
+        let makes_dictionary =
+            if u64::from(index) > u64::from(materialized_elements) + u64::from(SPARSE_ARRAY_HOLE_THRESHOLD) {
+                !self.keeps_dense_storage_for(index, materialized_elements)
+            } else {
+                kind == IndexedStorageKind::Holey
+                    && index >= self.indexed_elements_capacity()
+                    && !self.keeps_holey_storage_growing_for(index, materialized_elements)
+            };
+        if makes_dictionary {
             self.transition_to_dictionary();
             self.indexed_put_dictionary_and_update_size(index, value, attributes);
             return;

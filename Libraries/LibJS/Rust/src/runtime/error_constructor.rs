@@ -14,13 +14,17 @@ use crate::layout::value::Value;
 use crate::runtime::abstract_operations::get_prototype_from_constructor;
 use crate::runtime::completion::ThrowCompletionOr;
 use crate::runtime::error::{
-    Error, EvalError, InternalError, RangeError, ReferenceError, SyntaxError, TypeError, URIError,
+    Error, ErrorKind, EvalError, InternalError, RangeError, ReferenceError, SyntaxError, TypeError, URIError,
 };
+use crate::runtime::error_data::{DEFAULT_STACK_TRACE_LIMIT, ErrorData, SkippedFrames};
+use crate::runtime::error_prototype::stack_string_of;
+use crate::runtime::error_types::ErrorType;
 use crate::runtime::function_object::FunctionObject;
 use crate::runtime::intrinsics::Intrinsics;
 use crate::runtime::native_function::{NativeFunction, define_native_function_class, raw_native};
 use crate::runtime::primitive_string::PrimitiveString;
 use crate::runtime::property_attributes::{Attribute, PropertyAttributes};
+use crate::runtime::property_descriptor::PropertyDescriptor;
 use crate::runtime::realm::Realm;
 
 #[repr(C)]
@@ -65,6 +69,14 @@ impl ErrorConstructor {
             PropertyAttributes::new(Attribute::CONFIGURABLE),
         );
 
+        // NB: Not in the specification, but the other engines have it: how many frames the stack of a new error keeps.
+        object.define_direct_property(
+            vm,
+            &vm.names.stackTraceLimit,
+            Value::from_i32(DEFAULT_STACK_TRACE_LIMIT),
+            PropertyAttributes::new(Attribute::WRITABLE | Attribute::ENUMERABLE | Attribute::CONFIGURABLE),
+        );
+
         let attributes = PropertyAttributes::new(Attribute::WRITABLE | Attribute::CONFIGURABLE);
         object.define_native_function(
             vm,
@@ -72,6 +84,15 @@ impl ErrorConstructor {
             &vm.names.isError,
             raw_native!(ErrorConstructor::is_error),
             1,
+            attributes,
+            None,
+        );
+        object.define_native_function(
+            vm,
+            realm,
+            &vm.names.captureStackTrace,
+            raw_native!(ErrorConstructor::capture_stack_trace),
+            2,
             attributes,
             None,
         );
@@ -96,7 +117,9 @@ impl ErrorConstructor {
 
         // 2. Let O be ? OrdinaryCreateFromConstructor(newTarget, "%Error.prototype%", « [[ErrorData]] »).
         let prototype = get_prototype_from_constructor(vm, new_target, Intrinsics::error_prototype)?;
-        let error = realm.create_object(vm, |_| Error::new_in_constructor(vm, realm, Error::CLASS, prototype));
+        let error = realm.create_object(vm, |_| {
+            Error::new_in_constructor(vm, realm, Error::CLASS, prototype, new_target)
+        });
 
         // 3. If message is not undefined, then
         if !message.is_undefined() {
@@ -116,6 +139,57 @@ impl ErrorConstructor {
 
         // 5. Return O.
         Ok(error.upcast())
+    }
+
+    // NB: Not in the specification, but the other engines have it: Error.captureStackTrace(object, function) gives
+    //     object an own "stack" with the frames of the running code below the innermost frame of function, or below
+    //     this function's own frame when function is not a function. The stack is a string made at once, in a data
+    //     property, as some engines do; the others have an accessor.
+    fn capture_stack_trace(vm: &Vm) -> ThrowCompletionOr<Value> {
+        let object_value = vm.argument(0);
+        if !object_value.is_object() {
+            return vm.throw_completion(ErrorKind::TypeError, ErrorType::NotAnObject, &[&object_value]);
+        }
+        let object = object_value.as_object();
+
+        // NB: As the other engines do, refuse a non-extensible object even when it has a "stack" property already.
+        if !object.is_extensible(vm)? {
+            return vm.throw_completion(
+                ErrorKind::TypeError,
+                ErrorType::ObjectIsNotExtensible,
+                &[&vm.names.stack],
+            );
+        }
+
+        // NB: A bound function or a proxy has no frame of its own, so it counts as no function at all.
+        let function = vm.argument(1);
+        let skipped_frames = if function.is_function()
+            && !function.as_object().is_bound_function()
+            && !function.as_object().is_proxy_object()
+        {
+            SkippedFrames::UpToFrameOf(function.as_function())
+        } else {
+            SkippedFrames::Count(1)
+        };
+
+        let error_data = ErrorData::new_skipping(vm, skipped_frames);
+        let stack = if error_data.has_stack() {
+            Value::from_string(PrimitiveString::create(vm, stack_string_of(vm, &object, &error_data)?))
+        } else {
+            Value::UNDEFINED
+        };
+        object.define_property_or_throw(
+            vm,
+            &vm.names.stack,
+            &mut PropertyDescriptor {
+                value: Some(stack),
+                writable: Some(true),
+                enumerable: Some(false),
+                configurable: Some(true),
+                ..PropertyDescriptor::default()
+            },
+        )?;
+        Ok(Value::UNDEFINED)
     }
 
     // 20.5.2.1 Error.isError ( arg ), https://tc39.es/ecma262/#sec-error.iserror
@@ -204,7 +278,7 @@ macro_rules! define_native_error_constructors {
 
                     // 2. Let O be ? OrdinaryCreateFromConstructor(newTarget, "%NativeError.prototype%", « [[ErrorData]] »).
                     let prototype = get_prototype_from_constructor(vm, new_target, Intrinsics::$prototype)?;
-                    let error = realm.create_object(vm, |_| $class::new_in_constructor(vm, realm, prototype));
+                    let error = realm.create_object(vm, |_| $class::new_in_constructor(vm, realm, prototype, new_target));
 
                     // 3. If message is not undefined, then
                     if !message.is_undefined() {

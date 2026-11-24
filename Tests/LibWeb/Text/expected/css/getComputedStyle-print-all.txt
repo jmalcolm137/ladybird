@@ -1,5 +1,8 @@
 -webkit-font-smoothing: auto
 -webkit-text-fill-color: rgb(0, 0, 0)
+-webkit-text-security: none
+-webkit-text-stroke-color: rgb(0, 0, 0)
+-webkit-text-stroke-width: 0px
 accent-color: auto
 block-ellipsis: no-ellipsis
 border-collapse: separate
@@ -43,6 +46,7 @@ font-weight: 400
 font-width: 100%
 forced-color-adjust: auto
 hyphenate-character: auto
+hyphens: manual
 image-rendering: auto
 interpolate-size: numeric-only
 letter-spacing: normal
@@ -91,7 +95,11 @@ widows: 2
 word-break: normal
 word-spacing: 0px
 writing-mode: horizontal-tb
+-webkit-box-align: stretch
+-webkit-box-flex: 0
+-webkit-box-ordinal-group: 1
 -webkit-box-orient: horizontal
+-webkit-box-pack: start
 align-content: normal
 align-items: normal
 align-self: auto

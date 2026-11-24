@@ -11,14 +11,16 @@
 #include <AK/NonnullRefPtr.h>
 #include <AK/Optional.h>
 #include <AK/RefPtr.h>
-#include <Compositor/CompositedContext.h>
-#include <Compositor/DisplayListPlayer.h>
+#include <AK/Vector.h>
+#include <Compositor/DrawnResources.h>
 #include <Compositor/Forward.h>
-#include <Compositor/ScrollbarController.h>
-#include <LibCompositing/DisplayList/DisplayList.h>
 #include <LibCompositing/DisplayList/DisplayListCommand.h>
+#include <LibCompositing/DisplayList/DisplayListResources.h>
+#include <LibCompositing/RustFFI.h>
 #include <LibGfx/Forward.h>
 #include <LibGfx/Rect.h>
+#include <LibMedia/VideoSinkHandle.h>
+#include <LibMediaCodecs/VideoFrame.h>
 
 class GrDirectContext;
 class SkColorFilter;
@@ -35,7 +37,11 @@ namespace Compositor {
 // take — as a Skia runtime effect. Exposed so a benchmark can time the shipped effect, rather than a copy of it.
 sk_sp<SkColorFilter> force_dark_image_color_filter();
 
-class DisplayListPlayerSkia final : public DisplayListPlayer {
+using PresentedScrollbar = Compositing::RustFFI::PresentedScrollbar;
+
+// Paints with Skia whatever a Rust replay draws through the raster painter it is handed. It knows nothing of the
+// visual context tree, scroll offsets or frames: every value it gets is resolved for what it draws.
+class DisplayListPlayerSkia final {
 public:
     AK_ALLOC_WITH_KMALLOC;
 
@@ -43,39 +49,74 @@ public:
     explicit DisplayListPlayerSkia(RefPtr<Gfx::SkiaBackendContext>);
     ~DisplayListPlayerSkia();
 
-    void execute(
-        Compositing::DisplayList const&,
-        Compositing::AccumulatedVisualContextTree const&,
-        Compositing::DisplayListResourceStorage const&,
-        DisplayListRasterCache&,
-        Compositing::ScrollStateSnapshot const&,
-        RefPtr<Gfx::PaintingSurface>,
-        OwnedCanvasSurfaces const*,
-        CompositedContextResolver const*,
-        ScrollbarController const* = nullptr);
+    // Answers the frame that a video sink shows now, which is null for a sink that shows none.
+    using CurrentVideoFrame = Function<RefPtr<Media::VideoFrame>(Media::VideoSinkHandle)>;
 
-    void flush(Gfx::PaintingSurface&) override;
-    void flush_async(Gfx::PaintingSurface&, Function<void()>&&);
-    void paint_scrollbar(Gfx::PaintingSurface&, ScrollbarController::PresentedScrollbar const&);
+    // The painter paints into `surface`, with `fonts`, `image_frames` and the caches of `raster_cache`, until
+    // end_painting(). It draws no image frame without `image_frames`, no canvas without `canvas_surfaces`, and no video
+    // without `current_video_frame`.
+    Compositing::RustFFI::FfiRasterPainter begin_painting(Gfx::PaintingSurface&, DrawnFonts const&, DrawnImageFrames const*, DisplayListRasterCache&, OwnedCanvasSurfaces const*, CurrentVideoFrame, bool allows_lcd_text = false);
+    void end_painting();
+
+    static void flush(Gfx::PaintingSurface&);
+    static void flush_async(Gfx::PaintingSurface&, Function<void()>&&);
 
 private:
-#define DECLARE_PLAY_COMMAND(command_type) \
-    void play_command(Compositing::command_type const&) override;
-    ENUMERATE_DISPLAY_LIST_COMMANDS(DECLARE_PLAY_COMMAND)
-#undef DECLARE_PLAY_COMMAND
-    void set_matrix(Gfx::FloatMatrix4x4 const&) override;
-    Gfx::FloatMatrix4x4 canvas_matrix() const override;
-    bool would_be_fully_clipped_by_painter(Gfx::IntRect) const override;
+    struct PainterCallbacks;
 
-    void push_clip(Compositing::ReplayClip const&) override;
-    void push_clip_path(Gfx::PathData const&, u64 path_identity, Gfx::WindingRule) override;
-    void push_clip_path_bytes(ReadonlyBytes, Gfx::WindingRule) override;
-    void push_transform(Gfx::AffineTransform const&) override;
-    void push_layer(Compositing::ReplayLayer const&) override;
-    void push_mask(Compositing::ReplayMask const&, Compositing::ReplayLayer const* backdrop) override;
-    void pop_mask(Compositing::ReplayMask const&, Compositing::EffectNodeIndex) override;
-    void pop() override;
-    void push_device_space_plane_clip(ReadonlySpan<Gfx::FloatVector3> polygon_vertices) override;
+    Gfx::PaintingSurface& surface() const;
+    Gfx::Font const& font(Compositing::FontResourceId id) const { return m_fonts->font(id); }
+    Compositing::RegisteredImageFrame const& image_frame(Compositing::ImageFrameResourceId id) const { return m_image_frames->image_frame(id); }
+    OwnedCanvasSurfaces const* canvas_surfaces() const { return m_canvas_surfaces; }
+    DisplayListRasterCache& raster_cache() const { return *m_raster_cache; }
+
+    ReadonlyBytes inline_data(Compositing::DisplayListDataSpan span) const
+    {
+        VERIFY(static_cast<size_t>(span.offset) + span.size <= m_current_command_payload.size());
+        return m_current_command_payload.slice(span.offset, span.size);
+    }
+    template<typename T>
+    ReadonlySpan<T> inline_objects(Compositing::DisplayListDataSpan span) const
+    {
+        static_assert(alignof(T) <= Compositing::display_list_payload_alignment);
+        auto bytes = inline_data(span);
+        VERIFY(bytes.size() % sizeof(T) == 0);
+        VERIFY(reinterpret_cast<FlatPtr>(bytes.data()) % alignof(T) == 0);
+        return { reinterpret_cast<T const*>(bytes.data()), bytes.size() / sizeof(T) };
+    }
+
+    void play_command_bytes(Compositing::DisplayListCommandType, u8 const* command, ReadonlyBytes payload);
+#define DECLARE_PLAY_COMMAND(command_type) \
+    void play_command(Compositing::command_type const&);
+    ENUMERATE_DISPLAY_LIST_COMMANDS_PLAYED_AS_RECORDED(DECLARE_PLAY_COMMAND)
+#undef DECLARE_PLAY_COMMAND
+
+    void set_matrix(Gfx::FloatMatrix4x4 const&);
+    Gfx::FloatMatrix4x4 canvas_matrix() const;
+    bool would_be_fully_clipped_by_painter(Gfx::IntRect) const;
+    void push_clip(Compositing::ReplayClip const&);
+    void push_clip_path(Gfx::PathData const&, u64 path_identity, Gfx::WindingRule);
+    void push_clip_path_bytes(ReadonlyBytes, Gfx::WindingRule, Compositing::ClipMode);
+    void push_transform(Gfx::AffineTransform const&);
+    void push_layer(Compositing::ReplayLayer const&);
+    void push_mask(Compositing::ReplayMask const&, Compositing::ReplayLayer const* backdrop);
+    void begin_mask_content(Compositing::ReplayMask const&);
+    void pop_mask();
+    void pop();
+    void push_device_space_plane_clip(ReadonlySpan<Gfx::FloatVector3> polygon_vertices);
+    void fill_rect(Compositing::RustFFI::ResolvedFillRect const&);
+    void fill_rect_with_rounded_corners(Compositing::RustFFI::ResolvedFillRectWithRoundedCorners const&);
+    void paint_scrollbar(PresentedScrollbar const&);
+    void draw_composited_context(Compositing::RustFFI::CompositedContextDraw const&);
+    void begin_isolated_group(Compositing::RustFFI::IsolatedGroup const&);
+    void begin_isolated_group_mask(Gfx::MaskKind);
+    void end_isolated_group_mask();
+    void end_isolated_group();
+    bool begin_tile_raster(Compositing::RustFFI::TileRaster const&);
+    void end_tile_raster();
+    Compositing::RustFFI::VectorImageReplay begin_vector_image(Compositing::RustFFI::VectorImagePlacement const&, bool requires_direct_replay);
+    void end_vector_image();
+    void draw_surface(Compositing::RustFFI::SurfaceDraw const&);
 
     void clip_path(SkPath, Gfx::WindingRule, bool anti_aliased);
 
@@ -84,16 +125,24 @@ private:
     sk_sp<SkImageFilter> backdrop_image_filter(Compositing::ReplayLayer const&, bool limited_to_region);
     sk_sp<SkImageFilter> image_filter_from_bytes(ReadonlyBytes, Optional<Gfx::FloatRect> blur_edge = {});
     SkPath path_from_data(Compositing::DisplayListDataSpan) const;
-    sk_sp<SkImage> rasterize_records_into_tile(ReadonlyBytes tile_records, Gfx::IntRect tile_rect);
     ReadonlySpan<Color> gradient_colors(Compositing::DisplayListGradientColorStops) const;
     ReadonlySpan<float> gradient_positions(Compositing::DisplayListGradientColorStops) const;
 
     RefPtr<Gfx::SkiaBackendContext> m_skia_backend_context;
-    CompositedContextResolver const* m_composited_context_resolver { nullptr };
-    // Says how opaque the scrollbars that the display list paints are.
-    ScrollbarController const* m_scrollbar_controller { nullptr };
+
+    // The surface painted into last, which a tile or vector image raster stacks on top of the target.
+    Vector<NonnullRefPtr<Gfx::PaintingSurface>, 4> m_surfaces;
+    DrawnFonts const* m_fonts { nullptr };
+    DrawnImageFrames const* m_image_frames { nullptr };
     DisplayListRasterCache* m_raster_cache { nullptr };
-    DisplayListRasterCache& raster_cache() const { return *m_raster_cache; }
+    OwnedCanvasSurfaces const* m_canvas_surfaces { nullptr };
+    bool m_allows_lcd_text { false };
+    CurrentVideoFrame m_current_video_frame;
+    ReadonlyBytes m_current_command_payload;
+
+    // The tile and vector image rasters the painter replays into, which hold Skia objects.
+    struct RasterState;
+    NonnullOwnPtr<RasterState> m_raster_state;
 };
 
 }

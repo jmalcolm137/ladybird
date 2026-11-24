@@ -64,6 +64,24 @@ static Optional<String> read_family(hb_face_t* face)
     return {};
 }
 
+// https://learn.microsoft.com/en-us/typography/opentype/spec/cmap#windows-platform-platform-id--3
+static bool has_windows_symbol_encoding(hb_face_t* face)
+{
+    static constexpr u16 windows_platform_id = 3;
+    static constexpr u16 symbol_encoding_id = 0;
+
+    FontTable cmap { face, FourCC { "cmap" } };
+    if (!cmap.contains(0, 4))
+        return false;
+    size_t record_count = cmap.u16_at(2);
+    for (size_t index = 0; index < record_count && cmap.contains(4 + 8 * index, 4); ++index) {
+        auto record = 4 + 8 * index;
+        if (cmap.u16_at(record) == windows_platform_id && cmap.u16_at(record + 2) == symbol_encoding_id)
+            return true;
+    }
+    return false;
+}
+
 // https://learn.microsoft.com/en-us/typography/opentype/spec/os2#fsselection
 static constexpr u16 italic_selection_bit = 1 << 0;
 static constexpr u16 oblique_selection_bit = 1 << 9;
@@ -98,7 +116,8 @@ static FaceStyle read_declared_style(hb_face_t* face)
     return style;
 }
 
-// The ascender, the descender and the x-height at the default coordinates. A font adds the deltas of its variations.
+// The ascender, the descender, the line gap and the x-height at the default coordinates. A font adds the deltas of its
+// variations.
 static FaceVerticalMetrics read_vertical_metrics(hb_face_t* face)
 {
     // A new font has the scale of the face, so positions are in font units.
@@ -111,6 +130,24 @@ static FaceVerticalMetrics read_vertical_metrics(hb_face_t* face)
     metrics.ascender = position;
     hb_ot_metrics_get_position_with_fallback(font, HB_OT_METRICS_TAG_HORIZONTAL_DESCENDER, &position);
     metrics.descender = position;
+    if (hb_ot_metrics_get_position(font, HB_OT_METRICS_TAG_HORIZONTAL_LINE_GAP, &position))
+        metrics.line_gap = position;
+
+    // https://learn.microsoft.com/en-us/typography/opentype/spec/os2
+    // NB: Some fonts leave the ascender and descender of their hhea table at 0, and give them only in their OS/2 table.
+    //     Such a font takes them from the OS/2 typo metrics instead, or from its win metrics where those are 0 too.
+    if (metrics.ascender == 0 && metrics.descender == 0) {
+        FontTable os2 { face, FourCC { "OS/2" } };
+        if (os2.contains(68, 4) && (os2.i16_at(68) != 0 || os2.i16_at(70) != 0)) {
+            metrics.ascender = os2.i16_at(68);
+            metrics.descender = os2.i16_at(70);
+            metrics.line_gap = os2.contains(72, 2) ? os2.i16_at(72) : 0;
+        } else if (os2.contains(74, 4)) {
+            metrics.ascender = os2.u16_at(74);
+            metrics.descender = -static_cast<i32>(os2.u16_at(76));
+            metrics.line_gap = 0;
+        }
+    }
     if (hb_ot_metrics_get_position(font, HB_OT_METRICS_TAG_X_HEIGHT, &position))
         metrics.x_height = position;
 
@@ -123,6 +160,7 @@ FaceDescription FaceDescription::read(hb_face_t* face)
     FaceDescription description;
     if (auto family = read_family(face); family.has_value())
         description.m_family = FlyString { family.release_value() };
+    description.m_is_symbol_font = has_windows_symbol_encoding(face);
     description.m_declared_style = read_declared_style(face);
     description.m_vertical_metrics = read_vertical_metrics(face);
 

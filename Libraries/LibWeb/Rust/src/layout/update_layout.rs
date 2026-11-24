@@ -40,7 +40,11 @@ fn run_layout_round_job(host: &DocumentHost, read: &BegunRead, job: LayoutRoundJ
         let mut answer = job.run(state.arena_handle_mut());
         answer.prepare_committed_layout_for_rendering(state.arena_mut());
         // The host reads what each box owed an image is from rows published with the answer.
-        let rows = (!answer.owed_images.is_empty()).then(|| state.arena_mut().publish_row_snapshot(false));
+        let rows = (!answer.owed_images.is_empty()).then(|| {
+            state
+                .arena_mut()
+                .publish_row_snapshot(crate::layout::row_reads::MeasuredOverflow::None)
+        });
         (answer, rows)
     });
     if let Some(rows) = rows {
@@ -76,7 +80,6 @@ pub struct FfiLayoutUpdateHostCallbacks {
     /// that may take the partial relayout path asks.
     container_query_evaluation_is_pending: extern "C" fn(*mut c_void, &BegunRead) -> bool,
     needs_style_update_after_layout: extern "C" fn(*mut c_void, &BegunRead) -> bool,
-    prepare_for_rendering: extern "C" fn(*mut c_void, &BegunRead),
     /// Readies the document for a layout tree build, and answers the document's style, interned as a
     /// record, where the flag says the build may build the viewport, and 0 otherwise.
     prepare_layout_tree_build: extern "C" fn(*mut c_void, &BegunRead, bool) -> u64,
@@ -89,7 +92,6 @@ pub struct FfiLayoutUpdateHostCallbacks {
         extern "C" fn(*mut c_void, *const FfiNodeIdentity, usize) -> bool,
     /// Refreshes what derives from committed layout; the flag says whether the tree changed.
     after_layout_commit: extern "C" fn(*mut c_void, &BegunRead, bool),
-    note_full_layout_performed: extern "C" fn(*mut c_void),
     evaluate_pending_container_queries: extern "C" fn(*mut c_void, &BegunRead),
     /// Records that a layout update ran out of its exact bound, and answers what the document still has pending, for
     /// the panic that reports the failure, describing the elements the last unstyled-element report and the last
@@ -121,10 +123,12 @@ pub struct FfiLayoutUpdateDocumentFacts {
     pub document_is_active: bool,
     /// The document node or one of its descendants needs a layout tree update.
     pub document_needs_layout_tree_build: bool,
-    /// A top layer membership change or zone rebuild is waiting for the next pass.
+    /// A top layer membership change is waiting for the next pass.
     pub top_layer_work_pending: bool,
     pub should_collect_devtools_layout_data: bool,
     pub document_in_quirks_mode: bool,
+    pub document_in_limited_quirks_mode: bool,
+    pub suppresses_viewport_scrolling: bool,
     pub viewport_inline_size_raw: i32,
     pub viewport_block_size_raw: i32,
     /// The document's style node, which a layout tree build walks from.
@@ -146,10 +150,8 @@ pub struct FfiStabilizationBoundFailureHostFacts {
     pub has_flown_style_update: bool,
     pub size_containers_await_evaluation: bool,
     pub list_items_await_renumbering: bool,
-    pub top_layer_zone_rebuild_pending: bool,
     pub top_layer_membership_changes_pending: bool,
     pub document_needs_layout_tree_update: bool,
-    pub document_child_needs_layout_tree_update: bool,
 }
 
 /// What one layout update was asked for.
@@ -159,16 +161,6 @@ pub struct FfiLayoutUpdateInputs {
     pub reason_is_inspect_devtools_layout_data: bool,
     /// A document hosting template contents never needs layout.
     pub is_template_contents_document: bool,
-}
-
-/// Confinement report of the most recent layout tree build, for tests observing whether a
-/// partial rebuild stayed inside its rebuilt subtrees.
-#[derive(Clone, Copy, Default)]
-#[repr(C)]
-pub struct FfiLayoutTreeBuildStats {
-    pub builds: u64,
-    pub last_build_rebuilt_subtree_roots: u64,
-    pub last_build_escaped_rebuild_roots: bool,
 }
 
 impl FfiLayoutUpdateHostCallbacks {
@@ -200,10 +192,6 @@ impl FfiLayoutUpdateHostCallbacks {
         (self.needs_style_update_after_layout)(self.context, read)
     }
 
-    fn prepare_for_rendering(&self, _: &MainThread, read: &BegunRead) {
-        (self.prepare_for_rendering)(self.context, read);
-    }
-
     fn prepare_layout_tree_build(&self, _: &MainThread, read: &BegunRead, may_create_viewport: bool) -> Option<u64> {
         let record = (self.prepare_layout_tree_build)(self.context, read, may_create_viewport);
         (record != 0).then_some(record)
@@ -233,10 +221,6 @@ impl FfiLayoutUpdateHostCallbacks {
 
     fn after_layout_commit(&self, _: &MainThread, read: &BegunRead, layout_tree_changed: bool) {
         (self.after_layout_commit)(self.context, read, layout_tree_changed);
-    }
-
-    fn note_full_layout_performed(&self, _: &MainThread) {
-        (self.note_full_layout_performed)(self.context);
     }
 
     fn evaluate_pending_container_queries(&self, _: &MainThread, read: &BegunRead) {
@@ -354,8 +338,6 @@ struct StabilizationTrace {
     full_layouts_leaving_layout: u64,
     /// Elements the builds reached without a style.
     unstyled_elements_reached: u64,
-    /// Rebuilds the builds requested for a box that escaped its rebuild root.
-    rebuild_requests: u64,
     /// The builds' other reports.
     other_build_reports: u64,
 }
@@ -369,7 +351,6 @@ impl StabilizationTrace {
         for report in &built.reports {
             match report.kind {
                 FfiCommitMessageKind::UnstyledElementReached => self.unstyled_elements_reached += 1,
-                FfiCommitMessageKind::LayoutTreeRebuildRequested => self.rebuild_requests += 1,
                 _ => self.other_build_reports += 1,
             }
         }
@@ -388,7 +369,7 @@ impl StabilizationTrace {
     ) -> String {
         let facts = host.document_facts(main_thread, read);
         let connected_elements = host.connected_element_count(main_thread, read);
-        let (root_is_invalid, root_needs_layout, needs_full_tree_update, boundary_roots, updates_escaped, deferred) =
+        let (root_is_invalid, root_needs_layout, needs_full_tree_update, boundary_roots, updates_escaped) =
             read_arena(document_host, read, (), |arena, ()| {
                 let root = arena.layout_root();
                 (
@@ -397,7 +378,6 @@ impl StabilizationTrace {
                     arena.needs_full_layout_tree_update(),
                     arena.partial_relayout_boundary_roots.roots().len(),
                     arena.pending_updates_escape_partial_relayout,
-                    arena.deferred_child_list_insertion_parents.len(),
                 )
             });
         let facts_that_hold: Vec<&str> = [
@@ -414,15 +394,10 @@ impl StabilizationTrace {
             (host_facts.has_flown_style_update, "flown style update"),
             (host_facts.size_containers_await_evaluation, "size containers"),
             (host_facts.list_items_await_renumbering, "list item renumbering"),
-            (host_facts.top_layer_zone_rebuild_pending, "top layer zone rebuild"),
             (host_facts.top_layer_membership_changes_pending, "top layer membership"),
             (
                 host_facts.document_needs_layout_tree_update,
                 "document tree update mark",
-            ),
-            (
-                host_facts.document_child_needs_layout_tree_update,
-                "document child tree update mark",
             ),
         ]
         .into_iter()
@@ -431,8 +406,8 @@ impl StabilizationTrace {
         format!(
             "{passes} passes for {connected_elements} connected elements of a {} document: {} flown, {} builds asking \
              another pass, {} counter reconciles, partial layouts leaving style {}/layout {}, full layouts leaving \
-             style {}/top layer {}/layout {}; {} boundary roots, {} deferred insertions; facts: {}; build reports: {} \
-             unstyled elements, {} rebuild requests, {} other",
+             style {}/top layer {}/layout {}; {} boundary roots; facts: {}; build reports: {} \
+             unstyled elements, {} other",
             if host_facts.document_is_top_level {
                 "top-level"
             } else {
@@ -447,14 +422,12 @@ impl StabilizationTrace {
             self.full_layouts_leaving_top_layer,
             self.full_layouts_leaving_layout,
             boundary_roots,
-            deferred,
             if facts_that_hold.is_empty() {
                 "none".to_string()
             } else {
                 facts_that_hold.join(", ")
             },
             self.unstyled_elements_reached,
-            self.rebuild_requests,
             self.other_build_reports,
         )
     }
@@ -551,7 +524,7 @@ impl OwedImage {
             return Vec::new();
         }
         let owed: Vec<_> = owed
-            .into_iter()
+            .iter()
             // A box a build visits again with the style record it was owed resources for holds them already.
             .filter(|&(row, owed)| {
                 arena.slot_is_live(row)
@@ -687,7 +660,7 @@ impl ClockRound {
         }
         Ok(arena
             .document_style_node()
-            .filter(|&document| arena.layout_tree_update_marks().child_needs(document))
+            .filter(|_| arena.layout_tree_update_marks_need_build())
             .map(|document| TreeBuildJob::new(document, None)))
     }
 
@@ -770,11 +743,13 @@ impl LayoutRoundJob {
         let mut answer = self.run_with(state, &work);
         answer.work = work.resolve(state.arena_mut());
         answer.owed_images = OwedImage::take_from(state.arena_mut());
+        state.arena_mut().note_layout_round_ended();
         answer
     }
 
     fn run_with(mut self, state: &mut ArenaHandle, work: &OwedHostWork) -> LayoutRoundAnswer {
         let facts = self.facts;
+        state.arena_mut().suppresses_viewport_scrolling = facts.suppresses_viewport_scrolling;
         if self.build.is_none()
             && state.arena().layout_tree_update_marks_need_build()
             && let Some(document) = state.arena().document_style_node()
@@ -794,6 +769,7 @@ impl LayoutRoundJob {
             viewport_inline_size: crate::layout::CssPixels::from_raw(facts.viewport_inline_size_raw),
             viewport_block_size: crate::layout::CssPixels::from_raw(facts.viewport_block_size_raw),
             document_in_quirks_mode: facts.document_in_quirks_mode,
+            document_in_limited_quirks_mode: facts.document_in_limited_quirks_mode,
         };
         // The round cannot call the host, which hears of the boxes nodes gain and lose once it is over.
         state.arena_mut().queue_box_presence();
@@ -832,8 +808,8 @@ impl LayoutRoundJob {
             }
 
             let arena = state.arena_mut();
-            // Among the boundaries are those the build registered where it invalidated what deferred child list
-            // insertions reach.
+            // Among the boundaries are those the build registered where it invalidated what its child list changes
+            // reach.
             let boundaries = arena.take_partial_relayout_boundary_roots();
             if let Some(planned) =
                 arena.plan_partial_relayout_with_pending_rebuilt_roots(arena.layout_root(), &boundaries)
@@ -841,11 +817,13 @@ impl LayoutRoundJob {
                 for boundary in &planned {
                     debug_assert!(node_facts::kind_is_box(arena.data(boundary.root()).kind.get()));
                 }
-                sync_enrolled_content_for_layout(state.arena_mut());
-                for boundary in planned {
-                    answer.commits.push(lay_out_boundary(state, boundary, stage));
+                // NB: A build whose changes left no box to lay out again lays nothing out.
+                if !planned.is_empty() {
+                    sync_enrolled_content_for_layout(state.arena_mut());
+                    for boundary in planned {
+                        answer.commits.push(lay_out_boundary(state, boundary, stage));
+                    }
                 }
-                state.arena_mut().note_partial_layout();
                 answer.end = LayoutRoundEnd::PartialLayout;
                 return answer;
             }
@@ -882,13 +860,12 @@ impl LayoutRoundJob {
             facts.should_collect_devtools_layout_data,
         );
         answer.commits.push(commit);
-        state.arena_mut().note_full_layout();
         answer
     }
 
-    /// Runs `build`, records it, and answers how the round goes on from it. A build that shows the value of a
-    /// `list-item` counter, while some list's counters are stale, may show a stale one: the document reconciles them
-    /// with what was built before anything is laid out.
+    /// Runs `build`, records it, and answers how the round goes on from it. A build of some subtrees that shows the
+    /// value of a `list-item` counter, while some list's counters are stale, may show a stale one: the document
+    /// reconciles them with what was built before anything is laid out.
     fn build(
         state: &mut ArenaHandle,
         build: TreeBuildJob,
@@ -898,13 +875,21 @@ impl LayoutRoundJob {
     ) -> BuildEnd {
         let replaced_viewport = state.arena().layout_root();
         let built = build.run(state, work);
-        state.arena_mut().record_layout_tree_build(&built.outcome);
+        // A build of the whole tree resolves every counter again, so no counter it shows is stale, and the document
+        // is the root it rebuilt.
         if has_stale_list_item_counters {
-            answer.rebuilt_roots = state.arena().pending_rebuilt_dom_roots();
+            answer.rebuilt_roots = if built.rebuilt_whole_tree {
+                vec![crate::painting::host::FfiNodeIdentity {
+                    style_node: 0,
+                    is_document: true,
+                }]
+            } else {
+                state.arena().pending_rebuilt_dom_roots()
+            };
         }
         let end = if built.outcome.needs_another_build_pass {
             BuildEnd::AnotherPass
-        } else if has_stale_list_item_counters && built.shows_list_item_counter_value() {
+        } else if has_stale_list_item_counters && !built.rebuilt_whole_tree && built.shows_list_item_counter_value() {
             BuildEnd::ReconcileCounters
         } else {
             BuildEnd::LayOut
@@ -963,6 +948,7 @@ impl LayoutRoundAnswer {
             host.finish_layout_tree_build(main_thread, read, replaced_viewport, built.outcome.viewport);
         }
         if self.commits.is_empty() {
+            super::trace::name_layout_trace_owners(main_thread, read);
             return;
         }
         for commit in self.commits.drain(..) {
@@ -1082,7 +1068,6 @@ fn take_flown_layout_in(main_thread: &MainThread, document_host: &DocumentHost, 
         LayoutRoundEnd::Built { .. } | LayoutRoundEnd::NeedsDocumentStyle => return false,
         LayoutRoundEnd::PartialLayout => host.after_layout_commit(main_thread, read, rebuilds_tree),
         LayoutRoundEnd::FullLayout => {
-            host.note_full_layout_performed(main_thread);
             host.after_layout_commit(main_thread, read, true);
             host.evaluate_pending_container_queries(main_thread, read);
         }
@@ -1142,7 +1127,7 @@ fn update_layout(
                     inspection_round_pending && facts.should_collect_devtools_layout_data;
                 inspection_round_pending = false;
                 if host_layout_is_up_to_date(document_host, read, &facts) && !force_devtools_layout_data_collection {
-                    host.prepare_for_rendering(main_thread, read);
+                    crate::painting::paint_passes::prepare_for_rendering_if_pending(main_thread, document_host, read);
                     return;
                 }
 
@@ -1224,7 +1209,6 @@ fn update_layout(
             Some(LayoutRoundEnd::FullLayout) => {}
         }
 
-        host.note_full_layout_performed(main_thread);
         host.after_layout_commit(main_thread, read, true);
 
         host.evaluate_pending_container_queries(main_thread, read);
@@ -1235,7 +1219,7 @@ fn update_layout(
         }
 
         let facts = host.document_facts(main_thread, read);
-        // A zone rebuild requested during layout tree construction runs as another pass.
+        // A top layer membership change made during layout runs as another pass.
         if facts.top_layer_work_pending {
             trace.full_layouts_leaving_top_layer += 1;
             continue;
@@ -1294,7 +1278,6 @@ pub extern "C" fn document_host_update_layout_is_running(host: &DocumentHost) ->
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::layout::tree_builder::FfiLayoutTreeBuildOutcome;
 
     fn facts_for() -> FfiLayoutUpdateDocumentFacts {
         FfiLayoutUpdateDocumentFacts {
@@ -1303,6 +1286,8 @@ mod tests {
             top_layer_work_pending: false,
             should_collect_devtools_layout_data: false,
             document_in_quirks_mode: false,
+            document_in_limited_quirks_mode: false,
+            suppresses_viewport_scrolling: false,
             viewport_inline_size_raw: 0,
             viewport_block_size_raw: 0,
             document_style_node: 0,
@@ -1372,28 +1357,5 @@ mod tests {
         arena
             .free_subtree(viewport)
             .destroy_shells_and_invoke_callbacks(&crate::stage::MainThread::for_test());
-    }
-
-    #[test]
-    fn the_layout_counters_start_at_zero_and_count_each_pass() {
-        let mut arena = LayoutNodeArena::new();
-        assert_eq!(arena.partial_layout_count(), 0);
-        assert_eq!(arena.full_layout_count(), 0);
-        assert_eq!(arena.layout_tree_build_stats().builds, 0);
-        arena.note_partial_layout();
-        arena.note_full_layout();
-        arena.note_full_layout();
-        arena.record_layout_tree_build(&FfiLayoutTreeBuildOutcome {
-            viewport: NodeSlotId::INVALID,
-            rebuilt_subtree_root_count: 3,
-            layout_tree_update_escaped_rebuild_roots: true,
-            needs_another_build_pass: false,
-        });
-        assert_eq!(arena.partial_layout_count(), 1);
-        assert_eq!(arena.full_layout_count(), 2);
-        let stats = arena.layout_tree_build_stats();
-        assert_eq!(stats.builds, 1);
-        assert_eq!(stats.last_build_rebuilt_subtree_roots, 3);
-        assert!(stats.last_build_escaped_rebuild_roots);
     }
 }

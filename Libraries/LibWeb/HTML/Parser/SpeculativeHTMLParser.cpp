@@ -21,6 +21,7 @@
 #include <LibWeb/Fetch/Infrastructure/HTTP/Responses.h>
 #include <LibWeb/HTML/CORSSettingAttribute.h>
 #include <LibWeb/HTML/Parser/HTMLParser.h>
+#include <LibWeb/HTML/Parser/RustUtf16View.h>
 #include <LibWeb/HTML/Parser/SpeculativeHTMLParser.h>
 #include <LibWeb/HTML/PotentialCORSRequest.h>
 #include <LibWeb/HTML/PreloadEntry.h>
@@ -34,20 +35,23 @@ namespace Web::HTML {
 
 GC_DEFINE_ALLOCATOR(SpeculativeHTMLParser);
 
-GC::Ref<SpeculativeHTMLParser> SpeculativeHTMLParser::create(GC::Ref<DOM::Document> document, Utf16String pending_input, URL::URL base_url, ParserScriptingMode scripting_mode)
+GC::Ref<SpeculativeHTMLParser> SpeculativeHTMLParser::create(GC::Ref<DOM::Document> document, ParserScriptingMode scripting_mode)
 {
-    return document->relevant_settings_object().realm().create<SpeculativeHTMLParser>(document, move(pending_input), move(base_url), scripting_mode);
+    return document->relevant_settings_object().realm().create<SpeculativeHTMLParser>(document, scripting_mode);
 }
 
-SpeculativeHTMLParser::SpeculativeHTMLParser(GC::Ref<DOM::Document> document, Utf16String pending_input, URL::URL base_url, ParserScriptingMode scripting_mode)
+SpeculativeHTMLParser::SpeculativeHTMLParser(GC::Ref<DOM::Document> document, ParserScriptingMode scripting_mode)
     : m_document(document)
-    , m_input(move(pending_input))
-    , m_base_url(move(base_url))
-    , m_scripting_mode(scripting_mode)
+    , m_scanner(rust_html_preload_scanner_create(scripting_mode != ParserScriptingMode::Disabled))
 {
 }
 
-SpeculativeHTMLParser::~SpeculativeHTMLParser() = default;
+void SpeculativeHTMLParser::finalize()
+{
+    Base::finalize();
+    rust_html_preload_scanner_destroy(m_scanner);
+    m_scanner = nullptr;
+}
 
 void SpeculativeHTMLParser::visit_edges(JS::Cell::Visitor& visitor)
 {
@@ -61,6 +65,20 @@ void SpeculativeHTMLParser::stop()
     // 3. Throw away any pending content in speculativeParser's input stream, and discard any future content
     //    that would have been added to it.
     m_stopped = true;
+}
+
+void SpeculativeHTMLParser::take_unscanned_input(RustFfiTokenizerHandle* tokenizer, URL::URL const& base_url)
+{
+    m_stopped = false;
+
+    // NB: A scan resolves URLs against the document's base URL as it was when the scan started, so once that has
+    //     changed, the scan starts over.
+    auto start_over = base_url != m_document_base_url;
+    m_document_base_url = base_url;
+
+    // NB: A scan that starts over leaves behind any base element the last one found ahead of the parser.
+    if (!rust_html_preload_scanner_append_parser_input(m_scanner, tokenizer, start_over))
+        m_base_url = base_url;
 }
 
 void SpeculativeHTMLParser::run()
@@ -77,14 +95,7 @@ void SpeculativeHTMLParser::run()
         return !parser.m_stopped;
     };
 
-    auto scripting_enabled = m_scripting_mode != ParserScriptingMode::Disabled;
-    auto input = m_input.utf16_view();
-    if (input.has_latin1_storage()) {
-        rust_html_preload_scanner_scan_latin1(input.latin1_span(), scripting_enabled, this, scanner_callback);
-    } else {
-        auto code_units = input.utf16_span();
-        rust_html_preload_scanner_scan_utf16({ reinterpret_cast<u16 const*>(code_units.data()), code_units.size() }, scripting_enabled, this, scanner_callback);
-    }
+    rust_html_preload_scanner_scan(m_scanner, this, scanner_callback);
 }
 
 namespace {
@@ -187,16 +198,14 @@ void issue_speculative_fetch(JS::Realm& realm, DOM::Document& document, URL::URL
     (void)Fetch::Fetching::fetch(realm, request, Fetch::Infrastructure::FetchAlgorithms::create(move(fetch_algorithms_input)));
 }
 
-Utf16String utf16_string_from_preload_scanner(u8 const* pointer, size_t length)
+Utf16String utf16_string_from_preload_scanner(RustFfiHtmlUtf16View view)
 {
-    if (length == 0)
-        return {};
-    return Utf16String::from_utf8(ffi_string_view(pointer, length));
+    return Utf16String::from_utf16(utf16_view_from_ffi(view));
 }
 
 bool media_attribute_matches_environment(DOM::Document const& document, RustFfiPreloadScannerEntry const& entry)
 {
-    auto media = utf16_string_from_preload_scanner(entry.media_ptr, entry.media_len);
+    auto media = utf16_string_from_preload_scanner(entry.media);
     return CSS::RustMediaList::parse(media).evaluate(document);
 }
 
@@ -210,15 +219,15 @@ void issue_speculative_module_fetch(DOM::Document& document, URL::URL const& url
 {
     auto& settings_object = document.relevant_settings_object();
     auto integrity_metadata = entry.integrity_present
-        ? utf16_string_from_preload_scanner(entry.integrity_ptr, entry.integrity_len)
+        ? utf16_string_from_preload_scanner(entry.integrity)
         : resolve_a_module_integrity_metadata(url, settings_object);
     ScriptFetchOptions options {
-        .cryptographic_nonce = utf16_string_from_preload_scanner(entry.nonce_ptr, entry.nonce_len),
+        .cryptographic_nonce = utf16_string_from_preload_scanner(entry.nonce),
         .integrity_metadata = move(integrity_metadata),
         .parser_metadata = parser_metadata,
         .credentials_mode = cors_settings_attribute_credentials_mode(cors_setting_from_preload_scanner(entry.cors_setting)),
-        .referrer_policy = ReferrerPolicy::from_string(utf16_string_from_preload_scanner(entry.referrer_policy_ptr, entry.referrer_policy_len)).value_or(ReferrerPolicy::ReferrerPolicy::EmptyString),
-        .fetch_priority = Fetch::Infrastructure::request_priority_from_string(utf16_string_from_preload_scanner(entry.fetch_priority_ptr, entry.fetch_priority_len)).value_or(Fetch::Infrastructure::Request::Priority::Auto),
+        .referrer_policy = ReferrerPolicy::from_string(utf16_string_from_preload_scanner(entry.referrer_policy)).value_or(ReferrerPolicy::ReferrerPolicy::EmptyString),
+        .fetch_priority = Fetch::Infrastructure::request_priority_from_string(utf16_string_from_preload_scanner(entry.fetch_priority)).value_or(Fetch::Infrastructure::Request::Priority::Auto),
     };
 
     // NB: A speculative fetch must not populate the module map. A CSP meta element can appear between the parser's
@@ -266,8 +275,8 @@ void issue_speculative_module_script_fetch(DOM::Document& document, URL::URL con
 
 void SpeculativeHTMLParser::process_preload_scanner_entry(RustFfiPreloadScannerEntry const& entry)
 {
-    auto url_string = ffi_string_view(entry.url_ptr, entry.url_len);
-    if (url_string.is_empty())
+    auto url_view = utf16_view_from_ffi(entry.url);
+    if (url_view.is_empty())
         return;
 
     // https://html.spec.whatwg.org/multipage/parsing.html#speculative-fetch
@@ -276,7 +285,7 @@ void SpeculativeHTMLParser::process_preload_scanner_entry(RustFfiPreloadScannerE
         // 1. If the speculative HTML parser encounters one of the following elements, then act as if that
         //    element is processed for the purpose of its effect on subsequent speculative fetches.
         //    - A base element.
-        if (auto parsed = m_document->encoding_parse_url(Utf16String::from_utf8(url_string)); parsed.has_value())
+        if (auto parsed = m_document->encoding_parse_url(Utf16String::from_utf16(url_view)); parsed.has_value())
             m_base_url = parsed.release_value();
         return;
 
@@ -298,7 +307,7 @@ void SpeculativeHTMLParser::process_preload_scanner_entry(RustFfiPreloadScannerE
     // We resolve URLs against the speculative parser's tracked base_url (which may have been updated
     // by an earlier speculative <base href>); this is why we use complete_url here rather than
     // document.encoding_parse_url, which would resolve against the document's base instead.
-    auto url = m_base_url.complete_url(url_string);
+    auto url = m_base_url.complete_url(url_view.to_utf8_but_should_be_ported_to_utf16());
     if (!url.has_value())
         return;
 

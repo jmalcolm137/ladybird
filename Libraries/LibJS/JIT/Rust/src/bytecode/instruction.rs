@@ -11,6 +11,9 @@
 //! interpreter.flap. The input is the exact byte stream the interpreter
 //! executes: operands are flat slot indices, labels are absolute byte offsets.
 
+use ak::Zone;
+use ak::ZoneVec;
+
 include!(concat!(env!("OUT_DIR"), "/decoder_generated.rs"));
 
 /// A frame slot, as a flat index into the interpreter's
@@ -23,6 +26,15 @@ pub struct Operand(u32);
 impl Operand {
     /// The encoding of an absent `Optional<Operand>`.
     pub const INVALID: u32 = 0xFFFF_FFFF;
+
+    /// The raw operand that an operand byte of the bytecode stands for, `INVALID` for an absent one.
+    pub fn raw_from_byte(byte: u8) -> u32 {
+        if byte == u8::MAX {
+            Self::INVALID
+        } else {
+            u32::from(byte)
+        }
+    }
 
     pub fn from_raw(raw: u32) -> Self {
         Self(raw)
@@ -142,7 +154,7 @@ pub struct SlowPathField {
 pub struct SlowPathArray {
     /// Byte offset of the first operand of the array within the instruction.
     pub instruction_offset: u32,
-    /// Byte offset of the u32 element count within the instruction.
+    /// Byte offset of the one-byte element count within the instruction.
     pub count_offset: u32,
     pub optional: bool,
 }
@@ -162,17 +174,18 @@ pub struct FeedbackSlots {
     pub value: Option<u16>,
     pub call: Option<u16>,
     pub keyed: Option<u16>,
+    /// The property lookup cache whose site's value feedback the instruction records.
+    pub cache_value: Option<u16>,
 }
 
 /// One decoded instruction and where it lives in the bytecode.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DecodedInstruction {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DecodedInstruction<'a> {
     /// Byte offset of the instruction.
     pub pc: u32,
     /// Encoded length in bytes; the next instruction starts at `pc + length`.
     pub length: u32,
-    pub strict: bool,
-    pub instruction: Instruction,
+    pub instruction: Instruction<'a>,
 }
 
 impl OpCode {
@@ -180,7 +193,10 @@ impl OpCode {
     /// entering the frame, moves between slots (which SSA values rename),
     /// and jumps.
     pub fn is_free_when_inlined(self) -> bool {
-        matches!(self, OpCode::Enter | OpCode::Mov | OpCode::Jump)
+        matches!(
+            self,
+            OpCode::Enter | OpCode::EnterCoercingThis | OpCode::Mov | OpCode::Jump
+        )
     }
 }
 
@@ -193,7 +209,7 @@ pub fn inlining_size(instructions: &[DecodedInstruction]) -> usize {
         .count()
 }
 
-impl Instruction {
+impl Instruction<'_> {
     /// The property lookup cache whose entries compiled code speculates on
     /// for this instruction, as shape checks that exit with
     /// `ExitKind::BadShape`.
@@ -209,10 +225,50 @@ impl Instruction {
     }
 }
 
-impl DecodedInstruction {
+impl DecodedInstruction<'_> {
     pub fn next_pc(&self) -> u32 {
         self.pc + self.length
     }
+}
+
+#[cfg(test)]
+fn narrow_index(index: u32) -> u16 {
+    if index == u32::MAX {
+        return u16::MAX;
+    }
+    u16::try_from(index).expect("bytecode indices fit in 16 bits")
+}
+
+/// See `WIDE_NAME_INDEX_MARK` of the bytecode generator.
+const WIDE_NAME_INDEX_MARK: u16 = 0xff00;
+const NO_NAME_INDEX: u16 = u16::MAX;
+
+#[cfg(test)]
+fn is_wide_name_index(index: u32) -> bool {
+    index != u32::MAX && index >= u32::from(WIDE_NAME_INDEX_MARK)
+}
+
+#[cfg(test)]
+fn name_index_field(index: u32, distance: usize) -> u16 {
+    if index == u32::MAX {
+        return NO_NAME_INDEX;
+    }
+    if !is_wide_name_index(index) {
+        return index as u16;
+    }
+    WIDE_NAME_INDEX_MARK + u16::try_from(distance).unwrap()
+}
+
+fn read_optional_name_index(bytes: &[u8], at: usize) -> Option<u32> {
+    match read_u16(bytes, at) {
+        NO_NAME_INDEX => None,
+        raw if raw >= WIDE_NAME_INDEX_MARK => Some(read_u32(bytes, at - usize::from(raw - WIDE_NAME_INDEX_MARK))),
+        raw => Some(u32::from(raw)),
+    }
+}
+
+fn read_name_index(bytes: &[u8], at: usize) -> u32 {
+    read_optional_name_index(bytes, at).expect("the field holds a name table index")
 }
 
 fn read_u16(bytes: &[u8], at: usize) -> u16 {
@@ -227,44 +283,73 @@ fn read_u64(bytes: &[u8], at: usize) -> u64 {
     u64::from_ne_bytes(bytes[at..at + 8].try_into().unwrap())
 }
 
-/// Decodes the instruction starting at byte offset `pc`.
-pub fn decode_instruction(bytes: &[u8], pc: u32) -> Result<DecodedInstruction, DecodeError> {
+/// The opcode and the encoded length of the instruction starting at byte offset `pc`, after a check that the whole
+/// instruction lies within `bytes`.
+fn opcode_and_length(bytes: &[u8], pc: u32) -> Result<(u8, usize), DecodeError> {
     let error = |kind| DecodeError { pc, kind };
     let at = pc as usize;
-    // The two byte header holds the opcode and the strict mode flag.
-    if at.checked_add(2).is_none_or(|header_end| header_end > bytes.len()) {
+    if at >= bytes.len() {
         return Err(error(DecodeErrorKind::TruncatedInstruction));
     }
     let opcode = bytes[at];
-    let strict = bytes[at + 1] != 0;
     let length = instruction_length_from_bytes(opcode, bytes, at).map_err(error)?;
     if length == 0 || at + length > bytes.len() {
         return Err(error(DecodeErrorKind::TruncatedInstruction));
     }
-    let length_u32 = u32::try_from(length).map_err(|_| error(DecodeErrorKind::InvalidLength))?;
-    let instruction = decode_fields(opcode, bytes, at, length).map_err(error)?;
+    if u32::try_from(length).is_err() {
+        return Err(error(DecodeErrorKind::InvalidLength));
+    }
+    Ok((opcode, length))
+}
+
+/// Decodes the instruction starting at byte offset `pc`. Its array, if it has one, is in `zone`.
+pub fn decode_instruction<'a>(bytes: &[u8], pc: u32, zone: &'a Zone) -> Result<DecodedInstruction<'a>, DecodeError> {
+    let error = |kind| DecodeError { pc, kind };
+    let (opcode, length) = opcode_and_length(bytes, pc)?;
+    let instruction = match decode_fields(opcode, bytes, pc as usize, length, zone).map_err(error)? {
+        // NB: The rest of the compiler has no reason to care how far up the frame a move reaches.
+        Instruction::MovWide { dst_slot, src_slot } => Instruction::Mov {
+            dst: Operand::from_raw(dst_slot),
+            src: Operand::from_raw(src_slot),
+        },
+        instruction => instruction,
+    };
     Ok(DecodedInstruction {
         pc,
-        length: length_u32,
-        strict,
+        length: length as u32,
         instruction,
     })
 }
 
-/// Decodes a whole instruction stream.
-pub fn decode_all(bytes: &[u8]) -> Result<Vec<DecodedInstruction>, DecodeError> {
+/// The feedback slots of the instruction starting at byte offset `pc`, or `None` if it cannot be decoded.
+pub fn feedback_slots_at(bytes: &[u8], pc: u32) -> Option<FeedbackSlots> {
+    let (opcode, _) = opcode_and_length(bytes, pc).ok()?;
+    Some(feedback_slots_from_bytes(opcode, bytes, pc as usize))
+}
+
+/// Decodes a whole instruction stream into `zone`.
+pub fn decode_all<'a>(bytes: &[u8], zone: &'a Zone) -> Result<&'a [DecodedInstruction<'a>], DecodeError> {
     let end = u32::try_from(bytes.len()).map_err(|_| DecodeError {
         pc: 0,
         kind: DecodeErrorKind::InvalidLength,
     })?;
-    let mut instructions = Vec::new();
+    // NB: The list gets its size before the first instruction is decoded, so the arrays that the zone gives out
+    //     after it never make it move.
+    let mut count = 0;
     let mut pc = 0;
     while pc < end {
-        let instruction = decode_instruction(bytes, pc)?;
+        let (_, length) = opcode_and_length(bytes, pc)?;
+        pc += length as u32;
+        count += 1;
+    }
+    let mut instructions = ZoneVec::with_capacity_in(count, zone);
+    let mut pc = 0;
+    while pc < end {
+        let instruction = decode_instruction(bytes, pc, zone)?;
         pc = instruction.next_pc();
         instructions.push(instruction);
     }
-    Ok(instructions)
+    Ok(instructions.into_slice())
 }
 
 #[cfg(test)]
@@ -289,15 +374,13 @@ mod tests {
 
     #[test]
     fn decodes_hand_assembled_mov() {
-        let mut bytes = vec![OpCode::Mov as u8, 1, 0, 0];
-        bytes.extend(7u32.to_ne_bytes()); // dst
-        bytes.extend(12u32.to_ne_bytes()); // src
-        bytes.extend([0; 4]); // Padding to the 8 byte instruction alignment.
+        let mut bytes = vec![OpCode::Mov as u8];
+        bytes.push(7); // dst
+        bytes.push(12); // src
 
-        let decoded = decode_instruction(&bytes, 0).unwrap();
+        let decoded = decode_instruction(&bytes, 0, crate::test_zone()).unwrap();
         assert_eq!(decoded.pc, 0);
-        assert_eq!(decoded.length, 16);
-        assert!(decoded.strict);
+        assert_eq!(decoded.length, 3);
         assert_eq!(
             decoded.instruction,
             Instruction::Mov {
@@ -317,17 +400,16 @@ mod tests {
     #[test]
     fn decodes_hand_assembled_jump_if() {
         let mut bytes = vec![0; 16];
-        let mut jump = vec![OpCode::JumpIf as u8, 0, 0, 0];
-        jump.extend(5u32.to_ne_bytes()); // condition
+        let mut jump = vec![OpCode::JumpIf as u8];
+        jump.push(5); // condition
         jump.extend(32u32.to_ne_bytes()); // true_target
         jump.extend(48u32.to_ne_bytes()); // false_target
         bytes.extend(jump);
 
-        let decoded = decode_instruction(&bytes, 16).unwrap();
+        let decoded = decode_instruction(&bytes, 16, crate::test_zone()).unwrap();
         assert_eq!(decoded.pc, 16);
-        assert_eq!(decoded.length, 16);
-        assert_eq!(decoded.next_pc(), 32);
-        assert!(!decoded.strict);
+        assert_eq!(decoded.length, 10);
+        assert_eq!(decoded.next_pc(), 26);
         assert_eq!(
             decoded.instruction,
             Instruction::JumpIf {
@@ -349,20 +431,17 @@ mod tests {
     #[test]
     fn decodes_variable_length_call() {
         let call = Instruction::Call {
-            value_feedback: 0,
             call_feedback: 0,
             dst: operand(5),
             callee: operand(6),
             this_value: operand(7),
             argument_count: 3,
-            expression_string: Some(StringTableIndex(9)),
-            arguments: vec![operand(8), operand(20), operand(21)],
+            arguments: crate::test_zone().alloc_slice_copy(&[operand(8), operand(20), operand(21)]),
         };
         let mut bytes = Vec::new();
-        call.encode(true, &mut bytes);
-        assert_eq!(bytes.len() % 8, 0);
+        call.encode(&mut bytes);
 
-        let decoded = decode_instruction(&bytes, 0).unwrap();
+        let decoded = decode_instruction(&bytes, 0, crate::test_zone()).unwrap();
         assert_eq!(decoded.length as usize, bytes.len());
         assert_eq!(decoded.length as usize, call.encoded_size());
         assert_eq!(decoded.instruction, call);
@@ -387,9 +466,10 @@ mod tests {
             Instruction::NewPrimitiveArray {
                 dst: operand(5),
                 element_count: 2,
-                elements: vec![0x7ff8_0000_0000_0001, 42],
+                elements: crate::test_zone().alloc_slice_copy(&[0x7ff8_0000_0000_0001, 42]),
             },
             Instruction::NewClass {
+                element_keys_are_in_array: false,
                 dst: operand(6),
                 super_class: None,
                 proto_parent: None,
@@ -398,7 +478,7 @@ mod tests {
                 lhs_name: Some(IdentifierTableIndex(4)),
                 computed_name: None,
                 element_keys_count: 3,
-                element_keys: vec![Some(operand(8)), None, Some(operand(9))],
+                element_keys: crate::test_zone().alloc_slice_copy(&[Some(operand(8)), None, Some(operand(9))]),
             },
             Instruction::GetBinding {
                 value_feedback: 0,
@@ -437,17 +517,16 @@ mod tests {
             },
         ];
         let mut bytes = Vec::new();
-        for (index, instruction) in instructions.iter().enumerate() {
-            instruction.encode(index % 2 == 0, &mut bytes);
+        for instruction in &instructions {
+            instruction.encode(&mut bytes);
         }
 
-        let decoded = decode_all(&bytes).unwrap();
+        let decoded = decode_all(&bytes, crate::test_zone()).unwrap();
         assert_eq!(decoded.len(), instructions.len());
         let mut pc = 0;
-        for (index, (decoded, instruction)) in decoded.iter().zip(&instructions).enumerate() {
+        for (decoded, instruction) in decoded.iter().zip(&instructions) {
             assert_eq!(&decoded.instruction, instruction);
             assert_eq!(decoded.pc, pc);
-            assert_eq!(decoded.strict, index % 2 == 0);
             pc += u32::try_from(instruction.encoded_size()).unwrap();
         }
 
@@ -476,7 +555,7 @@ mod tests {
 
     #[test]
     fn rejects_malformed_instructions() {
-        let error = |bytes: &[u8]| decode_instruction(bytes, 0).unwrap_err().kind;
+        let error = |bytes: &[u8]| decode_instruction(bytes, 0, crate::test_zone()).unwrap_err().kind;
 
         assert_eq!(error(&[]), DecodeErrorKind::TruncatedInstruction);
         assert_eq!(error(&[u8::MAX, 0]), DecodeErrorKind::UnknownOpcode);
@@ -486,37 +565,31 @@ mod tests {
             dst: operand(5),
             src: operand(6),
         }
-        .encode(false, &mut mov);
-        assert_eq!(error(&mov[..8]), DecodeErrorKind::TruncatedInstruction);
+        .encode(&mut mov);
+        assert_eq!(error(&mov[..2]), DecodeErrorKind::TruncatedInstruction);
 
         let mut call = Vec::new();
         Instruction::Call {
-            value_feedback: 0,
             call_feedback: 0,
             dst: operand(5),
             callee: operand(6),
             this_value: operand(7),
             argument_count: 1,
-            expression_string: None,
-            arguments: vec![operand(8)],
+            arguments: crate::test_zone().alloc_slice_copy(&[operand(8)]),
         }
-        .encode(false, &mut call);
-        // Call's layout: header, value and call feedback slots, m_length at 8, dst, callee, this_value,
-        // argument_count at 24.
-        let mut short_length = call.clone();
-        short_length[8..12].copy_from_slice(&4u32.to_ne_bytes());
-        assert_eq!(error(&short_length), DecodeErrorKind::InvalidLength);
+        .encode(&mut call);
+        // Call's layout: header, call feedback slot, dst, callee, this_value, argument_count at 6.
         let mut too_many_arguments = call.clone();
-        too_many_arguments[24..28].copy_from_slice(&100u32.to_ne_bytes());
-        assert_eq!(error(&too_many_arguments), DecodeErrorKind::InvalidLength);
-        assert_eq!(error(&call[..call.len() - 8]), DecodeErrorKind::TruncatedInstruction);
+        too_many_arguments[6] = 100;
+        assert_eq!(error(&too_many_arguments), DecodeErrorKind::TruncatedInstruction);
+        assert_eq!(error(&call[..call.len() - 1]), DecodeErrorKind::TruncatedInstruction);
 
         let mut stream = mov.clone();
-        stream.extend(&mov[..8]);
+        stream.extend(&mov[..2]);
         assert_eq!(
-            decode_all(&stream).unwrap_err(),
+            decode_all(&stream, crate::test_zone()).unwrap_err(),
             DecodeError {
-                pc: 16,
+                pc: 3,
                 kind: DecodeErrorKind::TruncatedInstruction
             }
         );

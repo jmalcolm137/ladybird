@@ -14,6 +14,7 @@ use core::ptr::NonNull;
 use libjs_rust::api::{
     Array, EmbedderCell, EmbedderClass, EmbedderValue, Gc, Must, NativeFunction, Object, Promise, PromiseCapability,
     PromiseState, PropertyKey, Realm, RejectionOperation, Trace, Value, Visitor, Vm, call, new_promise_capability,
+    safe_promise_resolve,
 };
 
 use crate::bindings::interface::{with_temporary_execution_context, with_temporary_execution_context_and_callbacks};
@@ -37,11 +38,9 @@ unsafe extern "C" {
         steps: unsafe extern "C" fn(*mut c_void, *mut c_void),
     );
 
-    /// Queues a task on the task source, an HTML::Task::Source, that calls the steps with the VM and the cell while an
-    /// execution context of the realm is on the stack, as HTML::queue_a_task() queues one without a document. The
-    /// cell lives until then.
+    /// Queues a task on the task source, an HTML::Task::Source, that calls the steps with the VM and the cell, as
+    /// HTML::queue_a_task() queues one without a document. The cell lives until then.
     fn web_bindings_queue_a_task(
-        realm: *mut c_void,
         task_source: u8,
         cell: *mut c_void,
         steps: unsafe extern "C" fn(*mut c_void, *mut c_void),
@@ -62,6 +61,9 @@ unsafe extern "C" {
 
     /// The HTML::TaskID of the task that the event loop of the realm's agent is running.
     fn web_bindings_currently_running_task(realm: *mut c_void) -> u64;
+
+    /// Spins the event loop until the promise, a Promise, is no longer pending.
+    fn web_bindings_spin_until_promise_is_settled(promise: *mut c_void);
 }
 
 /// The task sources of HTML::Task::Source that the bindings queue tasks on.
@@ -70,10 +72,19 @@ unsafe extern "C" {
 pub(crate) enum TaskSource {
     Unspecified = 0,
     DOMManipulation = 1,
+    UserInteraction = 2,
     Networking = 3,
     PostedMessage = 6,
+    TimerTask = 8,
+    Geolocation = 10,
     FileReading = 13,
+    PerformanceTimeline = 15,
+    Clipboard = 17,
+    Permissions = 18,
     FontLoading = 19,
+    RemoteEvent = 20,
+    Gamepad = 25,
+    WebGL = 26,
     Crypto = 27,
     Storage = 29,
 }
@@ -86,6 +97,13 @@ unsafe impl Trace for TaskSource {
 /// A task that queue_a_global_task() queued, an HTML::TaskID.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) struct TaskId(u64);
+
+impl TaskId {
+    /// The HTML::TaskID of the task.
+    pub(crate) fn host_id(self) -> u64 {
+        self.0
+    }
+}
 
 /// The promise that LibWeb's C++ code returns, a WebIDL::Promise.
 ///
@@ -157,13 +175,9 @@ pub(crate) fn resolve_promise(vm: &Vm, promise: WebIdlPromise, value: Value) {
     // 1. If x is not given, then let it be the undefined value.
     // 2. Let value be the result of converting x to an ECMAScript value.
     // 3. Perform ! Call(p.[[Resolve]], undefined, « value »).
-    call(
-        vm,
-        Value::from_object(promise.resolve().upcast::<Object>()),
-        Value::UNDEFINED,
-        &[value],
-    )
-    .must();
+    // AD-HOC: We perform SafePromiseResolve instead, which never runs script.
+    //         See https://github.com/whatwg/webidl/pull/1645
+    safe_promise_resolve(vm, promise, value).must();
 }
 
 /// Rejects the promise with the reason, https://webidl.spec.whatwg.org/#reject
@@ -595,22 +609,20 @@ pub(crate) fn in_parallel<C: Trace + Copy + 'static>(vm: &Vm, realm: Gc<Realm>, 
     unsafe { web_bindings_run_in_parallel(realm.as_ptr().cast(), cell, run_pending_steps) };
 }
 
-/// Queues a task on the task source that performs the steps with the captures,
 /// https://html.spec.whatwg.org/multipage/webappapis.html#queue-a-task
-pub(crate) fn queue_a_task<C: Trace + Copy + 'static>(
+pub(crate) fn queue_a_task<C: Trace + Clone + 'static>(
     vm: &Vm,
-    realm: Gc<Realm>,
     task_source: TaskSource,
     captures: C,
     steps: fn(&Vm, C),
 ) {
     let cell = pending_steps(vm, captures, steps);
-    // SAFETY: The realm and the cell are live.
-    unsafe { web_bindings_queue_a_task(realm.as_ptr().cast(), task_source as u8, cell, run_pending_steps) };
+    // SAFETY: The cell is live.
+    unsafe { web_bindings_queue_a_task(task_source as u8, cell, run_pending_steps) };
 }
 
 /// Queues a global task on the task source, given the global object, that performs the steps with the captures,
-/// https://html.spec.whatwg.org/multipage/webappapis.html#queue-a-global-task. Unlike queue_a_task(), the steps run
+/// https://html.spec.whatwg.org/multipage/webappapis.html#queue-a-global-task. As with queue_a_task(), the steps run
 /// with no execution context of their own on the stack.
 pub(crate) fn queue_a_global_task<C: Trace + Clone + 'static>(
     vm: &Vm,
@@ -637,6 +649,12 @@ pub(crate) fn remove_tasks(realm: Gc<Realm>, tasks: &[TaskId]) {
 pub(crate) fn currently_running_task(realm: Gc<Realm>) -> TaskId {
     // SAFETY: The realm is live.
     TaskId(unsafe { web_bindings_currently_running_task(realm.as_ptr().cast()) })
+}
+
+/// Spins the event loop until the promise is fulfilled or rejected.
+pub(crate) fn spin_until_promise_is_settled(promise: WebIdlPromise) {
+    // SAFETY: The promise is live.
+    unsafe { web_bindings_spin_until_promise_is_settled(promise_object(promise).as_ptr().cast()) };
 }
 
 /// The [[Promise]] of a promise capability that LibWeb created, which is a Promise.

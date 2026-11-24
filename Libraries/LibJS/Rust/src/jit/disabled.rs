@@ -109,11 +109,19 @@ pub mod code {
 
         pub fn trace_jit_code(&self, _visitor: &mut Visitor) {}
 
+        pub fn trace_embedded_cells_of_jit_code(&self, _vm: &Vm, _visitor: &mut Visitor) {}
+
+        pub fn drop_jit_code_that_lost_embedded_cells(&self, _vm: &Vm, _sweep: &Sweep<'_>) {}
+
         pub fn jit_compile_state(&self) -> CompileState {
             CompileState::None
         }
 
         pub fn discard_jit_code(&self, _vm: &Vm) {
+            unreachable!("no executable has JIT code");
+        }
+
+        pub fn flush_idle_jit_code(&self, _vm: &Vm) {
             unreachable!("no executable has JIT code");
         }
     }
@@ -132,6 +140,8 @@ pub mod tier_up {
     }
 
     pub fn finish_top_level_code(_vm: &Vm, _executable: &crate::bytecode::executable::Executable) {}
+
+    pub fn wait_for_compile_jobs(_vm: &Vm) {}
 }
 
 pub mod entry_exit {
@@ -246,7 +256,7 @@ pub mod dependencies {
     pub struct Dependents;
 
     impl Dependents {
-        pub fn remove_dead_entries(&self, _: &crate::gc::sweep::Sweep<'_>) {}
+        pub fn remove_dead_entries(&self, _vm: &Vm, _: &crate::gc::sweep::Sweep<'_>) {}
     }
 
     pub fn invalidate_dependents(_vm: &Vm, _dependency: Dependency) {}

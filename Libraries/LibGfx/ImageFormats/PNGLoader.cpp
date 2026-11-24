@@ -55,15 +55,17 @@ struct PNGLoadingContext {
     {
         // NOTE: We need to setjmp() here because libpng uses longjmp() for error handling.
         if (auto error_value = setjmp(png_jmpbuf(png_ptr)); error_value) {
-            // longjmp() bypassed the C++ destructors for any stack-locals in read_frames(); release the working-state
-            // members explicitly here — so their heap storage doesn't sit around until ~PNGLoadingContext().
+            if (error_value != EIO || !in_flight_bitmap || output_buffer) {
+                clear_read_frames_working_state();
+                return Error::from_errno(error_value);
+            }
+            frame_descriptors.append({ in_flight_bitmap.release_nonnull(), 0 });
+            frame_count = 1;
             clear_read_frames_working_state();
-            return Error::from_errno(error_value);
+        } else {
+            png_read_update_info(png_ptr, info_ptr);
+            frame_count = TRY(read_frames(png_ptr, info_ptr));
         }
-
-        png_read_update_info(png_ptr, info_ptr);
-
-        frame_count = TRY(read_frames(png_ptr, info_ptr));
 
         if (exif_metadata)
             TRY(apply_exif_orientation());
@@ -81,7 +83,7 @@ ErrorOr<NonnullOwnPtr<ImageDecoderPlugin>> PNGImageDecoderPlugin::create(Readonl
         // NOTE: If we didn't fail in initialize(), that means we have size information.
         //       We can create a single-frame bitmap with that size and return it.
         //       This is weird, but kinda matches the behavior of other browsers.
-        auto bitmap = TRY(Bitmap::create_shareable(BitmapFormat::BGRA8888, AlphaType::Premultiplied, decoder->m_context->size));
+        auto bitmap = TRY(Bitmap::create_shareable_with_gpu_access(BitmapFormat::BGRA8888, AlphaType::Premultiplied, decoder->m_context->size));
         decoder->m_context->frame_descriptors.append({ move(bitmap), 0 });
         decoder->m_context->frame_count = 1;
         return decoder;
@@ -176,12 +178,13 @@ ErrorOr<void> PNGImageDecoderPlugin::initialize()
 
     png_set_read_fn(m_context->png_ptr, &m_context->data, [](png_structp png_ptr, png_bytep data, png_size_t length) {
         auto* read_data = reinterpret_cast<ReadonlyBytes*>(png_get_io_ptr(png_ptr));
-        if (read_data->size() < length) {
-            png_error(png_ptr, "Read error");
-            return;
-        }
+        if (read_data->size() < length)
+            png_longjmp(png_ptr, EIO);
         memcpy(data, read_data->data(), length);
         *read_data = read_data->slice(length);
+        // Let libpng inflate the available bytes even when the file ends inside an IDAT chunk.
+        if (!read_data->is_empty() && read_data->size() < png_get_compression_buffer_size(png_ptr))
+            png_set_compression_buffer_size(png_ptr, read_data->size());
     });
 
     png_set_error_fn(m_context->png_ptr, nullptr, log_png_error, log_png_warning);
@@ -344,9 +347,13 @@ ErrorOr<size_t> PNGLoadingContext::read_frames(png_structp png_ptr, png_infop in
         // Allocate into the in_flight_bitmap member — so the bitmap survives a potential libpng longjmp out of
         // png_read_image() below.
         if (use == DecodedFrameUse::Output)
-            in_flight_bitmap = TRY(Bitmap::create_shareable(BitmapFormat::BGRA8888, AlphaType::Unpremultiplied, frame_size));
+            in_flight_bitmap = TRY(Bitmap::create_shareable_with_gpu_access(BitmapFormat::BGRA8888, AlphaType::Unpremultiplied, frame_size));
         else
             in_flight_bitmap = TRY(Bitmap::create(BitmapFormat::BGRA8888, AlphaType::Unpremultiplied, frame_size));
+
+        // A partial static frame keeps the pixels that libpng never wrote transparent, including between interlace passes.
+        if (!output_buffer)
+            __builtin_memset(in_flight_bitmap->begin(), 0, in_flight_bitmap->size_in_bytes());
 
         row_pointers.resize_and_keep_capacity(frame_size.height());
         for (auto i = 0; i < frame_size.height(); ++i)
@@ -418,7 +425,7 @@ ErrorOr<size_t> PNGLoadingContext::read_frames(png_structp png_ptr, png_infop in
             }
 
             animation_frame_count++;
-            frame_descriptors.append({ TRY(output_buffer->to_bitmap_backed_by_anonymous_buffer()), duration_ms() });
+            frame_descriptors.append({ TRY(output_buffer->to_bitmap_shareable_with_gpu_access()), duration_ms() });
 
             switch (dispose_op) {
             case PNG_DISPOSE_OP_NONE:

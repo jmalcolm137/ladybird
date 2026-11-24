@@ -15,6 +15,7 @@
 #include <LibURL/URL.h>
 #include <LibWebCommon/CSS/PreferredColorScheme.h>
 #include <LibWebCommon/Loader/NavigatorCompatibilityMode.h>
+#include <LibWebCommon/MediaSession/MediaSessionState.h>
 #include <LibWebCommon/Gamepad/GamepadSnapshot.h>
 #include <LibWebCommon/Page/SpellingError.h>
 #include <LibWebCommon/Page/Translation.h>
@@ -24,11 +25,13 @@
 #include <LibWebCommon/HTML/SelectItem.h>
 #include <LibWebView/AccessibilityTreeManager.h>
 #include <LibWebView/ContextMenuRequest.h>
+#include <LibWebView/DefaultBrowser.h>
 #include <LibWebView/FileDownloader.h>
 #include <LibWebView/HistoryVisitTransition.h>
 #include <LibWebView/MicrophoneAuthorizer.h>
 #include <LibWebView/SessionHistory.h>
 #include <LibWebView/TabPerformanceStats.h>
+#include <LibWebView/UpdateCheck.h>
 #include <LibWebCommon/Clipboard/SystemClipboard.h>
 #include <LibWebCommon/HTML/PreparedNavigationDescriptor.h>
 #include <LibWebView/Application.h>
@@ -65,6 +68,7 @@ struct WebView::TabPerformanceStats {
     u64 upload_bytes_per_second;
     Optional<double> frames_per_second;
     Vector<double> cpu_history;
+    u32 other_tabs_sharing_processes;
 }
 
 [ExistingCpp]
@@ -130,6 +134,8 @@ struct Hub::UIInfo {
     bool reports_scroll_momentum;
     bool scrolls_elastically;
     bool scrollbar_track_press_jumps;
+    bool prefers_reduced_motion;
+    bool prefers_more_contrast;
     Vector<String> preferred_languages;
     Optional<Gfx::GpuDeviceIdentity> presentation_gpu_device;
     Vector<u64> presentation_drm_format_modifiers;
@@ -147,6 +153,8 @@ struct Hub::InitialState {
     bool scripting_enabled;
     bool blocks_pop_ups;
     bool devtools_enabled;
+    bool sandbox_is_disabled;
+    bool gpu_painting_enabled;
     Vector<Hub::DownloadState> downloads;
     Vector<URL::URL> urls;
     Vector<ByteString> raw_urls;
@@ -177,10 +185,23 @@ struct WebView::ContextMenuRequest {
 }
 
 [ExistingCpp]
+struct WebView::LocalFileRoot {
+    ByteString path;
+    WebView::LocalFileRoot::Scope scope;
+}
+
+[ExistingCpp]
+struct WebView::DocumentStateLocalFileRoot {
+    Web::HTML::CrossProcessId document_state_id;
+    WebView::LocalFileRoot root;
+}
+
+[ExistingCpp]
 struct WebView::SessionHistorySnapshot {
     Vector<Web::HTML::SessionHistoryEntryDescriptor> entries;
     Vector<i32> used_steps;
     size_t current_used_step_index;
+    Vector<WebView::DocumentStateLocalFileRoot> local_file_roots_of_document_states;
 }
 
 // A language the tab's page can be translated into, perhaps after a download.
@@ -202,10 +223,11 @@ struct Hub::ViewState {
     bool is_loading;
     bool crash_overlay_active;
     String crash_overlay_failed_url;
+    bool crash_overlay_is_for_memory_limit;
     Optional<ByteString> crash_report_name;
     Optional<String> crash_report_website;
     double zoom_level;
-    String force_dark_host;
+    String host_for_settings;
     i32 web_content_pid;
     bool can_report_website_issue;
     bool can_undo;
@@ -240,12 +262,14 @@ endpoint HubClient
     view_selected_text(u64 view_id, u64 request_id, Optional<ByteString> text) =|
     view_close_preflight_finished(u64 view_id, u64 request_id, bool may_close) =|
     view_page_dumps(u64 view_id, u64 request_id, Optional<String> dumps) =|
+    platform_features_description(u64 request_id, ByteString description) =|
     pip_open(u64 view_id, u64 owner_view_id, Gfx::IntSize video_size) =|
     pip_hide(u64 view_id) =|
     pip_set_video_size(u64 view_id, Gfx::IntSize video_size) =|
     pip_close(u64 view_id) =|
     notification_show(u64 id, u64 page_id, Optional<u64> replaces, Web::NotificationsAPI::NotificationData data, String attribution, Optional<Gfx::ShareableBitmap> icon) =|
     notification_close(u64 id) =|
+    media_session_update(Optional<Web::MediaSession::MediaSessionState> state) =|
     geolocation_start() =|
     geolocation_request_position(u64 id) =|
     geolocation_cancel_position_request(u64 id) =|
@@ -259,6 +283,7 @@ endpoint HubClient
     translator_translate(u64 request_id, u64 session_id, Web::TranslationUnit unit) =|
     translator_open_language_download_settings() =|
     microphone_request_authorization() =|
+    default_browser_make_default() =|
     gamepad_start(bool ignore_system_gamepads) =|
     gamepad_set_polling(bool polling) =|
     gamepad_rumble(u32 handle, u16 low_frequency_magnitude, u16 high_frequency_magnitude, u32 duration_ms) =|
@@ -286,12 +311,14 @@ endpoint HubClient
     app_update_tabs_display() =|
     app_did_clear_history_since(UnixDateTime since) =|
     app_quit_for_signal() =|
-    app_did_enable_devtools() =|
+    app_did_enable_devtools(u16 port) =|
     app_did_disable_devtools() =|
+    app_gpu_painting_changed(bool gpu_painting_enabled) =|
     app_open_urls_in_new_tabs(Vector<URL::URL> urls) =|
     app_activate_or_open_tab_with_url(URL::URL url) =|
     app_open_view_in_new_tab(u64 view_id, Optional<u64> source_view_id, WebView::IsPrivate is_private, Web::HTML::ActivateTab activate_tab) =|
     app_display_error_dialog(String message) =|
+    app_display_update_check_result(WebView::UpdateCheckResult::Kind kind, Optional<String> version, WebView::InstallMethod install_method, WebView::UpdateCheckTrigger trigger) =|
     app_display_download_confirmation_dialog(String download_name, ByteString path) =|
     app_read_clipboard_text(u64 request_id, WebView::Application::ClipboardType type) =|
     app_read_clipboard_item(u64 request_id) =|
@@ -323,6 +350,12 @@ endpoint HubClient
     view_keep_front_backing_store_as_backup(u64 view_id) =|
     view_clear_backup_backing_store(u64 view_id) =|
     view_clear_backing_stores(u64 view_id) =|
+    // The handle's kind is None when the view has no remote layer, and the UI goes on showing backing stores.
+    view_set_remote_layer(u64 view_id, Compositing::RemoteLayerHostHandle host_handle) =|
+    view_did_present_frame_in_remote_layer(u64 view_id, Gfx::IntSize size, double device_pixel_ratio) =|
+    view_did_take_frame_snapshot(u64 view_id, u64 request_id, Optional<Gfx::ShareableBitmap> snapshot) =|
+    view_did_hold_synchronized_resize_frame(u64 view_id, u64 token) =|
+    view_did_commit_synchronized_resize(u64 view_id, u64 token) =|
     view_finish_handling_key_event(u64 view_id, u64 input_id, Web::KeyEvent event) =|
     view_finish_handling_mouse_event(u64 view_id, u64 input_id, Web::MouseEvent event, Web::EventResult result) =|
     view_finish_handling_drag_event(u64 view_id, u64 input_id, Web::DragEvent event) =|
@@ -332,6 +365,7 @@ endpoint HubClient
     view_load_finish(u64 view_id, URL::URL url) =|
     view_activate_tab(u64 view_id) =|
     view_close(u64 view_id) =|
+    view_discard(u64 view_id) =|
     view_link_hover(u64 view_id, URL::URL url) =|
     view_link_unhover(u64 view_id) =|
     view_title_change(u64 view_id, Utf16String title) =|
@@ -376,4 +410,5 @@ endpoint HubClient
     view_crash_overlay_state_change(u64 view_id, bool active) =|
     view_crash_report_saved(u64 view_id) =|
     view_performance_stats(u64 view_id, WebView::TabPerformanceStats stats) =|
+    view_compositor_layers_change(u64 view_id, Compositing::CompositorLayersDescription layers) =|
 }

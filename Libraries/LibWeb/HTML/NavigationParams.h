@@ -14,6 +14,7 @@
 #include <LibGC/Ptr.h>
 #include <LibURL/Origin.h>
 #include <LibWeb/Bindings/PerformanceNavigationTiming.h>
+#include <LibWeb/Export.h>
 #include <LibWeb/Fetch/Infrastructure/FetchTimingInfo.h>
 #include <LibWeb/Fetch/Infrastructure/HTTP/Requests.h>
 #include <LibWeb/Fetch/Infrastructure/HTTP/Responses.h>
@@ -85,6 +86,13 @@ struct NavigationParams : GC::Cell {
     // AD-HOC: The group of the new top-level browsing context the UI process obtained for the new Document, when a
     //         browsing context group switch gave it one.
     Optional<u64> new_browsing_context_group_id;
+
+    // AD-HOC: The browsing context obtained for the new Document when the response arrived.
+    GC::Ptr<BrowsingContext> browsing_context;
+
+    // AD-HOC: The id of the new Window's environment when there is no reserved environment. The UI process learns it
+    //         before the Document is created.
+    Optional<EnvironmentId> environment_id;
 
     // AD-HOC: The permissions policy the UI process created for the new Document.
     Optional<PermissionsPolicy::PermissionsPolicy> permissions_policy;
@@ -222,7 +230,7 @@ protected:
 using NavigationParamsVariant = Variant<NavigationParamsNullOrError, GC::Ref<NavigationParams>, GC::Ref<NonFetchSchemeNavigationParams>>;
 
 // Returns whether a fetch controller or network transport was stopped.
-bool stop_body_delivery(NavigationParams::BodyDelivery const&);
+WEB_API bool stop_body_delivery(NavigationParams::BodyDelivery const&);
 
 bool check_a_navigation_responses_adherence_to_x_frame_options(GC::Ptr<Fetch::Infrastructure::ResponseView> response, LocalNavigable* navigable, ContentSecurityPolicy::PolicyList const& csp_list, URL::Origin destination_origin);
 

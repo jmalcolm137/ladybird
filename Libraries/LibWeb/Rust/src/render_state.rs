@@ -20,10 +20,11 @@ mod clock;
 mod devtools;
 mod document_host;
 mod owner;
-pub(crate) use owner::{process_style, release_unused_memory_of_style_layout_threads};
+pub(crate) use owner::{
+    process_style, release_caches_of_style_layout_threads, release_unused_memory_of_style_layout_threads,
+};
 mod wait;
 
-pub use clock::FfiPlannedScrollTimeline;
 pub use clock::hover::FfiHoverPlanInputs;
 pub(crate) use clock::hover::HoverPlan;
 pub(crate) use clock::{ClockPlan, CommittedContent, CommittedFrame, LaneDelivery, SampledFrame};
@@ -77,6 +78,9 @@ impl RenderState {
         arena
             .arena_mut()
             .share_first_letter_styles_derived(shared.first_letter_styles_derived);
+        arena
+            .arena_mut()
+            .share_text_rows_noted_for_first_paint(shared.text_rows_noted_for_first_paint);
         arena.arena_mut().set_style_engine(engine);
         Self {
             arena,
@@ -286,7 +290,10 @@ impl RenderState {
         if !shell_style_changes.is_empty() {
             self.owed.push(shell_style_changes);
         }
-        let rows = self.arena.arena_mut().publish_row_snapshot(false);
+        let rows = self
+            .arena
+            .arena_mut()
+            .publish_row_snapshot(crate::layout::row_reads::MeasuredOverflow::None);
         Some((round, rows))
     }
 }
@@ -388,10 +395,6 @@ pub(crate) enum ArenaChange {
     ReinheritDisplayContentsText(crate::css::style::tree::StyleNodeID),
     /// The `::first-letter` boxes whose element containing the letter took another style take their style again.
     RefreshFirstLetterStyles,
-    /// A removed node's box leaves its parent's box in place, or the parent is marked for a rebuild, as the render state
-    /// finds the boxes (see [`crate::layout::box_removal`]), which owes the host what it pays once the job that applies
-    /// it is done.
-    RemoveBox(crate::layout::box_removal::BoxRemoval),
     /// A write to the document's style sheets.
     Rule(crate::css::style::rule_writes::RuleWrite),
 }
@@ -451,7 +454,6 @@ impl ArenaChange {
                     .apply(arena)
                     .host_work,
             ),
-            Self::RemoveBox(removal) => removal.apply(arena, owed),
             Self::Paint(change) => change.apply(arena),
             Self::Style(change) => change.apply(state.engine_mut()),
             Self::Engine(write) => write.apply(state.engine_mut()),
@@ -488,8 +490,7 @@ impl ArenaChange {
             | Self::DetachForRemoval(_)
             | Self::ReinheritAnonymousDescendants(_)
             | Self::ReinheritDisplayContentsText(_)
-            | Self::RefreshFirstLetterStyles
-            | Self::RemoveBox(_) => false,
+            | Self::RefreshFirstLetterStyles => false,
         }
     }
 
@@ -506,7 +507,6 @@ impl ArenaChange {
             | Self::ReinheritAnonymousDescendants(_)
             | Self::ReinheritDisplayContentsText(_)
             | Self::RefreshFirstLetterStyles
-            | Self::RemoveBox(_)
             | Self::Rule(_) => (true, true),
         };
         Moves {
@@ -522,7 +522,7 @@ impl ArenaChange {
         match self {
             Self::Layout(change) => change.row_write(),
             Self::Paint(change) => change.row_write(),
-            Self::DetachForRemoval(_) | Self::RemoveBox(_) => RowWrite::Identities,
+            Self::DetachForRemoval(_) => RowWrite::Identities,
             Self::ReinheritAnonymousDescendants(_)
             | Self::ReinheritDisplayContentsText(_)
             | Self::RefreshFirstLetterStyles => RowWrite::NamedStyles,
@@ -1003,8 +1003,9 @@ pub(crate) fn fly(host: &DocumentHost, job: FrameJob, _license: &crate::painting
             crate::painting::recording_slot::submit_layout(run, |job| owner::hold(job))
         } else if claim_held {
             let flight = crate::stage_thread::render_thread().submit_reclaimable(run, |job| {
-                crate::painting::recording_slot::wait_while_recording_is_held_for_testing();
-                owner::hold(job);
+                if crate::painting::recording_slot::wait_while_claim_is_held_for_testing() {
+                    owner::hold(job);
+                }
             });
             (flight, true)
         } else {
@@ -1141,9 +1142,9 @@ mod tests {
         use crate::painting::replaced_paint_facts::ReplacedPaintFacts;
         let element = MarkedBox::Node(StyleNodeID::from_raw(1));
         let row = MarkedBox::Row(NodeSlotId::new(1, 1));
-        let canvas = |content_generation| {
+        let canvas = |canvas_id| {
             ReplacedPaintFacts::Canvas(FfiCanvasPaintFacts {
-                content_generation,
+                canvas_id,
                 ..Default::default()
             })
         };
@@ -1274,9 +1275,6 @@ mod tests {
     #[test]
     fn a_read_that_first_settles_a_scrollability_flip_leaves_the_paint_preparation_stale() {
         use crate::layout::node_data::NodeKind;
-        use document_host::{
-            document_host_note_paint_preparation_is_current, document_host_paint_preparation_is_current,
-        };
         let test_host = TestHost::new();
         let host = test_host.host();
         let viewport = host.with_arena_for_test(|arena| {
@@ -1286,8 +1284,8 @@ mod tests {
             // The viewport's fragment holds scrollable overflow it no longer has, and a read settles it first since.
             let mut link = crate::layout::fragment_tree::FragmentLink::for_test(viewport);
             let fragment = std::sync::Arc::get_mut(&mut link.fragment).unwrap();
-            fragment.content_inline_size = crate::css::css_pixels::CssPixels::from_integer(100);
-            fragment.content_block_size = crate::css::css_pixels::CssPixels::from_integer(100);
+            fragment.sides.content_size.width = crate::css::css_pixels::CssPixels::from_integer(100);
+            fragment.sides.content_size.height = crate::css::css_pixels::CssPixels::from_integer(100);
             fragment.scrollable_overflow.has_scrollable_overflow = true;
             arena.set_committed_fragment_link(viewport, link, None);
             arena.request_fragment_overflow_recalculation(viewport);
@@ -1299,15 +1297,15 @@ mod tests {
             });
         };
 
-        document_host_note_paint_preparation_is_current(host);
+        host.note_paint_preparation_is_current();
         measure();
-        assert!(!document_host_paint_preparation_is_current(host));
+        assert!(!host.paint_preparation_is_current());
         assert!(host.with_arena_for_test(|arena| arena.scrollable_overflow.scrollability_changed));
 
         // A read that settles nothing leaves the preparation as it is.
-        document_host_note_paint_preparation_is_current(host);
+        host.note_paint_preparation_is_current();
         measure();
-        assert!(document_host_paint_preparation_is_current(host));
+        assert!(host.paint_preparation_is_current());
 
         host.with_arena_for_test(|arena| {
             arena
@@ -1319,21 +1317,15 @@ mod tests {
     #[test]
     fn a_mark_that_asks_nothing_of_the_box_leaves_the_paint_preparation_current() {
         use crate::layout::tree_update_marks::{FfiBoxMarks, render_state_mark_node_box};
-        use document_host::{
-            document_host_note_paint_preparation_is_current, document_host_paint_preparation_is_current,
-        };
         let test_host = TestHost::new();
         let host = test_host.host();
-        document_host_note_paint_preparation_is_current(host);
+        host.note_paint_preparation_is_current();
         render_state_mark_node_box(host, 1, FfiBoxMarks::default());
-        assert!(document_host_paint_preparation_is_current(host));
+        assert!(host.paint_preparation_is_current());
     }
 
     #[test]
     fn a_write_set_aside_leaves_the_paint_preparation_stale_once_queued_again() {
-        use document_host::{
-            document_host_note_paint_preparation_is_current, document_host_paint_preparation_is_current,
-        };
         let test_host = TestHost::new();
         let host = test_host.host();
         crate::painting::paint_changes::render_state_set_viewport_scroll_offset(
@@ -1345,9 +1337,9 @@ mod tests {
         );
         host.set_writes_aside();
         // The properties prepared meanwhile read the render state as it was before the write.
-        document_host_note_paint_preparation_is_current(host);
+        host.note_paint_preparation_is_current();
         host.queue_writes_set_aside();
-        assert!(!document_host_paint_preparation_is_current(host));
+        assert!(!host.paint_preparation_is_current());
     }
 
     #[test]

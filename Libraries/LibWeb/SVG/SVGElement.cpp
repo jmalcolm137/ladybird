@@ -17,6 +17,7 @@
 #include <LibWeb/DOM/Document.h>
 #include <LibWeb/DOM/ElementRareData.h>
 #include <LibWeb/DOM/ShadowRoot.h>
+#include <LibWeb/HTML/AttributeNames.h>
 #include <LibWeb/Layout/LayoutRustBridge.h>
 #include <LibWeb/Layout/Node.h>
 #include <LibWeb/Painting/BoxViews.h>
@@ -121,7 +122,8 @@ bool SVGElement::is_focusable() const
 
 bool SVGElement::is_in_never_rendered_subtree() const
 {
-    for (auto element = this; element; element = as_if<SVGElement>(element->parent_element().ptr())) {
+    // NB: A use-element shadow tree is rendered where its host is, so the walk continues at the host.
+    for (auto element = this; element; element = as_if<SVGElement>(element->parent_or_shadow_host_element())) {
         if (is_never_rendered_element(*element))
             return true;
     }
@@ -472,6 +474,18 @@ void SVGElement::attribute_changed(Utf16FlyString const& local_name, Optional<Ut
     Base::attribute_changed(local_name, old_value, value, namespace_);
     HTMLOrSVGOrMathMLElement::attribute_changed(local_name, old_value, value, namespace_);
 
+    // https://html.spec.whatwg.org/multipage/webappapis.html#event-handler-attributes:concept-element-attributes-change-ext
+    // 1. If namespace is not null, or localName is not the name of an event handler content attribute on element, then return.
+    if (!namespace_.has_value() && local_name.view().starts_with(u"on"sv)) {
+#undef __ENUMERATE
+#define __ENUMERATE(attribute_name, event_name)                     \
+    if (local_name == HTML::AttributeNames::attribute_name) {       \
+        element_event_handler_attribute_changed(local_name, value); \
+    }
+        ENUMERATE_GLOBAL_EVENT_HANDLERS(__ENUMERATE)
+#undef __ENUMERATE
+    }
+
     if (old_value != value) {
         update_presentation_attribute_style(local_name, value, namespace_);
         invalidate_element_instances(ElementInstancesToInvalidate::All);
@@ -757,41 +771,28 @@ GC::Ptr<SVGElement> SVGElement::viewport_element()
 
 Gfx::Size<double> SVGElement::viewport_size_for_percentage_resolution(Layout::BegunRead const& read)
 {
-    auto viewport_size_from_layout = [&](SVGSVGElement const& viewport_element) -> Gfx::Size<double> {
+    auto committed_geometry = [&](SVGElement const& element) -> Optional<Layout::RustFFI::SvgGeometry> {
         // NB: A disconnected element may have stale layout objects from before it was removed.
-        if (!viewport_element.is_connected())
+        auto const* layout_node = element.is_connected() ? element.layout_node(read) : nullptr;
+        if (!layout_node)
             return {};
-
-        auto const* layout_node = viewport_element.layout_node(read);
-        if (layout_node && Painting::has_committed_box(*layout_node) && Painting::is_svg_svg_paintable(*layout_node))
-            return Painting::svg_viewport_size(*layout_node).to_type<double>();
-
-        return {};
+        return Painting::svg_geometry(*layout_node);
     };
 
-    // NB: Percentages for SVGSVGElements are resolved irrespective of it's own viewBox (which only affects the internal
-    //     coordinate system)
-    if (auto* svg_element = as_if<SVGSVGElement>(*this)) {
-        auto const* parent = svg_element->parent_or_shadow_host_element();
+    // NB: Layout committed the SVG viewport that a rendered element's own lengths resolve against. An outermost svg
+    //     element resolves against its own size, irrespective of its viewBox.
+    if (auto geometry = committed_geometry(*this); geometry.has_value())
+        return geometry->viewport_user_rect.size().to_type<double>();
 
-        // https://w3c.github.io/svgwg/svg2-draft/coords.html#InitialViewport
-        if (!parent || !is<SVGElement>(*parent))
-            return viewport_size_from_layout(*svg_element);
-
-        // https://w3c.github.io/svgwg/svg2-draft/coords.html#EstablishingANewSVGViewport
-        if (is<SVGForeignObjectElement>(*parent))
-            return viewport_size_from_layout(*svg_element);
-    }
-
-    auto const& viewport_element = const_cast<SVGElement*>(this)->owner_svg_element().ptr();
-
+    // An element without geometry resolves against the SVG viewport that its nearest svg ancestor establishes.
+    auto viewport_element = owner_svg_element();
     if (!viewport_element)
         return {};
-
+    if (auto geometry = committed_geometry(*viewport_element); geometry.has_value() && geometry->establishes_viewport)
+        return geometry->established_viewport_user_rect.size().to_type<double>();
     if (auto view_box = viewport_element->active_view_box(); view_box.has_value() && view_box->width > 0 && view_box->height > 0)
         return { view_box->width, view_box->height };
-
-    return viewport_size_from_layout(*viewport_element);
+    return {};
 }
 
 GC::Ref<SVGAnimatedLength> SVGElement::svg_animated_length_for_attribute(Utf16FlyString const& attribute_name, SVGLength::Directionality directionality, SVGLengthValue default_value)

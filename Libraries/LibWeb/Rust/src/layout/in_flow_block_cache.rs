@@ -25,6 +25,8 @@ pub(super) struct InFlowBlockKey {
     pub(super) input: LayoutInput,
     pub(super) containing_block_inline_size: CssPixels,
     pub(super) containing_block_is_right_to_left: bool,
+    containing_text_align: u8,
+    containing_justify_items: (u8, u8),
     /// The block margins of the child that stretch-fit sizing subtracts, which it treats as zero on a side where the
     /// containing block has no border or padding.
     pub(super) stretch_fit_block_margins: (CssPixels, CssPixels),
@@ -33,6 +35,10 @@ pub(super) struct InFlowBlockKey {
     pub(super) treat_block_axis_percentage_insets_as_auto_beyond_root: bool,
     pub(super) initial_containing_block_size: (CssPixels, CssPixels),
     pub(super) document_in_quirks_mode: bool,
+    pub(super) document_in_limited_quirks_mode: bool,
+    /// Whether the margins of the contents that collapse with the block-start margin of the box leave out the quirky
+    /// ones, as those collapsing into the block start of a quirks-mode body or table cell do.
+    pub(super) contents_ignore_quirky_margins: bool,
 }
 
 impl InFlowBlockKey {
@@ -40,14 +46,20 @@ impl InFlowBlockKey {
         run: &FormattingContextRun<'_>,
         input: LayoutInput,
         containing_block_inline_size: CssPixels,
-        containing_block_is_right_to_left: bool,
+        container_style: StyleValues<'_>,
         stretch_fit_block_margins: (CssPixels, CssPixels),
         incoming_outside_marker_line: Option<block_formatting_context::OutsideMarkerLine>,
+        contents_ignore_quirky_margins: bool,
     ) -> Self {
         Self {
             input,
             containing_block_inline_size,
-            containing_block_is_right_to_left,
+            containing_block_is_right_to_left: container_style.direction() == direction::RTL,
+            containing_text_align: container_style.text_align(),
+            containing_justify_items: (
+                container_style.justify_items(),
+                container_style.justify_items_overflow(),
+            ),
             stretch_fit_block_margins,
             incoming_outside_marker_line,
             run_root: run.box_,
@@ -58,6 +70,8 @@ impl InFlowBlockKey {
                 run.pass.initial_containing_block_block_size,
             ),
             document_in_quirks_mode: run.pass.document_in_quirks_mode,
+            document_in_limited_quirks_mode: run.pass.document_in_limited_quirks_mode,
+            contents_ignore_quirky_margins,
         }
     }
 }
@@ -93,6 +107,8 @@ pub(super) struct InFlowBlockEntry {
     pub(super) floats_placed_by_contents: Vec<block_formatting_context::FloatingBox>,
     pub(super) outgoing_outside_marker_line: Option<block_formatting_context::OutsideMarkerLine>,
     pub(super) depends_on_percentage_block_size: bool,
+    /// Whether margins collapse through the child where placing it introduces no clearance.
+    pub(super) margins_collapse_through_without_clearance: bool,
     /// The fragment the stored layout placed. The committed subtree is reused only while it is still that fragment.
     pub(super) fragment_identity: u64,
 }

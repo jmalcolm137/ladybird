@@ -46,6 +46,8 @@ pub(crate) struct SharedWithHost {
     /// The flag the state's arena raises once any `::first-letter` box takes a style derived from the element
     /// containing its letter, and never lowers.
     pub(super) first_letter_styles_derived: Arc<AtomicBool>,
+    /// The flag the state's arena raises while any text row waits for paint timing to look at it.
+    pub(super) text_rows_noted_for_first_paint: Arc<AtomicBool>,
     /// The flag the state's style engine raises while it keeps any row's container effects for the host.
     pub(super) container_effects_held: Arc<AtomicBool>,
     /// The versions the state's style engine mints declaration blocks from, which the host mints from as well.
@@ -150,6 +152,18 @@ pub(crate) fn release_unused_memory_of_style_layout_threads() {
 /// Standalone Rust tests do not link the C++ allocator, so there is nothing to release.
 #[cfg(not(feature = "allocator"))]
 pub(crate) fn release_unused_memory_of_style_layout_threads() {}
+
+/// Has the style and layout threads of the process let go of what they keep to work faster, and give that memory
+/// back, for a process that is short of memory. Each does so between its jobs, and this does not wait for them.
+pub(crate) fn release_caches_of_style_layout_threads() {
+    if let Some(pool) = SLOT.style_layout_pool.started() {
+        pool.spawn_broadcast(|_| {
+            libgfx_rust::text_layout::clear_shaping_cache();
+            #[cfg(feature = "allocator")]
+            ak::release_unused_allocator_memory();
+        });
+    }
+}
 
 /// The style data every document's style engine shares with the others, which any thread reaches without the slot: only
 /// what it guards itself is written once it is made.

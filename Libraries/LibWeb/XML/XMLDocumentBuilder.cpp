@@ -52,10 +52,10 @@ XMLDocumentBuilder::XMLDocumentBuilder(DOM::Document& document, XMLScriptingSupp
     m_namespace_stack.append({ {}, 1 });
 }
 
-ErrorOr<void> XMLDocumentBuilder::set_source(ByteString source)
+ErrorOr<void> XMLDocumentBuilder::set_source(StringView source)
 {
     m_document->update_readiness(HTML::DocumentReadyState::Loading);
-    m_document->set_source(Utf16String::from_utf8_with_replacement_character(source.view()));
+    m_document->set_source(Utf16String::from_utf8_with_replacement_character(source));
     return {};
 }
 
@@ -113,9 +113,7 @@ void XMLDocumentBuilder::element_start(Utf16FlyString const& name, Vector<XML::L
         m_namespace_stack.last().depth += 1;
     }
 
-    auto namespace_ = namespace_for_name(name);
-    auto utf8_name = MUST(name.view().to_utf8());
-    auto qualified_name_or_error = DOM::validate_and_extract(namespace_.map([](auto const& value) { return FlyString(MUST(value.view().to_utf8())); }), FlyString(utf8_name), DOM::ValidationContext::Element);
+    auto qualified_name_or_error = DOM::validate_and_extract(namespace_for_name(name), name, DOM::ValidationContext::Element);
 
     if (qualified_name_or_error.is_error()) {
         m_has_error = true;
@@ -162,7 +160,7 @@ void XMLDocumentBuilder::element_start(Utf16FlyString const& name, Vector<XML::L
         if (attribute.name == "xmlns"sv || attribute.name.starts_with("xmlns:"sv)) {
             // The prefix xmlns is used only to declare namespace bindings and is by definition bound to the namespace name http://www.w3.org/2000/xmlns/.
             if (!attribute.name.is_one_of("xmlns:"sv, "xmlns:xmlns"sv)) {
-                auto maybe_extracted_qualified_name = DOM::validate_and_extract(FlyString(MUST(Namespace::XMLNS.view().to_utf8())), FlyString(MUST(attribute.name.view().to_utf8())), DOM::ValidationContext::Element);
+                auto maybe_extracted_qualified_name = DOM::validate_and_extract(Namespace::XMLNS, attribute.name, DOM::ValidationContext::Element);
                 if (!maybe_extracted_qualified_name.is_error()) {
                     auto extracted_qualified_name = maybe_extracted_qualified_name.release_value();
                     node->set_attribute_value(extracted_qualified_name.local_name(), attribute.value, extracted_qualified_name.prefix(), extracted_qualified_name.namespace_());
@@ -173,7 +171,7 @@ void XMLDocumentBuilder::element_start(Utf16FlyString const& name, Vector<XML::L
             m_has_error = true;
         } else if (attribute.name.view().contains(':')) {
             if (auto namespace_for_key = namespace_for_name(attribute.name); namespace_for_key.has_value()) {
-                auto maybe_extracted_qualified_name = DOM::validate_and_extract(FlyString(MUST(namespace_for_key->view().to_utf8())), FlyString(MUST(attribute.name.view().to_utf8())), DOM::ValidationContext::Element);
+                auto maybe_extracted_qualified_name = DOM::validate_and_extract(namespace_for_key, attribute.name, DOM::ValidationContext::Element);
                 if (!maybe_extracted_qualified_name.is_error()) {
                     auto extracted_qualified_name = maybe_extracted_qualified_name.release_value();
                     node->set_attribute_value(extracted_qualified_name.local_name(), attribute.value, extracted_qualified_name.prefix(), extracted_qualified_name.namespace_());
@@ -313,9 +311,8 @@ Optional<Utf16FlyString> XMLDocumentBuilder::namespace_for_name(Utf16FlyString c
         prefix = Utf16FlyString::from_utf16(view.substring_view(0, *first_colon_position));
     }
 
-    // The xml prefix is bound to the XML namespace by definition (Namespaces in XML 1.0 §3), so it never appears among
-    // the declarations below: libxml2 drops every declaration of it before the SAX callback (xmlParserNsPush), the way
-    // expat pre-binds it (implicitContext) — and Blink and WebKit take the XML namespace libxml2 resolves it to.
+    // The xml prefix is bound to the XML namespace by definition (Namespaces in XML 1.0 §3), whether or not anything
+    // declares it, and a declaration of it can only say the same.
     if (prefix == "xml"sv)
         return Namespace::XML;
 

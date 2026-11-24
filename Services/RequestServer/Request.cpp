@@ -808,7 +808,8 @@ void Request::handle_fetch_complete(int result_code)
             if (m_type == RequestType::BackgroundRevalidation && m_disk_cache->mode() == HTTP::DiskCache::Mode::Testing)
                 m_response_headers->set({ HTTP::TEST_CACHE_REVALIDATION_STATUS_HEADER, "fresh"sv });
 
-            m_cache_entry_reader->revalidation_succeeded(m_response_headers);
+            auto current_time_offset_for_testing = HTTP::compute_current_time_offset_for_testing(m_disk_cache, *m_request_headers);
+            m_cache_entry_reader->revalidation_succeeded(m_response_headers, m_request_start_time + current_time_offset_for_testing, UnixDateTime::now() + current_time_offset_for_testing);
             m_cache_entry_was_revalidated = true;
             transition_to_state(m_type == RequestType::Fetch ? State::ReadCache : State::Complete);
             return;
@@ -1289,8 +1290,24 @@ void Request::handle_dns_lookup_state()
         return;
     }
 
-    // Avoid leaking hostnames resolved by the proxy.
     m_proxy = proxy_configuration().proxy_for(m_url).copy();
+    // The proxy configuration can change while a lookup is pending, so resolve again for a different proxy.
+    if (!m_proxy_host_resolved || m_resolved_proxy != m_proxy) {
+        resolve_proxy_host(m_proxy, weak_callback(*this, [proxy = m_proxy](auto& self, ErrorOr<void> result) {
+            if (result.is_error()) {
+                dbgln("Request::handle_dns_lookup_state: Proxy lookup failed: {}", result.error());
+                self.m_network_error = Requests::NetworkError::UnableToResolveProxy;
+                self.transition_to_state(State::Error);
+                return;
+            }
+            self.m_proxy_host_resolved = true;
+            self.m_resolved_proxy = proxy;
+            self.handle_dns_lookup_state();
+        }));
+        return;
+    }
+
+    // Avoid leaking hostnames resolved by the proxy.
     if (m_proxy.has_value() && m_proxy->resolves_hostnames()) {
         m_dns_result = nullptr;
         continue_after_dns_lookup();
@@ -1331,6 +1348,23 @@ void Request::handle_dns_lookup_state()
             self.m_dns_result = move(dns_result);
             self.continue_after_dns_lookup();
         }));
+}
+
+// Pins the request's host, if it was resolved, and its proxy's host, if that's given by name, so that curl resolves
+// neither itself.
+void Request::set_curl_resolve_list(Optional<ByteString> host_entry)
+{
+    curl_slist* resolve_list = nullptr;
+    if (host_entry.has_value())
+        resolve_list = curl_slist_append(resolve_list, host_entry->characters());
+    if (auto proxy_entry = curl_resolve_entry_for_proxy(m_proxy); proxy_entry.has_value())
+        resolve_list = curl_slist_append(resolve_list, proxy_entry->characters());
+    if (!resolve_list)
+        return;
+
+    auto result = curl_easy_setopt(m_curl_easy_handle, CURLOPT_RESOLVE, resolve_list);
+    VERIFY(result == CURLE_OK);
+    m_curl_string_lists.append(resolve_list);
 }
 
 StringView Request::connect_host() const
@@ -1404,15 +1438,7 @@ void Request::handle_connect_state()
     set_option(CURLOPT_PROXY, m_proxy.has_value() ? m_proxy->to_curl_url().characters() : "");
 
     // Pre-populate the multi's hostcache so libcurl skips its threaded resolver entirely.
-    if (m_dns_result) {
-        auto formatted_address = build_curl_resolve_list(*m_dns_result, m_url.serialized_host(), m_url.port_or_default());
-        if (curl_slist* resolve_list = curl_slist_append(nullptr, formatted_address.characters())) {
-            set_option(CURLOPT_RESOLVE, resolve_list);
-            m_curl_string_lists.append(resolve_list);
-        } else {
-            VERIFY_NOT_REACHED();
-        }
-    }
+    set_curl_resolve_list(m_dns_result ? build_curl_resolve_list(*m_dns_result, m_url.serialized_host(), m_url.port_or_default()) : Optional<ByteString> {});
 
     mark_lifecycle_event(this, &WireStats::curl_added_at);
     auto result = curl_multi_add_handle(m_curl_multi_handle, m_curl_easy_handle);
@@ -1518,7 +1544,9 @@ void Request::handle_fetch_state()
 
     curl_slist* curl_headers = nullptr;
 
-    if (m_method.is_one_of("POST"sv, "PUT"sv, "PATCH"sv, "DELETE"sv)) {
+    // Any method can carry a body (WebDAV's PROPFIND and REPORT, e.g.), and the request's headers already announce
+    // its length, so hand curl the body whatever the method.
+    if (m_method.is_one_of("POST"sv, "PUT"sv, "PATCH"sv, "DELETE"sv) || (!m_request_body.is_empty() && m_method != "HEAD"sv)) {
         set_option(CURLOPT_POSTFIELDSIZE, m_request_body.size());
         set_option(CURLOPT_POSTFIELDS, m_request_body.data());
 
@@ -1589,16 +1617,7 @@ void Request::handle_fetch_state()
 
     set_option(CURLOPT_PROXY, m_proxy.has_value() ? m_proxy->to_curl_url().characters() : "");
 
-    if (m_dns_result) {
-        auto formatted_address = build_curl_resolve_list(*m_dns_result, connect_host(), connect_port());
-
-        if (curl_slist* resolve_list = curl_slist_append(nullptr, formatted_address.characters())) {
-            set_option(CURLOPT_RESOLVE, resolve_list);
-            m_curl_string_lists.append(resolve_list);
-        } else {
-            VERIFY_NOT_REACHED();
-        }
-    }
+    set_curl_resolve_list(m_dns_result ? build_curl_resolve_list(*m_dns_result, connect_host(), connect_port()) : Optional<ByteString> {});
 
     // libcurl authenticates the alternative as the origin.
     if (m_alternative_service.has_value() && (connect_host() != m_url.serialized_host() || connect_port() != m_url.port_or_default())) {
@@ -2397,7 +2416,7 @@ void Request::send_headers_to_client()
         if (auto info = certificate_info(); info.has_value())
             m_client->async_certificate_info_available(m_request_id, *info);
     }
-    m_client->async_headers_became_available(m_request_id, m_response_headers->headers(), m_status_code, m_reason_phrase, cache_state, m_http_version);
+    m_client->async_headers_became_available(m_request_id, m_url, m_response_headers->headers(), m_status_code, m_reason_phrase, cache_state, m_http_version);
 }
 
 void Request::write_to_disk_cache(ReadonlyBytes bytes)
@@ -2636,7 +2655,7 @@ static u64 saturating_add(u64 left, u64 right)
 
 static bool s_performance_monitor_enabled;
 static u64 s_performance_generation;
-static HashMap<i32, HashMap<u64, Requests::NetworkUsage>> s_network_usage;
+static HashMap<int, HashMap<u64, Requests::NetworkUsage>> s_network_usage;
 
 void Request::set_performance_monitor_enabled(bool enabled)
 {
@@ -2650,23 +2669,34 @@ void Request::set_performance_monitor_enabled(bool enabled)
 Vector<Requests::NetworkUsage> Request::take_network_usage()
 {
     Vector<Requests::NetworkUsage> result;
-    for (auto const& process : s_network_usage) {
-        for (auto const& page : process.value)
+    for (auto const& client : s_network_usage) {
+        for (auto const& page : client.value)
             result.append(page.value);
     }
     s_network_usage.clear();
     return result;
 }
 
-void Request::set_performance_origin(i32 process_id, u64 page_id)
+void Request::add_network_usage(Requests::NetworkUsage const& usage)
 {
-    m_performance_origin = { process_id, page_id, 0, 0 };
+    if (!s_performance_monitor_enabled || usage.client_id == 0 || (usage.download_bytes == 0 && usage.upload_bytes == 0))
+        return;
+    auto& total = s_network_usage.ensure(usage.client_id).ensure(usage.page_id, [&] {
+        return Requests::NetworkUsage { usage.client_id, usage.page_id, 0, 0 };
+    });
+    total.download_bytes = saturating_add(total.download_bytes, usage.download_bytes);
+    total.upload_bytes = saturating_add(total.upload_bytes, usage.upload_bytes);
+}
+
+void Request::set_performance_origin(int client_id, u64 page_id)
+{
+    m_performance_origin = { client_id, page_id, 0, 0 };
     m_performance_generation = s_performance_generation;
 }
 
 void Request::sample_network_usage()
 {
-    if (!s_performance_monitor_enabled || m_performance_origin.process_id == 0)
+    if (!s_performance_monitor_enabled || m_performance_origin.client_id == 0)
         return;
     if (!m_curl_easy_handle) {
         m_sampled_download_bytes = 0;
@@ -2686,11 +2716,7 @@ void Request::sample_network_usage()
         auto delta = m_performance_origin;
         delta.download_bytes = download_bytes >= m_sampled_download_bytes ? download_bytes - m_sampled_download_bytes : download_bytes;
         delta.upload_bytes = upload_bytes >= m_sampled_upload_bytes ? upload_bytes - m_sampled_upload_bytes : upload_bytes;
-        if (delta.download_bytes || delta.upload_bytes) {
-            auto& total = s_network_usage.ensure(delta.process_id).ensure(delta.page_id, [&] { return m_performance_origin; });
-            total.download_bytes = saturating_add(total.download_bytes, delta.download_bytes);
-            total.upload_bytes = saturating_add(total.upload_bytes, delta.upload_bytes);
-        }
+        add_network_usage(delta);
     }
     m_sampled_download_bytes = download_bytes;
     m_sampled_upload_bytes = upload_bytes;

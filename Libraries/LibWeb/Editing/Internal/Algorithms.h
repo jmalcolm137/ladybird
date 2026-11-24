@@ -125,7 +125,7 @@ bool is_visible_node(GC::Ref<DOM::Node>);
 bool is_whitespace_node(GC::Ref<DOM::Node>);
 void justify_the_selection(DOM::Document&, JustifyAlignment);
 DOM::BoundaryPoint last_equivalent_point(DOM::BoundaryPoint);
-Utf16String legacy_font_size(int);
+Utf16String legacy_font_size(int, CSSPixels medium_font_size);
 void move_node_preserving_ranges(GC::Ref<DOM::Node>, GC::Ref<DOM::Node> new_parent, u32 new_index);
 void unwrap_node_preserving_ranges(GC::Ref<DOM::Node>);
 Optional<DOM::BoundaryPoint> next_equivalent_point(DOM::BoundaryPoint);
@@ -140,7 +140,6 @@ Vector<RecordedOverride> record_current_states_and_values(DOM::Document const&);
 GC::RootVector<RecordedNodeValue> record_the_values_of_nodes(Vector<GC::Ref<DOM::Node>> const&);
 void remove_extraneous_line_breaks_at_the_end_of_node(GC::Ref<DOM::Node>);
 void remove_extraneous_line_breaks_before_node(GC::Ref<DOM::Node>);
-void remove_extraneous_line_breaks_from_a_node(GC::Ref<DOM::Node>);
 void remove_node_preserving_its_descendants(GC::Ref<DOM::Node>);
 void reorder_modifiable_descendants(GC::Ref<DOM::Node>, Utf16FlyString const&, Optional<Utf16View>);
 void restore_states_and_values(DOM::Document&, Vector<RecordedOverride> const&);
@@ -154,7 +153,7 @@ bool standard_inline_indeterminate(DOM::Document const&, Utf16FlyString const& c
 Utf16String standard_inline_value(DOM::Document const&, Utf16FlyString const& command);
 void toggle_lists(DOM::Document&, Utf16FlyString const&);
 bool values_are_equivalent(Utf16FlyString const&, Optional<Utf16View>, Optional<Utf16View>);
-bool values_are_loosely_equivalent(Utf16FlyString const&, Optional<Utf16View>, Optional<Utf16View>);
+bool values_are_loosely_equivalent(Utf16FlyString const&, Optional<Utf16View>, Optional<Utf16View>, GC::Ref<DOM::Node> context);
 enum class PreservePrecedingLineBreak {
     No,
     Yes,
@@ -164,7 +163,8 @@ GC::Ptr<DOM::Node> wrap(GC::RootVector<GC::Ref<DOM::Node>>, Function<bool(GC::Re
 // Utility methods:
 
 GC::Ptr<DOM::Node> first_formattable_node_effectively_contained(GC::Ptr<DOM::Range>);
-CSSPixels font_size_to_pixel_size(Utf16View const&);
+CSSPixels font_size_to_pixel_size(Utf16View const&, CSSPixels medium_font_size);
+CSSPixels medium_font_size_at(GC::Ref<DOM::Node>);
 void for_each_node_effectively_contained_in_range(GC::Ptr<DOM::Range>, Function<TraversalDecision(GC::Ref<DOM::Node>)>);
 bool has_visible_children(GC::Ref<DOM::Node>);
 bool is_heading(Utf16FlyString const&);

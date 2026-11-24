@@ -5,7 +5,12 @@ AccumulatedVisualContext Tree:
   effects:
     [e0 in s0] effects=[]
 
+Layers (for a window server that shows tiles and filters what is below layers):
+  [L0] base space=viewport
+  [L1] caret #0 space=viewport region=[5,5 7x22]
+  [L2] painted space=viewport above L1
+
 DisplayList:
-PaintCaret@s1/e0 rect=[8,8 1x16] color=rgb(0, 0, 0) should_blink=false
-FillRoundedRectRing@s1/e0 rect=[6,6 104x24] widths=[2,2,2,2] color=rgb(61, 174, 233)
+L1 PaintCaret@s1/e0 rect=[8,8 1x16] color=rgb(0, 0, 0) blink_cycle_start_time_ns=t1 owner=BlockContainer<DIV> phase=foreground
+L2 FillRoundedRectRing@s1/e0 rect=[6,6 104x24] top_width=2 right_width=2 bottom_width=2 left_width=2 color=rgb(61, 174, 233) owner=BlockContainer<DIV> phase=outline
 

@@ -11,6 +11,7 @@ use std::collections::BTreeSet;
 use std::fmt::Write;
 
 use flapc::metadata::{InstructionDefinition, SlowPathLayout, field_type_info};
+use flapc::rust_bytecode::scaled;
 
 const RUST_KEYWORDS: &[&str] = &[
     "abstract", "as", "async", "await", "become", "box", "break", "const", "continue", "do", "dyn", "else", "enum",
@@ -41,13 +42,15 @@ fn rust_type(ty: &str) -> String {
         "IdentifierTableIndex" | "PropertyKeyTableIndex" | "StringTableIndex" => ty.to_string(),
         "Optional<IdentifierTableIndex>" => "OptionalIndex<IdentifierTableIndex>".to_string(),
         "Optional<StringTableIndex>" => "OptionalIndex<StringTableIndex>".to_string(),
-        "EnvironmentCoordinate" => "EnvironmentCoordinate".to_string(),
+        "EnvironmentCoordinate" => "BytecodeEnvironmentCoordinate".to_string(),
         "Value" => "Value".to_string(),
         "Builtin" => "u8".to_string(),
         _ => {
             let info = field_type_info(ty);
             match info.kind {
                 "bool" | "u8" | "u16" | "i32" | "u32" | "u64" => info.kind.to_string(),
+                "byte_count" => "u8".to_string(),
+                "cache_index" => "u16".to_string(),
                 other => panic!("no Rust view for bytecode field type {ty} ({other})"),
             }
         }
@@ -64,7 +67,7 @@ pub fn generate(ops: &[InstructionDefinition], ops_with_values: &BTreeSet<String
         }
         let _ = writeln!(
             out,
-            "#[repr(C)]\npub struct {} {{\n    pub header: InstructionHeader,",
+            "#[repr(C, packed)]\npub struct {} {{\n    pub header: InstructionHeader,",
             op.name
         );
         let mut assertions = String::new();
@@ -99,13 +102,21 @@ pub fn generate(ops: &[InstructionDefinition], ops_with_values: &BTreeSet<String
             let count_field = field_name(&op.fields[array.count_field_index].name);
             let name = field_name(&array_field.name);
             let ty = rust_type(&array_field.ty);
-            let _ = writeln!(
-                out,
-                "impl {op_name} {{\n    /// The elements the instruction holds after its fixed fields, within the length it records.\n    pub fn {name}(&self) -> &[{ty}] {{\n        let count = self.{count_field} as usize;\n        assert!(core::mem::offset_of!({op_name}, {name}) + count * size_of::<{ty}>() <= self.length() as usize);\n        // SAFETY: The instruction is a view of bytecode that holds the length it records, which the elements are\n        //         within.\n        unsafe {{ ak::slice_from_raw_parts(self.{name}.as_ptr(), count) }}\n    }}\n}}",
-                op_name = op.name
-            );
+            let accessor = if ty == "Value" {
+                format!(
+                    "impl {op_name} {{\n    /// The elements the instruction holds after its fixed fields, within the length it records.\n    pub fn {name}(&self) -> impl ExactSizeIterator<Item = Value> + '_ {{\n        let count = self.{count_field} as usize;\n        assert!(core::mem::offset_of!({op_name}, {name}) + count * size_of::<Value>() <= self.length() as usize);\n        let elements = core::ptr::addr_of!(self.{name}).cast::<Value>();\n        // SAFETY: The instruction is a view of bytecode that holds the length it records, which the elements are\n        //         within. They can be unaligned, so they are read as such.\n        (0..count).map(move |index| unsafe {{ elements.add(index).read_unaligned() }})\n    }}\n}}",
+                    op_name = op.name
+                )
+            } else {
+                format!(
+                    "impl {op_name} {{\n    /// The elements the instruction holds after its fixed fields, within the length it records.\n    pub fn {name}(&self) -> &[{ty}] {{\n        let count = self.{count_field} as usize;\n        assert!(core::mem::offset_of!({op_name}, {name}) + count * size_of::<{ty}>() <= self.length() as usize);\n        // SAFETY: The instruction is a view of bytecode that holds the length it records, which the elements are\n        //         within. {ty} has an alignment of 1.\n        unsafe {{ ak::slice_from_raw_parts(core::ptr::addr_of!(self.{name}).cast::<{ty}>(), count) }}\n    }}\n}}",
+                    op_name = op.name
+                )
+            };
+            out.push_str(&accessor);
+            out.push('\n');
         }
-        match (op.layout.size, op.layout.m_length_offset) {
+        match (op.layout.size, &op.array) {
             (Some(size), _) => {
                 let _ = writeln!(
                     out,
@@ -113,14 +124,23 @@ pub fn generate(ops: &[InstructionDefinition], ops_with_values: &BTreeSet<String
                     op.name, op.name
                 );
             }
-            (None, Some(_)) => {
+            (None, Some(array)) => {
+                let count_field = &op.fields[array.count_field_index];
+                let count_name = field_name(&count_field.name);
+                let count = if rust_type(&count_field.ty) == "u32" {
+                    format!("self.{count_name}")
+                } else {
+                    format!("u32::from(self.{count_name})")
+                };
                 let _ = writeln!(
                     out,
-                    "impl {} {{\n    /// The instruction's size in the bytecode, which it records itself.\n    pub fn length(&self) -> u32 {{\n        self.length\n    }}\n}}",
-                    op.name
+                    "impl {} {{\n    /// The instruction's size in the bytecode.\n    pub fn length(&self) -> u32 {{\n        let count = {count};\n        {} + {}\n    }}\n}}",
+                    op.name,
+                    op.layout.minimum_size,
+                    scaled("count", array.element_size)
                 );
             }
-            (None, None) => panic!("{} has neither a fixed size nor a length field", op.name),
+            (None, None) => panic!("{} has neither a fixed size nor a count field", op.name),
         }
 
         if ops_with_values.contains(&op.name) {

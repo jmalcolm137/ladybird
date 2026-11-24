@@ -147,7 +147,7 @@ static void apply_document_style_invalidation_after_style_change(DOM::Document& 
     if (invalidation.invalidates_hit_test_display_list())
         document.set_needs_to_record_display_list();
     else
-        document.set_needs_to_record_display_list_keeping_hit_test_display_list();
+        document.set_needs_to_record_display_list_keeping_hit_test_items_on_screen();
 }
 
 // One element's computed style answers for another only while the inputs it was keyed on still mean what they meant. A
@@ -170,7 +170,7 @@ void StyleEngineFFI::web_css_run_style_update(StyleReactionApplication* applicat
     auto const& read = application->read;
     auto& document = *application->document;
     auto& style_engine = document.style_computer().style_engine();
-    auto& counters = document.style_invalidation_counters();
+    auto& counters = document.style_update_statistics();
     StyleEngine::StyleUpdateTimings transaction {};
     if (flown) {
         transaction = style_engine.drain_flown_style_update(read);
@@ -278,8 +278,8 @@ StyleEngineFFI::FfiReactionElement StyleEngineFFI::web_css_style_inheritance_par
 // Swaps in the styles of a style installation, which the render side installed in the layout arena, and performs
 // the main-side effects of the elements whose styles move where they have any. Both are in tree order, and each
 // element's effects follow its swaps, which they name: an element's effects can clear the styles of its descendants,
-// whose swaps come after them.
-void StyleEngineFFI::web_css_install_styles(StyleReactionApplication* application, StyleSwap const* swaps, size_t swap_count, InstalledElementEffects const* effects, size_t effect_count, u32 document_damage)
+// which they name too, and whose swaps come after them.
+void StyleEngineFFI::web_css_install_styles(StyleReactionApplication* application, StyleSwap const* swaps, size_t swap_count, InstalledElementEffects const* effects, size_t effect_count, u32 const* cleared_descendants, size_t cleared_descendant_count, u32 document_damage)
 {
     auto const& read = application->read;
     auto& document = *application->document;
@@ -294,6 +294,7 @@ void StyleEngineFFI::web_css_install_styles(StyleReactionApplication* applicatio
     ScopeGuard end_style_installation = [&] { style_computer.end_style_installation(); };
 
     ReadonlySpan<StyleSwap> all_swaps { swaps, swap_count };
+    ReadonlySpan<u32> all_cleared_descendants { cleared_descendants, cleared_descendant_count };
     size_t next_swap = 0;
     // Swaps in the styles up to the swap `end`, each element's at once.
     auto swap_in_styles_until = [&](size_t end) {
@@ -355,6 +356,16 @@ void StyleEngineFFI::web_css_install_styles(StyleReactionApplication* applicatio
                     pseudo_element_before_change[i] = element->installed_style(pseudo_element);
             }
         }
+        // The pseudo-elements that are displayed before their swaps, ignoring animations: one that no longer is after
+        // them ends the animations it owns.
+        u16 pseudo_elements_displayed_before = 0;
+        if (element && element_effects.pseudo_elements_composed != 0 && element->has_css_animations_or_transitions()) {
+            for (auto pseudo_element : DOM::Element::computed_pseudo_elements) {
+                auto const& style = element->installed_style(pseudo_element);
+                if (style && !style.display_is_none_ignoring_animations())
+                    pseudo_elements_displayed_before |= static_cast<u16>(1 << to_underlying(pseudo_element));
+            }
+        }
         // The effects compare the record the element moves to with the one it moves from, which the installation pins
         // while the host applies it.
         InstalledStyle const old_style { element_effects.old_record };
@@ -381,6 +392,7 @@ void StyleEngineFFI::web_css_install_styles(StyleReactionApplication* applicatio
                 style_computer.apply_settled_animation_plan(read, abstract_element);
             if (old_style && document.is_in_style_stabilization_epoch())
                 style_computer.record_transition_stabilization_baseline(abstract_element, old_style);
+            StyleEngineFFI::style_engine_begin_composition_settling(style_computer.style_engine().host(), &read, element->style_node_id().value());
             if (style_computer.has_animations_to_compose(abstract_element))
                 sample_animations_for_installed_record(abstract_element);
             else
@@ -390,11 +402,12 @@ void StyleEngineFFI::web_css_install_styles(StyleReactionApplication* applicatio
                 apply_element_style_invalidation_after_style_change(read, *element, step_invalidation);
                 application->invalidation |= step_invalidation;
             }
+            StyleEngineFFI::style_engine_end_composition_settling(style_computer.style_engine().host(), &read);
         }
         // The host composes the records swapped in for the element's pseudo-elements that owe the plan of their
         // animations or the transition step, or whose element has animations, as it composes those it settles.
         if (element_effects.pseudo_elements_composed != 0) {
-            application->invalidation |= element->compose_style_pseudo_element_records(read, element_effects.pseudo_elements_composed, element_effects.pseudo_element_transition_steps, pseudo_element_before_change);
+            application->invalidation |= element->compose_style_pseudo_element_records(read, element_effects.pseudo_elements_composed, element_effects.pseudo_element_transition_steps, pseudo_element_before_change, pseudo_elements_displayed_before);
         }
         if (display_none_before.has_value()) {
             element->apply_display_none_change(*display_none_before);
@@ -402,9 +415,17 @@ void StyleEngineFFI::web_css_install_styles(StyleReactionApplication* applicatio
             if (element->installed_style().view().animated_overlay || element->custom_property_data_is_animation_overlay({}))
                 sample_animations_for_installed_record(DOM::AbstractElement { *element });
         }
-        // The render side decided whether the element's descendants hold styles while it is hidden.
-        if (has_flag(main_effects, CSS::MainEffects::ClearHiddenDescendants))
-            element->clear_computed_styles_from_display_none_descendants(read);
+        // The render side decided whether the element's descendants hold styles while it is hidden, and which of them
+        // do: those it found below the element in the tree the transaction was computed from. That can be another
+        // tree than the document's now, where a write made beside a transaction that flew moved an element in it.
+        if (has_flag(main_effects, CSS::MainEffects::ClearHiddenDescendants)) {
+            VERIFY(element_effects.cleared_descendants_begin <= element_effects.cleared_descendants_end);
+            VERIFY(element_effects.cleared_descendants_end <= all_cleared_descendants.size());
+            for (auto style_node : all_cleared_descendants.slice(element_effects.cleared_descendants_begin, element_effects.cleared_descendants_end - element_effects.cleared_descendants_begin)) {
+                if (auto* descendant = element_for(style_node))
+                    descendant->clear_computed_style_below_display_none(read);
+            }
+        }
         if (has_flag(main_effects, CSS::MainEffects::VisibilityFlip))
             document.throttled_animation_visibility_changed();
     }
@@ -414,7 +435,7 @@ void StyleEngineFFI::web_css_install_styles(StyleReactionApplication* applicatio
     // The render side noted the boxes whose visual contexts the moves change, which the document updates ahead of
     // its next paint.
     if (invalidation.accumulated_visual_contexts() != AccumulatedVisualContextInvalidation::None || invalidation.needs_stacking_context_tree_rebuild())
-        document.set_needs_accumulated_visual_contexts_update(true);
+        document.set_needs_accumulated_visual_contexts_update();
     if (invalidation.needs_repaint())
         Painting::request_document_repaint(document, invalidation.invalidates_hit_test_display_list() ? InvalidateDisplayList::PaintCommandsAndHitTestList : InvalidateDisplayList::PaintCommands);
     application->invalidation |= invalidation;
@@ -457,7 +478,7 @@ Optional<StyleUpdateInputs> begin_style_update_inputs(Layout::BegunRead const& r
     // change selector or cascade inputs. Apply an animation-only update first, then take a
     // transaction only if the resulting inherited-style feedback requires one.
     record_non_author_stylesheets(document);
-    document.style_invalidation_counters().style_update_submission_microseconds += microseconds_since(submission_started_at);
+    document.style_update_statistics().style_update_submission_microseconds += microseconds_since(submission_started_at);
     // Settle the counter-style registry of each tree scope that may have moved before the engine answers any row: a
     // record naming a counter style names the registry it was computed against, and a shadow tree can define its own.
     // None of it depends on layout.
@@ -483,7 +504,7 @@ static void update_style(Layout::BegunRead const& read, DOM::Document& document,
     // NB: The style update of a read with no transaction in flight is compiled without the drain's steps.
     constexpr bool drains_flown_transaction = IsSame<FirstTransaction, FlownStyleUpdate>;
     auto style_update_started_at = MonotonicTime::now();
-    auto& timing_counters = document.style_invalidation_counters();
+    auto& timing_counters = document.style_update_statistics();
     auto const submission_before = timing_counters.style_update_submission_microseconds;
     auto const bridge_before = timing_counters.style_update_bridge_microseconds;
     auto const apply_before = timing_counters.style_update_apply_microseconds;
@@ -830,7 +851,7 @@ static bool update_style_for_element(Layout::BegunRead const& read, DOM::Documen
             document.sample_animation_effects_needing_style_update();
         // NB: A style update stops after a number of passes with what they fed back still pending, as a chain of
         //     custom property animations does that moves one level per pass. The read wants them all.
-        auto const stopped_passes = [&] { return document.style_invalidation_counters().style_update_pass_guard_hits; };
+        auto const stopped_passes = [&] { return document.style_update_statistics().style_update_pass_guard_hits; };
         auto stopped_before = stopped_passes();
         bool update = !document.is_running_update_layout()
             && (can_run_regular_style_update || document.style_computer().style_engine().has_pending_transaction(read));
@@ -862,11 +883,29 @@ static bool update_style_for_element(Layout::BegunRead const& read, DOM::Documen
             return true;
     }
 
-    StyleReactionApplication application { read, document };
-    document.style_computer().begin_inheritance_chain_read();
-    ScopeGuard end_inheritance_chain_read = [&] { document.style_computer().end_inheritance_chain_read(); };
-    auto answer = StyleEngineFFI::style_engine_update_style_for_inheritance_chain(document.style_computer().style_engine().host(), &read, &application, first_element_of_inheritance_chain(abstract_element), static_cast<StyleEngineFFI::FfiStyleUpdateMode>(mode), embedding_document_layout_was_stale);
-    apply_document_style_invalidation_after_style_change(document, application.invalidation);
+    auto read_inheritance_chain = [&] {
+        StyleReactionApplication application { read, document };
+        document.style_computer().begin_inheritance_chain_read();
+        ScopeGuard end_inheritance_chain_read = [&] { document.style_computer().end_inheritance_chain_read(); };
+        auto answer = StyleEngineFFI::style_engine_update_style_for_inheritance_chain(document.style_computer().style_engine().host(), &read, &application, first_element_of_inheritance_chain(abstract_element), static_cast<StyleEngineFFI::FfiStyleUpdateMode>(mode), embedding_document_layout_was_stale);
+        apply_document_style_invalidation_after_style_change(document, application.invalidation);
+        return answer;
+    };
+    auto answer = read_inheritance_chain();
+    // NB: An element of the chain would read an input the next style update has yet to take: one recorded beside the
+    //     last style update above, or as the style of an element above it on the chain was installed. A style update
+    //     takes it, and the chain is read again. A read that cannot run one, or that still finds input pending after
+    //     these rounds, answers what the element holds.
+    constexpr size_t style_update_rounds_of_a_chain_read = 4;
+    for (size_t round = 0; answer == StyleEngineFFI::FfiTargetedStyleAnswer::NeedsStyleUpdate; ++round) {
+        if (round == style_update_rounds_of_a_chain_read || !entered_stabilization_epoch || document.is_running_update_layout() || document.is_at_style_stabilization_bound(read)) {
+            dbgln("Style read of an element answers the style it holds, with style input still pending");
+            answer = StyleEngineFFI::FfiTargetedStyleAnswer::HeldStyle;
+            break;
+        }
+        update_style(read, document, RecordedStyleUpdate { DocumentWithoutBrowsingContext::Update });
+        answer = read_inheritance_chain();
+    }
     return answer_style_read(abstract_element, answer);
 }
 
@@ -878,12 +917,11 @@ void Document::drain_style_update_that_flew(Layout::BegunRead const& read)
 {
     // The animations dirtied beside the transaction are the next style update's, as are the writes made beside it: the
     // drain samples those its own reactions create.
-    auto effects_beside = exchange(m_effects_needing_animated_style_update, {});
+    set_aside_effects_needing_animated_style_update();
     bool needed_beside = exchange(m_needs_animated_style_update, false);
     bool forced_beside = exchange(m_force_throttled_animation_style_update, false);
     CSS::update_style(read, *this, CSS::FlownStyleUpdate { m_flown_style_update_inputs.release_value() });
-    for (auto& effect : effects_beside)
-        m_effects_needing_animated_style_update.set(effect);
+    restore_effects_needing_animated_style_update();
     m_needs_animated_style_update |= needed_beside;
     m_force_throttled_animation_style_update |= forced_beside;
 }
@@ -892,7 +930,7 @@ void Document::update_style()
 {
     Layout::ForcedReadScope read { style_computer().style_engine().render_document() };
     drain_flown_style_update(read);
-    auto const stopped_passes = [&] { return style_invalidation_counters().style_update_pass_guard_hits; };
+    auto const stopped_passes = [&] { return style_update_statistics().style_update_pass_guard_hits; };
     auto stopped_before = stopped_passes();
     CSS::update_style(read, *this);
     if (stopped_passes() == stopped_before)
@@ -909,6 +947,11 @@ void Document::update_style()
         if (stopped_passes() == exchange(stopped_before, stopped_passes()))
             break;
     }
+}
+
+bool Document::has_style_work(Layout::BegunRead const& read) const
+{
+    return CSS::document_has_style_work(read, *this);
 }
 
 bool Document::let_style_update_fly(Layout::RustFFI::FfiFlightBlocker blocker)

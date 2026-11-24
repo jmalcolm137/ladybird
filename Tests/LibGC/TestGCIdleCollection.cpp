@@ -4,10 +4,41 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <LibCore/EventLoop.h>
+#include <LibGC/Cell.h>
+#include <LibGC/CellAllocator.h>
+#include <LibGC/Heap.h>
 #include <LibGC/IdleCollectionPolicy.h>
+#include <LibGC/Testing.h>
 #include <LibTest/TestCase.h>
 
 using Decision = GC::IdleCollectionPolicy::Decision;
+
+namespace {
+
+bool s_abandoned_cell_was_destroyed = false;
+
+class AbandonedCell final : public GC::Cell {
+    GC_CELL(AbandonedCell, GC::Cell);
+    GC_DECLARE_ALLOCATOR(AbandonedCell);
+
+public:
+    virtual ~AbandonedCell() override { s_abandoned_cell_was_destroyed = true; }
+
+private:
+    AbandonedCell() = default;
+
+    [[maybe_unused]] FlatPtr m_room_for_a_freelist_entry[2] {};
+};
+
+GC_DEFINE_ALLOCATOR(AbandonedCell);
+
+NEVER_INLINE void allocate_abandoned_cell(GC::Heap& heap)
+{
+    (void)heap.allocate<AbandonedCell>();
+}
+
+}
 
 TEST_CASE(collects_once_the_allocation_rate_drops)
 {
@@ -33,6 +64,20 @@ TEST_CASE(rate_drop_is_gated_on_having_enough_garbage)
     EXPECT(policy.evaluate(64 * KiB, 64 * KiB, 8 * MiB) == Decision::KeepWaiting);
 }
 
+TEST_CASE(a_quiet_tick_collects_a_few_mib_of_garbage_below_the_rate_drop_gate)
+{
+    GC::IdleCollectionPolicy policy;
+    policy.reset(0);
+
+    // A burst far below the rate-drop gate of a large heap (threshold / 16, i.e. 16 MiB here).
+    EXPECT(policy.evaluate(3 * MiB, 3 * MiB, 256 * MiB) == Decision::KeepWaiting);
+    EXPECT(!policy.last_tick_was_quiet());
+
+    // Next to no allocation since: the heap went quiet, and a few MiB of garbage are enough.
+    EXPECT(policy.evaluate(3 * MiB + 64 * KiB, 3 * MiB + 64 * KiB, 256 * MiB) == Decision::Collect);
+    EXPECT(policy.last_tick_was_quiet());
+}
+
 TEST_CASE(watchdog_collects_when_the_rate_never_drops)
 {
     GC::IdleCollectionPolicy policy;
@@ -55,4 +100,17 @@ TEST_CASE(parks_when_there_is_nothing_to_collect)
     GC::IdleCollectionPolicy policy;
     policy.reset(0);
     EXPECT(policy.evaluate(4 * MiB, 0, 8 * MiB) == Decision::Park);
+}
+
+TEST_CASE(an_abandoned_object_graph_is_collected_without_further_allocation)
+{
+    Core::EventLoop event_loop;
+    GC::Heap heap([](auto&) { }, GC::Heap::BecomeThreadDefault::No);
+
+    s_abandoned_cell_was_destroyed = false;
+    allocate_abandoned_cell(heap);
+    GC::scrub_stack_for_testing();
+
+    heap.did_abandon_object_graph();
+    event_loop.spin_until([] { return s_abandoned_cell_was_destroyed; });
 }

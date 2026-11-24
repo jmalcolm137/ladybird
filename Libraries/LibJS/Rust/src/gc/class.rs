@@ -44,6 +44,9 @@ pub struct Class {
     pub object_methods: Option<&'static ObjectMethods>,
     /// The kind of the cells of this class, which type_info also holds for LibGC.
     kind: CellKind,
+    /// Whether LibGC may only trace the cells of this class on the thread that owns their heap, see
+    /// traced_on_owner_thread_only().
+    owner_thread_only: bool,
 }
 
 // The layout module's mirror of the class, through which Layout.h tells an embedder where a class keeps its id and
@@ -99,11 +102,64 @@ impl Class {
             parent,
             object_methods,
             kind,
+            owner_thread_only: false,
         }
     }
 
     pub fn kind(&self) -> CellKind {
         self.kind
+    }
+
+    /// LibGC traces cells on several threads at once while the thread that owns their heap is stopped. This has it
+    /// trace the cells of this class on the owner only, for classes whose trace() or external_memory_size() read
+    /// state of the owner thread, or state that other cells share without synchronization.
+    pub const fn traced_on_owner_thread_only(mut self) -> Self {
+        self.owner_thread_only = true;
+        self
+    }
+
+    pub fn is_traced_on_owner_thread_only(&self) -> bool {
+        self.owner_thread_only
+    }
+
+    /// Whether collections that do not scan the stack may move the cells of this class, see gc_allocator_set_movable().
+    /// A class may only be movable if everything that keeps the address of its cells visits it through a slot, pins
+    /// the cell, or forgets the address when the cell moves. Classes derived at run time, such as an embedder's host
+    /// objects, never are, as the embedder keeps their addresses.
+    pub fn is_movable(&self) -> bool {
+        if self.is_derived_at_run_time() {
+            return false;
+        }
+        matches!(
+            self.id,
+            ClassId::ValueStorage
+                | ClassId::Object
+                | ClassId::Array
+                | ClassId::EcmascriptFunctionObject
+                | ClassId::EcmascriptFunctionObjectWithRareData
+                | ClassId::DeclarativeEnvironment
+                | ClassId::FunctionEnvironment
+                | ClassId::PrimitiveString
+                | ClassId::RopeString
+                | ClassId::Substring
+                | ClassId::InlineString
+                | ClassId::Shape
+                | ClassId::DescriptorArray
+                | ClassId::DictionaryPropertyTable
+                | ClassId::BigInt
+                | ClassId::Accessor
+                | ClassId::BoundFunction
+                | ClassId::ArgumentsObject
+                | ClassId::RegExpObject
+                | ClassId::Date
+                | ClassId::ArrayIterator
+                | ClassId::StringIterator
+                | ClassId::Map
+                | ClassId::MapIterator
+                | ClassId::Set
+                | ClassId::SetIterator
+                | ClassId::Promise
+        )
     }
 
     /// What Cell::class_name() returns for the cells of this class, which printing and messages show. It is the name
@@ -207,6 +263,7 @@ impl Class {
             parent: Some(parent),
             object_methods,
             kind: parent.kind,
+            owner_thread_only: parent.owner_thread_only,
         }));
         #[cfg(feature = "address-sanitizer")]
         // SAFETY: The class is a live allocation, which the process keeps for as long as it runs.
@@ -352,7 +409,8 @@ impl<T: GcCell> core::ops::Deref for crate::layout::cell::Gc<T> {
     type Target = T;
 
     fn deref(&self) -> &T {
-        // SAFETY: A Gc points to a live cell, which never moves.
+        // SAFETY: A Gc points to a live cell. Cells only move in collections that do not scan the stack, while no
+        //         reference to a cell is on it.
         unsafe { self.as_non_null().as_ref() }
     }
 }
@@ -401,7 +459,7 @@ impl CellHeaderTail {
     /// The header of a cell of `class` that keeps fields of its own in the first word, like `CellHeader::for_class()`.
     pub fn for_class(class: &'static Class) -> Self {
         Self {
-            mark: false.into(),
+            identity_hash_state: core::cell::Cell::new(0),
             state: CellState::Live.into(),
             kind: class.kind(),
         }
@@ -413,7 +471,7 @@ impl CellHeader {
     pub fn for_class(class: &'static Class) -> Self {
         Self {
             unused: [0; 8],
-            mark: false.into(),
+            identity_hash_state: core::cell::Cell::new(0),
             state: CellState::Live.into(),
             kind: class.kind(),
         }
@@ -432,17 +490,21 @@ impl CellHeader {
 /// of them inherits them from the class it extends, as C++ subclasses inherit virtual methods, so the Finalize
 /// implementation of a subclass has to finalize its base as well.
 macro_rules! define_cell {
-    ($type:ident, $kind:ident $(, extends: [$parent:ident $(, $ancestor:ident)*])? $(, methods: $methods:path)? $(, finalize: $finalize:ident)? $(, external_memory_size: $external_memory_size:ident)?) => {
+    ($type:ident, $kind:ident $(, extends: [$parent:ident $(, $ancestor:ident)*])? $(, methods: $methods:path)? $(, finalize: $finalize:ident)? $(, external_memory_size: $external_memory_size:ident)? $(, traced_on: $traced_on:ident)?) => {
         const _: () = {
-            static CLASS: $crate::gc::class::Class = $crate::gc::class::Class::new::<$type>(
-                stringify!($type),
-                $crate::gc::class_id::ClassId::$type,
-                $crate::layout::cell::CellKind::$kind,
-                define_cell!(@parent $($parent)?),
-                define_cell!(@methods [$($parent)?] [$($methods)?]),
-                define_cell!(@finalize $type [$($parent)?] [$($finalize)?]),
-            )
-            .with_external_memory_size(define_cell!(@external_memory_size $type [$($parent)?] [$($external_memory_size)?]));
+            static CLASS: $crate::gc::class::Class = {
+                let class = $crate::gc::class::Class::new::<$type>(
+                    stringify!($type),
+                    $crate::gc::class_id::ClassId::$type,
+                    $crate::layout::cell::CellKind::$kind,
+                    define_cell!(@parent $($parent)?),
+                    define_cell!(@methods [$($parent)?] [$($methods)?]),
+                    define_cell!(@finalize $type [$($parent)?] [$($finalize)?]),
+                )
+                .with_external_memory_size(define_cell!(@external_memory_size $type [$($parent)?] [$($external_memory_size)?]));
+                $(let class = define_cell!(@traced_on $traced_on class);)?
+                class
+            };
 
             // SAFETY: Checked by the asserts in Class::new and the cell's #[repr(C)] layout.
             unsafe impl $crate::gc::class::GcCell for $type {
@@ -456,6 +518,7 @@ macro_rules! define_cell {
             )?
         };
     };
+    (@traced_on owner_thread_only $class:ident) => { $class.traced_on_owner_thread_only() };
     (@parent) => { None };
     (@parent $parent:ident) => { Some(<$parent as $crate::gc::class::GcCell>::CLASS) };
     (@methods [] []) => { None };

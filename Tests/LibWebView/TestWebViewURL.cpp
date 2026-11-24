@@ -7,6 +7,7 @@
 
 #include <LibTest/TestCase.h>
 #include <LibWebView/Autocomplete.h>
+#include <LibWebView/AutocompleteMuxer.h>
 #include <LibWebView/SearchEngine.h>
 #include <LibWebView/URL.h>
 
@@ -81,14 +82,28 @@ static void expect_context_menu_text_not_url(StringView text)
     EXPECT(!WebView::url_from_text(text).has_value());
 }
 
+static WebView::AutocompleteSuggestion typed_text_row(StringView text)
+{
+    WebView::AutocompleteSuggestion row;
+    row.source = WebView::AutocompleteSuggestionSource::LiteralURL;
+    row.text = MUST(String::from_utf8(text));
+    return row;
+}
+
+static bool autocomplete_rows_go_to_the_same_place(StringView left, StringView right)
+{
+    auto right_row = typed_text_row(right);
+    return WebView::index_of_suggestion_with_same_destination(typed_text_row(left), { &right_row, 1 }).has_value();
+}
+
 static void expect_autocomplete_urls_match(StringView left, StringView right)
 {
-    EXPECT(WebView::autocomplete_urls_match(left, right));
+    EXPECT(autocomplete_rows_go_to_the_same_place(left, right));
 }
 
 static void expect_autocomplete_urls_do_not_match(StringView left, StringView right)
 {
-    EXPECT(!WebView::autocomplete_urls_match(left, right));
+    EXPECT(!autocomplete_rows_go_to_the_same_place(left, right));
 }
 
 static void expect_autocomplete_url_can_complete(StringView query, StringView suggestion)
@@ -474,7 +489,7 @@ TEST_CASE(search_query_percent_encoding)
     WebView::SearchEngine engine_with_suggestions {
         .name = "Test"_string,
         .query_url = "https://ecosia.org/search?q=%s"_string,
-        .suggestions = WebView::SearchSuggestions { "https://ac.ecosia.org/autocomplete?q=%s&type=list"_string },
+        .suggestions_url = "https://ac.ecosia.org/autocomplete?q=%s&type=list"_string,
     };
     auto suggestions_url = engine_with_suggestions.suggestions_url_for_query("a&b"sv);
     EXPECT(suggestions_url.has_value());

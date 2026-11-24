@@ -10,8 +10,10 @@
 
 #include <AK/Atomic.h>
 #include <AK/FFIHelpers.h>
+#include <AK/Math.h>
 #include <AK/NeverDestroyed.h>
 #include <LibCore/AnonymousBuffer.h>
+#include <LibCore/EventLoop.h>
 #include <LibCore/Platform/ThreadQoS.h>
 #include <LibCore/ThreadEventQueue.h>
 #include <LibGC/CellAllocator.h>
@@ -55,7 +57,6 @@
 #include <LibWeb/HTML/HTMLFormElement.h>
 #include <LibWeb/HTML/HTMLSlotElement.h>
 #include <LibWeb/HTML/Location.h>
-#include <LibWeb/HTML/MessageEvent.h>
 #include <LibWeb/HTML/PromiseRejectionEvent.h>
 #include <LibWeb/HTML/Scripting/ClassicScript.h>
 #include <LibWeb/HTML/Scripting/Environments.h>
@@ -73,8 +74,6 @@
 #include <LibWeb/HighResolutionTime/TimeOrigin.h>
 #include <LibWeb/Loader/ResourceLoader.h>
 #include <LibWeb/Page/Page.h>
-#include <LibWeb/PerformanceTimeline/PerformanceObserver.h>
-#include <LibWeb/PermissionsAPI/PermissionStore.h>
 #include <LibWeb/Platform/EventLoopPlugin.h>
 #include <LibWeb/Platform/ImageCodecPlugin.h>
 #include <LibWeb/Platform/ThreadPoolWork.h>
@@ -167,6 +166,74 @@ void set_collect_garbage_on_every_allocation_in_new_agents(bool enabled)
     s_collect_garbage_on_every_allocation = enabled;
 }
 
+struct AsyncWaitQueueReference {
+    AK_ALLOC_WITH_KMALLOC;
+    JS::AsyncWaitQueue const* queue;
+    ~AsyncWaitQueueReference() { JS::VM::release_async_wait_queue(queue); }
+};
+
+struct AsyncWaitEventLoop {
+    AK_ALLOC_WITH_KMALLOC;
+    NonnullRefPtr<Core::WeakEventLoopReference> loop;
+};
+
+static void install_async_wait_hooks(JS::VM& vm)
+{
+    auto* event_loop = new AsyncWaitEventLoop { Core::EventLoop::current_weak() };
+    JS::AsyncWaitHooks hooks {};
+    hooks.data = event_loop;
+    hooks.wake = [](void* context, JS::AsyncWaitQueue const* queue) {
+        auto reference = make<AsyncWaitQueueReference>(queue);
+        auto& weak_loop = static_cast<AsyncWaitEventLoop*>(context)->loop;
+        if (auto loop = weak_loop->take()) {
+            loop->deferred_invoke([reference = move(reference)] {
+                JS::VM::dispatch_async_wait_queue(reference->queue);
+            });
+        }
+    };
+    hooks.destroy = [](void* context) {
+        delete static_cast<AsyncWaitEventLoop*>(context);
+    };
+    hooks.enqueue_resolution = [](void*, u64 id, JS::Realm& realm) {
+        // https://html.spec.whatwg.org/multipage/webappapis.html#hostenqueuegenericjob
+        // 1. Let global be realm's global object.
+        auto& global = realm.global_object();
+        // 2. Queue a global task on the JavaScript engine task source given global to perform job().
+        HTML::queue_global_task(HTML::Task::Source::JavaScriptEngine, global, GC::create_function(realm.heap(), GC::captures(realm, id), [](auto& realm, auto& id) {
+            HTML::TemporaryExecutionContext context { realm };
+            realm.vm().resolve_async_wait(id);
+        }));
+    };
+    hooks.schedule_timeout = [](void*, u64 id, JS::Realm& realm, double milliseconds) {
+        // https://html.spec.whatwg.org/multipage/webappapis.html#hostenqueuetimeoutjob
+        // 1. Let global be realm's global object.
+        auto& global = realm.global_object();
+        // 2. Let timeoutStep be an algorithm step which queues a global task on the JavaScript engine task source
+        //    given global to perform job().
+        auto timeout_step = GC::create_function(realm.heap(), GC::captures(realm, id), [](auto& realm, auto& id) {
+            realm.vm().async_wait_timer_fired(id);
+            HTML::queue_global_task(HTML::Task::Source::JavaScriptEngine, realm.global_object(), GC::create_function(realm.heap(), GC::captures(realm, id), [](auto& realm, auto& id) {
+                HTML::TemporaryExecutionContext context { realm };
+                realm.vm().timeout_async_wait(id);
+            }));
+        });
+        // AD-HOC: The timer interface takes signed 32-bit milliseconds. Round up fractional waits, and split longer
+        //         waits into chunks; the runtime checks the deadline before timing out the waiter.
+        auto delay = static_cast<i32>(min(ceil(milliseconds), static_cast<double>(NumericLimits<i32>::max())));
+        // 3. Run steps after a timeout given global, "JavaScript", milliseconds, and timeoutStep.
+        if (auto* worklet = impl_from<HTML::WorkletGlobalScope>(&global))
+            return worklet->run_steps_after_a_timeout(delay, timeout_step);
+        return HTML::relevant_window_or_worker_global_scope(global).run_steps_after_a_timeout(delay, timeout_step);
+    };
+    hooks.cancel_timeout = [](void*, JS::Realm& realm, i32 timer) {
+        if (auto* worklet = impl_from<HTML::WorkletGlobalScope>(&realm.global_object()))
+            worklet->cancel_timeout_steps(timer);
+        else
+            HTML::relevant_window_or_worker_global_scope(realm.global_object()).cancel_timeout_steps(timer);
+    };
+    vm.set_async_wait_hooks(hooks);
+}
+
 void initialize_agent(HTML::AgentType type)
 {
     auto new_vm = JS::VM::create();
@@ -179,6 +246,8 @@ void initialize_agent(HTML::AgentType type)
         ladybird_did_start_short_lived_thread();
     }
     vm.set_agent(create_agent(vm.heap(), type));
+    if (Core::EventLoop::is_running())
+        install_async_wait_hooks(vm);
 
     vm.heap().set_should_collect_on_every_allocation(s_collect_garbage_on_every_allocation);
 
@@ -234,7 +303,7 @@ void initialize_agent(HTML::AgentType type)
         // 1. Let script be the running script.
         //    The running script is the script in the [[HostDefined]] field in the ScriptOrModule component of the running JavaScript execution context.
         HTML::Script* script { nullptr };
-        vm.running_execution_context().script_or_module.visit(
+        vm.running_execution_context().script_or_module().visit(
             [&script](GC::Ref<JS::Script>& js_script) {
                 script = as<HTML::ClassicScript>(HTML::script_from_host_defined(js_script->host_defined()));
             },
@@ -411,13 +480,13 @@ void initialize_agent(HTML::AgentType type)
 
                 // IMPLEMENTATION DEFINED: Per the previous "implementation defined" comment, we must now make the script or module the active script or module.
                 //                         Since the only active execution context currently is the realm execution context of job settings, lets attach it here.
-                job_settings->realm_execution_context().script_or_module = script_or_module;
+                job_settings->realm_execution_context().set_script_or_module(script_or_module);
             } else {
                 // FIXME: We need to setup a dummy execution context in case a JS::NativeFunction is called when processing the job.
                 //        This is because JS::NativeFunction::call excepts something to be on the execution context stack to be able to get the caller context to initialize the environment.
                 //        Do note that the JS spec gives _no_ guarantee that the execution context stack has something on it if HostEnqueuePromiseJob was called with a null realm: https://tc39.es/ecma262/#job-preparedtoevaluatecode
                 dummy_execution_context = JS::ExecutionContext::create(0, ReadonlySpan<JS::Value> {}, 0);
-                dummy_execution_context->script_or_module = script_or_module;
+                dummy_execution_context->set_script_or_module(script_or_module);
                 vm.push_execution_context(*dummy_execution_context);
             }
 
@@ -427,7 +496,7 @@ void initialize_agent(HTML::AgentType type)
             // 3. If job settings is not null, then clean up after running script with job settings.
             if (job_settings) {
                 // IMPLEMENTATION DEFINED: Disassociate the realm execution context from the script or module.
-                job_settings->realm_execution_context().script_or_module = Empty {};
+                job_settings->realm_execution_context().set_script_or_module(Empty {});
 
                 // IMPLEMENTATION DEFINED: See comment above, we need to clean up the non-standard prepare_to_run_callback() call.
                 HTML::clean_up_after_running_callback(*job_settings);
@@ -464,13 +533,13 @@ void initialize_agent(HTML::AgentType type)
         if (script) {
             script_execution_context = JS::ExecutionContext::create(0, ReadonlySpan<JS::Value> {}, 0);
             script_execution_context->function = nullptr;
-            script_execution_context->realm = &script->settings_object().realm();
+            script_execution_context->set_realm(&script->settings_object().realm());
             if (is<HTML::ClassicScript>(script)) {
-                script_execution_context->script_or_module = GC::Ref<JS::Script>(*as<HTML::ClassicScript>(script)->script_record());
+                script_execution_context->set_script_or_module(GC::Ref<JS::Script>(*as<HTML::ClassicScript>(script)->script_record()));
             } else if (is<HTML::ModuleScript>(script)) {
-                script_execution_context->script_or_module = as<HTML::ModuleScript>(script)->record().visit(
+                script_execution_context->set_script_or_module(as<HTML::ModuleScript>(script)->record().visit(
                     [](Empty) -> JS::ScriptOrModule { return {}; },
-                    [](auto& module) -> JS::ScriptOrModule { return GC::Ref<JS::Module> { module }; });
+                    [](auto& module) -> JS::ScriptOrModule { return GC::Ref<JS::Module> { module }; }));
             } else {
                 VERIFY_NOT_REACHED();
             }
@@ -738,9 +807,9 @@ void initialize_agent(HTML::AgentType type)
             auto* stack_mark = stack.top();
             auto* module_execution_context = stack.allocate(0, ReadonlySpan<JS::Value> {}, 0);
             VERIFY(module_execution_context);
-            module_execution_context->realm = realm;
+            module_execution_context->set_realm(realm);
             if (module)
-                module_execution_context->script_or_module = GC::Ref { *module };
+                module_execution_context->set_script_or_module(GC::Ref { *module });
             vm.push_execution_context(*module_execution_context);
 
             JS::finish_loading_imported_module(referrer, module_request, payload, completion);
@@ -789,23 +858,23 @@ void shut_down_agent()
     // NB: A window agent lives as long as its process does.
     VERIFY(&vm != main_thread_vm_ptr().ptr());
 
-    static_cast<HTML::Agent*>(vm.agent())->detach_script_abort_handle();
+    auto& agent = static_cast<HTML::Agent&>(*vm.agent());
+    agent.detach_script_abort_handle();
 
     // What the agent keeps outside its heap refers to cells in it, so that goes while the heap is alive.
     Platform::discard_thread_pool_completions();
     Fetch::Fetching::disarm_all_body_stream_wakes();
-    HTML::clear_message_event_ports_caches();
-    PerformanceTimeline::clear_supported_entry_types_caches();
     ServiceWorker::clear_service_worker_container_ready_promise_caches();
-    PermissionsAPI::PermissionStore::forget_statuses_of_this_agent();
     FileAPI::forget_blob_url_store_of_this_agent();
     Fetch::Fetching::clear_http_memory_cache();
     ServiceWorker::forget_job_queues_of_this_agent();
     ServiceWorker::Registration::forget_registrations_of_this_agent();
 
     // An event that is still queued can hold roots as well, and a stopped request only lets go of its roots in one. As
-    // the task queues discard everything by now, no script runs from these. What a deferred invocation of LibWeb is for
-    // has to go undone, as the worker that it was for has run its closing steps.
+    // the task queues discard everything by now, no script runs from these. What a deferred invocation of LibWeb or a
+    // command to the agent's fetch executor is for has to go undone, as the worker that it was for has run its closing
+    // steps.
+    agent.fetch_executor->shutdown();
     Platform::EventLoopPlugin::set_discard_deferred_invocations_on_this_thread(true);
     auto& event_queue = Core::ThreadEventQueue::current();
     for (;;) {
@@ -858,7 +927,7 @@ NonnullOwnPtr<JS::ExecutionContext> create_a_new_javascript_realm(JS::VM& vm, HT
     VERIFY(popped_execution_context == realm_execution_context.ptr());
 
     // 4. Let realm be realm execution context's Realm component.
-    auto& realm = *realm_execution_context->realm;
+    auto& realm = *realm_execution_context->realm();
 
     // 5. If agent's agent cluster's cross-origin isolation mode is "none":
     if (agent_cluster_cross_origin_isolation_mode == HTML::CrossOriginIsolationMode::None) {
@@ -914,7 +983,7 @@ GC::Ref<JS::Realm> create_a_simple_javascript_realm()
             return global_this.as_nonnull();
         });
 
-    auto& realm = *execution_context->realm;
+    auto& realm = *execution_context->realm();
     auto intrinsics = realm.create<Intrinsics>(realm);
     auto wrapper_world = GC::Heap::the().allocate<WrapperWorld>(WrapperWorld::Type::Internal);
     realm.set_host_defined(realm.heap().allocate<HostDefined>(intrinsics, *wrapper_world, *principal_realm));
@@ -1004,7 +1073,7 @@ GC::Ref<JS::Realm> create_a_principal_javascript_realm()
             return global_this.as_nonnull();
         });
 
-    auto realm = execution_context->realm;
+    auto realm = execution_context->realm();
     HTML::WindowEnvironmentSettingsObject::setup(
         *page,
         URL::about_blank(),

@@ -6,7 +6,7 @@
 
 //! Declarations of Libraries/LibGC/CAPI.h.
 
-use core::ffi::{c_char, c_void};
+use core::ffi::{c_char, c_int, c_void};
 
 use super::class::CellTypeInfo;
 
@@ -29,6 +29,11 @@ pub struct GCAllocator {
 }
 
 #[repr(C)]
+pub struct GCMarker {
+    _private: [u8; 0],
+}
+
+#[repr(C)]
 pub struct GCRoot {
     _private: [u8; 0],
 }
@@ -41,10 +46,12 @@ pub struct GCWeakImpl {
 pub const GC_COLLECTION_TYPE_COLLECT_GARBAGE: i32 = 0;
 pub const GC_COLLECTION_TYPE_COLLECT_EVERYTHING: i32 = 1;
 
+pub const GC_RECORDED_SLOT_VALUE: c_int = 0;
+pub const GC_RECORDED_SLOT_CELL_POINTER: c_int = 1;
+
 #[derive(Default)]
 #[repr(C)]
 pub struct GCLayout {
-    pub cell_mark_offset: u32,
     pub cell_state_offset: u32,
     pub cell_kind_offset: u32,
     pub min_cell_size: u32,
@@ -64,6 +71,10 @@ pub struct GCLayout {
     pub block_foreign_type_offset: u32,
     pub heap_region_offset_mask: u64,
     pub primitive_storage_cage_offset_mask: u64,
+    pub visitor_marker_offset: u32,
+    pub identity_hash_state_offset: u32,
+    pub identity_hash_hashed: u8,
+    pub identity_hash_moved: u8,
 }
 
 /// The generation of the storage's table entry in the high 32 bits and the entry's index in the low 32 bits.
@@ -83,7 +94,7 @@ pub type GCCallback = unsafe extern "C" fn(context: *mut c_void);
 pub type GCGatherRootsCallback = unsafe extern "C" fn(context: *mut c_void, root_visitor: *mut GCVisitor);
 
 unsafe extern "C" {
-    pub safe fn gc_get_layout(layout: &mut GCLayout);
+    pub safe fn gc_get_layout(layout: &mut GCLayout, layout_size: usize);
     pub safe fn gc_heap_region_base() -> usize;
     pub safe fn gc_primitive_storage_cage_base() -> usize;
 
@@ -95,7 +106,13 @@ unsafe extern "C" {
     pub fn gc_heap_destroy(heap: *mut GCHeap);
     // NB: The functions that take a reference to the heap have no other preconditions.
     pub safe fn gc_heap_collect_garbage(heap: &GCHeap, collection_type: i32, print_report: bool);
+    // NB: A collection that does not scan the stack may collect or move the cells that only the stack holds.
+    pub fn gc_heap_collect_garbage_without_scanning_the_stack(heap: &GCHeap);
+    pub safe fn gc_heap_moves_everything() -> bool;
+    pub safe fn gc_heap_set_moves_everything_for_testing(heap: &GCHeap, moves_everything: bool);
     pub safe fn gc_heap_is_collecting_everything(heap: &GCHeap) -> bool;
+    pub safe fn gc_heap_is_marking_for_collection(heap: &GCHeap) -> bool;
+    pub safe fn gc_heap_is_returning_memory_to_system(heap: &GCHeap) -> bool;
     pub safe fn gc_heap_undefer_gc(heap: &GCHeap);
     pub safe fn gc_heap_deferral_state(
         heap: &GCHeap,
@@ -119,15 +136,26 @@ unsafe extern "C" {
         foreign_type: *const c_void,
     ) -> *mut GCAllocator;
     pub fn gc_allocator_destroy(allocator: *mut GCAllocator);
-    pub fn gc_heap_allocate_cell(heap: *mut GCHeap, allocator: *mut GCAllocator, must_mark: *mut bool) -> *mut c_void;
-    pub fn gc_heap_allocate_storage_cell(
-        heap: *mut GCHeap,
-        allocator: *mut GCAllocator,
-        must_mark: *mut bool,
-    ) -> *mut c_void;
+    pub fn gc_allocator_set_traced_on_owner_thread_only(allocator: *mut GCAllocator);
+    pub fn gc_allocator_set_movable(allocator: *mut GCAllocator);
+    pub fn gc_heap_allocate_cell(heap: *mut GCHeap, allocator: *mut GCAllocator) -> *mut c_void;
+    pub fn gc_heap_allocate_storage_cell(heap: *mut GCHeap, allocator: *mut GCAllocator) -> *mut c_void;
     pub fn gc_heap_allocator_local_free_list(heap: *mut GCHeap, allocator: *mut GCAllocator) -> *mut *mut c_void;
     pub fn gc_cell_heap_context(cell: *const c_void) -> *mut c_void;
     pub fn gc_cell_type_info(cell: *const c_void) -> *const CellTypeInfo;
+    pub fn gc_cell_is_marked(cell: *const c_void) -> bool;
+    pub fn gc_cell_will_move(cell: *const c_void) -> bool;
+    pub safe fn gc_heap_is_moving_cells(heap: &GCHeap) -> bool;
+    pub fn gc_heap_record_slot(heap: *mut GCHeap, slot: *const c_void, kind: c_int);
+    pub fn gc_cell_identity_hash(cell: *const c_void) -> u32;
+    pub fn gc_marker_visit_cell(marker: *mut GCMarker, cell: *mut c_void);
+    pub fn gc_marker_visit_values(marker: *mut GCMarker, values: *const u64, count: usize);
+    pub fn gc_marker_visit_owned_values(marker: *mut GCMarker, values: *const u64, count: usize);
+    pub fn gc_marker_visit_member(marker: *mut GCMarker, slot: *const u32);
+    pub fn gc_marker_visit_interior_pointer(marker: *mut GCMarker, slot: *const usize, cell: *mut c_void);
+    pub fn gc_marker_visit_self_pointer(marker: *mut GCMarker, slot: *const usize);
+    pub fn gc_marker_pin_cell(marker: *mut GCMarker, cell: *const c_void);
+    pub fn gc_marker_visit_ephemeron_without_pinning(marker: *mut GCMarker, key: *mut c_void, value: *mut c_void);
 
     pub fn gc_root_create(cell: *mut c_void) -> *mut GCRoot;
     pub fn gc_root_destroy(root: *mut GCRoot);

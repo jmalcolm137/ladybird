@@ -551,6 +551,6 @@ mod tests {
         assert!(set.contains(&1));
         assert!(set.remove(&1));
         assert!(!set.remove(&1));
-        assert!(set.is_empty());
+        assert_eq!(set.iter().count(), 0);
     }
 }

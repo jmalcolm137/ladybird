@@ -23,13 +23,13 @@ use crate::css::ffi_support::FfiUtf16View;
 use crate::css::math_functions::math_function_from_name;
 use crate::css::parser::arbitrary_substitution::{
     SubstitutionFunctionsPresence, collect_arbitrary_substitution_function_presence,
-    contains_arbitrary_substitution_function, declaration_value_is_valid, substitution_function_presence_bits,
+    contains_arbitrary_substitution_function, declaration_value_is_valid,
 };
 use crate::css::parser::calc_parser::{CalcParseError, parse_a_calc_function_node};
 use crate::css::parser::color_parser::{is_color_function_name, parse_color_value};
 use crate::css::parser::component_value::{
-    ComponentKind, ComponentValue, ComponentValueList, consume_a_counted_list_of_component_values,
-    consume_a_list_of_component_values, consume_a_small_list_of_component_values,
+    ComponentKind, ComponentValue, consume_a_counted_list_of_component_values, consume_a_list_of_component_values,
+    consume_a_small_list_of_component_values,
 };
 use crate::css::parser::fonts_parser::parse_font_property;
 use crate::css::parser::grid_parser::parse_grid_property;
@@ -3823,7 +3823,10 @@ fn parse_generic_numeric_property(context: &ParseContext, property: u16, values:
         return ParseOutcome::NotHandled;
     }
 
-    let non_whitespace_values = values.iter().filter(|value| !value.is_whitespace()).collect::<Vec<_>>();
+    let non_whitespace_values = values
+        .iter()
+        .filter(|value| !value.is_whitespace())
+        .collect::<smallvec::SmallVec<[_; 4]>>();
     let accepted_types = property_accepted_value_types(property);
     let single_value = (non_whitespace_values.len() == 1).then(|| non_whitespace_values[0]);
     let mut parsed = accepted_types
@@ -4078,13 +4081,35 @@ pub(crate) fn parse_initial_value(property: u16) -> Option<StyleValueArc> {
     }
 }
 
-pub(crate) fn parse_initial_longhand(context: &ParseContext, property: u16) -> Option<StyleValueData> {
-    let initial = property_initial_value(property);
-    let values = consume_a_list_of_component_values(tokenize_for_parser(initial.as_bytes())).ok()?;
-    match parse_css_value(context, property, &values) {
-        ParseOutcome::Parsed(value) => Some((*value).clone()),
-        ParseOutcome::Invalid | ParseOutcome::NotHandled => None,
+/// The component values of `values` that are not whitespace, in inline memory where they are few.
+fn owned_non_whitespace(values: &[ComponentValue]) -> smallvec::SmallVec<[ComponentValue; 8]> {
+    values.iter().filter(|value| !value.is_whitespace()).cloned().collect()
+}
+
+pub(crate) fn parse_initial_longhand(_: &ParseContext, property: u16) -> Option<StyleValueData> {
+    initial_longhand_value(property).map(|value| (*value).clone())
+}
+
+/// The initial value of the longhand `property`, which is parsed once for each thread, as shorthands that leave a
+/// longhand out ask for it each time. It is parsed outside any document, as every context then shares it.
+fn initial_longhand_value(property: u16) -> Option<StyleValueArc> {
+    thread_local! {
+        static INITIAL_VALUES: std::cell::RefCell<std::collections::HashMap<u16, Option<StyleValueArc>>> =
+            std::cell::RefCell::new(std::collections::HashMap::new());
     }
+    if let Some(value) = INITIAL_VALUES.with(|cache| cache.borrow().get(&property).cloned()) {
+        return value;
+    }
+    let initial = property_initial_value(property);
+    let context = ParseContext::default();
+    let value = consume_a_list_of_component_values(tokenize_for_parser(initial.as_bytes()))
+        .ok()
+        .and_then(|values| match parse_css_value(&context, property, &values) {
+            ParseOutcome::Parsed(value) => Some(value),
+            ParseOutcome::Invalid | ParseOutcome::NotHandled => None,
+        });
+    INITIAL_VALUES.with(|cache| cache.borrow_mut().insert(property, value.clone()));
+    value
 }
 
 pub(crate) fn shorthand_value(property: u16, sub_properties: Vec<u16>, values: Vec<StyleValueData>) -> StyleValueData {
@@ -4167,6 +4192,7 @@ fn parse_unordered_shorthand(context: &ParseContext, property: u16, values: &[Co
             | property_id::FLEX_FLOW
             | property_id::OUTLINE
             | property_id::TEXT_WRAP
+            | property_id::_WEBKIT_TEXT_STROKE
     ) {
         return ParseOutcome::NotHandled;
     }
@@ -4212,7 +4238,7 @@ fn parse_unordered_shorthand(context: &ParseContext, property: u16, values: &[Co
     else {
         return ParseOutcome::Invalid;
     };
-    let order = if property == property_id::FLEX_FLOW {
+    let order = if matches!(property, property_id::FLEX_FLOW | property_id::_WEBKIT_TEXT_STROKE) {
         (0..longhands.len()).collect()
     } else {
         for index in 0..longhands.len() {
@@ -4683,11 +4709,7 @@ fn parse_place_shorthand(context: &ParseContext, property: u16, values: &[Compon
             ],
         )));
     }
-    let non_whitespace = values
-        .iter()
-        .filter(|value| !value.is_whitespace())
-        .cloned()
-        .collect::<Vec<_>>();
+    let non_whitespace = owned_non_whitespace(values);
     for split in (1..non_whitespace.len()).rev() {
         let (align_values, justify_values) = non_whitespace.split_at(split);
         let (ParseOutcome::Parsed(align_value), ParseOutcome::Parsed(justify_value)) = (
@@ -4907,11 +4929,7 @@ fn assign_shorthand_components(
 }
 
 fn parse_text_decoration_shorthand(context: &ParseContext, values: &[ComponentValue]) -> ParseOutcome {
-    let components = values
-        .iter()
-        .filter(|value| !value.is_whitespace())
-        .cloned()
-        .collect::<Vec<_>>();
+    let components = owned_non_whitespace(values);
     if components.is_empty() {
         return ParseOutcome::Invalid;
     }
@@ -5109,11 +5127,7 @@ fn parse_font_synthesis_shorthand(values: &[ComponentValue]) -> ParseOutcome {
 }
 
 fn parse_font_variant_shorthand(context: &ParseContext, values: &[ComponentValue]) -> ParseOutcome {
-    let components = values
-        .iter()
-        .filter(|value| !value.is_whitespace())
-        .cloned()
-        .collect::<Vec<_>>();
+    let components = owned_non_whitespace(values);
     if components.is_empty() {
         return ParseOutcome::Invalid;
     }
@@ -5190,11 +5204,7 @@ fn system_font_for_keyword(ident: &[u16]) -> Option<(&'static [u8], &'static [u8
 }
 
 fn parse_font_shorthand(context: &ParseContext, values: &[ComponentValue]) -> ParseOutcome {
-    let components = values
-        .iter()
-        .filter(|value| !value.is_whitespace())
-        .cloned()
-        .collect::<Vec<_>>();
+    let components = owned_non_whitespace(values);
     // A system font keyword on its own sets every longhand: the keyword's family and size, and the initial value of
     // the rest.
     if let [component] = components.as_slice()
@@ -5241,6 +5251,12 @@ fn parse_font_shorthand(context: &ParseContext, values: &[ComponentValue]) -> Pa
     let mut font_variant = None;
     let mut font_weight = None;
     let mut font_width = None;
+    // https://quirks.spec.whatwg.org/#the-unitless-length-quirk
+    // The font-size longhand accepts quirky lengths, but the font shorthand does not.
+    let size_context = ParseContext {
+        in_quirks_mode: false,
+        ..*context
+    };
     let mut normal_count = 0;
     let mut index = 0;
     while index < components.len() {
@@ -5274,7 +5290,7 @@ fn parse_font_shorthand(context: &ParseContext, values: &[ComponentValue]) -> Pa
             index += 1;
             continue;
         }
-        if let Some(font_size) = parse_component_for_property(context, property_id::FONT_SIZE, component) {
+        if let Some(font_size) = parse_component_for_property(&size_context, property_id::FONT_SIZE, component) {
             index += 1;
             let line_height = if components.get(index).is_some_and(|value| value.is_delim(b'/')) {
                 index += 1;
@@ -5748,11 +5764,11 @@ fn parse_mask_shorthand(context: &ParseContext, values: &[ComponentValue]) -> Pa
     )))
 }
 
-fn coordinating_initial_item(context: &ParseContext, property: u16) -> Option<StyleValueData> {
-    let initial = parse_initial_longhand(context, property)?;
-    match initial {
+fn coordinating_initial_item(_: &ParseContext, property: u16) -> Option<StyleValueData> {
+    let initial = initial_longhand_value(property)?;
+    match &*initial {
         StyleValueData::ValueList { values, .. } => values.as_slice().first()?.optional_data().cloned(),
-        value => Some(value),
+        value => Some(value.clone()),
     }
 }
 
@@ -5774,11 +5790,7 @@ fn parse_timeline_shorthand(context: &ParseContext, property: u16, values: &[Com
     let mut axes = Vec::new();
     let mut insets = Vec::new();
     for layer in values.split(ComponentValue::is_comma) {
-        let components = layer
-            .iter()
-            .filter(|value| !value.is_whitespace())
-            .cloned()
-            .collect::<Vec<_>>();
+        let components = owned_non_whitespace(layer);
         let Some(name) = components
             .first()
             .and_then(|value| parse_component_for_property(context, name_property, value))
@@ -5871,11 +5883,7 @@ fn parse_animation_transition_shorthand(
     let layers = values.split(ComponentValue::is_comma).collect::<Vec<_>>();
     let mut coordinated = vec![Vec::with_capacity(layers.len()); parsed_longhands.len()];
     for layer in &layers {
-        let components = layer
-            .iter()
-            .filter(|value| !value.is_whitespace())
-            .cloned()
-            .collect::<Vec<_>>();
+        let components = owned_non_whitespace(layer);
         if components.is_empty() {
             return ParseOutcome::Invalid;
         }
@@ -5904,16 +5912,20 @@ fn parse_animation_transition_shorthand(
     let mut sub_properties = parsed_longhands.to_vec();
     let mut output = coordinated
         .into_iter()
-        .map(|values| value_list(values, 1, true))
+        .map(|values| RetainedStyleValueData::from_owned(value_list(values, 1, true)))
         .collect::<Vec<_>>();
     for &reset_only in reset_only {
         sub_properties.push(reset_only);
-        let Some(initial) = parse_initial_longhand(context, reset_only) else {
+        let Some(initial) = initial_longhand_value(reset_only) else {
             return ParseOutcome::Invalid;
         };
-        output.push(initial);
+        output.push(RetainedStyleValueData::from_arc(initial));
     }
-    ParseOutcome::Parsed(shared_style_value(shorthand_value(property, sub_properties, output)))
+    ParseOutcome::Parsed(shared_style_value(retained_shorthand_value(
+        property,
+        sub_properties,
+        output,
+    )))
 }
 
 pub(crate) fn unresolved_value_from_string(
@@ -5921,18 +5933,17 @@ pub(crate) fn unresolved_value_from_string(
     presence: SubstitutionFunctionsPresence,
 ) -> StyleValueData {
     let values = consume_a_counted_list_of_component_values(tokenize_for_parser(unresolved_source)).unwrap_or_default();
-    unresolved_value(unresolved_source, values, presence)
+    unresolved_value(unresolved_source, &values, presence)
 }
 
 /// An unresolved value of `values`, whose source text `unresolved_source` is, and which it tokenizes again when its
 /// components are read.
 pub(crate) fn unresolved_value(
     unresolved_source: &[u16],
-    values: impl Into<ComponentValueList>,
+    values: &[ComponentValue],
     presence: SubstitutionFunctionsPresence,
 ) -> StyleValueData {
-    let values = values.into();
-    unresolved_value_with_components(unresolved_source, UnresolvedValueComponents::OfText(&values), presence)
+    unresolved_value_with_components(unresolved_source, UnresolvedValueComponents::OfText(values), presence)
 }
 
 /// An unresolved value whose source text is `unresolved_source`, made of `components`.
@@ -6016,7 +6027,7 @@ fn parse_css_value_after_substitution_scan(
             )
         } else {
             serialization = Vec::new();
-            unresolved_value(unresolved_source, values.to_vec(), substitution_presence)
+            unresolved_value(unresolved_source, values, substitution_presence)
         };
         if let StyleValueData::Unresolved(unresolved_payload) = &mut unresolved {
             unresolved_payload.payload_mut().contains_attr_tainted_values = context.contains_attr_tainted_values;
@@ -6052,6 +6063,9 @@ fn parse_css_value_after_substitution_scan(
     } else {
         values
     };
+    if values.iter().all(ComponentValue::is_whitespace) {
+        return ParseOutcome::Invalid;
+    }
     if property_is_shorthand(property_id) {
         let outcome = parse_grid_property(context, property_id, values);
         if !matches!(outcome, ParseOutcome::NotHandled) {
@@ -6366,28 +6380,53 @@ pub(crate) fn parse_css_value_with_utf16_source(
         return parse_css_value_after_substitution_scan(context, property_id, values, source, substitution_presence);
     }
     if substitution_presence.has_any() {
-        let unresolved_source = crate::css::serialize::serialize_component_values_to_utf16(
+        thread_local! {
+            static UNRESOLVED_SOURCE: std::cell::Cell<Vec<u16>> = const { std::cell::Cell::new(Vec::new()) };
+        }
+        // NB: An unresolved value copies the text that it keeps, thus the text is made in the memory of the last one.
+        let mut unresolved_source = UNRESOLVED_SOURCE.take();
+        crate::css::serialize::serialize_component_values_into_utf16(
             values,
             crate::css::parser::component_value::ComponentSerializationMode::PreserveNumericSource,
+            &mut unresolved_source,
         );
-        return parse_css_value_after_substitution_scan(
+        let outcome = parse_css_value_after_substitution_scan(
             context,
             property_id,
             values,
             &unresolved_source,
             substitution_presence,
         );
+        // NB: The thread keeps the memory for the next value, but not the memory of one very large value.
+        if unresolved_source.capacity() <= 4096 {
+            UNRESOLVED_SOURCE.set(unresolved_source);
+        }
+        return outcome;
     }
     parse_css_value_after_substitution_scan(context, property_id, values, &[], substitution_presence)
 }
 
 /// Parse a property value using the grammars which have been ported to Rust.
 pub(crate) fn parse_css_value(context: &ParseContext, property_id: u16, values: &[ComponentValue]) -> ParseOutcome {
+    if values
+        .iter()
+        .any(|value| matches!(value.kind, ComponentKind::Token(ParserTokenKind::Semicolon)))
+    {
+        return ParseOutcome::Invalid;
+    }
+    let mut substitution_presence = SubstitutionFunctionsPresence::default();
+    if collect_arbitrary_substitution_function_presence(values, &mut substitution_presence).is_err() {
+        return ParseOutcome::Invalid;
+    }
+    // NB: Only an unresolved value reads the source text, thus a value that cannot be one does not make it.
+    if property_id != property_id::CUSTOM && !substitution_presence.has_any() {
+        return parse_css_value_after_substitution_scan(context, property_id, values, &[], substitution_presence);
+    }
     let source = values
         .iter()
         .flat_map(|value| value.original_source_text.iter())
         .collect::<Vec<_>>();
-    parse_css_value_with_source(context, property_id, values, &source)
+    parse_css_value_after_substitution_scan(context, property_id, values, &source, substitution_presence)
 }
 
 pub(crate) fn component_values_from_source<'a>(
@@ -6453,28 +6492,6 @@ pub unsafe extern "C" fn rust_parse_css_value(
     };
     *out_status = status;
     value
-}
-
-/// Returns a substitution-function presence bitmap for CSS source.
-#[unsafe(no_mangle)]
-pub extern "C" fn rust_collect_arbitrary_substitution_function_presence_from_source(
-    source: FfiUtf16View,
-    out_presence: Option<&mut u8>,
-) -> bool {
-    let Some(out_presence) = out_presence else {
-        return false;
-    };
-    let Some(source) = source.units() else {
-        return false;
-    };
-    let Ok(values) = component_values_from_source(source) else {
-        return false;
-    };
-    let Some(presence) = substitution_function_presence_bits(&values) else {
-        return false;
-    };
-    *out_presence = presence;
-    true
 }
 
 type VisitMarginComponent = unsafe extern "C" fn(*mut c_void, u8, f64, *const u16, usize);
@@ -6582,15 +6599,15 @@ fn parse_css_primitive_values(
         }
         VALUE_TYPE_RATIO => {
             stream.discard_whitespace();
-            let first = stream.consume_a_token().clone();
+            let first = stream.consume_a_token();
             stream.discard_whitespace();
             let parsed = if stream.next_token().is_delim(b'/') {
-                let slash = stream.consume_a_token().clone();
+                let slash = stream.consume_a_token();
                 stream.discard_whitespace();
-                let second = stream.consume_a_token().clone();
-                parse_ratio_value_with_context(context, property, &[&first, &slash, &second])
+                let second = stream.consume_a_token();
+                parse_ratio_value_with_context(context, property, &[first, slash, second])
             } else {
-                parse_ratio_value_with_context(context, property, &[&first])
+                parse_ratio_value_with_context(context, property, &[first])
             }?;
             Some(parsed)
         }

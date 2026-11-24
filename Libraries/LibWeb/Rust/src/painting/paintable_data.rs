@@ -19,10 +19,6 @@ pub enum PaintableFlag {
     HasLaterBoxFragments = 1 << 4,
 }
 
-/// The flag bits that hold the writing mode of the frame a box was laid out in.
-const FRAME_WRITING_MODE_SHIFT: u32 = 5;
-const FRAME_WRITING_MODE_MASK: u32 = 0b111;
-
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[repr(C)]
 pub struct FfiPixelBox {
@@ -30,6 +26,17 @@ pub struct FfiPixelBox {
     pub right: CssPixels,
     pub bottom: CssPixels,
     pub left: CssPixels,
+}
+
+impl From<crate::layout::geometry::Sides> for FfiPixelBox {
+    fn from(sides: crate::layout::geometry::Sides) -> Self {
+        Self {
+            top: sides.top,
+            right: sides.right,
+            bottom: sides.bottom,
+            left: sides.left,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -47,9 +54,6 @@ pub struct PaintableData {
     pub slot_generation: u8,
     pub flags: u32,
 
-    pub offset: used_values::FfiCssPixelPoint,
-    pub content_size: used_values::FfiCssPixelSize,
-
     pub establishes_stacking_context: bool,
 
     pub own_scroll_node_index: SpatialNodeIndex,
@@ -66,8 +70,6 @@ impl Default for PaintableData {
             selection_state: 0,
             slot_generation: 0,
             flags: 0,
-            offset: used_values::FfiCssPixelPoint::default(),
-            content_size: used_values::FfiCssPixelSize::default(),
             establishes_stacking_context: false,
             own_scroll_node_index: SpatialNodeIndex::default(),
             node_identity: 0,
@@ -81,16 +83,6 @@ impl Default for PaintableData {
 impl PaintableData {
     pub fn has_flag(&self, flag: PaintableFlag) -> bool {
         self.flags & flag as u32 != 0
-    }
-
-    /// The writing mode of the frame the box was laid out in: that of its containing block.
-    pub(crate) fn frame(&self) -> crate::layout::geometry::Frame {
-        crate::layout::geometry::Frame::of(((self.flags >> FRAME_WRITING_MODE_SHIFT) & FRAME_WRITING_MODE_MASK) as u8)
-    }
-
-    pub(crate) fn set_frame(&mut self, frame: crate::layout::geometry::Frame) {
-        self.flags = (self.flags & !(FRAME_WRITING_MODE_MASK << FRAME_WRITING_MODE_SHIFT))
-            | ((u32::from(frame.writing_mode()) & FRAME_WRITING_MODE_MASK) << FRAME_WRITING_MODE_SHIFT);
     }
 
     pub fn set_flag(&mut self, flag: PaintableFlag, value: bool) {
@@ -231,6 +223,7 @@ pub(crate) struct CommittedSideData {
     pub(crate) order_inputs: crate::painting::paint_order_plan::PaintOrderInputs,
     pub(crate) containing_block_fragment: u32,
     pub(crate) box_fragments: Option<std::sync::Arc<Vec<CommittedBoxFragment>>>,
+    pub(crate) hit_test_bounds_of_lines: Option<std::sync::Arc<[crate::painting::ink_overflow::HitTestBoundOfLine]>>,
 }
 
 /// Rows are the same when they hold equal records; a shared record is compared only when the rows
@@ -249,6 +242,11 @@ impl PartialEq for CommittedSideData {
                 a == b
             })
             && self.containing_block_fragment == other.containing_block_fragment
+            && same_payload(
+                self.hit_test_bounds_of_lines.as_ref(),
+                other.hit_test_bounds_of_lines.as_ref(),
+                |a, b| a == b,
+            )
             && same_payload(self.box_fragments.as_ref(), other.box_fragments.as_ref(), |a, b| {
                 a.len() == b.len()
                     && a.iter().zip(b.iter()).all(|(left, right)| {
@@ -274,11 +272,21 @@ impl CommittedSideData {
     pub(crate) fn fragments(&self) -> &[FragmentRecord] {
         self.inline_content.as_ref().map_or(&[], |content| &content.fragments)
     }
+    pub(crate) fn glyph_ink_of_lines(&self) -> &[crate::css::css_pixels::CssPixelRect] {
+        self.inline_content
+            .as_ref()
+            .map_or(&[], |content| content.glyph_ink_of_lines())
+    }
     /// For a line root, the indices of the fragments of `node` among its fragments, in fragment order.
     pub(crate) fn fragment_indices_of(&self, node: NodeSlotId) -> &[u32] {
         self.inline_content
             .as_ref()
             .map_or(&[], |content| content.fragment_indices_of(node))
+    }
+    pub(crate) fn fragmentless_break_lines_of(&self, node: NodeSlotId) -> &[u32] {
+        self.inline_content
+            .as_ref()
+            .map_or(&[], |content| content.fragmentless_break_lines_of(node))
     }
     pub(crate) fn inline_box_pieces(&self) -> &[InlineBoxPieceRecord] {
         self.inline_content

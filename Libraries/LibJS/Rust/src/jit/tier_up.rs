@@ -9,10 +9,10 @@
 use core::ops::ControlFlow;
 use core::ptr::NonNull;
 
-use libjs_jit::code::CompiledCode;
-
+use super::allocation::SampleSlots;
 use super::code::{CompileState, FRUITLESS_LOOP_CHECKS_AFTER_INSTALL, JitCode, SnapshotExecutable};
-use super::compile_queue::CompileResult;
+use super::compile_queue::{CompileResult, Compiled};
+use super::data_memory::DataMemory;
 use super::executable_memory::ExecutableMemory;
 use super::snapshot::{CapturedSnapshot, capture_snapshot};
 use super::{CompileJob, JitState, executable_of};
@@ -146,8 +146,8 @@ fn code_to_compile(vm: &Vm) -> Option<CompileTarget> {
     let Some(function) = frame.function.get() else {
         // NB: The top-level code of a script or of a module runs once, but its loops can run long. Other code without
         //     a function, like that of eval, is not compiled.
-        let top_level_executable = match frame.script_or_module.get() {
-            ScriptOrModule::Script(script) => Some(script.cached_executable()),
+        let top_level_executable = match frame.script_or_module() {
+            ScriptOrModule::Script(script) => script.cached_executable(),
             ScriptOrModule::Module(module) => module.downcast_ref::<SourceTextModule>()?.cached_executable(),
             _ => None,
         };
@@ -301,6 +301,9 @@ pub fn on_budget_exhausted(vm: &Vm, pc: u32, is_loop: bool) {
         refuse_jit_compile(vm, &executable);
         return;
     };
+    if let Some(function) = code.function() {
+        function.shared_data().note_jit_compile(vm);
+    }
     compile(vm, executable, code.function(), is_loop.then_some(pc), options.sync);
     if executable.jit_compile_state() == CompileState::Queued {
         executable.head.tier_up_budget.set(QUEUED_BUDGET);
@@ -340,23 +343,24 @@ pub fn tier_up_check(vm: &Vm, encoded_pc: u64) -> i64 {
 fn should_install(vm: &Vm, result: &CompileResult) -> bool {
     result.as_ref().is_ok_and(|compiled| {
         compiled
-            .dependencies
-            .iter()
-            .all(|dependency| super::dependencies::holds(vm, dependency))
+            .artifact()
+            .dependencies()
+            .all(|dependency| super::dependencies::holds(vm, &dependency))
     }) && !vm.debugging_enabled()
 }
 
 fn install(
     vm: &Vm,
     executable: Gc<Executable>,
-    compiled: CompiledCode,
+    compiled: Compiled,
     memory: ExecutableMemory,
     snapshot: SnapshotExecutables,
+    sample_slots: SampleSlots,
     defer_gc: &DeferGc<'_>,
 ) {
-    let embedded_cells = compiled
-        .embedded_cells
-        .iter()
+    let artifact = compiled.artifact();
+    let embedded_cells: Vec<Gc<CellHeader>> = artifact
+        .embedded_cells()
         .map(|cell| {
             // SAFETY: The snapshot kept every cell it captured alive, and the code embeds only those.
             unsafe { Gc::from_non_null(NonNull::new(cell.0 as *mut CellHeader).expect("embedded cells are not null")) }
@@ -366,18 +370,17 @@ fn install(
     let mut code = JitCode::new(
         memory,
         compiled.entry_offset,
-        &compiled.osr_entries,
-        compiled.osr_loop_back_edges,
-        compiled.sites,
+        DataMemory::allocate(vm.jit.data_allocator(), &compiled.words[..compiled.layout.kept_len()]),
+        compiled.layout,
         embedded_cells,
         snapshot,
         defer_gc,
     );
-    code.set_invalidation(id, compiled.invalidation_patches);
+    code.set_sample_slots(sample_slots, defer_gc);
+    code.set_id(id);
     code.set_frame_offsets(compiled.site_index_frame_offset, compiled.register_dump_frame_offset);
-    code.set_osr_outer_loop_back_edges(compiled.osr_outer_loop_back_edges);
-    code.set_uncaught_handlers(compiled.uncaught_handlers);
-    vm.jit.dependents.register(vm, executable, id, &compiled.dependencies);
+    let dependencies = artifact.dependencies().collect::<Vec<_>>();
+    vm.jit.dependents.register(vm, executable, id, &dependencies);
     // NB: A callee's tier-up check may install the code while its caller still runs in the interpreter, possibly
     //     past the loop the code has an on-stack replacement entry at.
     vm.for_each_live_execution_context(|frame| {
@@ -402,6 +405,7 @@ fn finish_compile(
     result: CompileResult,
     memory: Option<ExecutableMemory>,
     snapshot_executables: SnapshotExecutables,
+    sample_slots: SampleSlots,
     defer_gc: &DeferGc<'_>,
 ) {
     assert_eq!(executable.jit_compile_state(), CompileState::Queued);
@@ -425,14 +429,22 @@ fn finish_compile(
         }
     };
     vm.jit.count_coverage("compile");
-    for key in &compiled.coverage {
+    for key in compiled.coverage() {
         vm.jit.count_coverage(key);
     }
-    if let Some(dump) = &compiled.dump {
+    if let Some(dump) = compiled.dump() {
         eprintln!("JIT code for {}:\n{dump}", super::describe_executable(&executable));
     }
     if let Some(memory) = memory {
-        install(vm, executable, compiled, memory, snapshot_executables, defer_gc);
+        install(
+            vm,
+            executable,
+            compiled,
+            memory,
+            snapshot_executables,
+            sample_slots,
+            defer_gc,
+        );
     }
     if executable.jit_compile_state() != CompileState::Installed {
         executable.set_jit_compile_state(CompileState::None);
@@ -456,11 +468,7 @@ fn compile(
     //     happens before the snapshot captures which valid sets the realm holds.
     let realm = match function {
         Some(function) => function.realm().expect("an ECMAScript function has a realm"),
-        None => vm
-            .running_execution_context_ref()
-            .realm
-            .get()
-            .expect("the frame of top-level code has a realm"),
+        None => vm.current_realm().expect("the frame of top-level code has a realm"),
     };
     realm_watchpoints::array_iterators_have_no_return(vm, realm);
     realm_watchpoints::array_iterators_have_builtin_next(vm, realm);
@@ -472,16 +480,18 @@ fn compile(
         snapshot,
         cells,
         snapshot_executables,
+        sample_slots,
     } = capture_snapshot(vm, executable, function, realm, osr_pc, &defer_gc);
     if sync {
         // NB: Nothing collects garbage while compiling on this thread, so the snapshot's cells stay alive.
-        let result = libjs_jit::compile(&snapshot);
+        let result = super::compile_queue::compile(&snapshot);
+        super::compile_queue::give_back_snapshot(snapshot);
         let memory = should_install(vm, &result).then(|| {
             let code = &result.as_ref().expect("the compile succeeded").code;
             let name = super::describe_executable(&executable);
             ExecutableMemory::allocate(
                 vm.jit.code_allocator(),
-                &[code.as_slice()],
+                &[&code[..]],
                 &[name.as_str()],
                 vm.jit.options.perf_map,
             )
@@ -494,6 +504,7 @@ fn compile(
             result,
             memory,
             snapshot_executables.into_inner(),
+            sample_slots.into_inner(),
             &defer_gc,
         );
         drop(defer_gc);
@@ -505,6 +516,7 @@ fn compile(
             executable,
             cells: cells.into_inner(),
             snapshot_executables: snapshot_executables.into_inner(),
+            sample_slots: sample_slots.into_inner(),
         },
         &defer_gc,
     );
@@ -527,6 +539,7 @@ pub fn compile_now(vm: &Vm, function: Gc<EcmascriptFunctionObject>) -> bool {
     }
     if executable.jit_compile_state() == CompileState::None {
         executable.ensure_feedback().update_value_feedback();
+        function.shared_data().note_jit_compile(vm);
         compile(vm, executable, Some(function), None, true);
     }
     executable.jit_compile_state() == CompileState::Installed
@@ -557,6 +570,17 @@ pub(crate) fn wait_for_compile_job(vm: &Vm, executable: &Executable) {
     }
 }
 
+/// Waits for every compile job to finish and installs its code. Only for tests.
+pub fn wait_for_compile_jobs(vm: &Vm) {
+    let Some(queue) = vm.jit.started_compile_queue() else {
+        return;
+    };
+    install_compile_results(vm, vm.jit.take_held_compile_results(), &DeferGc::new(vm));
+    while vm.jit.has_compile_jobs() {
+        install_compile_results(vm, queue.wait_for_finished(), &DeferGc::new(vm));
+    }
+}
+
 /// Installs the code of finished compile jobs.
 fn install_compile_results(vm: &Vm, results: Vec<(u64, CompileResult)>, defer_gc: &DeferGc<'_>) {
     let finished: Vec<(CompileJob, CompileResult)> = results
@@ -579,7 +603,7 @@ fn install_compile_results(vm: &Vm, results: Vec<(u64, CompileResult)>, defer_gc
             .map(|(compile, _)| compile)
     };
     let codes: Vec<&[u8]> = installed()
-        .map(|(_, result)| result.as_ref().expect("the compile succeeded").code.as_slice())
+        .map(|(_, result)| &result.as_ref().expect("the compile succeeded").code[..])
         .collect();
     let names: Vec<String> = installed()
         .map(|(job, _)| super::describe_executable(&job.executable))
@@ -590,6 +614,14 @@ fn install_compile_results(vm: &Vm, results: Vec<(u64, CompileResult)>, defer_gc
 
     for ((job, result), install) in finished.into_iter().zip(verdicts) {
         let memory = install.then(|| memories.next().expect("there is memory for each installed code"));
-        finish_compile(vm, job.executable, result, memory, job.snapshot_executables, defer_gc);
+        finish_compile(
+            vm,
+            job.executable,
+            result,
+            memory,
+            job.snapshot_executables,
+            job.sample_slots,
+            defer_gc,
+        );
     }
 }

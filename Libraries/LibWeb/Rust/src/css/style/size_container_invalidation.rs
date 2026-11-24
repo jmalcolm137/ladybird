@@ -8,8 +8,11 @@
 
 use super::bridge::FfiContainerEffectKind;
 use super::container_queries::ContainerVerdict;
-use super::fast_hash::FastSet as HashSet;
+use super::fast_hash::{FastMap as HashMap, FastSet as HashSet};
+use super::pipeline::Record;
 use super::{RetainedState, StyleEngine, StyleNodeID};
+use std::collections::hash_map::Entry;
+use std::sync::Arc;
 
 /// What the host learned about size container queries while it computed styles: which elements
 /// were asked about, which elements asked, and which containers had no box to answer with yet.
@@ -24,6 +27,13 @@ pub(super) struct SizeContainerQueryFacts {
     /// Containers a style computation asked about before they had a committed box. The layout
     /// that gives them one is where their dependents move.
     needing_evaluation_after_layout: HashSet<StyleNodeID>,
+    /// Containers asked about without a box that a full layout left without one, as one under an element that is not
+    /// rendered stays. Their dependents read nothing new until a commit gives them a box.
+    awaiting_box: HashSet<StyleNodeID>,
+    /// Queried containers whose font moved since their dependents were last recorded, each with the record it held
+    /// before the move. An animated container passes through its base record within every update, on its way to the
+    /// record with its animated values, so only a font that differs from the one before it counts.
+    font_moves: HashMap<StyleNodeID, Arc<Record>>,
     /// A container's eligibility changed, so units can newly select it even when it was not queried before.
     availability_changed: HashSet<StyleNodeID>,
     /// The size containers whose records say they answer size queries, as the records they were last published
@@ -38,8 +48,28 @@ impl SizeContainerQueryFacts {
         self.queried_containers.contains(&node)
     }
 
-    pub(super) fn note_font_input_change(&mut self, node: StyleNodeID) {
-        self.needing_evaluation_after_layout.insert(node);
+    /// Whether a layout left `node` without the box a style computation asked it about.
+    pub(super) fn is_awaiting_box(&self, node: StyleNodeID) -> bool {
+        self.awaiting_box.contains(&node)
+    }
+
+    /// Font-relative size queries can change even when the container's box keeps the same dimensions.
+    pub(super) fn note_held_record_change(&mut self, node: StyleNodeID, previous: Arc<Record>, current: &Record) {
+        if !self.is_queried_container(node) {
+            return;
+        }
+        match self.font_moves.entry(node) {
+            Entry::Occupied(entry) => {
+                if same_font(entry.get(), current) {
+                    entry.remove();
+                }
+            }
+            Entry::Vacant(entry) => {
+                if !same_font(&previous, current) {
+                    entry.insert(previous);
+                }
+            }
+        }
     }
 
     /// Follows whether `node` answers size queries, noting where that changed.
@@ -60,9 +90,21 @@ impl SizeContainerQueryFacts {
         self.queried_containers.remove(&node);
         self.dependents.remove(&node);
         self.needing_evaluation_after_layout.remove(&node);
+        self.awaiting_box.remove(&node);
+        self.font_moves.remove(&node);
         self.availability_changed.remove(&node);
         self.available.remove(&node);
     }
+}
+
+fn same_font(first: &Record, second: &Record) -> bool {
+    let font_group = crate::css::table_group_builder::group_index::FONT;
+    let (first, second) = (
+        first.payloads[font_group].as_ptr(),
+        second.payloads[font_group].as_ptr(),
+    );
+    // SAFETY: Both records hold a reference to their font payloads.
+    first == second || unsafe { crate::css::computed_values::style_group_payloads_equal(font_group, first, second) }
 }
 
 fn set_contains(set: &mut HashSet<StyleNodeID>, node: StyleNodeID, contains: bool) {
@@ -101,6 +143,7 @@ impl StyleEngine {
             .size_container_queries
             .needing_evaluation_after_layout
             .is_empty()
+            || !self.retained.size_container_queries.font_moves.is_empty()
             || !self.retained.size_container_queries.availability_changed.is_empty()
     }
 
@@ -135,23 +178,58 @@ impl StyleEngine {
         &mut self,
         rows: &[crate::layout::style_snapshot::CommittedGeometry],
     ) {
-        for container in self.retained.take_layout_style_snapshot_rows(rows) {
+        let mut resized = self.retained.take_layout_style_snapshot_rows(rows);
+        // A container its dependents read without a box answers them once a commit gives it one.
+        let awaiting_box = &mut self.retained.size_container_queries.awaiting_box;
+        if !awaiting_box.is_empty() {
+            let mut recorded: HashSet<StyleNodeID> = resized.iter().copied().collect();
+            for geometry in rows {
+                if geometry.has_committed_box && awaiting_box.remove(&geometry.node) && recorded.insert(geometry.node) {
+                    resized.push(geometry.node);
+                }
+            }
+        }
+        for container in resized {
             self.record_size_container_query_dependents(container);
         }
     }
 
+    /// Take the box of an element whose new style makes it a size container, which no commit has gathered a row for.
+    /// The container-relative units below it that were computed while it had no box resolved past it, to a container
+    /// further out or the viewport, so they are computed again against its box before any layout runs again. Their
+    /// records can come out the same as before the element became a container, so nothing else would ask for that.
+    pub(crate) fn apply_new_size_container_geometry(&mut self, row: crate::layout::style_snapshot::CommittedGeometry) {
+        let container = row.node;
+        self.apply_layout_style_snapshot_commit(&[row]);
+        self.record_size_container_query_dependents_after_input_change(container, true);
+    }
+
     /// The elements the dependent walks have visited, optionally starting the count again.
+    #[cfg(test)]
     pub fn size_query_container_scan_visits(&mut self, reset: bool) -> u64 {
         let visits = &mut self.retained.size_container_queries.scan_visits;
         if reset { std::mem::take(visits) } else { *visits }
     }
 
     /// A layout gave the containers that had no box when they were asked about one; their
-    /// dependents are computed again against it.
+    /// dependents are computed again against it. A container the layout left without a box is
+    /// computed against once more, as no longer eligible, and its dependents then wait for the
+    /// commit that gives it one; computing them again after every layout would only ask for this
+    /// evaluation again.
     pub fn evaluate_size_containers_needing_evaluation_after_layout(&mut self) {
         let mut containers = std::mem::take(&mut self.retained.size_container_queries.needing_evaluation_after_layout);
+        containers.retain(|&container| {
+            let has_box = self
+                .retained
+                .layout_style_snapshot(container)
+                .is_some_and(|row| row.has_committed_box);
+            // The units below a container the layout left without a box started out against no box at all. They are
+            // computed again once, now resolving past it, and then wait for a commit that gives it a box.
+            has_box || self.retained.size_container_queries.awaiting_box.insert(container)
+        });
         let availability_changed = std::mem::take(&mut self.retained.size_container_queries.availability_changed);
         containers.extend(availability_changed.iter().copied());
+        containers.extend(std::mem::take(&mut self.retained.size_container_queries.font_moves).into_keys());
         for container in containers {
             // A container that has left the document has no dependents left to move.
             if self.retained.projection.is_live(container) {

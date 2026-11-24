@@ -6,176 +6,6 @@
 
 use super::*;
 
-/// How one animation effect's description travels across the boundary: the ranges of the flat
-/// buffers that belong to it.
-#[repr(C)]
-pub struct FfiPublishedAnimationEffect {
-    pub identity: u64,
-    pub generation: u64,
-    /// The effect belongs to a CSS transition, which the interpolation treats differently.
-    pub is_transition: bool,
-    /// The effect's keyframes come from a style sheet, which their URLs resolve against: its base
-    /// URL is the range of the base URL buffer below.
-    pub has_resource_context: bool,
-    pub resource_context_is_origin_clean: bool,
-    pub first_keyframe: u32,
-    pub keyframe_count: u32,
-    pub base_url_offset: u32,
-    pub base_url_length: u32,
-    /// A transition's reversing-adjusted start value, or null for any other effect.
-    pub reversing_adjusted_start_value: *const c_void,
-    /// A transition's reversing shortening factor.
-    pub reversing_shortening_factor: f64,
-}
-
-/// The easing function a published keyframe spells out.
-#[repr(u8)]
-#[derive(Clone, Copy)]
-#[expect(dead_code, reason = "C++ constructs the variants")]
-pub enum FfiPublishedEasingKind {
-    Linear,
-    CubicBezier,
-    Steps,
-}
-
-/// One keyframe of a published effect: its offset on the scale the host keys keyframes by, its
-/// easing spelled out, its composite operation and the ranges of what it declares.
-#[repr(C)]
-pub struct FfiPublishedAnimationKeyframe {
-    pub key: i64,
-    pub easing_kind: FfiPublishedEasingKind,
-    pub step_position: u8,
-    pub interval_count: i32,
-    pub x1: f64,
-    pub y1: f64,
-    pub x2: f64,
-    pub y2: f64,
-    pub first_linear_point: u32,
-    pub linear_point_count: u32,
-    /// The keyframe's own easing where it still has to be substituted against the element being
-    /// sampled, or null.
-    pub easing_value: *const c_void,
-    /// The keyframe's composite operation, with `auto` already the effect's own.
-    pub composite: crate::css::animation::FfiCompositeOperation,
-    pub first_declaration: u32,
-    pub declaration_count: u32,
-    pub first_custom_declaration: u32,
-    pub custom_declaration_count: u32,
-}
-
-/// One control point of a published `linear()` easing.
-#[repr(C)]
-pub struct FfiPublishedLinearEasingPoint {
-    pub input: f64,
-    pub output: f64,
-}
-
-/// One longhand a published keyframe declares. A null value stands for the element's own value,
-/// which a keyframe the host synthesized holds and which is not known until the element is
-/// sampled.
-#[repr(C)]
-pub struct FfiPublishedAnimationDeclaration {
-    pub property_id: u16,
-    pub value: *const c_void,
-}
-
-/// One custom property a published keyframe declares, by the raw representation of its name. A
-/// null value stands for the element's own value of it.
-#[repr(C)]
-pub struct FfiPublishedAnimationCustomDeclaration {
-    pub name: usize,
-    pub value: *const c_void,
-}
-
-/// The version of one animation effect the host is about to sample.
-#[repr(C)]
-pub struct FfiAnimationEffectVersion {
-    pub identity: u64,
-    pub generation: u64,
-}
-
-/// Describe the effects one of an element's animation lists holds, in composite order, for the
-/// style engine to sample them from. The host retains every value the effects name and streams
-/// the description to the engine.
-///
-/// # Safety
-/// `host` must be a live document host, on its document's thread, every buffer must hold the count
-/// it is given, and every value and custom-property name the buffers name must be live for the
-/// duration of the call.
-#[unsafe(no_mangle)]
-#[allow(clippy::too_many_arguments)]
-pub unsafe extern "C" fn style_engine_set_element_animation_effect_descriptions(
-    host: &DocumentHost,
-    node: u32,
-    slot: u32,
-    effects: *const FfiPublishedAnimationEffect,
-    effect_count: usize,
-    keyframes: *const FfiPublishedAnimationKeyframe,
-    keyframe_count: usize,
-    declarations: *const FfiPublishedAnimationDeclaration,
-    declaration_count: usize,
-    custom_declarations: *const FfiPublishedAnimationCustomDeclaration,
-    custom_declaration_count: usize,
-    linear_points: *const FfiPublishedLinearEasingPoint,
-    linear_point_count: usize,
-    base_url_bytes: *const u8,
-    base_url_byte_count: usize,
-) {
-    // NB: The slot of an element's own animations is u8::MAX, whose upper bits a u8 parameter could not promise.
-    let slot = slot as u8;
-    let Some(node) = StyleNodeID::from_raw(node) else {
-        return;
-    };
-    // SAFETY: Guaranteed by the caller.
-    let effects = unsafe {
-        crate::css::style::effect_descriptions::PublishedEffectBuffers {
-            effects: ak::slice_from_raw_parts(effects, effect_count),
-            keyframes: ak::slice_from_raw_parts(keyframes, keyframe_count),
-            declarations: ak::slice_from_raw_parts(declarations, declaration_count),
-            custom_declarations: ak::slice_from_raw_parts(custom_declarations, custom_declaration_count),
-            linear_points: ak::slice_from_raw_parts(linear_points, linear_point_count),
-            base_url_bytes: ak::slice_from_raw_parts(base_url_bytes, base_url_byte_count),
-        }
-        .effects()
-    };
-    host.engine_memo().described.borrow_mut().follow(node, slot, &effects);
-    host.queue_change(crate::render_state::ArenaChange::Engine(
-        crate::css::style::engine_calls::EngineWrite::AnimationEffectDescriptions { node, slot, effects },
-    ));
-}
-
-/// Notes what the `attr()`s of the value `value`, which an animation effect's keyframes hold, can read, answering
-/// whether they can read a name none could before.
-///
-/// # Safety
-/// `value` must be a live style value.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn style_engine_note_attr_names_read_by_value(host: &DocumentHost, value: *const c_void) -> bool {
-    // SAFETY: Guaranteed by the caller.
-    let value = unsafe { &*value.cast::<crate::css::style_value::StyleValueData>() };
-    let before = crate::css::style::host_atoms::attr_names_read_generation(host);
-    crate::css::style::host_atoms::note_attr_names_read_by(host, std::iter::once(value));
-    crate::css::style::host_atoms::attr_names_read_generation(host) != before
-}
-
-/// Whether the engine describes one of an element's animation lists as holding exactly these
-/// versions of its effects, in this order, so that the host need not describe them again. Only
-/// the host describes them, so it knows without asking.
-#[unsafe(no_mangle)]
-pub extern "C" fn style_engine_describes_animation_effects(
-    host: &DocumentHost,
-    node: u32,
-    slot: u32,
-    versions: ak::Span<'_, FfiAnimationEffectVersion>,
-) -> bool {
-    StyleNodeID::from_raw(node).is_some_and(|node| {
-        host.engine_memo()
-            .described
-            .borrow()
-            .describe(node, slot as u8, versions.as_slice())
-    })
-}
-
 /// Publish already bound immutable selector inputs, after all host interning has finished.
 pub(crate) fn publish_style_rule(
     engine: &mut StyleEngine,
@@ -279,6 +109,26 @@ impl FfiAnimationOverlayPublication {
             rebuilt_every_group: false,
         }
     }
+}
+
+/// Whether the engine assigns a record to the pseudo-element `pseudo_kind` of `node`'s element, for its animations to
+/// compose over. It assigns none to a pseudo-element that is not rendered, whose record a read of its style alone
+/// holds.
+#[unsafe(no_mangle)]
+pub extern "C" fn style_engine_assigns_pseudo_element_record(
+    host: &DocumentHost,
+    read: &crate::render_state::BegunRead,
+    node: u32,
+    pseudo_kind: u8,
+) -> bool {
+    let Some(node) = StyleNodeID::from_raw(node) else {
+        return false;
+    };
+    with_engine(read, host, |engine| {
+        engine
+            .computed_group_sets
+            .holds_an_installed_record(crate::css::style::computed::ComputedStyleTarget::new(node, pseudo_kind))
+    })
 }
 
 /// Composes each element's sampled animation overlay over the record it installed, rebuilding only the groups the
@@ -409,6 +259,7 @@ pub(in crate::css::style) unsafe fn publish_sampled_animation_overlay(
         input.animated_overlay.cast(),
         groups,
         input.is_document_element,
+        engine.is_svg_graphics_element(node),
     );
     let (animated_overlay, overlay_payloads) = match input.animation_overlay_identity {
         0 => (std::ptr::null(), None),
@@ -432,7 +283,10 @@ pub(in crate::css::style) unsafe fn publish_sampled_animation_overlay(
         }
     };
     crate::css::style::engine_sample::release_rebuilt_overlay_payloads(&payloads, rebuilt.groups);
-    engine.retained.live_counters.note_animated_sample(rebuilt.every_group);
+    engine
+        .retained
+        .live_counters
+        .note_animated_sample(node, rebuilt.every_group);
     Ok(FfiAnimationOverlayPublication {
         invalidation,
         publication,

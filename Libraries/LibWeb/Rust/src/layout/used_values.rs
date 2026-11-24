@@ -67,6 +67,7 @@ pub(crate) struct LineData {
     pub(crate) line_boxes: Vec<line_box::LineBoxData>,
     pub(crate) inline_box_pieces: Vec<inline_formatting_context::InlineBoxPieceData>,
     pub(crate) lines_after_clamp_point_rect: Option<Box<FfiCssPixelRect>>,
+    pub(crate) inline_box_rects_after_clamp: Option<Box<[inline_content::ClampedInlineBoxRect]>>,
 }
 
 #[derive(Default)]
@@ -120,12 +121,8 @@ impl LineDataState {
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub(crate) struct CommittedSvgFacts {
     pub(crate) viewport_transform: Option<svg_formatting_context::FfiAffineTransform>,
-    pub(crate) viewport_size: Option<FfiCssPixelSize>,
-    pub(crate) view_box: Option<svg_formatting_context::FfiSvgViewBox>,
-    pub(crate) element_transform: Option<svg_formatting_context::FfiAffineTransform>,
     pub(crate) additional_element_transform: Option<svg_formatting_context::FfiAffineTransform>,
     pub(crate) mask_area_facts: Option<svg_formatting_context::SvgMaskAreaFacts>,
-    pub(crate) viewport_percentage_basis: CssPixels,
     pub(crate) resource_content_units_are_object_bounding_box: bool,
     /// The `pathLength` of a geometry element, where its element has one.
     pub(crate) author_path_length: Option<f32>,
@@ -203,33 +200,78 @@ impl RootInputCells {
         self.resolve_vertical_box_model(style, basis);
     }
 
-    /// The sizes and box sides `link` and its fragment show, with both sizes definite.
-    pub(crate) fn of_committed_fragment_link(link: &fragment_tree::FragmentLink) -> Self {
+    /// The content size, borders and paddings the fragment of the box shows.
+    pub(crate) fn box_sides(&self) -> fragment_tree::BoxSides {
+        fragment_tree::BoxSides {
+            content_size: FfiCssPixelSize {
+                width: self.content_inline_size,
+                height: self.content_block_size,
+            },
+            border: geometry::Sides {
+                top: self.border_top,
+                right: self.border_right,
+                bottom: self.border_bottom,
+                left: self.border_left,
+            },
+            padding: geometry::Sides {
+                top: self.padding_top,
+                right: self.padding_right,
+                bottom: self.padding_bottom,
+                left: self.padding_left,
+            },
+            collapsing: fragment_tree::CollapsingBorders::of(
+                self.uses_collapsing_borders_model,
+                self.is_collapsed_borders_table_box,
+            ),
+        }
+    }
+
+    /// The used margins of the box.
+    pub(crate) fn margins(&self) -> geometry::Sides {
+        geometry::Sides {
+            top: self.margin_top,
+            right: self.margin_right,
+            bottom: self.margin_bottom,
+            left: self.margin_left,
+        }
+    }
+
+    /// The sizes and box sides `link` and its fragment show, read in `frame`, with both sizes definite.
+    pub(crate) fn of_committed_fragment_link(link: &fragment_tree::FragmentLink, frame: geometry::Frame) -> Self {
         let mut cells = Self {
             has_definite_block_size: true,
             ..Self::default()
         };
-        cells.take_box_metrics_of_committed_link(link);
+        cells.take_box_metrics_of_committed_link(link, frame);
         cells
     }
 
-    /// Takes the sizes and box sides `link` and its fragment show.
-    pub(crate) fn take_box_metrics_of_committed_link(&mut self, link: &fragment_tree::FragmentLink) {
-        let fragment = &link.fragment;
-        self.set_content_inline_size(fragment.content_inline_size);
-        self.set_content_block_size(fragment.content_block_size);
-        self.margin_left = link.margin_left;
-        self.margin_right = link.margin_right;
-        self.margin_top = link.margin_top;
-        self.margin_bottom = link.margin_bottom;
-        self.border_left = fragment.border_left;
-        self.border_right = fragment.border_right;
-        self.border_top = fragment.border_top;
-        self.border_bottom = fragment.border_bottom;
-        self.padding_left = fragment.padding_left;
-        self.padding_right = fragment.padding_right;
-        self.padding_top = fragment.padding_top;
-        self.padding_bottom = fragment.padding_bottom;
+    /// Takes the sizes and box sides `link` and its fragment show, read in `frame`.
+    pub(crate) fn take_box_metrics_of_committed_link(
+        &mut self,
+        link: &fragment_tree::FragmentLink,
+        frame: geometry::Frame,
+    ) {
+        let sides = link.fragment.sides.in_frame(geometry::Frame::PHYSICAL, frame);
+        let margins = link
+            .placement
+            .shown_as
+            .margins
+            .in_frame(geometry::Frame::PHYSICAL, frame);
+        self.set_content_inline_size(sides.content_size.width);
+        self.set_content_block_size(sides.content_size.height);
+        self.margin_left = margins.left;
+        self.margin_right = margins.right;
+        self.margin_top = margins.top;
+        self.margin_bottom = margins.bottom;
+        self.border_left = sides.border.left;
+        self.border_right = sides.border.right;
+        self.border_top = sides.border.top;
+        self.border_bottom = sides.border.bottom;
+        self.padding_left = sides.padding.left;
+        self.padding_right = sides.padding.right;
+        self.padding_top = sides.padding.top;
+        self.padding_bottom = sides.padding.bottom;
     }
 
     /// The cells, with the sizes, size constraints and box sides they hold in frame `from` read in frame `to` instead.
@@ -563,9 +605,10 @@ pub(crate) fn cells_before_sizing(
             // The inline size of a non-flex-item block is definite when
             // it is auto and its containing block has a definite inline
             // size. This is the stretch-fit case from css-sizing-3.
-            // Replaced boxes remain content-based until layout.
+            // Replaced boxes and auto-width buttons are sized from their content during layout.
             if matches!(axis, Axis::Inline)
                 && !facts.is_replaced_box()
+                && !facts.uses_button_layout()
                 && !facts.is_floating()
                 && !facts.is_absolutely_positioned()
                 && facts.display().is_block_outside()
@@ -661,40 +704,4 @@ pub(crate) fn cells_before_sizing(
     cells.content_block_size = content_block_size.unwrap_or_default();
 
     cells
-}
-
-/// The input cells of a box and what its parent decided about it, as its committed fragment link has them in the frame
-/// of the link, which a run adopts as they are.
-pub(crate) struct CommittedBox {
-    pub(crate) cells: RootInputCells,
-    pub(crate) facts_decided_by_parent: super::run_state::FactsDecidedByParent,
-}
-
-pub(crate) fn committed_box_from_fragment_link(pass: &LayoutPass<'_>, node: Node) -> Option<CommittedBox> {
-    let link = pass.committed_fragment_link(node)?;
-
-    Some(CommittedBox {
-        cells: RootInputCells::of_committed_fragment_link(&link),
-        facts_decided_by_parent: super::run_state::FactsDecidedByParent {
-            placement: Some(super::run_state::BoxPlacement {
-                content_offset_in_containing_block: link.committed_offset,
-                containing_block: link.containing_block,
-            }),
-            used_insets: super::run_state::UsedInsets {
-                left: link.inset_left,
-                right: link.inset_right,
-                top: link.inset_top,
-                bottom: link.inset_bottom,
-            },
-            default_scroll_shift: None,
-            fragment_facts: super::run_state::FragmentFactsDecidedByParent {
-                table_column_index: link.table_column_index,
-                table_column_span: link.table_column_span,
-                hidden_by_collapsed_columns: link.hidden_by_collapsed_columns,
-                is_invisible_for_line_clamp: link.is_invisible_for_line_clamp,
-                clip_decided_by_parent: link.clip_decided_by_parent,
-                ..super::run_state::FragmentFactsDecidedByParent::default()
-            },
-        },
-    })
 }

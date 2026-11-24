@@ -21,17 +21,16 @@
 
 namespace WebView {
 
-WebWorkerClient::WebWorkerClient(NonnullOwnPtr<IPC::Transport> transport, IsPrivate is_private, Web::HTML::WorkerAgentId agent_id)
+WebWorkerClient::WebWorkerClient(NonnullOwnPtr<IPC::Transport> transport, BrowsingSession& session, Web::HTML::WorkerAgentId agent_id)
     : IPC::ConnectionToServer<WebWorkerClientEndpoint, WebWorkerServerEndpoint>(*this, move(transport))
-    , m_is_private(is_private)
+    , m_is_private(session.is_private())
+    , m_session(session.make_weak_ptr())
     , m_request_server_site_bindings([this](RequestServerClientConnection& connection, Optional<Utf16String> const& top_level_site) {
         async_connect_to_request_server(move(connection.handle), connection.client_id, top_level_site);
     })
     , m_agent_id(agent_id)
     , m_audio_tab_id(allocate_audio_tab_id())
 {
-    if (auto session = Application::existing_session(is_private))
-        m_session = session->make_weak_ptr();
 }
 
 WebWorkerClient::~WebWorkerClient()
@@ -101,11 +100,11 @@ void WebWorkerClient::remove_blob_url_entries()
         session->blob_url_store->remove_entries_added_by(WeakPtr<WebWorkerClient> { *this });
 }
 
-void WebWorkerClient::set_inside_settings(NonnullOwnPtr<CanonicalWorkerEnvironmentSettingsObject> inside_settings, bool may_read_local_files)
+void WebWorkerClient::set_inside_settings(NonnullOwnPtr<CanonicalWorkerEnvironmentSettingsObject> inside_settings, Vector<LocalFileRoot> local_file_roots)
 {
     m_top_level_origin = inside_settings->top_level_origin();
     m_inside_settings = move(inside_settings);
-    m_may_read_local_files = may_read_local_files;
+    m_local_file_roots = move(local_file_roots);
 }
 
 void WebWorkerClient::forget_inside_settings_of_closing_worker()
@@ -164,7 +163,11 @@ Messages::WebWorkerClient::DidAddBlobUrlEntryResponse WebWorkerClient::did_add_b
     if (!session || !environment.has_value())
         return 0;
     entry.origin = environment->origin();
-    return session->blob_url_store->add_entry(move(url), move(entry), WeakPtr<WebWorkerClient> { *this });
+
+    Optional<LocalFileRoot> root_of_adder;
+    if (m_local_file_roots.size() == 1)
+        root_of_adder = m_local_file_roots.first();
+    return session->blob_url_store->add_entry(move(url), move(entry), WeakPtr<WebWorkerClient> { *this }, move(root_of_adder));
 }
 
 void WebWorkerClient::did_remove_blob_url_entries(Web::HTML::EnvironmentId environment_id, Vector<Utf16String> urls)
@@ -189,32 +192,26 @@ void WebWorkerClient::did_request_file(ByteString path, i32 request_id)
     if (!m_inside_settings)
         return;
 
-    // NB: As a page, a worker reads a local file only through this broker, and only local file content may.
-    if (!m_may_read_local_files) {
-        async_handle_file_return(EACCES, {}, request_id);
-        return;
-    }
-
-    auto file = open_local_file_for_renderer(path);
+    auto file = open_local_file_for_renderer(path, m_local_file_roots);
     if (file.is_error())
         async_handle_file_return(file.error().code(), {}, request_id);
     else
-        async_handle_file_return(0, file.release_value(), request_id);
+        async_handle_file_return(0, move(file.value().file), request_id);
 }
 
 Messages::WebWorkerClient::DidIsKnownHstsHostResponse WebWorkerClient::did_is_known_hsts_host(String domain)
 {
     auto session = m_session.strong_ref();
-    return session ? session->hsts_store->is_known_hsts_host(domain) : false;
+    return session ? session->hsts_store->is_known_hsts_host(domain) : true;
 }
 
 Messages::WebWorkerClient::RequestMediaServerConnectionResponse WebWorkerClient::request_media_server_connection()
 {
-    auto connection = connect_new_media_server_client(m_media_server_client, child_id(), [weak_self = make_weak_ptr<WebWorkerClient>()]() -> ErrorOr<IPC::TransportHandle> {
+    auto connection = connect_new_media_server_client(m_media_server_client, child_id(), is_private(), [weak_self = make_weak_ptr<WebWorkerClient>()]() -> ErrorOr<IPC::TransportHandle> {
         auto self = weak_self.strong_ref();
         if (!self)
             return Error::from_string_literal("The worker is gone");
-        TRY(ensure_audio_server_is_running(self->m_audio_server_client, self->child_id()));
+        TRY(ensure_audio_server_is_running(self->m_audio_server_client, self->child_id(), self->is_private()));
         return connect_new_audio_server_client(*self->m_audio_server_client, self->m_audio_tab_id);
     });
     if (connection.is_error()) {
@@ -244,9 +241,9 @@ Messages::WebWorkerClient::RequestCompositorConnectionResponse WebWorkerClient::
     auto handle = Application::the().connect_new_compositor_canvas_client();
     if (handle.is_error()) {
         warnln("Unable to connect a worker to the compositor: {}", handle.error());
-        return Optional<IPC::TransportHandle> {};
+        return { Optional<IPC::TransportHandle> {}, 0 };
     }
-    return handle.release_value();
+    return { handle.release_value(), Application::the().compositor_generation() };
 }
 
 void WebWorkerClient::did_post_broadcast_channel_message(Web::HTML::PostedBroadcastChannelMessage message)

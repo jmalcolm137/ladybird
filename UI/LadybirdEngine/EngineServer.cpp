@@ -1013,7 +1013,7 @@ void EngineServer::handle_create_tab(JsonObject const& command)
             // is the page the user last saw. A snapshot written just before a navigation can lag it by one entry.
             if (auto requested = command.get_string("url"sv); requested.has_value() && !requested->is_empty()) {
                 if (auto parsed = URL::Parser::basic_parse(requested->bytes_as_string_view()); parsed.has_value() && tab.view->url() != *parsed)
-                    tab.view->load(*parsed);
+                    tab.view->load_from_browser_ui(*parsed);
             }
             return;
         }
@@ -1022,11 +1022,11 @@ void EngineServer::handle_create_tab(JsonObject const& command)
     if (auto url = command.get_string("url"sv); url.has_value() && !url->is_empty()) {
         auto settings = WebView::Application::settings().search_engine_settings();
         if (auto parsed = WebView::sanitize_url(url->bytes_as_string_view(), settings.engine); parsed.has_value())
-            tab.view->load(*parsed);
+            tab.view->load_from_browser_ui(*parsed);
         else
-            tab.view->load(WebView::Application::settings().new_tab_page_url());
+            tab.view->load_from_browser_ui(WebView::Application::settings().new_tab_page_url());
     } else {
-        tab.view->load(WebView::Application::settings().new_tab_page_url());
+        tab.view->load_from_browser_ui(WebView::Application::settings().new_tab_page_url());
     }
 }
 
@@ -1189,18 +1189,18 @@ void EngineServer::handle_navigate(u64 tab_id, JsonObject const& command)
 void EngineServer::perform_navigation(Tab& tab, String const& url, bool user_input)
 {
     if (url.is_empty()) {
-        tab.view->load(WebView::Application::settings().new_tab_page_url());
+        tab.view->load_from_browser_ui(WebView::Application::settings().new_tab_page_url());
         return;
     }
 
     if (user_input) {
         auto settings = WebView::Application::settings().search_engine_settings();
         if (auto parsed = WebView::sanitize_url(url.bytes_as_string_view(), settings.engine); parsed.has_value())
-            tab.view->load(*parsed);
+            tab.view->load_from_browser_ui(*parsed);
         else
-            tab.view->load(WebView::Application::settings().new_tab_page_url());
+            tab.view->load_from_browser_ui(WebView::Application::settings().new_tab_page_url());
     } else if (auto parsed = URL::Parser::basic_parse(url.bytes_as_string_view()); parsed.has_value()) {
-        tab.view->load(*parsed);
+        tab.view->load_from_browser_ui(*parsed);
     }
 }
 

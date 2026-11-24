@@ -5,6 +5,7 @@
  */
 
 use core::cell::Cell;
+use core::ops::ControlFlow;
 
 use ak::Utf16String;
 use libjs_runtime_macros::Trace;
@@ -12,6 +13,7 @@ use libjs_runtime_macros::Trace;
 use crate::gc::class::{ExternalMemorySize, GcCell, define_cell};
 use crate::interpreter::vm::Vm;
 use crate::layout::cell::{CellHeader, Gc};
+use crate::runtime::function_object::FunctionObject;
 use crate::runtime::primitive_string::PrimitiveString;
 use crate::source_range::SourceRange;
 use crate::utf16::{Utf16View, utf16_string_external_memory_size};
@@ -60,29 +62,94 @@ impl StackFrameSyntax {
     }
 }
 
+/// The initial value of Error.stackTraceLimit.
+pub const DEFAULT_STACK_TRACE_LIMIT: i32 = 10;
+
+/// How many frames an error keeps at least while the VM keeps long stack traces, as it does for a debugger that lists
+/// them.
+pub const LONG_STACK_TRACE_FRAME_COUNT: usize = 200;
+
+/// How many frames a new error keeps: the value of Error.stackTraceLimit on the %Error% of the current realm, cut to an
+/// integer, with negative numbers and NaN as 0 and Infinity as every frame. None, for no stack at all, when the property
+/// is not a number, which includes an accessor (whose getter is never called) and a deleted property. The other engines
+/// limit their stacks too, and pages read and set this property to see the frames they expect.
+pub fn stack_trace_limit(vm: &Vm) -> Option<usize> {
+    let Some(realm) = vm.current_realm() else {
+        return Some(DEFAULT_STACK_TRACE_LIMIT as usize);
+    };
+    let error_constructor = realm.intrinsics().error_constructor(vm);
+    let value = error_constructor.storage_get(vm, &vm.names.stackTraceLimit)?.value;
+    if value.is_int32() {
+        return Some(usize::try_from(value.as_i32()).unwrap_or(0));
+    }
+    if !value.is_number() {
+        return None;
+    }
+    // NB: The cast saturates, and takes NaN to 0.
+    Some(value.as_f64() as usize)
+}
+
+/// Which of the innermost frames a stack leaves out.
+#[derive(Clone, Copy)]
+pub enum SkippedFrames {
+    /// That many frames.
+    Count(usize),
+    /// Every frame up to the innermost frame of the function, and that frame too: all of them if the function has no
+    /// frame on the stack.
+    UpToFrameOf(Gc<FunctionObject>),
+}
+
 /// [[ErrorData]]: the call stack an error was created on.
 #[derive(Trace)]
 pub struct ErrorData {
     #[gc(untraced)]
     traceback: Vec<TracebackFrame>,
+    /// How many of the frames, from the innermost, the stack string shows, or None for an error without a stack, whose
+    /// stack is undefined. Such an error has frames only while the VM keeps long stack traces.
+    shown_frame_count: Option<usize>,
+    /// How many of the frames, from the innermost, the error would keep if the VM kept no long stack traces. What script
+    /// can observe, such as the location of an error event, reads only these, so it does not change while a debugger is
+    /// attached. Unlike shown_frame_count, it counts the outermost execution context when the walk got to it inside the
+    /// limit.
+    script_visible_frame_count: usize,
     cached_string: Cell<Option<Gc<PrimitiveString>>>,
 }
 
 impl ErrorData {
     pub fn new(vm: &Vm) -> Self {
-        Self {
-            traceback: Self::populate_stack(vm, 0),
-            cached_string: Cell::new(None),
-        }
+        Self::capture(vm, SkippedFrames::Count(0), stack_trace_limit(vm))
+    }
+
+    /// Error data with the frames below those that `skipped_frames` leaves out, as Error.captureStackTrace() captures
+    /// it.
+    pub fn new_skipping(vm: &Vm, skipped_frames: SkippedFrames) -> Self {
+        Self::capture(vm, skipped_frames, stack_trace_limit(vm))
     }
 
     /// Error data captured by an Error constructor, whose own frame is the innermost one. A stack string shows the
-    /// code that called the constructor, never the constructor itself, so that frame is left out.
-    pub fn new_in_constructor(vm: &Vm) -> Self {
-        Self {
-            traceback: Self::populate_stack(vm, 1),
-            cached_string: Cell::new(None),
-        }
+    /// code that made the error, never the constructors that made it: the frames up to and including the innermost
+    /// frame of `new_target`, which are those of the constructors of the subclasses an error class extends, are left
+    /// out. When `new_target` has no frame on the stack, as with Reflect.construct(), only the frame of the
+    /// constructor itself is.
+    pub fn new_in_constructor(vm: &Vm, new_target: Gc<FunctionObject>) -> Self {
+        let mut frames_up_to_new_target = 0;
+        let mut found_new_target = false;
+        vm.for_each_stack_frame_top_to_bottom(|frame| {
+            frames_up_to_new_target += 1;
+            if frame.function == Some(new_target) {
+                found_new_target = true;
+                return ControlFlow::Break(());
+            }
+            ControlFlow::Continue(())
+        });
+        let skipped_frames = if found_new_target { frames_up_to_new_target } else { 1 };
+        Self::capture(vm, SkippedFrames::Count(skipped_frames), stack_trace_limit(vm))
+    }
+
+    /// Error data with every frame of the call stack, whatever Error.stackTraceLimit is, for a trace of the running code
+    /// that is not the stack of an error.
+    pub fn with_whole_stack(vm: &Vm) -> Self {
+        Self::capture(vm, SkippedFrames::Count(0), Some(usize::MAX))
     }
 
     /// Error data for an exception whose source location came from another agent.
@@ -92,6 +159,42 @@ impl ErrorData {
                 function_name: Utf16String::default(),
                 cached_source_range: Some(source_range),
             }],
+            shown_frame_count: Some(0),
+            script_visible_frame_count: 1,
+            cached_string: Cell::new(None),
+        }
+    }
+
+    /// Error data with at most `limit` frames below those that `skipped_frames` leaves out, or with no stack for a
+    /// `limit` of None. While the VM keeps long stack traces, it keeps at least LONG_STACK_TRACE_FRAME_COUNT frames for
+    /// the debugger, even with no stack, but the stack string and the script-visible frames stay as without them.
+    fn capture(vm: &Vm, skipped_frames: SkippedFrames, limit: Option<usize>) -> Self {
+        let captured_limit = match limit {
+            Some(limit) if vm.keeps_long_stack_traces() => limit.max(LONG_STACK_TRACE_FRAME_COUNT),
+            Some(limit) => limit,
+            None if vm.keeps_long_stack_traces() => LONG_STACK_TRACE_FRAME_COUNT,
+            None => {
+                return Self {
+                    traceback: Vec::new(),
+                    shown_frame_count: None,
+                    script_visible_frame_count: 0,
+                    cached_string: Cell::new(None),
+                };
+            }
+        };
+        let (traceback, reached_limit) = Self::populate_stack(vm, skipped_frames, captured_limit);
+        // NB: A stack string leaves out the outermost execution context, the last frame when the walk got to it.
+        let frame_count = if reached_limit {
+            traceback.len()
+        } else {
+            traceback.len().saturating_sub(1)
+        };
+        let shown_frame_count = limit.map(|limit| frame_count.min(limit));
+        let script_visible_frame_count = limit.map_or(0, |limit| traceback.len().min(limit));
+        Self {
+            traceback,
+            shown_frame_count,
+            script_visible_frame_count,
             cached_string: Cell::new(None),
         }
     }
@@ -109,23 +212,55 @@ impl ErrorData {
         self.traceback_storage_size() + function_names_size
     }
 
-    fn populate_stack(vm: &Vm, skipped_innermost_frames: usize) -> Vec<TracebackFrame> {
-        let stack_trace = vm.stack_trace();
-        let mut traceback = Vec::with_capacity(stack_trace.len().saturating_sub(skipped_innermost_frames));
-        for element in stack_trace.values().iter().skip(skipped_innermost_frames) {
+    /// The frames from the running one down, after those `skipped_frames` leaves out, until there are `limit` of
+    /// them, and whether the walk stopped there with frames left below. The walk never goes further, so capture costs
+    /// the same at any depth, except for the walk to the frame of a function that has none.
+    fn populate_stack(vm: &Vm, mut skipped_frames: SkippedFrames, limit: usize) -> (Vec<TracebackFrame>, bool) {
+        let mut traceback = Vec::new();
+        let mut reached_limit = false;
+        vm.for_each_stack_frame_top_to_bottom(|frame| {
+            match skipped_frames {
+                SkippedFrames::Count(0) => {}
+                SkippedFrames::Count(count) => {
+                    skipped_frames = SkippedFrames::Count(count - 1);
+                    return ControlFlow::Continue(());
+                }
+                SkippedFrames::UpToFrameOf(function) => {
+                    if frame.function == Some(function) {
+                        skipped_frames = SkippedFrames::Count(0);
+                    }
+                    return ControlFlow::Continue(());
+                }
+            }
+            if traceback.len() == limit {
+                reached_limit = true;
+                return ControlFlow::Break(());
+            }
             traceback.push(TracebackFrame {
-                function_name: element
+                function_name: frame
                     .function
                     .map(|function| function.name_for_call_stack())
                     .unwrap_or_default(),
-                cached_source_range: element.source_range.clone(),
+                cached_source_range: frame.source_range(),
             });
-        }
-        traceback
+            ControlFlow::Continue(())
+        });
+        (traceback, reached_limit)
     }
 
+    /// Every frame the error kept, for a debugger that lists them.
     pub fn traceback(&self) -> &[TracebackFrame] {
         &self.traceback
+    }
+
+    /// The frames the error would keep if the VM kept no long stack traces, for what script can observe.
+    pub fn script_visible_traceback(&self) -> &[TracebackFrame] {
+        &self.traceback[..self.script_visible_frame_count]
+    }
+
+    /// Whether the error has a stack string; its stack is undefined if not, even with frames kept for a debugger.
+    pub fn has_stack(&self) -> bool {
+        self.shown_frame_count.is_some()
     }
 
     pub fn set_cached_string(&self, string: Gc<PrimitiveString>) {
@@ -141,7 +276,8 @@ impl ErrorData {
     }
 
     pub fn stack_string_with_syntax(&self, compact: CompactTraceback, syntax: StackFrameSyntax) -> Utf16String {
-        if self.traceback.is_empty() {
+        let used_frames = self.shown_frame_count.unwrap_or(0);
+        if used_frames == 0 {
             return Utf16String::default();
         }
 
@@ -194,10 +330,8 @@ impl ErrorData {
             a.function_name == b.function_name
         };
 
-        // Note: We don't want to capture the global execution context, so we omit the last frame
         // Note: The error's name and message get prepended by Error.prototype.stack
         let mut repetitions: usize = 0;
-        let used_frames = self.traceback.len() - 1;
         for i in 0..used_frames {
             let frame = &self.traceback[i];
             if compact == CompactTraceback::Yes && i + 1 < used_frames {
@@ -252,6 +386,11 @@ impl ErrorDataCell {
     /// ErrorDataCell::capture(vm): error data with the call stack of the running execution context.
     pub fn capture(vm: &Vm) -> Gc<ErrorDataCell> {
         Self::create(vm, ErrorData::new(vm))
+    }
+
+    /// Error data with every frame of the call stack, as ErrorData::with_whole_stack() has.
+    pub fn capture_whole_stack(vm: &Vm) -> Gc<ErrorDataCell> {
+        Self::create(vm, ErrorData::with_whole_stack(vm))
     }
 
     /// Error data for an exception whose source location came from another agent.

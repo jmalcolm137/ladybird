@@ -82,24 +82,42 @@ static Optional<Gfx::SystemUIFontKind> macos_system_ui_font_kind_from_family_nam
 // https://drafts.csswg.org/css-fonts-4/#font-synthesis-weight
 // How a face of the snapshot registered under `key` is synthesized for the request: never bolder where its font-weight
 // descriptor claims bold weights, nor slanted where its font-style descriptor claims a slant, whatever its file holds.
+// And always bolder for a bold request where its font-weight descriptor claims only weights lighter than bold, since the
+// family as declared then has no bold face, even where its file has a weight axis that goes further.
 static Gfx::FontSynthesis synthesis_for_face(FontFaceSnapshot::Face const& face, FontFaceKey const& key, Gfx::Typeface const& typeface, Gfx::FontSynthesisRequest const& request, Gfx::FontVariationSettings const& variations)
 {
     auto synthesis = typeface.synthesis_for(request, variations);
-    if (!face.weight_descriptor_is_auto && key.weight.max >= 600)
-        synthesis.bold = false;
+    if (!face.weight_descriptor_is_auto)
+        synthesis.bold = key.weight.max < 600 && request.allows_weight && request.weight >= 600;
     if (key.slope != 0)
         synthesis.oblique_angle = 0;
     return synthesis;
 }
 
+struct FontFaceSize {
+    float points;
+    bool apply_size_adjust;
+    bool automatic_optical_size;
+};
+
 // What one face of the snapshot renders with. A face still waiting on its load becomes a pending entry: a cascade is
 // frozen and laid out on whichever thread resolves it, so the entry reads the snapshot and the typeface the face
 // publishes, and only selecting it for a rendered code point, on the document thread, reaches the face, by its number
 // through the document's registry.
-static RefPtr<Gfx::FontCascadeList const> font_for_face(FontFaceSnapshot::Face const& face, FontFaceKey const& key, float point_size, Gfx::FontVariationSettings const& variations, Gfx::ShapeFeatures const& shape_features, Gfx::FontSynthesisRequest const& synthesis_request)
+static RefPtr<Gfx::FontCascadeList const> font_for_face(FontFaceSnapshot::Face const& face, FontFaceKey const& key, FontFaceSize size, Gfx::FontVariationSettings const& requested_variations, Gfx::ShapeFeatures const& shape_features, Gfx::FontSynthesisRequest const& synthesis_request)
 {
     if (face.is_unusable)
         return {};
+    auto point_size = size.points;
+    Optional<Gfx::FontVariationSettings> adjusted_variations;
+    if (size.apply_size_adjust && face.size_adjust != 1) {
+        point_size = clamp(size.points * face.size_adjust, 0.0, CSSPixels::max().to_double() * 0.75);
+        if (size.automatic_optical_size) {
+            adjusted_variations = requested_variations;
+            adjusted_variations->set_optical_sizing(point_size / 0.75f);
+        }
+    }
+    auto const& variations = adjusted_variations.has_value() ? *adjusted_variations : requested_variations;
     auto font_list = Gfx::FontCascadeList::create();
     if (face.typeface) {
         font_list->add(face.typeface->font(point_size, variations, shape_features, synthesis_for_face(face, key, *face.typeface, synthesis_request, variations)), face.unicode_ranges);
@@ -158,11 +176,11 @@ struct MatchingFontCandidate {
     unsigned width { Gfx::FontWidth::Normal };
     Gfx::Typeface const* system_typeface { nullptr };
 
-    [[nodiscard]] RefPtr<Gfx::FontCascadeList const> font_with_point_size(FontFaceSnapshot const& snapshot, float point_size, Gfx::FontVariationSettings const& variations, WeightAxisFollowsFontWeight weight_axis_follows_font_weight, Gfx::ShapeFeatures const& shape_features, Gfx::FontSynthesisRequest const& synthesis_request) const
+    [[nodiscard]] RefPtr<Gfx::FontCascadeList const> font_with_point_size(FontFaceSnapshot const& snapshot, FontFaceSize size, Gfx::FontVariationSettings const& variations, WeightAxisFollowsFontWeight weight_axis_follows_font_weight, Gfx::ShapeFeatures const& shape_features, Gfx::FontSynthesisRequest const& synthesis_request) const
     {
         if (system_typeface) {
             auto font_list = Gfx::FontCascadeList::create();
-            font_list->add(system_typeface->font(point_size, variations, shape_features, system_typeface->synthesis_for(synthesis_request, variations)));
+            font_list->add(system_typeface->font(size.points, variations, shape_features, system_typeface->synthesis_for(synthesis_request, variations)));
             return font_list;
         }
 
@@ -173,17 +191,7 @@ struct MatchingFontCandidate {
         auto clamped_variations = variations_clamped_to_weight_descriptor(variations, weight_axis_follows_font_weight, key.weight);
         auto font_list = Gfx::FontCascadeList::create();
         for (auto const& face : *faces) {
-            // https://drafts.csswg.org/css-font-loading/#font-face-load
-            // User agents can initiate font loads on their own, whenever they determine that a given font face is
-            // necessary to render something on the page. When this happens, they must act as if they had called the
-            // corresponding FontFace’s load() method described here.
-            // NB: An unloaded face with no subsetting unicode-range starts loading once a style actually selects
-            //     it. Loading happens via FontFace::load(), which mutates the face, its FontFaceSets and the
-            //     document, so this only leaves the face's number behind; request_wanted_web_faces() loads it
-            //     afterwards, and does nothing for a face past "unloaded" already.
-            if (face.has_urls && !face.has_non_default_unicode_range)
-                note_wanted_web_face(face.id);
-            if (auto face_fonts = font_for_face(face, key, point_size, variations_for_face(face, variations, clamped_variations), shape_features, synthesis_request)) {
+            if (auto face_fonts = font_for_face(face, key, size, variations_for_face(face, variations, clamped_variations), shape_features, synthesis_request)) {
                 font_list->extend(*face_fonts);
                 continue;
             }
@@ -205,7 +213,7 @@ struct MatchingFontCandidate {
 
 // Partial implementation of the font-matching algorithm: https://www.w3.org/TR/css-fonts-4/#font-matching-algorithm
 // FIXME: This should be replaced by the full CSS font selection algorithm.
-static RefPtr<Gfx::FontCascadeList const> font_matching_algorithm(FontFaceSnapshot const& snapshot, Utf16FlyString const& family_name, int weight, Percentage const& font_width, int slope, float font_size_in_pt, Gfx::FontVariationSettings const& variations, WeightAxisFollowsFontWeight weight_axis_follows_font_weight, Gfx::ShapeFeatures const& shape_features, Gfx::FontSynthesisRequest const& synthesis_request)
+static RefPtr<Gfx::FontCascadeList const> font_matching_algorithm(FontFaceSnapshot const& snapshot, Utf16FlyString const& family_name, int weight, Percentage const& font_width, int slope, FontFaceSize size, Gfx::FontVariationSettings const& variations, WeightAxisFollowsFontWeight weight_axis_follows_font_weight, Gfx::ShapeFeatures const& shape_features, Gfx::FontSynthesisRequest const& synthesis_request)
 {
     // If a font family match occurs, the user agent assembles the set of font faces in that family and then
     // narrows the set to a single face using other font properties in the order given below.
@@ -242,7 +250,7 @@ static RefPtr<Gfx::FontCascadeList const> font_matching_algorithm(FontFaceSnapsh
     order.resize(matching_family_fonts.size());
     auto order_length = Parser::ValueParserFFI::rust_font_matching_order(weighed_candidates.span(), weight, font_width_bucket_from_percentage(font_width.value()), slope, order.span());
     for (auto index : order.span().trim(order_length)) {
-        if (auto found_font = matching_family_fonts[index].font_with_point_size(snapshot, font_size_in_pt, variations, weight_axis_follows_font_weight, shape_features, synthesis_request))
+        if (auto found_font = matching_family_fonts[index].font_with_point_size(snapshot, size, variations, weight_axis_follows_font_weight, shape_features, synthesis_request))
             return found_font;
     }
     return {};
@@ -271,9 +279,9 @@ static Gfx::ShapeFeatures shape_features_for(ComputedFontCacheKey const& key, Fo
             return values->data();
         },
         &features,
-        [](void* features, u32 tag, u32 value) {
+        [](void* features, u32 tag, u32 value, bool set_by_feature_settings) {
             auto four_cc = Gfx::FourCC::from_u32(tag);
-            static_cast<Gfx::ShapeFeatures*>(features)->append({ { four_cc.cc[0], four_cc.cc[1], four_cc.cc[2], four_cc.cc[3] }, value });
+            static_cast<Gfx::ShapeFeatures*>(features)->append({ { four_cc.cc[0], four_cc.cc[1], four_cc.cc[2], four_cc.cc[3] }, value, set_by_feature_settings });
         });
     return features;
 }
@@ -293,7 +301,7 @@ static double font_size_adjust_aspect_value(Gfx::Font const& font, FontSizeAdjus
         return metrics.x_height / font_size;
     case FontSizeAdjustMetric::CapHeight:
         // Normalize the cap-height of the fonts, using the cap-height by the font size.
-        return font.cap_height() / font_size;
+        return metrics.cap_height / font_size;
     case FontSizeAdjustMetric::ChWidth:
         // Normalize the horizontal narrow pitch of the fonts, using the advance width of “0” (ZERO, U+0030) divided by
         // the font size.
@@ -339,9 +347,12 @@ NonnullRefPtr<Gfx::FontCascadeList const> resolve_font_cascade(FontFaceSnapshot 
     // The size the lookups below select fonts at, which font-size-adjust can change for each family.
     Gfx::FontVariationSettings variation;
     auto weight_axis_follows_font_weight = WeightAxisFollowsFontWeight::Yes;
-    float font_size_in_pt = 0;
+    // https://drafts.csswg.org/css-fonts-5/#size-adjust-desc
+    // The font-size-adjust property cancels the descriptor's scale by normalizing the font's metrics to font-size.
+    FontFaceSize face_size { .points = 0, .apply_size_adjust = !key.font_size_adjust.has_value() && !key.is_font_size_adjust_probe, .automatic_optical_size = false };
     auto select_fonts_at = [&](float font_size_used_value) {
         variation = {};
+        face_size.automatic_optical_size = font_optical_sizing == FontOpticalSizing::Auto;
         variation.set_weight(font_weight);
         variation.set_width(font_width.value());
 
@@ -355,18 +366,21 @@ NonnullRefPtr<Gfx::FontCascadeList const> resolve_font_cascade(FontFaceSnapshot 
         struct FontVariationSettingsTarget {
             Gfx::FontVariationSettings& variation;
             WeightAxisFollowsFontWeight& weight_axis_follows_font_weight;
-        } target { variation, weight_axis_follows_font_weight };
+            bool& automatic_optical_size;
+        } target { variation, weight_axis_follows_font_weight, face_size.automatic_optical_size };
         weight_axis_follows_font_weight = WeightAxisFollowsFontWeight::Yes;
         Parser::ValueParserFFI::rust_font_variation_axes(feature_value_data(key, FontResolutionFeatureInput::FontVariationSettings), &target, [](void* target, u32 tag, double value) {
-            auto& [variation, weight_axis_follows_font_weight] = *static_cast<FontVariationSettingsTarget*>(target);
+            auto& [variation, weight_axis_follows_font_weight, automatic_optical_size] = *static_cast<FontVariationSettingsTarget*>(target);
             auto four_cc = Gfx::FourCC::from_u32(tag);
             if (four_cc == Gfx::FourCC("wght"))
                 weight_axis_follows_font_weight = WeightAxisFollowsFontWeight::No;
+            if (four_cc == Gfx::FourCC("opsz"))
+                automatic_optical_size = false;
             variation.axes.set(four_cc, value);
         });
 
         // FIXME: Implement the full font-matching algorithm: https://www.w3.org/TR/css-fonts-4/#font-matching-algorithm
-        font_size_in_pt = font_size_used_value * 0.75f;
+        face_size.points = font_size_used_value * 0.75f;
     };
     select_fonts_at(font_size);
 
@@ -418,7 +432,7 @@ NonnullRefPtr<Gfx::FontCascadeList const> resolve_font_cascade(FontFaceSnapshot 
             return {};
 
         auto font_list = Gfx::FontCascadeList::create();
-        font_list->add(typeface->font(font_size_in_pt, variation, shape_features, typeface->synthesis_for(synthesis_request, variation)));
+        font_list->add(typeface->font(face_size.points, variation, shape_features, typeface->synthesis_for(synthesis_request, variation)));
         return font_list;
     };
 #endif
@@ -438,7 +452,7 @@ NonnullRefPtr<Gfx::FontCascadeList const> resolve_font_cascade(FontFaceSnapshot 
             auto clamped_variations = variations_clamped_to_weight_descriptor(variation, weight_axis_follows_font_weight, lookup_key.weight);
             auto result = Gfx::FontCascadeList::create();
             for (auto const& face : *faces) {
-                if (auto face_fonts = font_for_face(face, lookup_key, font_size_in_pt, variations_for_face(face, variation, clamped_variations), shape_features, synthesis_request))
+                if (auto face_fonts = font_for_face(face, lookup_key, face_size, variations_for_face(face, variation, clamped_variations), shape_features, synthesis_request))
                     result->extend(*face_fonts);
             }
             if (!result->is_empty())
@@ -454,7 +468,7 @@ NonnullRefPtr<Gfx::FontCascadeList const> resolve_font_cascade(FontFaceSnapshot 
         }
 #endif
 
-        if (auto found_font = font_matching_algorithm(snapshot, family, weight, font_width, slope, font_size_in_pt, variation, weight_axis_follows_font_weight, shape_features, synthesis_request); found_font && !found_font->is_empty())
+        if (auto found_font = font_matching_algorithm(snapshot, family, weight, font_width, slope, face_size, variation, weight_axis_follows_font_weight, shape_features, synthesis_request); found_font && !found_font->is_empty())
             return found_font;
 
         return {};
@@ -483,6 +497,9 @@ NonnullRefPtr<Gfx::FontCascadeList const> resolve_font_cascade(FontFaceSnapshot 
             break;
         case Keyword::Fantasy:
             generic_font = Platform::GenericFont::Fantasy;
+            break;
+        case Keyword::Math:
+            generic_font = Platform::GenericFont::Math;
             break;
         case Keyword::SansSerif:
             generic_font = Platform::GenericFont::SansSerif;
@@ -520,10 +537,10 @@ NonnullRefPtr<Gfx::FontCascadeList const> resolve_font_cascade(FontFaceSnapshot 
     }
 
     // NB: @font-feature-values can't apply to the default font since it's not loaded from CSS
-    auto default_font = Platform::FontPlugin::the().default_font(font_size_in_pt, variation, shape_features_for(key, nullptr));
+    auto default_font = Platform::FontPlugin::the().default_font(face_size.points, variation, shape_features_for(key, nullptr));
     if (auto adjusted_font_size = adjusted_font_size_for(*default_font); adjusted_font_size.has_value()) {
         select_fonts_at(*adjusted_font_size);
-        default_font = Platform::FontPlugin::the().default_font(font_size_in_pt, variation, shape_features_for(key, nullptr));
+        default_font = Platform::FontPlugin::the().default_font(face_size.points, variation, shape_features_for(key, nullptr));
         select_fonts_at(font_size);
     }
     if (font_list->is_empty()) {
@@ -551,10 +568,11 @@ NonnullRefPtr<Gfx::FontCascadeList const> resolve_font_cascade(FontFaceSnapshot 
         // FIXME: Normalize the size of each system fallback font by font-size-adjust as well, rather than giving it
         //        the requested size.
         Gfx::FontCascadeList::SystemFallbackRequest request {
-            .point_size = font_size_in_pt,
+            .point_size = face_size.points,
             .weight = static_cast<u16>(clamp(weight, 1, 1000)),
             .width = static_cast<u16>(font_width_bucket_from_percentage(font_width.value())),
             .slope = static_cast<u8>(slope),
+            .shape_features = shape_features_for(key, nullptr),
         };
         font_list->set_system_font_fallback_callback(request, [](u32 code_point, Gfx::EmojiPresentation presentation, Gfx::FontCascadeList::SystemFallbackRequest const& request) -> RefPtr<Gfx::Font const> {
             Gfx::SystemFallbackFontKey key {
@@ -564,7 +582,7 @@ NonnullRefPtr<Gfx::FontCascadeList const> resolve_font_cascade(FontFaceSnapshot 
                 .slope = request.slope,
                 .prefer_color_emoji = presentation == Gfx::EmojiPresentation::Emoji,
             };
-            return Gfx::system_fallback_font(key, request.point_size);
+            return Gfx::system_fallback_font(key, request.point_size, request.shape_features);
         });
     }
 
@@ -601,10 +619,7 @@ NonnullRefPtr<Gfx::FontCascadeList const> resolve_font_for_style_values(FontComp
     // all scopes.
     if (!key.feature_values[to_underlying(FontResolutionFeatureInput::FontVariantAlternates)])
         key.font_feature_values_scope = {};
-    auto font_list = font_computer.font_cascade_memo().resolve(font_computer.font_face_snapshot(), key, font_computer.font_feature_values_provider(key.font_feature_values_scope));
-    // Inside a style update the loads wait for its end; everywhere else, such as canvas, they happen right here.
-    request_wanted_web_faces();
-    return font_list;
+    return font_computer.font_cascade_memo().resolve(font_computer.font_face_snapshot(), key, font_computer.font_feature_values_provider(key.font_feature_values_scope));
 }
 
 NonnullRefPtr<Gfx::FontCascadeList const> FontCascadeMemo::resolve(FontFaceSnapshot const& snapshot, ComputedFontCacheKey const& key, FontFeatureValuesProvider const& font_feature_values_for_family) const
@@ -728,6 +743,7 @@ static StyleEngineFFI::FfiResolvedFont resolve_font_for_style_engine(void const*
         .font_feature_values_scope = TreeScopeID { request.font_feature_values_scope },
         .font_oblique_angle = request.font_oblique_angle,
         .font_synthesis = request.font_synthesis,
+        .is_font_size_adjust_probe = request.font_size_adjust == StyleEngineFFI::FontSizeAdjustKind::FromFont,
     };
     if (request.font_size_adjust == StyleEngineFFI::FontSizeAdjustKind::Number)
         key.font_size_adjust = FontSizeAdjust { static_cast<FontSizeAdjustMetric>(request.font_size_adjust_metric), request.font_size_adjust_value };
@@ -753,10 +769,10 @@ static StyleEngineFFI::FfiResolvedFont resolve_font_for_style_engine(void const*
         // NB: The element's other fonts are then sized by that number.
         auto metric = static_cast<FontSizeAdjustMetric>(request.font_size_adjust_metric);
         font_size_adjust_from_font = font_size_adjust_aspect_value(font_list->first_available_font(), metric);
-        if (font_size_adjust_from_font > 0) {
+        if (font_size_adjust_from_font > 0)
             key.font_size_adjust = FontSizeAdjust { metric, font_size_adjust_from_font };
-            font_list = resolve();
-        }
+        key.is_font_size_adjust_probe = false;
+        font_list = resolve();
     }
     // The metric probe must not load a face: the first available font answers without one.
     auto const& first_available_font = font_list->first_available_font();
@@ -772,7 +788,9 @@ static StyleEngineFFI::FfiResolvedFont resolve_font_for_style_engine(void const*
         .font_cascade_list = reinterpret_cast<StyleEngineFFI::FfiHostHandle>(font_list.ptr()),
         .ascent = metrics.ascent,
         .descent = metrics.descent,
+        .line_gap = metrics.line_gap,
         .x_height = metrics.x_height,
+        .cap_height = metrics.cap_height,
         .zero_advance = metrics.advance_of_ascii_zero,
         .font_size_adjust_from_font = font_size_adjust_from_font,
     };

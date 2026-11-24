@@ -6,9 +6,10 @@
 
 use crate::painting::record::trace::Observer;
 
-use crate::css::computed_value_types::{ComputedSvgPaint, SVG_PAINT_COLOR, SVG_PAINT_NONE, SVG_PAINT_URL};
+use crate::css::computed_value_types::SVG_PAINT_URL;
 use crate::css::computed_value_views::ComputedValuesView;
 use crate::css::css_enums::paint_order;
+use crate::css::svg_paint::svg_paint_color;
 use crate::layout::node_data::{NodeKind, NodeSlotId};
 use crate::painting::display_list::builder::PendingInlineClip;
 use crate::painting::display_list::commands::DisplayListGradientSpreadMethod;
@@ -17,13 +18,13 @@ use crate::painting::display_list::recorder::{
 };
 use crate::painting::force_dark::ForceDarkRole;
 use crate::painting::host::{FfiSvgGradientKind, FfiSvgGradientSpreadMethod};
-use crate::painting::node_painting;
 use crate::painting::paint_read::{GeometryRead, PaintRead};
 use crate::painting::paintable_geometry::absolute_rect;
 use crate::painting::record::{PaintPhase, PaintRecorder};
 use crate::painting::svg_paint_resources::{
     PublishedSvgGradient, PublishedSvgPaintServer, PublishedSvgPattern, SvgPaintResourceKind,
 };
+use crate::svg::stroke_style::{SvgStrokeStyle, svg_stroke_style_for_percentage_basis};
 use libgfx_rust::{AffineTransform, CapStyle, Color, FloatRect, JoinStyle, ShouldAntiAlias, WindingRule};
 
 #[derive(Clone, Copy, Default)]
@@ -44,18 +45,7 @@ struct SvgPaintFacts {
     non_scaling_stroke: bool,
     paint_order: [u8; 3],
     paint_order_count: u32,
-    has_viewport: bool,
-    viewport: [f32; 4],
     references_paint_server: bool,
-}
-
-/// The color `paint` paints with, with `currentcolor` resolved to `current_color`.
-pub(crate) fn svg_paint_color(paint: &ComputedSvgPaint, current_color: u32) -> Option<u32> {
-    match paint.kind {
-        SVG_PAINT_NONE => None,
-        SVG_PAINT_COLOR => Some(paint.color.resolve(current_color)),
-        _ => paint.has_color.then(|| paint.color.resolve(current_color)),
-    }
 }
 
 fn svg_paint_facts<O: Observer>(
@@ -64,16 +54,7 @@ fn svg_paint_facts<O: Observer>(
 ) -> (SvgPaintFacts, Vec<f32>) {
     use crate::css::css_enums::fill_rule;
     let layout_arena = recorder.source;
-    let viewport = layout_arena
-        .node_kind_if_live(paintable)
-        .is_some_and(node_painting::is_svg_path)
-        .then(|| crate::painting::svg_viewport::nearest_svg_viewport_user_rect(layout_arena, paintable))
-        .flatten();
-    let mut facts = SvgPaintFacts {
-        has_viewport: viewport.is_some(),
-        viewport: viewport.map_or([0.0; 4], |rect| [rect.x, rect.y, rect.width, rect.height]),
-        ..SvgPaintFacts::default()
-    };
+    let mut facts = SvgPaintFacts::default();
     let Some(style) = layout_arena.node_style_if_live(paintable) else {
         return (facts, Vec::new());
     };
@@ -112,23 +93,13 @@ fn svg_paint_facts<O: Observer>(
     (facts, stroke.dash_array)
 }
 
-/// The properties that shape the stroke of an SVG shape, in its user units.
-pub(crate) struct SvgStrokeStyle {
-    pub(crate) cap_style: CapStyle,
-    pub(crate) join_style: JoinStyle,
-    pub(crate) miter_limit: f32,
-    pub(crate) width: f32,
-    pub(crate) dash_array: Vec<f32>,
-    pub(crate) dash_offset: f32,
-    pub(crate) non_scaling_stroke: bool,
-}
-
 pub(crate) fn svg_stroke_style(
     layout_arena: &impl GeometryRead,
     paintable: NodeSlotId,
     style: &ComputedValuesView<'_>,
 ) -> SvgStrokeStyle {
-    let basis = crate::painting::paintable_geometry::committed_svg_viewport_percentage_basis(layout_arena, paintable);
+    let basis = crate::painting::paintable_geometry::committed_svg_geometry(layout_arena, paintable)
+        .map_or_else(Default::default, |geometry| geometry.percentage_basis());
     let mut stroke = svg_stroke_style_for_percentage_basis(style, basis);
     if !stroke.dash_array.is_empty()
         && let Some(path_length) =
@@ -156,57 +127,6 @@ pub(crate) fn svg_stroke_style(
         }
     }
     stroke
-}
-
-/// The stroke properties of an SVG shape, with percentages resolved against the given basis.
-pub(crate) fn svg_stroke_style_for_percentage_basis(
-    style: &ComputedValuesView<'_>,
-    basis: crate::layout::CssPixels,
-) -> SvgStrokeStyle {
-    use crate::css::css_enums::{stroke_linecap, stroke_linejoin, vector_effect};
-    let svg = style.inherited_svg();
-    let resolve = |handle: &crate::css::computed_value_types::ComputedStyleValueHandle, default: f32| {
-        handle
-            .length_percentage()
-            .map_or(default, |value| value.to_px(basis).to_double() as f32)
-    };
-
-    let mut dash_array: Vec<f32> = svg
-        .stroke_dasharray
-        .as_slice()
-        .iter()
-        .map(|dash| {
-            if dash.is_number {
-                dash.number as f32
-            } else {
-                resolve(&dash.value, 0.0)
-            }
-        })
-        .collect();
-    if dash_array.len() % 2 == 1 {
-        dash_array.extend_from_within(..);
-    }
-    if dash_array.iter().any(|value| *value < 0.0) || dash_array.iter().all(|value| *value == 0.0) {
-        dash_array.clear();
-    }
-
-    SvgStrokeStyle {
-        cap_style: match svg.stroke_linecap {
-            stroke_linecap::ROUND => CapStyle::Round,
-            stroke_linecap::SQUARE => CapStyle::Square,
-            _ => CapStyle::Butt,
-        },
-        join_style: match svg.stroke_linejoin {
-            stroke_linejoin::ROUND => JoinStyle::Round,
-            stroke_linejoin::BEVEL => JoinStyle::Bevel,
-            _ => JoinStyle::Miter,
-        },
-        miter_limit: svg.stroke_miterlimit as f32,
-        width: resolve(&svg.stroke_width, 1.0),
-        dash_array,
-        dash_offset: resolve(&svg.stroke_dashoffset, 0.0),
-        non_scaling_stroke: style.svg_reset().vector_effect == vector_effect::NON_SCALING_STROKE,
-    }
 }
 
 fn should_anti_alias(value: bool) -> ShouldAntiAlias {
@@ -250,7 +170,7 @@ fn gradient_paint_transform(
 
 fn gradient_paint_style(gradient: &PublishedSvgGradient, paint_context: &SvgPaintContext) -> PaintStyle {
     let description = &gradient.description;
-    let bounding_box = paint_context.path_bounding_box;
+    let bounding_box = paint_context.object_bounding_box;
     let viewport = paint_context.viewport;
     let point_in_bounding_box = |x: f32, y: f32| libgfx_rust::FloatPoint {
         x: bounding_box.x + x * bounding_box.width,
@@ -326,7 +246,9 @@ fn gradient_paint_style(gradient: &PublishedSvgGradient, paint_context: &SvgPain
 
 pub(crate) struct SvgPaintContext {
     pub viewport: FloatRect,
+    /// The bounds of the path as recorded, from which a gradient is positioned when it is drawn.
     pub path_bounding_box: FloatRect,
+    pub object_bounding_box: FloatRect,
     pub paint_transform: AffineTransform,
     pub content_scale: libgfx_rust::FloatSize,
 }
@@ -342,7 +264,7 @@ fn pattern_paint_style<O: Observer>(
     if !recorder.source.paintable_row_is_populated(pattern_box) {
         return None;
     }
-    let bounding_box = paint_context.path_bounding_box;
+    let bounding_box = paint_context.object_bounding_box;
     let viewport = paint_context.viewport;
     let (tile_x, tile_y, tile_width, tile_height) = if description.units_are_object_bounding_box {
         (
@@ -404,7 +326,7 @@ fn pattern_paint_style<O: Observer>(
             pattern_box,
         );
         Some(
-            crate::painting::visual_context::node_values::multiply_transform_functions(
+            crate::css::transform_functions::multiply_transform_functions(
                 libgfx_rust::FloatMatrix4x4::identity(),
                 &pattern.css_transform,
                 reference_box,
@@ -470,14 +392,97 @@ fn references_pattern<O: Observer>(recorder: &PaintRecorder<'_, O>, paintable: N
 }
 
 pub(crate) fn paint_path<O: Observer>(recorder: &mut PaintRecorder<'_, O>, paintable: NodeSlotId, phase: PaintPhase) {
+    paint_path_parts(recorder, paintable, phase, PathParts::BeforeChildren);
+}
+
+/// Which parts of a path to paint. A text content element paints in document order, so its text that follows a child
+/// element paints after that child, apart from the text before it.
+enum PathParts {
+    /// All of a path that paints in one go, or the parts that come before every child element.
+    BeforeChildren,
+    /// The parts in the given range of the parts the box committed.
+    Range(std::ops::Range<usize>),
+}
+
+/// How many parts the text content element `paintable` paints before its first child element; None where its path
+/// paints in one go.
+pub(crate) fn text_parts_before_children<O: Observer>(
+    recorder: &PaintRecorder<'_, O>,
+    paintable: NodeSlotId,
+) -> Option<usize> {
+    let segments = crate::painting::paintable_geometry::committed_svg_text_segments(recorder.source, paintable)?;
+    Some(
+        segments
+            .iter()
+            .take_while(|segment| segment.after_child.is_invalid())
+            .count(),
+    )
+}
+
+/// Paints the parts of the text content element `paintable` that follow `child`, one of its child elements.
+/// `next_part` is the first part that hasn't painted yet, which this moves past the parts it paints.
+pub(crate) fn paint_text_after_child<O: Observer>(
+    recorder: &mut PaintRecorder<'_, O>,
+    paintable: NodeSlotId,
+    child: NodeSlotId,
+    next_part: &mut usize,
+) {
+    let Some(segments) = crate::painting::paintable_geometry::committed_svg_text_segments(recorder.source, paintable)
+    else {
+        return;
+    };
+    let start = (*next_part).min(segments.len());
+    let end = start
+        + segments[start..]
+            .iter()
+            .take_while(|segment| segment.after_child == child)
+            .count();
+    if end > start {
+        paint_path_parts(
+            recorder,
+            paintable,
+            PaintPhase::Foreground,
+            PathParts::Range(start..end),
+        );
+        *next_part = end;
+    }
+}
+
+/// Paints the parts of the text content element `paintable` from `next_part` on: those left once its child elements
+/// have painted, which follow a child that didn't.
+pub(crate) fn paint_text_after_children<O: Observer>(
+    recorder: &mut PaintRecorder<'_, O>,
+    paintable: NodeSlotId,
+    next_part: usize,
+) {
+    let Some(segments) = crate::painting::paintable_geometry::committed_svg_text_segments(recorder.source, paintable)
+    else {
+        return;
+    };
+    if next_part < segments.len() {
+        paint_path_parts(
+            recorder,
+            paintable,
+            PaintPhase::Foreground,
+            PathParts::Range(next_part..segments.len()),
+        );
+    }
+}
+
+fn paint_path_parts<O: Observer>(
+    recorder: &mut PaintRecorder<'_, O>,
+    paintable: NodeSlotId,
+    phase: PaintPhase,
+    path_parts: PathParts,
+) {
     let Some(computed_path) = crate::painting::paintable_geometry::committed_svg_path(recorder.source, paintable)
     else {
         return;
     };
     let (facts, dash_array) = svg_paint_facts(recorder, paintable);
     // A pattern tile is rendered from the pattern's own subtree, and a textPath follows another
-    // element's geometry; neither pushes damage on this shape when it changes. A gradient is
-    // published by the paint resource sync, which pushes damage on the shapes using it.
+    // element's geometry; neither stamps this shape when it changes. A gradient is
+    // published by the paint resource sync, which stamps the shapes using it.
     let output_is_resolved_through_another_element = (facts.references_paint_server
         && references_pattern(recorder, paintable))
         || recorder.source.node_kind_if_live(paintable) == Some(NodeKind::SVGTextPathBox);
@@ -492,7 +497,9 @@ pub(crate) fn paint_path<O: Observer>(recorder: &mut PaintRecorder<'_, O>, paint
         return;
     }
 
-    super::paint_base(recorder, paintable, phase);
+    if matches!(path_parts, PathParts::BeforeChildren) {
+        super::paint_base(recorder, paintable, phase);
+    }
 
     if phase != PaintPhase::Foreground {
         return;
@@ -502,111 +509,225 @@ pub(crate) fn paint_path<O: Observer>(recorder: &mut PaintRecorder<'_, O>, paint
     // ratio; the visual context tree applies the viewport and element transforms at replay.
     let device_scale = recorder.inputs.device_pixels_per_css_pixel as f32;
     let paint_transform = [device_scale, 0.0, 0.0, device_scale, 0.0, 0.0];
-    let path = computed_path.copy_transformed(paint_transform);
+    let segments = crate::painting::paintable_geometry::committed_svg_text_segments(recorder.source, paintable);
+    // Each part of the path to paint, with its bounding box in user units, and the glyphs of color fonts that paint
+    // along with it.
+    type Part<'a> = (
+        libgfx_rust::path::Path,
+        FloatRect,
+        &'a [crate::layout::fragment_tree::SvgColorGlyphRun],
+    );
+    let parts: Vec<Part<'_>> = match &segments {
+        Some(segments) => {
+            let range = match path_parts {
+                PathParts::BeforeChildren => {
+                    0..segments
+                        .iter()
+                        .take_while(|segment| segment.after_child.is_invalid())
+                        .count()
+                }
+                PathParts::Range(range) => range,
+            };
+            segments[range]
+                .iter()
+                .map(|segment| {
+                    (
+                        segment.path.copy_transformed(paint_transform),
+                        FloatRect::from_array(segment.path.bounding_box()),
+                        segment.color_glyph_runs.as_slice(),
+                    )
+                })
+                .collect()
+        }
+        None => vec![(
+            computed_path.copy_transformed(paint_transform),
+            FloatRect::from_array(computed_path.bounding_box()),
+            &[][..],
+        )],
+    };
     let anti_alias = should_anti_alias(facts.should_anti_alias);
 
     if recorder.draws_clip_path_geometry() {
         // https://drafts.fxtf.org/css-masking/#ClipPathElement: the raw geometry of each child
         // element, exclusive of rendering properties, defines a 1-bit mask.
-        recorder.recorder.fill_path(FillPathParams {
-            force_dark_role: ForceDarkRole::Svg,
-            path: &path,
-            opacity: 1.0,
-            paint_style_or_color: PaintStyleOrColor::Color(Color::from_rgb(0, 0, 0)),
-            winding_rule: WindingRule::from_raw(facts.clip_rule_winding),
-            should_anti_alias: anti_alias,
-        });
+        // AD-HOC: The glyphs of a color font have no outlines, so they're left out of the clipping path.
+        for (path, _, _) in &parts {
+            recorder.recorder.fill_path(FillPathParams {
+                force_dark_role: ForceDarkRole::Svg,
+                path,
+                opacity: 1.0,
+                paint_style_or_color: PaintStyleOrColor::Color(Color::from_rgb(0, 0, 0)),
+                winding_rule: WindingRule::from_raw(facts.clip_rule_winding),
+                should_anti_alias: anti_alias,
+            });
+        }
         return;
     }
 
-    let paint_context = SvgPaintContext {
-        viewport: if facts.has_viewport {
-            FloatRect::from_array(facts.viewport)
-        } else {
-            FloatRect::default()
-        },
-        path_bounding_box: FloatRect::from_array(computed_path.bounding_box()),
-        paint_transform: affine(paint_transform),
-        content_scale: recorder.own_accumulated_2d_scale(paintable),
-    };
-
-    for index in 0..facts.paint_order_count as usize {
-        match facts.paint_order[index] {
-            paint_order::FILL => {
-                let fill_opacity = facts.fill_opacity;
-                let fill_winding = WindingRule::from_raw(facts.fill_winding);
-                if let Some(paint_style) = paint_server_style(recorder, paintable, false, &paint_context) {
-                    recorder.recorder.fill_path(FillPathParams {
-                        force_dark_role: ForceDarkRole::Svg,
-                        path: &path,
-                        opacity: fill_opacity,
-                        paint_style_or_color: PaintStyleOrColor::PaintStyle(paint_style),
-                        winding_rule: fill_winding,
-                        should_anti_alias: anti_alias,
-                    });
-                } else if let Some(fill_color) = facts.fill_color {
-                    recorder.recorder.fill_path(FillPathParams {
-                        force_dark_role: ForceDarkRole::Svg,
-                        path: &path,
-                        opacity: 1.0,
-                        paint_style_or_color: PaintStyleOrColor::Color(Color(fill_color).with_opacity(fill_opacity)),
-                        winding_rule: fill_winding,
-                        should_anti_alias: anti_alias,
-                    });
-                }
-            }
-            paint_order::STROKE => {
-                // https://svgwg.org/svg2-draft/painting.html#PaintingVectorEffects
-                // With the non-scaling-stroke vector effect, stroke outline shall be calculated in
-                // the "host" coordinate space instead of user coordinate system.
-                let mut stroke_scale = device_scale;
-                if facts.non_scaling_stroke {
-                    let accumulated_scale = recorder.own_accumulated_2d_scale(paintable);
-                    let accumulated_scale_area = accumulated_scale.width * accumulated_scale.height;
-                    if accumulated_scale_area > 0.0 {
-                        stroke_scale = device_scale / accumulated_scale_area.sqrt();
+    let geometry =
+        crate::painting::paintable_geometry::committed_svg_geometry(recorder.source, paintable).unwrap_or_default();
+    for (path, path_bounding_box, color_glyph_runs) in &parts {
+        // NB: A paint server is placed from the bounding box of the path it paints, so each part is painted with its
+        //     own.
+        let paint_context = SvgPaintContext {
+            viewport: geometry.viewport_user_rect,
+            path_bounding_box: *path_bounding_box,
+            object_bounding_box: geometry.object_bounding_box,
+            paint_transform: affine(paint_transform),
+            content_scale: recorder.own_accumulated_2d_scale(paintable),
+        };
+        for index in 0..facts.paint_order_count as usize {
+            match facts.paint_order[index] {
+                paint_order::FILL => {
+                    let fill_opacity = facts.fill_opacity;
+                    let fill_winding = WindingRule::from_raw(facts.fill_winding);
+                    // NB: The glyphs of a color font paint with their own colors, wherever the text has a fill.
+                    if !color_glyph_runs.is_empty() {
+                        let opacity = if paint_server_style(recorder, paintable, false, &paint_context).is_some() {
+                            Some(fill_opacity)
+                        } else {
+                            facts
+                                .fill_color
+                                .map(|fill_color| fill_opacity * f32::from(Color(fill_color).alpha()) / 255.0)
+                        };
+                        if let Some(opacity) = opacity {
+                            paint_color_glyph_runs(recorder, paintable, color_glyph_runs, opacity, device_scale);
+                        }
+                    }
+                    if let Some(paint_style) = paint_server_style(recorder, paintable, false, &paint_context) {
+                        recorder.recorder.fill_path(FillPathParams {
+                            force_dark_role: ForceDarkRole::Svg,
+                            path,
+                            opacity: fill_opacity,
+                            paint_style_or_color: PaintStyleOrColor::PaintStyle(paint_style),
+                            winding_rule: fill_winding,
+                            should_anti_alias: anti_alias,
+                        });
+                    } else if let Some(fill_color) = facts.fill_color {
+                        recorder.recorder.fill_path(FillPathParams {
+                            force_dark_role: ForceDarkRole::Svg,
+                            path,
+                            opacity: 1.0,
+                            paint_style_or_color: PaintStyleOrColor::Color(
+                                Color(fill_color).with_opacity(fill_opacity),
+                            ),
+                            winding_rule: fill_winding,
+                            should_anti_alias: anti_alias,
+                        });
                     }
                 }
-                let stroke_thickness = facts.stroke_width * stroke_scale;
-                let stroke_dasharray: Vec<f32> = dash_array.iter().map(|value| value * stroke_scale).collect();
-                let stroke_dashoffset = facts.stroke_dashoffset * stroke_scale;
-                let stroke_opacity = facts.stroke_opacity;
+                paint_order::STROKE => {
+                    // https://svgwg.org/svg2-draft/painting.html#PaintingVectorEffects
+                    // With the non-scaling-stroke vector effect, stroke outline shall be calculated in
+                    // the "host" coordinate space instead of user coordinate system.
+                    let mut stroke_scale = device_scale;
+                    if facts.non_scaling_stroke {
+                        let accumulated_scale = recorder.own_accumulated_2d_scale(paintable);
+                        let accumulated_scale_area = accumulated_scale.width * accumulated_scale.height;
+                        if accumulated_scale_area > 0.0 {
+                            stroke_scale = device_scale / accumulated_scale_area.sqrt();
+                        }
+                    }
+                    let stroke_thickness = facts.stroke_width * stroke_scale;
+                    let stroke_dasharray: Vec<f32> = dash_array.iter().map(|value| value * stroke_scale).collect();
+                    let stroke_dashoffset = facts.stroke_dashoffset * stroke_scale;
+                    let stroke_opacity = facts.stroke_opacity;
 
-                if let Some(paint_style) = paint_server_style(recorder, paintable, true, &paint_context) {
-                    recorder.recorder.stroke_path(StrokePathParams {
-                        force_dark_role: ForceDarkRole::Svg,
-                        cap_style: facts.cap_style,
-                        join_style: facts.join_style,
-                        miter_limit: facts.miter_limit,
-                        dash_array: stroke_dasharray,
-                        dash_offset: stroke_dashoffset,
-                        path: &path,
-                        opacity: stroke_opacity,
-                        paint_style_or_color: PaintStyleOrColor::PaintStyle(paint_style),
-                        thickness: stroke_thickness,
-                        should_anti_alias: anti_alias,
-                    });
-                } else if let Some(stroke_color) = facts.stroke_color {
-                    recorder.recorder.stroke_path(StrokePathParams {
-                        force_dark_role: ForceDarkRole::Svg,
-                        cap_style: facts.cap_style,
-                        join_style: facts.join_style,
-                        miter_limit: facts.miter_limit,
-                        dash_array: stroke_dasharray,
-                        dash_offset: stroke_dashoffset,
-                        path: &path,
-                        opacity: 1.0,
-                        paint_style_or_color: PaintStyleOrColor::Color(
-                            Color(stroke_color).with_opacity(stroke_opacity),
-                        ),
-                        thickness: stroke_thickness,
-                        should_anti_alias: anti_alias,
-                    });
+                    // NB: A glyph of a color font has no outline to stroke, so a stroke paints the glyph itself.
+                    if !color_glyph_runs.is_empty() && stroke_thickness > 0.0 {
+                        let opacity = if paint_server_style(recorder, paintable, true, &paint_context).is_some() {
+                            Some(stroke_opacity)
+                        } else {
+                            facts
+                                .stroke_color
+                                .map(|stroke_color| stroke_opacity * f32::from(Color(stroke_color).alpha()) / 255.0)
+                        };
+                        if let Some(opacity) = opacity {
+                            paint_color_glyph_runs(recorder, paintable, color_glyph_runs, opacity, device_scale);
+                        }
+                    }
+
+                    if let Some(paint_style) = paint_server_style(recorder, paintable, true, &paint_context) {
+                        recorder.recorder.stroke_path(StrokePathParams {
+                            force_dark_role: ForceDarkRole::Svg,
+                            cap_style: facts.cap_style,
+                            join_style: facts.join_style,
+                            miter_limit: facts.miter_limit,
+                            dash_array: stroke_dasharray,
+                            dash_offset: stroke_dashoffset,
+                            path,
+                            opacity: stroke_opacity,
+                            paint_style_or_color: PaintStyleOrColor::PaintStyle(paint_style),
+                            thickness: stroke_thickness,
+                            should_anti_alias: anti_alias,
+                        });
+                    } else if let Some(stroke_color) = facts.stroke_color {
+                        recorder.recorder.stroke_path(StrokePathParams {
+                            force_dark_role: ForceDarkRole::Svg,
+                            cap_style: facts.cap_style,
+                            join_style: facts.join_style,
+                            miter_limit: facts.miter_limit,
+                            dash_array: stroke_dasharray,
+                            dash_offset: stroke_dashoffset,
+                            path,
+                            opacity: 1.0,
+                            paint_style_or_color: PaintStyleOrColor::Color(
+                                Color(stroke_color).with_opacity(stroke_opacity),
+                            ),
+                            thickness: stroke_thickness,
+                            should_anti_alias: anti_alias,
+                        });
+                    }
                 }
+                // FIXME: Implement marker painting
+                _ => {}
             }
-            // FIXME: Implement marker painting
-            _ => {}
         }
+    }
+}
+
+fn paint_color_glyph_runs<O: Observer>(
+    recorder: &mut PaintRecorder<'_, O>,
+    paintable: NodeSlotId,
+    runs: &[crate::layout::fragment_tree::SvgColorGlyphRun],
+    opacity: f32,
+    device_scale: f32,
+) {
+    use crate::painting::display_list::commands::{DisplayListGlyph, FontResourceId};
+    use crate::painting::display_list::recorder::GlyphRunForRecording;
+
+    let Some(style) = recorder.source.node_style_if_live(paintable) else {
+        return;
+    };
+    let font_smoothing = style.inherited_text().font_smoothing;
+    for run in runs {
+        let font_id = recorder.register_font(&run.font);
+        let left = (run.bounds.x * device_scale).floor();
+        let top = (run.bounds.y * device_scale).floor();
+        let device_rect = libgfx_rust::IntRect::new(
+            left as i32,
+            top as i32,
+            ((run.bounds.right() * device_scale).ceil() - left) as i32,
+            ((run.bounds.bottom() * device_scale).ceil() - top) as i32,
+        );
+        recorder.recorder.draw_glyph_run(
+            libgfx_rust::FloatPoint { x: 0.0, y: 0.0 },
+            GlyphRunForRecording {
+                font_smoothing,
+                font_id: FontResourceId(font_id),
+                glyphs: run.glyphs.iter().map(|glyph| DisplayListGlyph {
+                    position: libgfx_rust::FloatPoint { x: glyph.x, y: glyph.y },
+                    glyph_id: glyph.glyph_id,
+                }),
+            },
+            Color::from_rgb(0, 0, 0).with_opacity(opacity),
+            0.0,
+            device_rect,
+            f64::from(device_scale),
+            libgfx_rust::Orientation::Horizontal,
+            device_rect,
+            ForceDarkRole::Svg,
+        );
     }
 }
 
@@ -628,7 +749,12 @@ pub(crate) fn svg_image_unquantized_device_rect(
 // https://svgwg.org/svg2-draft/coords.html#PreserveAspectRatioAttribute
 // Where an image of `natural_size` is drawn to fit `image_rect` as its preserveAspectRatio says, taking its own size as
 // its view box.
-fn image_draw_rect(image_rect: FloatRect, natural_size: (f32, f32), align: u8, meet_or_slice: u8) -> FloatRect {
+pub(crate) fn image_draw_rect(
+    image_rect: FloatRect,
+    natural_size: (f32, f32),
+    align: u8,
+    meet_or_slice: u8,
+) -> FloatRect {
     use crate::layout::svg_formatting_context::{
         MEET_OR_SLICE_SLICE, PRESERVE_ASPECT_RATIO_NONE, PRESERVE_ASPECT_RATIO_X_MIN_Y_MIN,
     };

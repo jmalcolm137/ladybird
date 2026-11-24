@@ -4,8 +4,8 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-#include <AK/NeverDestroyed.h>
-#include <LibGC/Root.h>
+#include <LibJS/HostClassBuilder.h>
+#include <LibJS/Runtime/VM.h>
 #include <LibWeb/DOM/Document.h>
 #include <LibWeb/HTML/LocalNavigable.h>
 #include <LibWeb/HTML/Navigator.h>
@@ -13,12 +13,11 @@
 #include <LibWeb/HTML/Window.h>
 #include <LibWeb/MediaCapture/MediaDevices.h>
 #include <LibWeb/Page/Page.h>
-#include <LibWeb/PermissionsAPI/PermissionStatus.h>
 #include <LibWeb/PermissionsAPI/PermissionStore.h>
 
 namespace Web::PermissionsAPI {
 
-bool permission_key_is_equal_to(PermissionDescriptor const&, URL::Origin const& key1, URL::Origin const& key2)
+bool permission_key_is_equal_to(Web::Permissions::PermissionName, URL::Origin const& key1, URL::Origin const& key2)
 {
     // FIXME: 1. If key1 is not of descriptor's permission key type or key2 is not of descriptor's permission key type, return false.
 
@@ -55,31 +54,18 @@ PermissionStore& PermissionStore::the()
     return s_the;
 }
 
-struct AgentPermissionStatuses {
-    Vector<GC::Weak<PermissionStatus>> statuses;
-
-    // The newest snapshot that these statuses have seen.
-    Optional<u64> revision;
-};
-
-static AgentPermissionStatuses& agent_permission_statuses()
-{
-    static thread_local NeverDestroyed<AgentPermissionStatuses> statuses;
-    return *statuses;
+extern "C" {
+// Defined in Bindings/Rust/src/permissions_api/exports.rs.
+bool web_rust_permissions_api_update_statuses_of_this_agent(JSVM*, u64 revision, bool store_changed);
 }
 
-void PermissionStore::forget_statuses_of_this_agent()
-{
-    agent_permission_statuses() = {};
-}
-
-Optional<PermissionStoreEntry> PermissionStore::get_permission_store_entry(PermissionDescriptor const& descriptor, URL::Origin const& key)
+Optional<PermissionStoreEntry> PermissionStore::get_permission_store_entry(Web::Permissions::PermissionName name, URL::Origin const& key)
 {
     MutexLocker locker(m_mutex);
 
     // 1. If the user agent's permission store contains an entry whose descriptor is descriptor, and whose key is equal to key given descriptor, return that entry.
     for (auto const& entry : m_entries) {
-        if (entry.descriptor.name == descriptor.name && permission_key_is_equal_to(descriptor, entry.permission_key, key))
+        if (entry.name == name && permission_key_is_equal_to(name, entry.permission_key, key))
             return entry;
     }
 
@@ -87,16 +73,16 @@ Optional<PermissionStoreEntry> PermissionStore::get_permission_store_entry(Permi
     return {};
 }
 
-void PermissionStore::set_permission_store_entry(PermissionDescriptor const& descriptor, URL::Origin const& key, PermissionState state)
+void PermissionStore::set_permission_store_entry(Web::Permissions::PermissionName name, URL::Origin const& key, PermissionState state)
 {
     MutexLocker locker(m_mutex);
 
     // 1. Let newEntry be a new permission store entry whose descriptor is descriptor, and whose key is key, and whose state is state.
-    PermissionStoreEntry new_entry { descriptor, key, state };
+    PermissionStoreEntry new_entry { name, key, state };
 
     // 2. If the user agent's permission store contains an entry whose descriptor is descriptor, and whose key is equal to key given descriptor, replace that entry with newEntry and abort these steps.
     for (auto& entry : m_entries) {
-        if (entry.descriptor.name == descriptor.name && permission_key_is_equal_to(descriptor, entry.permission_key, key)) {
+        if (entry.name == name && permission_key_is_equal_to(name, entry.permission_key, key)) {
             entry = new_entry;
             return;
         }
@@ -142,27 +128,8 @@ void PermissionStore::apply_snapshot(Web::Permissions::PermissionSnapshot snapsh
     if (notify == Notify::No)
         return;
 
-    // NB: The agent that got here first made the change, and the others still have to hear of it. An agent has heard of a
-    //     revision only once its statuses have, which is not the case for one that it fetched without telling them.
-    auto& agent = agent_permission_statuses();
-    if (!agent.revision.has_value() || snapshot.revision > *agent.revision) {
-        agent.revision = snapshot.revision;
-        changed = true;
-    }
-
-    if (!changed)
+    if (!web_rust_permissions_api_update_statuses_of_this_agent(JS::HostABI::vm_to_abi(JS::VM::the()), snapshot.revision, changed))
         return;
-
-    // NB: Updating a status allocates, and a collection then could clear another status's weak reference, so every
-    //     live status is rooted first.
-    agent.statuses.remove_all_matching([](auto const& status) { return !status; });
-    Vector<GC::Root<PermissionStatus>> statuses;
-    for (auto const& status : agent.statuses) {
-        if (status)
-            statuses.append(GC::make_root(status.ptr()));
-    }
-    for (auto const& status : statuses)
-        status->update_from_store();
 
     // Only a window agent has documents.
     if (!HTML::surrounding_agent().is_similar_origin_window_agent())
@@ -230,11 +197,6 @@ Vector<String> PermissionStore::cached_origins_for_testing() const
             origins.append(it.key);
     }
     return origins;
-}
-
-void PermissionStore::register_status(PermissionStatus& status)
-{
-    agent_permission_statuses().statuses.append(status);
 }
 
 }

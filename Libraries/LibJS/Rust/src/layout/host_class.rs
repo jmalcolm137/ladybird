@@ -12,8 +12,6 @@
 
 use core::ffi::{c_char, c_void};
 
-pub const JS_HOST_ABI_VERSION: u16 = 1;
-
 pub type JSValue = u64;
 
 /// A borrowed property key, with the bits of the runtime's own property key.
@@ -153,6 +151,7 @@ pub struct JSHostObjectHooks {
     pub error_data: Option<unsafe extern "C" fn(object: *mut JSObject) -> *mut c_void>,
     pub finalize: Option<unsafe extern "C" fn(object: *mut JSObject)>,
     pub get_indexed_value: Option<unsafe extern "C" fn(object: *mut JSObject, index: u32) -> JSCompletion>,
+    pub preserve_identity: Option<unsafe extern "C" fn(object: *mut JSObject)>,
 }
 
 #[repr(C)]
@@ -209,9 +208,7 @@ pub struct JSHostModuleHooks {
 
 #[repr(C)]
 pub struct JSHostClass {
-    pub abi_version: u16,
     pub kind: u8,
-    pub reserved: u8,
     pub flags: u32,
     pub name: *const c_char,
     pub name_length: usize,

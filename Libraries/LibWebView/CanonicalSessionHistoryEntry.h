@@ -47,7 +47,7 @@ public:
     ~CanonicalDocumentState();
 
     Web::HTML::SessionHistoryDocumentStateDescriptor descriptor() const;
-    void save_the_origin_of_the_populated_document();
+    void save_the_state_of_the_populated_document();
 
     // NB: The identity the processes hosting the document state's documents give it.
     Web::HTML::CrossProcessId id;
@@ -75,9 +75,9 @@ public:
     Utf16String navigable_target_name;
     Vector<CanonicalNestedHistory> nested_histories;
 
-    // Whether the UI process populated local file content for this document state. Only then may the process populating
-    // it again read the file its entry names: a process reports an entry's URL, but not this.
-    bool held_local_file_content { false };
+    // Saved root used when repopulating this document state.
+    // The renderer can report entry URLs, but cannot supply this root.
+    Optional<LocalFileRoot> local_file_root;
 
 private:
     explicit CanonicalDocumentState(Web::HTML::CrossProcessId);

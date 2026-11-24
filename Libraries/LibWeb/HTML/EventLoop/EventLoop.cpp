@@ -15,9 +15,8 @@
 #include <LibGC/HeapAccess.h>
 #include <LibJS/Runtime/VM.h>
 #include <LibWeb/Animations/NamedTimelines.h>
-#include <LibWeb/Animations/ScrollTimeline.h>
+#include <LibWeb/Animations/RecordHandles.h>
 #include <LibWeb/Bindings/MainThreadVM.h>
-#include <LibWeb/CSS/CSSTransition.h>
 #include <LibWeb/CSS/FontFaceSet.h>
 #include <LibWeb/CSS/StyleComputer.h>
 #include <LibWeb/CSS/StyleScope.h>
@@ -81,11 +80,33 @@ EventLoop::EventLoop(Type type)
 
 EventLoop::~EventLoop() = default;
 
-void EventLoop::reset_rendering_scheduler_counters()
+String EventLoop::take_rendering_trace()
 {
-    m_rendering_scheduler_counters = {};
-    m_rendering_scheduler_counters_at_last_update = {};
-    m_last_rendering_update_end_time = 0;
+    StringBuilder builder;
+    for (auto const& line : m_rendering_trace.value_or({})) {
+        builder.append(line.text);
+        if (line.repeats > 1)
+            builder.appendff(" x{}", line.repeats);
+        builder.append('\n');
+    }
+    m_rendering_trace.clear();
+    return builder.to_string_without_validation();
+}
+
+void EventLoop::note_rendering_trace_event(StringView event)
+{
+    if (!m_rendering_trace.has_value())
+        return;
+    if (!m_rendering_trace->is_empty() && m_rendering_trace->last().text == event) {
+        ++m_rendering_trace->last().repeats;
+        return;
+    }
+    m_rendering_trace->append({ MUST(String::from_utf8(event)) });
+}
+
+void note_rendering_trace_event(StringView event)
+{
+    main_thread_event_loop().note_rendering_trace_event(event);
 }
 
 void EventLoop::visit_edges(Visitor& visitor)
@@ -292,6 +313,8 @@ bool EventLoop::run_one_turn_of_the_processing_model()
 
         // 5. Set the event loop's currently running task to oldestTask.
         m_currently_running_task = oldest_task.ptr();
+        // NB: A task that spins the event loop runs other tasks in the middle of its own, so each restores what it found.
+        TemporaryChange timer_nesting_level_for_microtasks { m_timer_nesting_level_for_microtasks, oldest_task->timer_nesting_level() };
 
         // 6. Perform oldestTask's steps.
         oldest_task->execute();
@@ -410,8 +433,10 @@ void EventLoop::request_rendering_update()
 
     if (m_rendering_update_requested || m_rendering_task_queued) {
         ++m_rendering_scheduler_counters.coalesced_update_requests;
+        note_rendering_trace_event(m_running_rendering_task ? "request while rendering, coalesced"sv : "request, coalesced"sv);
         return;
     }
+    note_rendering_trace_event(m_running_rendering_task ? "request while rendering"sv : "request"sv);
 
     m_rendering_update_requested = true;
 }
@@ -422,6 +447,7 @@ bool EventLoop::rendering_opportunity(HighResolutionTime::DOMHighResTimeStamp fr
     ++m_rendering_scheduler_counters.opportunities_received;
     if (source == RenderingOpportunitySource::Watchdog)
         ++m_rendering_scheduler_counters.watchdog_opportunities;
+    note_rendering_trace_event(source == RenderingOpportunitySource::Watchdog ? "opportunity (watchdog)"sv : "opportunity"sv);
 
     // FIXME: 1. Wait until at least one navigable whose active document's relevant agent's event loop is eventLoop might have a rendering opportunity.
 
@@ -742,22 +768,6 @@ void EventLoop::finish_rendering_update(double update_start_time)
     m_last_rendering_update_end_time = update_end_time;
 }
 
-// Whether `animation` is a CSS animation or transition that the style of a rendering update began, which the update
-// makes ready once its style and layout are done.
-static bool rendering_update_makes_ready(Animations::Animation const& animation)
-{
-    auto const* effect = as_if<Animations::KeyframeEffect>(animation.effect().ptr());
-    return animation.pending() && (animation.is_css_animation() || animation.is_css_transition()) && effect && !effect->may_run_on_the_compositor();
-}
-
-// Whether `animation` runs on the compositor, whose animations, the wake-ups they arm and the ones that leave it, a
-// rendering update publishes with its frame.
-static bool runs_on_the_compositor(Animations::Animation const& animation)
-{
-    auto const* effect = as_if<Animations::KeyframeEffect>(animation.effect().ptr());
-    return effect && effect->is_compositor_driven();
-}
-
 enum class StyleTakenIn : u8 {
     No,
     Yes,
@@ -774,6 +784,8 @@ enum class LayoutHeldForTesting : bool {
 // observations the last doc's layout answers, and the animations it samples and transitions it starts, whose timing
 // script sees follow the update. Once the transaction is taken in, those are the ones its style began, and the ones
 // running on the compositor, which the update's frame publishes.
+// The Event Timing entries pending for any doc count too: The update sets their durations from the time it reaches them,
+// and queues those that lasted 16ms or more for observers to see.
 // AD-HOC: The render clock's lanes of the docs the update took in present nothing until its frame: a task beside the
 //         update would leave the pointer unhovered and the animations still for as long as it runs, where the lanes
 //         would hover or animate beside it. A test that holds the layout that flies runs the doc's tasks beside it.
@@ -782,8 +794,9 @@ static HeldTasks tasks_rendering_update_holds(Vector<GC::Root<DOM::Document>> co
 {
     if (any_of(docs, [](auto const& document) { return document->has_intersection_observation_targets(); }))
         return HeldTasks::All;
-    // The focus fixup of every doc whose focused area is not its viewport reads that area as the update leaves it.
-    if (any_of(docs.span().slice(0, docs.size() - 1), [](auto const& document) { return focus_fixup_rule_may_apply(*document); }))
+    // The focus fixup of every doc whose focused area is not its viewport reads that area as the update leaves it, and
+    // the Event Timing entries pending for a doc are reported as the update reaches them.
+    if (any_of(docs.span().slice(0, docs.size() - 1), [](auto const& document) { return focus_fixup_rule_may_apply(*document) || EventTiming::has_pending_event_timing_entries(*document); }))
         return HeldTasks::All;
     // The lanes of a doc the update took in present nothing until it seals their plan, which its tasks would hold up.
     auto lanes_wait = [&](DOM::Document const& document) {
@@ -793,16 +806,12 @@ static HeldTasks tasks_rendering_update_holds(Vector<GC::Root<DOM::Document>> co
     if (any_of(docs.span().slice(0, docs.size() - 1), [&](auto const& document) { return lanes_wait(*document); }))
         return HeldTasks::All;
     auto& document = *docs.last();
-    if (document.has_resize_observers() || focus_fixup_rule_may_apply(document))
+    if (document.has_resize_observers() || focus_fixup_rule_may_apply(document) || EventTiming::has_pending_event_timing_entries(document))
         return HeldTasks::OfLastDocument;
     if (lanes_wait(document))
         return HeldTasks::OfLastDocument;
-    for (auto const& timeline : document.associated_animation_timelines()) {
-        for (auto const& animation : timeline->associated_animations()) {
-            if (style_taken_in == StyleTakenIn::No || rendering_update_makes_ready(animation) || runs_on_the_compositor(animation))
-                return HeldTasks::OfLastDocument;
-        }
-    }
+    if (Animations::RustFFI::animations_document_timelines_hold_rendering_update_tasks(&document.document_animations(), style_taken_in == StyleTakenIn::Yes))
+        return HeldTasks::OfLastDocument;
     if (style_taken_in == StyleTakenIn::No && document.style_computer().style_engine().css_transitions_may_observe_style_changes())
         return HeldTasks::OfLastDocument;
     return HeldTasks::None;
@@ -894,7 +903,7 @@ Vector<GC::Root<DOM::Document>> EventLoop::take_clock_lanes_and_input_events_in(
         // their reactions run once every document took in what its lanes did.
         HTML::TemporaryExecutionContext execution_context { documents_with_lanes.first()->relevant_settings_object() };
         for (auto& document : documents_with_lanes)
-            CSS::CSSTransition::adopt_lane_transitions(*document);
+            document->style_computer().adopt_lane_transitions();
     }
 
     process_input_events();
@@ -985,6 +994,7 @@ void EventLoop::update_the_rendering()
         page->client().will_begin_rendering_update();
     auto update_start_time = HighResolutionTime::unsafe_shared_current_time();
     ++m_rendering_scheduler_counters.updates_run;
+    note_rendering_trace_event("update"sv);
     ++m_rendering_update_serial;
 
     // AD-HOC: The last rendering update may have ended as its style update flew. Its layout runs beside this
@@ -1059,7 +1069,7 @@ void EventLoop::update_the_rendering()
         //         at FormAssociatedTextControlElement::CursorRevealAfterEdit.
         if (auto* text_control = as_if<FormAssociatedTextControlElement>(document->focused_area().ptr()))
             text_control->reveal_cursor_if_pending();
-        document->run_the_scroll_steps();
+        document->run_the_scroll_steps(frame_timestamp);
     }
 
     // 10. For each doc of docs, evaluate media queries and report changes for doc. [CSSOMVIEW]
@@ -1303,19 +1313,18 @@ static void update_style_and_layout_for_rendering(DOM::Document& document, u64 u
     if (animations_changed_timeline)
         requires_style_and_layout_update = true;
 
-    GC::RootVector timelines = { document.associated_animation_timelines().values() };
-    for (auto const& timeline : timelines) {
-        auto* scroll_timeline = as_if<Animations::ScrollTimeline>(*timeline);
-
-        if (!scroll_timeline)
-            continue;
-
-        if (!animations_changed_timeline && !scroll_timeline->is_stale())
-            continue;
-
-        // NB: The passed timestamp is ignored for ScrollTimelines so we can just use 0.
-        timeline->update_current_time(0);
-        requires_style_and_layout_update = true;
+    {
+        // NB: The animations the timelines update stay alive through it, which can run script.
+        GC::RootVector<Animations::AnimationRef> updated_animations;
+        Animations::RustFFI::FfiTimelineAnimationsHost host {
+            .context = &updated_animations,
+            .keep_alive = Animations::keep_animation_alive_in,
+            .perform = Animations::web_animation_perform_host_effect,
+        };
+        // https://drafts.csswg.org/scroll-animations-1/#stale-timelines
+        auto update = animations_changed_timeline ? Animations::RustFFI::FfiTimelinesUpdate::ScrollTimelines : Animations::RustFFI::FfiTimelinesUpdate::StaleScrollTimelines;
+        if (Animations::RustFFI::animations_document_update_timelines(&document.document_animations(), update, 0, &host))
+            requires_style_and_layout_update = true;
     }
 
     if (requires_style_and_layout_update)
@@ -1337,16 +1346,9 @@ void EventLoop::update_the_rendering_after_style_and_layout(Vector<GC::Root<DOM:
     for (auto& document : docs) {
         // NB: A play task resolves the animation's ready promise.
         TemporaryExecutionContext execution_context { document->relevant_settings_object() };
-        GC::RootVector timelines = { document->associated_animation_timelines().values() };
-        for (auto const& timeline : timelines) {
-            GC::RootVector<GC::Ref<Animations::Animation>> pending_css_animations;
-            for (auto& animation : timeline->associated_animations()) {
-                if (rendering_update_makes_ready(animation))
-                    pending_css_animations.append(animation);
-            }
-            for (auto& animation : pending_css_animations)
-                animation->run_pending_play_task_if_ready();
-        }
+        // NB: Running a play task can run script, which the animations stay alive through.
+        GC::RootVector<Animations::AnimationRef> pending_css_animations;
+        Animations::RustFFI::animations_document_run_pending_css_play_tasks(&document->document_animations(), &pending_css_animations, Animations::keep_animation_alive_in, Animations::web_animation_perform_host_effect);
     }
 
     // 17. For each doc of docs, if the focused area of doc is not a focusable area, then run the focusing steps for doc's viewport, and set doc's relevant global object's navigation API's focus changed during ongoing navigation to false.
@@ -1402,7 +1404,7 @@ void EventLoop::update_the_rendering_after_style_and_layout(Vector<GC::Root<DOM:
         if (synced_pages.contains_slow(GC::Ref { document->page() }))
             continue;
         synced_pages.append(document->page());
-        document->page().sync_media_element_video_sink_ticking();
+        document->page().sync_media_element_video_sink_ticking(docs);
     }
 
     // FIXME: 20. For each doc of docs, record rendering time for doc given unsafeStyleAndLayoutStartTime.
@@ -1440,6 +1442,7 @@ void EventLoop::update_the_rendering_after_style_and_layout(Vector<GC::Root<DOM:
         if (!navigable || !navigable->paint_next_frame_if_needed(DOM::UpdateLayoutReason::HTMLEventLoopRenderingUpdate, lay_out_first))
             continue;
         ++m_rendering_scheduler_counters.paints;
+        note_rendering_trace_event("paint"sv);
         if (navigable->is_local_root())
             navigable->page().process_screenshot_requests();
     }
@@ -1496,14 +1499,21 @@ Layout::RustFFI::FfiFlightBlocker EventLoop::style_flight_blocker(DOM::Document&
         return Blocker::ScrollStateContainer;
     if (document.has_boxes_with_auto_content_visibility())
         return Blocker::ContentVisibilityAuto;
-    for (auto const& timeline : document.associated_animation_timelines()) {
-        if (is<Animations::ScrollTimeline>(*timeline))
-            return Blocker::ScrollTimeline;
-    }
+    if (Animations::RustFFI::animations_document_animations_query(&document.document_animations(), Animations::RustFFI::DocumentAnimationsQuery::AnyScrollTimeline))
+        return Blocker::ScrollTimeline;
     // The animations that name their timeline look it up again after style and layout.
     if (document.has_named_timelines())
         return Blocker::ScrollTimeline;
     return Blocker::None;
+}
+
+// The sizes the windows took as the update flew become the sizes of their traversables now that it ended.
+static void take_viewport_sizes_held_for_rendering_update_in_flight()
+{
+    for (auto const& page : pages_of_local_roots()) {
+        if (page->has_local_traversable())
+            page->local_traversable()->take_viewport_size_held_for_rendering_update_in_flight();
+    }
 }
 
 void EventLoop::resume_rendering_update_in_flight()
@@ -1521,6 +1531,7 @@ void EventLoop::resume_rendering_update_in_flight()
         for (auto const& page : pages_of_local_roots())
             page->client().did_finish_rendering_update();
     }
+    take_viewport_sizes_held_for_rendering_update_in_flight();
 }
 
 // The rest of the last rendering update, which ended as its style update flew, runs before anything of the next
@@ -1549,6 +1560,7 @@ bool EventLoop::finish_ended_rendering_update_as_its_layout_flew()
         update_the_rendering_after_style_and_layout(update->docs, update->frame_timestamp, update->serial, TakenLayout::AsItFlew, update.ptr());
     }
     update_whether_font_face_sets_are_pending_on_the_environment(update->docs, TakenLayout::AsItFlew);
+    take_viewport_sizes_held_for_rendering_update_in_flight();
     return true;
 }
 
@@ -1856,6 +1868,12 @@ void EventLoop::perform_a_microtask_checkpoint()
         // 2. Set the event loop's currently running task to oldestMicrotask.
         m_currently_running_task = oldest_microtask;
 
+        // AD-HOC: The spec gives a microtask no timer nesting level, so a timer it schedules starts over at 0 — even
+        //         in the checkpoint that ends a deeply-nested timer callback. A page that re-arms a 0ms timer from a
+        //         promise reaction then never reaches the 4ms clamp, and spins. Instead, a microtask carries the
+        //         nesting level of the task whose checkpoint runs it, just as the timer callback itself would have.
+        oldest_microtask->set_timer_nesting_level(m_timer_nesting_level_for_microtasks);
+
         // 3. Run oldestMicrotask.
         oldest_microtask->execute();
 
@@ -2011,6 +2029,38 @@ void EventLoop::pop_backup_incumbent_realm_stack()
 EnvironmentSettingsObject& EventLoop::top_of_backup_incumbent_realm_stack()
 {
     return m_backup_incumbent_realm_stack.last();
+}
+
+u32 EventLoop::skip_when_determining_incumbent_counter(JS::ExecutionContext const& execution_context) const
+{
+    for (auto const& counter : m_skip_when_determining_incumbent_counters) {
+        if (counter.execution_context == &execution_context)
+            return counter.count;
+    }
+    return 0;
+}
+
+void EventLoop::increment_skip_when_determining_incumbent_counter(JS::ExecutionContext const& execution_context)
+{
+    for (auto& counter : m_skip_when_determining_incumbent_counters) {
+        if (counter.execution_context == &execution_context) {
+            ++counter.count;
+            return;
+        }
+    }
+    m_skip_when_determining_incumbent_counters.append({ &execution_context, 1 });
+}
+
+void EventLoop::decrement_skip_when_determining_incumbent_counter(JS::ExecutionContext const& execution_context)
+{
+    auto index = m_skip_when_determining_incumbent_counters.find_first_index_if([&](auto const& counter) {
+        return counter.execution_context == &execution_context;
+    });
+    VERIFY(index.has_value());
+    auto& counter = m_skip_when_determining_incumbent_counters[*index];
+    VERIFY(counter.count > 0);
+    if (--counter.count == 0)
+        m_skip_when_determining_incumbent_counters.remove(*index);
 }
 
 void EventLoop::register_environment_settings_object(Badge<EnvironmentSettingsObject>, EnvironmentSettingsObject& environment_settings_object)

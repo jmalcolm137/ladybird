@@ -65,8 +65,12 @@ impl GenericIndexedPropertyStorage {
         if index as usize >= self.array_size {
             self.array_size = index as usize + 1;
         }
-        self.sparse_elements
-            .insert(index, ValueAndAttributes::new(value, attributes));
+        if value.is_empty() {
+            self.sparse_elements.remove(&index);
+        } else {
+            self.sparse_elements
+                .insert(index, ValueAndAttributes::new(value, attributes));
+        }
     }
 
     pub fn remove(&mut self, index: u32) {
@@ -78,14 +82,13 @@ impl GenericIndexedPropertyStorage {
         assert!(self.array_size > 0);
         self.array_size -= 1;
 
-        let first_index = *self
+        let first = self.sparse_elements.remove(&0).unwrap_or_default();
+        self.sparse_elements = self
             .sparse_elements
-            .keys()
-            .min()
-            .expect("an array with a size has an element");
-        self.sparse_elements
-            .remove(&first_index)
-            .expect("the first index is in the map")
+            .drain()
+            .map(|(index, element)| (index - 1, element))
+            .collect();
+        first
     }
 
     pub fn take_last(&mut self) -> ValueAndAttributes {

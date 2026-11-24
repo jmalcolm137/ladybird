@@ -9,6 +9,7 @@
 #include <AK/HashTable.h>
 #include <AK/LexicalPath.h>
 #include <AK/Utf16String.h>
+#include <LibCore/Directory.h>
 #include <LibCore/EventLoop.h>
 #include <LibCore/File.h>
 #include <LibCore/System.h>
@@ -17,7 +18,6 @@
 #include <LibImageDecoderClient/Client.h>
 #include <LibTest/TestCase.h>
 #include <LibURL/URL.h>
-#include <LibWebCommon/WebView/SiteIsolation.h>
 #include <LibWebView/Application.h>
 #include <LibWebView/HeadlessWebView.h>
 #include <LibWebView/ImageDecoderManager.h>
@@ -140,8 +140,8 @@ TEST_CASE(renderers_of_a_site_share_an_image_decoder)
     second_view->on_load_finish = [&](auto const&) { ++second_view_loads; };
     Core::EventLoop::current().spin_until([&] { return first_view_loads >= 1 && second_view_loads >= 1; });
 
-    first_view->load(page_url);
-    second_view->load(page_url);
+    first_view->load_from_browser_ui(page_url);
+    second_view->load_from_browser_ui(page_url);
     Core::EventLoop::current().spin_until([&] { return first_view_loads >= 2 && second_view_loads >= 2; });
 
     VERIFY(processes_of_type(WebView::ProcessType::WebContent).size() >= 2);
@@ -150,7 +150,7 @@ TEST_CASE(renderers_of_a_site_share_an_image_decoder)
 
     // A renderer that comes to host a second site leaves the decoder, which stays with the renderer that has only the one.
     first_view->page().client().did_host_document_of_site("https://other.example"_utf16);
-    first_view->load(page_url);
+    first_view->load_from_browser_ui(page_url);
     Core::EventLoop::current().spin_until([&] { return first_view_loads >= 3; });
 
     auto decoders_after_second_site = processes_of_type(WebView::ProcessType::ImageDecoder);
@@ -172,8 +172,12 @@ TEST_CASE(pdf_viewer_does_not_make_a_renderer_leave_the_image_decoder_of_its_sit
     auto theme_path = LexicalPath::join(WebView::s_ladybird_resource_root, "themes"sv, "Default.ini"sv);
     auto theme = TRY_OR_FAIL(Gfx::load_system_theme(theme_path.string()));
 
+    // The profile is beneath the environment's directory on Linux, so a page there would be granted only itself.
+    auto content_directory = LexicalPath::join(environment.directory(), "content"sv).string();
+    MUST(Core::Directory::create(content_directory, Core::Directory::CreateDirectories::Yes));
+
     auto write_file = [&](StringView name, StringView contents) {
-        auto path = LexicalPath::join(environment.directory(), name).string();
+        auto path = LexicalPath::join(content_directory, name).string();
         auto file = MUST(Core::File::open(path, Core::File::OpenMode::Write));
         MUST(file->write_until_depleted(contents.bytes()));
         file->close();
@@ -202,11 +206,11 @@ TEST_CASE(pdf_viewer_does_not_make_a_renderer_leave_the_image_decoder_of_its_sit
     second_view->on_title_change = [&](auto const& title) { second_view_decoded_image = title == "decoded"sv; };
     Core::EventLoop::current().spin_until([&] { return first_view_loads >= 1 && second_view_loads >= 1; });
 
-    first_view->load(image_page_url);
+    first_view->load_from_browser_ui(image_page_url);
     Core::EventLoop::current().spin_until([&] { return first_view_loads >= 2; });
     VERIFY(processes_of_type(WebView::ProcessType::ImageDecoder).size() == 1);
 
-    second_view->load(pdf_page_url);
+    second_view->load_from_browser_ui(pdf_page_url);
     Core::EventLoop::current().spin_until([&] { return second_view_decoded_image; });
     VERIFY(processes_of_type(WebView::ProcessType::ImageDecoder).size() == 1);
 
@@ -261,20 +265,12 @@ TEST_CASE(image_decoder_sharing_rules)
     connect(1'000'006, ordinary_session, {});
     VERIFY(decoder_count() == 5);
 
-    // Without site isolation a process may host anything, so its claim to a site does not make it safe to share with.
-    auto mode = WebView::site_isolation_mode();
-    WebView::set_site_isolation_mode(WebView::SiteIsolationMode::TopLevel);
-    connect(1'000'007, ordinary_session, site_a);
-    connect(1'000'008, ordinary_session, site_a);
-    WebView::set_site_isolation_mode(mode);
-    VERIFY(decoder_count() == 7);
-
     // A session that has ended shares nothing with the next, nor does a worker that outlived its session.
     private_session = nullptr;
     connect(1'000'009, WebView::Application::session_for_new_view(WebView::IsPrivate::Yes), site_a);
-    VERIFY(decoder_count() == 8);
+    VERIFY(decoder_count() == 6);
     connect(1'000'010, nullptr, site_a);
-    VERIFY(decoder_count() == 9);
+    VERIFY(decoder_count() == 7);
 
     // Only a process served by the decoder of a site has one to leave.
     VERIFY(manager.remove_client_from_decoder_of_site(1'000'002));
@@ -290,16 +286,16 @@ TEST_CASE(image_decoder_sharing_rules)
         return !processes_of_type(WebView::ProcessType::ImageDecoder).contains(crashed_decoder);
     });
     connect(1'000'003, ordinary_session, site_b);
-    VERIFY(decoder_count() == 9);
+    VERIFY(decoder_count() == 7);
     VERIFY(decoder_of_site("b.example"sv) != crashed_decoder);
     VERIFY(processes_of_type(WebView::ProcessType::ImageDecoder).contains(decoder_of_a));
 
     // A decoder ends with the last process it serves, and not before.
     handles.clear();
     manager.process_did_exit(1'000'003);
-    Core::EventLoop::current().spin_until([&] { return decoder_count() == 8; });
+    Core::EventLoop::current().spin_until([&] { return decoder_count() == 6; });
     manager.process_did_exit(1'000'005);
-    Core::EventLoop::current().spin_until([&] { return decoder_count() == 7; });
+    Core::EventLoop::current().spin_until([&] { return decoder_count() == 5; });
     for (u64 child_id = 1'000'001; child_id <= 1'000'010; ++child_id)
         manager.process_did_exit(child_id);
     Core::EventLoop::current().spin_until([&] { return decoder_count() == 0; });

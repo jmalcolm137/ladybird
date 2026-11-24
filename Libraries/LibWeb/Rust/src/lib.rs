@@ -22,8 +22,11 @@ pub(crate) mod fork_vec;
 #[cfg(test)]
 mod gfx_test_stubs;
 pub(crate) mod heap_size;
+#[cfg(test)]
+mod url_test_stubs;
 pub(crate) use libcompositing_rust::fast_hash;
 
+pub(crate) mod animations;
 pub(crate) mod css;
 pub(crate) mod layout;
 pub(crate) mod paint_stage;
@@ -36,6 +39,8 @@ pub(crate) mod svg;
 pub mod web_audio;
 
 // What libweb_bindings_rust, whose interfaces are implemented in Rust, uses of this crate.
+pub use animations::animation::AnimationRecordRef;
+pub use animations::bindings_api as web_animations;
 pub use css::font_feature_values::FontFeatureValuesRuleKind;
 pub use css::media_list::{MediaList as NativeMediaList, MediaListDeleteResult};
 pub use css::rule::cssom;

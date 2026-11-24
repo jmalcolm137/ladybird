@@ -6,10 +6,13 @@
 
 #pragma once
 
-#include <AK/Assertions.h>
 #include <AK/Atomic.h>
+#include <AK/AtomicRefCounted.h>
+#include <AK/Error.h>
 #include <AK/NonnullRefPtr.h>
+#include <AK/Span.h>
 #include <AK/kmalloc.h>
+#include <LibCore/AnonymousBuffer.h>
 #include <LibGC/Forward.h>
 #include <LibGfx/Bitmap.h>
 #include <LibGfx/ColorSpace.h>
@@ -17,56 +20,134 @@
 #include <LibGfx/Rect.h>
 #include <LibIPC/Forward.h>
 
+#ifdef AK_OS_MACOS
+#    include <LibCore/IOSurface.h>
+#endif
+
 namespace Gfx {
 
 class DecodedImageFrame final {
 public:
     AK_ALLOC_WITH_KMALLOC;
 
-    DecodedImageFrame(NonnullRefPtr<Bitmap const> bitmap, ColorSpace color_space = {})
-        : m_id(next_id())
-        , m_bitmap(move(bitmap))
+    // Copies of a frame share one of these, so that the last of them going away can be observed.
+    class SharedIdentity final : public AtomicRefCounted<SharedIdentity> {
+    public:
+        AK_ALLOC_WITH_KMALLOC;
+
+        explicit SharedIdentity(u64 id)
+            : m_id(id)
+        {
+        }
+        ~SharedIdentity();
+
+        u64 id() const { return m_id; }
+
+    private:
+        u64 m_id { 0 };
+    };
+
+    using IdentityDestructionObserver = void (*)(SharedIdentity const&);
+    static void set_identity_destruction_observer(IdentityDestructionObserver);
+
+    static ErrorOr<DecodedImageFrame> create(Bitmap const&, ColorSpace = {});
+    static ErrorOr<DecodedImageFrame> create_over_shared_memory(Core::AnonymousBuffer shared_memory, size_t offset_of_pixels, IntSize, BitmapFormat, AlphaType, ColorSpace = {});
+#ifdef AK_OS_MACOS
+    static ErrorOr<DecodedImageFrame> create_over_iosurface(Core::IOSurfaceHandle, IntSize, BitmapFormat, AlphaType, ColorSpace = {});
+#endif
+
+    // For the same pixels decoded again, which caches keyed by the id of a frame may still hold.
+    static ErrorOr<DecodedImageFrame> create_with_id(u64 id, Bitmap const&, ColorSpace = {});
+
+    DecodedImageFrame with_new_id() const
+    {
+        auto frame = *this;
+        frame.m_identity = adopt_ref(*new SharedIdentity(next_id()));
+        return frame;
+    }
+
+    DecodedImageFrame with_pixels_reinterpreted_in(ColorSpace color_space) const
+    {
+        auto frame = with_new_id();
+        frame.m_color_space = move(color_space);
+        return frame;
+    }
+
+    ColorSpace const& color_space() const { return m_color_space; }
+    u64 id() const { return m_identity->id(); }
+    SharedIdentity const& identity() const { return m_identity; }
+
+    BitmapFormat format() const { return m_format; }
+    AlphaType alpha_type() const { return m_alpha_type; }
+
+    int width() const { return m_size.width(); }
+    int height() const { return m_size.height(); }
+    IntRect rect() const { return { {}, m_size }; }
+    IntSize size() const { return m_size; }
+
+    size_t pitch() const { return m_pitch; }
+    size_t size_in_bytes() const { return Bitmap::size_in_bytes(m_pitch, m_size.height()); }
+    ReadonlyBytes pixels() const { return { m_pixels, size_in_bytes() }; }
+
+    // Invalid for a frame whose pixels are in an IOSurface.
+    Core::AnonymousBuffer const& shared_memory() const { return m_shared_memory; }
+    size_t offset_of_pixels() const { return m_offset_of_pixels; }
+
+#ifdef AK_OS_MACOS
+    Core::IOSurfaceHandle const* iosurface() const { return m_iosurface ? &m_iosurface->handle : nullptr; }
+#endif
+
+    bool has_same_pixels_as(DecodedImageFrame const& other) const { return m_pixels == other.m_pixels; }
+    bool pixels_are_held_elsewhere() const
+    {
+#ifdef AK_OS_MACOS
+        if (m_iosurface)
+            return m_iosurface->ref_count() > 1;
+#endif
+        return m_shared_memory.has_other_holders();
+    }
+
+    NonnullRefPtr<Bitmap const> bitmap_sharing_pixels() const;
+
+private:
+#ifdef AK_OS_MACOS
+    // Copies of a frame share one of these, so that whether anything else holds the pixels is a matter of counting.
+    struct SharedIOSurface : public AtomicRefCounted<SharedIOSurface> {
+        explicit SharedIOSurface(Core::IOSurfaceHandle handle)
+            : handle(move(handle))
+        {
+        }
+
+        Core::IOSurfaceHandle handle;
+    };
+#endif
+
+    DecodedImageFrame(Core::AnonymousBuffer shared_memory, size_t offset_of_pixels, IntSize size, BitmapFormat format, AlphaType alpha_type, ColorSpace color_space)
+        : m_identity(adopt_ref(*new SharedIdentity(next_id())))
+        , m_shared_memory(move(shared_memory))
+        , m_offset_of_pixels(offset_of_pixels)
+        , m_pixels(m_shared_memory.data<u8>() + offset_of_pixels)
+        , m_pitch(Bitmap::minimum_pitch(size.width(), format))
+        , m_size(size)
+        , m_format(format)
+        , m_alpha_type(alpha_type)
         , m_color_space(move(color_space))
     {
     }
 
-    DecodedImageFrame(Bitmap const& bitmap, ColorSpace color_space = {})
-        : DecodedImageFrame(NonnullRefPtr<Bitmap const> { bitmap }, move(color_space))
+#ifdef AK_OS_MACOS
+    DecodedImageFrame(NonnullRefPtr<SharedIOSurface> iosurface, IntSize size, BitmapFormat format, AlphaType alpha_type, ColorSpace color_space)
+        : m_identity(adopt_ref(*new SharedIdentity(next_id())))
+        , m_iosurface(move(iosurface))
+        , m_pixels(static_cast<u8 const*>(m_iosurface->handle.data()))
+        , m_pitch(m_iosurface->handle.bytes_per_row())
+        , m_size(size)
+        , m_format(format)
+        , m_alpha_type(alpha_type)
+        , m_color_space(move(color_space))
     {
     }
-
-    // For the same pixels decoded again, which caches keyed by the id of a frame may still hold.
-    static DecodedImageFrame with_id(u64 id, NonnullRefPtr<Bitmap const> bitmap, ColorSpace color_space = {})
-    {
-        DecodedImageFrame frame { move(bitmap), move(color_space) };
-        frame.m_id = id;
-        return frame;
-    }
-
-    DecodedImageFrame(Bitmap const& bitmap, AlphaType alpha_type, ColorSpace color_space = {})
-        : DecodedImageFrame(bitmap_with_alpha_type(bitmap, alpha_type), move(color_space))
-    {
-    }
-
-    Bitmap const& bitmap() const { return *m_bitmap; }
-    NonnullRefPtr<Bitmap const> bitmap_ref() const { return m_bitmap; }
-    ColorSpace const& color_space() const { return m_color_space; }
-    u64 id() const { return m_id; }
-
-    int width() const { return m_bitmap->width(); }
-    int height() const { return m_bitmap->height(); }
-    IntRect rect() const { return m_bitmap->rect(); }
-    IntSize size() const { return m_bitmap->size(); }
-
-private:
-    static NonnullRefPtr<Bitmap const> bitmap_with_alpha_type(Bitmap const& bitmap, AlphaType alpha_type)
-    {
-        if (bitmap.alpha_type() == alpha_type)
-            return NonnullRefPtr<Bitmap const> { bitmap };
-        auto new_bitmap = MUST(bitmap.clone());
-        new_bitmap->set_alpha_type_destructive(alpha_type);
-        return new_bitmap;
-    }
+#endif
 
     static u64 next_id()
     {
@@ -74,8 +155,17 @@ private:
         return s_next_id.fetch_add(1, AK::MemoryOrder::memory_order_relaxed);
     }
 
-    u64 m_id { 0 };
-    NonnullRefPtr<Bitmap const> m_bitmap;
+    NonnullRefPtr<SharedIdentity> m_identity;
+    Core::AnonymousBuffer m_shared_memory;
+    size_t m_offset_of_pixels { 0 };
+#ifdef AK_OS_MACOS
+    RefPtr<SharedIOSurface> m_iosurface;
+#endif
+    u8 const* m_pixels { nullptr };
+    size_t m_pitch { 0 };
+    IntSize m_size;
+    BitmapFormat m_format { BitmapFormat::Invalid };
+    AlphaType m_alpha_type { AlphaType::Premultiplied };
     ColorSpace m_color_space;
 };
 

@@ -1,5 +1,6 @@
 <!doctype html>
 <script src="../include.js"></script>
+<script src="../work-test.js"></script>
 <style>
     .flex { display: flex; }
     .grid { display: grid; }
@@ -590,17 +591,17 @@
             ],
         },
         {
-            name: "rebuild beside display-contents inline run",
+            name: "insert beside display-contents inline run",
             markup: '<div class="parent"><div class="tracked"></div><span class="contents"><span>inline</span></span><div class="after"></div></div>',
             steps: [
-                { name: "insert whitespace", mutate: parent => parent.querySelector(".after").before(" "), preserve: false },
+                { name: "insert whitespace", mutate: parent => parent.querySelector(".after").before(" ") },
             ],
         },
         {
             name: "table parent",
             markup: '<table class="parent"><tbody class="tracked"><tr><td>cell</td></tr></tbody></table>',
             steps: [
-                { name: "append whitespace", mutate: parent => parent.append(" "), preserve: false },
+                { name: "append whitespace", mutate: parent => parent.append(" ") },
             ],
         },
         {
@@ -632,20 +633,20 @@
             ],
         },
         {
-            name: "rebuild under first-letter",
+            name: "insert under first-letter",
             markup: '<div class="parent first-letter"><div class="tracked"></div><span>inline</span></div>',
             steps: [
-                { name: "append whitespace", mutate: parent => parent.append(" "), preserve: false },
+                { name: "append whitespace", mutate: parent => parent.append(" ") },
                 // White space after white space renders nothing, so it gets no box and the parent keeps its own.
                 { name: "append multiple whitespace nodes", mutate: parent => parent.append("\n", "\t", " ") },
             ],
         },
         {
-            name: "rebuild under ancestor first-letter",
+            name: "insert under ancestor first-letter",
             markup: '<div class="first-letter"><div class="parent"><div class="tracked"></div><span>inline</span></div></div>',
             parentSelector: ".parent",
             steps: [
-                { name: "append whitespace", mutate: parent => parent.append(" "), preserve: false },
+                { name: "append whitespace", mutate: parent => parent.append(" ") },
             ],
         },
         {
@@ -664,30 +665,34 @@
         },
     ];
 
+    function describeLayoutTreeBuilds(work) {
+        if (!work.builds()) return "no layout tree build";
+        const builds = work.builds() > 1 ? ` in ${work.builds()} builds` : "";
+        if (work.rebuiltWholeTree()) return `rebuilt the whole tree${builds}`;
+        return `rebuilt [${work.rebuiltRoots().join(", ")}]${work.escaped() ? ", escaped" : ""}${builds}`;
+    }
+
     test(() => {
+        const output = [];
         for (const case_ of cases) {
             fixture.innerHTML = case_.markup;
             const parent = case_.parentSelector ? fixture.querySelector(case_.parentSelector) : fixture.firstElementChild;
             const tracked = parent.querySelector(".tracked");
-            document.body.offsetWidth;
+            parent.id = "tracked-parent";
+            tracked.id = "tracked-child";
 
             for (const step of case_.steps) {
-                const parentIdentity = internals.layoutNodeIdentity(parent);
-                const trackedIdentity = internals.layoutNodeIdentity(tracked);
-                const buildsBefore = internals.layoutTreeBuildStats().builds;
+                const work = layoutTreeBuildWork(() => step.mutate(parent), { tracked: [parent, tracked] });
+                const [parentTransition, trackedTransition] = work.transitions();
 
-                step.mutate(parent);
-                document.body.offsetWidth;
-
-                const preserved = internals.layoutNodeIdentity(parent) === parentIdentity
-                    && internals.layoutNodeIdentity(tracked) === trackedIdentity;
+                const preserved = parentTransition === "PRESERVED" && trackedTransition === "PRESERVED";
                 const expectedPreserved = step.preserve !== false;
                 const name = `${case_.name} | ${step.name}`;
-                println(`${preserved === expectedPreserved ? "PASS" : "FAIL"}: ${name} | ${expectedPreserved ? "preserve" : "rebuild"}`);
-                const builds = internals.layoutTreeBuildStats().builds - buildsBefore;
-                println(`${builds === 1 ? "PASS" : "FAIL"}: ${name} | layout tree builds=${builds}`);
-                println(`${internals.compareLayoutTreeWithFullRebuild().matches ? "PASS" : "FAIL"}: ${name} | incremental tree matches full rebuild`);
+                output.push(`${preserved === expectedPreserved ? "PASS" : "FAIL"}: ${name} | ${expectedPreserved ? "preserve" : "rebuild"}: parent ${parentTransition}, tracked ${trackedTransition}`);
+                output.push(`${work.builds() === 1 ? "PASS" : "FAIL"}: ${name} | ${describeLayoutTreeBuilds(work)}`);
+                output.push(`${internals.compareLayoutTreeWithFullRebuild().matches ? "PASS" : "FAIL"}: ${name} | incremental tree matches full rebuild`);
             }
         }
+        output.forEach(line => println(line));
     });
 </script>

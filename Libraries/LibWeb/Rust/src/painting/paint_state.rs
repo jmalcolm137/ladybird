@@ -32,8 +32,13 @@ pub struct PaintState {
     pub(crate) trace_recordings: bool,
     pub(crate) visual_context: crate::painting::visual_context::VisualContextState,
     pub(crate) root_background_source: Option<crate::painting::host::RootBackgroundSource>,
-    pub(crate) hit_test_list_generation: u64,
     pub(crate) last_recording: Option<Arc<crate::painting::record::RecordingOutput>>,
+    /// The window of the document that the recording published last holds, with the visual context tree the recording
+    /// was made against, or none where that holds all of it.
+    pub(crate) window_of_published_recording: Option<(
+        Arc<crate::painting::record::window::RecordedWindow>,
+        Arc<crate::painting::visual_context::VisualContextTree>,
+    )>,
     /// The selection, shared with the frames published while it holds.
     pub(crate) selection: Option<Arc<SelectionRange>>,
     /// The `::selection` styles, shared with the frames published while they hold, so a write
@@ -87,6 +92,7 @@ impl PaintState {
     pub(crate) fn reset_visual_context_state(&mut self) {
         self.visual_context = crate::painting::visual_context::VisualContextState {
             needs_to_refresh_scroll_state: true,
+            trace: self.visual_context.trace.take(),
             ..Default::default()
         };
         self.visual_context
@@ -96,7 +102,7 @@ impl PaintState {
 }
 
 impl crate::layout::LayoutNodeArena {
-    /// Makes `source` the root background source, and pushes the damage of the boxes the move changes which paints
+    /// Makes `source` the root background source, and stamps the boxes the move changes which paints
     /// the root's background. Answers whether the source moved.
     pub(crate) fn update_root_background_source(
         &mut self,
@@ -108,26 +114,25 @@ impl crate::layout::LayoutNodeArena {
         if previous == source {
             return false;
         }
-        use crate::painting::record::damage::PaintDamage;
-        // Propagation changes which box paints the body's background. Push both the old
+        use crate::painting::record::change_ticks::RowPaintChange;
+        // Propagation changes which box paints the body's background. Stamp both the old
         // and new owners, including inline pieces painted by their containing block.
         for source in [previous, source] {
             for slot in [source.root_layout_node, source.body_layout_node] {
-                self.push_paint_damage_for_repaint(slot, PaintDamage::DRAW_BACKGROUND);
+                self.note_paint_change_for_repaint(slot, RowPaintChange::DRAWING);
             }
             // The viewport's scrollbars take their colors from the propagated background.
             if let Some(viewport) = self.node_parent_if_live(source.root_layout_node) {
-                self.push_paint_damage(viewport, PaintDamage::DRAW_OVERLAY | PaintDamage::SCROLL_METADATA);
+                self.note_paint_change(viewport, RowPaintChange::DRAWING | RowPaintChange::SCROLL_METADATA);
             }
         }
         true
     }
 
-    /// Lends the visual context state out of the paint state to `update`, which reads the rest of the arena beside it:
-    /// refreshing the scroll state and the sticky constraints reads the rows while it writes the state.
+    /// Lends the visual context state to `update`, which can read the rows and stamp paint changes beside it.
     pub(crate) fn with_visual_context_state_lent<T>(
         &mut self,
-        update: impl FnOnce(&Self, &mut crate::painting::visual_context::VisualContextState) -> T,
+        update: impl FnOnce(&mut Self, &mut crate::painting::visual_context::VisualContextState) -> T,
     ) -> T {
         let mut state = std::mem::take(&mut self.paint_state_mut().visual_context);
         let answer = update(self, &mut state);

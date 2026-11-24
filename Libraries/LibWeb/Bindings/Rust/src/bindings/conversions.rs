@@ -9,6 +9,7 @@
 
 use core::mem::MaybeUninit;
 use core::ops::Range;
+use core::ptr::NonNull;
 use std::borrow::Cow;
 
 use ak::{Utf16String, Utf16StringUnits, convert_valid_utf16_to_utf8, utf8_length_from_valid_utf16};
@@ -24,7 +25,10 @@ use libjs_rust::api::{
 use crate::ak_format::ak_formatted;
 use crate::bindings::interface::{Interface, Ref, create_dictionary_object, wrap};
 use crate::bindings::promise::WebIdlPromise;
-use crate::bindings::services::web_bindings_object_implements_interface;
+use crate::bindings::services::{
+    web_bindings_object_implements_interface, web_bindings_object_is_window_proxy,
+    web_bindings_window_proxy_object_in_realm,
+};
 use crate::bindings::{CallContext, WebIdlResult};
 
 /// A USVString, a string without lone surrogates. Its UTF-16 code units are always well-formed.
@@ -141,6 +145,25 @@ impl From<UsvString> for Utf16String {
     }
 }
 
+/// https://webidl.spec.whatwg.org/#idl-ByteString
+#[derive(Clone, Eq, PartialEq, Trace)]
+#[gc(crate = libjs_rust)]
+pub(crate) struct ByteString(Vec<u8>);
+
+impl ByteString {
+    pub(crate) fn from_bytes(bytes: Vec<u8>) -> Self {
+        Self(bytes)
+    }
+
+    pub(crate) fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+
+    pub(crate) fn into_bytes(self) -> Vec<u8> {
+        self.0
+    }
+}
+
 /// A JS value converted to a DOMString, https://webidl.spec.whatwg.org/#es-DOMString
 pub(crate) fn to_dom_string(vm: &Vm, value: Value) -> ThrowCompletionOr<Utf16String> {
     value.to_utf16_string(vm)
@@ -163,6 +186,31 @@ pub(crate) fn to_usv_string(vm: &Vm, value: Value) -> ThrowCompletionOr<UsvStrin
 
     // 2. Return an IDL USVString value that is the result of converting string to a sequence of scalar values.
     Ok(UsvString(to_well_formed(&string)))
+}
+
+/// https://webidl.spec.whatwg.org/#es-ByteString
+pub(crate) fn to_byte_string(vm: &Vm, value: Value) -> ThrowCompletionOr<ByteString> {
+    // 1. Let x be ? ToString(V).
+    let x = value.to_utf16_string(vm)?;
+
+    let code_units = match x.as_units() {
+        Utf16StringUnits::Ascii(bytes) | Utf16StringUnits::Latin1(bytes) => return Ok(ByteString(bytes.to_vec())),
+        Utf16StringUnits::Utf16(code_units) => code_units,
+    };
+
+    // 2. If the value of any element of x is greater than 255, then throw a TypeError.
+    if let Some((index, code_unit)) = code_units.iter().enumerate().find(|(_, code_unit)| **code_unit > 0xFF) {
+        let message = format!(
+            "Invalid byte 0x{code_unit:X} at index {index}, must be an integer no less than 0 and no greater than 0xFF"
+        );
+        return vm.throw_completion_with_utf16_message(ErrorKind::TypeError, Utf16String::from_utf8(&message));
+    }
+
+    // 3. Return an IDL ByteString value whose length is the length of x, and where the value of each element is the
+    //    value of the corresponding element of x.
+    Ok(ByteString(
+        code_units.iter().map(|code_unit| *code_unit as u8).collect(),
+    ))
 }
 
 /// The value of an enumeration that a JS value names, https://webidl.spec.whatwg.org/#js-enumeration: the index of
@@ -229,15 +277,21 @@ pub(crate) fn to_boolean(value: Value) -> ThrowCompletionOr<bool> {
 
 /// A JS value converted to a long, https://webidl.spec.whatwg.org/#js-long
 pub(crate) fn to_long(vm: &Vm, value: Value) -> ThrowCompletionOr<i32> {
-    // 1. Let x be ? ConvertToInt(V, 32, "signed"), which is ToInt32 without the extended attributes that change it.
+    // 1. Let x be ? ConvertToInt(V, 32, "signed").
     // 2. Return the IDL long value that represents the same numeric value as x.
     value.to_i32(vm)
 }
 
+/// A JS value converted to an unsigned short, https://webidl.spec.whatwg.org/#js-unsigned-short
+pub(crate) fn to_unsigned_short(vm: &Vm, value: Value) -> ThrowCompletionOr<u16> {
+    // 1. Let x be ? ConvertToInt(V, 16, "unsigned").
+    // 2. Return the IDL unsigned short value that represents the same numeric value as x.
+    value.to_u16(vm)
+}
+
 /// A JS value converted to an unsigned long, https://webidl.spec.whatwg.org/#js-unsigned-long
 pub(crate) fn to_unsigned_long(vm: &Vm, value: Value) -> ThrowCompletionOr<u32> {
-    // 1. Let x be ? ConvertToInt(V, 32, "unsigned"), which is ToUint32 without the extended attributes that change
-    //    it.
+    // 1. Let x be ? ConvertToInt(V, 32, "unsigned").
     // 2. Return the IDL unsigned long value that represents the same numeric value as x.
     value.to_u32(vm)
 }
@@ -364,6 +418,16 @@ fn to_integer_clamping(vm: &Vm, value: Value, lower_bound: f64, upper_bound: f64
 )]
 pub(crate) fn to_long_long_clamping(vm: &Vm, value: Value) -> ThrowCompletionOr<i64> {
     Ok(to_integer_clamping(vm, value, -MAX_SAFE_INTEGER, MAX_SAFE_INTEGER)? as i64)
+}
+
+/// A JS value converted to an unsigned long with [Clamp], https://webidl.spec.whatwg.org/#js-unsigned-long
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "the value is an integer within the bounds of the type"
+)]
+pub(crate) fn to_unsigned_long_clamping(vm: &Vm, value: Value) -> ThrowCompletionOr<u32> {
+    Ok(to_integer_clamping(vm, value, 0.0, f64::from(u32::MAX))? as u32)
 }
 
 /// The number that https://webidl.spec.whatwg.org/#abstract-opdef-converttoint has after step 10 for a bit length of
@@ -515,6 +579,13 @@ pub(crate) struct BufferSourceRules {
     pub(crate) allow_resizable: bool,
 }
 
+/// The buffer source types included in a union and their conversion rules.
+pub(crate) struct BufferSourceTypes<'a> {
+    pub(crate) array_buffer_type: Option<&'a BufferSourceRules>,
+    pub(crate) shared_array_buffer_type: Option<&'a BufferSourceRules>,
+    pub(crate) array_buffer_view_type: Option<&'a BufferSourceRules>,
+}
+
 // https://webidl.spec.whatwg.org/#js-ArrayBuffer
 pub(crate) fn to_array_buffer(vm: &Vm, value: Value, rules: &BufferSourceRules) -> ThrowCompletionOr<Gc<ArrayBuffer>> {
     // 1. If V is not an Object, or V does not have an [[ArrayBufferData]] internal slot, then throw a TypeError.
@@ -538,6 +609,41 @@ pub(crate) fn to_array_buffer(vm: &Vm, value: Value, rules: &BufferSourceRules) 
         );
     }
     // 4. Return the IDL ArrayBuffer value that is a reference to the same object as V.
+    Ok(buffer)
+}
+
+// https://webidl.spec.whatwg.org/#js-buffer-source-types
+pub(crate) fn to_shared_array_buffer(
+    vm: &Vm,
+    value: Value,
+    rules: &BufferSourceRules,
+) -> ThrowCompletionOr<Gc<ArrayBuffer>> {
+    // 1. If V is not an Object, or V does not have an [[ArrayBufferData]] internal slot, then throw a TypeError.
+    let buffer = value
+        .is_object()
+        .then(|| value.as_object().downcast::<ArrayBuffer>())
+        .flatten();
+    let Some(buffer) = buffer else {
+        return vm.throw_completion(
+            ErrorKind::TypeError,
+            ErrorType::NotAnObjectOfType,
+            &[&"SharedArrayBuffer"],
+        );
+    };
+    // 2. If IsSharedArrayBuffer(V) is false, then throw a TypeError.
+    if !buffer.is_shared_array_buffer() {
+        return vm.throw_completion(ErrorKind::TypeError, ErrorType::NotASharedArrayBuffer, &[]);
+    }
+    // 3. If the conversion is not to an IDL type associated with the [AllowResizable] extended attribute, and
+    //    IsFixedLengthArrayBuffer(V) is false, then throw a TypeError.
+    if !rules.allow_resizable && !buffer.is_fixed_length() {
+        return vm.throw_completion(
+            ErrorKind::TypeError,
+            ErrorType::NotAnObjectOfType,
+            &[&"fixed-length SharedArrayBuffer"],
+        );
+    }
+    // 4. Return the IDL SharedArrayBuffer value that is a reference to the same object as V.
     Ok(buffer)
 }
 
@@ -795,8 +901,13 @@ impl ArrayBufferView {
 /// A JS value converted to a BufferSource, with the steps of the conversion to a union type that apply to the buffer
 /// source types, https://webidl.spec.whatwg.org/#js-union
 pub(crate) fn to_buffer_source(vm: &Vm, value: Value, rules: &BufferSourceRules) -> ThrowCompletionOr<BufferSource> {
+    let types = BufferSourceTypes {
+        array_buffer_type: Some(rules),
+        shared_array_buffer_type: rules.allow_shared.then_some(rules),
+        array_buffer_view_type: Some(rules),
+    };
     if value.is_object()
-        && let Some(buffer_source) = buffer_source_if(vm, value.as_object(), rules)?
+        && let Some(buffer_source) = buffer_source_if(vm, value.as_object(), types)?
     {
         return Ok(buffer_source);
     }
@@ -810,12 +921,13 @@ pub(crate) fn to_buffer_source(vm: &Vm, value: Value, rules: &BufferSourceRules)
 pub(crate) fn buffer_source_if(
     vm: &Vm,
     object: Gc<Object>,
-    rules: &BufferSourceRules,
+    types: BufferSourceTypes<'_>,
 ) -> ThrowCompletionOr<Option<BufferSource>> {
     // 6. If V is an Object, V has an [[ArrayBufferData]] internal slot, and IsSharedArrayBuffer(V) is false, then:
     //     1. If types includes ArrayBuffer, then return the result of converting V to ArrayBuffer.
     if let Some(buffer) = object.downcast::<ArrayBuffer>()
         && !buffer.is_shared_array_buffer()
+        && let Some(rules) = types.array_buffer_type
     {
         check_buffer_of_buffer_source(vm, &buffer, "ArrayBuffer", rules)?;
         return Ok(Some(BufferSource::ArrayBuffer(buffer)));
@@ -823,17 +935,19 @@ pub(crate) fn buffer_source_if(
 
     // 7. If V is an Object, V, has an [[ArrayBufferData]] internal slot, and IsSharedArrayBuffer(V) is true, then:
     //     1. If types includes SharedArrayBuffer, then return the result of converting V to SharedArrayBuffer.
-    if rules.allow_shared
-        && let Some(buffer) = object.downcast::<ArrayBuffer>()
+    if let Some(buffer) = object.downcast::<ArrayBuffer>()
         && buffer.is_shared_array_buffer()
+        && let Some(rules) = types.shared_array_buffer_type
     {
-        check_buffer_of_buffer_source(vm, &buffer, "SharedArrayBuffer", rules)?;
+        let buffer = to_shared_array_buffer(vm, Value::from_object(object), rules)?;
         return Ok(Some(BufferSource::ArrayBuffer(buffer)));
     }
 
     // 8. If V is an Object and V has a [[DataView]] internal slot, then:
     //     1. If types includes DataView, then return the result of converting V to DataView.
-    if let Some(view) = object.downcast::<DataView>() {
+    if let Some(view) = object.downcast::<DataView>()
+        && let Some(rules) = types.array_buffer_view_type
+    {
         check_buffer_of_buffer_source(vm, &view.viewed_array_buffer(), "DataView", rules)?;
         return Ok(Some(BufferSource::DataView(view)));
     }
@@ -841,7 +955,9 @@ pub(crate) fn buffer_source_if(
     // 9. If V is an Object and V has a [[TypedArrayName]] internal slot, then:
     //     1. If types includes a typed array type whose name is the value of V's [[TypedArrayName]] internal slot,
     //        then return the result of converting V to that type.
-    if let Some(typed_array) = object.downcast::<TypedArrayBase>() {
+    if let Some(typed_array) = object.downcast::<TypedArrayBase>()
+        && let Some(rules) = types.array_buffer_view_type
+    {
         let type_name = format!("{:?}", typed_array.kind());
         check_buffer_of_buffer_source(vm, &typed_array.viewed_array_buffer(), &type_name, rules)?;
         return Ok(Some(BufferSource::TypedArray(typed_array)));
@@ -959,15 +1075,38 @@ pub(crate) fn sequence_from_iterable<T, S: SequenceStorage<T>>(
     Ok(sequence)
 }
 
-/// A JS value converted to an IDL record, https://webidl.spec.whatwg.org/#js-record, with the conversions of its keys
-/// and values. The entries are in a Vec in the order of the record, which hides cells from the collector, so their
-/// types hold none.
-pub(crate) fn record_from_js<K: PartialEq, V>(
+pub(crate) trait RecordStorage<K, V> {
+    /// https://infra.spec.whatwg.org/#map-set
+    fn set(&mut self, key: K, value: V);
+}
+
+impl<K: PartialEq, V> RecordStorage<K, V> for Vec<(K, V)> {
+    fn set(&mut self, key: K, value: V) {
+        match self.iter_mut().find(|(existing_key, _)| *existing_key == key) {
+            Some(entry) => entry.1 = value,
+            None => self.push((key, value)),
+        }
+    }
+}
+
+impl<K: PartialEq + Trace + Clone + 'static, V: Trace + Clone + 'static> RecordStorage<K, V> for MarkedVec<'_, (K, V)> {
+    fn set(&mut self, key: K, value: V) {
+        let index = self.values().iter().position(|(existing_key, _)| *existing_key == key);
+        match index {
+            Some(index) => MarkedVec::set(self, index, (key, value)),
+            None => self.push((key, value)),
+        }
+    }
+}
+
+/// https://webidl.spec.whatwg.org/#js-record
+pub(crate) fn record_from_js<K: PartialEq, V, R: RecordStorage<K, V>>(
     vm: &Vm,
     value: Value,
+    storage: R,
     mut key_from_js: impl FnMut(Value) -> ThrowCompletionOr<K>,
     mut value_from_js: impl FnMut(Value) -> ThrowCompletionOr<V>,
-) -> ThrowCompletionOr<Vec<(K, V)>> {
+) -> ThrowCompletionOr<R> {
     // 1. If O is not an Object, throw a TypeError.
     if !value.is_object() {
         return vm.throw_completion(ErrorKind::TypeError, ErrorType::NotAnObject, &[&value]);
@@ -975,7 +1114,7 @@ pub(crate) fn record_from_js<K: PartialEq, V>(
     let object = value.as_object();
 
     // 2. Let result be a new empty instance of record<K, V>.
-    let mut result: Vec<(K, V)> = Vec::new();
+    let mut result = storage;
 
     // 3. Let keys be ? O.[[OwnPropertyKeys]]().
     let keys = object.internal_own_property_keys(vm)?;
@@ -1003,10 +1142,7 @@ pub(crate) fn record_from_js<K: PartialEq, V>(
         let typed_value = value_from_js(value)?;
 
         // 4. Set result[typedKey] to typedValue.
-        match result.iter_mut().find(|(existing_key, _)| *existing_key == typed_key) {
-            Some(entry) => entry.1 = typed_value,
-            None => result.push((typed_key, typed_value)),
-        }
+        result.set(typed_key, typed_value);
     }
 
     // 5. Return result.
@@ -1171,6 +1307,21 @@ impl ToJs for UsvString {
     }
 }
 
+/// https://webidl.spec.whatwg.org/#js-ByteString
+impl ToJs for ByteString {
+    fn to_js(self, cx: &CallContext) -> ThrowCompletionOr<Value> {
+        // The result of converting an IDL ByteString value to a JavaScript value is a String value whose length is the
+        // length of the ByteString, and the value of each element of which is the value of the corresponding element
+        // of the ByteString.
+        let string = if self.0.is_ascii() {
+            Utf16String::from_ascii(&self.0)
+        } else {
+            Utf16String::from_utf16(&self.0.iter().map(|byte| u16::from(*byte)).collect::<Vec<_>>())
+        };
+        string.to_js(cx)
+    }
+}
+
 impl ToJs for Gc<TypedArrayBase> {
     fn to_js(self, _: &CallContext) -> ThrowCompletionOr<Value> {
         Ok(Value::from_object(self))
@@ -1269,6 +1420,36 @@ pub(crate) fn to_cpp_interface_in_union(
         return Ok(CppInterface(value.as_object()));
     }
     throw_no_union_types_matched(vm)
+}
+
+/// The WindowProxy whose exotic object this is, if any.
+pub(crate) fn window_proxy_from_object(object: Gc<Object>) -> Option<CppInterface> {
+    // SAFETY: The object is live.
+    unsafe { web_bindings_object_is_window_proxy(object.as_ptr().cast()) }.then_some(CppInterface(object))
+}
+
+/// A WindowProxy converted from a JS value, https://webidl.spec.whatwg.org/#js-interface
+pub(crate) fn to_window_proxy(vm: &Vm, value: Value) -> ThrowCompletionOr<CppInterface> {
+    // 1. If V implements I, then return the IDL interface type value that represents a reference to that platform
+    //    object.
+    if value.is_object()
+        && let Some(window_proxy) = window_proxy_from_object(value.as_object())
+    {
+        return Ok(window_proxy);
+    }
+    // 2. Throw a TypeError.
+    vm.throw_completion(ErrorKind::TypeError, ErrorType::NotAnObjectOfType, &[&"WindowProxy"])
+}
+
+/// A WindowProxy converted to a JS value, as the object that scripts of the realm see for it.
+pub(crate) fn window_proxy_to_js(cx: &CallContext, window_proxy: CppInterface) -> Value {
+    // SAFETY: The object and the realm are live.
+    let object = unsafe {
+        web_bindings_window_proxy_object_in_realm(window_proxy.0.as_ptr().cast(), cx.realm().as_ptr().cast())
+    };
+    let object = NonNull::new(object.cast::<Object>()).expect("a WindowProxy has an object");
+    // SAFETY: LibWeb returns a live object.
+    Value::from_object(unsafe { Gc::from_non_null(object) })
 }
 
 /// https://webidl.spec.whatwg.org/#js-interface

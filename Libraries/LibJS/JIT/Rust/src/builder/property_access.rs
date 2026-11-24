@@ -45,10 +45,12 @@ use crate::ir::Comparison;
 use crate::ir::NodeId;
 use crate::ir::Op;
 use crate::ir::ShapeCheck;
+use crate::ir::value;
 use crate::snapshot::CellId;
 use crate::snapshot::Intrinsic;
 use crate::snapshot::NativeCallTarget;
 use crate::snapshot::keyed_feedback_bits;
+use ak::ZoneVec;
 
 /// A check that a key is the one a keyed access speculates on: `key` must
 /// be `expected`, the encoded key cell `cell`.
@@ -60,9 +62,9 @@ pub(super) struct KeyCheck {
 }
 
 /// Cache entries of a keyed access for one key, and the check of the key.
-type KeyedEntries = (Vec<CacheEntry>, Option<KeyCheck>);
+type KeyedEntries<'a> = (&'a [CacheEntry], Option<KeyCheck>);
 
-impl GraphBuilder<'_> {
+impl<'a, 'z> GraphBuilder<'a, 'z> {
     /// The speculation gate: whether the current instruction may speculate
     /// in a way that exits with `kind`. A speculation that already failed at
     /// the same place is never made again.
@@ -70,9 +72,9 @@ impl GraphBuilder<'_> {
         let executable = self.function.executable;
         if executable.builtin {
             let site = (executable.cell, self.function.pc, kind);
-            return !self.snapshot.executables[0].builtin_exit_sites.contains(&site);
+            return !self.snapshot[self.snapshot.executables[0].builtin_exit_sites].contains(&site);
         }
-        !executable.exit_sites.contains(&(self.function.pc, kind))
+        !self.snapshot[executable.exit_sites].contains(&(self.function.pc, kind))
     }
 
     pub(super) fn embed(&mut self, cell: CellId) {
@@ -84,7 +86,7 @@ impl GraphBuilder<'_> {
     /// Emits a node that may exit with the current instruction's eager frame
     /// state. The value of a check is the input it refines (see
     /// `Op::refined_input()`).
-    pub(super) fn emit_checked(&mut self, op: Op, inputs: Vec<NodeId>, repr: Option<Repr>) -> NodeId {
+    pub(super) fn emit_checked(&mut self, op: Op<'z>, inputs: &[NodeId], repr: Option<Repr>) -> NodeId {
         let repr = repr.or_else(|| self.graph.node(inputs[op.refined_input()?]).repr);
         let frame_state = self.eager_frame_state();
         let node = self.emit(op, inputs, repr);
@@ -101,7 +103,7 @@ impl GraphBuilder<'_> {
         ) {
             return value;
         }
-        self.emit_checked(Op::CheckObject, vec![value], None)
+        self.emit_checked(Op::CheckObject, &[value], None)
     }
 
     /// `object`, refined: known to have one of `shapes`, or the code exits.
@@ -112,9 +114,9 @@ impl GraphBuilder<'_> {
         let address = self.cell_address(object);
         self.emit_checked(
             Op::CheckShape {
-                shapes: shapes.to_vec(),
+                shapes: self.graph.zone.alloc_slice_copy(shapes),
             },
-            vec![object, address],
+            &[object, address],
             None,
         )
     }
@@ -128,7 +130,7 @@ impl GraphBuilder<'_> {
             self.assume(Dependency::WatchpointSetValid(validity));
             return;
         }
-        self.emit_checked(Op::CheckPrototypeChainValid { validity }, Vec::new(), None);
+        self.emit_checked(Op::CheckPrototypeChainValid { validity }, &[], None);
     }
 
     /// Makes the code depend on no `[[IsHTMLDDA]]` object existing, if none
@@ -146,7 +148,7 @@ impl GraphBuilder<'_> {
     /// the current instruction on.
     pub(super) fn assume(&mut self, dependency: Dependency) {
         self.graph.depend_on(dependency);
-        self.emit_checked(Op::AssumeValid, Vec::new(), None);
+        self.emit_checked(Op::AssumeValid, &[], None);
     }
 
     pub(super) fn load_named(&mut self, object: NodeId, offset: u32) -> NodeId {
@@ -159,9 +161,9 @@ impl GraphBuilder<'_> {
         let address = self.cell_address(object);
         let op = Op::LoadNamed { offset, holds_data };
         if holds_data {
-            return self.emit(op, vec![object, address], Some(Repr::Tagged));
+            return self.emit(op, &[object, address], Some(Repr::Tagged));
         }
-        self.emit_checked(op, vec![object, address], Some(Repr::Tagged))
+        self.emit_checked(op, &[object, address], Some(Repr::Tagged))
     }
 
     pub(super) fn store_named(&mut self, object: NodeId, offset: u32, value: NodeId) {
@@ -174,15 +176,22 @@ impl GraphBuilder<'_> {
         let address = self.cell_address(object);
         let op = Op::StoreNamed { offset, holds_data };
         if holds_data {
-            self.emit(op, vec![object, value, address], None);
+            self.emit(op, &[object, value, address], None);
             return;
         }
-        self.emit_checked(op, vec![object, value, address], None);
+        self.emit_checked(op, &[object, value, address], None);
     }
 
     /// Loads the property a `Get` entry describes, from the object itself or
     /// from the prototype holding it.
     pub(super) fn load_entry(&mut self, object: NodeId, entry: &CacheEntry) -> NodeId {
+        if let Action::GetMissing { prototype_chain } = entry.action {
+            self.emit_checked(Op::CheckPropertyAbsenceCacheable, &[object], None);
+            if let Some((validity, valid)) = prototype_chain {
+                self.check_prototype_chain(validity, valid);
+            }
+            return self.constant(value::UNDEFINED);
+        }
         let Action::Get { holder, offset } = entry.action else {
             unreachable!("only gets load");
         };
@@ -236,7 +245,7 @@ impl GraphBuilder<'_> {
                 expected,
                 kind: ExitKind::UnexpectedValue,
             },
-            vec![loaded],
+            &[loaded],
             None,
         );
         constant
@@ -296,7 +305,7 @@ impl GraphBuilder<'_> {
         if !same_cached_getter || !gates.into_iter().all(|kind| self.may_speculate(kind)) {
             return Ok(false);
         }
-        let (object, getter) = self.check_accessor_call(base, &entries, AccessorPart::Getter)?;
+        let (object, getter) = self.check_accessor_call(base, entries, AccessorPart::Getter)?;
         debug_assert!(getter.is_none(), "all entries have the same checked getter");
         let value = self.load_named(object, offset);
         self.write(dst, value)?;
@@ -319,11 +328,11 @@ impl GraphBuilder<'_> {
             return Ok(false);
         }
         let object = self.read(base)?;
-        let array = self.emit_checked(Op::CheckArray, vec![object], Some(Repr::Tagged));
+        let array = self.emit_checked(Op::CheckArray, &[object], Some(Repr::Tagged));
         let address = self.cell_address(array);
-        let length = self.emit(Op::LoadElementsLength, vec![address], Some(Repr::Int32));
-        let length = self.emit_checked(Op::CheckNonNegativeInt32, vec![length], Some(Repr::Int32));
-        let boxed = self.emit(Op::BoxInt32, vec![length], Some(Repr::Tagged));
+        let length = self.emit(Op::LoadElementsLength, &[address], Some(Repr::Int32));
+        let length = self.emit_checked(Op::CheckNonNegativeInt32, &[length], Some(Repr::Int32));
+        let boxed = self.emit(Op::BoxInt32, &[length], Some(Repr::Tagged));
         self.write(dst, boxed)?;
         Ok(true)
     }
@@ -372,19 +381,19 @@ impl GraphBuilder<'_> {
         // NB: Exiting instead of running the slow path keeps loops bounded by the length free of code that may
         //     change what they read.
         self.exit_instead_of_slow_path(&mut slow_paths);
-        let (object, checked_getter) = self.check_accessor_call(base, &entries, AccessorPart::Getter)?;
+        let (object, checked_getter) = self.check_accessor_call(base, entries, AccessorPart::Getter)?;
         debug_assert!(checked_getter.is_none(), "all entries have the same checked getter");
-        let typed_array = self.emit_checked(Op::CheckTypedArray, vec![object], Some(Repr::Tagged));
+        let typed_array = self.emit_checked(Op::CheckTypedArray, &[object], Some(Repr::Tagged));
         let address = self.cell_address(typed_array);
-        let length = self.emit(Op::LoadTypedArrayLength, vec![address], Some(Repr::Int32));
+        let length = self.emit(Op::LoadTypedArrayLength, &[address], Some(Repr::Int32));
         let zero = self.int32_constant(0);
         let length = self.branch_to_slow_path(
             &mut slow_paths,
             BranchCondition::Int32(Comparison::GreaterThan),
-            vec![length, zero],
+            &[length, zero],
             true,
         );
-        let length = self.emit(Op::BoxInt32, vec![length], Some(Repr::Tagged));
+        let length = self.emit(Op::BoxInt32, &[length], Some(Repr::Tagged));
         let result = self.join_slow_paths(slow_paths, Some(length));
         self.write(dst, result.expect("GetLength has a value"))?;
         Ok(true)
@@ -394,7 +403,7 @@ impl GraphBuilder<'_> {
     /// `part` of the same accessor property with functions of the same
     /// executable (see `try_inline_getter()`), with the index of that
     /// executable in the snapshot.
-    fn accessor_call_entries(&self, cache: u32, part: AccessorPart) -> Option<(Vec<CacheEntry>, u32)> {
+    fn accessor_call_entries(&self, cache: u32, part: AccessorPart) -> Option<(&'a [CacheEntry], u32)> {
         let entries = self.cache_entries(cache)?;
         let first = entries[0];
         let executable_of = |entry: &CacheEntry| {
@@ -417,7 +426,7 @@ impl GraphBuilder<'_> {
     /// `part` of the same accessor property (at one offset of the receiver,
     /// or of one prototype) with the same raw native function, with the
     /// target through which JIT code calls it (see `try_build_native_getter()`).
-    fn native_accessor_entries(&self, cache: u32, part: AccessorPart) -> Option<(Vec<CacheEntry>, NativeCallTarget)> {
+    fn native_accessor_entries(&self, cache: u32, part: AccessorPart) -> Option<(&'a [CacheEntry], NativeCallTarget)> {
         // NB: Calls in inlined callees need their inlined frames, which these calls do not build.
         if self.function.is_virtual() {
             return None;
@@ -456,7 +465,7 @@ impl GraphBuilder<'_> {
         &mut self,
         part: AccessorPart,
         target: NativeCallTarget,
-        inputs: Vec<NodeId>,
+        inputs: &[NodeId],
         dst: u32,
     ) -> NodeId {
         let argument_count = inputs.len() as u64 - 1;
@@ -464,6 +473,8 @@ impl GraphBuilder<'_> {
         self.reserve_call_frame(slots_offset + 8 * argument_count);
         self.embed(target.function);
         self.embed(target.realm);
+        // NB: A call of a function of another realm makes this code's realm current again when it returns.
+        self.embed(self.runtime.realm);
         let op = Op::CallNativeAccessor {
             pc: self.function.pc,
             part,
@@ -489,9 +500,9 @@ impl GraphBuilder<'_> {
         let Some((entries, target)) = self.native_accessor_entries(cache, AccessorPart::Getter) else {
             return Ok(false);
         };
-        let (object, getter) = self.check_accessor_call(base, &entries, AccessorPart::Getter)?;
+        let (object, getter) = self.check_accessor_call(base, entries, AccessorPart::Getter)?;
         debug_assert!(getter.is_none(), "all entries have the same checked getter");
-        let value = self.emit_native_accessor_call(AccessorPart::Getter, target, vec![object], dst.raw());
+        let value = self.emit_native_accessor_call(AccessorPart::Getter, target, &[object], dst.raw());
         self.write(dst, value)?;
         Ok(true)
     }
@@ -509,9 +520,9 @@ impl GraphBuilder<'_> {
             return Ok(false);
         };
         let value = self.read(src)?;
-        let (object, setter) = self.check_accessor_call(base, &entries, AccessorPart::Setter)?;
+        let (object, setter) = self.check_accessor_call(base, entries, AccessorPart::Setter)?;
         debug_assert!(setter.is_none(), "all entries have the same checked setter");
-        self.emit_native_accessor_call(AccessorPart::Setter, target, vec![object, value], Operand::INVALID);
+        self.emit_native_accessor_call(AccessorPart::Setter, target, &[object, value], Operand::INVALID);
         Ok(true)
     }
 
@@ -538,14 +549,15 @@ impl GraphBuilder<'_> {
         let first = entries[0];
         let object = self.read(base)?;
         let object = self.check_object(object);
-        let shapes = entries.iter().map(|entry| self.shape_guard(entry)).collect::<Vec<_>>();
+        let work = self.work;
+        let shapes = ZoneVec::from_iter_in(entries.iter().map(|entry| self.shape_guard(entry)), work);
         let object = self.check_shapes(object, &shapes);
         let (Action::Get { holder, offset } | Action::Set { holder, offset }) = first.action else {
             unreachable!("accessor calls get or set");
         };
         let holder = match holder {
             Holder::Prototype { prototype, .. } => {
-                let mut checked_validities = Vec::new();
+                let mut checked_validities = ZoneVec::new_in(self.work);
                 for entry in entries {
                     let (Action::Get {
                         holder: Holder::Prototype { validity, valid, .. },
@@ -580,14 +592,14 @@ impl GraphBuilder<'_> {
             self.embed(function);
             self.emit_checked(
                 Op::CheckAccessorFunction { offset, part, function },
-                vec![holder, address],
+                &[holder, address],
                 None,
             );
             return Ok((object, None));
         }
         let function = self.emit_checked(
             Op::LoadAccessorFunction { offset, part },
-            vec![holder, address],
+            &[holder, address],
             Some(Repr::Tagged),
         );
         Ok((object, Some(function)))
@@ -608,7 +620,7 @@ impl GraphBuilder<'_> {
         let Some((entries, index)) = self.accessor_call_entries(cache, AccessorPart::Getter) else {
             return Ok(None);
         };
-        let (_, getter) = self.check_accessor_call(base, &entries, AccessorPart::Getter)?;
+        let (_, getter) = self.check_accessor_call(base, entries, AccessorPart::Getter)?;
         self.try_inline_getter_call(index, getter, base, dst)
     }
 
@@ -628,20 +640,22 @@ impl GraphBuilder<'_> {
         let Some(dst) = self.dead_register(&[base, src]) else {
             return Ok(None);
         };
-        let (_, setter) = self.check_accessor_call(base, &entries, AccessorPart::Setter)?;
+        let (_, setter) = self.check_accessor_call(base, entries, AccessorPart::Setter)?;
         self.try_inline_setter_call(index, setter, base, src, dst)
     }
 
     /// A register other than `operands` that is dead after the current
     /// instruction: nothing reads it before writing it again.
-    fn dead_register(&self, operands: &[Operand]) -> Option<Operand> {
+    fn dead_register(&mut self, operands: &[Operand]) -> Option<Operand> {
         let layout = self.function.layout;
-        let live = self.function.liveness.live_out(self.function.instruction_index);
-        (crate::bytecode::RESERVED_REGISTER_COUNT..layout.number_of_registers)
+        let live = self.live_out(self.function.instruction_index);
+        let register = (crate::bytecode::RESERVED_REGISTER_COUNT..layout.number_of_registers)
             .map(Operand::from_raw)
             .find(|register| {
                 !operands.contains(register) && layout.tracked_index(*register).is_some_and(|slot| !live.contains(slot))
-            })
+            });
+        self.release_slot_set(live);
+        register
     }
 
     /// Builds `dst = base[property]` for a string or symbol key from the
@@ -678,28 +692,34 @@ impl GraphBuilder<'_> {
     /// own if it is a constant, or those of the only key the cache saw, with
     /// the key check to make (see `check_key()`). Returns nothing for other
     /// keys.
-    fn keyed_cache_entries(&mut self, cache: u32, key: Operand) -> Result<Option<KeyedEntries>, CompileFailure> {
+    fn keyed_cache_entries(&mut self, cache: u32, key: Operand) -> Result<Option<KeyedEntries<'a>>, CompileFailure> {
         let Some(entries) = self.cache_entries(cache) else {
             return Ok(None);
         };
-        let Some(keys) = entries.iter().map(|entry| entry.key).collect::<Option<Vec<_>>>() else {
+        if entries.iter().any(|entry| entry.key.is_none()) {
             return Ok(None);
-        };
+        }
+        let key_of = |entry: &CacheEntry| entry.key.map(|(value, _)| value);
         let key = self.read(key)?;
         let key_value = match self.graph.constant_value(key) {
             Some(bits) => bits,
             None => {
-                let (first, _) = keys[0];
-                if !keys.iter().all(|(value, _)| *value == first) || !self.may_speculate(ExitKind::UnexpectedValue) {
+                let first = key_of(&entries[0]);
+                if !entries.iter().all(|entry| key_of(entry) == first) || !self.may_speculate(ExitKind::UnexpectedValue)
+                {
                     return Ok(None);
                 }
-                first
+                first.expect("every entry has a key")
             }
         };
-        let entries = entries
-            .into_iter()
-            .filter(|entry| entry.key.is_some_and(|(value, _)| value == key_value))
-            .collect::<Vec<_>>();
+        let entries = ZoneVec::from_iter_in(
+            entries
+                .iter()
+                .copied()
+                .filter(|entry| entry.key.is_some_and(|(value, _)| value == key_value)),
+            self.work,
+        )
+        .into_slice();
         let Some((_, cell)) = entries.first().and_then(|entry| entry.key) else {
             return Ok(None);
         };
@@ -722,7 +742,7 @@ impl GraphBuilder<'_> {
                 expected: check.expected,
                 kind: ExitKind::UnexpectedValue,
             },
-            vec![check.key],
+            &[check.key],
             None,
         );
     }
@@ -732,14 +752,14 @@ impl GraphBuilder<'_> {
         &mut self,
         dst: Operand,
         base: Operand,
-        entries: Vec<CacheEntry>,
+        entries: &[CacheEntry],
         key_check: Option<KeyCheck>,
     ) -> Result<bool, CompileFailure> {
         // NB: Loads of properties that hold accessors exit, so these are left to the instruction's handling, which
         //     calls their getters, unless the getter is inlined (see `try_inline_getter()`).
-        let speculatable = entries
-            .iter()
-            .all(|entry| matches!(entry.action, Action::Get { .. }) && entry.is_data_access());
+        let speculatable = entries.iter().all(|entry| {
+            matches!(entry.action, Action::Get { .. } | Action::GetMissing { .. }) && entry.is_data_access()
+        });
         if !speculatable || !self.may_speculate(ExitKind::NotObject) || !self.may_speculate(ExitKind::BadShape) {
             return Ok(false);
         }
@@ -748,7 +768,7 @@ impl GraphBuilder<'_> {
         let object = self.read(base)?;
         let object = self.check_object(object);
         let result = self
-            .translate_entries(object, &entries, |builder, entry, object| {
+            .translate_entries(object, entries, |builder, entry, object| {
                 Some(builder.load_entry(object, entry))
             })
             .expect("every case loads a value");
@@ -775,7 +795,7 @@ impl GraphBuilder<'_> {
         &mut self,
         base: Operand,
         src: Operand,
-        entries: Vec<CacheEntry>,
+        entries: &[CacheEntry],
         key_check: Option<KeyCheck>,
     ) -> Result<bool, CompileFailure> {
         let speculatable = entries
@@ -789,7 +809,7 @@ impl GraphBuilder<'_> {
         let object = self.read(base)?;
         let value = self.read(src)?;
         let object = self.check_object(object);
-        self.translate_entries(object, &entries, |builder, entry, object| {
+        self.translate_entries(object, entries, |builder, entry, object| {
             let Action::Set { offset, .. } = entry.action else {
                 unreachable!("only sets store");
             };

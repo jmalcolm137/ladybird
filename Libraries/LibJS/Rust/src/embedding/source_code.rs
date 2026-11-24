@@ -14,7 +14,9 @@
 use std::rc::Rc;
 
 use crate::bytecode::executable::Executable;
-use crate::embedding::abi_types::{JSOwnedUtf16String, JSSourceCode, owned_utf16_string_from_abi};
+use crate::embedding::abi_types::{
+    JSOwnedUtf16String, JSSourceCode, JSWeakSourceCode, owned_utf16_string_from_abi, owned_utf16_string_into_abi,
+};
 use crate::embedding::execution_context::JSExecutionContext;
 use crate::layout::execution_context::ExecutionContext;
 use crate::source_code::SourceCode;
@@ -114,17 +116,17 @@ pub unsafe extern "C" fn js_source_code_filename_address(
     core::ptr::from_ref(source_code.filename()).cast()
 }
 
-/// SourceCode::code() as C++ returns it, by reference: the address of the source code's AK::Utf16String, which stays
-/// where it is, unchanged, for as long as the source code lives. Only the VM's thread may call this.
+/// SourceCode::code(): the code as an AK::Utf16String whose one reference the caller owns. The runtime may hold the
+/// code compressed, so there is no string of it to return by reference. Only the VM's thread may call this.
 ///
 /// # Safety
 ///
 /// `source_code` must be live source code.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn js_source_code_code_address(source_code: *const JSSourceCode) -> *const JSOwnedUtf16String {
+pub unsafe extern "C" fn js_source_code_code(source_code: *const JSSourceCode) -> JSOwnedUtf16String {
     // SAFETY: The caller passes live source code.
     let source_code = unsafe { source_code_from_abi(source_code) };
-    core::ptr::from_ref(source_code.code()).cast()
+    owned_utf16_string_into_abi(source_code.code())
 }
 
 /// ExecutionContext::source_code(): the source code of the bytecode the context runs, or null if it runs none, as for a
@@ -148,4 +150,43 @@ pub unsafe extern "C" fn js_source_code_of_execution_context(
         .source_code
         .as_ref()
         .map_or(core::ptr::null(), source_code_into_abi)
+}
+
+/// A weak reference to the source code, which the caller owns and gives up with js_weak_source_code_destroy(). Only
+/// the VM's thread may call this.
+///
+/// # Safety
+///
+/// `source_code` must be live source code.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn js_source_code_downgrade(source_code: *const JSSourceCode) -> *mut JSWeakSourceCode {
+    // SAFETY: The caller passes live source code.
+    let source_code = unsafe { shared_source_code_from_abi(source_code) };
+    Box::into_raw(Box::new(Rc::downgrade(&source_code))).cast()
+}
+
+/// Whether anything still holds the source code of the weak reference. Only the VM's thread may call this.
+///
+/// # Safety
+///
+/// `weak` must be a weak reference that js_source_code_downgrade() handed out and that was not destroyed.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn js_weak_source_code_is_alive(weak: *const JSWeakSourceCode) -> bool {
+    assert!(!weak.is_null(), "the embedder passes a weak reference");
+    // SAFETY: The caller passes a live weak reference, which is a boxed Weak<SourceCode>.
+    unsafe { &*weak.cast::<std::rc::Weak<SourceCode>>() }.strong_count() > 0
+}
+
+/// Destroys a weak reference that js_source_code_downgrade() handed out. Null does nothing. Only the VM's thread may
+/// call this.
+///
+/// # Safety
+///
+/// `weak` must be null or a weak reference that was not destroyed, which the caller gives up.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn js_weak_source_code_destroy(weak: *mut JSWeakSourceCode) {
+    if !weak.is_null() {
+        // SAFETY: The caller gives up a live weak reference, which is a boxed Weak<SourceCode>.
+        drop(unsafe { Box::from_raw(weak.cast::<std::rc::Weak<SourceCode>>()) });
+    }
 }

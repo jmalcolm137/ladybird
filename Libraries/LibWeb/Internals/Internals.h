@@ -6,10 +6,11 @@
 
 #pragma once
 
-#include <LibCompositing/Scrolling/AsyncScrollTree.h>
 #include <LibCompositing/Scrolling/AsyncScrollingState.h>
+#include <LibCompositing/Types.h>
 #include <LibGC/Root.h>
 #include <LibWeb/Bindings/Internals.h>
+#include <LibWeb/Bindings/MediaSession.h>
 #include <LibWeb/DOM/Document.h>
 #include <LibWeb/Export.h>
 #include <LibWeb/Forward.h>
@@ -56,31 +57,27 @@ public:
     void set_force_dark_enabled(bool);
     void set_show_line_box_borders(bool);
     void set_force_dark_thresholds(i32, i32);
-    u64 visual_context_tree_node_count();
-    u64 accumulated_visual_context_incremental_update_count();
-    u64 visual_context_tree_node_capacity();
-    u64 visual_context_tree_dead_node_count();
-    u64 visual_context_tree_structural_epoch();
-    GC::Ref<JS::Object> visual_context_node_indices(DOM::Element&);
+    Utf16String dump_visual_context_nodes(DOM::Element&);
+    Utf16String dump_compositor_animations();
     void send_mismatched_visual_context_tree_update_to_compositor();
-    u64 layout_tree_pre_order_label_violation_count();
-    u64 layout_tree_pre_order_relabel_count();
     WebIDL::ExceptionOr<void> load_reference_test_metadata();
 
     bool has_completed_initial_paint() const;
     bool initial_paint_had_pending_fonts() const;
+    bool has_pending_image_loads() const;
+    bool had_user_edits() const;
     void set_font_display_time(CSS::FontFace&, u32 milliseconds);
     WebIDL::ExceptionOr<Utf16String> set_time_zone(Utf16String const& time_zone);
 
     void gc();
     u32 worker_agent_count() const;
-    void gc_async(GC::Ref<WebIDL::Promise>);
+    void gc_async(bool move_cells, GC::Ref<WebIDL::Promise>);
     WebIDL::UnsignedLongLong discard_decoded_image_frames();
     WebIDL::ExceptionOr<void> mark_as_garbage(Utf16String const& variable_name);
     bool wrapper_is_preserved(JS::Object&);
     bool has_pending_activity(JS::Object&, GC::Ptr<DOM::Document>);
     WebIDL::UnsignedLongLong message_port_pending_outgoing_message_count(HTML::MessagePort&);
-    WebIDL::UnsignedLongLong html_collection_cache_generation(DOM::HTMLCollection&);
+    bool html_collection_has_valid_cache(DOM::HTMLCollection&);
     void fail_next_message_port_transfer(HTML::MessagePort&);
     bool message_ports_are_directly_entangled(HTML::MessagePort&, HTML::MessagePort&);
     String message_port_entanglement_kind(HTML::MessagePort&);
@@ -148,6 +145,7 @@ public:
     Utf16String devtools_log(GC::RootVector<JS::Value> const& arguments);
     Utf16String devtools_logged_properties(u64 object_id);
     Utf16String devtools_log_table(GC::Root<JS::Object> const& table_data);
+    void set_long_stack_traces_enabled(bool);
     Optional<Vector<String>> complete_console_input(Utf16String const& input);
 
     void find_in_page(Utf16String const& query, bool highlight_all);
@@ -189,13 +187,14 @@ public:
     WebIDL::ExceptionOr<void> set_content_blockers(Utf16String const& patterns);
     WebIDL::ExceptionOr<void> set_site_compatibility_data(Utf16String const& source);
     void set_content_blocking_enabled(bool enabled);
-    WebIDL::UnsignedLongLong partial_layout_count();
-    WebIDL::UnsignedLongLong full_layout_count();
-    void begin_layout_trace();
+    void begin_layout_trace(Bindings::LayoutTraceOptions const&);
     void update_layout_for_testing();
     Utf16String take_layout_trace();
-    WebIDL::UnsignedLongLong accumulated_visual_context_tree_build_count();
     void begin_display_list_trace();
+    void begin_visual_context_trace();
+    Utf16String take_visual_context_trace();
+    void update_visual_contexts_for_testing();
+    u64 describe_owners_of_visual_context_nodes();
     Utf16String take_display_list_trace();
     void begin_input_trace();
     GC::Ref<JS::Object> take_input_trace();
@@ -203,7 +202,7 @@ public:
     GC::Ref<JS::Object> recorded_display_list_wheel_target_at(double x, double y, double delta_x, double delta_y);
     bool recorded_display_list_blocks_wheel_event_at(double x, double y);
     GC::Ref<JS::Object> recorded_async_scrolling_state_object();
-    void record_display_list_for_testing(bool paint_overlay, bool cold);
+    void record_display_list_for_testing(bool paint_overlay, bool cold, bool finest_runs);
     void set_autoplay_policy(Utf16String const& policy);
 
     Utf16String get_computed_role(DOM::Element& element);
@@ -233,7 +232,8 @@ public:
     bool needs_display_list_record();
     bool has_animation_frame_callbacks();
 
-    Utf16String dump_display_list();
+    Utf16String dump_display_list(Bindings::DisplayListDumpOptions const&);
+    Utf16String dump_display_list_changes(Bindings::DisplayListDumpOptions const&);
     Utf16String dump_accessibility_tree();
     String accessibility_character_offsets(GC::Ref<DOM::Node>);
     String dump_accessibility_node_data(GC::Ref<DOM::Node>);
@@ -259,7 +259,8 @@ public:
     bool canvas_has_unpresented_content(HTML::HTMLCanvasElement&);
     void crash_remote_frame_processes();
     i32 web_content_process_id();
-    u32 document_count_in_this_process();
+    Vector<String> documents_in_this_process();
+    bool is_in_realm_of_destroyed_document(JS::Object&);
     void close_tab_through_ui_process();
     void stop_loading_through_ui_process();
     void reload_through_ui_process();
@@ -287,7 +288,7 @@ public:
     void set_geolocation_emulated_position(double latitude, double longitude, double accuracy, Optional<double> altitude, Optional<double> altitude_accuracy, Optional<double> heading, Optional<double> speed);
     void set_geolocation_emulated_position_unavailable();
 
-    GC::Ref<WebIDL::Promise> request_permission(Utf16String const& name);
+    WebIDL::ExceptionOr<GC::Ref<WebIDL::Promise>> request_permission(Utf16String const& name);
     GC::Ref<WebIDL::Promise> set_permission(Utf16String const& name, Utf16String const& state);
     void set_next_permission_prompt_outcome(Utf16String const& name, Utf16String const& outcome, bool held);
     void set_system_microphone_authorization(Utf16String const& authorization, Utf16String const& answer, bool held);
@@ -301,13 +302,9 @@ public:
     void click_notification_for_testing(NotificationsAPI::Notification&);
     void click_notification_by_id_for_testing(WebIDL::UnsignedLongLong browser_notification_id);
     void dismiss_notification_for_testing(NotificationsAPI::Notification&);
+    void hold_next_notification_show_for_testing();
+    void fail_held_notification_show_for_testing();
 
-    u64 parser_non_append_insertions();
-    DOM::Document::StyleInvalidationCounters const& style_invalidation_counters() const;
-    GC::Ref<JS::Object> style_invalidation_counters_object() const;
-    void reset_style_invalidation_counters();
-    GC::Ref<JS::Object> get_rendering_scheduler_counters() const;
-    void reset_rendering_scheduler_counters();
     void set_manual_rendering_opportunities(bool enabled);
     void inject_rendering_opportunity(double frame_time_ms);
     Utf16String frame_scheduler_state() const;
@@ -327,7 +324,8 @@ public:
     Utf16String presented_selection();
     Utf16String painted_selection();
     GC::Ptr<Geometry::DOMRect> presented_border_box(DOM::Element&);
-    Optional<u32> presented_compositor_animation_count(DOM::Element&);
+    GC::Ptr<Geometry::DOMPointReadOnly> presented_scroll_offset(DOM::Element&);
+    Optional<Vector<String>> presented_compositor_animations(DOM::Element&);
     Optional<double> presented_opacity(DOM::Element&);
     Optional<String> presented_color(DOM::Element&, Optional<Utf16String> const& pseudo_element);
     bool last_frame_keyboard_scroll_state_is_current();
@@ -339,28 +337,20 @@ public:
     void fire_compositor_animation_wakeup_for_testing(double frame_time_ms);
     void force_visual_context_tree_rebuild_on_next_compositor_animation_update_for_testing();
     void request_reentrant_animation_style_flush_for_testing(GC::Ref<DOM::Node>);
-    GC::Ref<JS::Object> layout_tree_build_stats();
     GC::Ref<JS::Object> compare_layout_tree_with_full_rebuild();
-    GC::Ref<JS::Object> computed_values_stats();
-    GC::Ref<JS::Object> style_ffi_counters();
+    void request_full_layout_tree_update();
+    void force_parallel_layout();
     GC::Ref<JS::Object> style_engine_counters();
     GC::Ref<JS::Object> style_memory_report();
     u64 style_memory_of_frames();
-    u64 style_record_identity(DOM::Element&);
-    u64 custom_property_environment_identity(DOM::Element&);
-    u64 layout_style_record_identity(DOM::Element&);
-    u64 layout_node_identity(DOM::Node&);
-    u64 layout_arena_live_slot_count();
     void panic_render_state_for_testing();
-    u64 layout_arena_shell_count();
-    GC::Ref<JS::Object> style_cold_pass(bool verify, u32 threads);
-    GC::Ref<JS::Object> style_live_report(bool verify);
-    GC::Ref<JS::Object> style_counters();
-    void reset_style_counters();
-    GC::Ref<JS::Object> style_last_pass();
+    Vector<String> style_self_check();
+    void begin_style_trace();
+    void begin_rendering_trace();
+    String take_rendering_trace();
+    Utf16String take_style_trace();
     Utf16String style_engine_matched_rules();
-    void reset_style_ffi_counters();
-    GC::Ref<JS::Object> style_group_sharing_info(DOM::Element&);
+    Utf16String dump_style_records(GC::Ptr<DOM::Node> root, Bindings::StyleRecordsDumpOptions const&);
     void update_style();
     void set_user_style(Utf16String const& source);
     void set_preferred_color_scheme(Utf16String const& color_scheme);
@@ -369,12 +359,18 @@ public:
     void set_hidden_document_timer_wake_up_interval(double milliseconds);
     void set_hidden_document_intensive_timer_throttling(double wake_up_interval, double grace_period_once_loaded, double grace_period_while_loading);
     WebIDL::UnsignedLongLong active_timer_count(JS::Object& window);
+    Vector<WebIDL::Long> active_timer_ids(JS::Object& window);
     WebIDL::UnsignedLongLong task_queue_length();
     Utf16String canvas_color_scheme();
-    u64 image_request_count(DOM::Document const&) const;
+    Vector<String> image_request_urls(DOM::Document const&) const;
     WebIDL::ExceptionOr<GC::Ref<JS::Object>> image_animation_state_for_url(Utf16String const& url);
     bool media_element_is_fetching(HTML::HTMLMediaElement&);
     bool media_element_is_playing_audio(HTML::HTMLMediaElement&);
+    JS::Value active_media_session_state();
+    JS::Value now_playing_state_for_testing();
+    WebIDL::ExceptionOr<void> trigger_now_playing_action_for_testing(Bindings::MediaSessionAction, GC::Ptr<JS::Object> details);
+    GC::Ref<WebIDL::Promise> wait_for_media_session_artwork();
+    WebIDL::ExceptionOr<void> trigger_media_session_action(Bindings::MediaSessionAction, GC::Ptr<JS::Object> details);
     bool document_is_playing_audio(DOM::Document&);
     bool tab_is_playing_audio();
     bool tab_is_heard_playing_audio();
@@ -385,7 +381,7 @@ public:
     void report_audio_capture_of_page(WebIDL::UnsignedLongLong page_id, bool capturing);
     void retire_picture_in_picture_window();
     WebIDL::UnsignedLongLong audio_capture_stream_count();
-    WebIDL::UnsignedLongLong tab_audibility_change_count();
+    Vector<String> tab_audibility_transitions();
     bool media_element_video_sink_is_ticking(HTML::HTMLMediaElement&);
     void set_media_element_ready_state(HTML::HTMLMediaElement&, u16 ready_state);
     void set_media_element_paused(HTML::HTMLMediaElement&, bool paused);
@@ -409,6 +405,12 @@ private:
     GC::Root<JS::Cell> m_actions_executor;
     bool m_actions_running { false };
     Optional<Utf16String> m_pending_action_test_result;
+
+    struct DisplayListDumpForChanges {
+        UniqueNodeID document_id;
+        String jsonl;
+    };
+    Optional<DisplayListDumpForChanges> m_display_list_dump_for_changes;
     Vector<GC::Ref<InternalGamepad>> m_gamepads;
     Optional<HTML::DevToolsObjectTable> m_devtools_object_table;
     HTML::DevToolsLoggedObjects m_devtools_logged_objects;

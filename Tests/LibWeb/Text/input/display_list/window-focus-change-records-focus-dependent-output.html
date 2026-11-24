@@ -1,7 +1,7 @@
 <!doctype html>
 <html id="html">
 <script src="../include.js"></script>
-<script src="recording-test.js"></script>
+<script src="../work-test.js"></script>
 <style>
     body { margin: 0; font: 16px/20px monospace; }
     #ring { width: 100px; height: 20px; outline: auto; }
@@ -13,45 +13,34 @@
 // Only an outline: auto ring and the selection paint differently while the window is unfocused, so a
 // focus change records them again and copies everything else.
 const focusChangeTrace = ringOutline => `
-    damage: rows=0 moved=0 order=0 eligibility=0 all=false
     @canvas RECORD (empty)
     @viewport ASSEMBLE
       @viewport/preamble COPY
-      @viewport/background/hit-test COPY
       @viewport/scroll-metadata COPY
       @viewport/background COPY
       @viewport/border COPY
       BlockContainer<HTML>#html/descendants(background-and-borders) COPY
-      @viewport/foreground/hit-test COPY
       @viewport/foreground COPY
       BlockContainer<HTML>#html/descendants(foreground) COPY
       BlockContainer<HTML>#html ASSEMBLE
         BlockContainer<HTML>#html/preamble COPY
-        BlockContainer<HTML>#html/background/hit-test COPY
         BlockContainer<HTML>#html/scroll-metadata COPY
         BlockContainer<HTML>#html/background COPY
         BlockContainer<HTML>#html/border COPY
         BlockContainer<BODY>#body/descendants(background-and-borders) COPY
-        BlockContainer<HTML>#html/foreground/hit-test COPY
         BlockContainer<HTML>#html/foreground COPY
         BlockContainer<BODY>#body/descendants(foreground) ASSEMBLE
-          BlockContainer<BODY>#body/foreground/hit-test COPY
           BlockContainer<BODY>#body/foreground COPY
           BlockContainer<DIV>#ring/descendants(foreground) ASSEMBLE
-            BlockContainer<DIV>#ring/foreground/hit-test COPY
-            BlockContainer<DIV>#ring/foreground COPY
+            BlockContainer<DIV>#ring/foreground RECORD (empty)
             BlockContainer<DIV>#ring/outline ${ringOutline}
-            BlockContainer<DIV>#ring/overlay/hit-test COPY
-            BlockContainer<DIV>#ring/overlay COPY
+            BlockContainer<DIV>#ring/overlay SKIP
           BlockContainer<DIV>#selected/descendants(foreground) ASSEMBLE
-            BlockContainer<DIV>#selected/foreground/hit-test COPY
             BlockContainer<DIV>#selected/foreground RECORD
-            BlockContainer<DIV>#selected/outline COPY
-            BlockContainer<DIV>#selected/overlay/hit-test COPY
-            BlockContainer<DIV>#selected/overlay COPY
+            BlockContainer<DIV>#selected/outline SKIP
+            BlockContainer<DIV>#selected/overlay SKIP
           BlockContainer<DIV>#plain/descendants(foreground) COPY
           BlockContainer<BODY>#body/outline COPY
-          BlockContainer<BODY>#body/overlay/hit-test COPY
           BlockContainer<BODY>#body/overlay COPY
         BlockContainer<HTML>#html/outline COPY
       @viewport/outline COPY
@@ -65,7 +54,6 @@ displayListTest({
         {
             name: "quiet before focus changes",
             expect: `
-                damage: rows=0 moved=0 order=0 eligibility=0 all=false
                 @canvas RECORD (empty)
                 @viewport COPY
             `,
@@ -78,7 +66,6 @@ displayListTest({
         {
             name: "quiet while unfocused",
             expect: `
-                damage: rows=0 moved=0 order=0 eligibility=0 all=false
                 @canvas RECORD (empty)
                 @viewport COPY
             `,

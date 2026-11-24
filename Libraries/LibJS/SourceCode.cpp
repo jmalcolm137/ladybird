@@ -6,7 +6,6 @@
 
 #include <LibJS/ScriptAndModuleABIConversions.h>
 #include <LibJS/SourceCode.h>
-#include <LibTextCodec/Decoder.h>
 
 namespace JS {
 
@@ -32,23 +31,14 @@ Utf16String const& SourceCode::filename() const
     return string_in_place_from_abi(js_source_code_filename_address(source_code_to_abi(*this)));
 }
 
-Utf16String const& SourceCode::code() const
+Utf16String SourceCode::code() const
 {
-    return string_in_place_from_abi(js_source_code_code_address(source_code_to_abi(*this)));
+    return owned_utf16_string_from_abi(js_source_code_code(source_code_to_abi(*this)));
 }
 
 size_t SourceCode::length_in_code_units() const
 {
     return js_source_code_length_in_code_units(source_code_to_abi(*this));
-}
-
-Utf16String SourceCode::source_text_from_offsets(size_t start_offset, size_t length) const
-{
-    if (length == 0)
-        return {};
-
-    VERIFY(start_offset <= NumericLimits<size_t>::max() - length);
-    return Utf16String::from_utf16(code().utf16_view().substring_view(start_offset, length));
 }
 
 void SourceCode::ref() const
@@ -59,6 +49,40 @@ void SourceCode::ref() const
 void SourceCode::unref() const
 {
     js_source_code_release(source_code_to_abi(*this));
+}
+
+static JSWeakSourceCode* weak_source_code_to_abi(FFI::WeakSourceCode* weak)
+{
+    return reinterpret_cast<JSWeakSourceCode*>(weak);
+}
+
+WeakSourceCode::WeakSourceCode(SourceCode const& source_code)
+    : m_weak(reinterpret_cast<FFI::WeakSourceCode*>(js_source_code_downgrade(source_code_to_abi(source_code))))
+{
+}
+
+WeakSourceCode::WeakSourceCode(WeakSourceCode&& other)
+    : m_weak(exchange(other.m_weak, nullptr))
+{
+}
+
+WeakSourceCode& WeakSourceCode::operator=(WeakSourceCode&& other)
+{
+    if (this != &other) {
+        js_weak_source_code_destroy(weak_source_code_to_abi(m_weak));
+        m_weak = exchange(other.m_weak, nullptr);
+    }
+    return *this;
+}
+
+WeakSourceCode::~WeakSourceCode()
+{
+    js_weak_source_code_destroy(weak_source_code_to_abi(m_weak));
+}
+
+bool WeakSourceCode::is_alive() const
+{
+    return m_weak && js_weak_source_code_is_alive(weak_source_code_to_abi(m_weak));
 }
 
 }

@@ -17,6 +17,7 @@
 #include <LibWebView/BrowsingSession.h>
 #include <LibWebView/CrashReport.h>
 #include <LibWebView/CrashReportStore.h>
+#include <LibWebView/DefaultBrowser.h>
 #include <LibWebView/PermissionManager.h>
 #include <LibWebView/SearchEngine.h>
 #include <LibWebView/WebContentClient.h>
@@ -60,7 +61,7 @@ static bool should_show_config_variable(ConfigVariableID id)
 
 SettingsUISitePermissionsObserver::SettingsUISitePermissionsObserver(SettingsUI& settings_ui)
     : m_settings_ui(settings_ui)
-    , m_manager(*Application::the().default_session().permission_manager)
+    , m_manager(*Application::default_session().permission_manager)
 {
     m_manager->register_observer(*this);
 }
@@ -81,9 +82,6 @@ void SettingsUI::register_interfaces()
 {
     m_site_permissions_observer = make<SettingsUISitePermissionsObserver>(*this);
 
-    register_interface("setSitePermission"sv, [this](auto const& data) {
-        set_site_permission(data);
-    });
     register_interface("loadFeatures"sv, [this](auto const&) {
         load_features();
     });
@@ -115,6 +113,17 @@ void SettingsUI::register_interfaces()
     register_interface("setFilterListUpdatesEnabled"sv, [this](auto const& data) {
         set_filter_list_updates_enabled(data);
     });
+#if defined(LADYBIRD_HAS_UPDATE_CHECK)
+    register_interface("setUpdateChecksEnabled"sv, [this](auto const& data) {
+        set_update_checks_enabled(data);
+    });
+#endif
+    register_interface("setAppearance"sv, [this](auto const& data) {
+        set_appearance(data);
+    });
+    register_interface("makeDefaultBrowser"sv, [this](auto const& data) {
+        make_default_browser(data);
+    });
 
     if (host() == "welcome"sv) {
         register_interface("completeFirstRun"sv, [this](auto const& data) {
@@ -144,11 +153,8 @@ void SettingsUI::register_interfaces()
     register_interface("setLanguages"sv, [this](auto const& data) {
         set_languages(data);
     });
-    register_interface("setAppearance"sv, [this](auto const& data) {
-        set_appearance(data);
-    });
-    register_interface("resetForceDarkForHost"sv, [this](auto const& data) {
-        reset_force_dark_for_host(data);
+    register_interface("resetHostSetting"sv, [this](auto const& data) {
+        reset_host_setting(data);
     });
     register_interface("setContentSettings"sv, [this](auto const& data) {
         set_content_settings(data);
@@ -182,21 +188,9 @@ void SettingsUI::register_interfaces()
     register_interface("removeAllSiteSettingFilters"sv, [this](auto const& data) {
         remove_all_site_setting_filters(data);
     });
-    register_interface("setLocationPolicy"sv, [this](auto const& data) {
-        set_location_policy(data);
-    });
-    register_interface("setMicrophonePolicy"sv, [this](auto const& data) {
-        set_microphone_policy(data);
-    });
-    register_interface("setNotificationsPolicy"sv, [this](auto const& data) {
-        set_notifications_policy(data);
-    });
 
     register_interface("estimateBrowsingDataSizes"sv, [this](auto const& data) {
         estimate_browsing_data_sizes(data);
-    });
-    register_interface("setBrowsingDataSettings"sv, [this](auto const& data) {
-        set_browsing_data_settings(data);
     });
     register_interface("clearBrowsingData"sv, [this](auto const& data) {
         clear_browsing_data(data);
@@ -247,32 +241,54 @@ void SettingsUI::load_features()
 
 JsonObject SettingsUI::serialize_settings() const
 {
-    auto settings = Application::settings().serialize_json();
-    settings.as_object().set("forceDarkSitesReadOnly"sv, !has_client() || client().is_private() == IsPrivate::Yes);
+    auto settings_json = Application::settings().serialize_json();
+    auto settings = move(settings_json.as_object());
+
+    settings.set("defaultNewTabPageURL"sv, Settings::default_new_tab_page_url().serialize());
+
+    switch (Application::the().default_browser().status()) {
+    case DefaultBrowserStatus::Unknown:
+        break;
+    case DefaultBrowserStatus::Unavailable:
+        settings.set("defaultBrowser"sv, "unavailable"_string);
+        break;
+    case DefaultBrowserStatus::NotDefault:
+        settings.set("defaultBrowser"sv, "not-default"_string);
+        break;
+    case DefaultBrowserStatus::Default:
+        settings.set("defaultBrowser"sv, "default"_string);
+        break;
+    }
 
     // The sites the user allowed or blocked, for each permission.
-    JsonObject site_permissions;
-    for (auto name : { Web::Permissions::PermissionName::Geolocation, Web::Permissions::PermissionName::Microphone, Web::Permissions::PermissionName::Notifications }) {
+    JsonObject site_settings;
+    site_settings.set("autoplay"sv, settings.get("autoplay"sv).value());
+    for (auto name : Web::Permissions::PERMISSION_NAMES) {
         JsonArray sites;
-        for (auto const& site : Application::the().default_session().permission_manager->site_decisions(name)) {
+        for (auto const& site : Application::default_session().permission_manager->site_decisions(name)) {
             JsonObject entry;
-            entry.set("origin"sv, site.origin.serialize());
+            entry.set("filter"sv, site.origin.serialize());
             switch (site.decision) {
             case PermissionDecision::Allow:
-                entry.set("decision"sv, "allow"_string);
+                entry.set("policy"sv, "allow"_string);
                 break;
             case PermissionDecision::AllowOnce:
-                entry.set("decision"sv, "allow-once"_string);
+                entry.set("policy"sv, "allow-once"_string);
                 break;
             case PermissionDecision::Block:
-                entry.set("decision"sv, "block"_string);
+                entry.set("policy"sv, "block"_string);
                 break;
             }
             sites.must_append(move(entry));
         }
-        site_permissions.set(Web::Permissions::to_string(name), move(sites));
+
+        JsonObject setting;
+        setting.set("policy"sv, Application::settings().permission_policy(name) == PermissionPolicy::Block ? "block"sv : "ask"sv);
+        setting.set("siteFilters"sv, move(sites));
+        site_settings.set(Web::Permissions::to_string(name), move(setting));
     }
-    settings.as_object().set("sitePermissions"sv, move(site_permissions));
+
+    settings.set("siteSettings"sv, move(site_settings));
 
     JsonArray config_variables;
     for (auto const& variable : config_variable_definitions()) {
@@ -292,7 +308,7 @@ JsonObject SettingsUI::serialize_settings() const
         config_variables.must_append(move(variable_object));
     }
 
-    settings.as_object().set("configVariableDefinitions"sv, move(config_variables));
+    settings.set("configVariableDefinitions"sv, move(config_variables));
 
     JsonArray lists;
     for (auto const& list : Application::settings().content_blocker_lists()) {
@@ -308,10 +324,10 @@ JsonObject SettingsUI::serialize_settings() const
         object.set("lastUpdatedAt"sv, updated.has_value() ? JsonValue(updated->milliseconds_since_epoch()) : JsonValue {});
         lists.must_append(move(object));
     }
-    settings.as_object().set("contentBlockerLists"sv, move(lists));
-    settings.as_object().set("contentBlockerListUpdateInProgress"sv, Application::the().content_blocker_list_update_in_progress());
+    settings.set("contentBlockerLists"sv, move(lists));
+    settings.set("contentBlockerListUpdateInProgress"sv, Application::the().content_blocker_list_update_in_progress());
 
-    return move(settings.as_object());
+    return settings;
 }
 
 void SettingsUI::load_current_settings()
@@ -365,6 +381,25 @@ void SettingsUI::complete_first_run(JsonValue const&)
     async_send_message("firstRunCompleted"sv, settings.new_tab_page_url().serialize());
 }
 
+void SettingsUI::make_default_browser(JsonValue const&)
+{
+    Application::the().default_browser().make_default([weak_this = make_weak_ptr<SettingsUI>()](MakeDefaultBrowserResult const& result) {
+        auto self = weak_this.strong_ref();
+        if (!self)
+            return;
+
+        if (!result.failed) {
+            self->async_send_message("defaultBrowserResult"sv, JsonValue {});
+            return;
+        }
+
+        auto failure = result.system_message.has_value()
+            ? MUST(String::formatted("Could not make Ladybird the default browser. The system reported: {}", *result.system_message))
+            : "Could not make Ladybird the default browser. Choose it in your system settings instead."_string;
+        self->async_send_message("defaultBrowserResult"sv, move(failure));
+    });
+}
+
 void SettingsUI::set_new_tab_page_url(JsonValue const& new_tab_page_url)
 {
     if (!new_tab_page_url.is_string())
@@ -403,19 +438,29 @@ void SettingsUI::set_content_settings(JsonValue const& content_settings)
     auto parsed_content_settings = Settings::parse_content_settings(content_settings);
     auto const& current_content_settings = settings.content_settings();
 
-    // Zoom-per-host is not controlled by the settings UI. Don't overwrite it.
-    parsed_content_settings.zoom_per_host = current_content_settings.zoom_per_host;
     // Host choices change through their own controls, independently of edits to the default.
+    parsed_content_settings.zoom_per_host = current_content_settings.zoom_per_host;
     parsed_content_settings.force_dark_per_host = current_content_settings.force_dark_per_host;
 
     Application::settings().set_content_settings(move(parsed_content_settings));
 }
 
-void SettingsUI::reset_force_dark_for_host(JsonValue const& host)
+void SettingsUI::reset_host_setting(JsonValue const& data)
 {
-    if (!host.is_string() || !has_client() || client().is_private() == IsPrivate::Yes)
+    if (!data.is_object())
         return;
-    Application::settings().reset_force_dark_for_host(host.as_string());
+
+    auto setting = data.as_object().get_string("setting"sv);
+    auto host = data.as_object().get_string("host"sv);
+    if (data.as_object().has("host"sv) && !host.has_value())
+        return;
+
+    auto host_view = host.map([](auto const& value) { return value.bytes_as_string_view(); });
+
+    if (setting == "zoom"sv)
+        Application::settings().reset_host_setting(HostSetting::Zoom, host_view);
+    else if (setting == "force-dark"sv)
+        Application::settings().reset_host_setting(HostSetting::ForceDark, host_view);
 }
 
 void SettingsUI::set_tab_settings(JsonValue const& tab_settings)
@@ -427,6 +472,10 @@ void SettingsUI::set_tab_settings(JsonValue const& tab_settings)
     // Collapsed/expanded vertical tabs and their width are not controlled by the settings UI. Don't overwrite them.
     parsed_tab_settings.vertical_tabs_expanded = current_tab_settings.vertical_tabs_expanded;
     parsed_tab_settings.vertical_tabs_expanded_width = current_tab_settings.vertical_tabs_expanded_width;
+
+    // NB: A sidebar layout picked on the welcome page opens expanded, so the choice shows in the window at once.
+    if (host() == "welcome"sv && parsed_tab_settings.vertical_tabs_enabled)
+        parsed_tab_settings.vertical_tabs_expanded = true;
 
     settings.set_tab_settings(parsed_tab_settings);
 }
@@ -456,7 +505,7 @@ void SettingsUI::load_available_engines()
     for (auto const& engine : WebView::builtin_search_engines()) {
         JsonObject object;
         object.set("name"sv, engine.name);
-        object.set("supportsSuggestions"sv, engine.suggestions.has_value());
+        object.set("supportsSuggestions"sv, engine.suggestions_url.has_value());
         search_engines.must_append(move(object));
     }
 
@@ -496,168 +545,116 @@ void SettingsUI::remove_custom_search_engine(JsonValue const& search_engine)
         Application::settings().remove_custom_search_engine(*custom_engine);
 }
 
-enum class SiteSettingType {
-    Autoplay,
-};
-
-static constexpr StringView site_setting_type_to_string(SiteSettingType setting)
-{
-    switch (setting) {
-    case SiteSettingType::Autoplay:
-        return "autoplay"sv;
-    }
-    VERIFY_NOT_REACHED();
-}
-
-static Optional<SiteSettingType> site_setting_type(JsonValue const& settings)
-{
-    if (!settings.is_object())
-        return {};
-
-    auto setting_type = settings.as_object().get_string("setting"sv);
-    if (!setting_type.has_value())
-        return {};
-
-    if (*setting_type == "autoplay"sv)
-        return SiteSettingType::Autoplay;
-    return {};
-}
-
 void SettingsUI::load_forcibly_enabled_site_settings()
 {
     JsonArray site_settings;
 
     if (Application::web_content_options().enable_autoplay == EnableAutoplay::Yes)
-        site_settings.must_append(site_setting_type_to_string(SiteSettingType::Autoplay));
+        site_settings.must_append("autoplay"sv);
 
     async_send_message("forciblyEnableSiteSettings"sv, move(site_settings));
 }
 
 void SettingsUI::set_site_setting_policy(JsonValue const& site_setting)
 {
-    auto setting = site_setting_type(site_setting);
-    if (!setting.has_value())
+    if (!site_setting.is_object())
         return;
 
+    auto setting = site_setting.as_object().get_string("setting"sv);
     auto policy = site_setting.as_object().get_string("policy"sv);
-    if (!policy.has_value())
+    if (!setting.has_value() || !policy.has_value() || !policy->is_ascii())
         return;
 
-    switch (*setting) {
-    case SiteSettingType::Autoplay:
-        auto policy_utf16 = Utf16String::from_utf8_without_validation(*policy);
-        if (auto parsed = Web::HTML::autoplay_policy_from_string(policy_utf16.utf16_view()); parsed.has_value())
+    if (*setting == "autoplay"sv) {
+        auto policy_utf16 = Utf16View::from_ascii(*policy);
+        if (auto parsed = Web::HTML::autoplay_policy_from_string(policy_utf16); parsed.has_value())
             Application::settings().set_autoplay_policy(*parsed);
-        break;
+    } else if (auto name = Web::Permissions::permission_name_from_string(*setting); name.has_value()) {
+        if (*policy == "ask"sv)
+            Application::settings().set_permission_policy(*name, PermissionPolicy::Ask);
+        else if (*policy == "block"sv)
+            Application::settings().set_permission_policy(*name, PermissionPolicy::Block);
     }
+}
+
+static Optional<URL::Origin> site_setting_origin(String const& filter)
+{
+    auto url = URL::Parser::basic_parse(filter.bytes_as_string_view().trim_whitespace());
+    if (!url.has_value() || url->origin().is_opaque())
+        return {};
+    return url->origin();
 }
 
 void SettingsUI::add_site_setting_filter(JsonValue const& site_setting)
 {
-    auto setting = site_setting_type(site_setting);
-    if (!setting.has_value())
+    if (!site_setting.is_object())
         return;
 
+    auto setting = site_setting.as_object().get_string("setting"sv);
     auto filter = site_setting.as_object().get_string("filter"sv);
-    if (!filter.has_value())
+    auto policy = site_setting.as_object().get_string("policy"sv);
+    if (!setting.has_value() || !filter.has_value() || !policy.has_value() || !policy->is_ascii())
         return;
 
-    switch (*setting) {
-    case SiteSettingType::Autoplay:
-        Application::settings().add_autoplay_site_filter(*filter);
-        break;
+    auto origin = site_setting_origin(*filter);
+    if (!origin.has_value())
+        return;
+
+    if (*setting == "autoplay"sv) {
+        auto policy_utf16 = Utf16String::from_utf8_without_validation(*policy);
+        if (auto parsed = Web::HTML::autoplay_policy_from_string(policy_utf16.utf16_view()); parsed.has_value())
+            Application::settings().add_autoplay_site_filter(origin->serialize(), *parsed);
+    } else if (auto name = Web::Permissions::permission_name_from_string(*setting); name.has_value()) {
+        PermissionDecision decision;
+        if (*policy == "allow"sv)
+            decision = PermissionDecision::Allow;
+        else if (*policy == "block"sv)
+            decision = PermissionDecision::Block;
+        else
+            return;
+
+        Application::default_session().permission_manager->set_decision(*name, *origin, decision);
     }
 }
 
 void SettingsUI::remove_site_setting_filter(JsonValue const& site_setting)
 {
-    auto setting = site_setting_type(site_setting);
-    if (!setting.has_value())
+    if (!site_setting.is_object())
         return;
 
+    auto setting = site_setting.as_object().get_string("setting"sv);
     auto filter = site_setting.as_object().get_string("filter"sv);
-    if (!filter.has_value())
+    if (!setting.has_value() || !filter.has_value())
         return;
 
-    switch (*setting) {
-    case SiteSettingType::Autoplay:
-        Application::settings().remove_autoplay_site_filter(*filter);
-        break;
+    auto origin = site_setting_origin(*filter);
+    if (!origin.has_value())
+        return;
+
+    if (*setting == "autoplay"sv) {
+        Application::settings().remove_autoplay_site_filter(origin->serialize());
+    } else if (auto name = Web::Permissions::permission_name_from_string(*setting); name.has_value()) {
+        Application::default_session().permission_manager->set_decision(*name, *origin, {});
     }
 }
 
 void SettingsUI::remove_all_site_setting_filters(JsonValue const& site_setting)
 {
-    auto setting = site_setting_type(site_setting);
+    if (!site_setting.is_object())
+        return;
+
+    auto setting = site_setting.as_object().get_string("setting"sv);
     if (!setting.has_value())
         return;
 
-    switch (*setting) {
-    case SiteSettingType::Autoplay:
+    if (*setting == "autoplay"sv) {
         Application::settings().remove_all_autoplay_site_filters();
-        break;
+    } else if (auto name = Web::Permissions::permission_name_from_string(*setting); name.has_value()) {
+        auto& manager = *Application::default_session().permission_manager;
+
+        for (auto const& site : manager.site_decisions(*name))
+            manager.set_decision(*name, site.origin, {});
     }
-}
-
-void SettingsUI::set_site_permission(JsonValue const& data)
-{
-    if (!data.is_object())
-        return;
-    auto const& object = data.as_object();
-
-    auto name = object.get_string("permission"sv).map([](auto const& string) { return Web::Permissions::permission_name_from_string(string); });
-    auto origin_string = object.get_string("origin"sv);
-    if (!name.has_value() || !name->has_value() || !origin_string.has_value())
-        return;
-
-    auto url = URL::Parser::basic_parse(*origin_string);
-    if (!url.has_value() || url->origin().is_opaque())
-        return;
-
-    Optional<PermissionDecision> decision;
-    if (auto value = object.get_string("decision"sv); value.has_value()) {
-        if (*value == "allow"sv)
-            decision = PermissionDecision::Allow;
-        else if (*value == "block"sv)
-            decision = PermissionDecision::Block;
-        else
-            return;
-    }
-
-    Application::the().default_session().permission_manager->set_decision(**name, url->origin(), decision);
-}
-
-void SettingsUI::set_location_policy(JsonValue const& policy)
-{
-    if (!policy.is_string())
-        return;
-
-    if (policy.as_string() == "ask"sv)
-        Application::settings().set_location_policy(LocationPolicy::Ask);
-    else if (policy.as_string() == "block"sv)
-        Application::settings().set_location_policy(LocationPolicy::Block);
-}
-
-void SettingsUI::set_microphone_policy(JsonValue const& policy)
-{
-    if (!policy.is_string())
-        return;
-
-    if (policy.as_string() == "ask"sv)
-        Application::settings().set_microphone_policy(MicrophonePolicy::Ask);
-    else if (policy.as_string() == "block"sv)
-        Application::settings().set_microphone_policy(MicrophonePolicy::Block);
-}
-
-void SettingsUI::set_notifications_policy(JsonValue const& policy)
-{
-    if (!policy.is_string())
-        return;
-
-    if (policy.as_string() == "ask"sv)
-        Application::settings().set_notifications_policy(NotificationsPolicy::Ask);
-    else if (policy.as_string() == "block"sv)
-        Application::settings().set_notifications_policy(NotificationsPolicy::Block);
 }
 
 void SettingsUI::estimate_browsing_data_sizes(JsonValue const& options)
@@ -689,11 +686,6 @@ void SettingsUI::estimate_browsing_data_sizes(JsonValue const& options)
         .when_rejected([](Error const& error) {
             dbgln("Failed to estimate browsing data sizes: {}", error);
         });
-}
-
-void SettingsUI::set_browsing_data_settings(JsonValue const& settings)
-{
-    Application::settings().set_browsing_data_settings(Settings::parse_browsing_data_settings(settings));
 }
 
 void SettingsUI::clear_browsing_data(JsonValue const& options)
@@ -775,6 +767,16 @@ void SettingsUI::set_filter_list_updates_enabled(JsonValue const& enabled)
 
     Application::settings().set_filter_list_updates_enabled(enabled.as_bool());
 }
+
+#if defined(LADYBIRD_HAS_UPDATE_CHECK)
+void SettingsUI::set_update_checks_enabled(JsonValue const& enabled)
+{
+    if (!enabled.is_bool())
+        return;
+
+    Application::settings().set_update_checks_enabled(enabled.as_bool());
+}
+#endif
 
 void SettingsUI::update_content_blocker_lists(JsonValue const&)
 {

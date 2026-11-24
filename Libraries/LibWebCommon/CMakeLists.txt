@@ -47,11 +47,12 @@ set(SOURCES
     Infra/Strings.cpp
     Loader/ContentBlocking.cpp
     Loader/DownloadFilename.cpp
+    Loader/FileResponseHeaders.cpp
     Loader/LoaderConfigSnapshot.cpp
     Loader/SiteCompatibility.cpp
+    MediaSession/MediaSessionState.cpp
     MimeSniff/MimeType.cpp
     MimeSniff/Resource.cpp
-    Page/AsyncScrollNodeStableID.cpp
     Page/DragEvent.cpp
     Page/InputEvent.cpp
     Page/InputRoutingDecision.cpp
@@ -86,7 +87,6 @@ set(SOURCES
     WebView/DOMNodeProperties.cpp
     WebView/Geolocation.cpp
     WebView/Mutation.cpp
-    WebView/SiteIsolation.cpp
     WebView/Utilities.cpp
 )
 
@@ -118,10 +118,15 @@ invoke_py_generator(
 compile_ipc(ContentSecurityPolicy/RemoteViolationDirective.ipc ContentSecurityPolicy/RemoteViolationDirectiveCodecs.h)
 compile_ipc(HTML/NavigationResponse.ipc HTML/NavigationResponseCodecs.h)
 compile_ipc(MixedContent/ProhibitsMixedSecurityContexts.ipc MixedContent/ProhibitsMixedSecurityContextsCodecs.h)
+compile_ipc(Page/AsyncScrollNodeStableID.ipc Page/AsyncScrollNodeStableIDCodecs.h)
 compile_ipc(Page/DragData.ipc Page/DragDataCodecs.h)
 compile_ipc(Page/InputEvent.ipc Page/InputEventCodecs.h)
+compile_ipc(Page/InputRoutingDecision.ipc Page/InputRoutingDecisionCodecs.h)
+compile_ipc(Page/InputTrace.ipc Page/InputTraceCodecs.h)
 compile_ipc(Page/TextEditingCommand.ipc Page/TextEditingCommandCodecs.h)
 compile_ipc(PixelUnits.ipc PixelUnitsCodecs.h)
+compile_ipc(UIEvents/KeyCode.ipc UIEvents/KeyCodeCodecs.h)
+compile_ipc(UIEvents/MouseButton.ipc UIEvents/MouseButtonCodecs.h)
 compile_ipc(UpgradeInsecureRequests/InsecureRequestsPolicy.ipc UpgradeInsecureRequests/InsecureRequestsPolicyCodecs.h)
 compile_ipc(WebView/AccessibilityNodeData.ipc WebView/AccessibilityNodeDataCodecs.h)
 compile_ipc(WebView/DictionaryLookup.ipc WebView/DictionaryLookupCodecs.h)
@@ -164,7 +169,7 @@ endif()
 ladybird_lib(LibWebCommon webcommon EXPLICIT_SYMBOL_EXPORT)
 # NB: The enumerations of LibWeb's IDL modules are generated into LibWebCommon along with LibWeb's bindings.
 add_dependencies(LibWebCommon generate_bindings)
-target_link_libraries(LibWebCommon PRIVATE LibCore LibCrypto LibFileSystem LibGfx LibHTTP LibIPC LibRequests LibURL)
+target_link_libraries(LibWebCommon PRIVATE LibCore LibCrypto LibGfx LibHTTP LibIPC LibRequests LibURL)
 
 import_rust_crate(MANIFEST_PATH Rust/Cargo.toml CRATE_NAME libwebcommon_rust FEATURES allocator FFI_HEADER RustFFI.h)
 target_link_libraries(LibWebCommon PRIVATE libwebcommon_rust)

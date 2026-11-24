@@ -9,8 +9,9 @@
 
 use libgfx_rust::FloatRect;
 use libgfx_rust::filter::Filter;
+use libipc_rust::wire::{Decode, Encode};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode)]
 #[repr(u8)]
 pub enum FfiFilterFunctionKind {
     Blur,
@@ -21,7 +22,7 @@ pub enum FfiFilterFunctionKind {
 
 /// One function of a CSS filter list with its lengths already in device pixels, for a host that
 /// builds filter graphs outside the style system: compositor animation samples and canvas filters.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Encode, Decode)]
 #[repr(C)]
 pub struct FfiFilterFunction {
     pub kind: FfiFilterFunctionKind,
@@ -72,6 +73,12 @@ pub fn may_affect_output_bounds(bytes: &[u8]) -> bool {
 /// when it can paint everywhere.
 pub fn output_bounds(bytes: &[u8], source: FloatRect) -> Option<FloatRect> {
     Filter::serialized_output_bounds(bytes, source)
+}
+
+/// Whether a serialized filter can show what it is applied to away from where that is drawn, rather
+/// than only over it and around it.
+pub fn may_move_what_it_filters(bytes: &[u8]) -> bool {
+    Filter::serialized_may_move_its_source(bytes)
 }
 
 /// Where a serialized filter's output can change when what it is applied to changes only within

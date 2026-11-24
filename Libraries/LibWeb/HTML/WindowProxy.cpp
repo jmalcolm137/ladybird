@@ -377,7 +377,7 @@ void WindowProxy::set_window(GC::Ref<Window> window)
     m_remote_window = nullptr;
     m_cross_origin_window_wrapper = nullptr;
 
-    if (!realm().host_defined() || !Bindings::host_defined_wrapper_world(realm()).is_main_world()) {
+    if (!is_of_main_world()) {
         m_object->set_prototype(nullptr);
         return;
     }
@@ -404,7 +404,23 @@ void WindowProxy::set_remote_window_over_provisional_window(GC::Ref<RemoteWindow
 {
     m_remote_window = window;
     m_cross_origin_window_wrapper = nullptr;
-    m_object->set_prototype(nullptr);
+
+    if (!is_of_main_world()) {
+        m_object->set_prototype(nullptr);
+        return;
+    }
+
+    // A Window of another process has no realm here, so the proxy belongs to none instead of pinning the realm of the
+    // Window it followed.
+    m_object->set_realm_and_prototype(vm().empty_realm(), nullptr);
+}
+
+// Only a proxy of the main world stands for a Window of another process, in the empty realm.
+bool WindowProxy::is_of_main_world() const
+{
+    if (&realm() == &vm().empty_realm())
+        return true;
+    return realm().host_defined() && Bindings::host_defined_wrapper_world(realm()).is_main_world();
 }
 
 bool WindowProxy::is_platform_object_same_origin() const

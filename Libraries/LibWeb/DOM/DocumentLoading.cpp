@@ -25,8 +25,10 @@
 #include <LibWeb/DOM/Document.h>
 #include <LibWeb/DOM/DocumentLoading.h>
 #include <LibWeb/DOM/IDLEventListener.h>
+#include <LibWeb/Fetch/Infrastructure/HTTP/Bodies.h>
 #include <LibWeb/Fetch/Infrastructure/HTTP/MIME.h>
 #include <LibWeb/Fetch/Response.h>
+#include <LibWeb/HTML/BrowsingContext.h>
 #include <LibWeb/HTML/EventLoop/EventLoop.h>
 #include <LibWeb/HTML/HTMLHeadElement.h>
 #include <LibWeb/HTML/HTMLImageElement.h>
@@ -37,10 +39,10 @@
 #include <LibWeb/HTML/Parser/HTMLEncodingDetection.h>
 #include <LibWeb/HTML/Parser/HTMLParser.h>
 #include <LibWeb/HTML/Parser/IncrementalDocumentParser.h>
+#include <LibWeb/HTML/PolicyContainers.h>
 #include <LibWeb/HTML/Scripting/Environments.h>
 #include <LibWeb/HTML/SharedResourceRequest.h>
 #include <LibWeb/HTML/Window.h>
-#include <LibWeb/HighResolutionTime/TimeOrigin.h>
 #include <LibWeb/Loader/GeneratedPagesLoader.h>
 #include <LibWeb/Namespace.h>
 #include <LibWeb/Platform/EventLoopPlugin.h>
@@ -58,10 +60,9 @@ static void add_pdf_viewer_ready_listener(DOM::Document& document, GC::Ref<Fetch
 
     auto listener_function = JS::NativeFunction::create(
         realm, GC::create_function(GC::Heap::the(), GC::captures(document, js_response), [](DOM::Document& document, GC::Ref<Fetch::Response>& js_response, JS::VM&) -> JS::ThrowCompletionOr<JS::Value> {
-            DOM::CustomEventInit init;
             auto& realm = document.relevant_settings_object().realm();
-            init.detail = Bindings::wrap(Bindings::host_defined_wrapper_world(realm), realm, GC::Ref { js_response });
-            document.dispatch_event(*DOM::CustomEvent::create("ladybirdpdf"_fly_string, init, HighResolutionTime::current_high_resolution_time(HTML::relevant_global_object(document))));
+            auto detail = Bindings::wrap(Bindings::host_defined_wrapper_world(realm), realm, GC::Ref { js_response });
+            document.dispatch_event(*DOM::create_custom_event(realm, "ladybirdpdf"_utf16_fly_string, detail));
             return JS::js_undefined();
         }),
         0, Utf16FlyString {}, &realm);
@@ -80,6 +81,12 @@ static void convert_to_xml_error_document(DOM::Document& document, Utf16String e
     MUST(document.append_child(html_element));
 
     if (document.ready_for_post_load_tasks())
+        return;
+
+    // NB: The XML parser stops parsing at an error the way it does at the end of its input, so the end steps it started
+    //     may still be running. They completely finish loading the document, and doing it here too would fire a second
+    //     load event at the document's container.
+    if (document.has_html_parser_end_state())
         return;
 
     if (!document.is_completely_loaded())
@@ -119,7 +126,7 @@ bool build_xml_document(DOM::Document& document, ByteBuffer const& data, Optiona
         return false;
     }
     auto source = source_or_error.release_value();
-    XML::Parser parser(source, { .resolve_named_html_entity = resolve_named_html_entity });
+    XML::Parser parser(source, { .preserve_comments = true, .resolve_named_html_entity = resolve_named_html_entity });
     XMLDocumentBuilder builder { document, scripting_support };
     auto result = parser.parse_with_listener(builder);
     return !result.is_error() && !builder.has_error();
@@ -295,15 +302,21 @@ static WebIDL::ExceptionOr<GC::Ref<DOM::Document>> load_text_document(HTML::Navi
         // The rules for how to convert the bytes of the plain text document into actual characters, and the rules for
         // actually rendering the text to the user, are defined by the specifications for the computed MIME type of the
         // resource (i.e., type).
-        // NB: JSON text is UTF-8 [RFC8259]. Like other browsers, honor a BOM or an explicit charset parameter.
+        // NB: JSON text is UTF-8 [RFC8259], whatever a BOM or the charset parameter say.
         ByteString encoding;
-        if (mime.is_json())
-            encoding = HTML::run_bom_sniff(data).value_or(Fetch::Infrastructure::legacy_extract_an_encoding(mime, "UTF-8"sv));
-        else
+        Utf16String decoded;
+        if (mime.is_json()) {
+            encoding = "UTF-8"sv;
+            decoded = TextCodec::utf8_decode_to_utf16(data).release_value_but_fixme_should_propagate_errors();
+        } else {
             encoding = HTML::run_encoding_sniffing_algorithm(document, data, mime, container_document).encoding;
-        dbgln_if(HTML_PARSER_DEBUG, "The encoding sniffing algorithm returned encoding '{}'", encoding);
+            dbgln_if(HTML_PARSER_DEBUG, "The encoding sniffing algorithm returned encoding '{}'", encoding);
+            auto decoder = TextCodec::decoder_for(encoding);
+            VERIFY(decoder.has_value());
+            decoded = TextCodec::decode_to_utf16(data, *decoder).release_value_but_fixme_should_propagate_errors();
+        }
 
-        auto run_text_parser = GC::create_function(GC::Heap::the(), GC::captures(document, move(data), url, response_header_list, move(encoding)), [](auto& document, auto& data, auto& url, auto& response_header_list, auto& encoding) {
+        auto run_text_parser = GC::create_function(GC::Heap::the(), GC::captures(document, move(decoded), url, response_header_list, move(encoding)), [](auto& document, auto& decoded, auto& url, auto& response_header_list, auto& encoding) {
             auto parser = HTML::HTMLParser::create_with_open_input_stream(document);
             parser->tokenizer().update_insertion_point();
 
@@ -323,9 +336,6 @@ static WebIDL::ExceptionOr<GC::Ref<DOM::Document>> load_text_document(HTML::Navi
             }
 
             parser->tokenizer().switch_to(HTML::HTMLTokenizer::State::PLAINTEXT);
-            auto decoder = TextCodec::decoder_for(encoding);
-            VERIFY(decoder.has_value());
-            auto decoded = TextCodec::decode_to_utf16(data, *decoder).release_value_but_fixme_should_propagate_errors();
             parser->tokenizer().insert_input_at_insertion_point(decoded);
             parser->tokenizer().insert_eof();
             parser->run(url);
@@ -452,7 +462,7 @@ static WebIDL::ExceptionOr<GC::Ref<DOM::Document>> load_media_document(HTML::Nav
     if (image_element) {
         // INTEROP: All major engines present the image from the response that was navigated to rather than fetching it
         //          again. A second fetch would be subject to the Content-Security-Policy of that same response.
-        image_element->set_resource_from_navigation_response(HTML::SharedResourceRequest::create_from_navigation_response_body(document, *navigation_params.response->body(), stop_parsing));
+        image_element->set_resource_from_navigation_response(HTML::SharedResourceRequest::create_from_image_response_body(document, document->url(), *navigation_params.response->body(), false, stop_parsing));
     } else {
         navigation_params.response->body()->fully_read(
             realm,
@@ -486,7 +496,19 @@ static GC::Ref<DOM::Document> load_pdf_document(HTML::NavigationParams const& na
     static NeverDestroyed<ByteBuffer> viewer_bytes { MUST(Core::Resource::load_from_uri("resource://ladybird/pdfjs/web/viewer.html"sv))->clone_data() };
 
     auto document = MUST(DOM::Document::create_and_initialize(DOM::Document::Type::HTML, "text/html"_utf16_fly_string, navigation_params));
-    document->set_origin(URL::Origin("resource"_string, String {}, {}));
+    // The viewer is the user agent's own page, which brings its own CSP. The PDF response's policies are for the PDF,
+    // and would stop the viewer — a base-uri or script-src directive alone refuses its resources. So the viewer gets a
+    // new policy container, which keeps only the insecure requests policy inherited from the container document.
+    auto policy_container = HTML::PolicyContainer::create();
+    if (navigation_params.navigable->parent()) {
+        auto container_state = navigation_params.navigable->container_state();
+        policy_container->inherit_insecure_requests_policy(container_state.document_insecure_requests_policy, container_state.document_upgrade_insecure_navigations_set);
+    }
+    document->set_policy_container(policy_container);
+
+    // The sandboxing flags of the PDF response's CSP would stop the viewer's scripts too, so the viewer keeps only the
+    // sandboxing flags that don't come from the response.
+    document->set_active_sandboxing_flag_set(navigation_params.final_sandboxing_flag_set & HTML::determine_the_creation_sandboxing_flags(*document->browsing_context(), *navigation_params.navigable));
 
     add_pdf_viewer_ready_listener(document, GC::Ref(*navigation_params.response));
 
@@ -529,20 +551,22 @@ bool can_load_document_with_type(MimeSniff::MimeType const& type)
 }
 
 // https://html.spec.whatwg.org/multipage/browsing-the-web.html#loading-a-document
-GC::Ptr<DOM::Document> load_document(HTML::NavigationParams const& navigation_params, ReadonlyBytes sniff_bytes)
+// AD-HOC: This returns the document to create in place of the Document, which is created once navigationParams's
+//         navigable's active document is unloaded.
+GC::Ptr<HTML::DocumentToCreate> load_document(GC::Ref<HTML::NavigationParams> navigation_params, ReadonlyBytes sniff_bytes)
 {
     // To load a document given navigation params navigationParams, source snapshot params sourceSnapshotParams,
     // and origin initiatorOrigin, perform the following steps. They return a Document or null.
 
     // 1. Let type be the computed type of navigationParams's response.
-    auto supplied_type = Fetch::Infrastructure::extract_mime_type(navigation_params.response->header_list());
+    auto supplied_type = Fetch::Infrastructure::extract_mime_type(navigation_params->response->header_list());
     auto type = MimeSniff::Resource::sniff(
         sniff_bytes,
         MimeSniff::SniffingConfiguration {
             .sniffing_context = MimeSniff::SniffingContext::Browsing,
             .supplied_type = move(supplied_type) });
 
-    VERIFY(navigation_params.response->body());
+    VERIFY(navigation_params->response->body());
 
     // 2. If the user agent has been configured to process resources of the given type using some mechanism other than
     //    rendering the content in a navigable, then skip this step.
@@ -551,14 +575,18 @@ GC::Ptr<DOM::Document> load_document(HTML::NavigationParams const& navigation_pa
     // -> an HTML MIME type
     if (type.is_html()) {
         // Return the result of loading an HTML document, given navigationParams.
-        return load_html_document(navigation_params).release_value_but_fixme_should_propagate_errors();
+        return HTML::DocumentToCreate::create(navigation_params, GC::create_function(GC::Heap::the(), [](HTML::NavigationParams const& navigation_params) -> GC::Ref<DOM::Document> {
+            return load_html_document(navigation_params).release_value_but_fixme_should_propagate_errors();
+        }));
     }
 
     // -> an XML MIME type that is not an explicitly supported XML MIME type
     //    FIXME: that is not an explicitly supported XML MIME type
     if (type.is_xml()) {
         // Return the result of loading an XML document given navigationParams and type.
-        return load_xml_document(navigation_params, type).release_value_but_fixme_should_propagate_errors();
+        return HTML::DocumentToCreate::create(navigation_params, GC::create_function(GC::Heap::the(), GC::captures(type), [](auto& type, HTML::NavigationParams const& navigation_params) -> GC::Ref<DOM::Document> {
+            return load_xml_document(navigation_params, type).release_value_but_fixme_should_propagate_errors();
+        }));
     }
 
     // -> a JavaScript MIME type
@@ -572,7 +600,9 @@ GC::Ptr<DOM::Document> load_document(HTML::NavigationParams const& navigation_pa
         || type.essence() == "text/plain"_string
         || type.essence() == "text/vtt"_string) {
         // Return the result of loading a text document given navigationParams and type.
-        return load_text_document(navigation_params, type).release_value_but_fixme_should_propagate_errors();
+        return HTML::DocumentToCreate::create(navigation_params, GC::create_function(GC::Heap::the(), GC::captures(type), [](auto& type, HTML::NavigationParams const& navigation_params) -> GC::Ref<DOM::Document> {
+            return load_text_document(navigation_params, type).release_value_but_fixme_should_propagate_errors();
+        }));
     }
 
     // -> "multipart/x-mixed-replace"
@@ -585,14 +615,21 @@ GC::Ptr<DOM::Document> load_document(HTML::NavigationParams const& navigation_pa
     if (type.is_image()
         || type.is_audio_or_video()) {
         // Return the result of loading a media document given navigationParams and type.
-        return load_media_document(navigation_params, type).release_value_but_fixme_should_propagate_errors();
+        return HTML::DocumentToCreate::create(navigation_params, GC::create_function(GC::Heap::the(), GC::captures(type), [](auto& type, HTML::NavigationParams const& navigation_params) -> GC::Ref<DOM::Document> {
+            return load_media_document(navigation_params, type).release_value_but_fixme_should_propagate_errors();
+        }));
     }
 
     // -> "application/pdf"
     // -> "text/pdf"
     if (type.essence() == "application/pdf"_string
         || type.essence() == "text/pdf"_string) {
-        return load_pdf_document(navigation_params);
+        // AD-HOC: The PDF viewer runs with an origin of its own.
+        return HTML::DocumentToCreate::create(
+            navigation_params, GC::create_function(GC::Heap::the(), [](HTML::NavigationParams const& navigation_params) -> GC::Ref<DOM::Document> {
+                return load_pdf_document(navigation_params);
+            }),
+            URL::Origin("resource"_string, String {}, {}));
     }
 
     // Otherwise, proceed onward.

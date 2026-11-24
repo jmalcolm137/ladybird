@@ -51,6 +51,9 @@ mod shape_flag {
     pub const HAS_WATCHED_SLOTS: u8 = 1 << 2;
     /// See `Shape::is_non_extensible()`.
     pub const NON_EXTENSIBLE: u8 = 1 << 3;
+    /// JIT code allocates objects of the shape from a template that holds its address (see
+    /// `Shape::note_in_allocation_template()`).
+    pub const IN_ALLOCATION_TEMPLATE: u8 = 1 << 4;
     /// The flags a shape gets from the shape it comes from.
     pub const INHERITED: u8 = HAS_PARAMETER_MAP | NON_EXTENSIBLE;
     /// An object may have left the shape (see `Shape::is_stable()`).
@@ -288,7 +291,8 @@ unsafe impl Trace for ShapeStorage {
 // SAFETY: Visits the keys.
 unsafe impl Trace for OwnStringKeys {
     fn trace(&self, visitor: &mut Visitor) {
-        visitor.visit_values(&self.keys);
+        // SAFETY: The keys are the shape's own, which only with_own_string_keys() replaces, and nothing writes them.
+        unsafe { visitor.visit_owned_values(&self.keys) };
     }
 }
 
@@ -323,6 +327,11 @@ define_cell!(Shape, Other);
 // the storage owns.
 unsafe impl Trace for Shape {
     fn trace(&self, visitor: &mut Visitor) {
+        // NB: The VM keeps the compiled code that depends on a shape by the address of the shape, and JIT code copies
+        //     the address from allocation templates, so such shapes stay where they are.
+        if self.flags.get() & (shape_flag::HAS_DEPENDENT_CODE | shape_flag::IN_ALLOCATION_TEMPLATE) != 0 {
+            visitor.pin(Gc::from_ref(self));
+        }
         self.realm.trace(visitor);
         self.prototype.trace(visitor);
         self.prototype_chain_validity.trace(visitor);
@@ -334,6 +343,89 @@ unsafe impl Trace for Shape {
 
 fn prototype_address(prototype: Option<Gc<Object>>) -> usize {
     prototype.map_or(0, |prototype| prototype.as_ptr().addr())
+}
+
+/// The shape OrdinaryCreateFromConstructor() gave a new object for `constructor`: the empty object shape of a realm
+/// with the prototype that the "prototype" data property of the constructor held, at `prototype_offset` in objects of
+/// `constructor_shape`.
+#[derive(Clone, Copy, Default)]
+struct ConstructShape {
+    constructor: Option<Gc<Object>>,
+    constructor_shape: Option<Gc<Shape>>,
+    prototype_offset: u32,
+    this_shape: Option<Gc<Shape>>,
+}
+
+const CONSTRUCT_SHAPE_CACHE_INDEX_BITS: u32 = 6;
+
+/// The shapes of the objects that constructs of ECMAScript functions created most recently, by the constructor (the
+/// new target), so that a construct does not have to look up "prototype" and the prototype transition every time. An
+/// entry holds while the constructor keeps its shape, which is no dictionary shape, and its "prototype" slot still
+/// holds the prototype of the shape.
+///
+/// The cache does not keep its cells alive: the VM's sweep callback forgets entries whose cells died.
+pub struct ConstructShapeCache {
+    entries: [Cell<ConstructShape>; 1 << CONSTRUCT_SHAPE_CACHE_INDEX_BITS],
+}
+
+impl ConstructShapeCache {
+    pub fn new() -> Self {
+        Self {
+            entries: core::array::from_fn(|_| Cell::new(ConstructShape::default())),
+        }
+    }
+
+    fn entry(&self, constructor: Gc<Object>) -> &Cell<ConstructShape> {
+        let hash = (constructor.as_ptr().addr() as u32).wrapping_mul(0x9e37_79b9);
+        &self.entries[(hash >> (32 - CONSTRUCT_SHAPE_CACHE_INDEX_BITS)) as usize]
+    }
+
+    /// The shape of an object a construct with `constructor` as the new target creates in `realm`, if it is known.
+    pub fn get(&self, constructor: Gc<Object>, realm: Gc<Realm>) -> Option<Gc<Shape>> {
+        let entry = self.entry(constructor).get();
+        if entry.constructor != Some(constructor) || entry.constructor_shape != Some(constructor.shape()) {
+            return None;
+        }
+        let this_shape = entry.this_shape?;
+        if this_shape.realm() != realm {
+            return None;
+        }
+        let prototype = constructor.get_direct(entry.prototype_offset);
+        (prototype.is_object() && this_shape.prototype() == Some(prototype.as_object())).then_some(this_shape)
+    }
+
+    /// Remembers that a construct with `constructor` as the new target created an object of `this_shape`, whose
+    /// prototype the constructor holds in its own "prototype" data property at `prototype_offset`.
+    pub fn set(&self, constructor: Gc<Object>, prototype_offset: u32, this_shape: Gc<Shape>) {
+        let constructor_shape = constructor.shape();
+        if constructor_shape.is_dictionary() {
+            return;
+        }
+        self.entry(constructor).set(ConstructShape {
+            constructor: Some(constructor),
+            constructor_shape: Some(constructor_shape),
+            prototype_offset,
+            this_shape: Some(this_shape),
+        });
+    }
+
+    pub fn remove_dead_entries(&self, sweep: &Sweep<'_>) {
+        for entry in &self.entries {
+            let construct_shape = entry.get();
+            if construct_shape
+                .constructor
+                .is_some_and(|cell| sweep.is_dead_or_moving(cell))
+                || construct_shape
+                    .constructor_shape
+                    .is_some_and(|cell| sweep.is_dead_or_moving(cell))
+                || construct_shape
+                    .this_shape
+                    .is_some_and(|cell| sweep.is_dead_or_moving(cell))
+            {
+                entry.set(ConstructShape::default());
+            }
+        }
+    }
 }
 
 /// A prototype transition the VM's cache of them remembers: from shape `from` to prototype `prototype` (see
@@ -388,11 +480,25 @@ impl PrototypeTransitionCache {
     pub fn remove_dead_entries(&self, sweep: &Sweep<'_>) {
         for entry in &self.entries {
             let transition = entry.get();
-            let is_dead = |shape| sweep.is_dead(shape);
-            if transition.from.is_some_and(is_dead) || transition.target.is_some_and(is_dead) {
+            // NB: The entry is found by the addresses of the shape and the prototype, which change if they move.
+            let is_dead = |shape| sweep.is_dead_or_moving(shape);
+            if transition.from.is_some_and(is_dead)
+                || transition.target.is_some_and(|target| {
+                    is_dead(target)
+                        || target
+                            .prototype()
+                            .is_some_and(|prototype| sweep.is_dead_or_moving(prototype))
+                })
+            {
                 entry.set(PrototypeTransition::default());
             }
         }
+    }
+}
+
+impl Default for ConstructShapeCache {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -684,7 +790,9 @@ impl Shape {
         let key = prototype_address(prototype);
         self.with_existing_rare_data(vm, |rare_data| {
             let target = rare_data.prototype_transitions.get(&key)?;
-            let Some(shape) = target.get() else {
+            // NB: The entry is keyed by the address of a prototype, which may have moved since, and another object
+            //     may be at that address now.
+            let Some(shape) = target.get().filter(|shape| shape.prototype() == prototype) else {
                 // The cached prototype transition has gone stale (from garbage collection). Prune it.
                 rare_data.prototype_transitions.remove(&key);
                 return None;
@@ -1214,6 +1322,12 @@ impl Shape {
     /// Notes that JIT code depends on the shape staying stable.
     pub fn set_has_dependent_code(&self) {
         self.flags.set(self.flags.get() | shape_flag::HAS_DEPENDENT_CODE);
+    }
+
+    /// Notes that the words of a template JIT code allocates cells from hold the address of the shape, which keeps the
+    /// shape from moving from now on.
+    pub fn note_in_allocation_template(&self) {
+        self.flags.set(self.flags.get() | shape_flag::IN_ALLOCATION_TEMPLATE);
     }
 
     /// Whether the objects of this shape are not extensible. Preventing extensions moves an object to such a shape, so

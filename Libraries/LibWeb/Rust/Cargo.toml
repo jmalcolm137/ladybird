@@ -19,13 +19,15 @@ foldhash = "0.2"
 hashbrown = "0.17.1"
 ladybird_allocator = { path = "../../RustAllocator", optional = true }
 libcompositing_rust = { path = "../../LibCompositing/Rust" }
+libcompress_rust = { path = "../../LibCompress/Rust" }
 libgfx_rust = { path = "../../LibGfx/Rust", default-features = false }
+libipc_rust = { path = "../../LibIPC/Rust" }
 liburl_rust = { path = "../../LibURL/Rust", default-features = false }
 libweb_html_tokenizer = { path = "../HTML/Parser/Rust" }
 rayon = "1.12"
 rustc-demangle = "0.1"
 serde_json = { version = "1", features = ["float_roundtrip", "preserve_order"] }
-smallvec = { version = "1.16.3", features = ["const_generics", "union"] }
+smallvec = { version = "1.16.5", features = ["const_generics", "union"] }
 
 [build-dependencies]
 cbindgen = "0.29"

@@ -28,6 +28,7 @@ mod allocation;
 mod call;
 mod call_stub;
 mod entry;
+pub mod lowering_info;
 pub use call::DIRECT_CALL_MAX_INPUTS;
 pub use call::DIRECT_CALL_TEMPS;
 
@@ -38,6 +39,7 @@ enum InputValue {
     Constant(u64),
 }
 pub use call_stub::generate_call_stub;
+pub use call_stub::generate_construct_stub;
 pub use entry::generate_entry_trampoline;
 mod array_iterators;
 mod arrays;
@@ -48,7 +50,7 @@ mod float64;
 mod named_storage;
 mod probes;
 mod property_iterator;
-mod sites;
+pub(crate) mod sites;
 mod slow_path;
 mod slow_path_calls;
 mod speculation;
@@ -56,6 +58,7 @@ mod strings;
 mod values;
 
 pub use slow_path::SlowPathCall;
+pub use slow_path::SlowPathSymbol;
 pub use slow_path::ValueSource;
 pub use slow_path::binary_operands;
 pub use slow_path::jump_operands;
@@ -63,6 +66,8 @@ pub use slow_path::slow_path_call;
 pub use slow_path::slow_path_symbol;
 
 use crate::CompileFailure;
+use crate::artifact::Artifact;
+use crate::artifact::ArtifactWriter;
 use crate::asm::Address;
 use crate::asm::Architecture;
 use crate::asm::Condition;
@@ -70,6 +75,7 @@ use crate::asm::Fpr;
 use crate::asm::FprSet;
 use crate::asm::Gpr;
 use crate::asm::GprSet;
+use crate::asm::JumpPatch;
 use crate::asm::Label;
 use crate::asm::MachineFrame;
 use crate::asm::PortableMacroAssembler;
@@ -88,10 +94,8 @@ use crate::code::CALLEE_SLOT;
 use crate::code::ExitKind;
 use crate::code::JitStatus;
 use crate::code::Repr;
-use crate::code::Site;
 use crate::code::SiteKind;
 use crate::code::ValueLocation;
-use crate::fast_hash::{HashMap, HashSet};
 use crate::ir;
 use crate::ir::BlockId;
 use crate::ir::BranchCondition;
@@ -111,8 +115,19 @@ use crate::snapshot::COMPRESSED_POINTER_SHIFT;
 use crate::snapshot::CellId;
 use crate::snapshot::ExecutableSnapshot;
 use crate::snapshot::RuntimeInfo;
+use crate::snapshot::Snapshot;
 use crate::snapshot::StressOptions;
-pub(crate) use sites::site;
+use ak::Column;
+use ak::Zone;
+use ak::ZoneMap;
+use ak::ZoneSet;
+use ak::ZoneVec;
+use sites::SiteScratch;
+use sites::SiteSource;
+
+/// The most bytes of code a stub or the entry trampoline has, and of lists its code generator makes.
+const STUB_CODE_LIMIT: usize = 1 << 20;
+const STUB_ZONE_LIMIT: usize = 1 << 24;
 
 /// Bit 32 of a slow path control word marks a continuation in the same frame.
 const CONTINUATION_BIT: u64 = 1 << 32;
@@ -156,8 +171,9 @@ pub fn target_registers<M: PortableMacroAssembler>() -> (RegisterSet, PinnedRegi
         allocatable_fprs: RegisterMask(allocatable_fprs),
         caller_saved_gprs: RegisterMask(u64::from(M::CALLER_SAVED_GPRS.0)),
         caller_saved_fprs: RegisterMask(u64::from(M::CALLER_SAVED_FPRS.0)),
-        argument_gprs: M::ARGUMENT_GPRS.iter().map(|register| register.0).collect(),
+        argument_gprs: M::ARGUMENT_GPRS,
         return_gpr: M::RETURN_GPRS[0].0,
+        shift_amount_gpr: M::SHIFT_AMOUNT_GPR.map(|register| register.0),
         scratch_gpr: pinned.scratch.0,
     };
     (registers, pinned)
@@ -198,21 +214,65 @@ pub(super) fn register_of(register: u8) -> Register {
     }
 }
 
-/// Machine code for one graph, before it becomes `CompiledCode`.
-pub struct GeneratedCode {
-    pub code: Vec<u8>,
+/// A list of at most 32 values (one for each register of a class), in an array of its own: the short lists that the
+/// code generator makes for a node, mostly of registers, take no memory of a zone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct RegisterList<T> {
+    values: [T; 32],
+    len: u8,
+}
+
+impl<T: Copy + Default> RegisterList<T> {
+    pub(super) fn new() -> Self {
+        Self {
+            values: [T::default(); 32],
+            len: 0,
+        }
+    }
+
+    pub(super) fn push(&mut self, value: T) {
+        self.values[usize::from(self.len)] = value;
+        self.len += 1;
+    }
+}
+
+impl<T: Copy + Default> Default for RegisterList<T> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<T> core::ops::Deref for RegisterList<T> {
+    type Target = [T];
+
+    fn deref(&self) -> &[T] {
+        &self.values[..usize::from(self.len)]
+    }
+}
+
+impl<T: Copy + Default> FromIterator<T> for RegisterList<T> {
+    fn from_iter<I: IntoIterator<Item = T>>(values: I) -> Self {
+        let mut list = Self::new();
+        for value in values {
+            list.push(value);
+        }
+        list
+    }
+}
+
+/// Machine code for one graph, before it becomes `CompiledCode`. The code is in the column it was generated into.
+pub struct GeneratedCode<'a> {
     /// Where the instructions end and the constants they load begin.
     pub data_offset: u32,
     pub entry_offset: u32,
-    pub sites: Vec<Site>,
     /// What the code from each offset on was generated for, in emission
     /// order. Only `dump-asm` reads it.
-    pub annotations: Vec<(u32, CodeAnnotation)>,
+    pub annotations: ZoneVec<'a, (u32, CodeAnnotation)>,
     /// The on-stack replacement entry points, as (back edge pc, code offset).
-    pub osr_entries: Vec<(u32, u32)>,
+    pub osr_entries: ZoneVec<'a, (u32, u32)>,
     /// What invalidates the code: the bytes to write at each offset (see
     /// `Op::AssumeValid`).
-    pub invalidation_patches: Vec<(u32, Vec<u8>)>,
+    pub invalidation_patches: ZoneVec<'a, (u32, JumpPatch)>,
     /// See `CompiledCode::site_index_frame_offset`.
     pub site_index_frame_offset: i32,
     /// See `CompiledCode::register_dump_frame_offset`.
@@ -230,8 +290,8 @@ pub enum CodeAnnotation {
     BlockEndMoves,
     /// Out-of-line code of a node, emitted after the blocks.
     Deferred(NodeId),
-    /// The code that takes the exit or leave site `index` (an index into
-    /// `sites`) of `node`.
+    /// The code that takes the exit or leave site `index` (see
+    /// `Artifact::site()`) of `node`.
     Exit {
         index: u32,
         node: NodeId,
@@ -264,12 +324,19 @@ struct Locals {
     spills: u32,
 }
 
-struct Codegen<'a, M: PortableMacroAssembler> {
-    masm: M,
-    graph: &'a Graph,
-    allocation: &'a Allocation,
-    /// `Snapshot::executables`; index 0 is the compiled function.
-    executables: &'a [ExecutableSnapshot],
+/// The code generator of a graph, which keeps its lists in the work zone (`'a`) and writes code with an assembler
+/// whose memory lives for `'c`.
+struct Codegen<'a, 'c, M: PortableMacroAssembler> {
+    masm: M::In<'c>,
+    graph: &'a Graph<'a>,
+    allocation: &'a Allocation<'a>,
+    /// What the graph was built from. Executable 0 is the compiled function.
+    snapshot: &'a Snapshot,
+    /// Where the lists of the code generator are.
+    work: &'a Zone,
+    /// The instructions that code generation decoded again, by executable and pc, so that each is decoded one time.
+    decoded_instructions: ZoneMap<'a, (u32, u32), DecodedInstruction<'a>>,
+    /// The runtime info of the snapshot.
     runtime: &'a RuntimeInfo,
     stress: StressOptions,
     pinned: PinnedRegisters,
@@ -277,38 +344,42 @@ struct Codegen<'a, M: PortableMacroAssembler> {
     locals: Locals,
     gpr_dump_count: u32,
     fpr_dump_count: u32,
-    block_labels: Vec<Label>,
+    block_labels: &'a [Label],
     /// Where control that goes to each block lands (see `landing_blocks()`).
-    landing_blocks: Vec<BlockId>,
+    landing_blocks: &'a [BlockId],
     exit_stub: Label,
     resume: Label,
     /// Where the prologues resume in the interpreter.
     entry_resume: Label,
+    /// Where the prologues resume in the interpreter if the frame does not fit on the native stack, before they set it
+    /// up.
+    entry_overflow: Label,
     exit_interpreter: Label,
     /// The nodes of the code's sites, by site index, with what they are.
-    sites: Vec<(NodeId, SiteKind)>,
+    sites: ZoneVec<'a, (NodeId, SiteKind)>,
     /// Out of line stubs that store an exit index and jump to the exit stub.
-    exit_site_stubs: Vec<(Label, u32)>,
-    annotations: Vec<(u32, CodeAnnotation)>,
+    exit_site_stubs: ZoneVec<'a, (Label, u32)>,
+    annotations: ZoneVec<'a, (u32, CodeAnnotation)>,
     /// The block being emitted.
     block: BlockId,
-    deferred_cache_probes: Vec<probes::DeferredCacheProbe>,
-    deferred_allocations: Vec<allocation::DeferredAllocation>,
-    deferred_storage_growths: Vec<named_storage::DeferredStorageGrowth>,
+    deferred_cache_probes: ZoneVec<'a, probes::DeferredCacheProbe>,
+    deferred_vm_cache_probes: ZoneVec<'a, probes::DeferredVmCacheProbe>,
+    deferred_allocations: ZoneVec<'a, allocation::DeferredAllocation<'a>>,
+    deferred_storage_growths: ZoneVec<'a, named_storage::DeferredStorageGrowth>,
     /// `InitializeNamed` nodes whose constant the allocation of their object
     /// stored already.
-    absorbed_initializations: Vec<NodeId>,
+    absorbed_initializations: ZoneVec<'a, NodeId>,
     /// `InitializeNamed` nodes right after the allocation of their object, which still has its properties inline.
-    inline_initializations: HashSet<NodeId>,
+    inline_initializations: ZoneSet<'a, NodeId>,
     /// The slots of the compiled function's frame that hold its arguments
     /// object, which the code never created, when the node being emitted
     /// (in the compiled function or an inlined callee) leaves the code after
     /// its slow path: they get the object before the interpreter continues
     /// with the frames. Whether it is a mapped one.
-    leave_arguments: Vec<(u32, bool)>,
+    leave_arguments: ZoneVec<'a, (u32, bool)>,
     /// Out of line code for slow paths that do not continue with the next
     /// instruction, emitted with the tails.
-    leave_stubs: Vec<LeaveStub>,
+    leave_stubs: ZoneVec<'a, LeaveStub<'a>>,
     /// How the slow path of the node being emitted leaves compiled code, if
     /// it writes the node's frame state then (see `LeaveFrame`).
     leave_frame: Option<LeaveFrame>,
@@ -319,52 +390,53 @@ struct Codegen<'a, M: PortableMacroAssembler> {
     /// While a `CallSlowPath` node that is a call is emitted: where the
     /// operands of its slow path are.
     slow_path_values: Option<SlowPathValues>,
+    /// While `slow_path_values` is set: the index of the first of the node's inputs with each operand.
+    input_of_operand: ZoneMap<'a, u32, usize>,
+    /// While `slow_path_values` is set: the outputs that are SSA values, which no frame slot receives.
+    slow_path_ssa_outputs: ZoneVec<'a, u32>,
+    /// Lists that the lowering of a node fills, which keep their memory for the next node: the operands of a slow
+    /// path call and the outputs it stores, the operands of a call, the constant fields an allocation stores, and
+    /// the values of a frame.
+    spare_operands: ZoneVec<'a, u32>,
+    spare_outputs: ZoneVec<'a, (OutputSource, u32)>,
+    spare_call_operands: ZoneVec<'a, call::CallOperand>,
+    spare_fields: ZoneVec<'a, call::ConstantField>,
+    spare_frame_values: ZoneVec<'a, (u32, ValueLocation)>,
+    spare_bytes: ZoneVec<'a, u8>,
     /// The target of the branch on the result of the cache probe being
     /// emitted, which the probe branches to itself where it finds nothing
     /// (see `fused_probe_branch()`).
     fused_probe_failure: Option<Label>,
     /// The no-ops of `AssumeValid` nodes, with the exits that the jumps
     /// replacing them go to once the code is invalidated.
-    invalidation_points: Vec<(usize, Label)>,
+    invalidation_points: ZoneVec<'a, (usize, Label)>,
+    /// Whether to check that the lowerings match what they declare (see `verify_lowerings()`).
+    verify: bool,
+    /// The node whose code (inline or out of line) is being emitted, if any.
+    emitting: Option<NodeId>,
+    /// How many temps each node's lowering took (see `temp()`).
+    requested_temps: &'a [core::cell::Cell<u8>],
+    /// The nodes whose code used the saves area without declaring it.
+    undeclared_saves_area_uses: core::cell::RefCell<ZoneVec<'a, NodeId>>,
 }
 
 /// The operands of the slow path of a `CallSlowPath` node that is a call,
-/// which reads them from the node's inputs instead of frame slots.
+/// which reads them from the node's inputs instead of frame slots (see
+/// `Codegen::input_of_operand` and `Codegen::slow_path_ssa_outputs`).
+#[derive(Clone, Copy)]
 struct SlowPathValues {
     node: NodeId,
-    /// The index of the first of the node's inputs with each operand.
-    input_of_operand: HashMap<u32, usize>,
     /// Where the inputs in registers are.
     registers: InputRegisters,
-    /// The outputs that are SSA values, which no frame slot receives.
-    ssa_outputs: Vec<u32>,
-}
-
-impl SlowPathValues {
-    /// `operands` are those of the node's inputs, in input order.
-    fn new(node: NodeId, operands: &[u32], registers: InputRegisters, ssa_outputs: Vec<u32>) -> Self {
-        // NB: Looking up each operand in a list would take time quadratic in the operand count of instructions like
-        //     NewArray of a large array literal.
-        let mut input_of_operand = HashMap::with_capacity_and_hasher(operands.len(), Default::default());
-        for (index, operand) in operands.iter().enumerate() {
-            input_of_operand.entry(*operand).or_insert(index);
-        }
-        Self {
-            node,
-            input_of_operand,
-            registers,
-            ssa_outputs,
-        }
-    }
 }
 
 /// Where the code of a slow path call or a call finds those of its inputs
 /// that are in registers, once it clobbered registers.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub(super) enum InputRegisters {
     /// In their registers, except for these, which are in the saves area,
     /// in the order of their words there.
-    Saved(Vec<Gpr>),
+    Saved(RegisterList<Gpr>),
     /// In the register dump that publishing the frames of the inlined calls
     /// wrote (see `emit_publish_frames()`), since that clobbered every
     /// register a call clobbers.
@@ -380,52 +452,60 @@ pub(super) enum InputRegisters {
 /// the frame. Slow paths and calls in inlined callees run in frames the
 /// runtime published with their headers only (see `SiteKind::Publish`),
 /// which the leave fills as far as they are still on the stack.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 struct LeaveFrame {
     node: NodeId,
     /// Registers a slow path saved, with where, to restore first.
-    restore: Vec<(Gpr, u32)>,
+    restore: RegisterList<(Gpr, u32)>,
 }
 
 /// The out of line part of a slow path call: what runs when the slow path
 /// does not continue with the next instruction.
-struct LeaveStub {
+#[derive(Clone, Copy)]
+struct LeaveStub<'a> {
     label: Label,
     /// See `Codegen::leave_frame`.
     leave_frame: Option<LeaveFrame>,
     /// Outputs that are also inputs, stored back if the frame still runs.
-    input_outputs: Vec<(OutputSource, u32)>,
+    input_outputs: &'a [(OutputSource, u32)],
     /// See `Codegen::leave_arguments`.
-    leave_arguments: Vec<(u32, bool)>,
+    leave_arguments: &'a [(u32, bool)],
 }
 
-/// Generates code for `graph` with `allocation`, whose registers came from
-/// `target_registers::<M>()`.
-pub fn generate<M: PortableMacroAssembler>(
-    graph: &Graph,
-    allocation: &Allocation,
-    executables: &[ExecutableSnapshot],
-    runtime: &RuntimeInfo,
-    stress: StressOptions,
-) -> Result<GeneratedCode, CompileFailure> {
+/// Generates code for `graph` with the register allocation `allocation`, whose registers came from
+/// `target_registers::<M>()`, into `code` in place of what it holds, and writes the sites of the code into
+/// `artifact`, which holds nothing. With `verify` (and in debug builds), checks that every lowering matches its
+/// `lowering_info()`.
+pub fn generate<'a, M: PortableMacroAssembler>(
+    graph: &'a Graph<'a>,
+    snapshot: &'a Snapshot,
+    verify: bool,
+    artifact: &mut ArtifactWriter<'_>,
+    allocation: &'a Allocation<'a>,
+    code: &mut Column<u8>,
+    work: &'a Zone,
+) -> Result<GeneratedCode<'a>, CompileFailure> {
     let (_, pinned) = target_registers::<M>();
     let (gpr_dump_count, fpr_dump_count) = register_dump_counts::<M>();
-    let mut masm = M::new();
-    let block_labels = graph.blocks.iter().map(|_| masm.new_label()).collect();
-    let landing_blocks = landing_blocks(graph, allocation);
+    let mut masm = M::new(code, work);
+    let block_labels = work.alloc_slice_from_iter(graph.blocks.iter().map(|_| masm.new_label()));
+    let landing_blocks = landing_blocks(graph, allocation, work);
     let exit_stub = masm.new_label();
     let resume = masm.new_label();
     let entry_resume = masm.new_label();
+    let entry_overflow = masm.new_label();
     let exit_interpreter = masm.new_label();
     let leave_tail = masm.new_label();
 
-    let mut codegen = Codegen {
+    let mut codegen = Codegen::<M> {
         masm,
         graph,
         allocation,
-        executables,
-        runtime,
-        stress,
+        snapshot,
+        work,
+        decoded_instructions: ZoneMap::new_in(work),
+        runtime: &snapshot.runtime,
+        stress: snapshot.options.stress,
         pinned,
         frame: M::frame(GprSet::EMPTY, FprSet::EMPTY, 0),
         locals: Locals::default(),
@@ -436,24 +516,38 @@ pub fn generate<M: PortableMacroAssembler>(
         exit_stub,
         resume,
         entry_resume,
+        entry_overflow,
         exit_interpreter,
-        sites: Vec::new(),
-        exit_site_stubs: Vec::new(),
-        annotations: Vec::new(),
+        sites: ZoneVec::new_in(work),
+        exit_site_stubs: ZoneVec::new_in(work),
+        annotations: ZoneVec::new_in(work),
         block: BlockId(0),
-        deferred_cache_probes: Vec::new(),
-        deferred_allocations: Vec::new(),
-        deferred_storage_growths: Vec::new(),
-        absorbed_initializations: Vec::new(),
-        inline_initializations: HashSet::default(),
-        leave_arguments: Vec::new(),
-        leave_stubs: Vec::new(),
+        deferred_cache_probes: ZoneVec::new_in(work),
+        deferred_vm_cache_probes: ZoneVec::new_in(work),
+        deferred_allocations: ZoneVec::new_in(work),
+        deferred_storage_growths: ZoneVec::new_in(work),
+        absorbed_initializations: ZoneVec::new_in(work),
+        inline_initializations: ZoneSet::new_in(work),
+        leave_arguments: ZoneVec::new_in(work),
+        leave_stubs: ZoneVec::new_in(work),
         leave_frame: None,
         leave_tail,
         frame_initialization_stub: None,
         slow_path_values: None,
-        invalidation_points: Vec::new(),
+        input_of_operand: ZoneMap::new_in(work),
+        slow_path_ssa_outputs: ZoneVec::new_in(work),
+        spare_operands: ZoneVec::new_in(work),
+        spare_outputs: ZoneVec::new_in(work),
+        spare_call_operands: ZoneVec::new_in(work),
+        spare_fields: ZoneVec::new_in(work),
+        spare_frame_values: ZoneVec::new_in(work),
+        spare_bytes: ZoneVec::new_in(work),
+        invalidation_points: ZoneVec::new_in(work),
         fused_probe_failure: None,
+        verify: verify || cfg!(debug_assertions),
+        emitting: None,
+        requested_temps: work.alloc_slice_from_iter(graph.nodes.iter().map(|_| core::cell::Cell::new(0))),
+        undeclared_saves_area_uses: core::cell::RefCell::new(ZoneVec::new_in(work)),
     };
     codegen.lay_out_frame()?;
     codegen.emit_prologue();
@@ -468,36 +562,32 @@ pub fn generate<M: PortableMacroAssembler>(
     codegen.emit_tails();
     codegen.emit_frame_initialization_stub()?;
     let osr_entries = codegen.emit_osr_entries();
+    if codegen.verify
+        && let Err(errors) = codegen.verify_lowerings()
+    {
+        panic!("lowerings that do not match their declarations:\n{errors}");
+    }
 
-    let sites = codegen
-        .sites
-        .iter()
-        .map(|(node, kind)| codegen.site_descriptor(*node, *kind))
-        .collect();
-    let annotations = std::mem::take(&mut codegen.annotations);
-    let invalidation_patches = codegen
-        .invalidation_points
-        .iter()
-        .map(|(offset, exit)| {
-            let target = codegen.masm.label_offset(*exit).expect("exit stubs are bound");
-            (
-                u32::try_from(*offset).expect("code fits in 4 GiB"),
-                M::jump_patch(*offset, target),
-            )
-        })
-        .collect();
+    let mut sites = SiteScratch::new_in(graph, work)?;
+    for (node, kind) in &*codegen.sites {
+        codegen.with_site_source(*node, *kind, |site| site.write(&mut sites, artifact))?;
+    }
+    let annotations = codegen.annotations.take();
+    let mut invalidation_patches = ZoneVec::with_capacity_in(codegen.invalidation_points.len(), work);
+    for (offset, exit) in &*codegen.invalidation_points {
+        let target = codegen.masm.label_offset(*exit).expect("exit stubs are bound");
+        invalidation_patches.push((
+            u32::try_from(*offset).expect("code fits in 4 GiB"),
+            M::jump_patch(*offset, target),
+        ));
+    }
     let site_index_frame_offset = codegen.local_frame_pointer_offset(codegen.locals.exit_index);
     let register_dump_frame_offset = codegen.local_frame_pointer_offset(codegen.locals.dump);
-    let (code, data_offset) = codegen
-        .masm
-        .finish_with_data_offset()
-        .map_err(|_| CompileFailure::CodeGeneration)?;
+    let data_offset = codegen.masm.finish().map_err(assembly_failure)?;
     let data_offset = u32::try_from(data_offset).expect("code fits in 4 GiB");
     Ok(GeneratedCode {
-        code,
         data_offset,
         entry_offset: 0,
-        sites,
         annotations,
         osr_entries,
         invalidation_patches,
@@ -506,101 +596,165 @@ pub fn generate<M: PortableMacroAssembler>(
     })
 }
 
-/// Points `location`, a register among `saves` (registers with the frame
-/// pointer offsets of their words in the saves area), at its word there.
-fn relocate_saved_register(location: &mut ValueLocation, saves: &[(Gpr, i32)]) {
-    // NB: Float64 values are in floating point registers, which are not saved.
-    if let ValueLocation::Register(register, repr) = *location
-        && repr != crate::code::Repr::Float64
-        && let Some((_, offset)) = saves.iter().find(|(saved, _)| saved.0 == register)
-    {
-        *location = ValueLocation::Stack(*offset, repr);
+/// Why a compile fails when the assembler could not finish the code.
+fn assembly_failure(error: crate::asm::AsmError) -> CompileFailure {
+    match error {
+        crate::asm::AsmError::TooLarge => CompileFailure::TooLarge,
+        crate::asm::AsmError::UnboundLabel | crate::asm::AsmError::BranchOutOfRange => CompileFailure::CodeGeneration,
     }
 }
 
-/// The machine code as disassembly, under headers naming the block, IR node
+/// The machine code `code` as disassembly, under headers naming the block, IR node
 /// or tail each run of instructions was generated for. Calls of runtime
 /// helpers and well-known values are named.
-pub fn dump_code(
-    graph: &Graph,
-    executable: &ExecutableSnapshot,
-    runtime: &RuntimeInfo,
+pub fn dump_code<'a>(
+    graph: &'a Graph<'a>,
+    executable: &'a ExecutableSnapshot,
+    runtime: &'a RuntimeInfo,
     architecture: Architecture,
-    generated: &GeneratedCode,
-) -> String {
-    use std::fmt::Write;
+    code: &'a [u8],
+    generated: &'a GeneratedCode<'a>,
+    artifact: Artifact<'a>,
+) -> CodeDump<'a> {
+    CodeDump {
+        graph,
+        executable,
+        runtime,
+        architecture,
+        code,
+        generated,
+        artifact,
+    }
+}
 
-    let mut symbols = vec![
-        (runtime.jit_call, "libjs_jit_call".to_string()),
-        (runtime.jit_exit, "libjs_jit_exit".to_string()),
-        (runtime.finish_direct_call, "libjs_jit_finish_direct_call".to_string()),
-        (runtime.to_boolean, "asm_helper_to_boolean".to_string()),
-        (runtime.heap_region_base, "js_heap_region_base".to_string()),
-    ];
-    for (index, address) in runtime.slow_paths.iter().enumerate() {
-        let opcode = u8::try_from(index).ok().and_then(OpCode::from_u8);
-        if let Some(symbol) = opcode.and_then(slow_path_symbol) {
-            symbols.push((*address, symbol));
+/// The text of `dump_code()`.
+pub struct CodeDump<'a> {
+    graph: &'a Graph<'a>,
+    executable: &'a ExecutableSnapshot,
+    runtime: &'a RuntimeInfo,
+    architecture: Architecture,
+    code: &'a [u8],
+    generated: &'a GeneratedCode<'a>,
+    artifact: Artifact<'a>,
+}
+
+/// What a constant in code is, if the dump of the code names it.
+enum ConstantName {
+    Helper(&'static str),
+    SlowPath(SlowPathSymbol),
+    /// An address in the bytecode of the executable, at this offset.
+    Bytecode(u64),
+    Value(value::Description),
+}
+
+impl core::fmt::Display for ConstantName {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Helper(symbol) => f.write_str(symbol),
+            Self::SlowPath(symbol) => write!(f, "{symbol}"),
+            Self::Bytecode(offset) => write!(f, "bytecode @{offset}"),
+            Self::Value(description) => write!(f, "{description}"),
         }
     }
-    symbols.retain(|(address, _)| *address != 0);
-    let describe_constant = |bits: u64| {
-        if let Some((_, symbol)) = symbols.iter().find(|(address, _)| *address == bits) {
-            return Some(symbol.clone());
+}
+
+impl CodeDump<'_> {
+    fn name_constant(&self, bits: u64) -> Option<ConstantName> {
+        let (runtime, executable) = (self.runtime, self.executable);
+        if bits != 0 {
+            let helpers = [
+                (runtime.jit_call, "libjs_jit_call"),
+                (runtime.jit_exit, "libjs_jit_exit"),
+                (runtime.finish_direct_call, "libjs_jit_finish_direct_call"),
+                (runtime.to_boolean, "asm_helper_to_boolean"),
+                (runtime.heap_region_base, "js_heap_region_base"),
+            ];
+            if let Some((_, symbol)) = helpers.iter().find(|(address, _)| *address == bits) {
+                return Some(ConstantName::Helper(symbol));
+            }
+            let slow_path = runtime
+                .slow_paths
+                .iter()
+                .enumerate()
+                .filter(|(_, address)| **address == bits)
+                .find_map(|(index, _)| {
+                    u8::try_from(index)
+                        .ok()
+                        .and_then(OpCode::from_u8)
+                        .and_then(slow_path_symbol)
+                });
+            if let Some(symbol) = slow_path {
+                return Some(ConstantName::SlowPath(symbol));
+            }
         }
         let bytecode_end = executable.bytecode_address + executable.bytecode.len() as u64;
         if (executable.bytecode_address..bytecode_end).contains(&bits) {
-            return Some(format!("bytecode @{}", bits - executable.bytecode_address));
+            return Some(ConstantName::Bytecode(bits - executable.bytecode_address));
         }
         let description = value::describe(bits);
-        (!description.starts_with("0x")).then_some(description)
-    };
-
-    let instructions = disassembler::listing_with_data(architecture, &generated.code, generated.data_offset as usize);
-    let mut annotations = generated.annotations.iter().peekable();
-    let layout = &executable.layout;
-    let mut out = String::new();
-    for instruction in &instructions {
-        while let Some((_, annotation)) = annotations.next_if(|(offset, _)| *offset as usize <= instruction.offset) {
-            match annotation {
-                CodeAnnotation::Prologue => out.push_str("prologue:\n"),
-                CodeAnnotation::Block(block) => writeln!(out, "b{}:", block.0).unwrap(),
-                CodeAnnotation::Node(node) => {
-                    writeln!(out, "  {}", ir::node_text(graph, layout, *node)).unwrap();
-                }
-                CodeAnnotation::BlockEndMoves => out.push_str("  block end moves\n"),
-                CodeAnnotation::Deferred(node) => {
-                    writeln!(out, "deferred code of {}", ir::node_text(graph, layout, *node)).unwrap();
-                }
-                CodeAnnotation::Tail(name) => writeln!(out, "{name}:").unwrap(),
-                CodeAnnotation::Exit { index, node } => {
-                    let kind = match generated.sites[*index as usize].kind {
-                        SiteKind::Exit(kind) => format!("{kind:?}"),
-                        kind => format!("{kind:?}"),
-                    };
-                    writeln!(out, "  exit #{index} ({kind}) of v{}:", node.0).unwrap();
-                }
-            }
-        }
-        write!(out, "    {:06x}  {}", instruction.offset, instruction.text).unwrap();
-        if let Some(description) = instruction.constant.and_then(describe_constant) {
-            write!(out, "  ; {description}").unwrap();
-        }
-        out.push('\n');
+        description.is_known_value().then_some(ConstantName::Value(description))
     }
-    let count = |kind: fn(SiteKind) -> bool| generated.sites.iter().filter(|site| kind(site.kind)).count();
-    writeln!(
-        out,
-        "{} instructions, {} bytes, {} exits, {} leaves, {} publish sites, {} call sites",
-        instructions.len(),
-        generated.code.len(),
-        count(|kind| matches!(kind, SiteKind::Exit(_))),
-        count(|kind| kind == SiteKind::Leave),
-        count(|kind| kind == SiteKind::Publish),
-        count(|kind| kind == SiteKind::Call),
-    )
-    .unwrap();
-    out
+
+    fn write_annotation(&self, f: &mut core::fmt::Formatter<'_>, annotation: &CodeAnnotation) -> core::fmt::Result {
+        let (graph, layout) = (self.graph, &self.executable.layout);
+        match annotation {
+            CodeAnnotation::Prologue => f.write_str("prologue:\n"),
+            CodeAnnotation::Block(block) => writeln!(f, "b{}:", block.0),
+            CodeAnnotation::Node(node) => writeln!(f, "  {}", ir::node_text(graph, layout, *node)),
+            CodeAnnotation::BlockEndMoves => f.write_str("  block end moves\n"),
+            CodeAnnotation::Deferred(node) => writeln!(f, "deferred code of {}", ir::node_text(graph, layout, *node)),
+            CodeAnnotation::Tail(name) => writeln!(f, "{name}:"),
+            CodeAnnotation::Exit { index, node } => match self.artifact.site(*index).kind() {
+                SiteKind::Exit(kind) => writeln!(f, "  exit #{index} ({kind:?}) of v{}:", node.0),
+                kind => writeln!(f, "  exit #{index} ({kind:?}) of v{}:", node.0),
+            },
+        }
+    }
+}
+
+impl core::fmt::Display for CodeDump<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let generated = self.generated;
+        let mut annotations = generated.annotations.iter().peekable();
+        let mut instruction_count = 0;
+        let mut result = Ok(());
+        disassembler::for_each_instruction(
+            self.architecture,
+            self.code,
+            generated.data_offset as usize,
+            |instruction| {
+                instruction_count += 1;
+                if result.is_err() {
+                    return;
+                }
+                result = (|| {
+                    while let Some((_, annotation)) =
+                        annotations.next_if(|(offset, _)| *offset as usize <= instruction.offset)
+                    {
+                        self.write_annotation(f, annotation)?;
+                    }
+                    write!(f, "    {:06x}  {}", instruction.offset, instruction.text)?;
+                    if let Some(name) = instruction.constant.and_then(|bits| self.name_constant(bits)) {
+                        write!(f, "  ; {name}")?;
+                    }
+                    f.write_str("\n")
+                })();
+            },
+        );
+        result?;
+        let artifact = self.artifact;
+        let count = |kind: fn(SiteKind) -> bool| artifact.sites().filter(|site| kind(site.kind())).count();
+        writeln!(
+            f,
+            "{} instructions, {} bytes, {} exits, {} leaves, {} publish sites, {} call sites",
+            instruction_count,
+            self.code.len(),
+            count(|kind| matches!(kind, SiteKind::Exit(_))),
+            count(|kind| kind == SiteKind::Leave),
+            count(|kind| kind == SiteKind::Publish),
+            count(|kind| kind == SiteKind::Call),
+        )
+    }
 }
 
 /// For a block that ends in a cache probe and a branch on its result, where
@@ -638,20 +792,20 @@ fn fused_probe_branch(graph: &Graph, allocation: &Allocation, block: BlockId) ->
         ) => (*if_false, *if_true),
         _ => return None,
     };
-    (!allocation.live_in[failure.index()].contains(probe.index())).then_some((control, failure, success))
+    (!allocation.is_live_in(failure, probe)).then_some((control, failure, success))
 }
 
 /// Where control that goes to each block lands: blocks that only jump on, like the edges the builder splits off
 /// branches, pass it on, so jumps go straight to where they lead and those blocks have no code. The first block, which
 /// the prologue falls into, and blocks that jump on in a cycle land in themselves.
-fn landing_blocks(graph: &Graph, allocation: &Allocation) -> Vec<BlockId> {
+fn landing_blocks<'a>(graph: &Graph, allocation: &Allocation, work: &'a Zone) -> &'a [BlockId] {
     let block_count = graph.blocks.len();
     let jumps_on = |index: usize| -> Option<BlockId> {
         let block = &graph.blocks[index];
         if index == 0
             || !block.phis.is_empty()
             || !block.body.is_empty()
-            || !allocation.block_end_moves[index].is_empty()
+            || !allocation.block_end_moves(BlockId::from_index(index)).is_empty()
         {
             return None;
         }
@@ -660,25 +814,23 @@ fn landing_blocks(graph: &Graph, allocation: &Allocation) -> Vec<BlockId> {
             _ => None,
         }
     };
-    (0..block_count)
-        .map(|index| {
-            let mut landing = index;
-            for _ in 0..block_count {
-                match jumps_on(landing) {
-                    Some(target) => landing = target.index(),
-                    None => return BlockId::from_index(landing),
-                }
+    work.alloc_slice_from_iter((0..block_count).map(|index| {
+        let mut landing = index;
+        for _ in 0..block_count {
+            match jumps_on(landing) {
+                Some(target) => landing = target.index(),
+                None => return BlockId::from_index(landing),
             }
-            BlockId::from_index(index)
-        })
-        .collect()
+        }
+        BlockId::from_index(index)
+    }))
 }
 
 fn checked_i32(value: u64) -> Result<i32, CompileFailure> {
     i32::try_from(value).map_err(|_| CompileFailure::CodeGeneration)
 }
 
-impl<M: PortableMacroAssembler> Codegen<'_, M> {
+impl<'a, M: PortableMacroAssembler> Codegen<'a, '_, M> {
     // Frame layout.
 
     /// Sizes the locals area and decides which callee-saved registers to save.
@@ -696,23 +848,19 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
         let needs_saves_area = (0..self.graph.blocks.len())
             .flat_map(|block| self.graph.block_nodes(BlockId::from_index(block)))
             .any(|node| self.uses_saves_area(node));
+        // NB: This sizes the record for the nodes that are no longer in any block too.
         for node in &self.graph.nodes {
-            // NB: The runtime's PutById cache probe takes a record.
-            if let Op::ProbePropertyStore { .. } = node.op {
-                record_bytes = record_bytes.max(probes::PUT_BY_ID_RECORD_BYTES);
-            }
-            // NB: Binary slow paths called on values write their result into
-            //     the record.
-            if let Op::CallSlowPath { opcode, .. } = node.op
-                && slow_path_call(opcode) == Some(SlowPathCall::BinaryValues)
-            {
-                record_bytes = record_bytes.max(8);
-            }
-            match node.op {
-                Op::Generic { opcode, executable, pc }
-                | Op::CallSlowPath {
-                    opcode, executable, pc, ..
-                } if slow_path_call(opcode) == Some(SlowPathCall::Record) => {
+            match lowering_info::lowering_info(node).record {
+                lowering_info::Record::None => {}
+                lowering_info::Record::Bytes(bytes) => record_bytes = record_bytes.max(bytes),
+                lowering_info::Record::SlowPathOperands => {
+                    let (Op::Generic { opcode, executable, pc }
+                    | Op::CallSlowPath {
+                        opcode, executable, pc, ..
+                    }) = node.op
+                    else {
+                        unreachable!("only slow path calls take their operands in the record");
+                    };
                     let layout = slow_path_layout(opcode);
                     let (inputs, fixed_registers) = match layout.abi {
                         SlowPathAbi::Scalar => (
@@ -737,7 +885,7 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
                     outgoing_bytes = outgoing_bytes.max(8 * stack_arguments);
                     let array_count = layout
                         .array
-                        .map_or(Ok(0), |array| self.read_u32(executable, pc, array.count_offset))?;
+                        .map_or(Ok(0), |array| self.read_array_count(executable, pc, array))?;
                     let record = match layout.abi {
                         SlowPathAbi::Scalar => 0,
                         SlowPathAbi::ScalarInputs => layout.fields.len() as u32,
@@ -745,7 +893,6 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
                     };
                     record_bytes = record_bytes.max(8 * record);
                 }
-                _ => {}
             }
         }
         let record = outgoing_bytes.next_multiple_of(16);
@@ -780,73 +927,72 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
         //     load it, see `entry.rs`) and does not keep the scratch register.
         let mut saved = GprSet::EMPTY.with(self.pinned.frame);
         let mut saved_fprs = FprSet::EMPTY;
-        for register in self.used_registers() {
-            match register {
-                Register::General(register) if M::CALLEE_SAVED_GPRS.contains(register) => {
-                    saved = saved.with(register);
-                }
-                Register::Float(register) if M::CALLEE_SAVED_FPRS.contains(register) => {
-                    saved_fprs = saved_fprs.with(register);
-                }
-                _ => {}
+        self.for_each_used_register(|register| match register {
+            Register::General(register) if M::CALLEE_SAVED_GPRS.contains(register) => {
+                saved = saved.with(register);
             }
-        }
+            Register::Float(register) if M::CALLEE_SAVED_FPRS.contains(register) => {
+                saved_fprs = saved_fprs.with(register);
+            }
+            _ => {}
+        });
         self.frame = M::frame(saved, saved_fprs, size);
+        // NB: The prologue addresses the lowest byte of the frame relative to the stack pointer.
+        checked_i32(u64::from(self.frame.caller_stack_offset))?;
         Ok(())
     }
 
-    fn used_registers(&self) -> Vec<Register> {
-        let mut registers = Vec::new();
+    /// Calls `visit` with each register that the allocation uses, once for each use.
+    fn for_each_used_register(&self, mut visit: impl FnMut(Register)) {
         let mut add = |location: &Location| {
             if let Location::Register(register) = location {
-                registers.push(register_of(*register));
+                visit(register_of(*register));
             }
         };
-        for node in &self.allocation.nodes {
+        for node in 0..self.allocation.node_count() {
+            let node = self.allocation.node(NodeId::from_index(node));
             node.inputs.iter().for_each(&mut add);
             node.output.iter().for_each(&mut add);
-            for m in &node.moves_before {
+            for m in node.moves_before {
                 add(&m.from);
                 add(&m.to);
             }
-            for temp in &node.temps {
+            for temp in node.temps {
                 add(&Location::Register(*temp));
             }
         }
-        for moves in &self.allocation.block_end_moves {
-            for m in moves {
+        for block in 0..self.graph.blocks.len() {
+            for m in self.allocation.block_end_moves(BlockId::from_index(block)) {
                 add(&m.from);
                 add(&m.to);
             }
         }
-        registers
     }
 
-    /// The site of kind `kind` for the frame state of `node`, with where
-    /// the runtime finds each value once the code reached it.
-    fn site_descriptor(&self, node: NodeId, kind: SiteKind) -> Site {
-        let fp_offset = |slot: u32| self.frame_pointer_offset(slot);
-        let mut descriptor = site(self.graph, self.allocation, node, kind, &fp_offset);
+    /// Calls `with` with what the site of kind `kind` for the frame state of
+    /// `node` is written from: where the runtime finds each value once the
+    /// code reached the site.
+    fn with_site_source<T>(&self, node: NodeId, kind: SiteKind, with: impl FnOnce(&SiteSource<'_>) -> T) -> T {
         // NB: A slow path call keeps the registers it saved in the saves
         //     area while it runs, where its exits find them.
-        if let Op::CallSlowPath {
+        let saves = if let Op::CallSlowPath {
             saves_registers: true, ..
         } = self.graph.node(node).op
         {
             let saved = slow_path_calls::slow_path_saved_registers_of::<M>(self.allocation.node(node));
-            let saves = self.save_slot_offsets(&saved);
-            for frame in &mut descriptor.frames {
-                for (_, location) in &mut frame.values {
-                    relocate_saved_register(location, &saves);
-                }
-            }
-            for object in &mut descriptor.objects {
-                for location in &mut object.properties {
-                    relocate_saved_register(location, &saves);
-                }
-            }
-        }
-        descriptor
+            self.save_slot_offsets(&saved)
+        } else {
+            RegisterList::new()
+        };
+        with(&SiteSource {
+            graph: self.graph,
+            allocation: self.allocation,
+            node,
+            kind,
+            stack_slot_offset: &|slot| self.frame_pointer_offset(slot),
+            saves: &saves,
+            work: self.work,
+        })
     }
 
     /// The offset of the local at `offset` from the frame pointer.
@@ -857,7 +1003,7 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
 
     /// The `saved` registers of a slow path call, with the frame pointer
     /// offsets of their words in the saves area.
-    fn save_slot_offsets(&self, saved: &[Gpr]) -> Vec<(Gpr, i32)> {
+    fn save_slot_offsets(&self, saved: &[Gpr]) -> RegisterList<(Gpr, i32)> {
         let frame_pointer = i64::from(self.frame.caller_stack_offset) - 16;
         saved
             .iter()
@@ -893,32 +1039,67 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
         Ok(Address::new(self.pinned.frame, checked_i32(offset)?))
     }
 
+    /// The address of the slot `slot` of the frame at `frame` that is the home of a value (see
+    /// `regalloc::frame_home()`), which the value's `LoadSlot` addressed already.
+    fn frame_home_address(&self, frame: Gpr, slot: u32) -> Address {
+        let offset = u64::from(self.runtime.offsets.execution_context_slots) + 8 * u64::from(slot);
+        Address::new(frame, i32::try_from(offset).expect("the load of the slot addressed it"))
+    }
+
+    /// Loads the value that the compiled function's frame slot `slot` holds (see `regalloc::frame_home()`) into `dst`
+    /// inside the code of a node, where the frame register may hold the innermost frame of the inlined calls the node
+    /// published: reads the compiled function's frame from where the entry saved it.
+    fn emit_load_frame_home(&mut self, dst: Gpr, slot: u32) {
+        let root_frame = self.local_address(self.locals.root_frame);
+        self.masm.load64(dst, &root_frame);
+        let address = self.frame_home_address(dst, slot);
+        self.masm.load64(dst, &address);
+    }
+
     fn frame_field(&self, offset: u32) -> Address {
         Address::new(self.pinned.frame, offset as i32)
     }
 
     /// The instruction at `pc` of executable `executable`.
-    fn decoded(&self, executable: u32, pc: u32) -> Result<DecodedInstruction, CompileFailure> {
-        decode_instruction(&self.executables[executable as usize].bytecode, pc).map_err(|_| {
-            CompileFailure::InvalidBytecode {
-                pc,
-                reason: "undecodable instruction",
-            }
-        })
+    fn decoded(&mut self, executable: u32, pc: u32) -> Result<DecodedInstruction<'a>, CompileFailure> {
+        if let Some(decoded) = self.decoded_instructions.get(&(executable, pc)) {
+            return Ok(*decoded);
+        }
+        let bytecode = &self.snapshot[self.snapshot.executables[executable as usize].bytecode];
+        let decoded = decode_instruction(bytecode, pc, self.work).map_err(|_| CompileFailure::InvalidBytecode {
+            pc,
+            reason: "undecodable instruction",
+        })?;
+        self.decoded_instructions.insert((executable, pc), decoded);
+        Ok(decoded)
     }
 
-    /// The u32 at `offset` in the instruction at `pc` of executable `executable`.
-    fn read_u32(&self, executable: u32, pc: u32, offset: u32) -> Result<u32, CompileFailure> {
+    /// How many elements the array of the instruction at `pc` of executable `executable` holds.
+    fn read_array_count(
+        &self,
+        executable: u32,
+        pc: u32,
+        array: crate::bytecode::SlowPathArray,
+    ) -> Result<u32, CompileFailure> {
+        Ok(u32::from(self.read_u8(executable, pc, array.count_offset)?))
+    }
+
+    /// The byte at `offset` in the instruction at `pc` of executable `executable`.
+    fn read_u8(&self, executable: u32, pc: u32, offset: u32) -> Result<u8, CompileFailure> {
         let at = (pc + offset) as usize;
-        let bytes =
-            self.executables[executable as usize]
-                .bytecode
-                .get(at..at + 4)
-                .ok_or(CompileFailure::InvalidBytecode {
-                    pc,
-                    reason: "operand field outside the bytecode",
-                })?;
-        Ok(u32::from_ne_bytes(bytes.try_into().expect("four bytes")))
+        let byte = self.snapshot[self.snapshot.executables[executable as usize].bytecode]
+            .get(at)
+            .ok_or(CompileFailure::InvalidBytecode {
+                pc,
+                reason: "field outside the bytecode",
+            })?;
+        Ok(*byte)
+    }
+
+    /// The operand at `offset` in the instruction at `pc` of executable `executable`, `Operand::INVALID` if absent.
+    fn read_operand(&self, executable: u32, pc: u32, offset: u32) -> Result<u32, CompileFailure> {
+        let byte = self.read_u8(executable, pc, offset)?;
+        Ok(crate::bytecode::Operand::raw_from_byte(byte))
     }
 
     // Prologue and tails.
@@ -926,30 +1107,58 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
     fn annotate(&mut self, annotation: CodeAnnotation) {
         let offset = u32::try_from(self.masm.offset()).expect("code fits in 4 GiB");
         self.annotations.push((offset, annotation));
+        self.emitting = match annotation {
+            CodeAnnotation::Node(node) | CodeAnnotation::Deferred(node) => Some(node),
+            _ => None,
+        };
     }
 
     fn emit_prologue(&mut self) {
         self.annotate(CodeAnnotation::Prologue);
         let frame = self.frame;
-        self.masm.emit_prologue_unprobed(&frame);
-        // NB: The VM is in its pinned register already.
-        self.masm.move64(self.pinned.frame, M::ARGUMENT_GPRS[1]);
 
         // Exit to the interpreter (which runs the function on its own stack,
-        // and reports overflows of that) if the native stack is nearly
-        // exhausted. No value lives in a register yet. The locals are only
-        // touched once the frame is known to fit: on Windows, touching a
-        // frame that goes past the end of the stack would crash.
+        // and reports overflows of that) if the frame would go below the
+        // native stack limit. This is checked before the prologue moves the
+        // stack pointer or stores anything: a large frame could otherwise
+        // skip past the guard page at the end of the stack.
+        // NB: JIT code does not keep the pinned scratch register.
+        let lowest = self.pinned.scratch;
+        let frame_bottom = Address::new(M::STACK_POINTER, -(frame.caller_stack_offset as i32));
+        self.masm.load_effective_address(lowest, &frame_bottom);
         let limit = Address::new(self.pinned.vm, self.runtime.offsets.vm_jit_native_stack_limit as i32);
-        let resume = self.entry_resume;
-        self.masm.branch_if_stack_pointer_below(&limit, resume);
-        self.masm.probe_frame(&frame);
+        let entry_overflow = self.entry_overflow;
+        self.masm
+            .branch64_memory(Condition::Above, &limit, lowest, entry_overflow);
+
+        self.masm.emit_prologue(&frame);
+        // NB: The VM is in its pinned register already.
+        self.masm.move64(self.pinned.frame, M::ARGUMENT_GPRS[1]);
+        // Note that the executable was entered, like the interpreter's Enter does.
+        // NB: Only a collection makes the count nonzero, so the store is rare. Storing on every entry made deeply
+        //     recursive code 15% slower.
+        let offsets = self.runtime.offsets;
+        if offsets.executable_idle_collection_count != 0 {
+            let executable = self.pinned.scratch;
+            let count = M::RETURN_GPRS[1];
+            self.masm.load64(
+                executable,
+                &Address::new(self.pinned.frame, offsets.execution_context_executable as i32),
+            );
+            let idle_collection_count = Address::new(executable, offsets.executable_idle_collection_count as i32);
+            self.masm.load8(count, &idle_collection_count);
+            let entered = self.masm.new_label();
+            self.masm.branch32_imm(Condition::Equal, count, 0, entered);
+            self.masm.store_imm8(&idle_collection_count, 0);
+            self.masm.bind(entered);
+        }
         let root_frame = self.local_address(self.locals.root_frame);
         self.masm.store64(&root_frame, self.pinned.frame);
 
         // Materializing the frames of inlined calls must not run out of
         // interpreter stack, so exit if they would not all fit.
         if self.graph.materialized_frame_bytes != 0 {
+            let resume = self.entry_resume;
             let offsets = self.runtime.offsets;
             let top = M::RETURN_GPRS[1];
             self.masm.load64(
@@ -985,13 +1194,23 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
         self.masm.move_imm32(M::RETURN_GPRS[0], 0);
         self.emit_return(JitStatus::Resume);
 
+        // NB: No frame is set up here, so the frame is still in its argument
+        //     register.
+        self.annotate(CodeAnnotation::Tail("return Resume before the prologue"));
+        let entry_overflow = self.entry_overflow;
+        self.masm.bind(entry_overflow);
+        self.emit_publish_frame_from(M::ARGUMENT_GPRS[1]);
+        self.masm.move_imm32(M::RETURN_GPRS[0], 0);
+        self.masm.move_imm32(M::RETURN_GPRS[1], JitStatus::Resume as u32);
+        self.masm.ret();
+
         self.annotate(CodeAnnotation::Tail("return ExitInterpreter"));
         let exit_interpreter = self.exit_interpreter;
         self.masm.bind(exit_interpreter);
         self.masm.move_imm32(M::RETURN_GPRS[0], 0);
         self.emit_return(JitStatus::ExitInterpreter);
 
-        let leave_stubs = std::mem::take(&mut self.leave_stubs);
+        let leave_stubs = self.leave_stubs.take();
         if !leave_stubs.is_empty() {
             self.annotate(CodeAnnotation::Tail("slow paths that did not continue"));
         }
@@ -1007,7 +1226,7 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
         if !self.exit_site_stubs.is_empty() {
             self.annotate(CodeAnnotation::Tail("exit sites"));
         }
-        for (label, index) in std::mem::take(&mut self.exit_site_stubs) {
+        for (label, index) in self.exit_site_stubs.take() {
             let node = self.sites[index as usize].0;
             self.annotate(CodeAnnotation::Exit { index, node });
             self.masm.bind(label);
@@ -1079,7 +1298,7 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
         self.emit_exit_runtime_call();
         let control = self.local_address(self.locals.leave_control);
         self.masm.load64(M::RETURN_GPRS[0], &control);
-        self.leave_arguments = Vec::new();
+        self.leave_arguments.clear();
         self.emit_leave_after_slow_path();
     }
 
@@ -1123,8 +1342,8 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
 
     /// Emits an entry point for every on-stack replacement entry block:
     /// the prologue, then a jump to the block.
-    fn emit_osr_entries(&mut self) -> Vec<(u32, u32)> {
-        let mut entries = Vec::new();
+    fn emit_osr_entries(&mut self) -> ZoneVec<'a, (u32, u32)> {
+        let mut entries = ZoneVec::with_capacity_in(self.graph.osr_entries.len(), self.work);
         for (pc, block) in &self.graph.osr_entries {
             let offset = u32::try_from(self.masm.offset()).expect("code fits in 4 GiB");
             self.emit_prologue();
@@ -1188,7 +1407,7 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
             self.jump_to(success);
             return Ok(());
         }
-        let end_moves = &self.allocation.block_end_moves[block.index()];
+        let end_moves = self.allocation.block_end_moves(block);
         if !end_moves.is_empty() {
             self.annotate(CodeAnnotation::BlockEndMoves);
         }
@@ -1233,7 +1452,23 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
                 let address = self.spill_address(to);
                 self.masm.store_imm64(&address, bits);
             }
-            (_, Location::Constant(_)) => unreachable!("moves never write constants"),
+            // NB: Between nodes, the frame register holds the compiled function's frame.
+            (Location::Frame(slot), Location::Register(to)) => {
+                let Register::General(to) = register_of(to) else {
+                    unreachable!("values loaded from frame slots are tagged");
+                };
+                let address = self.frame_home_address(self.pinned.frame, slot);
+                self.masm.load64(to, &address);
+            }
+            (Location::Frame(slot), Location::Stack(to)) => {
+                let from = self.frame_home_address(self.pinned.frame, slot);
+                let to = self.spill_address(to);
+                self.masm.load64(self.pinned.scratch, &from);
+                self.masm.store64(&to, self.pinned.scratch);
+            }
+            (_, Location::Constant(_) | Location::Frame(_)) => {
+                unreachable!("moves never write constants or frame slots")
+            }
         }
     }
 
@@ -1278,7 +1513,7 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
                 Register::Float(_) => unreachable!("float64 inputs are read with `float_input()`"),
             },
             Location::Constant(bits) => InputValue::Constant(bits),
-            Location::Stack(_) => unreachable!("inputs are in registers or constants"),
+            Location::Stack(_) | Location::Frame(_) => unreachable!("inputs are in registers or constants"),
         }
     }
 
@@ -1295,15 +1530,15 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
     fn emit_node(&mut self, node_id: NodeId) -> Result<(), CompileFailure> {
         self.annotate(CodeAnnotation::Node(node_id));
         let allocation = self.allocation.node(node_id);
-        for m in &allocation.moves_before {
+        for m in allocation.moves_before {
             self.emit_move(m);
         }
         let node = self.graph.node(node_id);
         self.emit_stress_exit(node_id);
-        self.leave_arguments = self.virtual_arguments_slots(node_id);
+        self.find_virtual_arguments_slots(node_id);
         self.leave_frame = self.leave_frame_of(node_id).map(|node| LeaveFrame {
             node,
-            restore: Vec::new(),
+            restore: RegisterList::new(),
         });
         match &node.op {
             Op::Constant(_) | Op::Phi | Op::VirtualObject { .. } | Op::Refine { .. } => {
@@ -1315,9 +1550,9 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
                 self.masm.load64(self.output(node_id), &address);
             }
             Op::StoreSlot { slot } => self.emit_store_slot(node_id, *slot)?,
-            Op::InitializeFrame { clobbers_floats } => self.emit_initialize_frame(node_id, *clobbers_floats)?,
-            Op::EnsureFrameInitialized { clobbers_floats } => {
-                self.emit_ensure_frame_initialized(node_id, *clobbers_floats)?;
+            Op::InitializeFrame => self.emit_initialize_frame(node_id)?,
+            Op::EnsureFrameInitialized => {
+                self.emit_ensure_frame_initialized(node_id)?;
             }
             Op::PublishFrame => self.emit_publish_frame(),
             Op::LoadOuterEnvironment => {
@@ -1378,6 +1613,30 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
                 ];
                 self.emit_constant_fields(self.pinned.frame, self.pinned.scratch, &mut fields)?;
             }
+            Op::KeepOwnEnvironments => {
+                let (scratch, function, without_function) =
+                    (self.pinned.scratch, self.temp(node_id, 0), self.masm.new_label());
+                let offsets = self.runtime.offsets;
+                self.masm
+                    .load64(function, &self.frame_field(offsets.execution_context_function));
+                self.masm
+                    .branch_test64(Condition::Zero, function, u64::MAX, without_function);
+                self.emit_load_function_private_environment(scratch, function);
+                self.masm.store64(
+                    &self.frame_field(offsets.execution_context_private_environment),
+                    scratch,
+                );
+                // NB: The variable environment of a frame starts out as its lexical environment.
+                self.masm.load64(
+                    scratch,
+                    &self.frame_field(offsets.execution_context_lexical_environment),
+                );
+                self.masm.store64(
+                    &self.frame_field(offsets.execution_context_variable_environment),
+                    scratch,
+                );
+                self.masm.bind(without_function);
+            }
             Op::LeavePrivateEnvironment => {
                 let scratch = self.pinned.scratch;
                 let field = self.frame_field(self.runtime.offsets.execution_context_private_environment);
@@ -1431,6 +1690,14 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
             Op::CheckElements { kind } => self.emit_check_elements(node_id, *kind),
             Op::CheckTypedArray => self.emit_check_typed_array(node_id),
             Op::CheckArray => self.emit_check_array(node_id),
+            Op::CheckPropertyAbsenceCacheable => {
+                let exit = self.exit_site(node_id);
+                let (value, object, class) = (self.input(node_id, 0), self.temp(node_id, 0), self.temp(node_id, 1));
+                let scratch = self.pinned.scratch;
+                self.branch_on_tag(Condition::NotEqual, value, value::OBJECT_TAG, scratch, exit);
+                self.emit_unbox_cell(object, value);
+                self.branch_unless_cacheable_for_property_absence(object, class, exit);
+            }
             Op::CheckNonNegativeInt32 => {
                 let exit = self.exit_site(node_id);
                 self.masm
@@ -1505,7 +1772,7 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
                 let (registers, published) = if self.publishes_frames(node_id) {
                     self.emit_publish_frames_or_save_inputs(node_id)?
                 } else {
-                    (InputRegisters::Saved(Vec::new()), 0)
+                    (InputRegisters::Saved(RegisterList::new()), 0)
                 };
                 if matches!(self.graph.node(node_id).op, Op::CallDirect { .. }) {
                     self.emit_call_direct(node_id, executable, pc, &registers)?;
@@ -1529,8 +1796,10 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
             Op::InitializeNamed { offset } => self.emit_initialize_named(node_id, *offset)?,
             Op::AllocateArray { count } => self.emit_allocate_array(node_id, *count)?,
             Op::AllocateFunction {
+                executable,
                 shared_function_data_index,
-            } => self.emit_allocate_function(node_id, *shared_function_data_index)?,
+                ..
+            } => self.emit_allocate_function(node_id, *executable, *shared_function_data_index)?,
             Op::AllocateEnvironment { shape_cache, capacity } => {
                 self.emit_allocate_environment(node_id, *shape_cache, *capacity)?;
             }
@@ -1650,7 +1919,7 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
             }
             Op::StoreGlobalBinding { environment, index } => {
                 let exit = self.exit_site(node_id);
-                let values = Gpr(self.allocation.node(node_id).temps[0]);
+                let values = self.temp(node_id, 0);
                 let slot = self.global_binding_slot(values, *environment, *index)?;
                 self.masm
                     .branch64_memory_imm(Condition::Equal, &slot, value::EMPTY as i64, exit);
@@ -1665,7 +1934,7 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
             }
             Op::CheckAccessorFunction { offset, part, function } => {
                 let exit = self.exit_site(node_id);
-                let accessor = Gpr(self.allocation.node(node_id).temps[0]);
+                let accessor = self.temp(node_id, 0);
                 let field = self.emit_load_accessor(node_id, accessor, *offset, *part, exit)?;
                 self.masm
                     .branch32_memory_imm(Condition::NotEqual, &field, function.compressed() as i32, exit);
@@ -1684,7 +1953,7 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
             }
             Op::StoreNamed { offset, holds_data } => {
                 let exit = (!holds_data).then(|| self.exit_site(node_id));
-                let storage = Gpr(self.allocation.node(node_id).temps[0]);
+                let storage = self.temp(node_id, 0);
                 let slot = self.named_property_address(storage, *offset)?;
                 let cell = self.cell_address_of(node_id, storage, 2);
                 let storage_field = Address::new(cell, self.runtime.offsets.object_named_properties as i32);
@@ -1695,25 +1964,33 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
                 self.masm.store64(&slot, self.input(node_id, 1));
             }
             Op::AddNamed { offset, shape, .. } => self.emit_add_named(node_id, *offset, *shape)?,
-            Op::ShapeSwitch { cases } => {
+            Op::ShapeSwitch { shapes, targets } => {
                 let exit = self.exit_site(node_id);
                 self.emit_load_compressed_shape_of(node_id, self.pinned.scratch, 1);
-                for (shape, block) in cases {
+                for (shape, block) in shapes.iter().zip(*targets) {
                     let label = self.label(*block);
                     self.emit_branch_on_shape(*shape, label, exit);
                 }
                 self.masm.jump(exit);
             }
-            Op::ProbePropertyCache { executable, cache } => {
-                self.emit_probe_property_cache(node_id, *executable, *cache)?;
+            Op::ProbePropertyCache {
+                executable,
+                cache,
+                property,
+            } => {
+                self.emit_probe_property_cache(node_id, *executable, *cache, *property)?;
             }
             Op::ProbeKeyedCache { executable, cache } => self.emit_probe_keyed_cache(node_id, *executable, *cache)?,
             Op::ProbeKeyedStore { executable, cache } => self.emit_probe_keyed_store(node_id, *executable, *cache)?,
             Op::ProbeGlobalCache { cache } => self.emit_probe_global_cache(node_id, *cache)?,
             Op::ProbeHasProperty { own } => self.emit_probe_has_property(node_id, *own),
             Op::ProbeGlobalStore { cache } => self.emit_probe_global_store(node_id, *cache)?,
-            Op::ProbePropertyStore { executable, cache } => {
-                self.emit_probe_property_store(node_id, *executable, *cache)?;
+            Op::ProbePropertyStore {
+                executable,
+                cache,
+                property,
+            } => {
+                self.emit_probe_property_store(node_id, *executable, *cache, *property)?;
             }
             Op::CallSlowPath {
                 opcode,
@@ -1779,7 +2056,7 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
             Op::Uint32ShiftRight => self.emit_uint32_shift_right(node_id),
             Op::Uint32ToFloat64 => self.emit_uint32_to_float64(node_id),
             Op::StringsEqual => self.emit_strings_equal(node_id),
-            Op::ConcatenateStrings => self.emit_concatenate_strings(node_id),
+            Op::ConcatenateStrings { key } => self.emit_concatenate_strings(node_id, *key),
             Op::IntegerToString => self.emit_integer_to_string(node_id),
             Op::StringAddress => {
                 let (output, input) = (self.output(node_id), self.input(node_id, 0));
@@ -1834,39 +2111,34 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
         Ok(())
     }
 
-    /// The slots of the compiled function's frame, as the frame state of
-    /// `node` describes it, that hold the arguments object the code never
-    /// created, and whether it is a mapped one.
-    fn virtual_arguments_slots(&self, node: NodeId) -> Vec<(u32, bool)> {
-        self.graph
-            .node(node)
-            .frame_state
-            .map(|frame_state| {
-                // NB: Only the compiled function's own frame, the outermost
-                //     one, keeps an arguments object virtual.
-                let root = *self
-                    .graph
-                    .frame_state_chain(frame_state)
-                    .last()
-                    .expect("the chain is not empty");
-                self.graph
-                    .frame_state(root)
-                    .values
-                    .iter()
-                    .filter_map(|(slot, value)| {
-                        let bits = self.graph.constant_value(*value)?;
-                        value::virtual_arguments_kind(bits).map(|mapped| (*slot, mapped))
-                    })
-                    .collect()
-            })
-            .unwrap_or_default()
+    /// Makes `leave_arguments` the slots of the compiled function's frame,
+    /// as the frame state of `node` describes it, that hold the arguments
+    /// object the code never created, and whether it is a mapped one.
+    fn find_virtual_arguments_slots(&mut self, node: NodeId) {
+        self.leave_arguments.clear();
+        let Some(frame_state) = self.graph.node(node).frame_state else {
+            return;
+        };
+        // NB: Only the compiled function's own frame, the outermost
+        //     one, keeps an arguments object virtual.
+        let root = self
+            .graph
+            .frame_state_chain(frame_state)
+            .last()
+            .expect("the chain is not empty");
+        let graph = self.graph;
+        self.leave_arguments
+            .extend(graph.frame_state(root).values.iter().filter_map(|(slot, value)| {
+                let bits = graph.constant_value(*value)?;
+                value::virtual_arguments_kind(bits).map(|mapped| (*slot, mapped))
+            }));
     }
 
     fn emit_has_in_prototype_chain(&mut self, node: NodeId) {
         let exit = self.exit_site(node);
         let (value, prototype) = (self.input(node, 0), self.input(node, 1));
         let output = self.output(node);
-        let object = Gpr(self.allocation.node(node).temps[0]);
+        let object = self.temp(node, 0);
         let scratch = self.pinned.scratch;
         let layout = self.runtime.layout;
         let offsets = self.runtime.offsets;
@@ -1987,14 +2259,20 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
     /// `LoadFrameField`: a field of the running execution context.
     fn emit_load_frame_field(&mut self, node_id: NodeId, field: FrameField) {
         let offsets = self.runtime.offsets;
+        let output = self.output(node_id);
         let offset = match field {
             FrameField::LexicalEnvironment => offsets.execution_context_lexical_environment,
             FrameField::VariableEnvironment => offsets.execution_context_variable_environment,
             FrameField::PrivateEnvironment => offsets.execution_context_private_environment,
-            FrameField::Realm => offsets.execution_context_realm,
+            FrameField::Function => offsets.execution_context_function,
+            // NB: The running frame runs in the current realm.
+            FrameField::Realm => {
+                self.masm
+                    .load64(output, &Address::new(self.pinned.vm, offsets.vm_current_realm as i32));
+                return;
+            }
             FrameField::Executable => offsets.execution_context_executable,
         };
-        let output = self.output(node_id);
         self.masm.load64(output, &self.frame_field(offset));
     }
 
@@ -2046,7 +2324,7 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
     fn emit_add_named(&mut self, node_id: NodeId, offset: u32, shape: CellId) -> Result<(), CompileFailure> {
         // NB: Nothing can collect garbage between giving the object
         //     the shape with the property and storing its value.
-        let storage = Gpr(self.allocation.node(node_id).temps[0]);
+        let storage = self.temp(node_id, 0);
         let cell = self.cell_address_of(node_id, storage, 2);
         let offsets = self.runtime.offsets;
         self.masm
@@ -2204,19 +2482,17 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
 
     /// The `Enter` bytecode: empty registers and locals, constants copied
     /// into the frame, and the frame marked initialized (and published).
-    fn emit_initialize_frame(&mut self, node: NodeId, clobbers_floats: bool) -> Result<(), CompileFailure> {
-        let temps = &self.allocation.node(node).temps;
-        let (value, cursor) = (Gpr(temps[0]), Gpr(temps[1]));
-        self.emit_frame_initialization(value, cursor, clobbers_floats.then_some(M::ARGUMENT_FPRS[0]))
+    fn emit_initialize_frame(&mut self, node: NodeId) -> Result<(), CompileFailure> {
+        let (value, cursor) = (self.temp(node, 0), self.temp(node, 1));
+        self.emit_frame_initialization(value, cursor, Self::lowering_fpr(0))
     }
 
     /// `EnsureFrameInitialized`: initializes the frame unless it is.
-    fn emit_ensure_frame_initialized(&mut self, node: NodeId, clobbers_floats: bool) -> Result<(), CompileFailure> {
-        let temps = &self.allocation.node(node).temps;
-        let (value, cursor) = (Gpr(temps[0]), Gpr(temps[1]));
+    fn emit_ensure_frame_initialized(&mut self, node: NodeId) -> Result<(), CompileFailure> {
+        let (value, cursor) = (self.temp(node, 0), self.temp(node, 1));
         let done = self.masm.new_label();
         self.branch_if_frame_initialized(done);
-        self.emit_frame_initialization(value, cursor, clobbers_floats.then_some(M::ARGUMENT_FPRS[0]))?;
+        self.emit_frame_initialization(value, cursor, Self::lowering_fpr(0))?;
         self.masm.bind(done);
         Ok(())
     }
@@ -2231,29 +2507,30 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
     /// `PublishFrame`: makes the frame the running execution context, which
     /// it may be already.
     fn emit_publish_frame(&mut self) {
+        self.emit_publish_frame_from(self.pinned.frame);
+    }
+
+    /// Makes the frame in `frame` the running one.
+    fn emit_publish_frame_from(&mut self, frame: Gpr) {
         let running = Address::new(self.pinned.vm, self.runtime.offsets.vm_running_execution_context as i32);
-        self.masm.store64(&running, self.pinned.frame);
+        self.masm.store64(&running, frame);
     }
 
     /// Publishes the frame and initializes it like `Enter`, with `value` for
     /// the stored values, and with a loop using `cursor` for large frames.
-    /// With a `vector` register, which it clobbers, it stores two slots at
-    /// a time. Clobbers the scratch register.
-    fn emit_frame_initialization(
-        &mut self,
-        value: Gpr,
-        cursor: Gpr,
-        vector: Option<Fpr>,
-    ) -> Result<(), CompileFailure> {
+    /// Stores two slots at a time through `vector`, which it clobbers (and
+    /// which therefore holds no values: a lowering register, or any register
+    /// in the out of line stub). Clobbers the scratch register.
+    fn emit_frame_initialization(&mut self, value: Gpr, cursor: Gpr, vector: Fpr) -> Result<(), CompileFailure> {
         self.emit_publish_frame();
-        // Up to this many registers and locals are emptied with one store
-        // each (or per two slots through a vector register), more in a loop.
-        let unrolled_slots: u32 = if vector.is_some() { 64 } else { 32 };
-        let layout = self.executables[0].layout;
+        // Up to this many registers and locals are emptied with one store per two slots, more in a loop.
+        const UNROLLED_SLOTS: u32 = 64;
+        let layout = self.snapshot.executables[0].layout;
         let slots = self.runtime.offsets.execution_context_slots;
         let first = crate::bytecode::RESERVED_REGISTER_COUNT;
-        let mut fields: Vec<call::ConstantField> = Vec::new();
-        let unrolled = layout.registers_and_locals_count.saturating_sub(first) <= unrolled_slots;
+        let mut fields = self.spare_fields.take();
+        fields.clear();
+        let unrolled = layout.registers_and_locals_count.saturating_sub(first) <= UNROLLED_SLOTS;
         if !unrolled {
             self.masm.move_imm64(value, value::EMPTY);
             let start = self.slot_address(first)?;
@@ -2270,11 +2547,13 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
                 fields.push((slots + 8 * index, 8, value::EMPTY));
             }
         }
-        for (index, constant) in (0..).zip(&self.executables[0].constants) {
+        for (index, constant) in (0..).zip(&self.snapshot[self.snapshot.executables[0].constants]) {
             fields.push((slots + 8 * (layout.constants_base() + index), 8, *constant));
         }
         fields.push((self.runtime.offsets.execution_context_frame_initialized, 1, 1));
-        self.emit_constant_fields_with_vector(self.pinned.frame, value, &mut fields, vector, &[])
+        self.emit_constant_fields_with_vector(self.pinned.frame, value, &mut fields, Some(vector), &[])?;
+        self.spare_fields = fields;
+        Ok(())
     }
 
     /// Initializes the frame for slow paths, whose caller-saved general
@@ -2288,7 +2567,7 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
         };
         self.annotate(CodeAnnotation::Tail("frame initialization (shared by slow paths)"));
         self.masm.bind(label);
-        self.emit_frame_initialization(M::ARGUMENT_GPRS[0], M::ARGUMENT_GPRS[1], Some(M::ARGUMENT_FPRS[0]))?;
+        self.emit_frame_initialization(M::ARGUMENT_GPRS[0], M::ARGUMENT_GPRS[1], M::ARGUMENT_FPRS[0])?;
         self.masm.ret();
         Ok(())
     }
@@ -2517,11 +2796,10 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
             self.masm.move_imm64(dst, value::EMPTY);
             return Ok(());
         }
-        if let Some(values) = &self.slow_path_values
-            && let Some(&index) = values.input_of_operand.get(&operand)
+        if let Some(values) = self.slow_path_values
+            && let Some(&index) = self.input_of_operand.get(&operand)
         {
-            let (node, registers) = (values.node, values.registers.clone());
-            self.load_input(dst, node, index, &registers);
+            self.load_input(dst, values.node, index, &values.registers);
             return Ok(());
         }
         let address = self.slot_address(operand)?;
@@ -2531,17 +2809,27 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
 
     /// Runs the slow path of the instruction at `pc` of `executable`, with
     /// its operands in their frame slots or, while `slow_path_values` is
-    /// set, in the node's inputs. Returns where the outputs that are SSA
-    /// values are, in layout order.
+    /// set, in the node's inputs. Returns where the first of the outputs
+    /// that are SSA values is, in layout order.
     fn emit_generic(
         &mut self,
         opcode: crate::bytecode::OpCode,
         executable: u32,
         pc: u32,
-    ) -> Result<Vec<OutputSource>, CompileFailure> {
+    ) -> Result<Option<OutputSource>, CompileFailure> {
         if opcode == crate::bytecode::OpCode::Call && self.makes_dynamic_calls() {
             self.emit_generic_js_call(executable, pc)?;
-            return Ok(Vec::new());
+            return Ok(None);
+        }
+        if matches!(
+            opcode,
+            crate::bytecode::OpCode::CallConstruct
+                | crate::bytecode::OpCode::SuperCall
+                | crate::bytecode::OpCode::SuperCallWithForwardedArguments
+        ) && self.runtime.construct_stub != 0
+        {
+            self.emit_generic_construct(executable, pc)?;
+            return Ok(None);
         }
         let decoded = self.decoded(executable, pc)?;
         let next_pc = decoded.next_pc();
@@ -2557,7 +2845,7 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
         let program_counter = self.frame_field(self.runtime.offsets.execution_context_program_counter);
         self.masm.store_imm32(&program_counter, pc);
         let arguments = M::ARGUMENT_GPRS;
-        let mut ssa_outputs = Vec::new();
+        let mut ssa_output = None;
         match call {
             SlowPathCall::JitCall => {
                 self.emit_frame_runtime_call(address, pc);
@@ -2565,12 +2853,9 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
             }
             SlowPathCall::BinaryValues => {
                 let (dst, lhs, rhs) = binary_operands(&decoded.instruction).expect("binary slow path operands");
-                let into_record = self
-                    .slow_path_values
-                    .as_ref()
-                    .is_some_and(|values| values.ssa_outputs.contains(&dst.raw()));
+                let into_record = self.slow_path_values.is_some() && self.slow_path_ssa_outputs.contains(&dst.raw());
                 let destination = if into_record {
-                    ssa_outputs.push(OutputSource::Record(self.locals.record));
+                    ssa_output = Some(OutputSource::Record(self.locals.record));
                     self.local_address(self.locals.record)
                 } else {
                     self.slot_address(dst.raw())?
@@ -2578,6 +2863,7 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
                 self.masm.load_effective_address(arguments[2], &destination);
                 self.load_value(arguments[3], lhs)?;
                 self.load_value(arguments[4], rhs)?;
+                self.masm.move_imm32(arguments[5], next_pc - pc);
                 self.masm.move64(arguments[0], self.pinned.vm);
                 self.masm.move_imm32(arguments[1], pc);
                 self.masm.call_absolute(address);
@@ -2596,33 +2882,36 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
                 self.emit_jump_target_check(pc, true_target, false_target);
             }
             SlowPathCall::Record => {
-                ssa_outputs = self.emit_record_call(opcode, executable, pc, next_pc, address, None)?;
+                ssa_output = self.emit_record_call(opcode, executable, pc, next_pc, address, None)?;
             }
         }
-        Ok(ssa_outputs)
+        Ok(ssa_output)
     }
 
-    /// The operands a slow path call of the instruction at `pc` reads, in
-    /// the order of the node's inputs, and the outputs it writes that are SSA
-    /// values.
+    /// Makes `operands` the operands a slow path call of the instruction at
+    /// `pc` reads, in the order of the node's inputs, and `ssa_outputs` the
+    /// outputs it writes that are SSA values.
     fn slow_path_call_operands(
-        &self,
+        &mut self,
         opcode: crate::bytecode::OpCode,
         executable: u32,
         pc: u32,
-    ) -> Result<(Vec<u32>, Vec<u32>), CompileFailure> {
-        let mut operands = Vec::new();
-        let mut outputs = Vec::new();
+        operands: &mut ZoneVec<'_, u32>,
+        ssa_outputs: &mut ZoneVec<'_, u32>,
+    ) -> Result<(), CompileFailure> {
+        operands.clear();
+        ssa_outputs.clear();
+        let outputs = ssa_outputs;
         let is_js_call = slow_path_call(opcode) == Some(SlowPathCall::JitCall);
         if is_js_call {
             let decoded = self.decoded(executable, pc)?;
-            let call_operands = crate::builder::js_call_operands(&decoded.instruction);
-            operands = call_operands.inputs;
-            outputs = call_operands.outputs.into_iter().map(|(_, operand)| operand).collect();
+            let call_operands = crate::builder::js_call_operands(decoded.instruction);
+            call_operands.for_each_input(|operand| operands.push(operand));
+            call_operands.for_each_output(|_, operand| outputs.push(operand));
         } else {
             let layout = slow_path_layout(opcode);
             for field in layout.fields {
-                let operand = self.read_u32(executable, pc, field.instruction_offset)?;
+                let operand = self.read_operand(executable, pc, field.instruction_offset)?;
                 if field.role != OperandRole::Out {
                     operands.push(operand);
                 }
@@ -2631,23 +2920,28 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
                 }
             }
             if let Some(array) = layout.array {
-                for element in 0..self.read_u32(executable, pc, array.count_offset)? {
-                    operands.push(self.read_u32(executable, pc, array.instruction_offset + 4 * element)?);
+                for element in 0..self.read_array_count(executable, pc, array)? {
+                    operands.push(self.read_operand(executable, pc, array.instruction_offset + element)?);
                 }
             }
         }
-        let frame_layout = self.executables[executable as usize].layout;
-        let ssa_outputs = outputs
-            .into_iter()
-            .filter(|operand| {
-                crate::builder::is_ssa_slow_path_output(
-                    &frame_layout,
-                    crate::bytecode::Operand::from_raw(*operand),
-                    executable != 0,
-                )
-            })
-            .collect::<Vec<_>>();
-        Ok((operands, ssa_outputs))
+        let frame_layout = self.snapshot.executables[executable as usize].layout;
+        outputs.retain(|operand| {
+            crate::builder::is_ssa_slow_path_output(&frame_layout, crate::bytecode::Operand::from_raw(*operand))
+        });
+        Ok(())
+    }
+
+    /// Makes `slow_path_values` the operands of the slow path of `node`, in
+    /// the node's inputs: `operands` are those of the inputs, in input order.
+    fn set_slow_path_values(&mut self, node: NodeId, operands: &[u32], registers: InputRegisters) {
+        // NB: Looking up each operand in a list would take time quadratic in the operand count of instructions like
+        //     NewArray of a large array literal.
+        self.input_of_operand.clear();
+        for (index, operand) in operands.iter().enumerate() {
+            self.input_of_operand.entry(*operand).or_insert(index);
+        }
+        self.slow_path_values = Some(SlowPathValues { node, registers });
     }
 
     /// A `CallSlowPath` node that is a call: runs the slow path of its
@@ -2662,7 +2956,8 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
         pc: u32,
     ) -> Result<(), CompileFailure> {
         let is_js_call = slow_path_call(opcode) == Some(SlowPathCall::JitCall);
-        let (operands, ssa_outputs) = self.slow_path_call_operands(opcode, executable, pc)?;
+        let (mut operands, mut ssa_outputs) = (self.spare_operands.take(), self.slow_path_ssa_outputs.take());
+        self.slow_path_call_operands(opcode, executable, pc, &mut operands, &mut ssa_outputs)?;
         // NB: In an inlined callee, the slow path runs in the frames of the
         //     inlined calls, which compiled code pops again if it continues.
         let (registers, published) = self.emit_publish_frames_or_save_inputs(node)?;
@@ -2680,20 +2975,23 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
             for _ in 0..published {
                 self.emit_pop_inline_frame();
             }
+            (self.spare_operands, self.slow_path_ssa_outputs) = (operands, ssa_outputs);
             return Ok(());
         }
-        self.slow_path_values = Some(SlowPathValues::new(node, &operands, registers, ssa_outputs));
-        let sources = self.emit_generic(opcode, executable, pc);
+        self.set_slow_path_values(node, &operands, registers);
+        self.slow_path_ssa_outputs = ssa_outputs;
+        self.spare_operands = operands;
+        let source = self.emit_generic(opcode, executable, pc);
         self.slow_path_values = None;
-        let sources = sources?;
+        let source = source?;
         // NB: The value of a conditional jump is the control word, which is
         //     in the output register already.
-        if let (Some(source), Some(Location::Register(output))) = (sources.first(), self.allocation.node(node).output) {
+        if let (Some(source), Some(Location::Register(output))) = (source, self.allocation.node(node).output) {
             let output = Gpr(output);
             match source {
-                OutputSource::Register(register) => self.masm.move64(output, *register),
+                OutputSource::Register(register) => self.masm.move64(output, register),
                 OutputSource::Record(offset) => {
-                    let record = self.local_address(*offset);
+                    let record = self.local_address(offset);
                     self.masm.load64(output, &record);
                 }
             }
@@ -2708,12 +3006,12 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
     /// that calls clobber in the saves area, and returns them: marshalling
     /// operands into argument registers and publishing frames clobbers them,
     /// so the call reads those inputs from there.
-    fn save_input_registers(&mut self, node: NodeId) -> Vec<Gpr> {
+    fn save_input_registers(&mut self, node: NodeId) -> RegisterList<Gpr> {
         let clobbered = slow_path_calls::slow_path_saved_registers::<M>();
-        let mut saved = Vec::new();
-        for location in &self.allocation.node(node).inputs {
-            if let Location::Register(register) = location
-                && let Register::General(register) = register_of(*register)
+        let mut saved = RegisterList::new();
+        for location in self.allocation.node(node).inputs {
+            if let Location::Register(register) = *location
+                && let Register::General(register) = register_of(register)
                 && clobbered.contains(register)
                 && !saved.contains(&register)
             {
@@ -2737,7 +3035,7 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
         //     clobbers anyway.
         let saved = slow_path_calls::slow_path_saved_registers::<M>()
             .iter()
-            .collect::<Vec<_>>();
+            .collect::<RegisterList<_>>();
         self.emit_save_registers(&saved);
         let (published, registers) = self.emit_publish_frames(node, &saved)?;
         Ok((registers, published))
@@ -2773,7 +3071,7 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
         &mut self,
         node: NodeId,
         registers: &InputRegisters,
-    ) -> Result<Vec<OutputSource>, CompileFailure> {
+    ) -> Result<Option<OutputSource>, CompileFailure> {
         let Op::CallSlowPath {
             opcode, executable, pc, ..
         } = self.graph.node(node).op
@@ -2783,25 +3081,30 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
         // NB: Slow paths that take their operands by value run like those of
         //     calls, with the saves area for the inputs in saved registers.
         if slow_path_call(opcode) != Some(SlowPathCall::Record) {
-            let (operands, ssa_outputs) = self.slow_path_call_operands(opcode, executable, pc)?;
+            let (mut operands, mut ssa_outputs) = (self.spare_operands.take(), self.slow_path_ssa_outputs.take());
+            self.slow_path_call_operands(opcode, executable, pc, &mut operands, &mut ssa_outputs)?;
             // NB: The runtime's call helper and the call stub read the
             //     operands of calls from the frame, and calls leave their
             //     result there.
             if slow_path_call(opcode) == Some(SlowPathCall::JitCall) {
                 self.emit_store_operand_inputs(node, &operands, registers)?;
                 self.emit_generic(opcode, executable, pc)?;
-                let Some(destination) = ssa_outputs.first() else {
-                    return Ok(Vec::new());
+                let destination = ssa_outputs.first().copied();
+                (self.spare_operands, self.slow_path_ssa_outputs) = (operands, ssa_outputs);
+                let Some(destination) = destination else {
+                    return Ok(None);
                 };
                 let result = M::RETURN_GPRS[0];
-                let address = self.slot_address(*destination)?;
+                let address = self.slot_address(destination)?;
                 self.masm.load64(result, &address);
-                return Ok(vec![OutputSource::Register(result)]);
+                return Ok(Some(OutputSource::Register(result)));
             }
-            self.slow_path_values = Some(SlowPathValues::new(node, &operands, registers.clone(), ssa_outputs));
-            let sources = self.emit_generic(opcode, executable, pc);
+            self.set_slow_path_values(node, &operands, *registers);
+            self.slow_path_ssa_outputs = ssa_outputs;
+            self.spare_operands = operands;
+            let source = self.emit_generic(opcode, executable, pc);
             self.slow_path_values = None;
-            return sources;
+            return source;
         }
         let decoded = self.decoded(executable, pc)?;
         let address = self.runtime.slow_paths.get(opcode as usize).copied().unwrap_or(0);
@@ -2853,6 +3156,12 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
                 self.emit_box(dst, dst, repr);
             }
             Location::Constant(bits) => self.masm.move_imm64(dst, value::boxed_constant(bits, repr)),
+            // NB: Nodes that publish no frames run in the compiled function's frame.
+            Location::Frame(slot) if !self.publishes_frames(node) => {
+                let address = self.frame_home_address(self.pinned.frame, slot);
+                self.masm.load64(dst, &address);
+            }
+            Location::Frame(slot) => self.emit_load_frame_home(dst, slot),
         }
     }
 
@@ -2870,39 +3179,21 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
         next_pc: u32,
         address: u64,
         inputs: Option<(NodeId, &InputRegisters)>,
-    ) -> Result<Vec<OutputSource>, CompileFailure> {
+    ) -> Result<Option<OutputSource>, CompileFailure> {
         let layout = slow_path_layout(opcode);
         let arguments = M::ARGUMENT_GPRS;
         let scratch = self.pinned.scratch;
-        let operands = layout
-            .fields
-            .iter()
-            .map(|field| self.read_u32(executable, pc, field.instruction_offset))
-            .collect::<Result<Vec<_>, _>>()?;
+        let mut operands = self.spare_operands.take();
+        operands.clear();
+        for field in layout.fields {
+            operands.push(self.read_operand(executable, pc, field.instruction_offset)?);
+        }
 
         // Inputs passed by value: in the remaining argument registers, then on the stack.
-        let (by_value, first_register) = match layout.abi {
-            SlowPathAbi::Scalar => (
-                layout
-                    .fields
-                    .iter()
-                    .zip(&operands)
-                    .filter(|(field, _)| field.role == OperandRole::In)
-                    .map(|(_, operand)| *operand)
-                    .collect::<Vec<_>>(),
-                3,
-            ),
-            SlowPathAbi::ScalarInputs => (
-                layout
-                    .fields
-                    .iter()
-                    .zip(&operands)
-                    .filter(|(field, _)| field.role != OperandRole::Out)
-                    .map(|(_, operand)| *operand)
-                    .collect(),
-                4,
-            ),
-            SlowPathAbi::Record => (Vec::new(), 4),
+        let (is_by_value, first_register): (fn(&crate::bytecode::SlowPathField) -> bool, usize) = match layout.abi {
+            SlowPathAbi::Scalar => (|field| field.role == OperandRole::In, 3),
+            SlowPathAbi::ScalarInputs => (|field| field.role != OperandRole::Out, 4),
+            SlowPathAbi::Record => (|_| false, 4),
         };
         // NB: The inputs of a slow path call are the operands of the fields
         //     that are not outputs, then the array's.
@@ -2912,17 +3203,6 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
                 .filter(|field| field.role != OperandRole::Out)
                 .count()
         };
-        let by_value_fields = layout
-            .fields
-            .iter()
-            .enumerate()
-            .filter(|(_, field)| match layout.abi {
-                SlowPathAbi::Scalar => field.role == OperandRole::In,
-                SlowPathAbi::ScalarInputs => field.role != OperandRole::Out,
-                SlowPathAbi::Record => false,
-            })
-            .map(|(index, _)| index)
-            .collect::<Vec<_>>();
         let load = |codegen: &mut Self, dst: Gpr, operand: u32, input: usize| match inputs {
             Some((node, registers)) => {
                 codegen.load_input(dst, node, input, registers);
@@ -2930,12 +3210,13 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
             }
             None => codegen.load_raw_operand(dst, operand),
         };
-        for (index, operand) in by_value.iter().enumerate() {
-            let input = input_index(by_value_fields[index]);
+        let by_value_fields = (0..layout.fields.len()).filter(|index| is_by_value(&layout.fields[*index]));
+        for (index, field) in by_value_fields.enumerate() {
+            let (operand, input) = (operands[field], input_index(field));
             match arguments.get(first_register + index) {
-                Some(register) => load(self, *register, *operand, input)?,
+                Some(register) => load(self, *register, operand, input)?,
                 None => {
-                    load(self, scratch, *operand, input)?;
+                    load(self, scratch, operand, input)?;
                     let stack_index = (first_register + index - arguments.len()) as u32;
                     let address = self.local_address(8 * stack_index);
                     self.masm.store64(&address, scratch);
@@ -2945,7 +3226,7 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
 
         // The record of every operand value; inputs are filled in here.
         if layout.abi == SlowPathAbi::Record {
-            for (index, (field, operand)) in layout.fields.iter().zip(&operands).enumerate() {
+            for (index, (field, operand)) in layout.fields.iter().zip(operands.iter()).enumerate() {
                 if field.role != OperandRole::Out {
                     load(self, scratch, *operand, input_index(index))?;
                     let address = self.local_address(self.locals.record + 8 * index as u32);
@@ -2953,10 +3234,10 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
                 }
             }
             if let Some(array) = layout.array {
-                let count = self.read_u32(executable, pc, array.count_offset)?;
+                let count = self.read_array_count(executable, pc, array)?;
                 let first_input = input_index(layout.fields.len());
                 for element in 0..count {
-                    let operand = self.read_u32(executable, pc, array.instruction_offset + 4 * element)?;
+                    let operand = self.read_operand(executable, pc, array.instruction_offset + element)?;
                     load(self, scratch, operand, first_input + element as usize)?;
                     let index = layout.fields.len() as u32 + element;
                     let address = self.local_address(self.locals.record + 8 * index);
@@ -2968,7 +3249,7 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
             let record = self.local_address(self.locals.record);
             self.masm.load_effective_address(arguments[3], &record);
         }
-        let instruction = self.executables[executable as usize]
+        let instruction = self.snapshot.executables[executable as usize]
             .bytecode_address
             .checked_add(u64::from(pc))
             .ok_or(CompileFailure::InvalidBytecode {
@@ -2981,36 +3262,47 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
         self.masm.call_absolute(address);
 
         // Outputs come back in the second return register (scalar) or in the record.
-        let mut outputs = Vec::new();
-        let mut input_outputs = Vec::new();
-        for (index, (field, operand)) in layout.fields.iter().zip(&operands).enumerate() {
-            if field.role == OperandRole::In || *operand == crate::bytecode::Operand::INVALID {
-                continue;
-            }
-            let source = match layout.abi {
-                SlowPathAbi::Scalar => OutputSource::Register(M::RETURN_GPRS[1]),
-                _ => OutputSource::Record(self.locals.record + 8 * index as u32),
-            };
-            outputs.push((source, *operand));
-            if field.role == OperandRole::InOut {
-                input_outputs.push((source, *operand));
-            }
-        }
+        let source_of = |codegen: &Self, index: usize| match layout.abi {
+            SlowPathAbi::Scalar => OutputSource::Register(M::RETURN_GPRS[1]),
+            _ => OutputSource::Record(codegen.locals.record + 8 * index as u32),
+        };
+        let outputs = (0..layout.fields.len()).filter(|index| {
+            layout.fields[*index].role != OperandRole::In && operands[*index] != crate::bytecode::Operand::INVALID
+        });
         if inputs.is_some() {
+            let first = outputs.clone().next().map(|index| source_of(self, index));
+            self.spare_operands = operands;
             self.emit_continuation_check(next_pc, &[]);
-            return Ok(outputs.into_iter().map(|(source, _)| source).collect());
+            return Ok(first);
         }
         // NB: Outputs that are SSA values stay where the slow path left them.
-        let ssa_outputs = self
-            .slow_path_values
-            .as_ref()
-            .map(|values| values.ssa_outputs.clone())
-            .unwrap_or_default();
-        let (ssa_outputs, frame_outputs): (Vec<_>, Vec<_>) = outputs
-            .into_iter()
-            .partition(|(_, operand)| ssa_outputs.contains(operand));
-        self.emit_continuation_check_with_outputs(next_pc, &frame_outputs, &input_outputs)?;
-        Ok(ssa_outputs.into_iter().map(|(source, _)| source).collect())
+        let is_ssa = |codegen: &Self, operand: u32| {
+            codegen.slow_path_values.is_some() && codegen.slow_path_ssa_outputs.contains(&operand)
+        };
+        let first_ssa_output = outputs
+            .clone()
+            .find(|index| is_ssa(self, operands[*index]))
+            .map(|index| source_of(self, index));
+        // NB: The frame outputs, then the outputs that are also inputs.
+        let mut stored = self.spare_outputs.take();
+        stored.clear();
+        stored.extend(
+            outputs
+                .clone()
+                .filter(|index| !is_ssa(self, operands[*index]))
+                .map(|index| (source_of(self, index), operands[index])),
+        );
+        let frame_output_count = stored.len();
+        stored.extend(
+            outputs
+                .filter(|index| layout.fields[*index].role == OperandRole::InOut)
+                .map(|index| (source_of(self, index), operands[index])),
+        );
+        self.spare_operands = operands;
+        let (frame_outputs, input_outputs) = stored.split_at(frame_output_count);
+        self.emit_continuation_check_with_outputs(next_pc, frame_outputs, input_outputs)?;
+        self.spare_outputs = stored;
+        Ok(first_ssa_output)
     }
 
     /// Stores slow path outputs to their frame slots.
@@ -3057,9 +3349,9 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
         );
         self.leave_stubs.push(LeaveStub {
             label,
-            leave_frame: self.leave_frame.clone(),
-            input_outputs: input_outputs.to_vec(),
-            leave_arguments: self.leave_arguments.clone(),
+            leave_frame: self.leave_frame,
+            input_outputs: self.work.alloc_slice_copy(input_outputs),
+            leave_arguments: self.work.alloc_slice_copy(&self.leave_arguments),
         });
         self.store_outputs(outputs)
     }
@@ -3075,25 +3367,19 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
             //     published frames, and an exception they throw may be caught
             //     further out, where the interpreter reads the frames. (The
             //     slow paths of fast paths run in frames written in full.)
-            return matches!(
-                self.graph.node(node).op,
-                Op::Generic { .. }
-                    | Op::CallSlowPath { .. }
-                    | Op::CallDirect { .. }
-                    | Op::CallNative { .. }
-                    | Op::CallForwardingArguments { .. }
-            )
-            .then_some(node);
+            return lowering_info::lowering_info(self.graph.node(node))
+                .may_leave_from_inlined_callee
+                .then_some(node);
         }
         (frame_state.executable == 0 && !frame_state.values.is_empty()).then_some(node)
     }
 
     /// The out of line code of a slow path call that did not continue.
-    fn emit_leave_stub(&mut self, stub: LeaveStub) -> Result<(), CompileFailure> {
+    fn emit_leave_stub(&mut self, stub: LeaveStub<'a>) -> Result<(), CompileFailure> {
         self.masm.bind(stub.label);
         if let Some(leave_frame) = stub.leave_frame {
             if !stub.input_outputs.is_empty() {
-                self.emit_store_input_outputs(&stub.input_outputs)?;
+                self.emit_store_input_outputs(stub.input_outputs)?;
             }
             // NB: Nothing runs the frame again once the interpreter is to
             //     exit, which needs no frame state.
@@ -3105,7 +3391,7 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
             }
             let control = self.local_address(self.locals.leave_control);
             self.masm.store64(&control, M::RETURN_GPRS[0]);
-            for (register, offset) in &leave_frame.restore {
+            for (register, offset) in leave_frame.restore.iter() {
                 let address = self.local_address(*offset);
                 self.masm.load64(*register, &address);
             }
@@ -3118,9 +3404,9 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
             return Ok(());
         }
         if !stub.input_outputs.is_empty() {
-            self.emit_store_input_outputs(&stub.input_outputs)?;
+            self.emit_store_input_outputs(stub.input_outputs)?;
         }
-        self.leave_arguments = stub.leave_arguments;
+        self.leave_arguments.assign(stub.leave_arguments);
         self.emit_leave_after_slow_path();
         Ok(())
     }
@@ -3142,8 +3428,10 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
         let Some((handler_pc, exception_dst, entry_pc, entry)) = self.catch_entry_of(leave_frame.node)? else {
             return Ok(());
         };
-        let descriptor = self.site_descriptor(leave_frame.node, SiteKind::Leave);
-        let values = &descriptor.frames.last().expect("a site has a frame state").values;
+        let mut values = self.spare_frame_values.take();
+        self.with_site_source(leave_frame.node, SiteKind::Leave, |site| {
+            site.root_frame_values(&mut values);
+        });
         let writable = |location: &ValueLocation| {
             !matches!(
                 location,
@@ -3154,6 +3442,7 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
             .iter()
             .all(|(slot, location)| *slot != CALLEE_SLOT && writable(location))
         {
+            self.spare_frame_values = values;
             return Ok(());
         }
         let leave = self.masm.new_label();
@@ -3182,7 +3471,7 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
         self.masm
             .branch64_imm(Condition::Equal, scratch, value::EMPTY as i64, leave);
         self.masm.move64(self.pinned.frame, root_frame);
-        for (register, offset) in &leave_frame.restore {
+        for (register, offset) in leave_frame.restore.iter() {
             let address = self.local_address(*offset);
             self.masm.load64(*register, &address);
         }
@@ -3198,7 +3487,7 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
         self.masm.bind(initialized);
         let value = M::RETURN_GPRS[0];
         let number = M::ARGUMENT_FPRS[0];
-        for (slot, location) in values {
+        for (slot, location) in &*values {
             match *location {
                 ValueLocation::Constant(bits) => self.masm.move_imm64(value, bits),
                 ValueLocation::Register(register, Repr::Float64) => {
@@ -3219,6 +3508,10 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
                 ValueLocation::Stack(offset, repr) => {
                     self.masm.load64(value, &Address::new(M::FRAME_POINTER, offset));
                     self.emit_box(value, value, repr);
+                }
+                ValueLocation::Frame(slot) => {
+                    let address = self.slot_address(slot)?;
+                    self.masm.load64(value, &address);
                 }
                 ValueLocation::ArgumentsObject { .. } | ValueLocation::VirtualObject(_) => {
                     unreachable!("frame states with objects to create leave through the runtime")
@@ -3241,23 +3534,23 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
         let entry = self.label(entry);
         self.masm.jump(entry);
         self.masm.bind(leave);
+        self.spare_frame_values = values;
         Ok(())
     }
 
     /// The pc of the handler that catches exceptions thrown at `node` in the
     /// compiled function's frame, the slot its `Catch` stores the exception
     /// in, and the pc and block of its catch entry, if it has one.
-    fn catch_entry_of(&self, node: NodeId) -> Result<Option<(u32, u32, u32, BlockId)>, CompileFailure> {
+    fn catch_entry_of(&mut self, node: NodeId) -> Result<Option<(u32, u32, u32, BlockId)>, CompileFailure> {
         let frame_state = self.graph.node(node).frame_state.expect("leaves have a frame state");
-        let root = *self
+        let root = self
             .graph
             .frame_state_chain(frame_state)
             .last()
             .expect("a frame state chain is not empty");
         let pc = self.graph.frame_state(root).pc;
         // NB: Handler ranges do not overlap.
-        let Some(handler) = self.executables[0]
-            .exception_handlers
+        let Some(handler) = self.snapshot[self.snapshot.executables[0].exception_handlers]
             .iter()
             .find(|handler| handler.start_offset <= pc && pc < handler.end_offset)
         else {
@@ -3317,9 +3610,9 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
             let stub = self.masm.new_label();
             self.leave_stubs.push(LeaveStub {
                 label: stub,
-                leave_frame: self.leave_frame.clone(),
-                input_outputs: Vec::new(),
-                leave_arguments: Vec::new(),
+                leave_frame: self.leave_frame,
+                input_outputs: &[],
+                leave_arguments: &[],
             });
             self.masm.jump(stub);
         } else {
@@ -3350,7 +3643,8 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
             self.masm.move_imm32(arguments[2], u32::from(mapped));
             self.masm.call_absolute(self.runtime.create_arguments);
             self.masm.load64(arguments[1], &root_frame);
-            for (slot, _) in self.leave_arguments.clone() {
+            for index in 0..self.leave_arguments.len() {
+                let slot = self.leave_arguments[index].0;
                 let offset = u64::from(self.runtime.offsets.execution_context_slots) + 8 * u64::from(slot);
                 let address = Address::new(
                     arguments[1],

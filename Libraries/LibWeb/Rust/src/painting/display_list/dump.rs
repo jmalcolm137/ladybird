@@ -4,32 +4,59 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-use super::builder::{for_each_command, inline_transform_of, read_command};
+use super::builder::{
+    HEADER_SIZE, RecordedDisplayList, for_each_command, inline_clips_of, inline_transform_of, read_command,
+};
+use super::chunks::ChunkId;
 use super::commands::*;
-use super::nested_records::{NestedRecordsRole, for_each_nested_record_span, span_bytes};
-use crate::css::color_resolution::format_to_8bit_compatible;
+use super::dump_format::{
+    DumpNames, DumpValue, dumped_record_field, json_corner_radii, json_fields, json_float, json_float_point,
+    json_float_rect, json_int_rect, json_name, path_description, push_clip_radii, push_fields, push_value,
+};
+use super::layers::planning::{LayerStackInputs, PlannedLayers, plan_layer_stack};
+use super::layers::{LayerIndex, VisualContextNodeNamer, WindowServerCompositing, WindowServerPresentationOfMedia};
+use super::nested_records::{
+    NestedRecordsRole, for_each_command_including_nested, for_each_nested_record_span, span_bytes,
+};
+use super::record_fields::visit_command_fields;
+use super::recorder::{RecordNotes, RecordOrigin};
+use super::storage::{ChunkIndexInList, DisplayListStorage, ListPosition};
 use crate::layout::LayoutNodeArena;
 use crate::layout::node_data::NodeSlotId;
-use crate::painting::dump::{
-    format_float_like_ak, push_affine_transform, push_float_like_ak, push_float_point, push_float_rect,
-    push_float_size, push_int_point, push_int_rect, push_int_size,
-};
+use crate::painting::dump::{push_affine_transform, push_float_rect};
 use crate::painting::paint_read::PaintRead;
-#[cfg(test)]
-use crate::painting::visual_context::VisualContextTree;
+use crate::painting::vector_image_records::display_list_holding_vector_image_records;
 use crate::painting::visual_context::VisualContextTreeDump;
-use crate::painting::visual_context::dump::SlotKind;
+use crate::painting::visual_context::dump::{DumpedNode, SlotKind, tree_section_text};
 use crate::stage::MainThread;
+use libcompositing_rust::visual_context::CompositorScrollTable;
 use libgfx_rust::path::Path;
-use libgfx_rust::{
-    Color, CompositingAndBlendingOperator, CornerRadii, FloatPoint, FloatRect, FloatSize, IntPoint, IntRect, IntSize,
-    LineStyle, ScalingMode,
-};
+use libgfx_rust::{FloatPoint, FloatRect, IntRect};
 use std::collections::HashMap;
 use std::ffi::c_void;
 use std::fmt::Write;
 
 crate::stage::main_thread_ffi_entries!();
+
+/// What the display list dump prints besides what it always does.
+#[derive(Clone, Copy)]
+#[repr(C)]
+pub struct FfiDisplayListDumpOptions {
+    /// Names, on each record, the box and the paint phase that recorded it.
+    pub owners: bool,
+    /// Prints, on each glyph run, the text it draws.
+    pub text: bool,
+    /// Prints, on each glyph run, the family, size and weight of its font.
+    pub fonts: bool,
+    /// Numbers every record, nested ones too, in tape order, and names the records of each layer by those numbers.
+    pub record_ids: bool,
+    /// Marks where each chunk of the tape starts, with its id, its record count and its size.
+    pub chunks: bool,
+    /// Names visual context nodes by their indices in the tree rather than by the order the dump first prints them in.
+    pub raw_node_indices: bool,
+    /// Writes one JSON object per line instead of text, with everything the other options add.
+    pub jsonl: bool,
+}
 
 /// What a display list dump asks the document. The fields are private: the callbacks are reached
 /// only through the methods below, which take the main thread token.
@@ -42,9 +69,9 @@ pub struct FfiPaintingDumpCallbacks {
     context: *mut c_void,
     /// Describes the row in the slot, as its layout node describes itself.
     debug_description: extern "C" fn(context: *mut c_void, slot: NodeSlotId, description_sink: *mut c_void),
-    /// Answers the storage handle of a nested display list.
-    nested_display_list: extern "C" fn(context: *mut c_void, display_list_id: u64) -> *const c_void,
     append_text: extern "C" fn(context: *mut c_void, bytes: *const u8, byte_count: usize),
+    /// Describes the font, a `Gfx::Font`, by its family, pixel size and weight.
+    describe_font: extern "C" fn(context: *mut c_void, font: *const c_void, description_sink: *mut c_void),
 }
 
 impl FfiPaintingDumpCallbacks {
@@ -56,11 +83,12 @@ impl FfiPaintingDumpCallbacks {
         String::from_utf8_lossy(&description).into_owned()
     }
 
-    fn nested_display_list(&self, _: &MainThread, display_list_id: DisplayListResourceId) -> *const c_void {
-        // Nested ids come from records the host produced, so they resolve in its storage.
-        let display_list = (self.nested_display_list)(self.context, display_list_id.0);
-        assert!(!display_list.is_null());
-        display_list
+    fn describe_font(&self, _: &MainThread, font: &libgfx_rust::font::FontHandle) -> String {
+        let mut description = Vec::new();
+        // The C++ host fills the description sink synchronously through the exported push function, and the handle
+        // keeps the font alive for the call.
+        (self.describe_font)(self.context, font.as_raw(), (&raw mut description).cast());
+        String::from_utf8_lossy(&description).into_owned()
     }
 
     fn append_text(&self, _: &MainThread, text: &str) {
@@ -113,26 +141,193 @@ impl VisualContextNodeOwners {
     }
 }
 
+/// Hands `append_line` each animation the compositor runs for the document of `host`, in the order the tree holds
+/// them: the property it animates (0 for opacity, 1 for background color, 2 for filter, 3 for transform) and the element
+/// of the box owning the node it drives, or zero. Answers, in bit 0, whether the animations share one timing anchor and,
+/// in bit 1, whether every one drives a live node.
+///
 /// # Safety
 ///
-/// `host` must be a live document host, on its document's thread, and `visual_context_tree` a live retained tree
-/// handle built from its render state; `display_list` is the storage handle of the display list, and it and every
-/// storage handle `callbacks` returns must remain live for this call. `debug_description` is called synchronously
-/// with a `Vec<u8>` sink the host fills through `layout_arena_paint_push_bytes`.
+/// `host` must be a live document host, on its document's thread, and `append_line` must return before the next call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn render_state_dump_compositor_animations(
+    host: &crate::render_state::DocumentHost,
+    read: &crate::render_state::BegunRead,
+    viewport: NodeSlotId,
+    context: *mut c_void,
+    append_line: unsafe extern "C" fn(*mut c_void, u8, u32),
+) -> u8 {
+    use crate::painting::host::FfiVisualAnimationTargetKind;
+    let (lines, flags) = crate::painting::ffi::read_arena(host, read, viewport, |arena, viewport| {
+        let Some(tree) = arena.paint_state().visual_context.tree.clone() else {
+            return (Vec::new(), 3);
+        };
+        let owners = VisualContextNodeOwners::collect(arena, viewport);
+        let lines = tree
+            .visual_animations()
+            .iter()
+            .map(|animation| {
+                let kind = match animation.target_kind {
+                    FfiVisualAnimationTargetKind::Opacity => 0,
+                    FfiVisualAnimationTargetKind::BackgroundColor => 1,
+                    FfiVisualAnimationTargetKind::Filter => 2,
+                    FfiVisualAnimationTargetKind::Transform => 3,
+                };
+                let slot_kind = match animation.target_kind {
+                    FfiVisualAnimationTargetKind::Transform => SlotKind::Spatial,
+                    _ => SlotKind::Effect,
+                };
+                let element = animation
+                    .node_indices
+                    .first()
+                    .and_then(|&index| owners.owner(slot_kind, index))
+                    .and_then(|slot| arena.node_style_node(slot))
+                    .map_or(0, |element| element.raw());
+                (kind, element)
+            })
+            .collect::<Vec<_>>();
+        let summary = tree.visual_animation_summary();
+        (
+            lines,
+            u8::from(summary.share_timing_anchor) | (u8::from(summary.targets_are_valid) << 1),
+        )
+    });
+    for (kind, element) in lines {
+        // SAFETY: Guaranteed by the caller.
+        unsafe { append_line(context, kind, element) };
+    }
+    flags
+}
+
+/// What describing the owners of nodes of the visual context tree asks the document. The fields are private: the
+/// callbacks are reached only through the method below, which takes the main thread token.
+///
+/// NB: The callbacks are typed as safe functions because the table only comes from the host through an export whose
+///     safety contract keeps them callable, and the private fields let nothing else call them.
+#[derive(Clone, Copy)]
+#[repr(C)]
+pub struct FfiVisualContextNodeOwnerCallbacks {
+    context: *mut c_void,
+    /// Describes the row in the slot, as its layout node describes itself.
+    debug_description: extern "C" fn(context: *mut c_void, slot: NodeSlotId, description_sink: *mut c_void),
+    /// Takes the description of the owner of the node at `position` among the nodes asked of.
+    take_owner: extern "C" fn(context: *mut c_void, position: usize, bytes: *const u8, byte_count: usize),
+}
+
+impl FfiVisualContextNodeOwnerCallbacks {
+    fn take_owner(&self, _: &MainThread, slot: NodeSlotId, position: usize) {
+        let mut description = Vec::new();
+        // The C++ host fills the description sink synchronously through the exported push function, and copies the
+        // description it takes.
+        (self.debug_description)(self.context, slot, (&raw mut description).cast());
+        (self.take_owner)(self.context, position, description.as_ptr(), description.len());
+    }
+}
+
+/// Describes the boxes that own the nodes of the visual context tree of `host`'s document, prepared up to date, that
+/// `spatial_node_indices` and then `effect_node_indices` name: `take_owner` gets the description of each live owner,
+/// by the position of its node among those asked of. Answers the structural epoch of the tree, or zero where the
+/// document has none, when nothing is described.
+///
+/// # Safety
+///
+/// `host` must be a live document host, on its document's thread. Each pointer and count of indices must make a
+/// valid slice for this call, and the callbacks are called synchronously, with a `Vec<u8>` sink the host fills through
+/// `layout_arena_paint_push_bytes`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn painting_describe_owners_of_visual_context_nodes(
+    host: &crate::render_state::DocumentHost,
+    read: &crate::render_state::BegunRead,
+    viewport: NodeSlotId,
+    spatial_node_indices: *const u32,
+    spatial_node_count: usize,
+    effect_node_indices: *const u32,
+    effect_node_count: usize,
+    callbacks: FfiVisualContextNodeOwnerCallbacks,
+) -> u64 {
+    // SAFETY: Guaranteed by the entry point's contract.
+    let main_thread = unsafe { main_thread(host) };
+    // SAFETY: As above.
+    let Some(visual_context_tree) = (unsafe { crate::painting::ffi::main_visual_context_tree(host, read) }) else {
+        return 0;
+    };
+    // SAFETY: Guaranteed by the entry point's contract.
+    let slice_of = |indices: *const u32, count: usize| unsafe { ak::slice_from_raw_parts(indices, count) }.to_vec();
+    let nodes: Vec<(SlotKind, u32)> = slice_of(spatial_node_indices, spatial_node_count)
+        .into_iter()
+        .map(|index| (SlotKind::Spatial, index))
+        .chain(
+            slice_of(effect_node_indices, effect_node_count)
+                .into_iter()
+                .map(|index| (SlotKind::Effect, index)),
+        )
+        .collect();
+    let live_owners = crate::painting::ffi::read_arena(host, read, (viewport, nodes), |arena, (viewport, nodes)| {
+        let owners = VisualContextNodeOwners::collect(arena, viewport);
+        nodes
+            .into_iter()
+            .map(|(kind, index)| {
+                owners
+                    .owner(kind, index)
+                    .filter(|&owner| owner != NodeSlotId::INVALID && arena.slot_is_live(owner))
+            })
+            .collect::<Vec<_>>()
+    });
+    for (position, owner) in live_owners.into_iter().enumerate() {
+        if let Some(owner) = owner {
+            callbacks.take_owner(&main_thread, owner, position);
+        }
+    }
+    visual_context_tree.structural_epoch
+}
+
+/// # Safety
+///
+/// Dumps `display_list` with the nodes it names of the visual context tree of `host`'s document, prepared up to date.
+///
+/// # Safety
+///
+/// `host` must be a live document host, on its document's thread; `display_list` is the storage handle of the display
+/// list, and it and every storage handle `callbacks` returns must remain live for this call. `debug_description` is
+/// called synchronously with a `Vec<u8>` sink the host fills through `layout_arena_paint_push_bytes`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn painting_dump(
     host: &crate::render_state::DocumentHost,
     read: &crate::render_state::BegunRead,
     viewport: NodeSlotId,
-    visual_context_tree: *const c_void,
-    display_list: *const c_void,
+    device_viewport_rect: IntRect,
+    options: FfiDisplayListDumpOptions,
     callbacks: FfiPaintingDumpCallbacks,
 ) {
-    assert!(!display_list.is_null());
+    let options = if options.jsonl {
+        FfiDisplayListDumpOptions {
+            owners: true,
+            text: true,
+            fonts: true,
+            record_ids: true,
+            chunks: true,
+            ..options
+        }
+    } else {
+        options
+    };
     // SAFETY: Guaranteed by the entry point's contract.
     let main_thread = unsafe { main_thread(host) };
-    let visual_context_tree = unsafe { libcompositing_rust::ffi::tree_from_handle(visual_context_tree) };
-    let (_, command_runs) = unsafe { libcompositing_rust::display_list::storage::tape_of(display_list) };
+    // SAFETY: As above.
+    let visual_context_tree = unsafe { crate::painting::ffi::main_visual_context_tree(host, read) }
+        .expect("a document with a committed viewport box has a visual context tree");
+    let visual_context_tree = visual_context_tree.as_ref();
+    let recording =
+        crate::painting::ffi::read_arena(host, read, (), |arena, ()| arena.paint_state().last_recording.clone())
+            .expect("the dump records the document first");
+    // The dump shows the tape as the compositor replays it, with the records of the SVG images it draws.
+    let display_list = DisplayListStorage::recorded(
+        &display_list_holding_vector_image_records(&recording.display_list, &recording.resources.vector_images),
+        recording
+            .visual_context_tree
+            .clone()
+            .expect("a recording was recorded against a tree"),
+    );
     let owners = {
         crate::painting::ffi::read_arena(host, read, viewport, |arena, viewport| {
             let mut owners = VisualContextNodeOwners::collect(arena, viewport);
@@ -142,546 +337,1013 @@ pub unsafe extern "C" fn painting_dump(
             owners
         })
     };
-    let mut output = visual_context_tree.dump_nodes_reachable_from_runs(command_runs, |kind, index| {
+    let record_notes = (options.owners || options.text).then(|| {
+        let record_notes = recording.record_notes.clone().unwrap_or_default();
+        record_notes_in_tape_order(&recording.display_list, &record_notes)
+    });
+    let owner_labels = record_notes
+        .as_ref()
+        .filter(|_| options.owners)
+        .map(|notes| owner_labels(host, read, &main_thread, &callbacks, notes))
+        .unwrap_or_default();
+    let font_descriptions = options.fonts.then(|| {
+        recording
+            .resources
+            .with_vector_image_resources()
+            .fonts
+            .iter()
+            .map(|(id, font)| (*id, callbacks.describe_font(&main_thread, font)))
+            .collect::<HashMap<_, _>>()
+    });
+    let mut names = if options.raw_node_indices {
+        DumpNames::default()
+    } else {
+        DumpNames::numbering_nodes_in_print_order()
+    };
+    let record_ids = options
+        .record_ids
+        .then(|| RecordIdsOfTopLevelRecords::of(&display_list));
+    let nodes = visual_context_tree.reachable_nodes_in_print_order(display_list.runs(), &mut names, |kind, index| {
         let owner = owners.owner(kind, index)?;
         Some(callbacks.debug_description(&main_thread, owner))
     });
-    output.push_str("\nDisplayList:\n");
-    dump_commands(&main_thread, &mut output, &callbacks, display_list, 0);
+    let mut output = String::new();
+    if options.jsonl {
+        push_json_line(
+            &mut output,
+            serde_json::json!({
+                "type": "header",
+                "format": "ladybird-display-list-dump",
+                "version": 1,
+                "viewport": json_int_rect(device_viewport_rect),
+                "node_names": if options.raw_node_indices { "raw-indices" } else { "print-order" },
+                "record_count": record_ids.as_ref().map_or(0, |record_ids| record_ids.record_count),
+            }),
+        );
+        for node in &nodes {
+            push_json_line(&mut output, json_node(node));
+        }
+    } else {
+        output = tree_section_text(&nodes);
+    }
+    dump_compositor_scroll_table(
+        &mut output,
+        &mut names,
+        visual_context_tree.compositor_scroll_table(),
+        options.jsonl,
+    );
+    let scroll_state = host.scroll_state();
+    let scroll_offsets = scroll_state.device_offsets();
+    let planned_layers = plan_layer_stack(&LayerStackInputs {
+        list: &display_list,
+        tree: visual_context_tree,
+        scroll_offsets,
+        viewport_rect: device_viewport_rect,
+    });
+    let presentation_of_media = planned_layers.stack.window_server_presentation_of_media(
+        &display_list,
+        visual_context_tree,
+        scroll_offsets,
+        device_viewport_rect,
+        WINDOW_SERVER_THE_DUMP_TELLS_LAYERS_FOR,
+    );
+    dump_layers(
+        &mut output,
+        &mut names,
+        &display_list,
+        &planned_layers,
+        &presentation_of_media,
+        record_ids.as_ref(),
+        options.jsonl,
+    );
+    if !options.jsonl {
+        output.push_str("\nDisplayList:\n");
+    }
+    let mut records = RecordDump {
+        output: &mut output,
+        names: &mut names,
+        jsonl: options.jsonl,
+        prints_record_ids: options.record_ids,
+        record_count: 0,
+        record_notes: record_notes.map(|notes| RecordNotesInDumpOrder {
+            notes,
+            next_index: 0,
+            owner_labels,
+            prints_owners: options.owners,
+            prints_glyph_run_texts: options.text,
+        }),
+        font_descriptions,
+        chunk_starts: if options.chunks {
+            ChunkStart::of_list(&display_list)
+        } else {
+            Vec::new()
+        },
+        current_chunk: None,
+        layer_label_of_current_top_level_record: String::new(),
+    };
+    records.dump_top_level_commands_with_their_layers(&display_list, &planned_layers);
     callbacks.append_text(&main_thread, &output);
+}
+
+/// Hands `append_text` what changed from the JSON Lines dump `previous`, if there is one, to the JSON Lines dump
+/// `current` of the display list of the same document.
+///
+/// # Safety
+///
+/// `previous` must point to `previous_length` readable bytes where `has_previous` is set, and `current` to
+/// `current_length`; `append_text` copies the report synchronously.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn painting_dump_changes(
+    previous: *const u8,
+    previous_length: usize,
+    has_previous: bool,
+    current: *const u8,
+    current_length: usize,
+    context: *mut c_void,
+    append_text: extern "C" fn(context: *mut c_void, bytes: *const u8, byte_count: usize),
+) {
+    // SAFETY: Guaranteed by the caller.
+    let previous = has_previous.then(|| unsafe { ak::slice_from_raw_parts(previous, previous_length) });
+    // SAFETY: Guaranteed by the caller.
+    let current = unsafe { ak::slice_from_raw_parts(current, current_length) };
+    let report = super::dump_changes::display_list_dump_changes(
+        previous.map(|previous| String::from_utf8_lossy(previous)).as_deref(),
+        &String::from_utf8_lossy(current),
+    );
+    append_text(context, report.as_ptr(), report.len());
 }
 
 fn push_indent(output: &mut String, indent: usize) {
     output.extend(std::iter::repeat_n(' ', indent * 2));
 }
 
-fn dump_commands(
-    main_thread: &MainThread,
-    output: &mut String,
-    callbacks: &FfiPaintingDumpCallbacks,
-    display_list: *const c_void,
-    base_indent: usize,
-) {
-    // SAFETY: The caller keeps the storage live for the dump.
-    let (bytes, command_runs) = unsafe { libcompositing_rust::display_list::storage::tape_of(display_list) };
-    for run in command_runs {
-        let run_bytes = &bytes[run.offset as usize..(run.offset + run.size) as usize];
-        dump_command_bytes(main_thread, output, callbacks, run_bytes, run.context, base_indent);
+fn css_pixel_point(point: crate::layout::used_values::FfiCssPixelPoint) -> FloatPoint {
+    FloatPoint {
+        x: point.x.to_float(),
+        y: point.y.to_float(),
     }
 }
 
-fn dump_command_bytes(
-    main_thread: &MainThread,
-    output: &mut String,
-    callbacks: &FfiPaintingDumpCallbacks,
-    command_bytes: &[u8],
-    context: ContextRef,
-    base_indent: usize,
-) {
-    for_each_command(command_bytes, |header, _, payload| {
-        push_indent(output, base_indent);
-        write!(output, "{}@", header.command_type.name()).unwrap();
-        write_context(output, context);
-        dump_command(output, header.command_type, payload);
-        if header.inline_clip_count > 0 {
-            dump_inline_clips(output, header, payload);
-        }
-        if let Some(transform) = inline_transform_of(header, payload) {
-            output.push_str(" inline_transform=");
-            push_affine_transform(output, transform);
-        }
-        output.push('\n');
-
-        dump_records_inside(
-            main_thread,
-            output,
-            callbacks,
-            header.command_type,
-            payload,
-            context,
-            base_indent + 1,
-        );
-        let Some(nested) = nested_display_lists(header.command_type, payload) else {
-            return;
-        };
-        dump_commands(
-            main_thread,
-            output,
-            callbacks,
-            callbacks.nested_display_list(main_thread, nested.display_list),
-            base_indent + 1,
-        );
-    });
+fn css_pixel_rect(rect: crate::layout::used_values::FfiCssPixelRect) -> FloatRect {
+    FloatRect::new(
+        rect.x.to_float(),
+        rect.y.to_float(),
+        rect.width.to_float(),
+        rect.height.to_float(),
+    )
 }
 
-struct NestedDisplayLists {
-    display_list: DisplayListResourceId,
+fn push_field(output: &mut String, names: &mut DumpNames, name: &str, value: DumpValue) {
+    write!(output, " {name}=").unwrap();
+    push_value(output, &value, names);
 }
 
-fn nested_display_lists(command_type: DisplayListCommandType, payload: &[u8]) -> Option<NestedDisplayLists> {
-    match command_type {
-        DisplayListCommandType::PaintNestedDisplayList => Some(NestedDisplayLists {
-            display_list: read_command::<PaintNestedDisplayList>(payload).display_list_id,
+fn json_node(node: &DumpedNode) -> serde_json::Value {
+    let mut object = serde_json::Map::new();
+    object.insert("type".into(), serde_json::json!("node"));
+    object.insert(
+        "kind".into(),
+        serde_json::json!(match node.kind {
+            SlotKind::Spatial => "spatial",
+            SlotKind::Clip => "clip",
+            SlotKind::Effect => "effect",
         }),
-        _ => None,
+    );
+    object.insert("name".into(), serde_json::json!(node.name));
+    object.insert("raw".into(), serde_json::json!(node.index));
+    object.insert("depth".into(), serde_json::json!(node.depth));
+    for (key, value) in [
+        ("parent", &node.parent),
+        ("space", &node.space),
+        ("output_clip", &node.output_clip),
+    ] {
+        if let Some(value) = value {
+            object.insert(key.into(), serde_json::json!(value));
+        }
+    }
+    object.insert("description".into(), serde_json::json!(node.description));
+    if let Some(owner) = &node.owner {
+        object.insert("owner".into(), serde_json::json!(owner));
+    }
+    serde_json::Value::Object(object)
+}
+
+fn json_scroll_node(names: &mut DumpNames, table: &CompositorScrollTable, node_index: usize) -> serde_json::Value {
+    use serde_json::json;
+    let node = &table.nodes[node_index];
+    let mut object = serde_json::Map::new();
+    object.insert("type".into(), json!("scroll_node"));
+    object.insert(
+        "scroll_node".into(),
+        json_name(names.spatial(node.scroll_node_index), node.scroll_node_index.0),
+    );
+    object.insert(
+        "parent".into(),
+        json_name(
+            names.spatial(node.parent_scroll_node_index),
+            node.parent_scroll_node_index.0,
+        ),
+    );
+    object.insert("scrollport_rect".into(), json_int_rect(node.scrollport_rect));
+    object.insert("min_scroll_offset".into(), json_float_point(node.min_scroll_offset));
+    object.insert("max_scroll_offset".into(), json_float_point(node.max_scroll_offset));
+    object.insert("is_viewport".into(), json!(node.is_viewport));
+    if let Ok(container_index) = table
+        .snap_containers
+        .binary_search_by_key(&node.scroll_node_index, |container| container.scroll_node_index)
+    {
+        let container = &table.snap_containers[container_index];
+        let first_area_index = container.first_area_index as usize;
+        let areas: Vec<serde_json::Value> = table.snap_areas
+            [first_area_index..first_area_index + container.area_count as usize]
+            .iter()
+            .map(|area| {
+                json!({
+                    "pseudo_element_type": area.pseudo_element_type,
+                    "rect": json_float_rect(css_pixel_rect(area.rect)),
+                    "align_x": area.align_x,
+                    "align_y": area.align_y,
+                    "always_stop": area.always_stop,
+                })
+            })
+            .collect();
+        object.insert(
+            "snap_container".into(),
+            json!({
+                "snapport": json_float_rect(css_pixel_rect(container.snapport)),
+                "min_scroll_offset": json_float_point(css_pixel_point(container.min_scroll_offset)),
+                "max_scroll_offset": json_float_point(css_pixel_point(container.max_scroll_offset)),
+                "strictness": container.strictness,
+                "snaps_x": container.snaps_x,
+                "snaps_y": container.snaps_y,
+                "horizontal_writing_mode": container.horizontal_writing_mode,
+                "areas": areas,
+            }),
+        );
+    }
+    serde_json::Value::Object(object)
+}
+
+// Lists every row, unlike the tree section above it, which shows only the nodes that command runs reach.
+fn dump_compositor_scroll_table(
+    output: &mut String,
+    names: &mut DumpNames,
+    table: &CompositorScrollTable,
+    jsonl: bool,
+) {
+    if jsonl {
+        for node_index in 0..table.nodes.len() {
+            push_json_line(output, json_scroll_node(names, table, node_index));
+        }
+        return;
+    }
+    if table.nodes.is_empty() {
+        return;
+    }
+    output.push_str("\nScrollNodes:\n");
+    for node in table.nodes.iter() {
+        output.push_str("ScrollNode");
+        push_field(
+            output,
+            names,
+            "scroll_node_index",
+            DumpValue::SpatialNode(node.scroll_node_index),
+        );
+        push_field(
+            output,
+            names,
+            "parent_scroll_node_index",
+            DumpValue::SpatialNode(node.parent_scroll_node_index),
+        );
+        push_field(
+            output,
+            names,
+            "scrollport_rect",
+            DumpValue::IntRect(node.scrollport_rect),
+        );
+        push_field(
+            output,
+            names,
+            "min_scroll_offset",
+            DumpValue::FloatPoint(node.min_scroll_offset),
+        );
+        push_field(
+            output,
+            names,
+            "max_scroll_offset",
+            DumpValue::FloatPoint(node.max_scroll_offset),
+        );
+        writeln!(output, " is_viewport={}", node.is_viewport).unwrap();
+        let Ok(container_index) = table
+            .snap_containers
+            .binary_search_by_key(&node.scroll_node_index, |container| container.scroll_node_index)
+        else {
+            continue;
+        };
+        let container = &table.snap_containers[container_index];
+        push_indent(output, 1);
+        output.push_str("SnapContainer");
+        push_field(
+            output,
+            names,
+            "snapport",
+            DumpValue::FloatRect(css_pixel_rect(container.snapport)),
+        );
+        push_field(
+            output,
+            names,
+            "min_scroll_offset",
+            DumpValue::FloatPoint(css_pixel_point(container.min_scroll_offset)),
+        );
+        push_field(
+            output,
+            names,
+            "max_scroll_offset",
+            DumpValue::FloatPoint(css_pixel_point(container.max_scroll_offset)),
+        );
+        writeln!(
+            output,
+            " strictness={} snaps_x={} snaps_y={} horizontal_writing_mode={}",
+            container.strictness, container.snaps_x, container.snaps_y, container.horizontal_writing_mode
+        )
+        .unwrap();
+        let first_area_index = container.first_area_index as usize;
+        for area in &table.snap_areas[first_area_index..first_area_index + container.area_count as usize] {
+            push_indent(output, 2);
+            output.push_str("SnapArea");
+            write!(output, " pseudo_element_type={}", area.pseudo_element_type).unwrap();
+            push_field(output, names, "rect", DumpValue::FloatRect(css_pixel_rect(area.rect)));
+            writeln!(
+                output,
+                " align_x={} align_y={} always_stop={}",
+                area.align_x, area.align_y, area.always_stop
+            )
+            .unwrap();
+        }
     }
 }
 
-fn dump_records_inside(
-    main_thread: &MainThread,
+// A dump tells what the most capable window server can show of the layers, whichever window server shows the page, if
+// any does, so that it reads the same on every platform.
+const WINDOW_SERVER_THE_DUMP_TELLS_LAYERS_FOR: WindowServerCompositing = WindowServerCompositing {
+    shows_tiles_of_painted_layers: true,
+    filters_what_is_below_layers: true,
+};
+const HEADER_OF_LAYERS_SECTION: &str =
+    "Layers (for a window server that shows tiles and filters what is below layers):";
+
+fn dump_layers(
     output: &mut String,
-    callbacks: &FfiPaintingDumpCallbacks,
-    command_type: DisplayListCommandType,
-    payload: &[u8],
-    context: ContextRef,
-    indent: usize,
+    names: &mut DumpNames,
+    display_list: &DisplayListStorage,
+    planned_layers: &PlannedLayers,
+    presentation_of_media: &WindowServerPresentationOfMedia,
+    record_ids: Option<&RecordIdsOfTopLevelRecords>,
+    jsonl: bool,
 ) {
-    for_each_nested_record_span(command_type, payload, |role, span| {
-        let label = match role {
-            NestedRecordsRole::IsolatedGroupMask => Some("Mask:\n"),
-            NestedRecordsRole::PatternTile => Some("PatternTile:\n"),
-            NestedRecordsRole::IsolatedGroupContent
-            | NestedRecordsRole::RepeatedTile
-            | NestedRecordsRole::MaskContent => None,
-        };
-        let mut nested_indent = indent;
-        if let Some(label) = label {
-            push_indent(output, indent);
-            output.push_str(label);
-            nested_indent += 1;
-        }
-        dump_command_bytes(
-            main_thread,
-            output,
-            callbacks,
-            span_bytes(payload, span),
-            context,
-            nested_indent,
-        );
+    let record_id_ranges_by_layer = record_ids.map(|record_ids| {
+        record_ids.record_id_ranges_by_layer_joining_adjacent_ranges(planned_layers.stack.layers.len(), |position| {
+            let (header, _) = display_list.record_at(position);
+            layers_labelling_top_level_record(planned_layers, &header, position)
+        })
     });
-}
-
-trait DumpValue {
-    fn push_dump(self, output: &mut String);
-}
-
-macro_rules! dump_value_via {
-    ($($type:ty => $push:expr),+ $(,)?) => {
-        $(impl DumpValue for $type {
-            fn push_dump(self, output: &mut String) {
-                $push(output, self);
+    let names = DumpNodeNamer(std::cell::RefCell::new(names));
+    if jsonl {
+        for (layer, line) in planned_layers.layer_lines(presentation_of_media, &names, |_| None) {
+            let mut object = serde_json::Map::new();
+            object.insert("type".into(), serde_json::json!("layer"));
+            if let Some(layer) = layer {
+                object.insert("name".into(), serde_json::json!(format!("L{}", layer.0)));
             }
-        })+
+            object.insert("line".into(), serde_json::json!(line));
+            if let (Some(layer), Some(ranges)) = (layer, &record_id_ranges_by_layer) {
+                object.insert("records".into(), json_record_id_ranges(&ranges[layer.0]));
+            }
+            push_json_line(output, serde_json::Value::Object(object));
+        }
+        return;
+    }
+    writeln!(output, "\n{HEADER_OF_LAYERS_SECTION}").unwrap();
+    let describe_records = |layer: LayerIndex| {
+        record_id_ranges_by_layer
+            .as_ref()
+            .map(|ranges| describe_record_id_ranges(&ranges[layer.0]))
+    };
+    for (_, line) in planned_layers.layer_lines(presentation_of_media, &names, describe_records) {
+        writeln!(output, "  {line}").unwrap();
+    }
+}
+
+struct DumpNodeNamer<'a>(std::cell::RefCell<&'a mut DumpNames>);
+
+impl VisualContextNodeNamer for DumpNodeNamer<'_> {
+    fn name_of_spatial_node(&self, index: SpatialNodeIndex) -> String {
+        self.0.borrow_mut().spatial(index)
+    }
+
+    fn name_of_effect_node(&self, index: EffectNodeIndex) -> String {
+        self.0.borrow_mut().effect(index)
+    }
+}
+
+fn layers_labelling_top_level_record(
+    planned_layers: &PlannedLayers,
+    header: &DisplayListCommandHeader,
+    position: ListPosition,
+) -> Vec<LayerIndex> {
+    let mut layers = if header.command_type.is_compositor_metadata() {
+        Vec::new()
+    } else {
+        planned_layers.layers_of_record(position)
+    };
+    if layers.is_empty() {
+        layers.push(planned_layers.stack.base_layer);
+    }
+    layers
+}
+
+/// The numbers of the records of a list, nested ones too, in paint order, by the top-level record that holds them.
+struct RecordIdsOfTopLevelRecords {
+    // In paint order: where each top-level record is, with the numbers of the first and the last record it holds.
+    top_level_records: Vec<(ListPosition, u32, u32)>,
+    record_count: u32,
+}
+
+impl RecordIdsOfTopLevelRecords {
+    fn of(display_list: &DisplayListStorage) -> Self {
+        let mut top_level_records = Vec::new();
+        let mut record_count = 0;
+        for (chunk_index, chunk) in display_list.chunks().iter().enumerate() {
+            for run in chunk.runs() {
+                let run_bytes = &chunk.records()[run.offset as usize..(run.offset + run.size) as usize];
+                for_each_command(run_bytes, |_, offset_in_run, payload| {
+                    let first_id = record_count + 1;
+                    let record_bytes = &run_bytes[offset_in_run..offset_in_run + HEADER_SIZE + payload.len()];
+                    for_each_command_including_nested(record_bytes, &mut |_, _, _| record_count += 1);
+                    let position =
+                        ListPosition::new(ChunkIndexInList(chunk_index as u32), run.offset + offset_in_run as u32);
+                    top_level_records.push((position, first_id, record_count));
+                });
+            }
+        }
+        Self {
+            top_level_records,
+            record_count,
+        }
+    }
+
+    fn record_id_ranges_by_layer_joining_adjacent_ranges(
+        &self,
+        layer_count: usize,
+        layers_of_top_level_record: impl Fn(ListPosition) -> Vec<LayerIndex>,
+    ) -> Vec<Vec<(u32, u32)>> {
+        let mut ranges_by_layer: Vec<Vec<(u32, u32)>> = vec![Vec::new(); layer_count];
+        for &(position, first_id, last_id) in &self.top_level_records {
+            for layer in layers_of_top_level_record(position) {
+                let ranges = &mut ranges_by_layer[layer.0];
+                match ranges.last_mut() {
+                    Some(range) if range.1 + 1 == first_id => range.1 = last_id,
+                    _ => ranges.push((first_id, last_id)),
+                }
+            }
+        }
+        ranges_by_layer
+    }
+}
+
+fn json_record_id_ranges(ranges: &[(u32, u32)]) -> serde_json::Value {
+    serde_json::Value::Array(
+        ranges
+            .iter()
+            .map(|(first, last)| serde_json::json!([first, last]))
+            .collect(),
+    )
+}
+
+fn describe_record_id_ranges(ranges: &[(u32, u32)]) -> String {
+    let mut text = String::new();
+    for (index, (first, last)) in ranges.iter().enumerate() {
+        if index > 0 {
+            text.push(',');
+        }
+        if first == last {
+            write!(text, "#{first}").unwrap();
+        } else {
+            write!(text, "#{first}-#{last}").unwrap();
+        }
+    }
+    text
+}
+
+/// What the recording noted of a record, as the dump prints it.
+#[derive(Default)]
+struct RecordNote {
+    origin: Option<RecordOrigin>,
+    glyph_run_text: Option<String>,
+}
+
+/// The notes of each record of a tape in tape order, nested records after the one they are nested in. A nested record
+/// whose recording noted no origin, such as a record of a pattern tile, which is recorded once and copied wherever it
+/// is drawn, has the origin of the record it is nested in.
+fn record_notes_in_tape_order(display_list: &RecordedDisplayList, notes: &RecordNotes) -> Vec<RecordNote> {
+    fn collect(
+        bytes: &[u8],
+        base_offset: u32,
+        enclosing_origin: Option<RecordOrigin>,
+        notes: &RecordNotes,
+        record_notes: &mut Vec<RecordNote>,
+    ) {
+        for_each_command(bytes, |header, record_offset, payload| {
+            let record_offset = base_offset + record_offset as u32;
+            let origin = notes.origin_at(record_offset).or(enclosing_origin);
+            record_notes.push(RecordNote {
+                origin,
+                glyph_run_text: notes.glyph_run_text_at(record_offset).map(str::to_owned),
+            });
+            let payload_offset = record_offset + HEADER_SIZE as u32;
+            for_each_nested_record_span(header.command_type, payload, |_, span| {
+                collect(
+                    span_bytes(payload, span),
+                    payload_offset + span.offset,
+                    origin,
+                    notes,
+                    record_notes,
+                );
+            });
+        });
+    }
+    let mut record_notes = Vec::new();
+    for run in &display_list.command_runs {
+        let run_bytes = &display_list.bytes[run.offset as usize..(run.offset + run.size) as usize];
+        collect(run_bytes, run.offset, None, notes, &mut record_notes);
+    }
+    record_notes
+}
+
+/// The labels of the live boxes that recorded the records.
+fn owner_labels(
+    host: &crate::render_state::DocumentHost,
+    read: &crate::render_state::BegunRead,
+    main_thread: &MainThread,
+    callbacks: &FfiPaintingDumpCallbacks,
+    notes: &[RecordNote],
+) -> HashMap<NodeSlotId, String> {
+    let owners: Vec<NodeSlotId> = notes
+        .iter()
+        .filter_map(|note| note.origin)
+        .map(|origin| origin.owner)
+        .collect::<std::collections::HashSet<_>>()
+        .into_iter()
+        .collect();
+    let live_owners = crate::painting::ffi::read_arena(host, read, owners, |arena, owners| {
+        owners
+            .into_iter()
+            .filter(|&owner| owner != NodeSlotId::INVALID && arena.slot_is_live(owner))
+            .collect::<Vec<_>>()
+    });
+    live_owners
+        .into_iter()
+        .map(|owner| (owner, callbacks.debug_description(main_thread, owner)))
+        .collect()
+}
+
+/// The notes of the records the DisplayList section prints, which it takes in turn. The records of an SVG image, which
+/// the recording names by the image's id only, are not among them.
+struct RecordNotesInDumpOrder {
+    notes: Vec<RecordNote>,
+    next_index: usize,
+    owner_labels: HashMap<NodeSlotId, String>,
+    prints_owners: bool,
+    prints_glyph_run_texts: bool,
+}
+
+/// Where the DisplayList section is written, with the names it gives what the records name.
+struct RecordDump<'a> {
+    output: &'a mut String,
+    names: &'a mut DumpNames,
+    jsonl: bool,
+    prints_record_ids: bool,
+    // How many records were dumped so far, which numbers the next one.
+    record_count: u32,
+    record_notes: Option<RecordNotesInDumpOrder>,
+    // The descriptions of the fonts the glyph runs draw with, by their ids, where the dump prints them.
+    font_descriptions: Option<HashMap<u64, String>>,
+    // The chunks of the list in paint order, where the dump marks them.
+    chunk_starts: Vec<ChunkStart>,
+    current_chunk: Option<String>,
+    layer_label_of_current_top_level_record: String,
+}
+
+/// Where a chunk of the list starts, with what it holds.
+struct ChunkStart {
+    name: String,
+    id: ChunkId,
+    record_count: usize,
+    byte_count: u32,
+}
+
+impl ChunkStart {
+    fn of_list(display_list: &DisplayListStorage) -> Vec<Self> {
+        display_list
+            .chunks()
+            .iter()
+            .enumerate()
+            .map(|(chunk_index, chunk)| {
+                let mut record_count = 0;
+                for run in chunk.runs() {
+                    for_each_command_including_nested(
+                        &chunk.records()[run.offset as usize..(run.offset + run.size) as usize],
+                        &mut |_, _, _| record_count += 1,
+                    );
+                }
+                Self {
+                    name: format!("k{}", chunk_index + 1),
+                    id: chunk.id,
+                    record_count,
+                    byte_count: chunk.runs().iter().map(|run| run.size).sum(),
+                }
+            })
+            .collect()
+    }
+}
+
+/// Where a record sits: how deep in other records, and in which of them and as what.
+#[derive(Clone, Copy)]
+struct RecordPlace {
+    indent: usize,
+    depth: usize,
+    nested_in: Option<(u32, NestedRecordsRole)>,
+    // The records of an SVG image take the origin of the record that draws the image.
+    origin_of_enclosing_vector_image: Option<Option<RecordOrigin>>,
+}
+
+impl RecordPlace {
+    const TOP_LEVEL: Self = Self {
+        indent: 0,
+        depth: 0,
+        nested_in: None,
+        origin_of_enclosing_vector_image: None,
     };
 }
 
-impl DumpValue for crate::layout::used_values::FfiCssPixelPoint {
-    fn push_dump(self, output: &mut String) {
-        push_float_point(
-            output,
-            FloatPoint {
-                x: self.x.to_float(),
-                y: self.y.to_float(),
-            },
-        );
+fn nested_records_role_name(role: NestedRecordsRole) -> &'static str {
+    match role {
+        NestedRecordsRole::IsolatedGroupContent => "content",
+        NestedRecordsRole::IsolatedGroupMask => "mask",
+        NestedRecordsRole::RepeatedTile => "tile",
+        NestedRecordsRole::MaskContent => "mask-content",
+        NestedRecordsRole::PatternTile => "pattern-tile",
+        NestedRecordsRole::VectorImage => "vector-image",
     }
 }
 
-impl DumpValue for crate::layout::used_values::FfiCssPixelRect {
-    fn push_dump(self, output: &mut String) {
-        push_float_rect(
-            output,
-            FloatRect::new(
-                self.x.to_float(),
-                self.y.to_float(),
-                self.width.to_float(),
-                self.height.to_float(),
-            ),
-        );
+impl RecordDump<'_> {
+    fn mark_chunk_start(&mut self, chunk_index: usize) {
+        let Some(chunk) = self.chunk_starts.get(chunk_index) else {
+            return;
+        };
+        if self.jsonl {
+            push_json_line(
+                self.output,
+                serde_json::json!({
+                    "type": "chunk",
+                    "name": chunk.name,
+                    "id": format!("{:016x}{:016x}", chunk.id.0[0], chunk.id.0[1]),
+                    "first_record": self.record_count + 1,
+                    "records": chunk.record_count,
+                    "bytes": chunk.byte_count,
+                }),
+            );
+        } else {
+            writeln!(
+                self.output,
+                "Chunk {} id={:012x} records={} bytes={}",
+                chunk.name,
+                chunk.id.0[0] >> 16,
+                chunk.record_count,
+                chunk.byte_count
+            )
+            .unwrap();
+        }
+        self.current_chunk = Some(chunk.name.clone());
     }
-}
 
-dump_value_via! {
-    IntPoint => push_int_point,
-    FloatPoint => push_float_point,
-    IntSize => push_int_size,
-    FloatSize => push_float_size,
-    IntRect => push_int_rect,
-    FloatRect => push_float_rect,
-    f32 => push_float_like_ak,
-    Color => write_color,
-    SpatialNodeIndex => write_spatial_node_index,
-}
-
-fn write_spatial_node_index(output: &mut String, index: SpatialNodeIndex) {
-    write!(output, "s{}", index.0).unwrap();
-}
-
-fn write_field(output: &mut String, label: &str, value: impl DumpValue) {
-    output.push(' ');
-    output.push_str(label);
-    output.push('=');
-    value.push_dump(output);
-}
-
-fn dump_command(output: &mut String, command_type: DisplayListCommandType, payload: &[u8]) {
-    match command_type {
-        DisplayListCommandType::DrawGlyphRun => {
-            let command = read_command::<DrawGlyphRun>(payload);
-            write_field(output, "rect", command.rect);
-            write_field(output, "translation", command.translation);
-            write_field(output, "color", command.color);
-        }
-        DisplayListCommandType::FillRect => {
-            let command = read_command::<FillRect>(payload);
-            write_field(output, "rect", command.rect);
-            write_field(output, "color", command.color);
-            write_blend_mode(output, command.compositing_and_blending_operator);
-        }
-        DisplayListCommandType::PaintCaret => {
-            let command = read_command::<PaintCaret>(payload);
-            write_field(output, "rect", command.rect);
-            write_field(output, "color", command.color);
-            write!(output, " should_blink={}", command.should_blink).unwrap();
-        }
-        DisplayListCommandType::DrawScaledDecodedImageFrame => {
-            let command = read_command::<DrawScaledDecodedImageFrame>(payload);
-            write_field(output, "dst_rect", command.dst_rect);
-            if let Some(rect) = command.src_rect.get() {
-                write_field(output, "src_rect", rect);
-            }
-            write_blend_mode(output, command.compositing_and_blending_operator);
-            if let Some(color) = command.isolated_backdrop_color.get() {
-                write_field(output, "isolated_backdrop_color", color);
-            }
-        }
-        DisplayListCommandType::DrawRepeatedDecodedImageFrame => {
-            let command = read_command::<DrawRepeatedDecodedImageFrame>(payload);
-            write_field(output, "dst_rect", command.dst_rect);
-            write_field(output, "clip_rect", command.clip_rect);
-            write_blend_mode(output, command.compositing_and_blending_operator);
-            if let Some(color) = command.isolated_backdrop_color.get() {
-                write_field(output, "isolated_backdrop_color", color);
-            }
-        }
-        DisplayListCommandType::DrawRepeatedTile => {
-            let command = read_command::<DrawRepeatedTile>(payload);
-            write_field(output, "dst_rect", command.dst_rect);
-            write_field(output, "clip_rect", command.clip_rect);
-            write_field(output, "tile_size", command.tile_size);
-            write_field(output, "tile_step", command.tile_step);
-            write!(output, " scaling_mode={}", scaling_mode_name(command.scaling_mode)).unwrap();
-            write_blend_mode(output, command.compositing_and_blending_operator);
-        }
-        DisplayListCommandType::DrawTiledDecodedImageFrame => {
-            let command = read_command::<DrawTiledDecodedImageFrame>(payload);
-            write_field(output, "tile_rect", command.tile_rect);
-            write_field(output, "clip_rect", command.clip_rect);
-            write_field(output, "src_rect", command.src_rect);
-            write_field(output, "tile_step", command.tile_step);
-            if let Some(count) = command.tile_count_x.get() {
-                write!(output, " tile_count_x={count}").unwrap();
-            } else {
-                output.push_str(" tile_count_x=repeat");
-            }
-            if let Some(count) = command.tile_count_y.get() {
-                write!(output, " tile_count_y={count}").unwrap();
-            } else {
-                output.push_str(" tile_count_y=repeat");
-            }
-        }
-        DisplayListCommandType::DrawCompositedContext => {
-            let command = read_command::<DrawCompositedContext>(payload);
-            write_field(output, "dst_rect", command.dst_rect);
-        }
-        DisplayListCommandType::DrawCanvas => {
-            let command = read_command::<DrawCanvas>(payload);
-            write_field(output, "dst_rect", command.dst_rect);
-            write!(output, " content_generation={}", command.content_generation).unwrap();
-        }
-        DisplayListCommandType::DrawVideoFrame => {
-            let command = read_command::<DrawVideoFrame>(payload);
-            write_field(output, "dst_rect", command.dst_rect);
-        }
-        DisplayListCommandType::PaintLinearGradient => {
-            let command = read_command::<PaintLinearGradient>(payload);
-            write_field(output, "rect", command.gradient_rect);
-            write_blend_mode(output, command.compositing_and_blending_operator);
-        }
-        DisplayListCommandType::PaintRadialGradient => {
-            let command = read_command::<PaintRadialGradient>(payload);
-            write_field(output, "rect", command.rect);
-            write_field(output, "center", command.center);
-            write_field(output, "size", command.size);
-            write_blend_mode(output, command.compositing_and_blending_operator);
-        }
-        DisplayListCommandType::PaintConicGradient => {
-            let command = read_command::<PaintConicGradient>(payload);
-            write_field(output, "rect", command.rect);
-            write_field(output, "position", command.position);
-            write_field(output, "angle", command.start_angle);
-            write_blend_mode(output, command.compositing_and_blending_operator);
-        }
-        DisplayListCommandType::PaintOuterBoxShadow => {
-            let command = read_command::<PaintOuterBoxShadow>(payload);
-            write_field(output, "content_rect", command.device_content_rect);
-            write_field(output, "shadow_rect", command.shadow_rect);
-            write!(output, " blur_radius={}", command.blur_radius).unwrap();
-            write_field(output, "color", command.color);
-        }
-        DisplayListCommandType::PaintInnerBoxShadow => {
-            let command = read_command::<PaintInnerBoxShadow>(payload);
-            write_field(output, "content_rect", command.device_content_rect);
-            write_field(output, "outer_shadow_rect", command.outer_shadow_rect);
-            write_field(output, "inner_shadow_rect", command.inner_shadow_rect);
-            write!(output, " blur_radius={}", command.blur_radius).unwrap();
-            write_field(output, "color", command.color);
-        }
-        DisplayListCommandType::PaintPathBoxShadow => {
-            let command = read_command::<PaintPathBoxShadow>(payload);
-            write_field(output, "shape_path_bounding_rect", command.shape_path_bounding_rect);
-            write_field(output, "offset", command.offset);
-            write!(
-                output,
-                " blur_radius={} spread_distance={}",
-                command.blur_radius, command.spread_distance
-            )
-            .unwrap();
-            write!(output, " inner={}", command.inner).unwrap();
-            write_field(output, "color", command.color);
-        }
-        DisplayListCommandType::PaintTextShadow => {
-            let command = read_command::<PaintTextShadow>(payload);
-            write_field(output, "shadows_rect", command.shadows_bounding_rect);
-            write_field(output, "rect", command.rect);
-            write_field(output, "translation", command.translation);
-            let orientation = match command.orientation {
-                libgfx_rust::Orientation::Horizontal => "Horizontal",
-                libgfx_rust::Orientation::Vertical => "Vertical",
-            };
-            write!(output, " orientation={orientation}").unwrap();
-            output.push_str(" layers=[");
-            let (layer_chunks, _) =
-                span_bytes(payload, command.layers).as_chunks::<{ std::mem::size_of::<TextShadowLayer>() }>();
-            for (index, layer_bytes) in layer_chunks.iter().enumerate() {
-                if index > 0 {
-                    output.push_str(", ");
-                }
-                let layer = read_command::<TextShadowLayer>(layer_bytes);
-                output.push_str("offset=");
-                layer.offset.push_dump(output);
-                write!(output, " blur_radius={}", layer.blur_radius).unwrap();
-                write_field(output, "color", layer.color);
-            }
-            output.push(']');
-        }
-        DisplayListCommandType::FillRectWithRoundedCorners => {
-            let command = read_command::<FillRectWithRoundedCorners>(payload);
-            write_field(output, "rect", command.rect);
-            write_field(output, "color", command.color);
-        }
-        DisplayListCommandType::FillRoundedRectRing => {
-            let command = read_command::<FillRoundedRectRing>(payload);
-            write_field(output, "rect", command.rect);
-            write_corner_radii(output, command.corner_radii);
-            write!(
-                output,
-                " widths=[{},{},{},{}]",
-                command.top_width, command.right_width, command.bottom_width, command.left_width
-            )
-            .unwrap();
-            write_field(output, "color", command.color);
-        }
-        DisplayListCommandType::FillPath => {
-            let command = read_command::<FillPath>(payload);
-            write_field(output, "path_bounding_rect", command.path_bounding_rect);
-            write_blend_mode(output, command.compositing_and_blending_operator);
-        }
-        DisplayListCommandType::StrokePath => {
-            let command = read_command::<StrokePath>(payload);
-            write_field(output, "path_bounding_rect", command.path_bounding_rect);
-            write_field(output, "thickness", command.thickness);
-            if command.paint_kind == PathPaintKind::Color {
-                write_field(output, "color", command.color);
-            }
-            if !command.dash_array.is_empty() {
-                write!(
-                    output,
-                    " dash_array_size={} dash_offset={:.2}",
-                    command.dash_array.size as usize / std::mem::size_of::<f32>(),
-                    command.dash_offset
-                )
-                .unwrap();
-            }
-        }
-        DisplayListCommandType::DrawEllipse => {
-            let command = read_command::<DrawEllipse>(payload);
-            write_field(output, "rect", command.rect);
-            write_field(output, "color", command.color);
-            write!(output, " thickness={}", command.thickness).unwrap();
-        }
-        DisplayListCommandType::DrawLine => {
-            let command = read_command::<DrawLine>(payload);
-            write_field(output, "from", command.from);
-            write_field(output, "to", command.to);
-            write_field(output, "color", command.color);
-            write!(
-                output,
-                " thickness={} style={}",
-                command.thickness,
-                line_style_name(command.style)
-            )
-            .unwrap();
-            if command.style != LineStyle::Solid {
-                write_field(output, "alternate_color", command.alternate_color);
-            }
-        }
-        DisplayListCommandType::BackdropFilterRegion => {
-            let command = read_command::<BackdropFilterRegion>(payload);
-            write_field(output, "rect", command.rect);
-        }
-        DisplayListCommandType::DrawRect => {
-            let command = read_command::<DrawRect>(payload);
-            write_field(output, "rect", command.rect);
-            write_field(output, "color", command.color);
-            write!(output, " rough={}", command.rough).unwrap();
-        }
-        DisplayListCommandType::PaintNestedDisplayList => {
-            let command = read_command::<PaintNestedDisplayList>(payload);
-            write_field(output, "rect", command.rect);
-        }
-        DisplayListCommandType::DrawIsolatedGroup => {
-            let command = read_command::<DrawIsolatedGroup>(payload);
-            write_field(output, "clip_rect", command.clip_rect);
-            if command.opacity != 1.0 {
-                write!(output, " opacity={}", format_float_like_ak(command.opacity)).unwrap();
-            }
-            if !command.filter.is_empty() {
-                output.push_str(" has_filter=true");
-            }
-            write_blend_mode(output, command.compositing_and_blending_operator);
-            if !command.mask.is_empty() {
-                write!(
-                    output,
-                    " has_mask={}",
-                    if command.mask_kind == libgfx_rust::MaskKind::Luminance {
-                        "luminance"
-                    } else {
-                        "alpha"
+    // A top-level command can be drawn into several layers, one per tile, where a canvas, video or another space sits
+    // between it and what is painted before it. Its nested records draw into the same layers.
+    fn dump_top_level_commands_with_their_layers(
+        &mut self,
+        display_list: &DisplayListStorage,
+        planned_layers: &PlannedLayers,
+    ) {
+        for (chunk_index, chunk) in display_list.chunks().iter().enumerate() {
+            self.mark_chunk_start(chunk_index);
+            for run in chunk.runs() {
+                let run_bytes = &chunk.records()[run.offset as usize..(run.offset + run.size) as usize];
+                for_each_command(run_bytes, |header, offset_in_run, payload| {
+                    let position =
+                        ListPosition::new(ChunkIndexInList(chunk_index as u32), run.offset + offset_in_run as u32);
+                    let layer_names: Vec<String> = layers_labelling_top_level_record(planned_layers, header, position)
+                        .iter()
+                        .map(|layer| format!("L{}", layer.0))
+                        .collect();
+                    self.layer_label_of_current_top_level_record = layer_names.join(",");
+                    let record_bytes = &run_bytes[offset_in_run..offset_in_run + HEADER_SIZE + payload.len()];
+                    if self.jsonl {
+                        self.dump_command_bytes(record_bytes, run.context, RecordPlace::TOP_LEVEL);
+                        return;
                     }
-                )
-                .unwrap();
+                    let layer_label = format!("{} ", self.layer_label_of_current_top_level_record);
+                    let record_dump_start = self.output.len();
+                    self.dump_command_bytes(record_bytes, run.context, RecordPlace::TOP_LEVEL);
+                    let record_dump = self.output.split_off(record_dump_start);
+                    for (line_index, line) in record_dump.split_inclusive('\n').enumerate() {
+                        if line_index == 0 {
+                            self.output.push_str(&layer_label);
+                        } else {
+                            self.output.extend(std::iter::repeat_n(' ', layer_label.len()));
+                        }
+                        self.output.push_str(line);
+                    }
+                });
             }
         }
-        DisplayListCommandType::DeclareMaskContent => {
-            let command = read_command::<DeclareMaskContent>(payload);
-            write_field(output, "rect", command.rect);
-            write!(output, " effect=e{}", command.effect.0).unwrap();
+    }
+
+    fn dump_command_bytes(&mut self, command_bytes: &[u8], context: ContextRef, place: RecordPlace) {
+        for_each_command(command_bytes, |header, _, payload| {
+            let note = match place.origin_of_enclosing_vector_image {
+                Some(origin) => RecordNote {
+                    origin,
+                    glyph_run_text: None,
+                },
+                None => self
+                    .record_notes
+                    .as_mut()
+                    .map(RecordNotesInDumpOrder::take_next)
+                    .unwrap_or_default(),
+            };
+            self.record_count += 1;
+            let record_id = self.record_count;
+            if self.jsonl {
+                self.push_json_record(record_id, header, payload, context, place, &note);
+            } else {
+                push_indent(self.output, place.indent);
+                if self.prints_record_ids {
+                    write!(self.output, "#{record_id} ").unwrap();
+                }
+                write!(self.output, "{}@", header.command_type.name()).unwrap();
+                write_context(self.output, self.names, context);
+                let fields = command_fields(header.command_type, payload);
+                push_fields(self.output, &fields, self.names);
+                if header.inline_clip_count > 0 {
+                    dump_inline_clips(self.output, self.names, header, payload);
+                }
+                if let Some(transform) = inline_transform_of(header, payload) {
+                    self.output.push_str(" inline_transform=");
+                    push_affine_transform(self.output, transform);
+                }
+                self.push_note(header.command_type, payload, &note);
+                self.output.push('\n');
+            }
+
+            self.dump_records_inside(header.command_type, payload, context, place, record_id, note.origin);
+        });
+    }
+
+    fn dump_records_inside(
+        &mut self,
+        command_type: DisplayListCommandType,
+        payload: &[u8],
+        context: ContextRef,
+        place: RecordPlace,
+        record_id: u32,
+        origin: Option<RecordOrigin>,
+    ) {
+        for_each_nested_record_span(command_type, payload, |role, span| {
+            let label = match role {
+                NestedRecordsRole::IsolatedGroupMask => Some("Mask:\n"),
+                NestedRecordsRole::PatternTile => Some("PatternTile:\n"),
+                NestedRecordsRole::IsolatedGroupContent
+                | NestedRecordsRole::RepeatedTile
+                | NestedRecordsRole::MaskContent
+                | NestedRecordsRole::VectorImage => None,
+            };
+            let mut nested_indent = place.indent + 1;
+            if let Some(label) = label
+                && !self.jsonl
+            {
+                push_indent(self.output, place.indent + 1);
+                self.output.push_str(label);
+                nested_indent += 1;
+            }
+            let origin_of_enclosing_vector_image = match role {
+                NestedRecordsRole::VectorImage => place.origin_of_enclosing_vector_image.or(Some(origin)),
+                _ => place.origin_of_enclosing_vector_image,
+            };
+            self.dump_command_bytes(
+                span_bytes(payload, span),
+                context,
+                RecordPlace {
+                    indent: nested_indent,
+                    depth: place.depth + 1,
+                    nested_in: Some((record_id, role)),
+                    origin_of_enclosing_vector_image,
+                },
+            );
+        });
+    }
+
+    fn font_description(&self, command_type: DisplayListCommandType, payload: &[u8]) -> Option<&String> {
+        let font_descriptions = self.font_descriptions.as_ref()?;
+        let font_id = match command_type {
+            DisplayListCommandType::DrawGlyphRun => read_command::<DrawGlyphRun>(payload).font_id,
+            DisplayListCommandType::PaintTextShadow => read_command::<PaintTextShadow>(payload).font_id,
+            _ => return None,
+        };
+        font_descriptions.get(&font_id.0)
+    }
+
+    // What the recording noted of the record, and the font a glyph run draws with: the text, the font and then the
+    // origin.
+    fn push_note(&mut self, command_type: DisplayListCommandType, payload: &[u8], note: &RecordNote) {
+        let (prints_owners, prints_glyph_run_texts) = self.record_notes.as_ref().map_or((false, false), |notes| {
+            (notes.prints_owners, notes.prints_glyph_run_texts)
+        });
+        if prints_glyph_run_texts && let Some(text) = &note.glyph_run_text {
+            push_glyph_run_text(self.output, text);
         }
-        DisplayListCommandType::CompositorScrollNode => {
-            let command = read_command::<CompositorScrollNode>(payload);
-            write_field(output, "scroll_node_index", command.scroll_node_index);
-            write_field(output, "parent_scroll_node_index", command.parent_scroll_node_index);
-            write_field(output, "scrollport_rect", command.scrollport_rect);
-            write_field(output, "min_scroll_offset", command.min_scroll_offset);
-            write_field(output, "max_scroll_offset", command.max_scroll_offset);
-            write!(output, " is_viewport={}", command.is_viewport).unwrap();
+        if let Some(description) = self.font_description(command_type, payload) {
+            let font = format!(" font=\"{description}\"");
+            self.output.push_str(&font);
         }
-        DisplayListCommandType::CompositorBlockingWheelEventRegion => {
-            let command = read_command::<CompositorBlockingWheelEventRegion>(payload);
-            write_field(output, "rect", command.rect);
+        let Some(origin) = note.origin.filter(|_| prints_owners) else {
+            return;
+        };
+        let owner_label = self
+            .record_notes
+            .as_ref()
+            .and_then(|notes| notes.owner_labels.get(&origin.owner));
+        if let Some(owner_label) = owner_label {
+            write!(self.output, " owner={owner_label}").unwrap();
         }
-        DisplayListCommandType::CompositorWheelHitTestTarget => {
-            let command = read_command::<CompositorWheelHitTestTarget>(payload);
-            write_field(output, "target_scroll_node_index", command.target_scroll_node_index);
-            write_field(output, "rect", command.rect);
+        write!(self.output, " phase={}", origin.phase).unwrap();
+    }
+
+    fn push_json_record(
+        &mut self,
+        record_id: u32,
+        header: &DisplayListCommandHeader,
+        payload: &[u8],
+        context: ContextRef,
+        place: RecordPlace,
+        note: &RecordNote,
+    ) {
+        use serde_json::{Value, json};
+        let mut record = serde_json::Map::new();
+        record.insert("type".into(), json!("record"));
+        record.insert("id".into(), json!(record_id));
+        record.insert("op".into(), json!(header.command_type.name()));
+        record.insert("depth".into(), json!(place.depth));
+        if let Some((parent_id, role)) = place.nested_in {
+            record.insert("parent".into(), json!(parent_id));
+            record.insert("role".into(), json!(nested_records_role_name(role)));
         }
-        DisplayListCommandType::CompositorWheelHitTestTargetWithCornerRadii => {
-            let command = read_command::<CompositorWheelHitTestTargetWithCornerRadii>(payload);
-            write_field(output, "target_scroll_node_index", command.target_scroll_node_index);
-            write_field(output, "rect", command.rect);
-            write_corner_radii(output, command.corner_radii);
+        record.insert("layer".into(), json!(self.layer_label_of_current_top_level_record));
+        if let Some(chunk) = &self.current_chunk {
+            record.insert("chunk".into(), json!(chunk));
         }
-        DisplayListCommandType::CompositorMainThreadWheelEventRegion => {
-            let command = read_command::<CompositorMainThreadWheelEventRegion>(payload);
-            write_field(output, "rect", command.rect);
+        record.insert("context".into(), json_context(self.names, context));
+        let fields = command_fields(header.command_type, payload);
+        record.insert("fields".into(), json_fields(&fields, self.names));
+        if header.inline_clip_count > 0 {
+            record.insert("inline_clips".into(), json_inline_clips(self.names, header, payload));
         }
-        DisplayListCommandType::CompositorNestedContextWheelRegion => {
-            let command = read_command::<CompositorNestedContextWheelRegion>(payload);
-            write_field(output, "rect", command.rect);
-            write_corner_radii(output, command.corner_radii);
+        if let Some(transform) = inline_transform_of(header, payload) {
+            record.insert(
+                "inline_transform".into(),
+                Value::Array(transform.values.iter().map(|value| json_float(*value)).collect()),
+            );
         }
-        DisplayListCommandType::CompositorScrollbar => {
-            let command = read_command::<CompositorScrollbar>(payload);
-            write_field(output, "scroll_node_index", command.scroll_node_index);
-            write_field(output, "gutter_rect", command.gutter_rect);
-            write_field(output, "thumb_rect", command.thumb_rect);
-            write_field(output, "track_rect", command.track_rect);
-            write_field(output, "expanded_gutter_rect", command.expanded_gutter_rect);
-            write_field(output, "expanded_thumb_rect", command.expanded_thumb_rect);
-            write!(
-                output,
-                " scroll_size={} expanded_scroll_size={}",
-                command.scroll_size, command.expanded_scroll_size
-            )
-            .unwrap();
-            write_field(output, "min_scroll_offset", command.min_scroll_offset);
-            write_field(output, "max_scroll_offset", command.max_scroll_offset);
-            write_field(output, "thumb_color", command.thumb_color);
-            write_field(output, "thumb_outline_color", command.thumb_outline_color);
-            write_field(output, "track_color", command.track_color);
-            write!(
-                output,
-                " vertical={} is_painted_by_compositor={}",
-                command.vertical, command.is_painted_by_compositor
-            )
-            .unwrap();
+        if let Some(text) = &note.glyph_run_text {
+            record.insert("text".into(), json!(text));
         }
-        DisplayListCommandType::PaintScrollBar => {}
-        DisplayListCommandType::CompositorSnapContainer => {
-            let command = read_command::<CompositorSnapContainer>(payload);
-            write_field(output, "scroll_node_index", command.scroll_node_index);
-            write_field(output, "snapport", command.snapport);
-            write_field(output, "min_scroll_offset", command.min_scroll_offset);
-            write_field(output, "max_scroll_offset", command.max_scroll_offset);
-            write!(
-                output,
-                " strictness={} snaps_x={} snaps_y={} horizontal_writing_mode={}",
-                command.strictness, command.snaps_x, command.snaps_y, command.horizontal_writing_mode
-            )
-            .unwrap();
+        if let Some(description) = self.font_description(header.command_type, payload) {
+            record.insert("font".into(), json!(description));
         }
-        DisplayListCommandType::CompositorSnapArea => {
-            let command = read_command::<CompositorSnapArea>(payload);
-            write_field(output, "scroll_node_index", command.scroll_node_index);
-            write!(output, " pseudo_element_type={}", command.pseudo_element_type).unwrap();
-            write_field(output, "rect", command.rect);
-            write!(
-                output,
-                " align_x={} align_y={} always_stop={}",
-                command.align_x, command.align_y, command.always_stop
-            )
-            .unwrap();
+        if let Some(origin) = note.origin {
+            let owner_label = self
+                .record_notes
+                .as_ref()
+                .and_then(|notes| notes.owner_labels.get(&origin.owner));
+            if let Some(owner_label) = owner_label {
+                record.insert("owner".into(), json!(owner_label));
+            }
+            record.insert("phase".into(), json!(origin.phase));
         }
-        // The display list of a page holds none of the commands of the canvas 2D stream.
-        DisplayListCommandType::Canvas2DFillPath
-        | DisplayListCommandType::Canvas2DStrokePath
-        | DisplayListCommandType::Canvas2DDrawGlyphRuns
-        | DisplayListCommandType::Canvas2DClearRect
-        | DisplayListCommandType::Canvas2DDrawImageFrame
-        | DisplayListCommandType::Canvas2DDrawCanvas
-        | DisplayListCommandType::Canvas2DDrawVideoFrame
-        | DisplayListCommandType::Canvas2DSetTransform
-        | DisplayListCommandType::Canvas2DSave
-        | DisplayListCommandType::Canvas2DRestore
-        | DisplayListCommandType::Canvas2DClipPath
-        | DisplayListCommandType::Canvas2DReset
-        | DisplayListCommandType::Canvas2DClearCanvas
-        | DisplayListCommandType::Canvas2DPutImageFrame => {}
+        push_json_line(self.output, Value::Object(record));
     }
 }
 
-fn dump_inline_clips(output: &mut String, header: &DisplayListCommandHeader, payload: &[u8]) {
+fn push_json_line(output: &mut String, value: serde_json::Value) {
+    output.push_str(&value.to_string());
+    output.push('\n');
+}
+
+fn json_context(names: &mut DumpNames, context: ContextRef) -> serde_json::Value {
+    let mut object = serde_json::Map::new();
+    object.insert(
+        "spatial".into(),
+        json_name(names.spatial(context.spatial), context.spatial.0),
+    );
+    if !context.clip.is_none() {
+        object.insert("clip".into(), json_name(names.clip(context.clip), context.clip.0));
+    }
+    if !context.effect.is_none() {
+        object.insert(
+            "effect".into(),
+            json_name(names.effect(context.effect), context.effect.0),
+        );
+    }
+    serde_json::Value::Object(object)
+}
+
+fn json_inline_clips(names: &mut DumpNames, header: &DisplayListCommandHeader, payload: &[u8]) -> serde_json::Value {
+    use serde_json::json;
+    serde_json::Value::Array(
+        inline_clips_of(header, payload)
+            .map(|clip| {
+                let mut object = serde_json::Map::new();
+                object.insert("kind".into(), json!(format!("{:?}", clip.kind)));
+                object.insert("rect".into(), json_float_rect(clip.clip_rect_or_path_device_bounds));
+                if clip.kind == InlineClipKind::Path {
+                    let path = Path::from_serialized_bytes(span_bytes(payload, clip.path_data));
+                    object.insert("path".into(), json!(path_description(&path)));
+                    object.insert("winding_rule".into(), json!(format!("{:?}", clip.path_winding_rule)));
+                } else if clip.corner_radii.has_any_radius() {
+                    object.insert("corner_radii".into(), json_corner_radii(clip.corner_radii));
+                }
+                if clip.mode == ClipMode::Difference {
+                    object.insert("mode".into(), json!("difference"));
+                }
+                if clip.has_own_space {
+                    object.insert("space".into(), json_name(names.spatial(clip.space), clip.space.0));
+                }
+                serde_json::Value::Object(object)
+            })
+            .collect(),
+    )
+}
+
+impl RecordNotesInDumpOrder {
+    fn take_next(&mut self) -> RecordNote {
+        let note = self
+            .notes
+            .get_mut(self.next_index)
+            .map(std::mem::take)
+            .unwrap_or_default();
+        self.next_index += 1;
+        note
+    }
+}
+
+const GLYPH_RUN_TEXT_PRINTED_LENGTH: usize = 40;
+
+/// The text a glyph run draws, quoted and escaped, cut to its first characters with its full length after it where it
+/// is longer.
+fn push_glyph_run_text(output: &mut String, text: &str) {
+    output.push_str(" text=\"");
+    let length = text.chars().count();
+    for character in text.chars().take(GLYPH_RUN_TEXT_PRINTED_LENGTH) {
+        match character {
+            '"' => output.push_str("\\\""),
+            '\\' => output.push_str("\\\\"),
+            '\n' => output.push_str("\\n"),
+            '\t' => output.push_str("\\t"),
+            character if character.is_control() => write!(output, "\\u{{{:x}}}", character as u32).unwrap(),
+            character => output.push(character),
+        }
+    }
+    if length > GLYPH_RUN_TEXT_PRINTED_LENGTH {
+        write!(output, "…\" text_length={length}").unwrap();
+    } else {
+        output.push('"');
+    }
+}
+
+fn command_fields(command_type: DisplayListCommandType, payload: &[u8]) -> Vec<(&'static str, DumpValue)> {
+    let mut fields = Vec::new();
+    visit_command_fields(command_type, payload, &mut |name, value, holds_neutral_value| {
+        if holds_neutral_value {
+            return;
+        }
+        if let Some(name_and_value) = dumped_record_field(name, value, payload) {
+            fields.push(name_and_value);
+        }
+    });
+    fields
+}
+
+fn dump_inline_clips(output: &mut String, names: &mut DumpNames, header: &DisplayListCommandHeader, payload: &[u8]) {
     output.push_str(" inline_clips=[");
     let count = header.inline_clip_count as usize;
     let entries_size = count * INLINE_CLIP_ENTRY_SIZE;
@@ -697,118 +1359,38 @@ fn dump_inline_clips(output: &mut String, header: &DisplayListCommandHeader, pay
             let size = clip.path_data.size as usize;
             assert!(start <= payload.len() && size <= payload.len() - start);
             let path = Path::from_serialized_bytes(&payload[start..start + size]);
-            let svg_path = path.to_svg_string();
-            let has_host_dependent_curves = svg_path.contains('Q') || svg_path.contains('C');
             output.push_str("clip_path=[bounds: ");
             push_float_rect(output, clip.clip_rect_or_path_device_bounds);
-            if has_host_dependent_curves {
-                let command_count = svg_path
-                    .bytes()
-                    .filter(|byte| matches!(byte, b'M' | b'L' | b'Q' | b'C' | b'Z'))
-                    .count();
-                write!(output, ", curved path: {command_count} commands]").unwrap();
-            } else {
-                write!(output, ", path: {svg_path}]").unwrap();
+            write!(output, ", {}]", path_description(&path)).unwrap();
+            if clip.path_winding_rule != libgfx_rust::WindingRule::default() {
+                write!(output, " winding_rule={:?}", clip.path_winding_rule).unwrap();
             }
         } else {
             output.push_str("clip=");
             push_float_rect(output, clip.clip_rect_or_path_device_bounds);
-            write_inline_clip_radii(output, clip.corner_radii);
+            if clip.corner_radii.has_any_radius() {
+                output.push_str(" radii=");
+                push_clip_radii(output, clip.corner_radii);
+            }
         }
         if clip.mode == ClipMode::Difference {
             output.push_str(" mode=difference");
         }
         if clip.has_own_space {
-            output.push_str(" in ");
-            write_spatial_node_index(output, clip.space);
+            write!(output, " in {}", names.spatial(clip.space)).unwrap();
         }
     }
     output.push(']');
 }
 
 // A context prints its spatial, clip and effect nodes.
-fn write_context(output: &mut String, context: ContextRef) {
-    write_spatial_node_index(output, context.spatial);
+fn write_context(output: &mut String, names: &mut DumpNames, context: ContextRef) {
+    output.push_str(&names.spatial(context.spatial));
     if !context.clip.is_none() {
-        write!(output, "/c{}", context.clip.0).unwrap();
+        write!(output, "/{}", names.clip(context.clip)).unwrap();
     }
     if !context.effect.is_none() {
-        write!(output, "/e{}", context.effect.0).unwrap();
-    }
-}
-
-fn write_color(output: &mut String, color: Color) {
-    match color.alpha() {
-        0 => write!(output, "rgba({}, {}, {}, 0)", color.red(), color.green(), color.blue()).unwrap(),
-        255 => write!(output, "rgb({}, {}, {})", color.red(), color.green(), color.blue()).unwrap(),
-        alpha => {
-            let (digits, length) = format_to_8bit_compatible(alpha);
-            let fraction = std::str::from_utf8(&digits[..length]).expect("digits are ASCII");
-            write!(
-                output,
-                "rgba({}, {}, {}, 0.{fraction})",
-                color.red(),
-                color.green(),
-                color.blue()
-            )
-            .unwrap();
-        }
-    }
-}
-
-fn write_blend_mode(output: &mut String, operator: CompositingAndBlendingOperator) {
-    if operator != CompositingAndBlendingOperator::Normal {
-        write!(output, " blend_mode={}", operator as i32).unwrap();
-    }
-}
-
-fn line_style_name(style: LineStyle) -> &'static str {
-    match style {
-        LineStyle::Solid => "Solid",
-        LineStyle::Dotted => "Dotted",
-        LineStyle::Dashed => "Dashed",
-    }
-}
-
-fn scaling_mode_name(mode: ScalingMode) -> &'static str {
-    match mode {
-        ScalingMode::None => "None",
-        ScalingMode::Bilinear => "Bilinear",
-        ScalingMode::BilinearMipmap => "BilinearMipmap",
-        ScalingMode::NearestNeighbor => "NearestNeighbor",
-    }
-}
-
-fn write_corner_radii(output: &mut String, radii: CornerRadii) {
-    if !radii.has_any_radius() {
-        return;
-    }
-    write!(
-        output,
-        " corner_radii=[{}x{},{}x{},{}x{},{}x{}]",
-        radii.top_left.horizontal_radius,
-        radii.top_left.vertical_radius,
-        radii.top_right.horizontal_radius,
-        radii.top_right.vertical_radius,
-        radii.bottom_right.horizontal_radius,
-        radii.bottom_right.vertical_radius,
-        radii.bottom_left.horizontal_radius,
-        radii.bottom_left.vertical_radius
-    )
-    .unwrap();
-}
-
-fn write_inline_clip_radii(output: &mut String, radii: CornerRadii) {
-    if radii.has_any_radius() {
-        write!(
-            output,
-            " radii=({},{},{},{})",
-            radii.top_left.horizontal_radius,
-            radii.top_right.horizontal_radius,
-            radii.bottom_right.horizontal_radius,
-            radii.bottom_left.horizontal_radius
-        )
-        .unwrap();
+        write!(output, "/{}", names.effect(context.effect)).unwrap();
     }
 }
 
@@ -817,7 +1399,8 @@ mod tests {
     use super::*;
     use crate::painting::display_list::builder::DisplayListBuilder;
     use crate::painting::display_list::builder::{HEADER_SIZE, read_header};
-    use libgfx_rust::IntRect;
+    use crate::painting::visual_context::VisualContextTree;
+    use libgfx_rust::{Color, CompositingAndBlendingOperator, IntRect};
 
     #[test]
     fn command_dump_matches_the_canonical_format() {
@@ -875,21 +1458,83 @@ mod tests {
             let header = read_header(bytes);
             let payload = &bytes[HEADER_SIZE..HEADER_SIZE + header.payload_size as usize];
             let mut output = format!("{}@", header.command_type.name());
-            write_context(&mut output, builder.command_runs()[0].context);
-            dump_command(&mut output, header.command_type, payload);
+            let mut names = DumpNames::default();
+            write_context(&mut output, &mut names, builder.command_runs()[0].context);
+            push_fields(&mut output, &command_fields(header.command_type, payload), &mut names);
             output
         };
         assert_eq!(
             dump(clip_and_effect),
-            "FillRect@s0/c0/e0 rect=[1,2 30x40] color=rgba(101, 2, 0, 0.8) blend_mode=2"
+            "FillRect@s0/c0/e0 rect=[1,2 30x40] color=rgba(101, 2, 0, 0.8) compositing_and_blending_operator=Multiply"
         );
         assert_eq!(
             dump(effect_only),
-            "FillRect@s0/e0 rect=[1,2 30x40] color=rgba(101, 2, 0, 0.8) blend_mode=2"
+            "FillRect@s0/e0 rect=[1,2 30x40] color=rgba(101, 2, 0, 0.8) compositing_and_blending_operator=Multiply"
         );
         assert_eq!(
             dump(ContextRef::default()),
-            "FillRect@s0 rect=[1,2 30x40] color=rgba(101, 2, 0, 0.8) blend_mode=2"
+            "FillRect@s0 rect=[1,2 30x40] color=rgba(101, 2, 0, 0.8) compositing_and_blending_operator=Multiply"
+        );
+    }
+
+    #[test]
+    fn record_ids_count_nested_records_and_join_adjacent_records_of_a_layer() {
+        let fill = FillRect {
+            rect: IntRect::new(0, 0, 10, 10),
+            color: Color::from_rgba(0, 0, 0, 255),
+            compositing_and_blending_operator: CompositingAndBlendingOperator::Normal,
+            background_color_animation_effect: EffectNodeIndex::NONE,
+        };
+        let mut builder = DisplayListBuilder::new();
+        builder.append(&fill, &[], ContextRef::default());
+        let group = builder.begin_group::<DrawIsolatedGroup>(Vec::new());
+        builder.append(&fill, &[], ContextRef::default());
+        builder.append(&fill, &[], ContextRef::default());
+        let group_command = DrawIsolatedGroup {
+            clip_rect: libgfx_rust::FloatRect::new(0.0, 0.0, 10.0, 10.0),
+            content: builder.group_content_span(&group),
+            mask: DisplayListDataSpan::default(),
+            filter: DisplayListDataSpan::default(),
+            opacity: 0.5,
+            compositing_and_blending_operator: CompositingAndBlendingOperator::Normal,
+            mask_kind: libgfx_rust::MaskKind::Alpha,
+        };
+        builder.finish_group(group, &group_command, ContextRef::default());
+        builder.append(&fill, &[], ContextRef::default());
+        let display_list = DisplayListStorage::recorded(
+            &builder.finish(),
+            std::sync::Arc::new(VisualContextTree::create_identity()),
+        );
+        let record_ids = RecordIdsOfTopLevelRecords::of(&display_list);
+        let positions: Vec<ListPosition> = record_ids
+            .top_level_records
+            .iter()
+            .map(|&(position, _, _)| position)
+            .collect();
+        let ranges = record_ids.record_id_ranges_by_layer_joining_adjacent_ranges(3, |position| {
+            match positions.iter().position(|&top_level| top_level == position) {
+                Some(0) => vec![LayerIndex(0)],
+                Some(1) => vec![LayerIndex(1), LayerIndex(2)],
+                _ => vec![LayerIndex(0), LayerIndex(2)],
+            }
+        });
+        assert_eq!(record_ids.record_count, 5);
+        assert_eq!(describe_record_id_ranges(&ranges[0]), "#1,#5");
+        assert_eq!(describe_record_id_ranges(&ranges[1]), "#2-#4");
+        assert_eq!(describe_record_id_ranges(&ranges[2]), "#2-#5");
+    }
+
+    #[test]
+    fn glyph_run_text_is_escaped_and_cut_with_its_full_length_after_it() {
+        let text = |text: &str| {
+            let mut output = String::new();
+            push_glyph_run_text(&mut output, text);
+            output
+        };
+        assert_eq!(text("say \"hi\"\\\n\t\u{7}"), r#" text="say \"hi\"\\\n\t\u{7}""#);
+        assert_eq!(
+            text(&"é".repeat(41)),
+            format!(" text=\"{}…\" text_length=41", "é".repeat(40))
         );
     }
 }

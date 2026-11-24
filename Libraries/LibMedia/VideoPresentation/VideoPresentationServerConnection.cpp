@@ -76,9 +76,9 @@ void VideoPresentationServerConnection::create_registered_video_edge(VideoSinkHa
             connection.async_lend_frame(edge_id, lent_frame.lend_id, lent_frame.seek_id, lent_frame.metadata, move(lent_frame.pixels));
         });
     };
-    delegates.send_status = [weak_connection, edge_id](PipelineStatus status, u32 seek_id) {
+    delegates.send_status = [weak_connection, edge_id](PipelineStatus status, u32 seek_id, PipelineCheckpoint checkpoint) {
         weak_connection.with_target([&](auto& connection) {
-            connection.async_edge_status_changed(edge_id, status, seek_id);
+            connection.async_edge_status_changed(edge_id, status, seek_id, checkpoint);
         });
     };
     delegates.notify_clock_resumed = [weak_connection, edge_id] {
@@ -102,6 +102,14 @@ void VideoPresentationServerConnection::create_registered_video_edge(VideoSinkHa
             if (!connection.m_edge_states.contains(edge_id))
                 return;
             connection.async_update_edge_time_reader(edge_id, time_reader);
+        });
+    };
+    delegates.transmit_ticking = [weak_connection, edge_id](bool ticking) {
+        weak_connection.with_target([&](auto& connection) {
+            VERIFY(connection.m_owner_thread_id.is_current_thread());
+            if (!connection.m_edge_states.contains(edge_id))
+                return;
+            connection.async_set_sink_ticking(edge_id, ticking);
         });
     };
 
@@ -139,6 +147,12 @@ void VideoPresentationServerConnection::request_start(u64 edge_id)
         it->value.pump->start_input();
 }
 
+void VideoPresentationServerConnection::request_suspend(u64 edge_id)
+{
+    if (auto it = m_edge_states.find(edge_id); it != m_edge_states.end())
+        it->value.pump->suspend_input();
+}
+
 void VideoPresentationServerConnection::request_seek(u64 edge_id, AK::Duration timestamp, InvalidateHeldData invalidate_held_data, u64 newest_received_lend_id)
 {
     if (auto it = m_edge_states.find(edge_id); it != m_edge_states.end())
@@ -159,14 +173,14 @@ void VideoPresentationServerConnection::release_frame(u64 edge_id, u64 lend_id)
         m_released_edge_pumps_with_lent_frames.remove(edge_id);
 }
 
-void VideoPresentationServerConnection::notify_sink_status(u64 edge_id, PipelineStatus status, u32 requested_seek_id)
+void VideoPresentationServerConnection::notify_sink_status(u64 edge_id, PipelineStatus status, u32 requested_seek_id, PipelineCheckpoint checkpoint)
 {
     auto it = m_edge_states.find(edge_id);
     if (it == m_edge_states.end())
         return;
     if (requested_seek_id != it->value.actual_requested_seek_id)
         return;
-    it->value.pump->report_remote_status(status);
+    it->value.pump->report_remote_status(status, checkpoint);
 }
 
 void VideoPresentationServerConnection::notify_sink_resize(u64 edge_id, u32 width, u32 height)

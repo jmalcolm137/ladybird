@@ -69,7 +69,6 @@ endif()
 
 find_package(CURL REQUIRED)
 find_package(ICU 78.3 EXACT REQUIRED COMPONENTS data i18n uc)
-find_package(LibXml2 REQUIRED)
 find_package(OpenSSL REQUIRED)
 find_package(SDL3 CONFIG REQUIRED)
 find_package(simdjson CONFIG REQUIRED)
@@ -78,7 +77,6 @@ find_package(Threads REQUIRED)
 find_package(ZLIB REQUIRED)
 
 pkg_check_modules(LIBPSL REQUIRED IMPORTED_TARGET libpsl)
-pkg_check_modules(libtommath REQUIRED IMPORTED_TARGET libtommath)
 
 find_package(unofficial-angle CONFIG)
 if(unofficial-angle_FOUND)
@@ -147,18 +145,41 @@ else()
     set(HAS_DIRECTX OFF CACHE BOOL "" FORCE)
 endif()
 
-if (ENABLE_GUI_TARGETS AND NOT (ANDROID OR VCPKG_TARGET_ANDROID))
+if (ENABLE_GUI_TARGETS AND NOT ANDROID)
     set(LADYBIRD_QT_COMPONENTS Core Gui Widgets)
     if (NOT APPLE)
         list(APPEND LADYBIRD_QT_COMPONENTS Positioning)
     endif()
 
-    if (APPLE OR (LINUX AND NOT ANDROID) OR HAS_DIRECTX)
+    if (APPLE OR HAS_DIRECTX)
         # The native presentation paths use platform GPU buffer handles directly instead of copying frames through CPU
-        # memory. Wayland activation also uses Qt platform APIs.
+        # memory.
         list(APPEND LADYBIRD_QT_COMPONENTS GuiPrivate)
         set(QT_NO_PRIVATE_MODULE_WARNING ON)
     endif()
 
-    find_package(Qt6 6.10 REQUIRED COMPONENTS ${LADYBIRD_QT_COMPONENTS})
+    if (LINUX AND "qt" IN_LIST VCPKG_MANIFEST_FEATURES)
+        set(vcpkg_qt_package_dir "${VCPKG_INSTALLED_DIR}/${VCPKG_TARGET_TRIPLET}/share")
+        set(vcpkg_qt_dir "${vcpkg_qt_package_dir}/Qt6")
+
+        # Cached package directories take priority over the search paths, including for Qt modules.
+        get_cmake_property(cached_qt_dirs CACHE_VARIABLES)
+        list(FILTER cached_qt_dirs INCLUDE REGEX "^Qt6.*_DIR$")
+        foreach (cached_qt_dir IN LISTS cached_qt_dirs)
+            cmake_path(IS_PREFIX vcpkg_qt_package_dir "$CACHE{${cached_qt_dir}}" NORMALIZE is_vcpkg_qt_dir)
+            if (NOT is_vcpkg_qt_dir)
+                unset("${cached_qt_dir}" CACHE)
+            endif()
+        endforeach()
+
+        list(APPEND LADYBIRD_QT_COMPONENTS Svg)
+        find_package(Qt6 6.10 REQUIRED COMPONENTS ${LADYBIRD_QT_COMPONENTS} PATHS "${vcpkg_qt_dir}" NO_DEFAULT_PATH)
+
+        get_target_property(qt_core_type Qt6::Core TYPE)
+        if (NOT qt_core_type STREQUAL "SHARED_LIBRARY" OR NOT Qt6_DIR STREQUAL vcpkg_qt_dir)
+            message(FATAL_ERROR "The qt feature requires shared Qt from vcpkg.")
+        endif()
+    else()
+        find_package(Qt6 6.10 REQUIRED COMPONENTS ${LADYBIRD_QT_COMPONENTS})
+    endif()
 endif()

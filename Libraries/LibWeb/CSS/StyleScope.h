@@ -15,7 +15,7 @@
 #include <AK/Utf16FlyString.h>
 #include <AK/Vector.h>
 #include <LibGC/Ptr.h>
-#include <LibWeb/Animations/KeyframeEffect.h>
+#include <LibWeb/Animations/KeyframeSetHandle.h>
 #include <LibWeb/CSS/CascadeOrigin.h>
 #include <LibWeb/CSS/ContainerQuery.h>
 #include <LibWeb/CSS/RustDeclarationBlock.h>
@@ -67,7 +67,7 @@ struct StyleRuleCache {
     // Take in what another cache collected, as if from a later sheet.
     void add_rules_from_cache(StyleRuleCache const&);
 
-    HashMap<Utf16FlyString, NonnullRefPtr<Animations::KeyframeEffect::KeyFrameSet>> rules_by_animation_keyframes;
+    HashMap<Utf16FlyString, Animations::KeyframeSetHandle> rules_by_animation_keyframes;
     // https://drafts.csswg.org/css-anchor-position-1/#fallback-rule
     // If multiple @position-try rules are declared with the same name, they cascade (overriding each other) the same
     // as @keyframes rules do.
@@ -116,11 +116,12 @@ public:
     void publish_position_try_rules();
     void invalidate_user_style_sheet();
 
-    // The `@keyframes` row a shadow root's scope published to the style engine, taken from the scope as the root
-    // leaves its document, with the keyframe sets the row names: they stay alive until the row is given up.
+    // The rows a shadow root's scope published to the style engine, taken from the scope as the root leaves its
+    // document, to be given up before the next style update.
     struct DepartedAnimationKeyframes {
         TreeScopeID tree_scope;
-        Vector<NonnullRefPtr<Animations::KeyframeEffect::KeyFrameSet const>> keyframe_sets;
+        // NB: Whether the scope published a `@keyframes` row.
+        bool has_animation_keyframes { false };
         // NB: Whether the scope published a `@position-try` row too, which is given up along with this one.
         bool has_position_try_rules { false };
     };
@@ -132,6 +133,8 @@ public:
     static void prepare_user_agent_rules(DOM::Document&);
     // Lets go of the parsed sheets and sheet segments only the process keeps, past the documents that used them.
     static WEB_API void release_kept_data();
+    // Lets go of the shaped texts that this thread and the style and layout threads keep, for a process short of memory.
+    static WEB_API void release_shaped_texts();
     static WEB_API void for_each_user_agent_stylesheet(bool include_quirks_mode_stylesheet, bool include_mathml_and_svg_stylesheets, Function<void(CSS::StyleSheetState&, StyleSheetIdentifier const&)> const&);
     void build_user_style_sheet_if_needed();
 
@@ -155,9 +158,8 @@ public:
 
     void visit_edges(GC::Cell::Visitor&);
 
-    // The keyframe sets this scope last published. The style engine names them by pointer, so they stay alive after
-    // the rule cache they came from is invalidated, until the scope publishes again or gives its row up.
-    Vector<NonnullRefPtr<Animations::KeyframeEffect::KeyFrameSet const>> m_published_keyframe_sets;
+    // Whether the style engine holds a `@keyframes` row this scope published.
+    bool m_has_published_animation_keyframes { false };
 
     // The names and declarations of the @position-try rules this scope last published.
     Vector<Utf16FlyString> m_published_position_try_names;

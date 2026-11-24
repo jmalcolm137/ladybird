@@ -33,6 +33,8 @@ if (BUILD_TESTING)
         PYTHON_EXECUTABLE "${LADYBIRD_TEST_PYTHON}" ARGS $<TARGET_FILE:test-web>)
     ladybird_python_test(test-manual-rendering-reset.py
         PYTHON_EXECUTABLE "${LADYBIRD_TEST_PYTHON}" ARGS $<TARGET_FILE:test-web> TIMEOUT 240)
+    ladybird_python_test(test-pointer-input-reset.py
+        PYTHON_EXECUTABLE "${LADYBIRD_TEST_PYTHON}" ARGS $<TARGET_FILE:test-web> TIMEOUT 240)
 
     add_test(
         NAME LibWeb
@@ -42,7 +44,7 @@ if (BUILD_TESTING)
     add_test(
         NAME LibWebUIProcessSessionHistory
         COMMAND $<TARGET_FILE:test-web> --per-test-timeout 120
-            --force-new-process --run-ui-process-session-history-tests -f "Text/input/navigation/*"
+            --temporary-profile --run-ui-process-session-history-tests -f "Text/input/navigation/*"
             --results-dir test-dumps/ui-process-session-history-results
     )
 

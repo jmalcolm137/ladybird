@@ -269,8 +269,17 @@ static void try_write_harness_status(StringView reason)
         warnln("Failed to write test-web harness status: {}", result.error());
 }
 
-static String generate_wait_for_test_string(StringView wait_class, StringView on_finish_script = ""sv)
+enum class WaitForImages {
+    No,
+    Yes,
+};
+
+static String generate_wait_for_test_string(StringView wait_class, WaitForImages wait_for_images = WaitForImages::No, StringView on_finish_script = ""sv)
 {
+    // A reference test's screenshot has to show the images the page uses. But a CSS image only starts loading once
+    // layout reaches the element that uses it, which can be after the test is otherwise done. So a reference test
+    // forces a layout, then waits until no image is loading. It polls with timers rather than animation frames, since
+    // a test may hold rendering back, and the capture itself updates the layout.
     return MUST(String::formatted(R"(
 function hasTestWaitClass() {{
     return document.documentElement.classList.contains('{}');
@@ -280,13 +289,27 @@ function afterFontsAndPaint(callback) {{
     document.fonts.ready.then(() => requestAnimationFrame(() => requestAnimationFrame(callback)));
 }}
 
+const waitForImages = {};
+
+function afterImagesLoad(callback) {{
+    if (!waitForImages) {{
+        callback();
+        return;
+    }}
+    document.documentElement.getBoundingClientRect();
+    if (internals.hasPendingImageLoads)
+        setTimeout(() => afterImagesLoad(callback), 10);
+    else
+        callback();
+}}
+
 if (!hasTestWaitClass()) {{
-    afterFontsAndPaint(() => internals.signalTestIsDone("PASS"));
+    afterFontsAndPaint(() => afterImagesLoad(() => internals.signalTestIsDone("PASS")));
 }} else {{
     const observer = new MutationObserver(() => {{
         if (!hasTestWaitClass()) {{
             observer.disconnect();
-            internals.signalTestIsDone("PASS");
+            afterImagesLoad(() => internals.signalTestIsDone("PASS"));
         }}
     }});
 
@@ -297,13 +320,13 @@ if (!hasTestWaitClass()) {{
     {}
 }}
 )"sv,
-        wait_class, on_finish_script));
+        wait_class, wait_for_images == WaitForImages::Yes ? "true"sv : "false"sv, on_finish_script));
 }
 
 static auto wait_for_test_completion = generate_wait_for_test_string("test-wait"sv);
 
 // https://web-platform-tests.org/writing-tests/reftests.html#waiting-for-content-to-render
-static auto wait_for_reftest_completion = generate_wait_for_test_string("reftest-wait"sv, R"(
+static auto wait_for_reftest_completion = generate_wait_for_test_string("reftest-wait"sv, WaitForImages::Yes, R"(
     afterFontsAndPaint(() => document.documentElement.dispatchEvent(new Event("TestRendered", { bubbles: true })));
 )"sv);
 
@@ -663,7 +686,7 @@ static void run_dump_test(TestWebView& view, TestRunContext& context, Test& test
         };
     }
 
-    view.load(url);
+    view.load_from_browser_ui(url);
 }
 
 static ErrorOr<void> dump_screenshot_to_file(Gfx::Bitmap const& bitmap, StringView path)
@@ -795,7 +818,7 @@ static void run_ref_test(TestWebView& view, TestRunContext& context, Test& test,
 
                 test.expectation_screenshot.clear();
                 test.did_inject_js = false;
-                view.load(test.ref_test_expectations[test.ref_test_expectation_index].url);
+                view.load_from_browser_ui(test.ref_test_expectations[test.ref_test_expectation_index].url);
             });
         } else {
             // When the test initially finishes, we take a screenshot and request the reference test metadata.
@@ -863,10 +886,10 @@ static void run_ref_test(TestWebView& view, TestRunContext& context, Test& test,
 
         // Clear flag so we can inject the JS into the reference page.
         test.did_inject_js = false;
-        view.load(test.ref_test_expectations[test.ref_test_expectation_index].url);
+        view.load_from_browser_ui(test.ref_test_expectations[test.ref_test_expectation_index].url);
     };
 
-    view.load(url);
+    view.load_from_browser_ui(url);
 }
 
 static void run_screenshot_test(TestWebView& view, TestRunContext& context, Test& test, URL::URL const& url)
@@ -977,7 +1000,7 @@ static void run_screenshot_test(TestWebView& view, TestRunContext& context, Test
         });
     };
 
-    view.load(url);
+    view.load_from_browser_ui(url);
 }
 
 static void run_test(TestWebView& view, TestRunContext& context, size_t test_index, Application& app, TestRunCapture& test_run_capture)
@@ -1046,9 +1069,10 @@ static void run_test(TestWebView& view, TestRunContext& context, size_t test_ind
                 url = URL::create_with_file_scheme(real_path).release_value();
             }
 
-            // Append variant query string if present (variant is "?foo=bar", set_query expects "foo=bar")
+            // Append variant query string if present (variant is "?foo=bar"). Parsing it against the URL
+            // percent-encodes it, as it is in the URL that the test's request fetches.
             if (test.variant.has_value())
-                url->set_query(test.variant->bytes_as_string_view().substring_view(1));
+                url = URL::Parser::basic_parse(*test.variant, *url).release_value();
 
             switch (test.mode) {
             case TestMode::Crash:
@@ -1069,7 +1093,7 @@ static void run_test(TestWebView& view, TestRunContext& context, size_t test_ind
         });
     });
 
-    view.load(URL::about_blank());
+    view.load_from_browser_ui(URL::about_blank());
 }
 
 static void set_ui_callbacks_for_tests(TestWebView& view, TestRunContext& context, TestRunCapture& test_run_capture)

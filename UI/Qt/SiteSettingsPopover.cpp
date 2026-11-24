@@ -24,6 +24,9 @@ namespace Ladybird {
 static constexpr int POPOVER_WIDTH = 344;
 static constexpr int ROW_HEIGHT = 36;
 static constexpr int BLOCKED_RESOURCE_ROW_HEIGHT = 26;
+// NB: The heading of a page without a site leaves its text the card's width less the card's border, the page's and the
+//     heading's side margins, and the favicon and the space after it.
+static constexpr int NO_SITE_TITLE_WIDTH = POPOVER_WIDTH - 2 * 1 - 2 * 6 - 2 * 10 - 28 - 10;
 
 static void add_separator(QWidget& parent, QVBoxLayout& layout, int top_margin, int bottom_margin)
 {
@@ -43,6 +46,13 @@ static QLabel* create_icon(QWidget& parent)
     auto* label = new QLabel(&parent);
     label->setFixedSize(16, 16);
     return label;
+}
+
+// A page's favicon for the heading of the popover, or a globe for a page without one.
+static QPixmap heading_favicon_pixmap(QIcon const& favicon, qreal device_pixel_ratio)
+{
+    auto const& icon = favicon.isNull() ? create_chrome_icon(ChromeIcon::Globe, Theme::panel().muted) : favicon;
+    return icon.pixmap(QSize(16, 16), device_pixel_ratio);
 }
 
 static QPushButton* create_link(QWidget& parent, QString const& text)
@@ -185,22 +195,27 @@ SiteSettingsPopover::SiteSettingsPopover(QWidget* parent, WebView::Settings& set
     autoplay_row->addWidget(autoplay_label, 1);
     m_autoplay_button = create_value_button(*m_site_page);
     QObject::connect(m_autoplay_button, &QPushButton::clicked, this, [this] {
-        // A site is either allowed to autoplay, or follows the default, which the menu names so that the choice it shows
-        // on the button is always one of those in the menu.
         auto const& autoplay = m_settings.autoplay_settings();
-        auto is_allowed_on_site = autoplay.site_filters.contains(m_host);
+        auto site_policy = autoplay.site_filters.get(m_origin);
         QMenu menu(this);
-        auto* allow = menu.addAction("Allow");
-        allow->setCheckable(true);
-        allow->setChecked(is_allowed_on_site);
+
+        for (auto policy : { Web::HTML::AutoplayPolicy::AllowAudioAndVideo, Web::HTML::AutoplayPolicy::BlockAudio, Web::HTML::AutoplayPolicy::BlockAudioAndVideo }) {
+            auto* action = menu.addAction(autoplay_policy_name(policy));
+            action->setData(static_cast<int>(policy));
+            action->setCheckable(true);
+            action->setChecked(site_policy == policy);
+        }
+
         auto* use_default = menu.addAction(qformatted("Default ({})", autoplay_policy_name(autoplay.policy)));
         use_default->setCheckable(true);
-        use_default->setChecked(!is_allowed_on_site);
+        use_default->setChecked(!site_policy.has_value());
+
         auto* chosen = menu.exec(m_autoplay_button->mapToGlobal(QPoint(0, m_autoplay_button->height())));
-        if (chosen == allow)
-            m_settings.add_autoplay_site_filter(m_host);
-        else if (chosen == use_default)
-            m_settings.remove_autoplay_site_filter(m_host);
+        if (chosen == use_default)
+            m_settings.remove_autoplay_site_filter(m_origin);
+        else if (chosen)
+            m_settings.add_autoplay_site_filter(m_origin, static_cast<Web::HTML::AutoplayPolicy>(chosen->data().toInt()));
+
         update_autoplay();
     });
     autoplay_row->addWidget(m_autoplay_button);
@@ -220,8 +235,8 @@ SiteSettingsPopover::SiteSettingsPopover(QWidget* parent, WebView::Settings& set
     m_force_dark_switch = new PopoverSwitch(m_site_page);
     m_force_dark_switch->setAccessibleName("Force dark mode on this site");
     QObject::connect(m_force_dark_switch, &QCheckBox::toggled, this, [this](bool enabled) {
-        if (!m_is_private && !m_force_dark_host.is_empty())
-            m_settings.set_force_dark_for_host(m_force_dark_host, enabled);
+        if (!m_is_private && !m_host.is_empty())
+            m_settings.set_force_dark_for_host(m_host, enabled);
     });
     force_dark_row->addWidget(m_force_dark_switch);
     layout->addLayout(force_dark_row);
@@ -275,9 +290,9 @@ SiteSettingsPopover::SiteSettingsPopover(QWidget* parent, WebView::Settings& set
     // What can be set for the site is reset to the defaults.
     m_reset_permissions_link = create_link(*m_site_page, "Reset permissions");
     QObject::connect(m_reset_permissions_link, &QPushButton::clicked, this, [this] {
-        m_settings.remove_autoplay_site_filter(m_host);
+        m_settings.remove_autoplay_site_filter(m_origin);
         if (!m_is_private)
-            m_settings.reset_force_dark_for_host(m_force_dark_host);
+            m_settings.reset_host_setting(WebView::HostSetting::ForceDark, m_host);
         update_autoplay();
         if (on_reset_permissions)
             on_reset_permissions();
@@ -350,26 +365,87 @@ SiteSettingsPopover::SiteSettingsPopover(QWidget* parent, WebView::Settings& set
     pages->addWidget(m_blocked_page);
     m_blocked_page->hide();
 
+    // A page that is not from a website.
+    m_no_site_page = new QWidget(&card());
+    auto* no_site_layout = new QVBoxLayout(m_no_site_page);
+    no_site_layout->setContentsMargins(6, 14, 6, 8);
+    no_site_layout->setSpacing(0);
+
+    auto* no_site_heading = new QHBoxLayout;
+    no_site_heading->setContentsMargins(10, 0, 10, 0);
+    no_site_heading->setSpacing(10);
+    m_no_site_favicon = new QLabel(m_no_site_page);
+    m_no_site_favicon->setFixedSize(28, 28);
+    m_no_site_favicon->setAlignment(Qt::AlignCenter);
+    m_no_site_favicon->setObjectName("LadybirdSiteSettingsFavicon");
+    no_site_heading->addWidget(m_no_site_favicon, 0, Qt::AlignTop);
+    auto* no_site_text = new QVBoxLayout;
+    no_site_text->setSpacing(2);
+    m_no_site_title = new QLabel(m_no_site_page);
+    m_no_site_title->setObjectName("LadybirdSiteSettingsHost");
+    m_no_site_title->setTextFormat(Qt::PlainText);
+    no_site_text->addWidget(m_no_site_title);
+    m_no_site_explanation = new QLabel(m_no_site_page);
+    m_no_site_explanation->setObjectName("LadybirdSiteSettingsDetail");
+    m_no_site_explanation->setTextFormat(Qt::PlainText);
+    m_no_site_explanation->setWordWrap(true);
+    no_site_text->addWidget(m_no_site_explanation);
+    no_site_heading->addLayout(no_site_text, 1);
+    no_site_layout->addLayout(no_site_heading);
+
+    add_separator(*m_no_site_page, *no_site_layout, 12, 2);
+
+    auto* no_site_links = new QHBoxLayout;
+    no_site_links->setContentsMargins(4, 0, 4, 0);
+    no_site_links->addStretch(1);
+    auto* no_site_settings_link = create_link(*m_no_site_page, "All site settings");
+    QObject::connect(no_site_settings_link, &QPushButton::clicked, this, [this] {
+        close();
+        if (on_open_all_site_settings)
+            on_open_all_site_settings();
+    });
+    no_site_links->addWidget(no_site_settings_link);
+    no_site_layout->addLayout(no_site_links);
+    pages->addWidget(m_no_site_page);
+    m_no_site_page->hide();
+
     update_icons();
 }
 
 void SiteSettingsPopover::set_site(Site site)
 {
-    m_host = AK::move(site.host);
-    m_force_dark_host = AK::move(site.force_dark_host);
+    m_origin = site.origin.serialize();
+    m_host = AK::move(site.host_for_settings);
     m_is_private = site.is_private;
     content_settings_changed();
-    m_host_label->setText(qstring_from_ak_string(m_host));
+    m_host_label->setText(qstring_from_ak_string(site.origin.host().serialize()));
     // A secure connection is the norm, so only an insecure one is mentioned.
     m_security_label->setText("Connection is not secure");
-    m_security_label->setVisible(!site.is_secure);
+    m_security_label->setVisible(site.origin.scheme() != "https"sv);
 
-    m_favicon->setPixmap(site.favicon.isNull() ? create_chrome_icon(ChromeIcon::Globe, Theme::panel().muted).pixmap(QSize(16, 16), devicePixelRatioF()) : site.favicon.pixmap(QSize(16, 16), devicePixelRatioF()));
+    m_favicon->setPixmap(heading_favicon_pixmap(site.favicon, devicePixelRatioF()));
 
     set_permissions(site.permissions);
     update_autoplay();
+    m_no_site_page->hide();
     show_blocked_resources(false);
     set_content_blocking(site.content_blocking);
+}
+
+void SiteSettingsPopover::set_page_without_site(QString const& title, QString const& explanation, QIcon const& favicon)
+{
+    // NB: A long title, such as the path of a file or one a sandboxed page chose, would widen the text past the card,
+    //     so it is cut short. The style sheet sets the title's font once it is polished.
+    m_no_site_title->ensurePolished();
+    m_no_site_title->setText(m_no_site_title->fontMetrics().elidedText(title, Qt::ElideRight, NO_SITE_TITLE_WIDTH));
+    m_no_site_explanation->setText(explanation);
+    m_no_site_favicon->setPixmap(heading_favicon_pixmap(favicon, devicePixelRatioF()));
+
+    // NB: The page shown before is hidden first, so that the popover never has to fit two pages at once.
+    m_site_page->hide();
+    m_blocked_page->hide();
+    m_no_site_page->show();
+    fit_to_page();
 }
 
 // A permission the user never decided and the page never asked for has no row.
@@ -490,7 +566,7 @@ void SiteSettingsPopover::fit_to_page()
 {
     // NB: The page's and the card's layouts take in a row that shows or hides only once they are activated, so they are
     //     activated before the popover's own, which would otherwise keep the card at its old height.
-    for (auto* page : { m_site_page, m_blocked_page }) {
+    for (auto* page : { m_site_page, m_blocked_page, m_no_site_page }) {
         if (!page->isHidden())
             page->layout()->activate();
     }
@@ -502,15 +578,15 @@ void SiteSettingsPopover::fit_to_page()
 void SiteSettingsPopover::content_settings_changed()
 {
     QSignalBlocker blocker(m_force_dark_switch);
-    m_force_dark_switch->setChecked(m_settings.force_dark_for_host(m_force_dark_host));
-    m_force_dark_switch->setEnabled(!m_is_private && !m_force_dark_host.is_empty());
+    m_force_dark_switch->setChecked(m_settings.force_dark_for_host(m_host));
+    m_force_dark_switch->setEnabled(!m_is_private && !m_host.is_empty());
     update_reset_link();
 }
 
 void SiteSettingsPopover::update_autoplay()
 {
     auto const& autoplay = m_settings.autoplay_settings();
-    auto name = autoplay.site_filters.contains(m_host) ? QStringLiteral("Allow") : autoplay_policy_name(autoplay.policy);
+    auto name = autoplay_policy_name(autoplay.site_filters.get(m_origin).value_or(autoplay.policy));
     m_autoplay_button->setText(name);
     m_autoplay_button->setIcon(create_chrome_icon(ChromeIcon::ChevronDown, Theme::panel().muted));
     update_reset_link();
@@ -522,8 +598,8 @@ void SiteSettingsPopover::update_reset_link()
     if (!m_reset_permissions_link)
         return;
     auto const& autoplay = m_settings.autoplay_settings();
-    auto has_force_dark_choice = !m_is_private && m_settings.content_settings().force_dark_per_host.contains(m_force_dark_host);
-    m_reset_permissions_link->setEnabled(m_has_decided_permissions || autoplay.site_filters.contains(m_host) || has_force_dark_choice);
+    auto has_force_dark_choice = !m_is_private && m_settings.content_settings().force_dark_per_host.contains(m_host);
+    m_reset_permissions_link->setEnabled(m_has_decided_permissions || autoplay.site_filters.contains(m_origin) || has_force_dark_choice);
 }
 
 void SiteSettingsPopover::update_chrome_style(QPalette const& palette)

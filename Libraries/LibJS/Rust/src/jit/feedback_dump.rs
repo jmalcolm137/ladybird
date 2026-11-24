@@ -96,6 +96,26 @@ fn append_cell(out: &mut String, cell: Option<Gc<CellHeader>>) {
     }
 }
 
+fn append_value_feedback(out: &mut String, bits: u16) {
+    append_bits(
+        out,
+        bits,
+        &[
+            (value_feedback::INT32, "Int32"),
+            (value_feedback::DOUBLE, "Double"),
+            (value_feedback::STRING, "String"),
+            (value_feedback::SYMBOL, "Symbol"),
+            (value_feedback::BOOLEAN, "Boolean"),
+            (value_feedback::UNDEFINED, "Undefined"),
+            (value_feedback::NULL, "Null"),
+            (value_feedback::OBJECT, "Object"),
+            (value_feedback::BIG_INT, "BigInt"),
+            (value_feedback::EMPTY, "Empty"),
+            (value_feedback::OTHER_MASK, "Other"),
+        ],
+    );
+}
+
 fn append_call_feedback(out: &mut String, feedback: &CallFeedback) {
     out.push_str("target=");
     append_cell(out, feedback.target());
@@ -184,8 +204,9 @@ pub fn describe_feedback(executable: &Executable) -> Option<String> {
     let mut at = 0;
     while at < bytecode.len() {
         let opcode = bytecode[at];
-        let [arith, value, call, keyed] = instruction_feedback_slots_from_bytes(opcode, bytecode, at);
-        if arith.is_some() || value.is_some() || call.is_some() || keyed.is_some() {
+        let slots = instruction_feedback_slots_from_bytes(opcode, bytecode, at);
+        let [arith, value, call, keyed, cache_value] = slots;
+        if slots.iter().any(Option::is_some) {
             let _ = write!(out, "  [{at:4x}] {}", instruction_name_from_opcode(opcode));
             if let Some(slot) = arith {
                 let _ = write!(out, " arith#{slot}: ");
@@ -206,27 +227,18 @@ pub fn describe_feedback(executable: &Executable) -> Option<String> {
             }
             if let Some(slot) = value {
                 let _ = write!(out, " value#{slot}: ");
-                append_bits(
-                    &mut out,
-                    feedback.value[usize::from(slot)].get(),
-                    &[
-                        (value_feedback::INT32, "Int32"),
-                        (value_feedback::DOUBLE, "Double"),
-                        (value_feedback::STRING, "String"),
-                        (value_feedback::SYMBOL, "Symbol"),
-                        (value_feedback::BOOLEAN, "Boolean"),
-                        (value_feedback::UNDEFINED, "Undefined"),
-                        (value_feedback::NULL, "Null"),
-                        (value_feedback::OBJECT, "Object"),
-                        (value_feedback::BIG_INT, "BigInt"),
-                        (value_feedback::EMPTY, "Empty"),
-                        (value_feedback::OTHER_MASK, "Other"),
-                    ],
-                );
+                append_value_feedback(&mut out, feedback.value()[usize::from(slot)].get());
+            }
+            if let Some(cache) = cache_value {
+                let _ = write!(out, " value of cache#{cache}: ");
+                append_value_feedback(&mut out, feedback.cache_value()[usize::from(cache)].get());
             }
             if let Some(slot) = call {
                 let _ = write!(out, " call#{slot}: ");
-                append_call_feedback(&mut out, &feedback.call()[usize::from(slot)]);
+                let call = &feedback.call()[usize::from(slot)];
+                append_call_feedback(&mut out, call);
+                out.push_str(" returned: ");
+                append_value_feedback(&mut out, call.value.get());
             }
             if let Some(slot) = keyed {
                 let _ = write!(out, " keyed#{slot}: ");

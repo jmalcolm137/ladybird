@@ -10,18 +10,62 @@ use core::ffi::c_void;
 
 use core::ptr::NonNull;
 
-use libjs_rust::api::{Gc, Object, Trace};
+use ak::Utf16String;
+use libjs_rust::api::{Gc, Object, Realm, Trace, Vm};
+use liburl_rust::origin::Origin;
+use liburl_rust::{FfiOrigin, RustUrl, Url};
 
 use crate::bindings::cpp_cell::CppCell;
 
 unsafe extern "C" {
     fn web_bindings_relevant_settings_object(global_object: *mut c_void) -> *mut c_void;
+    fn web_bindings_principal_realm_settings_object(realm: *mut c_void) -> *mut c_void;
     fn web_bindings_environment_settings_object_global_object(settings_object: *mut c_void) -> *mut c_void;
+    fn web_bindings_environment_settings_object_realm(settings_object: *mut c_void) -> *mut c_void;
+    fn web_bindings_environment_settings_object_time_origin(settings_object: *mut c_void) -> f64;
+    fn web_bindings_environment_settings_object_is_secure_context(settings_object: *mut c_void) -> bool;
+    fn web_bindings_environment_settings_object_top_level_origin(
+        settings_object: *mut c_void,
+        origin: *mut c_void,
+        on_origin: unsafe extern "C" fn(*mut c_void, *const FfiOrigin),
+    ) -> bool;
+    fn web_bindings_environment_settings_object_api_base_url(
+        settings_object: *mut c_void,
+        url: *mut c_void,
+        on_url: unsafe extern "C" fn(*mut c_void, *const RustUrl),
+    );
+    fn web_bindings_environment_settings_object_current_wall_time(settings_object: *mut c_void) -> f64;
     fn web_bindings_environment_settings_object_id(
         settings_object: *mut c_void,
         id: *mut c_void,
         on_id: unsafe extern "C" fn(*mut c_void, ak::Span<'_, u8>),
     );
+    fn web_bindings_environment_settings_object_origin(
+        settings_object: *mut c_void,
+        origin: *mut c_void,
+        on_origin: unsafe extern "C" fn(*mut c_void, *const FfiOrigin),
+    );
+    fn web_bindings_environment_settings_object_creation_url(
+        settings_object: *mut c_void,
+        url: *mut c_void,
+        on_url: unsafe extern "C" fn(*mut c_void, *const RustUrl),
+    );
+    fn web_bindings_environment_settings_object_encoding_parse_url(
+        settings_object: *mut c_void,
+        url: usize,
+        parsed_url: *mut c_void,
+        on_url: unsafe extern "C" fn(*mut c_void, *const RustUrl),
+    );
+}
+
+unsafe extern "C" fn on_url(parsed_url: *mut c_void, url: *const RustUrl) {
+    // SAFETY: parsed_url is the URL of the caller, and LibWeb lends the URL for the call.
+    unsafe { *parsed_url.cast::<Option<Url>>() = Some((*url).to_url()) };
+}
+
+unsafe extern "C" fn on_origin(origin: *mut c_void, ffi_origin: *const FfiOrigin) {
+    // SAFETY: origin is the origin of the caller, and LibWeb lends the origin for the call.
+    unsafe { *origin.cast::<Option<Origin>>() = Some((*ffi_origin).to_origin()) };
 }
 
 unsafe extern "C" fn on_id(id: *mut c_void, bytes: ak::Span<'_, u8>) {
@@ -39,6 +83,18 @@ pub(crate) fn relevant_settings_object(global_object: Gc<Object>) -> CppEnvironm
     // SAFETY: The global object is live, and LibWeb returns its live environment settings object.
     CppEnvironmentSettingsObject(unsafe {
         CppCell::from_raw(web_bindings_relevant_settings_object(global_object.as_ptr().cast()))
+    })
+}
+
+/// https://html.spec.whatwg.org/multipage/webappapis.html#current-settings-object
+pub(crate) fn current_settings_object(vm: &Vm) -> CppEnvironmentSettingsObject {
+    // Then, the current settings object is the environment settings object of the current realm.
+    let current_realm = vm.current_realm().expect("there is a current realm");
+    // SAFETY: The realm is live, and LibWeb returns its live environment settings object.
+    CppEnvironmentSettingsObject(unsafe {
+        CppCell::from_raw(web_bindings_principal_realm_settings_object(
+            current_realm.as_ptr().cast(),
+        ))
     })
 }
 
@@ -61,5 +117,84 @@ impl CppEnvironmentSettingsObject {
         let global_object = unsafe { web_bindings_environment_settings_object_global_object(self.as_ptr()) };
         // SAFETY: The global object is live.
         unsafe { Gc::from_non_null(NonNull::new(global_object.cast()).expect("a settings object has a global object")) }
+    }
+
+    /// https://html.spec.whatwg.org/multipage/webappapis.html#environment-settings-object's-realm
+    pub(crate) fn realm(&self) -> Gc<Realm> {
+        // SAFETY: The settings object is live, and LibWeb returns its live realm.
+        let realm = unsafe { web_bindings_environment_settings_object_realm(self.as_ptr()) };
+        // SAFETY: The realm is live.
+        unsafe { Gc::from_non_null(NonNull::new(realm.cast()).expect("a settings object has a realm")) }
+    }
+
+    /// https://html.spec.whatwg.org/multipage/webappapis.html#secure-context
+    pub(crate) fn is_secure_context(&self) -> bool {
+        // SAFETY: The settings object is live.
+        unsafe { web_bindings_environment_settings_object_is_secure_context(self.as_ptr()) }
+    }
+
+    /// https://html.spec.whatwg.org/multipage/webappapis.html#concept-settings-object-time-origin
+    pub(crate) fn time_origin(&self) -> f64 {
+        // SAFETY: The settings object is live.
+        unsafe { web_bindings_environment_settings_object_time_origin(self.as_ptr()) }
+    }
+
+    /// https://html.spec.whatwg.org/multipage/webappapis.html#concept-settings-object-origin
+    pub(crate) fn origin(&self) -> Origin {
+        let mut origin = None;
+        // SAFETY: The settings object is live, and the origin outlives the call.
+        unsafe { web_bindings_environment_settings_object_origin(self.as_ptr(), (&raw mut origin).cast(), on_origin) };
+        origin.expect("LibWeb lends the origin")
+    }
+
+    /// https://html.spec.whatwg.org/multipage/webappapis.html#concept-environment-creation-url
+    pub(crate) fn creation_url(&self) -> Url {
+        let mut url = None;
+        // SAFETY: The settings object is live, and the URL outlives the call.
+        unsafe { web_bindings_environment_settings_object_creation_url(self.as_ptr(), (&raw mut url).cast(), on_url) };
+        url.expect("LibWeb lends the creation URL")
+    }
+
+    /// https://html.spec.whatwg.org/multipage/webappapis.html#concept-environment-top-level-origin
+    pub(crate) fn top_level_origin(&self) -> Option<Origin> {
+        let mut origin = None;
+        // SAFETY: The settings object is live, and the origin outlives the call.
+        unsafe {
+            web_bindings_environment_settings_object_top_level_origin(
+                self.as_ptr(),
+                (&raw mut origin).cast(),
+                on_origin,
+            )
+        };
+        origin
+    }
+
+    /// https://html.spec.whatwg.org/multipage/webappapis.html#api-base-url
+    pub(crate) fn api_base_url(&self) -> Url {
+        let mut url = None;
+        // SAFETY: The settings object is live, and the URL outlives the call.
+        unsafe { web_bindings_environment_settings_object_api_base_url(self.as_ptr(), (&raw mut url).cast(), on_url) };
+        url.expect("LibWeb lends the API base URL")
+    }
+
+    /// https://w3c.github.io/hr-time/#dfn-current-wall-time
+    pub(crate) fn current_wall_time(&self) -> f64 {
+        // SAFETY: The settings object is live.
+        unsafe { web_bindings_environment_settings_object_current_wall_time(self.as_ptr()) }
+    }
+
+    /// https://html.spec.whatwg.org/multipage/urls-and-fetching.html#encoding-parsing-a-url
+    pub(crate) fn encoding_parse_url(&self, url: &Utf16String) -> Option<Url> {
+        let mut parsed_url = None;
+        // SAFETY: The settings object is live, the URL is lent for the call, and the parsed URL outlives it.
+        unsafe {
+            web_bindings_environment_settings_object_encoding_parse_url(
+                self.as_ptr(),
+                url.raw_identity(),
+                (&raw mut parsed_url).cast(),
+                on_url,
+            );
+        }
+        parsed_url
     }
 }

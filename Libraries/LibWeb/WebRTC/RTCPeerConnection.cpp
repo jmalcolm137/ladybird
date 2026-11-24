@@ -79,8 +79,7 @@ WebIDL::ExceptionOr<GC::Ref<RTCPeerConnection>> RTCPeerConnection::create_for_co
     // Like other browsers, only reveal local addresses to pages that may capture audio, which could tell where the
     // user is anyway. Everyone else gets mDNS names in their place.
     // https://datatracker.ietf.org/doc/html/draft-ietf-mmusic-mdns-ice-candidates#section-3.1
-    PermissionsAPI::PermissionDescriptor microphone_permission { "microphone"_utf16 };
-    auto may_capture = PermissionsAPI::permission_state(microphone_permission) == PermissionsAPI::PermissionState::Granted;
+    auto may_capture = PermissionsAPI::permission_state(Web::Permissions::PermissionName::Microphone) == PermissionsAPI::PermissionState::Granted;
     config.set("host_candidates"sv, may_capture ? "exposed"sv : "obfuscated"sv);
     if (!configuration.certificates.is_empty())
         return WebIDL::NotSupportedError::create("Custom RTC certificates are not supported"_utf16);
@@ -1235,9 +1234,9 @@ void RTCPeerConnection::on_remote_track_added(u64 receiver_id, u64 transceiver_i
     //   - Firing one RTCTrackEvent per init.
     //   - Muting each track in muteTracks.
     for (auto& pair : add_list)
-        pair.stream->add_track(pair.track);
+        pair.stream->add_a_track(pair.track);
     for (auto& pair : remove_list)
-        pair.stream->remove_track(pair.track);
+        pair.stream->remove_a_track(pair.track);
     for (auto& init : track_event_inits) {
         auto event = RTCTrackEvent::create(HTML::EventNames::track,
             init.receiver, init.track, move(init.streams), init.transceiver,

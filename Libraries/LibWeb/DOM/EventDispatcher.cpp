@@ -288,6 +288,21 @@ bool EventDispatcher::dispatch(GC::Ref<EventTarget> target, Event& event, bool l
     //               events are always dispatched. This saves us from going through the path building and dispatch
     //               phases for events that will be dropped on the floor anyway.
     bool is_activation_event = is<UIEvents::MouseEvent>(event) && event.type() == HTML::EventNames::click;
+
+    // AD-HOC: The spec only has a disabled form control prevent the click events queued on the user interaction task
+    //         source from being dispatched on it:
+    //         https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#enabling-and-disabling-form-controls:-the-disabled-attribute
+    //         But no mousedown, mouseup, click, or dblclick from the user reaches a disabled form control, or anything
+    //         above it: The path of such an event ends below the control, so a press on the control's own box
+    //         dispatches nothing. Every other event (pointer events, mouseover, mousemove, wheel, ...) reaches it as
+    //         usual. See https://github.com/whatwg/html/issues/2368.
+    bool const path_ends_below_disabled_form_control = event.is_trusted() && is<UIEvents::MouseEvent>(event)
+        && (event.type() == UIEvents::EventNames::mousedown || event.type() == UIEvents::EventNames::mouseup
+            || event.type() == UIEvents::EventNames::click || event.type() == UIEvents::EventNames::dblclick);
+    auto is_disabled_form_control = [](EventTarget const& event_target) {
+        auto const* element = as_if<Element>(event_target);
+        return element && element->is_disabled_form_control();
+    };
     bool should_dispatch = is_activation_event;
     if (!should_dispatch) {
         auto const* node = as_if<Node>(*target);
@@ -312,7 +327,20 @@ bool EventDispatcher::dispatch(GC::Ref<EventTarget> target, Event& event, bool l
             if (auto legacy_event_type = legacy_event_type_for_event_type(event.type()); legacy_event_type.has_value())
                 should_dispatch = has_listener_on_event_path(*legacy_event_type);
         }
+
+        // NB: The script that dispatched an untrusted event can read the target that dispatch leaves on it. For a node
+        //     outside any shadow tree, with no related target or touch targets, that's targetOverride itself, so set
+        //     it, and skip the dispatch. Anywhere else, retargeting decides what's left, so dispatch.
+        if (!should_dispatch && !event.is_trusted()) {
+            if (is<ShadowRoot>(node->root()) || event.related_target() || !event.touch_target_list().is_empty())
+                should_dispatch = true;
+            else
+                event.set_target(target_override.ptr());
+        }
     }
+
+    if (path_ends_below_disabled_form_control && is_disabled_form_control(*target))
+        should_dispatch = false;
 
     // 6. If target is not relatedTarget or target is event’s relatedTarget, then:
     if (should_dispatch && (related_target != target || event.related_target() == target)) {
@@ -351,6 +379,9 @@ bool EventDispatcher::dispatch(GC::Ref<EventTarget> target, Event& event, bool l
 
         // 9. While parent is non-null:
         while (parent) {
+            if (path_ends_below_disabled_form_control && is_disabled_form_control(*parent))
+                break;
+
             // 1. If slottable is non-null:
             if (slottable != nullptr) {
                 // 1. Assert: parent is a slot.

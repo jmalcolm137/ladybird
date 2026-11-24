@@ -46,20 +46,25 @@ Blocks without predecessors are entries: block 0, the on-stack replacement entri
 entries of generators (section 4.1) and the catch entries of exception handlers (section 4.2). Every
 block is reachable from one.
 
-The compiled function's slots are SSA values. The builder tracks, per slot, whether only frame
-memory holds it or which value holds it (and whether memory holds that too). Merges and loop
-headers never write frame memory: a slot that every path leaves in memory stays there, a slot the
-paths disagree on (or a loop assigns) gets a phi, with loads at the predecessors that only have it
-in memory. Frame memory is written only where something reads it: before calls that read the
-frame (`StoreSlot`), where the compiled function assigns an argument that its legacy `arguments`
-shows (which any code it calls can read), and by exits and leaves through the translator. The
-this value register is the exception at loop headers: slow paths write it to memory, so loops
-keep it there.
+The compiled function's slots are SSA values. The builder tracks, per slot (the reserved registers
+included), which value holds it and whether frame memory holds that value too. Values come from
+frame memory (`LoadSlot`) where the code starts using it: every slot live at an entry, and the slots
+a node that writes the frame wrote, right after it. Merges and loop headers never write frame
+memory: a slot the paths disagree on (or a loop assigns) gets a phi, except that a slot every path
+loaded, and memory still holds, is loaded again at the merge (loop invariant code motion takes such
+loads out of loops, those of `Graph::unwritten_slots` even out of loops that call). The arguments and the `this` value register that no instruction writes keep
+the values the function started with (`Graph::unwritten_slots`), and nothing stores to them, so the
+values loaded from them need no spill slots (section 7). Frame memory is written
+only where something reads it: before calls that read the frame and before `Suspend` (`StoreSlot`),
+where the compiled function assigns an argument that its legacy `arguments` shows (which any code it
+calls can read), and by exits and leaves through the translator.
 
 ### 3.1 Effects
 
-`Op::properties()` describes every op's effects, and every pass decides what it may do with a node
-from them alone:
+`Op::info()` (`ir/info.rs`) decides, for every op in one exhaustive match, its effects
+(`NodeProperties`), its exit kind, the input it refines (section 3.2), whether it ends a block, and
+the inputs it takes (`Inputs`: how many, of which representations), which the verifier checks every
+node against. Every pass decides what it may do with a node from its effects alone:
 
 - **Exits.** `Op::can_eager_exit()`, whether the op has an exit kind (`Op::exit_kind()`): may exit
   before its side effects, resuming at the current bytecode (needs the eager frame state).
@@ -76,7 +81,7 @@ from them alone:
   one question: whether one node's writes intersect another's reads. `runs_code`: may run other
   code, which may write anything, or invalidate the compiled code. The op table below names the
   locations coarsely (Named for slots and shapes, Elements for values and counts, Any for all);
-  `Op::properties()` has the exact sets.
+  `Op::info()` has the exact sets.
 - **Allocation.** `allocates`: may allocate, so may run the garbage collector.
 
 Global value numbering shares nodes without effects that read no memory; check elimination reuses
@@ -125,8 +130,8 @@ Exits: E = eager, L = lazy. Every node that can exit has a frame state. "Call" m
 | **Values** | | | | | |
 | Constant | A NaN-boxed constant. | | | | cse |
 | Phi | One input per predecessor, in predecessor order. | | | | |
-| LoadSlot | Reads a frame slot. | | Frame | | |
-| StoreSlot | Writes input 0 to a frame slot: a reserved register (the this value, the saved lexical environment), a written constant, an argument the legacy `arguments` shows, or a slot the next call reading the frame or `Suspend` reads. The verifier enforces this. | | | Frame | |
+| LoadSlot | Reads a frame slot: at an entry, right after a node that writes it, or at a merge of loads of it. | | Frame | | |
+| StoreSlot | Writes input 0 to a frame slot: a written constant, an argument the legacy `arguments` shows, or a slot the next call reading the frame or `Suspend` reads. The verifier enforces this. | | | Frame | |
 | BoxInt32, BoxBool | The tagged value of an unboxed input. | | | | cse |
 | CheckInt32 | Input 0 as an int32; exits unless it is one. | E | | | cse |
 | CheckFloat64Int32 | The float64 input 0 as an int32; exits unless it is one (-0 is none). What an int32 check of a boxed double becomes once checks of doubles no longer go. | E | | | cse |
@@ -194,7 +199,7 @@ Exits: E = eager, L = lazy. Every node that can exit has a frame state. "Call" m
 | StringLength, LoadStringCodeUnit | The length of a string, and a code unit of a readable string at an index in bounds, which the refinements of their branches establish. Strings never change. | | | | cse |
 | SingleCharacterString | The VM's string of an ASCII code unit (refined below 128). | | | | cse |
 | StringsEqual | Whether two strings are equal, as a tagged boolean, or the empty value where only the slow path can tell. | | | | cse |
-| ConcatenateStrings | The concatenation of two strings, a rope or a cached short string, or the empty value where only the slow path makes it. | | | | allocates |
+| ConcatenateStrings | The concatenation of two strings, a rope or a cached short string, or the empty value where only the slow path makes it. If it is a `key` (`ConcatenateKeyStrings` in dumps), it is the string that the same two strings made when it became a property key before, where the VM remembers that, which the caches of keyed accesses know. | | | | allocates |
 | IntegerToString | The VM's cached string of an int32, or the empty value. | | | | cse |
 | LoadPropertyIteratorKeyCount, LoadPropertyIteratorKey | The keys of a property iterator cache, at an index refined to be in bounds. The keys never change. | | | | cse |
 | OpenArrayIteration | `GetIterator` in fast array mode, through a runtime call that preserves every register: the iterable, if it is an array that iterates with `%Array.prototype.values%` and whose array iterators have the builtin `next`, or the empty value. The iteration then keeps the index of the next element in the iterator operand and the array in the next operand, and makes no iterator. | | Any | | |
@@ -262,7 +267,8 @@ Rules (enforced by `passes/verify.rs`):
 
 Code generation turns each point where the runtime may read the state into a **site**
 (`code::Site`): its kind, its chain of frame states with the location of every value (register,
-stack slot, constant, an arguments object or a virtual object to create), and the virtual objects.
+stack slot, a slot of the compiled function's frame that nothing writes, constant, an arguments
+object or a virtual object to create), and the virtual objects.
 
 | Site kind | Where | What the runtime does |
 |---|---|---|
@@ -316,7 +322,8 @@ that `Suspend` marks the value as awaited (`yield_is_await`), which tells an asy
 await it rather than yield it.
 
 Each continuation then gets a resume entry (`builder/osr.rs`), like an on-stack replacement entry:
-a block without predecessors that loads the slots live there from the frame and jumps to the
+a block without predecessors that loads the slots live there from the frame (the accumulator the
+runtime resumes with among them) and jumps to the
 continuation's block, which nothing else in compiled code reaches. Both kinds of entry are listed in
 `Graph::osr_entries` by pc, since both continue a frame whose memory holds every value at that pc.
 `GeneratorObject::execute()` runs the generator from its continuation through `run_executable()`,
@@ -356,7 +363,7 @@ compiled again with the entry once catches keep happening there.
 Callees with handlers are inlined only if none of their handlers caught an exception before the
 compile, and their handlers get no blocks at all. An exception that one of them catches unwinds into
 the callee's materialized frame, the leave writes the frames, and the interpreter runs the handler.
-Inlined frames do not list their exception register in frame states, so the leave keeps the
+No frame state lists an exception register, which only the runtime writes, so the leave keeps the
 exception the unwinder put there. The leave counts such a catch like an exit, so that the code is
 compiled again once catches keep happening there, and the recompile calls the callee instead.
 
@@ -410,7 +417,7 @@ unreachable. Each one keeps the graph valid (`passes/verify.rs`), and IR tests i
 | Check elimination | A forward dataflow of facts removes checks that passed already, decides branches that a branch on the same values decided before, and reuses loads whose value is known; may turn shape checks into `AssumeValid` plus a stable shape dependency. |
 | Simplification | Again, for what the branches that check elimination decided left foldable (like the double path of `Math.abs` of an int32). Int32 checks of boxed doubles become `CheckFloat64Int32` of the doubles. |
 | Global value numbering | Again, for the nodes that check elimination and simplification made the same. |
-| Loop invariant code motion | Gives loops entered from several blocks a merged preheader, then moves effect-free nodes with inputs from outside the loop to it (but calls in cold blocks); nodes that may exit too, exiting to the loop header, and not where that kind of exit was taken there before. Those from blocks that not every iteration runs, but for cold ones, move speculatively: they exit with `Hoisted`, and stay in the loop where such an exit was taken there before. |
+| Loop invariant code motion | Gives loops entered from several blocks a merged preheader, then moves effect-free nodes with inputs from outside the loop to it (but calls in cold blocks), and loads of slots nothing writes even where the loop calls; nodes that may exit too, exiting to the loop header, and not where that kind of exit was taken there before. Those from blocks that not every iteration runs, but for cold ones, move speculatively: they exit with `Hoisted`, and stay in the loop where such an exit was taken there before. |
 | Bounds check elimination | Bounds checks against constant counts go away where the index is known to be in range: induction variables of loops whose back edge compares the grown counter with a constant bound, merges of values from outside a loop, and int32 arithmetic on them that cannot overflow. The counter an on-stack replacement entry brings is checked against the bound once where it enters, unless such a check exited there before. With the same ranges, `((x << k) + c) >> k` becomes `x + (c >> k)` where nothing overflows and `c` is a multiple of 2^k. Int32 additions, subtractions and multiplications become `Int32WrappingBinary` where the ranges of their operands keep the result an int32 (and not -0), with operands also bounded by the masks and shifts of any int32, and by the dominating bounds checks and in-bounds branches of indices. |
 | Interrupt check elimination | Small innermost loops that count towards an end lose their `CheckInterrupt`, if they run under 5000 times or a loop around them keeps its check (section 9, "Interrupts"). |
 | Exit unboxing | Frame states take the unboxed value of an int32, float64 or bool boxing that only frame states use, so that exits box it instead of the fast path. |
@@ -418,6 +425,7 @@ unreachable. Each one keeps the graph valid (`passes/verify.rs`), and IR tests i
 | Escape analysis | Allocations that do not escape become their properties' SSA values; frame states refer to `VirtualObject`s. `AssumeLegacyArgumentsUnread` nodes after calls whose frame states have virtual objects among legacy arguments become `AssumeValid` nodes; the others go away. |
 | Dead code elimination | Again, for what escape analysis left unused. |
 | Branch fusion | A branch on a single-use comparison (int32, float64 or tagged) compares itself, after a block that only branches on a phi of booleans hands the branch to its predecessors. |
+| Key strings | A `ConcatenateStrings` whose value is the key of a `ProbeKeyedCache`, `ProbeKeyedStore` or `ProbeHasProperty`, or one of the strings of such a concatenation, through refinements and phis other than those of loop headers, becomes a `key`: the rope it would make is a new string for every access, which the caches of the access never know. A concatenation that adds to the phi of a loop header stays as it is: it makes a piece of a string that a loop puts together. |
 | Refinement removal | Every use of a refined value becomes a use of the value itself; `Refine` nodes go away and checks lose their values; value numbering then merges what differed only in refinements (section 3.2), and dead code elimination removes what only the merged checks' frame states kept alive. |
 | Frame initialization | Moves `InitializeFrame` to the first node that observes the frame's slots on each path, and puts `PublishFrame` before nodes that only need the frame visible (allocations, calls in inlined callees) where it may not be yet. |
 | Frame state cleanup | Drops the frame states no node uses. |
@@ -425,8 +433,33 @@ unreachable. Each one keeps the graph valid (`passes/verify.rs`), and IR tests i
 
 ## 7. Register allocation
 
-To be written: the forward walk, node constraints, spills at definition, merges and their state
-predecessor, cold blocks, the verifier.
+Every node declares what its lowering needs in `codegen::lowering_info()`, one exhaustive match next
+to the lowerings: where each input must be (a register, a register of the calling convention, a
+register or an immediate constant, the register the target shifts by
+(`RegisterSet::shift_amount_gpr`, RCX on x86-64, any register on AArch64) or an immediate constant,
+or anywhere, its stack slot included), where its output goes (a register or the return register),
+how many temps it takes (with a comment saying what each is for), what its code clobbers beyond
+those (nothing; every floating point register, for nodes whose out of line code calls the runtime
+saving only the general purpose registers; or every caller-saved register, for calls), whether its
+output may take the register of its first input where that dies, and which parts of the JIT frame it
+uses (the saves area, the operand record). The register allocator, its verifier and the frame layout
+read it instead of keeping lists of ops of their own. In debug builds and with `verify-ir`, code
+generation checks the lowerings against it: each lowering takes exactly the temps it declares
+(through `Codegen::temp()`, also on paths that do not use them), and only nodes that declare it use
+the saves area. The verifier of the allocation checks that every node got the temps it declares,
+that inputs of a fixed register are in it, and that no value an exit needs is in the node's output
+register.
+
+A value loaded from one of `Graph::unwritten_slots` has that frame slot as its home
+(`regalloc::frame_home()`): it gets no spill slot and no store after its definition, and wherever
+no register holds it, moves reload it from the frame and exits find it there
+(`code::ValueLocation::Frame`). Code inside a node that published the frames of inlined calls
+reads it through the compiled function's frame the entry saved, since the frame register then
+holds another frame. The verifier names the value of such a slot by the slot, which holds it
+everywhere, and reports stores to it.
+
+To be written: the forward walk, spills at definition, merges and their state predecessor, cold
+blocks, the verifier.
 
 ## 8. Code generation and the runtime interface
 
@@ -455,8 +488,9 @@ explicitly:
   stack pointer goes through `emit_prologue()` or `allocate_stack()`, which touch the pages on the
   way down (with the stack probes in `asm::x86_64`, which the Wasm JIT shares). Code that moves it
   any other way can skip the guard pages and fault. Compiled functions check the native stack limit
-  before they touch their frames, with `emit_prologue_unprobed()` and `probe_frame()`, so that a
-  frame that does not fit makes the code exit instead of touching past the end of the stack.
+  before their prologue moves the stack pointer (`Codegen::emit_prologue()` compares the lowest
+  address of the frame with `Vm::jit_native_stack_limit`), so that a frame that does not fit makes
+  the code exit instead of touching past the end of the stack.
 
 ## 9. Speculation and exits
 
@@ -609,7 +643,7 @@ Options for debugging the JIT:
 | `dump-passes`        | Print the IR after building it and after every pass.                                            |
 | `dump-asm`           | Print the machine code of every compile.                                                        |
 | `dump-feedback`      | Print the interpreter feedback of each function the first time it gets hot.                     |
-| `verify-ir`          | Check the invariants of the IR after building it and after every pass, also in release builds.  |
+| `verify-ir`          | Check the IR, the register allocation and the lowerings (sections 6 and 7), also in release builds.|
 | `log-exits`          | Print every exit from compiled code to the interpreter, and every discard of compiled code.     |
 | `perf-map`           | Describe compiled code in `/tmp/perf-<pid>.map` for `perf`.                                     |
 | `coverage=DIRECTORY` | Write what compiled code contained and did into `DIRECTORY`, one JSON file per VM.              |

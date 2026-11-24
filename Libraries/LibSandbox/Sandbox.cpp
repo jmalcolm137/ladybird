@@ -10,6 +10,7 @@
 #    include <AK/LexicalPath.h>
 #    include <AK/ScopeGuard.h>
 #    include <AK/Vector.h>
+#    include <LibSandbox/FileBroker.h>
 #    include <dirent.h>
 #    include <errno.h>
 #    include <fcntl.h>
@@ -26,6 +27,7 @@
 #if defined(AK_OS_MACOS)
 #    include <AK/LexicalPath.h>
 #    include <AK/StringBuilder.h>
+#    include <LibCore/IOSurface.h>
 #    include <LibCore/StatsLog.h>
 #    include <errno.h>
 #    include <limits.h>
@@ -61,8 +63,9 @@ ErrorOr<void> install_no_new_privileges()
 ErrorOr<void> configure_runtime()
 {
 #if defined(AK_OS_LINUX) && defined(__GLIBC__) && defined(M_ARENA_MAX) && !defined(HAS_ADDRESS_SANITIZER)
-    if (mallopt(M_ARENA_MAX, 4) == 0)
-        return Error::from_string_literal("mallopt(M_ARENA_MAX) failed");
+    // NB: This only limits memory use. Other allocators, such as hardened_malloc, do not know this option and return 0,
+    //     so we ignore a failure.
+    (void)mallopt(M_ARENA_MAX, 4);
 #endif
 #if defined(AK_OS_LINUX) && defined(HAS_ADDRESS_SANITIZER)
     // The sanitizers symbolize a report through an llvm-symbolizer process they start the first time they need one, but
@@ -75,7 +78,7 @@ ErrorOr<void> configure_runtime()
 }
 
 #if defined(AK_OS_LINUX)
-ErrorOr<void> add_landlock_path_if_exists(Vector<LandlockPath>& paths, StringView path, LandlockPath::Access access)
+ErrorOr<void> add_path_if_exists(Vector<PathRule>& paths, StringView path, PathRule::Access access)
 {
     auto path_bytes = path.to_byte_string();
 
@@ -97,7 +100,7 @@ ErrorOr<void> add_landlock_path_if_exists(Vector<LandlockPath>& paths, StringVie
     return {};
 }
 
-ErrorOr<void> add_loaded_library_directories(Vector<LandlockPath>& paths, Optional<StringView> root)
+ErrorOr<void> add_loaded_library_directories(Vector<PathRule>& paths, Optional<StringView> root)
 {
     Vector<ByteString> directories;
     dl_iterate_phdr([](dl_phdr_info* info, size_t, void* data) {
@@ -114,7 +117,7 @@ ErrorOr<void> add_loaded_library_directories(Vector<LandlockPath>& paths, Option
 
     for (auto const& directory : directories) {
         if (!root.has_value() || LexicalPath { directory }.is_child_of(LexicalPath { root->to_byte_string() }))
-            TRY(add_landlock_path_if_exists(paths, directory, LandlockPath::Access::ReadOnly));
+            TRY(add_path_if_exists(paths, directory, PathRule::Access::ReadOnly));
     }
     return {};
 }
@@ -761,6 +764,11 @@ ErrorOr<void> apply_macos_sandbox(SeatbeltProfile const& options)
 
     auto profile_string = profile.to_byte_string();
 
+    // IOSurface loads Launch Services preferences on first use. Do this before sandboxing, since a denied read
+    // makes Launch Services log errors whose formatting produces CoreFoundation warnings about URLs without schemes.
+    if (has_flag(options.system_services, SystemService::IOSurface))
+        Core::IOSurfaceHandle::initialize();
+
     char* errorbuf = nullptr;
 #    pragma clang diagnostic push
 #    pragma clang diagnostic ignored "-Wdeprecated-declarations"
@@ -795,28 +803,21 @@ static ErrorOr<size_t> count_threads()
     return thread_count;
 }
 
-ErrorOr<void> restrict_filesystem_with_landlock(ReadonlySpan<LandlockPath> paths)
+static bool s_signals_stay_within_the_process_tree = false;
+
+bool sandbox_debugging_is_enabled()
 {
-    // Landlock confines only the calling thread and the threads that it starts later. A thread that already runs would
-    // keep full access to the file system.
-    if (TRY(count_threads()) != 1)
-        return Error::from_string_literal("Landlock must be applied before the process starts a second thread");
+    auto const* value = getenv("LADYBIRD_SANDBOX_DEBUG");
+    return value && *value && StringView { value, strlen(value) } != "0"sv;
+}
 
-    // Without Landlock, nothing limits the files a helper can open, so we refuse to go on. Running without it has to
-    // be a choice that the user makes with --disable-sandbox.
-    auto landlock_abi = syscall(__NR_landlock_create_ruleset, nullptr, 0, LANDLOCK_CREATE_RULESET_VERSION);
-    if (landlock_abi < 0 && errno != ENOSYS && errno != EOPNOTSUPP)
-        return Error::from_syscall("landlock_create_ruleset(LANDLOCK_CREATE_RULESET_VERSION)"sv, errno);
-    if (landlock_abi <= 0) {
-        // NB: Only for machines that cannot run Landlock at all, such as our CI runners. The rest of the sandbox still
-        //     applies. On a kernel that has Landlock, this changes nothing.
-        if (auto const* allow = getenv("LADYBIRD_UNSAFE_ALLOW_MISSING_LANDLOCK"); allow && StringView { allow, strlen(allow) } == "1"sv) {
-            warnln("Landlock is not available in this kernel. This helper runs without file system confinement, because LADYBIRD_UNSAFE_ALLOW_MISSING_LANDLOCK is set.");
-            return {};
-        }
-        return Error::from_string_literal("Landlock is not available in this kernel, so the helper cannot be sandboxed (--disable-sandbox runs helpers without a sandbox)");
-    }
+bool signals_stay_within_the_process_tree()
+{
+    return s_signals_stay_within_the_process_tree;
+}
 
+static ErrorOr<void> restrict_filesystem_with_landlock(ReadonlySpan<PathRule> paths, long landlock_abi)
+{
     // Before ABI 3, Landlock does not handle truncation, so a helper can truncate any file that it can open.
     static bool s_warned_about_truncation = false;
     if (landlock_abi < 3 && !s_warned_about_truncation) {
@@ -880,21 +881,21 @@ ErrorOr<void> restrict_filesystem_with_landlock(ReadonlySpan<LandlockPath> paths
 
         landlock_path_beneath_attr path_beneath {};
         switch (landlock_path.access) {
-        case LandlockPath::Access::ReadOnly: {
+        case PathRule::Access::ReadOnly: {
             path_beneath.allowed_access = LANDLOCK_ACCESS_FS_READ_FILE;
 
             if (landlock_path.is_directory)
                 path_beneath.allowed_access |= LANDLOCK_ACCESS_FS_READ_DIR;
             break;
         }
-        case LandlockPath::Access::ReadAndExecute: {
+        case PathRule::Access::ReadAndExecute: {
             path_beneath.allowed_access = LANDLOCK_ACCESS_FS_READ_FILE | LANDLOCK_ACCESS_FS_EXECUTE;
 
             if (landlock_path.is_directory)
                 path_beneath.allowed_access |= LANDLOCK_ACCESS_FS_READ_DIR;
             break;
         }
-        case LandlockPath::Access::ReadWrite: {
+        case PathRule::Access::ReadWrite: {
             path_beneath.allowed_access = LANDLOCK_ACCESS_FS_READ_FILE | LANDLOCK_ACCESS_FS_WRITE_FILE;
 
 #    ifdef LANDLOCK_ACCESS_FS_TRUNCATE
@@ -926,8 +927,27 @@ ErrorOr<void> restrict_filesystem_with_landlock(ReadonlySpan<LandlockPath> paths
 
     if (syscall(__NR_landlock_restrict_self, ruleset_fd, 0) < 0)
         return Error::from_syscall("landlock_restrict_self"sv, errno);
+#    if defined(LANDLOCK_SCOPE_ABSTRACT_UNIX_SOCKET) && defined(LANDLOCK_SCOPE_SIGNAL)
+    s_signals_stay_within_the_process_tree = landlock_abi >= 6;
+#    endif
 
     return {};
+}
+
+ErrorOr<void> restrict_filesystem(ReadonlySpan<PathRule> paths)
+{
+    // Landlock confines only the calling thread and the threads that it starts later, and forking the broker is only
+    // safe with one thread. A thread that already runs would keep full access to the file system.
+    if (TRY(count_threads()) != 1)
+        return Error::from_string_literal("The file system must be restricted before the process starts a second thread");
+
+    // Any failure means we can't have Landlock here: a kernel without it says ENOSYS or EOPNOTSUPP, and a container's
+    // own seccomp filter can say anything.
+    auto landlock_abi = syscall(__NR_landlock_create_ruleset, nullptr, 0, LANDLOCK_CREATE_RULESET_VERSION);
+    if (landlock_abi > 0 && !sandbox_debugging_is_enabled())
+        return restrict_filesystem_with_landlock(paths, landlock_abi);
+
+    return start_file_broker(paths);
 }
 #endif
 

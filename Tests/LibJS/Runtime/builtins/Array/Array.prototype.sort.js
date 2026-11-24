@@ -89,6 +89,36 @@ describe("Array.prototype.sort", () => {
         expect(arr[2].other_property == 2);
     });
 
+    test("sorting a frozen singleton returns the array", () => {
+        const array = Object.freeze([1]);
+        expect(array.sort()).toBe(array);
+        expect(() => array.sort(null)).toThrow(TypeError);
+        expect(() => Object.freeze([1, 2]).sort()).toThrow(TypeError);
+    });
+
+    test("sorting a singleton array-like only reads its length", () => {
+        const accesses = [];
+        const object = new Proxy(
+            { 0: 1, length: 1 },
+            {
+                get(target, property) {
+                    accesses.push(property);
+                    return target[property];
+                },
+                has(target, property) {
+                    accesses.push(property);
+                    return property in target;
+                },
+                set(target, property) {
+                    accesses.push(property);
+                    return false;
+                },
+            }
+        );
+        expect(Array.prototype.sort.call(object)).toBe(object);
+        expect(accesses).toEqual(["length"]);
+    });
+
     test("that it makes no unnecessary calls to compare function", () => {
         expectNoCallCompareFunction = function (a, b) {
             expect().fail();
@@ -171,5 +201,25 @@ describe("Array.prototype.sort", () => {
             }
         );
         Array.prototype.sort.call(obj);
+    });
+
+    test("inconsistent comparators sort the way websites expect", () => {
+        const numbers = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
+        const reversed = numbers.toReversed();
+
+        expect([1, 2].sort(() => 1)).toEqual([1, 2]);
+        expect([1, 2].sort(() => -1)).toEqual([2, 1]);
+        expect(numbers.slice().sort(() => 1)).toEqual(numbers);
+        expect(numbers.slice().sort(() => -1)).toEqual(reversed);
+        expect(numbers.toSorted(() => 1)).toEqual(numbers);
+        expect(numbers.toSorted(() => -1)).toEqual(reversed);
+
+        // A comparator that returns a boolean never reports "less than".
+        expect(reversed.slice().sort((a, b) => a > b)).toEqual(reversed);
+        expect(numbers.slice().sort((a, b) => a < b)).toEqual(numbers);
+
+        // A comparator that only looks at its first argument.
+        expect([1, 2, 3, 4, 5].sort(a => (a === 3 ? -1 : 1))).toEqual([3, 1, 2, 4, 5]);
+        expect([1, 2, 3, 4, 5].sort(a => (a === 3 ? 1 : -1))).toEqual([5, 4, 2, 1, 3]);
     });
 });

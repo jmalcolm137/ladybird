@@ -1,0 +1,7 @@
+seekable ranges: []
+after setting currentTime: seeking true
+after the seek is skipped: currentTime 0
+seekable ranges after appending media: [0-1.999666666]
+seeking event, currentTime 1
+timeupdate event, currentTime 1
+seeked event, currentTime 1

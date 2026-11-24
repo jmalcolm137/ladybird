@@ -4,6 +4,7 @@ set(TEST_SOURCES
     TestADTSDemuxer.cpp
     TestADTSFrameHeader.cpp
     TestADTSReader.cpp
+    TestAV1Decode.cpp
     TestAudioBlockTimingRing.cpp
     TestAudioDiscardIntervals.cpp
     TestAudioMixer.cpp
@@ -44,6 +45,7 @@ set(TEST_SOURCES
     TestVideoFramePool.cpp
     TestVorbisDecode.cpp
     TestVP9Decode.cpp
+    TestWebMByteStreamParser.cpp
     TestWav.cpp
     TestWAVDemuxer.cpp
 )
@@ -61,7 +63,13 @@ if (WIN32)
     )
 endif()
 if (LINUX)
-    list(APPEND TEST_SOURCES TestH264Decode.cpp)
+    list(APPEND TEST_SOURCES
+        TestH264Decode.cpp
+        TestH265Decode.cpp
+    )
+    if (USE_VULKAN_DMABUF_IMAGES)
+        list(APPEND TEST_SOURCES TestFFmpegVulkanDecode.cpp)
+    endif()
 
     # Loads the bundled libavcodec in place of a system one, which needs it to be a shared library.
     find_library(LADYBIRD_BUNDLED_LIBAVCODEC NAMES ${AVCODEC_LIBRARIES} PATHS ${AVCODEC_LIBRARY_DIRS} NO_DEFAULT_PATH REQUIRED)
@@ -72,6 +80,12 @@ endif()
 
 target_sources(TestLibMedia PRIVATE ${TEST_SOURCES})
 target_link_libraries(TestLibMedia PRIVATE LibAudio LibFileSystem LibGfx LibIPC LibMedia LibMediaCodecs LibThreading)
+# The header of FFmpegChannelLayout includes FFmpeg's headers.
+target_link_libraries(TestLibMedia PRIVATE PkgConfig::AVCODEC PkgConfig::AVUTIL)
+
+if ("TestFFmpegVulkanDecode.cpp" IN_LIST TEST_SOURCES)
+    target_link_libraries(TestLibMedia PRIVATE LibPlatformFeatures Vulkan::Vulkan)
+endif()
 
 if ("TestSystemFFmpeg.cpp" IN_LIST TEST_SOURCES)
     set_property(SOURCE TestSystemFFmpeg.cpp APPEND PROPERTY COMPILE_DEFINITIONS LADYBIRD_BUNDLED_LIBAVCODEC_PATH="${LADYBIRD_BUNDLED_LIBAVCODEC}")

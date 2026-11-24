@@ -15,6 +15,8 @@
 #include <LibJS/Runtime/VM.h>
 #include <LibThreading/Thread.h>
 #include <LibWeb/Bindings/MainThreadVM.h>
+#include <LibWeb/Fetch/Fetching/FetchEngine.h>
+#include <LibWeb/HTML/Scripting/Agent.h>
 #include <LibWebCommon/HTML/WorkerAgentTypes.h>
 #include <WebContent/Worker/ConnectionFromClient.h>
 #include <WebContent/Worker/DedicatedWorkerThreadLink.h>
@@ -60,6 +62,13 @@ static intptr_t run_worker_thread(IPC::TransportHandle const& worker_handle, Web
 
     Core::EventLoop event_loop;
     Web::Bindings::initialize_agent(agent_type);
+    auto& agent = Web::HTML::surrounding_agent();
+    agent.fetch_executor = Web::Fetch::Fetching::create_inline_fetch_executor(agent.network_activity_observers);
+    // NB: Below the event loop, the stack of this thread holds only this frame and the thread's entry, whose locals are
+    //     the transport, the event loop, the agent and the connection. None of those is a cell, and whatever cells they
+    //     hold are rooted, so no frame that is still on the stack in the outermost turn holds the only reference to a
+    //     cell. Keep it that way. See initialize_process() in WebContent's main.cpp for the main thread.
+    JS::VM::the().heap().set_outermost_event_loop_turn_holds_no_cells(true);
 
     auto event_loop_reference = Core::EventLoop::current_weak();
     {

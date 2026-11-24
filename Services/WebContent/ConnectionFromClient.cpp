@@ -24,6 +24,7 @@
 #include <LibCore/StatsLog.h>
 #include <LibDevTools/IndexedDBSerialization.h>
 #include <LibGC/Heap.h>
+#include <LibGC/Internals.h>
 #include <LibGfx/Bitmap.h>
 #include <LibGfx/Color.h>
 #include <LibGfx/Font/Font.h>
@@ -32,6 +33,8 @@
 #include <LibIPC/Transport.h>
 #include <LibJS/Runtime/ConsoleObject.h>
 #include <LibJS/Runtime/Date.h>
+#include <LibJS/Runtime/HostObject.h>
+#include <LibJS/Runtime/Object.h>
 #include <LibUnicode/TimeZone.h>
 #include <LibWeb/Bindings/MainThreadVM.h>
 #include <LibWeb/CSS/CustomPropertyData.h>
@@ -75,6 +78,7 @@
 #include <LibWeb/HTML/RemoteNavigable.h>
 #include <LibWeb/HTML/Scripting/Environments.h>
 #include <LibWeb/HTML/Scripting/TemporaryExecutionContext.h>
+#include <LibWeb/HTML/SessionHistoryEntry.h>
 #include <LibWeb/HTML/Storage.h>
 #include <LibWeb/HTML/Window.h>
 #include <LibWeb/HTML/WorkerAgentParent.h>
@@ -147,6 +151,35 @@ void ConnectionFromClient::die()
     Core::Process::terminate_immediately(0);
 }
 
+// What the main thread and each worker thread give up when the process is short of memory.
+static void release_memory_of_this_thread()
+{
+    Web::Fetch::Fetching::clear_http_memory_cache();
+    // NB: This comes last, so that what the steps before it let go of goes back to the system as well.
+    GC::Heap::the().collect_garbage_and_return_memory_to_system();
+}
+
+// The browser asks for this when the process is near its memory limit, or when its tabs were hidden for a while. The
+// process gives up everything it can work without. What it gives up may cost time to make again.
+void ConnectionFromClient::release_memory()
+{
+    // NB: The browser asks for more than one reason, and one release serves all requests that wait for it.
+    static bool is_pending = false;
+    if (is_pending)
+        return;
+    is_pending = true;
+
+    Web::CSS::StyleScope::release_kept_data();
+    Web::CSS::StyleScope::release_shaped_texts();
+
+    WebWorker::post_to_worker_threads(release_memory_of_this_thread);
+    // NB: This is deferred so that garbage collection runs with as little on the stack as possible.
+    Core::deferred_invoke([] {
+        is_pending = false;
+        release_memory_of_this_thread();
+    });
+}
+
 void ConnectionFromClient::set_font_service(IPC::TransportHandle handle, IPC::File catalog, u64 catalog_size, u64 generation)
 {
     auto* font_provider = MUST(Compositing::install_font_service(move(handle), move(catalog), catalog_size, generation));
@@ -170,6 +203,12 @@ void ConnectionFromClient::create_embedded_page(Web::PageId page_id, Vector<Web:
     page.page().set_system_visibility_state(system_visibility_state);
     page.page().create_remote_navigable_graph(move(remote_navigables));
     page.page().begin_hosting(root_navigable_id, initial_history_entry);
+}
+
+void ConnectionFromClient::media_session_action(Web::PageId page_id, Web::Bindings::MediaSessionAction action, Optional<double> seek_offset, Optional<double> seek_time, Optional<bool> fast_seek)
+{
+    if (auto page = this->page(page_id); page.has_value())
+        page->page().handle_media_session_action(action, seek_offset, seek_time, fast_seek);
 }
 
 void ConnectionFromClient::insert_remote_navigable(Web::PageId page_id, Web::HTML::RemoteNavigableDescriptor navigable)
@@ -405,6 +444,16 @@ void ConnectionFromClient::set_window_handle(Web::PageId page_id, String handle)
     }
 }
 
+// A WebDriver command sees what the commands before it did, such as the viewport they set. The sizes that the windows
+// took while a rendering update was in flight become their sizes before the command runs.
+static void take_viewport_sizes_held_for_webdriver_command(PageHost& page_host)
+{
+    page_host.for_each_page([](PageClient& page_client) {
+        if (page_client.page().has_local_traversable())
+            page_client.page().local_traversable()->take_viewport_size_held_for_rendering_update_in_flight();
+    });
+}
+
 void ConnectionFromClient::run_webdriver_command(Web::PageId page_id, u64 command_id, Optional<Web::HTML::CrossProcessId> navigable_id, String name, JsonValue payload, Vector<String> arguments)
 {
     auto page = this->page(page_id);
@@ -414,6 +463,7 @@ void ConnectionFromClient::run_webdriver_command(Web::PageId page_id, u64 comman
         return;
     }
 
+    take_viewport_sizes_held_for_webdriver_command(*m_page_host);
     page->run_webdriver_command(command_id, navigable_id, name, move(payload), move(arguments));
 }
 
@@ -426,6 +476,7 @@ void ConnectionFromClient::run_webdriver_bidi_command(Web::PageId page_id, u64 c
         return;
     }
 
+    take_viewport_sizes_held_for_webdriver_command(*m_page_host);
     WebContent::run_webdriver_bidi_command(*page, command_id, navigable_id, method, move(params));
 }
 
@@ -491,7 +542,7 @@ void ConnectionFromClient::connect_to_compositor_process(IPC::TransportHandle ha
     };
 
     m_compositor_connection->attach_render_clock(move(render_clock_handle));
-    m_compositor_connection->hand_frame_sink_to_paint_thread();
+    m_compositor_connection->hand_poster_to_paint_thread();
 }
 
 void ConnectionFromClient::compositor_process_reconnected()
@@ -1085,8 +1136,104 @@ void ConnectionFromClient::enqueue_input_event(Web::QueuedInputEvent event)
         Web::HTML::main_thread_event_loop().queue_task_to_process_input_events();
 }
 
+// Whether the destroyed document at the end of the path is reachable only because script holds objects of its realm, as
+// of a removed iframe whose built-ins the page kept. That is when the first cell of the document's realm on the path is
+// held for script: by a JS object, or by a callback that the platform keeps for script, such as an event listener,
+// maybe through other cells of the JS runtime, such as the environment of a closure. Any other cell holding it keeps the
+// document alive by itself.
+// NB: Only the shortest path is looked at, so a document that a leak keeps alive too can be put down to script. Cells
+//     of the Wasm runtime count as cells of the engine, as their heap blocks do not tell them apart.
+static bool is_held_by_script(GC::Heap::RetainingPath const& path)
+{
+    auto& document = static_cast<Web::DOM::Document&>(*path.steps.last().cell);
+    // NB: A window that another document reuses is that document's, as is its realm.
+    auto window = document.window();
+    if (window && &window->associated_document() != &document)
+        window = nullptr;
+    JS::Realm const* realm = window ? &window->principal_realm() : nullptr;
+
+    auto as_object = [](GC::Cell const& cell) -> JS::Object const* {
+        if (cell.cell_kind() != GC::CellKind::Object)
+            return nullptr;
+        return GC::static_cell_cast<JS::Object const>(&cell);
+    };
+
+    auto is_of_document_realm = [&](GC::Cell const& cell) {
+        if (&cell == &document)
+            return true;
+        if (!window)
+            return false;
+        if (&cell == window.ptr() || &cell == GC::as_cell(realm))
+            return true;
+        auto const* object = as_object(cell);
+        return object && &Web::HTML::relevant_realm(*object) == realm;
+    };
+
+    auto entry = path.steps.find_first_index_if([&](auto const& step) { return is_of_document_realm(*step.cell); });
+    VERIFY(entry.has_value());
+    for (size_t i = *entry; i > 0; --i) {
+        auto const& holder = *path.steps[i - 1].cell;
+        // NB: As for documents, the class the heap block records tells a callback apart without a cast.
+        if (as_object(holder) || GC::class_name_of(holder) == "CallbackType"sv)
+            return true;
+        // NB: The heap block of a cell that is not a C++ object records the type its foreign implementation gave it.
+        if (!GC::HeapBlockBase::from_cell(&holder)->foreign_type())
+            return false;
+        // NB: The wrapper of a platform object that is implemented in Rust holds the object as its host data.
+        if (i >= 2) {
+            auto const* wrapper = as_object(*path.steps[i - 2].cell);
+            if (wrapper && JS::host_data_of(*wrapper).ptr() == &holder)
+                return false;
+        }
+    }
+    return false;
+}
+
+namespace {
+
+// Paths to destroyed documents, grouped by the root and the classes along them.
+struct LeakedDocumentPaths {
+    void add(GC::Heap::RetainingPath const& path)
+    {
+        StringBuilder builder;
+        builder.append(GC::Heap::describe_root(path.root));
+        for (size_t i = 0; i < path.steps.size(); ++i) {
+            builder.append(i == 0 ? ": "sv : " -> "sv);
+            builder.append(path.steps[i].class_name);
+        }
+        auto signature = builder.to_string_without_validation();
+        auto& count = counts.ensure(signature, [&] -> size_t {
+            order.append(signature);
+            return 0;
+        });
+        ++count;
+        ++documents;
+    }
+
+    JsonArray print_and_serialize()
+    {
+        quick_sort(order, [&](auto const& a, auto const& b) { return counts.get(a).value() > counts.get(b).value(); });
+        JsonArray groups;
+        for (auto const& signature : order) {
+            auto count = counts.get(signature).value();
+            dbgln("  {}x {}", count, signature);
+            JsonObject group;
+            group.set("count"sv, count);
+            group.set("path"sv, signature);
+            groups.must_append(move(group));
+        }
+        return groups;
+    }
+
+    size_t documents { 0 };
+    HashMap<String, size_t> counts;
+    Vector<String> order;
+};
+
+}
+
 // Prints the shortest path from a root to each destroyed document that is still reachable, grouped by the classes along
-// it. Unless script still holds objects of the document, as of a removed iframe, whatever keeps it alive leaks it.
+// it. Whatever keeps such a document alive leaks it, unless script holds objects of its realm. Those are listed apart.
 static void report_leaked_documents()
 {
     static constexpr size_t max_documents = 1000;
@@ -1098,40 +1245,30 @@ static void report_leaked_documents()
     },
         max_documents);
 
-    HashMap<String, size_t> counts;
-    Vector<String> order;
+    LeakedDocumentPaths leaked;
+    LeakedDocumentPaths held_by_script;
     for (auto const& path : paths) {
-        StringBuilder builder;
-        builder.append(GC::Heap::describe_root(path.root));
-        for (size_t i = 0; i < path.steps.size(); ++i) {
-            auto const& step = path.steps[i];
-            builder.append(i == 0 ? ": "sv : " -> "sv);
-            builder.append(step.class_name);
-        }
-        auto signature = builder.to_string_without_validation();
-        auto& count = counts.ensure(signature, [&] -> size_t {
-            order.append(signature);
-            return 0;
-        });
-        ++count;
+        if (is_held_by_script(path))
+            held_by_script.add(path);
+        else
+            leaked.add(path);
     }
-    quick_sort(order, [&](auto const& a, auto const& b) { return counts.get(a).value() > counts.get(b).value(); });
 
-    dbgln("Leaked documents: {} destroyed documents are reachable{}", paths.size(), paths.size() >= max_documents ? " (or more)"sv : ""sv);
-    JsonArray groups;
-    for (auto const& signature : order) {
-        auto count = counts.get(signature).value();
-        dbgln("  {}x {}", count, signature);
-        JsonObject group;
-        group.set("count"sv, count);
-        group.set("path"sv, signature);
-        groups.must_append(move(group));
-    }
+    auto or_more = paths.size() >= max_documents ? " (or more)"sv : ""sv;
+    dbgln("Leaked documents: {} destroyed documents are reachable{}", leaked.documents, or_more);
+    auto leaked_groups = leaked.print_and_serialize();
+    if (held_by_script.documents > 0)
+        dbgln("Held by script: {} destroyed documents are reachable through objects of their realms that script holds{}", held_by_script.documents, or_more);
+    auto held_by_script_groups = held_by_script.print_and_serialize();
 
     if (auto* log = Core::StatsLog::the()) {
         JsonObject data;
-        data.set("documents"sv, paths.size());
-        data.set("paths"sv, move(groups));
+        data.set("documents"sv, leaked.documents);
+        // NB: The search stops at max_documents destroyed documents, held by script or not.
+        data.set("truncated"sv, paths.size() >= max_documents);
+        data.set("paths"sv, move(leaked_groups));
+        data.set("documents_held_by_script"sv, held_by_script.documents);
+        data.set("paths_held_by_script"sv, move(held_by_script_groups));
         log->event("leaked_documents"sv, move(data));
     }
 }
@@ -1149,7 +1286,7 @@ void ConnectionFromClient::debug_request(Web::PageId page_id, ByteString request
 
     if (request == "dump-display-list") {
         if (auto doc = page->page().local_traversable()->active_document()) {
-            auto display_list_dump = doc->dump_display_list();
+            auto display_list_dump = doc->dump_display_list({ .owners = true, .text = true, .fonts = true, .record_ids = true, .chunks = true, .jsonl = argument == "jsonl" });
             dbgln("{}", display_list_dump.to_utf8());
         }
         return;
@@ -1176,7 +1313,6 @@ void ConnectionFromClient::debug_request(Web::PageId page_id, ByteString request
             Web::Layout::ForcedReadScope read { *doc };
             if (doc->layout_node(read)) {
                 VERIFY(doc->has_committed_viewport_box());
-                doc->update_paint_and_hit_testing_properties_if_needed();
                 StringBuilder builder;
                 Web::Painting::dump_stacking_context_tree(read, builder, *doc);
                 dbgln("{}", builder.string_view());
@@ -2421,6 +2557,24 @@ void ConnectionFromClient::set_has_devtools_client(Web::PageId page_id, bool has
         page->set_has_devtools_client(has_devtools_client);
 }
 
+// The Hub holds the session history, but only learns where the user is in a document once they leave it. Each navigable
+// of the page saves what it would save then, and the Hub hears when all of them have.
+void ConnectionFromClient::save_session_history_entry_states(Web::PageId page_id)
+{
+    auto page = this->page(page_id);
+    if (!page.has_value())
+        return;
+    for (auto const& navigable : page->page().hosted_navigables()) {
+        navigable->save_persisted_state_to_active_session_history_entry();
+        auto entry = navigable->active_session_history_entry();
+        if (!entry)
+            continue;
+        if (auto persisted_state = Web::HTML::create_session_history_entry_persisted_state(*entry); persisted_state.has_value())
+            async_did_save_session_history_entry_state(page_id, navigable->id(), persisted_state.release_value());
+    }
+    async_did_save_session_history_entry_states(page_id);
+}
+
 void ConnectionFromClient::start_sending_console_output(Web::PageId page_id, bool messages, bool errors)
 {
     if (auto page = this->page(page_id); page.has_value())
@@ -2741,7 +2895,6 @@ static void append_stacking_context_tree(Web::Page& page, StringBuilder& builder
         return;
     }
 
-    document->update_paint_and_hit_testing_properties_if_needed();
     Web::Painting::dump_stacking_context_tree(read, builder, *document);
 }
 
@@ -2753,13 +2906,24 @@ static void append_display_list(Web::Page& page, StringBuilder& builder)
         return;
     }
 
-    builder.append(document->dump_display_list().to_utf8());
+    builder.append(document->dump_display_list({}).to_utf8());
 }
 
 static void append_gc_graph(StringBuilder& builder)
 {
     auto gc_graph = Web::Bindings::main_thread_vm().heap().dump_graph();
     gc_graph.serialize(builder);
+}
+
+void ConnectionFromClient::describe_owners_of_visual_context_nodes(Web::PageId page_id, Vector<u32> spatial_node_indices, Vector<u32> effect_node_indices)
+{
+    Web::Painting::OwnersOfVisualContextNodes owners;
+    auto page = this->page(page_id);
+    if (auto document = page.has_value() && page->page().has_local_traversable() ? page->page().local_traversable()->active_document() : nullptr)
+        owners = Web::Painting::describe_owners_of_visual_context_nodes(*document, spatial_node_indices, effect_node_indices);
+    else
+        owners.owners.resize(spatial_node_indices.size() + effect_node_indices.size());
+    async_did_describe_owners_of_visual_context_nodes(page_id, owners.structural_epoch, move(spatial_node_indices), move(effect_node_indices), move(owners.owners));
 }
 
 void ConnectionFromClient::request_internal_page_info(Web::PageId page_id, WebView::PageInfoType type)
@@ -3319,9 +3483,15 @@ void ConnectionFromClient::set_force_dark_settings(Web::PageId page_id, bool ena
         page->page().local_traversable()->set_force_dark_settings(enabled, move(per_host));
 }
 
-void ConnectionFromClient::set_autoplay_settings(Web::PageId, Web::HTML::AutoplayPolicy policy, Vector<Utf16String> allowlist)
+void ConnectionFromClient::set_force_dark_for_local_roots(Web::PageId page_id, bool enabled)
 {
-    Web::HTML::AutoplaySettings::the().set_policy(policy, allowlist);
+    if (auto page = this->page(page_id); page.has_value() && !page->page().has_local_traversable())
+        page->page().set_force_dark_for_local_roots(enabled);
+}
+
+void ConnectionFromClient::set_autoplay_settings(Web::PageId, Web::HTML::AutoplayPolicy policy, OrderedHashMap<String, Web::HTML::AutoplayPolicy> site_policies)
+{
+    Web::HTML::AutoplaySettings::the().set_policy(policy, site_policies);
 }
 
 void ConnectionFromClient::set_preferred_color_scheme(Web::PageId page_id, Web::CSS::PreferredColorScheme color_scheme)
@@ -3448,6 +3618,12 @@ void ConnectionFromClient::set_maximum_frames_per_second(Web::PageId page_id, do
         page->set_maximum_frames_per_second(maximum_frames_per_second);
 }
 
+void ConnectionFromClient::set_screen_shows_high_dynamic_range(Web::PageId page_id, bool screen_shows_high_dynamic_range)
+{
+    if (auto page = this->page(page_id); page.has_value())
+        page->set_screen_shows_high_dynamic_range(screen_shows_high_dynamic_range);
+}
+
 void ConnectionFromClient::set_frame_rate_capped(Web::PageId page_id, bool capped)
 {
     if (auto page = this->page(page_id); page.has_value())
@@ -3490,6 +3666,16 @@ void ConnectionFromClient::request_file(Web::PageId page_id, Web::FileRequest fi
     m_requested_files.set(id, move(file_request));
 
     async_did_request_file(page_id, path, id);
+}
+
+void ConnectionFromClient::request_file_for_webdriver(Web::PageId page_id, u64 command_id, Web::FileRequest file_request)
+{
+    i32 const id = last_id++;
+
+    auto path = file_request.path();
+    m_requested_files.set(id, move(file_request));
+
+    async_did_request_file_for_webdriver(page_id, command_id, path, id);
 }
 
 void ConnectionFromClient::blob_url_entry_removed(Utf16String url)
@@ -3835,7 +4021,7 @@ void ConnectionFromClient::cookies_changed(Web::PageId page_id, Vector<HTTP::Coo
         if (!window)
             return;
 
-        window->cookie_store()->process_cookie_changes(Web::HTML::relevant_global_object(*window), move(cookies));
+        window->cookie_store()->process_cookie_changes(cookies);
     }
 }
 

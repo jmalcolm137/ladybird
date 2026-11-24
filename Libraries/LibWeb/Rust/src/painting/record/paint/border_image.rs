@@ -8,7 +8,7 @@ use crate::css::style_value::BorderImageSlicePayload;
 use crate::painting::paint_read::PaintRead;
 use crate::painting::record::trace::Observer;
 
-use crate::css::computed_value_views::LengthPercentageRef;
+use crate::css::computed_value_views::{ComputedValuesView, LengthPercentageRef};
 use crate::css::css_enums::border_image_repeat;
 use crate::css::css_pixels::{CssPixelFraction, CssPixels};
 use crate::css::css_pixels::{CssPixelRect, CssPixelSize};
@@ -21,11 +21,14 @@ use crate::painting::image_content::ImageContent;
 use crate::painting::paintable_data::{PIECE_EDGE_BOTTOM, PIECE_EDGE_LEFT, PIECE_EDGE_RIGHT, PIECE_EDGE_TOP};
 use crate::painting::record::PaintRecorder;
 use crate::painting::record::paint::background::to_gfx_scaling_mode;
+use crate::painting::record::paint::gradient_resolution::{
+    ResolvedGradientPaint, record_resolved_gradient_fill, resolve_gradient_paint,
+};
 use crate::painting::record::vector_images::{
     VectorImageRenderRequest, VectorImageSource, vector_image_render_geometry,
 };
 use crate::painting::style_queries;
-use libgfx_rust::{CompositingAndBlendingOperator, FloatRect, FloatSize, IntRect, IntSize};
+use libgfx_rust::{AffineTransform, CompositingAndBlendingOperator, FloatRect, FloatSize, IntRect, IntSize};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Track {
@@ -242,8 +245,8 @@ fn paint_border_image_slice<O: Observer>(
     );
 }
 
-/// The most device pixels the tile of one piece of a vector border image is rendered into.
-const MAXIMUM_VECTOR_TILE_AREA: f32 = 2048.0 * 2048.0;
+/// The most device pixels used to rasterize one piece of a generated border image.
+const MAXIMUM_BORDER_IMAGE_TILE_AREA: f32 = 2048.0 * 2048.0;
 
 /// A vector border image, and the size it's sliced at.
 struct VectorBorderImage {
@@ -277,7 +280,7 @@ fn paint_vector_border_image_slice<O: Observer>(
     //     along one axis is rendered at a lower scale than that, so that its tile stays a reasonable size.
     let scale = (tiling.first_tile.width / source_rect.width)
         .max(tiling.first_tile.height / source_rect.height)
-        .min((MAXIMUM_VECTOR_TILE_AREA / (source_rect.width * source_rect.height)).sqrt());
+        .min((MAXIMUM_BORDER_IMAGE_TILE_AREA / (source_rect.width * source_rect.height)).sqrt());
     let geometry = vector_image_render_geometry(
         FloatRect::new(0.0, 0.0, image.width, image.height),
         FloatSize {
@@ -294,19 +297,18 @@ fn paint_vector_border_image_slice<O: Observer>(
         1.max((source_rect.width * rendered_scale.width).round() as i32),
         1.max((source_rect.height * rendered_scale.height).round() as i32),
     );
-    let display_list_id = recorder
-        .resources
-        .vector_image_placeholder(VectorImageRenderRequest::new(
-            image.source,
-            geometry.css_width,
-            geometry.css_height,
-            geometry.raster_scale,
-            image.content_identity,
-            recorder.vector_image_color_scheme(image.source.owner()),
-        ));
+    let display_list_id = recorder.vector_image_placeholder(VectorImageRenderRequest::new(
+        image.source,
+        geometry.css_width,
+        geometry.css_height,
+        geometry.raster_scale,
+        image.content_identity,
+        recorder.vector_image_color_scheme(image.source.owner()),
+        recorder.vector_image_force_dark(),
+    ));
     let group = recorder.recorder.begin_repeated_tile();
     // The tile holds the whole image, offset so that the slice fills it, and clips away the rest.
-    recorder.recorder.paint_nested_display_list(
+    recorder.recorder.paint_vector_image_records(
         display_list_id,
         FloatRect::new(
             -source_rect.x * rendered_scale.width,
@@ -342,6 +344,83 @@ fn paint_vector_border_image_slice<O: Observer>(
 enum BorderImageContent {
     Raster(ImageFrameResourceId),
     Vector(VectorBorderImage),
+    Gradient(ResolvedGradientPaint),
+}
+
+#[allow(clippy::too_many_arguments)]
+fn paint_gradient_border_image_slice<O: Observer>(
+    recorder: &mut PaintRecorder<'_, O>,
+    gradient: &ResolvedGradientPaint,
+    source_size: CssPixelSize,
+    source_rect: FloatRect,
+    dest_rect: IntRect,
+    device_tile_size: FloatSize,
+    image_rendering: u8,
+    repeat_x: u8,
+    repeat_y: u8,
+) {
+    if source_rect.is_empty() {
+        return;
+    }
+    let Some(tiling) = slice_tiling(dest_rect, device_tile_size, repeat_x, repeat_y) else {
+        return;
+    };
+    let image_size = recorder.converter.rounded_device_size(source_size);
+    if image_size.width <= 0 || image_size.height <= 0 {
+        return;
+    }
+    let tile = tiling.first_tile;
+    let scale = (MAXIMUM_BORDER_IMAGE_TILE_AREA / (tile.width * tile.height))
+        .sqrt()
+        .min(1.0)
+        .min(16384.0 / tile.width)
+        .min(16384.0 / tile.height);
+    let tile_size = IntSize {
+        width: (tile.width * scale).ceil().max(1.0) as i32,
+        height: (tile.height * scale).ceil().max(1.0) as i32,
+    };
+    let source_scale_x = image_size.width as f32 / source_size.width.to_float();
+    let source_scale_y = image_size.height as f32 / source_size.height.to_float();
+    let scale_x = tile_size.width as f32 / (source_rect.width * source_scale_x);
+    let scale_y = tile_size.height as f32 / (source_rect.height * source_scale_y);
+    let transform = AffineTransform::new(
+        scale_x,
+        0.0,
+        0.0,
+        scale_y,
+        -source_rect.x * source_scale_x * scale_x,
+        -source_rect.y * source_scale_y * scale_y,
+    );
+    let group = recorder.recorder.begin_repeated_tile();
+    let previous_transform = recorder.recorder.set_ambient_inline_transform(Some(transform));
+    // Resolve the gradient for the whole image, then clip and stretch its slice into the tile. Resolving it at the
+    // tile's size would move its stops and change radial and conic geometry when the slice stretches unevenly.
+    record_resolved_gradient_fill(
+        &mut recorder.recorder,
+        recorder.converter,
+        gradient,
+        FloatRect::new(0.0, 0.0, image_size.width as f32, image_size.height as f32),
+        CompositingAndBlendingOperator::Normal,
+        ForceDarkRole::Border,
+    );
+    recorder.recorder.set_ambient_inline_transform(previous_transform);
+    recorder.recorder.finish_repeated_tile(
+        group,
+        tiling.first_tile,
+        dest_rect,
+        tile_size,
+        tiling.step,
+        to_gfx_scaling_mode(
+            image_rendering,
+            (tile_size.width, tile_size.height),
+            tile_size_for_scaling(&tiling),
+        ),
+        CompositingAndBlendingOperator::Normal,
+        Repeat {
+            x: tiling.count_x != Some(1),
+            y: tiling.count_y != Some(1),
+        },
+    );
 }
 
 fn component_items(value: &StyleValueData) -> Vec<&StyleValueData> {
@@ -352,10 +431,11 @@ fn component_items(value: &StyleValueData) -> Vec<&StyleValueData> {
 }
 
 // https://drafts.csswg.org/css-backgrounds-3/#border-image-slice
-fn resolve_slice_px(value: &StyleValueData, reference_length: CssPixels) -> CssPixels {
+fn resolve_slice_px(value: &StyleValueData, reference_length: CssPixels, number_scale: f64) -> CssPixels {
+    // Computed values larger than the size of the image are interpreted as 100%.
     match value {
-        StyleValueData::Number { value } => CssPixels::nearest_value_for(*value),
-        StyleValueData::Integer { value } => CssPixels::nearest_value_for(*value as f64),
+        StyleValueData::Number { value } => CssPixels::nearest_value_for(*value * number_scale),
+        StyleValueData::Integer { value } => CssPixels::nearest_value_for(*value as f64 * number_scale),
         StyleValueData::Percentage { value } => {
             CssPixels::nearest_value_for(reference_length.to_double() * (*value * 0.01))
         }
@@ -365,12 +445,14 @@ fn resolve_slice_px(value: &StyleValueData, reference_length: CssPixels) -> CssP
             } else {
                 CssPixels::nearest_value_for(
                     crate::css::calc::resolve_calculated_number_without_context(value)
-                        .expect("computed border-image-slice calc resolves to a number"),
+                        .expect("computed border-image-slice calc resolves to a number")
+                        * number_scale,
                 )
             }
         }
         _ => unreachable!("computed border-image-slice holds an unknown value"),
     }
+    .min(reference_length)
 }
 
 fn resolve_outset_px(value: &StyleValueData, border_width: CssPixels) -> CssPixels {
@@ -433,21 +515,36 @@ fn sides_present(present_edges: u8) -> [bool; 4] {
     [PIECE_EDGE_TOP, PIECE_EDGE_RIGHT, PIECE_EDGE_BOTTOM, PIECE_EDGE_LEFT].map(|edge| present_edges & edge != 0)
 }
 
+pub(crate) fn paints_border_image(style: ComputedValuesView<'_>) -> bool {
+    style_queries::handle_value(&style.border().border_image_source).is_some_and(|source| source.is_image())
+}
+
+pub(crate) fn border_image_outsets(
+    style: ComputedValuesView<'_>,
+    border_widths: [CssPixels; 4],
+    present_edges: u8,
+) -> [CssPixels; 4] {
+    let outset_value = style_queries::handle_value(&style.border().border_image_outset)
+        .expect("computed border-image-outset lost its style value");
+    let outset_items = component_items(outset_value);
+    let side_is_present = sides_present(present_edges);
+    std::array::from_fn(|side| {
+        if side_is_present[side] {
+            resolve_outset_px(outset_items[side % outset_items.len()], border_widths[side])
+        } else {
+            CssPixels::default()
+        }
+    })
+}
+
 // https://drafts.csswg.org/css-backgrounds-3/#border-image-area
 fn border_image_area(
-    outset_items: &[&StyleValueData],
+    style: ComputedValuesView<'_>,
     border_box_rect: CssPixelRect,
     border_width: [CssPixels; 4],
     present_edges: u8,
 ) -> CssPixelRect {
-    let side_is_present = sides_present(present_edges);
-    let resolved_outset: [CssPixels; 4] = std::array::from_fn(|side| {
-        if side_is_present[side] {
-            resolve_outset_px(outset_items[side % outset_items.len()], border_width[side])
-        } else {
-            CssPixels::default()
-        }
-    });
+    let resolved_outset = border_image_outsets(style, border_width, present_edges);
     let mut border_image_rect = border_box_rect;
     border_image_rect.inflate(
         resolved_outset[0],
@@ -465,23 +562,19 @@ fn resolve_border_image_geometry(
     border_image_rect: CssPixelRect,
     border_width: [CssPixels; 4],
     present_edges: u8,
+    number_scale: f64,
 ) -> ResolvedBorderImageGeometry {
     let side_is_present = sides_present(present_edges);
     let source_width = source_size.width;
     let source_height = source_size.height;
 
     let [slice_top, slice_right, slice_bottom, slice_left] = slice_values;
-    let mut source_slices = [
-        resolve_slice_px(slice_top, source_height),
-        resolve_slice_px(slice_right, source_width),
-        resolve_slice_px(slice_bottom, source_height),
-        resolve_slice_px(slice_left, source_width),
+    let source_slices = [
+        resolve_slice_px(slice_top, source_height, number_scale),
+        resolve_slice_px(slice_right, source_width, number_scale),
+        resolve_slice_px(slice_bottom, source_height, number_scale),
+        resolve_slice_px(slice_left, source_width, number_scale),
     ];
-    {
-        let [top, right, bottom, left] = &mut source_slices;
-        shrink_opposite_sides_to_fit(left, right, source_width);
-        shrink_opposite_sides_to_fit(top, bottom, source_height);
-    }
 
     // https://drafts.csswg.org/css-backgrounds-3/#border-image-process
     let mut widths: [CssPixels; 4] = std::array::from_fn(|side| {
@@ -542,18 +635,27 @@ pub(crate) fn paint_border_image<O: Observer>(
     let Some(source) = style_queries::handle_value(&border.border_image_source) else {
         return false;
     };
-    // FIXME: Support all abstract image sources here. NodeWithStyle loads and observes gradients and
-    // image-set(), but this painting path currently only handles raster and vector images.
-    if !matches!(source, StyleValueData::Image { .. }) {
-        return false;
-    }
     let image_rendering = style.image_rendering();
-    let Some(facts) = recorder
+    let facts = recorder
         .source
-        .layer_image_paint_facts(paintable, FfiLayerImageList::BorderImageSource, 0)
-    else {
-        return false;
+        .layer_image_paint_facts(paintable, FfiLayerImageList::BorderImageSource, 0);
+    let source = if let StyleValueData::ImageSet(payload) = source {
+        let Some(index) = facts.as_ref().and_then(|facts| facts.image_set_selected_option_index) else {
+            return false;
+        };
+        let Some(option) = payload.options.as_slice().get(index as usize) else {
+            return false;
+        };
+        option.values()[0].data()
+    } else {
+        source
     };
+    let is_gradient = matches!(
+        source,
+        StyleValueData::LinearGradient { .. }
+            | StyleValueData::RadialGradient { .. }
+            | StyleValueData::ConicGradient { .. }
+    );
 
     let slice_value = style_queries::handle_value(&border.border_image_slice)
         .expect("computed border-image-slice lost its style value");
@@ -577,8 +679,6 @@ pub(crate) fn paint_border_image<O: Observer>(
     };
     let width_value = style_queries::handle_value(&border.border_image_width)
         .expect("computed border-image-width lost its style value");
-    let outset_value = style_queries::handle_value(&border.border_image_outset)
-        .expect("computed border-image-outset lost its style value");
     let repeat_value = style_queries::handle_value(&border.border_image_repeat)
         .expect("computed border-image-repeat lost its style value");
     let repeat_items = component_items(repeat_value);
@@ -591,49 +691,66 @@ pub(crate) fn paint_border_image<O: Observer>(
     let repeat_x = repeat_keyword(repeat_items[0]);
     let repeat_y = repeat_keyword(repeat_items[1 % repeat_items.len()]);
 
-    let border_image_rect = border_image_area(
-        &component_items(outset_value),
-        border_box_rect,
-        css_border_widths,
-        present_edges,
-    );
-    let (content, source_size) = match facts.content {
-        ImageContent::Raster(Some(frame)) => (
-            BorderImageContent::Raster(recorder.register_image_frame(&frame)),
-            CssPixelSize::new(
-                CssPixels::from_integer(i64::from(frame.width())),
-                CssPixels::from_integer(i64::from(frame.height())),
-            ),
-        ),
-        ImageContent::Vector {
-            content_identity,
-            has_active_view_box,
-        } => {
-            // https://drafts.csswg.org/css-backgrounds-3/#border-image-source
-            // An image without a natural size is sized to the border image area.
-            let size = CssPixelSize::new(
-                facts.natural.width.unwrap_or(border_image_rect.width),
-                facts.natural.height.unwrap_or(border_image_rect.height),
-            );
-            if size.width <= CssPixels::default() || size.height <= CssPixels::default() {
-                return false;
-            }
-            (
-                BorderImageContent::Vector(VectorBorderImage {
-                    source: VectorImageSource::Layer {
-                        owner: paintable,
-                        list: FfiLayerImageList::BorderImageSource,
-                        computed_index: 0,
-                    },
-                    content_identity,
-                    has_active_view_box,
-                    width: size.width.to_float(),
-                    height: size.height.to_float(),
-                }),
-                size,
-            )
+    let border_image_rect = border_image_area(style, border_box_rect, css_border_widths, present_edges);
+    let (content, source_size) = if is_gradient {
+        // https://drafts.csswg.org/css-backgrounds-3/#border-image-slice
+        // Gradients have no natural size, so their concrete size is the border image area.
+        let size = CssPixelSize::new(border_image_rect.width, border_image_rect.height);
+        if size.width <= CssPixels::default() || size.height <= CssPixels::default() {
+            return false;
         }
-        ImageContent::None | ImageContent::Raster(None) => return false,
+        (
+            BorderImageContent::Gradient(resolve_gradient_paint(style, source, size)),
+            size,
+        )
+    } else {
+        let Some(facts) = facts else {
+            return false;
+        };
+        match facts.content {
+            ImageContent::Raster(Some(frame)) => (
+                BorderImageContent::Raster(recorder.register_image_frame(&frame)),
+                CssPixelSize::new(
+                    CssPixels::from_integer(i64::from(frame.width())),
+                    CssPixels::from_integer(i64::from(frame.height())),
+                ),
+            ),
+            ImageContent::Vector {
+                content_identity,
+                has_active_view_box,
+            } => {
+                // https://drafts.csswg.org/css-backgrounds-3/#border-image-source
+                // An image without a natural size is sized to the border image area.
+                let size = CssPixelSize::new(
+                    facts.natural.width.unwrap_or(border_image_rect.width),
+                    facts.natural.height.unwrap_or(border_image_rect.height),
+                );
+                if size.width <= CssPixels::default() || size.height <= CssPixels::default() {
+                    return false;
+                }
+                (
+                    BorderImageContent::Vector(VectorBorderImage {
+                        source: VectorImageSource::Layer {
+                            owner: paintable,
+                            list: FfiLayerImageList::BorderImageSource,
+                            computed_index: 0,
+                        },
+                        content_identity,
+                        has_active_view_box,
+                        width: size.width.to_float(),
+                        height: size.height.to_float(),
+                    }),
+                    size,
+                )
+            }
+            ImageContent::None | ImageContent::Raster(None) => return false,
+        }
+    };
+    // Numeric gradient slices use CSS coordinates; the generated image and percentage slices already include zoom.
+    let number_scale = if is_gradient {
+        f64::from(style.effective_zoom())
+    } else {
+        1.0
     };
     let geometry = resolve_border_image_geometry(
         slice_values,
@@ -642,6 +759,7 @@ pub(crate) fn paint_border_image<O: Observer>(
         border_image_rect,
         css_border_widths,
         present_edges,
+        number_scale,
     );
     let source_columns = geometry.source_columns;
     let source_rows = geometry.source_rows;
@@ -718,6 +836,17 @@ pub(crate) fn paint_border_image<O: Observer>(
                 BorderImageContent::Vector(image) => paint_vector_border_image_slice(
                     recorder,
                     image,
+                    source_rect,
+                    destination_device_rect,
+                    tile_device_size,
+                    image_rendering,
+                    horizontal_repeat,
+                    vertical_repeat,
+                ),
+                BorderImageContent::Gradient(gradient) => paint_gradient_border_image_slice(
+                    recorder,
+                    gradient,
+                    source_size,
                     source_rect,
                     destination_device_rect,
                     tile_device_size,

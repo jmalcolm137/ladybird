@@ -4,69 +4,39 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-#include <AK/Assertions.h>
 #include <AK/ByteString.h>
-#include <AK/Mutex.h>
 #include <AK/Optional.h>
 #include <LibCore/MachPort.h>
-#include <LibCore/System.h>
-#include <LibIPC/MachBootstrapMessages.h>
+#include <LibIPC/RustFFI.h>
 #include <LibIPC/TransportBootstrapMach.h>
-#include <LibIPC/TransportMachPort.h>
-
-#include <mach/mach.h>
 
 namespace IPC {
 
-ErrorOr<TransportBootstrapMachPorts> bootstrap_transport_from_server_port(Core::MachPort const& server_port)
+static TransportBootstrapMachPorts adopt_transport_ports(u32 receive_right, u32 send_right)
 {
-    auto reply_port = TRY(Core::MachPort::create_with_right(Core::MachPort::PortRight::Receive));
-
-    // NB: Send only the task name port. It is enough for task_info() statistics, while the task control port from
-    //     mach_task_self() would give the server full control over this process, including its memory.
-    mach_port_t raw_task_name_port = MACH_PORT_NULL;
-    auto const name_port_result = task_get_special_port(mach_task_self(), TASK_NAME_PORT, &raw_task_name_port);
-    if (name_port_result != KERN_SUCCESS)
-        return Core::mach_error_to_error(name_port_result);
-    auto task_name_port = Core::MachPort::adopt_right(raw_task_name_port, Core::MachPort::PortRight::Send);
-
-    MessageWithSelfTaskNamePort message {};
-    message.header.msgh_bits = MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, MACH_MSG_TYPE_MAKE_SEND_ONCE) | MACH_MSGH_BITS_COMPLEX;
-    message.header.msgh_size = sizeof(message);
-    message.header.msgh_remote_port = server_port.port();
-    message.header.msgh_local_port = reply_port.port();
-    message.header.msgh_id = SELF_TASK_NAME_PORT_MESSAGE_ID;
-    message.body.msgh_descriptor_count = 1;
-    message.port_descriptor.name = task_name_port.port();
-    message.port_descriptor.disposition = MACH_MSG_TYPE_COPY_SEND;
-    message.port_descriptor.type = MACH_MSG_PORT_DESCRIPTOR;
-
-    mach_msg_timeout_t const send_timeout = 100;
-    auto const send_result = mach_msg(&message.header, MACH_SEND_MSG | MACH_SEND_TIMEOUT, message.header.msgh_size, 0, MACH_PORT_NULL, send_timeout, MACH_PORT_NULL);
-    if (send_result != KERN_SUCCESS)
-        return Core::mach_error_to_error(send_result);
-
-    ReceivedIPCChannelPortsMessage reply {};
-    mach_msg_timeout_t const reply_timeout = 5000;
-    auto const recv_result = mach_msg(&reply.header, MACH_RCV_MSG | MACH_RCV_TIMEOUT, 0, sizeof(reply),
-        reply_port.port(), reply_timeout, MACH_PORT_NULL);
-    if (recv_result != KERN_SUCCESS)
-        return Core::mach_error_to_error(recv_result);
-
-    if (reply.header.msgh_id == MACH_NOTIFY_SEND_ONCE)
-        return Error::from_string_literal("Mach bootstrap server closed before replying");
-
-    VERIFY(reply.header.msgh_id == IPC_CHANNEL_PORTS_MESSAGE_ID);
-    VERIFY(reply.body.msgh_descriptor_count == 2);
-    VERIFY(reply.receive_port.type == MACH_MSG_PORT_DESCRIPTOR);
-    VERIFY(reply.receive_port.disposition == MACH_MSG_TYPE_MOVE_RECEIVE);
-    VERIFY(reply.send_port.type == MACH_MSG_PORT_DESCRIPTOR);
-    VERIFY(reply.send_port.disposition == MACH_MSG_TYPE_MOVE_SEND);
-
     return TransportBootstrapMachPorts {
-        .receive_right = Core::MachPort::adopt_right(reply.receive_port.name, Core::MachPort::PortRight::Receive),
-        .send_right = Core::MachPort::adopt_right(reply.send_port.name, Core::MachPort::PortRight::Send),
+        .receive_right = Core::MachPort::adopt_right(receive_right, Core::MachPort::PortRight::Receive),
+        .send_right = Core::MachPort::adopt_right(send_right, Core::MachPort::PortRight::Send),
     };
+}
+
+ErrorOr<TransportBootstrapMachPorts> bootstrap_transport_from_server_port(Core::MachPort const& server_port, AK::Duration reply_timeout)
+{
+    u32 receive_right = MACH_PORT_NULL;
+    u32 send_right = MACH_PORT_NULL;
+    i32 kernel_error = KERN_SUCCESS;
+    auto const reply_timeout_in_milliseconds = static_cast<u32>(clamp<i64>(reply_timeout.to_milliseconds(), 0, NumericLimits<u32>::max()));
+    switch (FFI::ipc_mach_bootstrap_transport_from_server_port(server_port.port(), reply_timeout_in_milliseconds, &receive_right, &send_right, &kernel_error)) {
+    case FFI::BootstrapOutcome::Received:
+        return adopt_transport_ports(receive_right, send_right);
+    case FFI::BootstrapOutcome::KernelError:
+        return Core::mach_error_to_error(kernel_error);
+    case FFI::BootstrapOutcome::ServerClosedBeforeReplying:
+        return Error::from_string_literal("Mach bootstrap server closed before replying");
+    case FFI::BootstrapOutcome::MalformedReply:
+        return Error::from_string_literal("Malformed Mach bootstrap reply");
+    }
+    VERIFY_NOT_REACHED();
 }
 
 ErrorOr<TransportBootstrapMachPorts> bootstrap_transport_from_mach_server(StringView server_name)
@@ -75,66 +45,25 @@ ErrorOr<TransportBootstrapMachPorts> bootstrap_transport_from_mach_server(String
     return bootstrap_transport_from_server_port(server_port);
 }
 
-ErrorOr<void> TransportBootstrapMachServer::send_transport_ports_to_child(Core::MachPort reply_port, TransportBootstrapMachPorts ports)
+TransportBootstrapMachServer::TransportBootstrapMachServer()
+    : m_server(FFI::ipc_mach_bootstrap_server_create())
 {
-    MessageWithIPCChannelPorts message {};
-    message.header.msgh_bits = MACH_MSGH_BITS(MACH_MSG_TYPE_MOVE_SEND_ONCE, 0) | MACH_MSGH_BITS_COMPLEX;
-    message.header.msgh_size = sizeof(message);
-    message.header.msgh_remote_port = reply_port.release();
-    message.header.msgh_local_port = MACH_PORT_NULL;
-    message.header.msgh_id = IPC_CHANNEL_PORTS_MESSAGE_ID;
-    message.body.msgh_descriptor_count = 2;
-    message.receive_port.name = ports.receive_right.release();
-    message.receive_port.disposition = MACH_MSG_TYPE_MOVE_RECEIVE;
-    message.receive_port.type = MACH_MSG_PORT_DESCRIPTOR;
-    message.send_port.name = ports.send_right.release();
-    message.send_port.disposition = MACH_MSG_TYPE_MOVE_SEND;
-    message.send_port.type = MACH_MSG_PORT_DESCRIPTOR;
-
-    mach_msg_timeout_t const timeout = 5000;
-    auto const ret = mach_msg(&message.header, MACH_SEND_MSG | MACH_SEND_TIMEOUT, sizeof(message), 0, MACH_PORT_NULL, timeout, MACH_PORT_NULL);
-    if (ret != KERN_SUCCESS) {
-        // NB: These errors leave the message's rights with the sender. The child may have exited before the reply.
-        if (ret == MACH_SEND_INVALID_DEST || ret == MACH_SEND_TIMED_OUT || ret == MACH_SEND_INTERRUPTED || ret == MACH_SEND_NO_BUFFER)
-            mach_msg_destroy(&message.header);
-        return Core::mach_error_to_error(ret);
-    }
-    return {};
 }
 
-ErrorOr<TransportBootstrapMachPorts> TransportBootstrapMachServer::create_on_demand_local_transport(Core::MachPort reply_port)
+TransportBootstrapMachServer::~TransportBootstrapMachServer()
 {
-    auto local_receive_right = TRY(Core::MachPort::create_with_right(Core::MachPort::PortRight::Receive));
-    auto local_send_right = TRY(local_receive_right.insert_right(Core::MachPort::MessageRight::MakeSend));
-
-    auto remote_receive_right = TRY(Core::MachPort::create_with_right(Core::MachPort::PortRight::Receive));
-    auto remote_send_right = TRY(remote_receive_right.insert_right(Core::MachPort::MessageRight::MakeSend));
-
-    // Either peer may send messages before the other has constructed its transport.
-    TransportMachPort::raise_receive_queue_limit(local_receive_right);
-    TransportMachPort::raise_receive_queue_limit(remote_receive_right);
-
-    TRY(send_transport_ports_to_child(move(reply_port), TransportBootstrapMachPorts {
-                                                            .receive_right = move(remote_receive_right),
-                                                            .send_right = move(local_send_right),
-                                                        }));
-
-    return TransportBootstrapMachPorts {
-        .receive_right = move(local_receive_right),
-        .send_right = move(remote_send_right),
-    };
+    FFI::ipc_mach_bootstrap_server_destroy(m_server);
 }
 
 void TransportBootstrapMachServer::register_child_transport(pid_t pid, TransportBootstrapMachPorts ports)
 {
-    VERIFY(!m_child_transports.contains(pid));
-    m_child_transports.set(pid, move(ports));
+    FFI::ipc_mach_bootstrap_server_register_child_transport(m_server, pid, ports.receive_right.release(), ports.send_right.release());
 }
 
 void TransportBootstrapMachServer::unregister_child_transport(pid_t pid)
 {
     MutexLocker locker(m_child_registration_mutex);
-    m_child_transports.remove(pid);
+    FFI::ipc_mach_bootstrap_server_unregister_child_transport(m_server, pid);
 }
 
 ErrorOr<TransportBootstrapMachServer::BootstrapRequestResult> TransportBootstrapMachServer::handle_bootstrap_request(pid_t pid, Core::MachPort reply_port)
@@ -142,15 +71,26 @@ ErrorOr<TransportBootstrapMachServer::BootstrapRequestResult> TransportBootstrap
     Optional<TransportBootstrapMachPorts> child_transport;
     {
         MutexLocker locker(m_child_registration_mutex);
-        child_transport = m_child_transports.take(pid);
+        u32 receive_right = MACH_PORT_NULL;
+        u32 send_right = MACH_PORT_NULL;
+        if (FFI::ipc_mach_bootstrap_server_take_child_transport(m_server, pid, &receive_right, &send_right))
+            child_transport = adopt_transport_ports(receive_right, send_right);
     }
 
     if (child_transport.has_value()) {
-        TRY(send_transport_ports_to_child(move(reply_port), child_transport.release_value()));
+        auto ports = child_transport.release_value();
+        auto const result = FFI::ipc_mach_bootstrap_send_transport_ports_to_child(reply_port.release(), ports.receive_right.release(), ports.send_right.release());
+        if (result != KERN_SUCCESS)
+            return Core::mach_error_to_error(result);
         return ChildTransportHandled {};
     }
 
-    return OnDemandTransport { .ports = TRY(create_on_demand_local_transport(move(reply_port))) };
+    u32 receive_right = MACH_PORT_NULL;
+    u32 send_right = MACH_PORT_NULL;
+    auto const result = FFI::ipc_mach_bootstrap_create_on_demand_local_transport(reply_port.release(), &receive_right, &send_right);
+    if (result != KERN_SUCCESS)
+        return Core::mach_error_to_error(result);
+    return OnDemandTransport { .ports = adopt_transport_ports(receive_right, send_right) };
 }
 
 }

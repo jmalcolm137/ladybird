@@ -257,16 +257,14 @@ impl SyntheticModule {
         let module_context_ref = unsafe { module_context.as_ref() };
 
         // 3. Set the Realm of moduleContext to module.[[Realm]].
-        module_context_ref.realm.set(Some(realm));
+        module_context_ref.set_realm(Some(realm));
 
         // 4. Set the ScriptOrModule of moduleContext to module.
-        module_context_ref
-            .script_or_module
-            .set(ScriptOrModule::Module(self.as_gc()));
+        module_context_ref.set_script_or_module(ScriptOrModule::Module(self.as_gc()));
 
         // 5. Set the VariableEnvironment of moduleContext to module.[[Environment]].
         let environment = self.environment().map(Gc::upcast);
-        module_context_ref.variable_environment.set(environment);
+        module_context_ref.set_variable_environment(environment);
 
         // 6. Set the LexicalEnvironment of moduleContext to module.[[Environment]].
         module_context_ref.lexical_environment.set(environment);

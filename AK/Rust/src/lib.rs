@@ -6,18 +6,39 @@
 
 //! Rust views of shared AK data structures.
 
+pub mod character_types;
+mod column;
+mod fast_hash;
 mod generic_lexer;
 pub mod math;
 pub mod perf_map;
+mod region;
+mod row_block;
 mod scope_guard;
 mod slice;
+pub mod stack;
+mod string_conversions;
+mod utf16_view;
 pub mod waiter_list;
 #[cfg(all(windows, target_arch = "x86_64"))]
 pub mod windows_code_memory;
+mod word_chunk;
+mod zone;
+mod zone_bit_set;
+mod zone_map;
 
+pub use column::{Column, ColumnFull};
+pub use fast_hash::FastHasher;
 pub use generic_lexer::GenericLexer;
+pub use row_block::{RowBlock, RowBlockFull, RowList};
 pub use scope_guard::ScopeGuard;
 pub use slice::{Span, SpanMut, slice_from_raw_parts, slice_from_raw_parts_mut};
+pub use string_conversions::{UnsignedInteger, parse_ascii_digits};
+pub use utf16_view::Utf16View;
+pub use word_chunk::WordChunk;
+pub use zone::{Zone, ZoneVec, ZoneVecIntoIter};
+pub use zone_bit_set::ZoneBitSet;
+pub use zone_map::{ZoneMap, ZoneSet};
 
 use core::mem::MaybeUninit;
 use std::num::NonZeroUsize;
@@ -100,8 +121,7 @@ unsafe extern "C" {
     ) -> u8;
     fn ladybird_encode_base64_to_utf16(data: *const u8, length: usize, url: bool, omit_padding: bool) -> usize;
     fn ladybird_release_unused_allocator_memory();
-    fn ladybird_enter_scratch_heap() -> *mut core::ffi::c_void;
-    fn ladybird_leave_scratch_heap(previous_heap: *mut core::ffi::c_void);
+    fn ladybird_set_idle_thread_memory_release(release: extern "C" fn());
     fn ladybird_convert_to_decimal_exponential_form(
         value: f64,
         sign: *mut bool,
@@ -218,6 +238,19 @@ macro_rules! impl_utf16_string_owner {
             pub unsafe fn from_raw_owned(raw: usize) -> Self {
                 // SAFETY: The caller transfers a valid ownership reference.
                 Self(unsafe { OwnedUtf16String::from_raw(raw) })
+            }
+
+            /// Retains a borrowed raw `AK::Utf16String` reference.
+            ///
+            /// # Safety
+            ///
+            /// `raw` must be a valid, nonzero raw representation that remains live for this call.
+            #[inline]
+            pub unsafe fn from_raw_borrowed(raw: usize) -> Self {
+                // SAFETY: The caller keeps the string alive while adding a reference.
+                unsafe { reference_utf16_string(raw) };
+                // SAFETY: The new reference is transferred to the returned owner.
+                unsafe { Self::from_raw_owned(raw) }
             }
 
             /// Transfers this owner's existing reference to the caller.
@@ -343,6 +376,22 @@ impl Utf16String {
         // exactly `string.len()` Latin-1 bytes.
         unsafe { std::ptr::copy_nonoverlapping(string.as_ptr(), result.long_storage(), string.len()) };
         result
+    }
+
+    pub fn to_ascii_lowercase(&self) -> Self {
+        match self.as_units() {
+            Utf16StringUnits::Ascii(units) => Self::from_ascii(&units.to_ascii_lowercase()),
+            Utf16StringUnits::Latin1(units) => Self::from_latin1(&units.to_ascii_lowercase()),
+            Utf16StringUnits::Utf16(units) => Self::from_utf16(
+                &units
+                    .iter()
+                    .map(|&code_unit| match u8::try_from(code_unit) {
+                        Ok(byte) => u16::from(byte.to_ascii_lowercase()),
+                        Err(_) => code_unit,
+                    })
+                    .collect::<Vec<u16>>(),
+            ),
+        }
     }
 
     /// Creates a string in AK's native representation from the Latin-1 bytes of `pieces` one after the other, which
@@ -485,28 +534,43 @@ pub fn release_unused_allocator_memory() {
     unsafe { ladybird_release_unused_allocator_memory() }
 }
 
-/// While this lives, what the calling thread allocates goes to a heap of its own. Work that frees
-/// nearly everything it allocates uses it to keep its temporary data out of the pages of what
-/// outlives it. Blocks stay valid after it ends. Scopes end in the reverse order they were entered in.
-/// It holds a pointer so that it stays on its thread.
-pub struct ScratchHeapScope {
-    previous_heap: *mut core::ffi::c_void,
+/// Sets the function that a thread pool calls on a thread that goes idle. It gives back the memory that the calling
+/// thread keeps outside the allocator for its next jobs, and does nothing on a thread that keeps none.
+pub fn set_idle_thread_memory_release(release: extern "C" fn()) {
+    // SAFETY: Any thread may set the function, which stays valid for as long as the process runs.
+    unsafe { ladybird_set_idle_thread_memory_release(release) }
 }
 
-impl ScratchHeapScope {
-    #[must_use = "the scratch heap is only in use while the scope lives"]
-    pub fn enter() -> Self {
-        // SAFETY: Takes no arguments, and any thread may call it.
-        let previous_heap = unsafe { ladybird_enter_scratch_heap() };
-        Self { previous_heap }
+/// Maps in, in one go, the pages of the room `vector` has past its elements for `additional` more, for writes about to
+/// fill it: a vector a large write grows into fresh memory then takes its pages at once rather than a fault at a time.
+/// Where the system cannot, the writes map them in as they come.
+pub fn populate_room_for_write<T>(vector: &mut Vec<T>, additional: usize) {
+    #[cfg(target_os = "linux")]
+    {
+        unsafe extern "C" {
+            fn madvise(address: *mut core::ffi::c_void, length: usize, advice: core::ffi::c_int) -> core::ffi::c_int;
+            fn getpagesize() -> core::ffi::c_int;
+        }
+        const MADV_POPULATE_WRITE: core::ffi::c_int = 23;
+        let room = vector.spare_capacity_mut();
+        let length = additional.min(room.len());
+        let room = &mut room[..length];
+        let (start, end) = (
+            room.as_mut_ptr() as usize,
+            room.as_mut_ptr() as usize + size_of_val(room),
+        );
+        // SAFETY: Takes no arguments.
+        let page_size = unsafe { getpagesize() } as usize;
+        let (start, end) = (start.next_multiple_of(page_size), end / page_size * page_size);
+        if start < end {
+            // SAFETY: The pages lie in unused capacity the vector owns, and mapping them in changes nothing the vector
+            //         reads. It only fails where the kernel is too old to know the advice, which leaves the faults to
+            //         the first writes.
+            unsafe { madvise(start as *mut core::ffi::c_void, end - start, MADV_POPULATE_WRITE) };
+        }
     }
-}
-
-impl Drop for ScratchHeapScope {
-    fn drop(&mut self) {
-        // SAFETY: The heap is the one this thread entered the scratch heap from.
-        unsafe { ladybird_leave_scratch_heap(self.previous_heap) }
-    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = (vector, additional);
 }
 
 pub fn validate_utf16(string: &[u16]) -> bool {
@@ -687,19 +751,6 @@ pub fn encode_base64(input: &[u8], alphabet: Base64Alphabet, omit_padding: bool)
 }
 
 impl Utf16FlyString {
-    /// Retains a borrowed raw `AK::Utf16FlyString` reference.
-    ///
-    /// # Safety
-    ///
-    /// `raw` must be a valid, nonzero fly-string representation that remains live for this call.
-    #[inline]
-    pub unsafe fn from_raw_borrowed(raw: usize) -> Self {
-        // SAFETY: The caller keeps the string alive while adding a reference.
-        unsafe { reference_utf16_string(raw) };
-        // SAFETY: The new reference is transferred to the returned owner.
-        unsafe { Self::from_raw_owned(raw) }
-    }
-
     /// Creates a string through AK's authoritative UTF-8 fly-string table.
     pub fn from_utf8(string: &str) -> Self {
         if let Some(raw) = utf16_short_string_raw(string) {
@@ -784,6 +835,23 @@ impl PartialEq for Utf16String {
 }
 
 impl Eq for Utf16String {}
+
+impl PartialEq<str> for Utf16String {
+    fn eq(&self, other: &str) -> bool {
+        match self.as_units() {
+            // NB: The UTF-8 of an ASCII string is its ASCII bytes.
+            Utf16StringUnits::Ascii(units) => units == other.as_bytes(),
+            Utf16StringUnits::Latin1(units) => units.iter().map(|&unit| u16::from(unit)).eq(other.encode_utf16()),
+            Utf16StringUnits::Utf16(units) => units.iter().copied().eq(other.encode_utf16()),
+        }
+    }
+}
+
+impl PartialEq<&str> for Utf16String {
+    fn eq(&self, other: &&str) -> bool {
+        *self == **other
+    }
+}
 
 impl std::fmt::Debug for Utf16String {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

@@ -27,9 +27,9 @@ chmod 700 "$RUNTIME"
 export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
 export SDE_STATE_DIR="$RUNTIME"
 export SDE_SESSION_DIR="$RUNTIME/session"
-mkdir -p "$SDE_SESSION_DIR/portal" "$RUNTIME/data/Ladybird/CrashReports" "$RUNTIME/config"
+mkdir -p "$SDE_SESSION_DIR/portal" "$RUNTIME/data/Ladybird/Profiles/crash-test-$$/CrashReports" "$RUNTIME/config"
 
-cat > "$RUNTIME/data/Ladybird/CrashReports/2026-11-01T00-00-00Z-WebContent-abc123.txt" <<'EOF'
+cat > "$RUNTIME/data/Ladybird/Profiles/crash-test-$$/CrashReports/2026-11-01T00-00-00Z-WebContent-abc123.txt" <<'EOF'
 Ladybird crash report, format 1
 Process: WebContent
 Crashed at: 2026-11-01T00:00:00Z

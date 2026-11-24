@@ -35,11 +35,11 @@ use crate::css::style_value::{
 };
 use crate::css::style_value_arc::StyleValueArc;
 use crate::css::table_group_builder::group_index;
+use crate::css::transform_functions::multiply_transform_functions;
 use crate::css::value_codes::{COLOR_SYNTAX_MODERN, COLOR_TYPE_RGB};
 use crate::layout::node_data::NodeSlotId;
 use crate::layout::script_entries::FfiAnchorSizedProperty;
 use crate::painting::ffi::FfiBoxModelMetrics;
-use crate::painting::visual_context::node_values::multiply_transform_functions;
 use crate::render_state::DocumentHost;
 
 const VALUE_LIST_SEPARATOR_SPACE: u8 = 0;
@@ -589,7 +589,10 @@ impl ResolvedValueBox<'_> {
         property: u16,
         size_in_axis: impl FnOnce(FfiCssPixelSize) -> CssPixels,
     ) -> StyleValueArc {
-        if !self.query.svg_sizing_properties_apply || !self.has_used_box(self.node, self.style) {
+        if !self.query.svg_sizing_properties_apply
+            || !self.has_used_box(self.node, self.style)
+            || crate::layout::shell_reads::layout_row_is_fragmented_inline(self.host, self.node)
+        {
             return self.computed(property);
         }
         let used_size = if self.style.box_sizing() == box_sizing::BORDER_BOX {
@@ -859,12 +862,23 @@ impl ResolvedValueBox<'_> {
 
             // -> line-height
             //    The resolved value is normal if the computed value is normal, or the used value otherwise.
+            // NB: The used value is the computed length, or a number times the computed font size, before layout
+            //     rounds the line box's height.
             property_id::LINE_HEIGHT => {
                 let line_height = self.computed(property);
-                if matches!(&*line_height, StyleValueData::Keyword { keyword } if *keyword == keyword::NORMAL) {
-                    return line_height;
+                match &*line_height {
+                    StyleValueData::Keyword { keyword } if *keyword == keyword::NORMAL => line_height,
+                    StyleValueData::Number { value } => {
+                        match absolute_length_px(&self.computed(property_id::FONT_SIZE)) {
+                            Some(font_size) => length_value(value * font_size),
+                            None => length_value(self.element_style.font().line_height_used().to_double()),
+                        }
+                    }
+                    computed => match absolute_length_px(computed) {
+                        Some(length) => length_value(length),
+                        None => length_value(self.element_style.font().line_height_used().to_double()),
+                    },
                 }
-                length_value(self.element_style.font().line_height_used().to_double())
             }
 
             property_id::HEIGHT => self.resolved_value_for_size(property, |size| size.height),
@@ -965,6 +979,13 @@ impl ResolvedValueBox<'_> {
             property_id::_WEBKIT_TEXT_FILL_COLOR => {
                 self.resolved_color(property, style.inherited_text().webkit_text_fill_color)
             }
+            property_id::_WEBKIT_TEXT_STROKE_COLOR => self.resolved_color(
+                property,
+                style
+                    .inherited_text()
+                    .webkit_text_stroke_color
+                    .resolve(style.current_color()),
+            ),
             property_id::LETTER_SPACING => {
                 // https://drafts.csswg.org/css-text-4/#letter-spacing-property
                 // For legacy reasons, a computed letter-spacing of zero yields a resolved value (getComputedStyle()
@@ -1103,6 +1124,7 @@ pub unsafe extern "C" fn rust_resolved_value_of_style(
         property_id::OUTLINE_COLOR => used_color(misc_layout.outline_color.resolve(current_color)),
         property_id::TEXT_DECORATION_COLOR => used_color(text_reset.text_decoration_color.resolve(current_color)),
         property_id::_WEBKIT_TEXT_FILL_COLOR => used_color(text.webkit_text_fill_color),
+        property_id::_WEBKIT_TEXT_STROKE_COLOR => used_color(text.webkit_text_stroke_color.resolve(current_color)),
         property_id::BOX_SHADOW => {
             // SAFETY: The list holds `length` shadows while the style lives.
             let shadows = unsafe {
@@ -1117,6 +1139,29 @@ pub unsafe extern "C" fn rust_resolved_value_of_style(
             style_value_for_shadow(SHADOW_TYPE_TEXT, shadows, current)
         }
         property_id::BACKDROP_FILTER | property_id::FILTER => resolve_filter_style_value(&computed(), current),
+        // https://drafts.csswg.org/cssom/#resolved-value
+        // line-height: The resolved value is normal if the computed value is normal, or the used value otherwise.
+        // NB: Without a box, the used value of a number is that number times the computed font size.
+        property_id::LINE_HEIGHT => {
+            let line_height = computed();
+            match &*line_height {
+                StyleValueData::Number { value } => {
+                    // SAFETY: The caller passes a context its callback accepts, and the call hands over one strong
+                    //         reference.
+                    let font_size = unsafe {
+                        StyleValueArc::from_raw((query.computed_value)(
+                            query.computed_value_context,
+                            property_id::FONT_SIZE,
+                        ))
+                    };
+                    match absolute_length_px(&font_size) {
+                        Some(font_size) => length_value(value * font_size),
+                        None => line_height,
+                    }
+                }
+                _ => line_height,
+            }
+        }
         property_id::TOUCH_ACTION => resolve_touch_action_style_value(&computed()),
         property_id::TRANSFORM_ORIGIN => style_value_for_transform_origin(
             handle_value(&transform.transform_origin_x).expect("transform-origin has an x offset"),

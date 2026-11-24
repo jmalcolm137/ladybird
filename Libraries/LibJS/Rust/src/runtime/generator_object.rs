@@ -56,9 +56,10 @@ impl GeneratingFunction {
 
     pub fn bytecode_executable(self, vm: &Vm) -> Gc<Executable> {
         match self {
+            // NB: The generating function runs, so its executable is not flushed.
             GeneratingFunction::Ecmascript(function) => function
                 .bytecode_executable()
-                .expect("a generating function is compiled before it is called"),
+                .expect("a generating function is compiled while it runs"),
             GeneratingFunction::NativeJavaScriptBacked(function) => function.bytecode_executable(vm).must(),
         }
     }
@@ -247,6 +248,14 @@ impl GeneratorObject {
             .as_non_null()
     }
 
+    /// The Realm of [[GeneratorContext]], until the generator completes.
+    pub fn realm_of_context(&self) -> Option<Gc<Realm>> {
+        self.execution_context
+            .borrow()
+            .as_ref()
+            .and_then(|context| context.realm_of_resumed_frame())
+    }
+
     /// Once a generator enters the completed state it never leaves it and its associated execution context is never
     /// resumed. Any execution state associated with generator can be discarded at this point.
     /// NB: Freeing the context right away, rather than when the generator is finalized, lets the next generator reuse
@@ -407,7 +416,7 @@ impl GeneratorObject {
         // 8. Push genContext onto the execution context stack; genContext is now the running execution context.
         // NOTE: This is done out of order as to not permanently disable the generator if push_execution_context throws,
         //       as `resume` will immediately throw when [[GeneratorState]] is "executing", never allowing the state to change.
-        vm.push_execution_context_checking_stack_space(generator_context)?;
+        vm.push_resumed_execution_context_checking_stack_space(generator_context)?;
 
         // 7. Set generator.[[GeneratorState]] to executing.
         self.generator_state.set(GeneratorState::Executing);
@@ -469,7 +478,7 @@ impl GeneratorObject {
         // 9. Push genContext onto the execution context stack; genContext is now the running execution context.
         // NOTE: This is done out of order as to not permanently disable the generator if push_execution_context throws,
         //       as `resume_abrupt` will immediately throw when [[GeneratorState]] is "executing", never allowing the state to change.
-        vm.push_execution_context_checking_stack_space(generator_context)?;
+        vm.push_resumed_execution_context_checking_stack_space(generator_context)?;
 
         // 8. Set generator.[[GeneratorState]] to executing.
         self.generator_state.set(GeneratorState::Executing);

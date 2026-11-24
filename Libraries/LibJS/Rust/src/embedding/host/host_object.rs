@@ -133,8 +133,11 @@ fn host_object_methods(table: &'static JSHostClass) -> ObjectMethods {
     if hooks.own_property_keys.is_some() {
         methods.internal_own_property_keys = own_property_keys_through_hook;
     }
+    if hooks.preserve_identity.is_some() {
+        methods.preserve_identity = Some(preserve_identity_through_hook);
+    }
     if table.has_flag(JS_HOST_CLASS_NOT_CACHEABLE_FOR_PROPERTY_ABSENCE) {
-        methods.is_cacheable_for_property_absence = |_| false;
+        methods.is_cacheable_for_property_absence = false;
     } else if table.has_flag(JS_HOST_CLASS_NOT_CACHEABLE_FOR_INDEXED_PROPERTY_ABSENCE) {
         methods.is_cacheable_for_absence_of = |_, _, property_key| !property_key.is_number();
     }
@@ -413,6 +416,14 @@ fn is_cacheable_for_inherited_property_through_hook(object: &Object) -> bool {
     unsafe { hook(lend_object_to_hook(object)) }
 }
 
+fn preserve_identity_through_hook(object: &Object) {
+    let hook = hooks_of(object)
+        .preserve_identity
+        .expect("the class has a preserve_identity hook");
+    // SAFETY: The hook takes an object of its class.
+    unsafe { hook(lend_object_to_hook(object)) }
+}
+
 fn error_data_through_hook(object: &Object) -> Option<&ErrorData> {
     let hook = hooks_of(object).error_data.expect("the class has an error_data hook");
     // SAFETY: The hook takes an object of its class, and returns null or error data that lives as long as the object,
@@ -467,6 +478,16 @@ impl HostObject {
 /// The host object an internal method of a host object class was called on.
 pub(crate) fn as_host_object(object: &Object) -> &HostObject {
     cast_ref(object)
+}
+
+/// HostObjectHasImpureLookupInternalMethods(object): whether a hook of the object's host class looks its properties or
+/// its prototype up, which may run script.
+pub(crate) fn host_object_has_impure_lookup_internal_methods(object: &Object) -> bool {
+    if object.class().id != ClassId::HostObject {
+        return false;
+    }
+    let hooks = hooks_of(object);
+    hooks.get_prototype_of.is_some() || hooks.get_own_property.is_some() || hooks.get.is_some()
 }
 
 /// host_class_of(): the host class of an object of any host kind, or none for any other object.

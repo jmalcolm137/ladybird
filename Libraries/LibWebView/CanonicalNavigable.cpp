@@ -15,7 +15,6 @@
 #include <LibWebCommon/HTML/SerializationRecords.h>
 #include <LibWebCommon/Page/ViewportIsFullscreen.h>
 #include <LibWebCommon/SecureContexts/AbstractOperations.h>
-#include <LibWebCommon/WebView/SiteIsolation.h>
 #include <LibWebView/Application.h>
 #include <LibWebView/BrowsingSession.h>
 #include <LibWebView/CanonicalBrowsingContext.h>
@@ -184,7 +183,7 @@ Web::HTML::PreparedNavigationDescriptor CanonicalNavigable::prepare_navigation(U
 }
 
 // Continue the navigate algorithm at step 9 with the values prepared by steps 1-7.
-void CanonicalNavigable::begin_navigation(Web::HTML::PreparedNavigationDescriptor navigation, RefPtr<WebContentPage> source_page)
+void CanonicalNavigable::begin_navigation(Web::HTML::PreparedNavigationDescriptor navigation, RefPtr<WebContentPage> source_page, LocalFileAccess local_file_access)
 {
     auto& traversable = top_level_traversable();
     auto const& url = navigation.url;
@@ -340,6 +339,7 @@ void CanonicalNavigable::begin_navigation(Web::HTML::PreparedNavigationDescripto
         .state = CanonicalNavigation::CheckingIfUnloadingIsCanceled { move(start_request) },
         .page = worker,
         .source_page = move(source_page),
+        .local_file_access = move(local_file_access),
     });
     worker->async_set_ongoing_navigation(id(), navigation_id);
     worker->begin_navigation_unload_check(*this, navigation_id);
@@ -893,6 +893,26 @@ static Optional<String> origin_of_sandboxed_document(CanonicalNavigable const& n
     return {};
 }
 
+// The inherited root is settled before a process is chosen, so that reusing a process can't combine roots.
+static Optional<LocalFileRoot> local_file_root_to_host(CanonicalNavigable const& navigable, CanonicalDocument const& document)
+{
+    if (document.is_local_file_content())
+        return document.local_file_root();
+    auto const& url = document.creation_url();
+    if (!document.origin().is_file_origin() && !Web::HTML::url_matches_about_srcdoc(url) && url.scheme() != "data"sv)
+        return {};
+    for (auto const* ancestor = navigable.parent(); ancestor; ancestor = ancestor->parent()) {
+        if (auto const& root = ancestor->active_document().local_file_root(); root.has_value())
+            return root;
+    }
+    return {};
+}
+
+static bool may_read_local_files_under(WebContentClient const& process, Optional<LocalFileRoot> const& root)
+{
+    return !root.has_value() || process.local_file_roots() == Vector { *root };
+}
+
 static RefPtr<WebContentClient> lowest_process_hosting_only_tabs_like(CanonicalDocument const& document, BrowsingSession const& session)
 {
     RefPtr<WebContentClient> process;
@@ -914,8 +934,7 @@ RefPtr<WebContentClient> CanonicalNavigable::process_to_host_for_site_isolation(
         return process;
 
     // Documents that are not isolated go with the page holding the navigable.
-    auto mode = site_isolation_mode();
-    if (mode == SiteIsolationMode::Disabled || (mode == SiteIsolationMode::TopLevel && parent()))
+    if (Application::the().tab_processes() == TabProcesses::PerTabWithoutSiteIsolation)
         return process_holding_navigable;
 
     // A sandboxed document stays out of its initiator's process, and the sandboxed documents of an origin share one
@@ -929,14 +948,14 @@ RefPtr<WebContentClient> CanonicalNavigable::process_to_host_for_site_isolation(
             return nullptr;
     }
 
-    // A tab goes to a process that has hosted only tabs of its origin that are origin-keyed just as it is, to share
-    // what the process holds. Nothing else can reach a browsing context group of one, whereas an opener could make a
-    // process it can connect to host the tab. A tab recovering from a crash gets a process of its own, so that it can't
-    // take the tabs it joins down with it again.
+    // A tab goes to a process that has hosted only tabs of its origin that are origin-keyed just as it is, or of its
+    // site if the user chose so, to share what the process holds. Nothing else can reach a browsing context group of
+    // one, whereas an opener could make a process it can connect to host the tab. A tab recovering from a crash gets a
+    // process of its own, so that it can't take the tabs it joins down with it again.
     if (!parent() && process_holding_navigable && document.may_share_a_process_with_tabs_of_its_origin()
         && document.browsing_context().top_level_browsing_context().group()->browsing_context_set().size() == 1
         && !top_level_traversable().has_page_standing_in_for_lost_document()
-        && Application::the().same_origin_tabs_may_share_a_process()) {
+        && Application::the().tabs_may_share_processes()) {
         if (auto process = lowest_process_hosting_only_tabs_like(document, process_holding_navigable->session()))
             return process;
     }
@@ -980,18 +999,19 @@ RefPtr<WebContentClient> CanonicalNavigable::process_to_host(CanonicalDocument c
 
     // NB: Without site isolation, every document stays with the process holding its navigable, local file content and
     //     WebUI documents too, and that process may then read local files or speak for the WebUI for as long as it lives.
-    if (site_isolation_mode() == SiteIsolationMode::Disabled)
+    if (Application::the().tab_processes() == TabProcesses::PerTabWithoutSiteIsolation)
         return process;
-    auto process_has_hosted_local_file_content = process && process->has_hosted_local_file_content();
+    auto process_has_hosted_local_file_content = process && process->may_read_local_files();
     auto process_has_hosted_web_ui = process && process->hosted_web_ui().has_value();
 
     if (document.web_ui_host().has_value())
         return process && process->hosted_web_ui() == document.web_ui_host() ? process : nullptr;
+    auto root = local_file_root_to_host(*this, document);
     if (document.is_local_file_content())
-        return process_has_hosted_local_file_content ? process : nullptr;
+        return process && may_read_local_files_under(*process, root) ? process : nullptr;
     if (!process_has_hosted_local_file_content && !process_has_hosted_web_ui)
         return process;
-    if (process_has_hosted_local_file_content && document.origin().is_file_origin())
+    if (process_has_hosted_local_file_content && document.origin().is_file_origin() && may_read_local_files_under(*process, root))
         return process;
 
     // An agent runs in one process, and one the process hosts was let in with the documents it has there.
@@ -1005,24 +1025,28 @@ RefPtr<WebContentClient> CanonicalNavigable::process_to_host(CanonicalDocument c
         return process;
 
     auto is_made_from_what_its_initiator_holds = Web::HTML::url_matches_about_srcdoc(url) || url.scheme() == "data"sv;
-    if (process_has_hosted_local_file_content && is_made_from_what_its_initiator_holds && initiator_origin.has_value() && initiator_origin->is_file_origin())
+    if (process_has_hosted_local_file_content && is_made_from_what_its_initiator_holds && initiator_origin.has_value() && initiator_origin->is_file_origin()
+        && may_read_local_files_under(*process, root)) {
         return process;
+    }
     return nullptr;
 }
 
 ErrorOr<NonnullRefPtr<WebContentPage>> CanonicalNavigable::obtain_page_to_host(CanonicalDocument const& document, Optional<URL::Origin> const& initiator_origin)
 {
     auto page = TRY(obtain_page_to_host_in(process_to_host(document, initiator_origin)));
-    if (site_isolation_mode() == SiteIsolationMode::IFrame) {
+    if (Application::the().tab_processes() != TabProcesses::PerTabWithoutSiteIsolation) {
         if (auto origin = origin_of_sandboxed_document(*this, document); origin.has_value()) {
             document.browsing_context().top_level_browsing_context().group()->set_process_hosting_sandboxed_documents_of_origin(*origin, page->client());
             // NB: A sandboxed srcdoc or data: URL iframe of local file content loads files as that content can.
-            if (*origin == serialized_file_origin)
-                page->client().set_has_hosted_local_file_content();
+            if (*origin == serialized_file_origin) {
+                if (auto root = local_file_root_to_host(*this, document); root.has_value())
+                    TRY(page->client().add_local_file_root(root.release_value()));
+            }
         }
     }
     if (document.is_local_file_content())
-        page->client().set_has_hosted_local_file_content();
+        TRY(page->client().add_local_file_root(*document.local_file_root()));
     if (auto const& web_ui_host = document.web_ui_host(); web_ui_host.has_value()) {
         page->client().set_hosted_web_ui(*web_ui_host);
         // NB: The page took the view's preferences before it hosted the WebUI, so it now takes the interface theme.
@@ -1092,7 +1116,7 @@ ErrorOr<CanonicalNavigable::PageToPopulateDocument> CanonicalNavigable::obtain_p
     response_document->document_id = Application::the().allocate_ui_process_cross_process_id();
     auto document = create_and_initialize_a_document(*response_document);
     loader.set_document(*document, *this);
-    populate_document(document_state, document, loader.result().inline_content_origin);
+    populate_document(document_state, document, loader.result().inline_content_origin, loader.local_file_root());
 
     // A document created for inline content stands in for the resource the process that fetched it could not load; that
     // process hosts it.
@@ -1128,11 +1152,11 @@ RefPtr<CanonicalDocument> CanonicalNavigable::document_with_id(Web::HTML::CrossP
 }
 
 // A document state that is not a navigation's is a history job's, which the navigable holds while the job runs.
-void CanonicalNavigable::populate_document(NonnullRefPtr<CanonicalDocumentState> document_state, NonnullRefPtr<CanonicalDocument> document, Optional<URL::Origin> inline_content_origin)
+void CanonicalNavigable::populate_document(NonnullRefPtr<CanonicalDocumentState> document_state, NonnullRefPtr<CanonicalDocument> document, Optional<URL::Origin> inline_content_origin, Optional<LocalFileRoot> root_of_read_file)
 {
-    document->determine_whether_it_is_local_file_content(blob_url_store());
+    document->determine_whether_it_is_local_file_content(blob_url_store(), move(root_of_read_file));
     if (document->is_local_file_content())
-        document_state->held_local_file_content = true;
+        document_state->local_file_root = document->local_file_root();
     abandon_populated_document(document_state);
     auto is_for_navigation = any_of(m_navigations, [&](auto const& navigation) {
         return navigation->history_entry && navigation->history_entry->document_state == document_state;
@@ -1148,16 +1172,17 @@ void CanonicalNavigable::populate_document(NonnullRefPtr<CanonicalDocumentState>
 // https://html.spec.whatwg.org/multipage/browsing-the-web.html#navigate-to-a-javascript:-url
 // NB: newDocument's URL is the active document's, as the process hosting both reports it. Whatever URL it reports,
 //     newDocument holds no local file content and displays no WebUI unless the active document does, as its contents
-//     come from that process.
+//     come from that process. Its local file content has the active document's root.
 void CanonicalNavigable::populate_document_for_javascript_url(CanonicalNavigation& navigation, NonnullRefPtr<CanonicalSessionHistoryEntry> history_entry, NonnullRefPtr<CanonicalDocument> document)
 {
-    document->determine_whether_it_is_local_file_content(blob_url_store());
-    if (document->is_local_file_content() && !active_document().is_local_file_content())
+    auto const& root = active_document().local_file_root();
+    document->determine_whether_it_is_local_file_content(blob_url_store(), root);
+    if (document->is_local_file_content() && document->local_file_root() != root)
         return;
     if (document->web_ui_host().has_value() && document->web_ui_host() != active_document().web_ui_host())
         return;
     navigation.history_entry = move(history_entry);
-    populate_document(navigation.history_entry->document_state, move(document));
+    populate_document(navigation.history_entry->document_state, move(document), {}, root);
 }
 
 // The process hosting a document populated for the navigable created it with an origin other than its navigation
@@ -1179,6 +1204,12 @@ void CanonicalNavigable::did_create_populated_document_with_an_origin_of_its_own
     auto origin = is_inline_content ? *populated_document->inline_content_origin : URL::Origin { "resource"_string, String {}, {} };
 
     auto url = is_inline_content ? URL::about_error() : populated_document->document->creation_url();
+
+    // The PDF viewer keeps only the sandboxing flags that don't come from the CSP of the PDF response.
+    auto sandboxing_flags = populated_document->document->active_sandboxing_flag_set();
+    if (!is_inline_content)
+        sandboxing_flags &= snapshot_target_snapshot_params().sandboxing_flags;
+
     NavigationLoader::ResponseDocument response_document {
         .is_inline_content = is_inline_content,
         .coop_enforcement_result = { .url = url, .origin = origin, .opener_policy = {} },
@@ -1187,7 +1218,7 @@ void CanonicalNavigable::did_create_populated_document_with_an_origin_of_its_own
         .origin = origin,
         .opener_policy = {},
         .embedder_policy = {},
-        .final_sandboxing_flag_set = populated_document->document->active_sandboxing_flag_set(),
+        .final_sandboxing_flag_set = sandboxing_flags,
         .environment_id = environment_id,
         .document_id = document_id,
     };
@@ -1579,7 +1610,7 @@ void CanonicalNavigable::did_commit_navigation(CanonicalSessionHistoryEntry& ent
 
     // The document populated for the entry becomes its document state's document below.
     // NB: The process hosting the document ran the steps populating it for the entry it holds.
-    entry.document_state->save_the_origin_of_the_populated_document();
+    entry.document_state->save_the_state_of_the_populated_document();
     RefPtr<CanonicalDocument> document;
     if (auto populated_document = exchange(entry.document_state->populated_document, {}); populated_document.has_value())
         document = populated_document->document;

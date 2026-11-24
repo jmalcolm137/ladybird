@@ -14,7 +14,6 @@
 #include <AK/Time.h>
 #include <AK/Utf16View.h>
 #include <AK/Variant.h>
-#include <LibCompositing/DisplayList/DisplayListResourceIds.h>
 #include <LibCompositing/Video/VideoFrameHold.h>
 #include <LibCore/Forward.h>
 #include <LibGC/Function.h>
@@ -22,6 +21,7 @@
 #include <LibGfx/Rect.h>
 #include <LibJS/Forward.h>
 #include <LibMedia/Forward.h>
+#include <LibMedia/SeekMode.h>
 #include <LibMedia/VideoSinkHandle.h>
 #include <LibMediaClient/Forward.h>
 #include <LibWeb/DOM/Document.h>
@@ -63,6 +63,10 @@ class HTMLMediaElement : public HTMLElement {
     WEB_WRAPPABLE(HTMLMediaElement, HTMLElement);
 
 public:
+    // NB: A move runs no children changed steps, so the move algorithm reports these instead.
+    void child_moved_out(DOM::Node const& child, GC::Ptr<DOM::Node> old_previous_sibling);
+    void child_moved_in();
+
     static constexpr size_t audio_tracks_offset() { return offsetof(HTMLMediaElement, m_audio_tracks); }
     static constexpr size_t video_tracks_offset() { return offsetof(HTMLMediaElement, m_video_tracks); }
     static constexpr size_t text_tracks_offset() { return offsetof(HTMLMediaElement, m_text_tracks); }
@@ -127,6 +131,7 @@ public:
 
     double current_playback_position() const;
     void set_official_playback_position(double);
+    double earliest_possible_position() const;
 
     double duration() const;
     JS::Object* get_start_date(JS::Object& relevant_global_object) const;
@@ -175,15 +180,19 @@ public:
     void set_selected_video_track(Badge<VideoTrack>, GC::Ptr<HTML::VideoTrack> video_track);
 
     void add_current_video_sink();
-    void sync_video_sink_ticking() const;
-    void video_sink_ticking_inputs_changed() const;
+    enum class DocumentWasLaidOut {
+        No,
+        Yes,
+    };
+    void sync_video_sink_ticking(DocumentWasLaidOut = DocumentWasLaidOut::Yes) const;
+    void video_sink_ticking_inputs_changed();
     void detach_video_sink_edge();
 
     GC::Ref<TextTrack> add_text_track(Bindings::TextTrackKind kind, Utf16View label, Utf16View language);
 
     void update_ready_state();
 
-    void set_duration(Badge<MediaSourceExtensions::MediaSource>, double duration) { set_duration(duration); }
+    void set_duration(Badge<MediaSourceExtensions::MediaSource>, double duration, double playback_position_before_the_change) { set_duration(duration, playback_position_before_the_change); }
     void media_source_metadata_available(Badge<MediaSourceExtensions::SourceBuffer>) { on_metadata_parsed(SourceType::Local); }
 
     MediaClient::RemotePlaybackManager& playback_manager()
@@ -224,8 +233,6 @@ public:
     Optional<PresentedVideoFrame> hold_presented_video_frame_for_callbacks();
     void release_presented_video_frame_held_for_callbacks();
     virtual void request_rendering_update_for_video_frame_callbacks() { }
-
-    Optional<Compositing::VideoSinkResourceId> video_sink_resource_id() const;
 
     virtual void update_representation() { }
 
@@ -310,6 +317,7 @@ private:
     void on_video_track_added(Media::Track const&);
     void on_metadata_parsed(SourceType);
     void on_playback_manager_state_change();
+    void on_playback_manager_seek_decided(Media::SeekDecision);
     void upon_current_playback_position_possibly_changed();
     void start_or_stop_playback_position_update_timer();
     void play_element();
@@ -320,7 +328,7 @@ private:
     void update_audio_play_state();
     void set_show_poster(bool);
     void set_paused(bool);
-    void set_duration(double);
+    void set_duration(double, Optional<double> playback_position_before_the_change = {});
     void set_ended(bool);
     void update_ended_attribute();
 
@@ -328,12 +336,13 @@ private:
     void update_volume();
     void attach_selected_video_track_sink(Media::Track const&);
 
-    bool video_sink_should_tick() const;
+    bool video_sink_should_tick(DocumentWasLaidOut) const;
     virtual bool is_shown_elsewhere() const { return false; }
     virtual HTMLMediaElement& media_element_for_controls() { return *this; }
 
-    // Mirrors what PlaybackManager and the compositor were last told; a freshly reserved sink is assumed to tick.
-    mutable bool m_video_sink_is_ticking { true };
+    // Mirrors what PlaybackManager was last told. A freshly reserved sink is undecided, and leaves its input unstarted
+    // until the first decision.
+    mutable Optional<bool> m_video_sink_is_ticking;
     void note_frame_captured() const;
 
     bool is_eligible_for_autoplay() const;
@@ -377,6 +386,18 @@ private:
 
     // https://html.spec.whatwg.org/multipage/media.html#media-element-event-task-source
     UniqueTaskSource m_media_element_event_task_source;
+
+    // NB: The media element tasks that haven't run yet, in the order they were queued, so that they can follow the
+    //     element when it's adopted into another document.
+    struct PendingMediaElementTask {
+        u64 key { 0 };
+        TaskID task_id;
+        GC::Ref<GC::Function<void(HTMLMediaElement&)>> steps;
+    };
+    void queue_pending_media_element_task(PendingMediaElementTask&);
+    void requeue_pending_media_element_tasks();
+    Vector<PendingMediaElementTask> m_pending_media_element_tasks;
+    u64 m_next_media_element_task_key { 0 };
 
     // https://html.spec.whatwg.org/multipage/media.html#dom-media-error
     GC::Ptr<MediaError> m_error;

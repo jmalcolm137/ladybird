@@ -87,12 +87,14 @@ enum class RootNodeComposed {
     X(HTMLCanvasElementWidthOrHeightChange)           \
     X(HTMLImageElementReactToChangesInTheEnvironment) \
     X(HTMLImageElementUpdateTheImageData)             \
-    X(HTMLObjectElementContentDocumentResized)        \
+    X(EmbeddedDocumentResized)                        \
     X(HTMLVideoElementNaturalDimensionsChanged)       \
     X(HTMLVideoElementSetVideoTrack)                  \
+    X(ImplicitAnchorChange)                           \
     X(KeyframeEffect)                                 \
     X(LayoutTreeUpdate)                               \
     X(MathMLAttributeChange)                          \
+    X(FrameScrollingAttributeChange)                  \
     X(NavigableSetViewportSize)                       \
     X(SVGImageElementFetchTheDocument)                \
     X(SVGResourceElementAttributeChange)              \
@@ -109,12 +111,12 @@ enum class SetNeedsLayoutReason {
 
 #define ENUMERATE_SET_NEEDS_LAYOUT_TREE_UPDATE_REASONS(X) \
     X(CharacterDataReplaceData)                           \
-    X(ElementSetInnerHTML)                                \
     X(ElementSetShadowRoot)                               \
     X(DetailsElementOpenedOrClosed)                       \
     X(HTMLImageElementUpdateTheImageData)                 \
     X(HTMLInputElementSrcAttribute)                       \
     X(HTMLInputElementTypeAttribute)                      \
+    X(HTMLEmbedElementRepresentationChanged)              \
     X(HTMLObjectElementUpdateLayoutAndChildObjects)       \
     X(KeyframeEffect)                                     \
     X(LanguageChangeUnderCasingTextTransform)             \
@@ -124,12 +126,10 @@ enum class SetNeedsLayoutReason {
     X(NodeInsertBeforeWithDisplayContents)                \
     X(NodeRemove)                                         \
     X(TableCellSpanAttribute)                             \
-    X(NodeSetTextContent)                                 \
     X(None)                                               \
-    X(PseudoElementBoxEscapedRebuildRoot)                 \
-    X(ShadowRootSetInnerHTML)                             \
     X(SlotAssignmentChange)                               \
     X(StyleChange)                                        \
+    X(StyleRebuild)                                       \
     X(SVGResourceContentChange)                           \
     X(SVGResourceElementRemoved)                          \
     X(SVGResourceReferenceChange)                         \
@@ -449,6 +449,8 @@ public:
         Type type {};
         GC::Ref<Node> node;
         AffectsElements affects_elements { AffectsElements::No };
+        // For a removal, the sibling that was before the removed node, if any.
+        GC::Ptr<Node> old_previous_sibling {};
     };
     // FIXME: It would be good if we could always provide this metadata for use in optimizations.
     virtual void children_changed(ChildrenChangedMetadata const&) { }
@@ -472,12 +474,6 @@ public:
         m_has_layout_box = has_layout_box;
         m_has_committed_box = has_committed_box;
     }
-    Element const* first_letter_owner_for_layout_subtree_from(Layout::BegunRead const& read, Node const& inclusive_ancestor) const;
-    Element* first_letter_owner_for_layout_subtree_from(Layout::BegunRead const& read, Node const& inclusive_ancestor)
-    {
-        return const_cast<Element*>(const_cast<Node const*>(this)->first_letter_owner_for_layout_subtree_from(read, inclusive_ancestor));
-    }
-
     void set_needs_repaint(InvalidateDisplayList = InvalidateDisplayList::PaintCommandsAndHitTestList);
     // Queues `marks` for the node's box, which the render state finds as it applies them: the marks may be made beside a
     // frame in flight, which holds the boxes.
@@ -485,13 +481,6 @@ public:
     // The facts about this node that a box built for it paints (inertness, editability, and so on) may have changed.
     void publish_dom_paint_facts();
     void set_needs_layout_update(SetNeedsLayoutReason);
-
-    // Whether the node's layout subtree can leave the parent's box without restructuring the
-    // anonymous boxes around it, so the parent's subtree keeps its layout tree.
-    static bool can_detach_layout_subtree_in_place(Layout::BegunRead const& read, Element const& element, Element const& parent, bool box_is_block_level);
-    // Whether a list item's box appearing or disappearing changes the list-item counter value of
-    // some item that stays in the list.
-    static bool list_item_box_change_renumbers_list(Element const& list_item);
 
     // Does what a removal does to the layout nodes of this subtree that stay until the parent's layout is rebuilt,
     // while the StyleNodeIDs they are found through are still current.
@@ -507,9 +496,6 @@ public:
     static u8 layout_tree_update_reuse_reason(SetNeedsLayoutTreeUpdateReason);
 
     [[nodiscard]] bool may_reuse_layout_node_for_child_list_insertion() const { return layout_tree_update_reuse_reasons() & ChildListInsertion; }
-
-    [[nodiscard]] bool child_needs_layout_tree_update() const;
-    void set_child_needs_layout_tree_update(bool);
 
     // The number of animations associated with this node's shadow-including inclusive subtree. A
     // synchronous read of layout geometry has to catch up the style of a throttled animation that
@@ -643,8 +629,6 @@ public:
     bool is_inert() const;
 
     bool has_inclusive_ancestor_with_display_none_ignoring_animations() const;
-    bool has_inclusive_ancestor_with_event_listener(Utf16FlyString const& type) const;
-
     GC::Ptr<ShadowRoot> containing_shadow_root();
     GC::Ptr<ShadowRoot const> containing_shadow_root() const
     {
@@ -708,6 +692,10 @@ protected:
     enum LayoutTreeUpdateReuseReason : u8 {
         ChildListInsertion = 1,
         PseudoElementChange = 2,
+        // NB: Bits 4 and 8 are the marks themselves, and 32 and 64 notes of the mark.
+        ChildListRemoval = 16,
+        // The element's box may stay if a fresh build gives it a box of the same kind.
+        Restyle = 128,
     };
     [[nodiscard]] u8 layout_tree_update_reuse_reasons() const;
 
@@ -732,19 +720,10 @@ protected:
     static Optional<Utf16View> first_valid_id(Utf16View, Document const&);
 
 private:
-    enum class LayoutSubtreeRemoval {
-        DetachInPlace,
-        RebuildParent,
-    };
-    enum class AncestorsMayHaveFirstLetter {
-        No,
-        Yes,
-    };
-
     void run_node_iterator_pre_removing_steps();
     bool schedule_list_item_renumber_for_removal();
     void report_removal_to_style_engine(Node& parent);
-    void update_layout_tree_for_removal(Layout::BegunRead const& read, Node& parent, LayoutSubtreeRemoval, AncestorsMayHaveFirstLetter);
+    void update_layout_tree_for_removal(Node& parent);
     GC::RootVector<GC::Ref<HTML::HTMLSlotElement>> descendant_slots_before_removal(Node& parent_root);
     void assign_slottables_after_removal(Node& parent, Node& parent_root, ReadonlySpan<GC::Ref<HTML::HTMLSlotElement>> descendant_slots);
     void run_removing_steps(Node& parent, Node& parent_root, bool was_tracked_by_style_engine);

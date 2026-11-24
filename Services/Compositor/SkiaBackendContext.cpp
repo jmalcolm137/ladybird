@@ -54,6 +54,7 @@ static constexpr size_t skia_resource_cache_limit = 256 * MiB;
 static constexpr auto skia_deferred_cleanup_interval = AK::Duration::from_seconds(1);
 static constexpr auto skia_aggressive_cleanup_interval = AK::Duration::from_seconds(5);
 static constexpr auto skia_deferred_cleanup_resource_age = std::chrono::seconds(5);
+static constexpr auto skia_idle_cleanup_delay = AK::Duration::from_seconds(6);
 static constexpr auto skia_resource_cache_high_watermark = 384 * MiB;
 static constexpr auto skia_resource_cache_critical_watermark = 512 * MiB;
 
@@ -133,6 +134,18 @@ void SkiaBackendContext::flush_and_submit_async(PaintingSurface& surface, Functi
     perform_post_flush_cleanup();
 }
 
+void SkiaBackendContext::flush_and_submit_async(Function<void()>&& callback)
+{
+    auto& context = *sk_context();
+    GrFlushInfo flush_info {};
+    flush_info.fFinishedProc = invoke_async_flush_callback;
+    flush_info.fFinishedContext = new Function<void()>(move(callback));
+    context.flush(flush_info);
+    VERIFY(context.submit(GrSyncCpu::kNo));
+
+    perform_post_flush_cleanup();
+}
+
 void SkiaBackendContext::perform_post_flush_cleanup()
 {
     auto* context = sk_context();
@@ -148,6 +161,15 @@ void SkiaBackendContext::perform_post_flush_cleanup()
 
     s_last_deferred_cleanup = now;
     context->performDeferredCleanup(skia_deferred_cleanup_resource_age);
+
+    if (!m_idle_cleanup_timer) {
+        m_idle_cleanup_timer = Core::Timer::create_single_shot(skia_idle_cleanup_delay, [this] {
+            auto& context = *sk_context();
+            context.checkAsyncWorkCompletion();
+            context.purgeUnlockedResources(GrPurgeResourceOptions::kAllResources);
+        });
+    }
+    m_idle_cleanup_timer->restart();
 
     size_t resource_bytes = 0;
     context->getResourceCacheUsage(nullptr, &resource_bytes);
@@ -169,6 +191,15 @@ size_t SkiaBackendContext::resource_cache_bytes() const
     if (auto* context = sk_context())
         context->getResourceCacheUsage(nullptr, &bytes);
     return bytes;
+}
+
+bool SkiaBackendContext::can_hold_texture_of_size(IntSize size) const
+{
+    auto* context = sk_context();
+    if (!context)
+        return false;
+    auto max_texture_size = context->maxTextureSize();
+    return size.width() <= max_texture_size && size.height() <= max_texture_size;
 }
 
 void SkiaBackendContext::initialize_gpu_backend(Optional<GpuDeviceIdentity> const& preferred_device)

@@ -1,31 +1,94 @@
 <!DOCTYPE html>
 <script src="../include.js"></script>
+<script src="../work-test.js"></script>
+<!-- Changing the value of an effect or a transform patches the box's node in place: the tree keeps its structure, and
+     the recorded display list needs no new recording. A transformed box may have moved across the edge of the window
+     the published recording was made for, so a recording made after its transform changed walks down to it, and
+     copies everything. -->
 <div id="box" style="width: 100px; height: 100px; opacity: 0.5; transform: translateX(10px)"></div>
+<div id="relative-box" style="position: relative; width: 100px; height: 100px; opacity: 0.5"></div>
+<div id="backdrop-box" style="width: 100px; height: 100px; backdrop-filter: invert(1)"></div>
 <script>
-    test(() => {
-        const settle = () => document.elementFromPoint(0, 0);
-        const box = document.getElementById("box");
-        settle();
-        const liveNodes = internals.visualContextTreeNodeCount();
-        const capacity = internals.visualContextTreeNodeCapacity();
-        const epoch = internals.visualContextTreeStructuralEpoch();
-        const fullBuilds = internals.accumulatedVisualContextTreeBuildCount();
-        const incrementalUpdates = internals.accumulatedVisualContextIncrementalUpdateCount();
-
-        box.style.opacity = "0.6";
-        box.style.transform = "translateX(20px)";
-        const rect = box.getBoundingClientRect();
-        settle();
-
-        const lines = [
-            `rect x: ${rect.x}`,
-            `full builds: ${internals.accumulatedVisualContextTreeBuildCount() - fullBuilds}`,
-            `incremental updates: ${internals.accumulatedVisualContextIncrementalUpdateCount() - incrementalUpdates}`,
-            `live nodes unchanged: ${internals.visualContextTreeNodeCount() === liveNodes}`,
-            `capacity unchanged: ${internals.visualContextTreeNodeCapacity() === capacity}`,
-            `epoch unchanged: ${internals.visualContextTreeStructuralEpoch() === epoch}`,
-        ];
-        for (const line of lines)
-            println(line);
+    const quietRecording = `
+        @canvas RECORD (empty)
+        @viewport COPY
+    `;
+    const walkedAndCopied = `
+        @canvas RECORD (empty)
+        @viewport ASSEMBLE
+          @viewport/preamble COPY
+          @viewport/scroll-metadata COPY
+          @viewport/background COPY
+          @viewport/border COPY
+          BlockContainer<HTML>/descendants(background-and-borders) ASSEMBLE
+          @viewport/foreground COPY
+          BlockContainer<HTML>/descendants(foreground) ASSEMBLE
+          BlockContainer<HTML> ASSEMBLE
+            BlockContainer<HTML>/preamble COPY
+            BlockContainer<HTML>/scroll-metadata COPY
+            BlockContainer<HTML>/background COPY
+            BlockContainer<HTML>/border COPY
+            BlockContainer<BODY>/descendants(background-and-borders) ASSEMBLE
+              BlockContainer<BODY>/scroll-metadata COPY
+              BlockContainer<BODY>/background COPY
+              BlockContainer<BODY>/border COPY
+              BlockContainer<DIV>#box/descendants(background-and-borders) COPY
+              BlockContainer<DIV>#relative-box/descendants(background-and-borders) COPY
+              BlockContainer<DIV>#backdrop-box/descendants(background-and-borders) COPY
+            BlockContainer<HTML>/foreground COPY
+            BlockContainer<BODY>/descendants(foreground) ASSEMBLE
+              BlockContainer<BODY>/foreground COPY
+              BlockContainer<DIV>#box/descendants(foreground) COPY
+              BlockContainer<DIV>#relative-box/descendants(foreground) COPY
+              BlockContainer<DIV>#backdrop-box/descendants(foreground) COPY
+              BlockContainer<BODY>/outline COPY
+              BlockContainer<BODY>/overlay COPY
+            BlockContainer<DIV>#box COPY
+            BlockContainer<DIV>#relative-box COPY
+            BlockContainer<DIV>#backdrop-box COPY
+            BlockContainer<HTML>/outline COPY
+          @viewport/outline COPY
+    `;
+    displayListTest({
+        steps: [
+            {
+                name: "opacity and transform values change",
+                mutate: () => {
+                    box.style.opacity = "0.6";
+                    box.style.transform = "translateX(20px)";
+                },
+                check: equal => equal(box.getBoundingClientRect().x, 28, "rect x"),
+                expect: {
+                    visualContexts: `
+                        update DIRTY-PATH
+                          div#box effects UPDATED
+                          div#box transform UPDATED
+                    `,
+                    displayList: walkedAndCopied,
+                },
+            },
+            {
+                name: "opacity value changes on a relative box",
+                mutate: () => { document.getElementById("relative-box").style.opacity = "0.7"; },
+                expect: {
+                    visualContexts: `
+                        update DIRTY-PATH
+                          div#relative-box effects UPDATED
+                    `,
+                    displayList: quietRecording,
+                },
+            },
+            {
+                name: "one backdrop filter replaces another",
+                mutate: () => { document.getElementById("backdrop-box").style.backdropFilter = "invert(0.5)"; },
+                expect: {
+                    visualContexts: `
+                        update DIRTY-PATH
+                          div#backdrop-box effects UPDATED
+                    `,
+                    displayList: quietRecording,
+                },
+            },
+        ],
     });
 </script>

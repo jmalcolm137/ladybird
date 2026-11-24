@@ -9,22 +9,27 @@
 use core::ffi::c_void;
 use core::ptr::NonNull;
 
-use libjs_rust::api::{Gc, MarkedVec, Object, Trace, Vm};
-use liburl_rust::Url;
+use libjs_rust::api::{Gc, MarkedVec, Object, Realm, Trace, Vm};
 
 use crate::bindings::cpp_cell::CppCell;
 use crate::bindings::event_target::CppEventTarget;
 use crate::bindings::interface::Wrappable;
+use crate::bindings::realm_data::realm_data;
+use crate::dom::document::CppDocument;
+use crate::event_timing::event_timing::{WindowEventTimingState, WindowEventTimingStateRef};
+use crate::html::window_or_worker_global_scope::CppWindowOrWorkerGlobalScope;
 
 unsafe extern "C" {
     fn web_bindings_window_from_global_object(global_object: *mut c_void) -> *mut c_void;
     fn web_bindings_for_each_active_window(ctx: *mut c_void, on_window: unsafe extern "C" fn(*mut c_void, *mut c_void));
     fn web_bindings_window_associated_document(window: *mut c_void) -> *mut c_void;
+    fn web_bindings_window_realm(window: *mut c_void) -> *mut c_void;
     fn web_bindings_window_page_id(window: *mut c_void) -> u64;
+    fn web_bindings_window_has_transient_activation(window: *mut c_void) -> bool;
+    fn web_bindings_window_consume_user_activation(window: *mut c_void);
+    fn web_bindings_window_set_last_activation_timestamp_to_now(window: *mut c_void);
+    fn web_bindings_is_service_worker_global_scope(global_object: *mut c_void) -> bool;
     fn web_bindings_window_as_event_target(window: *mut c_void) -> *mut c_void;
-    fn web_bindings_document_has_navigable(document: *mut c_void) -> bool;
-    fn web_bindings_document_is_fully_active(document: *mut c_void) -> bool;
-    fn web_bindings_document_url(document: *mut c_void) -> liburl_rust::RustUrl;
     fn web_bindings_worker_global_scope_from_global_object(global_object: *mut c_void) -> *mut c_void;
     fn web_bindings_worker_global_scope_is_closing(worker_global_scope: *mut c_void) -> bool;
 }
@@ -38,11 +43,6 @@ pub(crate) struct CppWindow(CppCell);
 #[derive(Clone, Trace)]
 #[gc(crate = libjs_rust)]
 pub(crate) struct CppWorkerGlobalScope(CppCell);
-
-/// https://dom.spec.whatwg.org/#document
-#[derive(Clone, Trace)]
-#[gc(crate = libjs_rust)]
-pub(crate) struct CppDocument(CppCell);
 
 /// The cell of a C++ object that LibWeb returns, or None for a null pointer.
 ///
@@ -79,6 +79,22 @@ pub(crate) fn worker_global_scope_from_global_object(global_object: Gc<Object>) 
     .map(CppWorkerGlobalScope)
 }
 
+pub(crate) fn is_service_worker_global_scope(global_object: Gc<Object>) -> bool {
+    // SAFETY: The global object is live.
+    unsafe { web_bindings_is_service_worker_global_scope(global_object.as_ptr().cast()) }
+}
+
+pub(crate) fn window_or_worker_global_scope_from_global_object(
+    global_object: Gc<Object>,
+) -> Option<CppWindowOrWorkerGlobalScope> {
+    if window_from_global_object(global_object).is_some()
+        || worker_global_scope_from_global_object(global_object).is_some()
+    {
+        return Some(CppWindowOrWorkerGlobalScope(global_object));
+    }
+    None
+}
+
 unsafe extern "C" fn on_active_window(windows: *mut c_void, window: *mut c_void) {
     // SAFETY: windows is the list of the caller, and LibWeb passes a live Window.
     unsafe { &*windows.cast::<MarkedVec<'_, CppWindow>>() }.push(CppWindow(unsafe { CppCell::from_raw(window) }));
@@ -93,8 +109,35 @@ pub(crate) fn active_windows(vm: &Vm) -> MarkedVec<'_, CppWindow> {
 }
 
 impl CppWindow {
+    /// # Safety
+    ///
+    /// `window` must be a live Window.
+    pub(crate) unsafe fn from_raw(window: *mut c_void) -> Self {
+        // SAFETY: The caller passes a live Window.
+        Self(unsafe { CppCell::from_raw(window) })
+    }
+
     pub(crate) fn as_ptr(&self) -> *mut c_void {
         self.0.as_ptr()
+    }
+
+    // https://w3c.github.io/event-timing/#sec-modifications-HTML
+    pub(crate) fn event_timing_state(&self, vm: &Vm) -> WindowEventTimingStateRef {
+        let data = realm_data(vm, self.realm());
+        if let Some(state) = data.event_timing_state.get() {
+            return state;
+        }
+        let state = WindowEventTimingState::create(vm);
+        data.event_timing_state.set(Some(state));
+        state
+    }
+
+    /// https://html.spec.whatwg.org/multipage/webappapis.html#concept-relevant-realm
+    pub(crate) fn realm(&self) -> Gc<Realm> {
+        // SAFETY: The Window is live, and LibWeb returns its live relevant realm.
+        let realm = unsafe { web_bindings_window_realm(self.0.as_ptr()) };
+        // SAFETY: The realm is live.
+        unsafe { Gc::from_non_null(NonNull::new(realm.cast()).expect("a Window has a relevant realm")) }
     }
 
     /// The Window as an EventTarget.
@@ -109,30 +152,28 @@ impl CppWindow {
         unsafe { web_bindings_window_page_id(self.0.as_ptr()) }
     }
 
+    /// https://html.spec.whatwg.org/multipage/interaction.html#transient-activation
+    pub(crate) fn has_transient_activation(&self) -> bool {
+        // SAFETY: The Window is live.
+        unsafe { web_bindings_window_has_transient_activation(self.0.as_ptr()) }
+    }
+
+    /// https://html.spec.whatwg.org/multipage/interaction.html#consume-user-activation
+    pub(crate) fn consume_user_activation(&self) {
+        // SAFETY: The Window is live.
+        unsafe { web_bindings_window_consume_user_activation(self.0.as_ptr()) };
+    }
+
+    /// https://html.spec.whatwg.org/multipage/interaction.html#last-activation-timestamp
+    pub(crate) fn set_last_activation_timestamp_to_now(&self) {
+        // SAFETY: The Window is live.
+        unsafe { web_bindings_window_set_last_activation_timestamp_to_now(self.0.as_ptr()) };
+    }
+
     /// https://html.spec.whatwg.org/multipage/nav-history-apis.html#concept-document-window
     pub(crate) fn associated_document(&self) -> CppDocument {
         // SAFETY: The Window is live, and LibWeb returns its live associated Document.
-        CppDocument(unsafe { CppCell::from_raw(web_bindings_window_associated_document(self.0.as_ptr())) })
-    }
-}
-
-impl CppDocument {
-    /// https://html.spec.whatwg.org/multipage/document-sequences.html#fully-active
-    pub(crate) fn is_fully_active(&self) -> bool {
-        // SAFETY: The Document is live.
-        unsafe { web_bindings_document_is_fully_active(self.0.as_ptr()) }
-    }
-
-    /// Whether the Document's node navigable is not null, https://html.spec.whatwg.org/multipage/document-sequences.html#node-navigable
-    pub(crate) fn has_navigable(&self) -> bool {
-        // SAFETY: The Document is live.
-        unsafe { web_bindings_document_has_navigable(self.0.as_ptr()) }
-    }
-
-    /// https://dom.spec.whatwg.org/#concept-document-url
-    pub(crate) fn url(&self) -> Url {
-        // SAFETY: The Document is live, and LibWeb lends its URL, which this copies before the Document can change it.
-        unsafe { web_bindings_document_url(self.0.as_ptr()).to_url() }
+        unsafe { CppDocument::from_raw(web_bindings_window_associated_document(self.0.as_ptr())) }
     }
 }
 

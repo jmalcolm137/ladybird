@@ -47,12 +47,16 @@ public:
     void set_settings_from_hub(JsonValue const&);
     void send_settings_changes(JsonValue const&);
 
+    // What the Hub decided about the GPU and media platform features, as a report describes it.
+    void fetch_platform_features_description(Function<void(ByteString)>);
+
 private:
     Core::GeolocationProvider* ensure_geolocation_provider();
 
     bool m_did_initialize { false };
     u64 m_next_request_id { 1 };
     HashMap<u64, Function<void(RequestResponse)>> m_requests;
+    HashMap<u64, Function<void(ByteString)>> m_platform_features_description_requests;
     OwnPtr<Core::GeolocationProvider> m_geolocation_provider;
     HashMap<u64, Core::GeolocationProvider::RequestId> m_geolocation_requests;
     HashMap<u64, Core::GeolocationProvider::WatchId> m_geolocation_watches;
@@ -82,12 +86,14 @@ private:
     virtual void view_selected_text(u64 view_id, u64 request_id, Optional<ByteString> text) override;
     virtual void view_close_preflight_finished(u64 view_id, u64 request_id, bool may_close) override;
     virtual void view_page_dumps(u64 view_id, u64 request_id, Optional<String> dumps) override;
+    virtual void platform_features_description(u64 request_id, ByteString description) override;
     virtual void pip_open(u64 view_id, u64 owner_view_id, Gfx::IntSize video_size) override;
     virtual void pip_hide(u64 view_id) override;
     virtual void pip_set_video_size(u64 view_id, Gfx::IntSize video_size) override;
     virtual void pip_close(u64 view_id) override;
     virtual void notification_show(u64 id, u64 page_id, Optional<u64> replaces, Web::NotificationsAPI::NotificationData data, String attribution, Optional<Gfx::ShareableBitmap> icon) override;
     virtual void notification_close(u64 id) override;
+    virtual void media_session_update(Optional<Web::MediaSession::MediaSessionState>) override;
     virtual void geolocation_start() override;
     virtual void geolocation_request_position(u64 id) override;
     virtual void geolocation_cancel_position_request(u64 id) override;
@@ -101,6 +107,7 @@ private:
     virtual void translator_translate(u64 request_id, u64 session_id, Web::TranslationUnit unit) override;
     virtual void translator_open_language_download_settings() override;
     virtual void microphone_request_authorization() override;
+    virtual void default_browser_make_default() override;
     virtual void gamepad_start(bool ignore_system_gamepads) override;
     virtual void gamepad_set_polling(bool polling) override;
     virtual void gamepad_rumble(u32 handle, u16 low_frequency_magnitude, u16 high_frequency_magnitude, u32 duration_ms) override;
@@ -128,12 +135,14 @@ private:
     virtual void app_update_tabs_display() override;
     virtual void app_did_clear_history_since(UnixDateTime since) override;
     virtual void app_quit_for_signal() override;
-    virtual void app_did_enable_devtools() override;
+    virtual void app_did_enable_devtools(u16 port) override;
     virtual void app_did_disable_devtools() override;
+    virtual void app_gpu_painting_changed(bool gpu_painting_enabled) override;
     virtual void app_open_urls_in_new_tabs(Vector<URL::URL> urls) override;
     virtual void app_activate_or_open_tab_with_url(URL::URL url) override;
     virtual void app_open_view_in_new_tab(u64 view_id, Optional<u64> source_view_id, WebView::IsPrivate is_private, Web::HTML::ActivateTab activate_tab) override;
     virtual void app_display_error_dialog(String message) override;
+    virtual void app_display_update_check_result(WebView::UpdateCheckResult::Kind, Optional<String> version, WebView::InstallMethod, WebView::UpdateCheckTrigger) override;
     virtual void app_display_download_confirmation_dialog(String download_name, ByteString path) override;
     virtual void app_read_clipboard_text(u64 request_id, WebView::Application::ClipboardType type) override;
     virtual void app_read_clipboard_item(u64 request_id) override;
@@ -165,6 +174,12 @@ private:
     virtual void view_keep_front_backing_store_as_backup(u64 view_id) override;
     virtual void view_clear_backup_backing_store(u64 view_id) override;
     virtual void view_clear_backing_stores(u64 view_id) override;
+    virtual void view_set_remote_layer(u64 view_id, Compositing::RemoteLayerHostHandle host_handle) override;
+    virtual void view_did_present_frame_in_remote_layer(u64 view_id, Gfx::IntSize size, double device_pixel_ratio) override;
+    virtual void view_did_take_frame_snapshot(u64 view_id, u64 request_id, Optional<Gfx::ShareableBitmap> snapshot) override;
+    // NB: A view waits for these while CoreAnimation commits a resize, and ignores those that come too late.
+    virtual void view_did_hold_synchronized_resize_frame(u64, u64) override { }
+    virtual void view_did_commit_synchronized_resize(u64, u64) override { }
     virtual void view_finish_handling_key_event(u64 view_id, u64 input_id, Web::KeyEvent event) override;
     virtual void view_finish_handling_mouse_event(u64 view_id, u64 input_id, Web::MouseEvent event, Web::EventResult result) override;
     virtual void view_finish_handling_drag_event(u64 view_id, u64 input_id, Web::DragEvent event) override;
@@ -174,6 +189,7 @@ private:
     virtual void view_load_finish(u64 view_id, URL::URL url) override;
     virtual void view_activate_tab(u64 view_id) override;
     virtual void view_close(u64 view_id) override;
+    virtual void view_discard(u64 view_id) override;
     virtual void view_link_hover(u64 view_id, URL::URL url) override;
     virtual void view_link_unhover(u64 view_id) override;
     virtual void view_title_change(u64 view_id, Utf16String title) override;
@@ -218,6 +234,7 @@ private:
     virtual void view_crash_overlay_state_change(u64 view_id, bool active) override;
     virtual void view_crash_report_saved(u64 view_id) override;
     virtual void view_performance_stats(u64 view_id, WebView::TabPerformanceStats stats) override;
+    virtual void view_compositor_layers_change(u64 view_id, Compositing::CompositorLayersDescription layers) override;
 };
 
 }

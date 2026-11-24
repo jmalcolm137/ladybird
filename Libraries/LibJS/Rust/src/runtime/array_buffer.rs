@@ -801,9 +801,12 @@ impl ArrayBuffer {
         };
 
         let prototype = prototype_for_shared_state(vm, realm, is_shared);
-        Ok(realm.create_object(vm, |_| {
+        let array_buffer = realm.create_object(vm, |_| {
             ArrayBuffer::new_with_buffer(vm, realm, buffer, is_shared, prototype)
-        }))
+        });
+        vm.heap()
+            .did_allocate_external_memory(array_buffer.external_memory_size());
+        Ok(array_buffer)
     }
 
     /// ArrayBuffer::create(Realm&, ByteBuffer, DataBlock::Shared)
@@ -1419,6 +1422,23 @@ impl ArrayBuffer {
             _ => unreachable!("Atomics.wait waits on 4-byte or 8-byte elements"),
         };
         waiter_list::atomic_wait(word, expected, timeout, waiter)
+    }
+
+    pub fn atomic_wait_async(
+        &self,
+        byte_index: usize,
+        expected: u64,
+        size: usize,
+        immediate_timeout: bool,
+        waiter: &Arc<waiter_list::AsyncWaiter>,
+    ) -> Option<AtomicWaitResult> {
+        let data_block = self.data_block.borrow();
+        let word = match size {
+            4 => WaitWord::Word32(data_block.atomic_at(byte_index)),
+            8 => WaitWord::Word64(data_block.atomic_at(byte_index)),
+            _ => unreachable!("atomic waits require a 4-byte or 8-byte element"),
+        };
+        waiter_list::atomic_wait_async(word, expected, immediate_timeout, waiter)
     }
 
     /// waiter_list::atomic_notify() on the word at `byte_index`.

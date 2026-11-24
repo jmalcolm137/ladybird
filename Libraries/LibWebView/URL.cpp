@@ -113,6 +113,13 @@ ClassifiedUserInput classify_user_input(StringView location, AppendTLD append_tl
         return {};
     }
 
+    return classify_user_input_ignoring_local_files(location, append_tld);
+}
+
+ClassifiedUserInput classify_user_input_ignoring_local_files(StringView location, AppendTLD append_tld)
+{
+    location = location.trim_whitespace();
+
     bool https_scheme_was_guessed = false;
     bool input_has_explicit_port = false;
     ByteString schemeless_location;
@@ -232,23 +239,6 @@ Optional<URL::URL> url_from_text(StringView text)
         return {};
 
     return sanitize_url(trimmed_text);
-}
-
-bool autocomplete_urls_match(StringView left, StringView right)
-{
-    auto parse_destination = [](StringView value) {
-        auto classified_input = classify_user_input(value);
-        if (classified_input.url.has_value())
-            return classified_input.url;
-        return URL::Parser::basic_parse(MUST(String::formatted("https://{}", value)));
-    };
-
-    auto left_url = parse_destination(left);
-    auto right_url = parse_destination(right);
-    if (!left_url.has_value() || !right_url.has_value())
-        return false;
-
-    return left_url->equals(*right_url);
 }
 
 bool autocomplete_url_can_complete(StringView query, StringView suggestion)

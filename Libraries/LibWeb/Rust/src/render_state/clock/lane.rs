@@ -156,7 +156,7 @@ pub(crate) struct LaneDelivery {
 impl LaneDelivery {
     /// Hands the lane the recorder state and the seal its ticks present with, from what the recording of its frame
     /// answered. On the Paint thread, once the frame is presented.
-    pub(crate) fn deliver(&self, answer: &RecordingAnswer) {
+    pub(crate) fn deliver(&self, answer: &mut RecordingAnswer) {
         let Some((recorder, presentation, output)) = answer.clock_lane_recorder() else {
             // No lane starts from the frame, and the presenter takes no frame of the lane of an earlier one after it:
             // the moves and the animations are the host's.
@@ -167,19 +167,22 @@ impl LaneDelivery {
             return;
         };
         let presented = match output {
-            // NB: The fork took no recording in since the frame was sampled, so the hit-test list moved on.
             Some(output) => TickPresented::Frame {
                 output,
-                hit_test_list_changed: true,
                 publishes: true,
             },
             None => TickPresented::Nothing,
         };
+        let structural_epoch_on_screen = recorder
+            .published_recording
+            .as_ref()
+            .map(|published| published.recorded_structural_epoch);
         let recorder = ClockRecorder {
             recorder,
             presentation,
             presented,
-            presented_hit_test_items: None,
+            structural_epoch_on_screen,
+            held_frame: answer.take_held_frame(),
         };
         let (ticks, frame) = (Arc::clone(&self.ticks), self.frame);
         super::super::post_to_render_side(move || {
@@ -314,6 +317,12 @@ pub(in crate::render_state) fn take_lanes_in(ticks: &Arc<ClockTicks>, update: u6
 #[must_use]
 pub(in crate::render_state) fn take_lane_report(ticks: &Arc<ClockTicks>) -> LaneReport {
     with_slot(ticks.document, LaneSlot::take_report).unwrap_or_default()
+}
+
+/// On the render owner: has the lane of the presented frame of the document `ticks` belong to record it where the
+/// compositor scrolled to past what the display list it shows holds.
+pub(super) fn record_where_scrolled(ticks: &Arc<ClockTicks>) {
+    with_slot(ticks.document, LaneSlot::record_where_scrolled);
 }
 
 /// On the render owner: runs the tick queued for the lanes `ticks` belong to.
@@ -508,13 +517,22 @@ impl LaneSlot {
         }));
     }
 
-    fn tick(&mut self) {
-        self.take_in_scroll_offsets();
-        // A recording of the host's own adds to the resource storage the lane presents with: a move waits for it.
-        if self.ticks.is_held() {
-            self.show_cursor_where_a_move_waits();
+    fn record_where_scrolled(&mut self) {
+        let Some(scrolled) = self.ticks.take_scrolled_past_display_list() else {
+            return;
+        };
+        // A rendering update that took in the lanes presents a frame of its own, which records for where the
+        // compositor scrolled to.
+        if self.taken_in.is_some() {
             return;
         }
+        if let Lanes::Newest(lane) = &mut self.lanes {
+            lane.record_where_scrolled(scrolled);
+        }
+    }
+
+    fn tick(&mut self) {
+        self.take_in_scroll_offsets();
         // A rendering update took in what the lanes did, and the frame it presents shows that, at the time it took it
         // in: the lane of the frame before it presents nothing on from there, which the update's frame would go back
         // from, and the moves and animation times since wait for the lane of the update's frame.
@@ -599,6 +617,7 @@ impl LaneSlot {
             self.presented = true;
             *self.ticks.presented_boxes.lock().expect("presented boxes") = super::PresentedBoxes {
                 border_boxes: lane.presented_border_boxes.clone(),
+                scroll_offsets: lane.presented_scroll_offsets.clone(),
                 colors: lane.presented_colors.clone(),
                 compositor_animations: lane.presented_compositor_animations.clone(),
             };

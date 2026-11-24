@@ -8,12 +8,154 @@ use core::cell::{Cell, RefCell};
 use core::ptr::NonNull;
 use std::alloc::{Layout, alloc, dealloc, handle_alloc_error};
 
+use crate::bytecode::executable::Executable;
 use crate::gc::visitor::{Trace, Visitor};
+use crate::interpreter::vm::Vm;
+use crate::layout::cell::Gc;
+use crate::layout::environment::{Environment, PrivateEnvironment};
 use crate::layout::execution_context::{ExecutionContext, ScriptOrModule, ScriptOrModuleSlot};
 use crate::layout::value::Value;
+use crate::runtime::completion::Must;
+use crate::runtime::ecmascript_function_object::{EcmascriptFunctionObject, as_ecmascript_function_object};
+use crate::runtime::native_function::NativeFunction;
+use crate::runtime::realm::Realm;
+use crate::runtime::shared_function_instance_data::ThisMode;
 use libjs_abi::register::RESERVED_REGISTER_COUNT;
 
 impl ExecutionContext {
+    /// The [[ScriptOrModule]] of the context. That of a frame with a function is the function's, which is null for a
+    /// native function.
+    pub fn script_or_module(&self) -> ScriptOrModule {
+        match self.function.get() {
+            Some(function) => as_ecmascript_function_object(function)
+                .map_or(ScriptOrModule::Empty, |function| function.script_or_module()),
+            None => self.script_or_module_without_function.get(),
+        }
+    }
+
+    /// The [[Realm]] of the context. That of a frame with a function is the function's.
+    pub fn realm(&self) -> Option<Gc<Realm>> {
+        match self.function.get() {
+            Some(function) => function.function_realm(),
+            None => self.realm_without_function.get(),
+        }
+    }
+
+    /// realm(), with the realm of a frame of an ECMAScript function read here: it is that of the function's shape (see
+    /// ECMASCRIPT_FUNCTION_OBJECT_METHODS), which saves the call through the function's method table. For the paths
+    /// that resume suspended frames, which ask on every resume.
+    #[inline]
+    pub fn realm_of_resumed_frame(&self) -> Option<Gc<Realm>> {
+        if let Some(function) = self.function.get()
+            && function.is_ecmascript_function_object()
+        {
+            return Some(function.shape().realm());
+        }
+        self.realm()
+    }
+
+    /// Sets the [[Realm]] of a context without a function. The context must not be running yet: the VM reads the
+    /// realm of a context when it starts running (see `Vm::set_running_execution_context()`).
+    pub fn set_realm(&self, realm: Option<Gc<Realm>>) {
+        debug_assert!(
+            self.function.get().is_none(),
+            "a context with a function runs in the function's realm"
+        );
+        self.realm_without_function.set(realm);
+    }
+
+    /// Whether the context's code starts with `EnterWithOwnEnvironments`.
+    fn runs_code_that_keeps_own_environments(&self) -> bool {
+        self.executable
+            .get()
+            .is_some_and(|executable| Executable::from_head(executable).keeps_own_environments())
+    }
+
+    /// Whether the context keeps its own [[PrivateEnvironment]]: one without a function, or one whose code makes
+    /// private environments.
+    pub fn keeps_private_environment(&self) -> bool {
+        self.function.get().is_none() || self.runs_code_that_keeps_own_environments()
+    }
+
+    /// Whether the context keeps its own [[VariableEnvironment]]: one without a function, one of a function that needs
+    /// a function environment, or one whose code makes variable environments. That of another ECMAScript function is
+    /// the function's [[Environment]], and a native function has none.
+    pub fn keeps_variable_environment(&self) -> bool {
+        let Some(function) = self.function.get() else {
+            return true;
+        };
+        if let Some(function) = function.downcast::<EcmascriptFunctionObject>() {
+            return function.function_environment_needed() || self.runs_code_that_keeps_own_environments();
+        }
+        function
+            .downcast::<NativeFunction>()
+            .is_some_and(|function| function.function_environment_needed())
+    }
+
+    /// The [[VariableEnvironment]] of the context.
+    pub fn variable_environment(&self) -> Option<Gc<Environment>> {
+        if self.keeps_variable_environment() {
+            return self.variable_environment_in_frame.get();
+        }
+        self.function
+            .get()
+            .and_then(|function| function.downcast::<EcmascriptFunctionObject>())
+            .and_then(|function| function.environment())
+    }
+
+    /// Sets the [[VariableEnvironment]] of a context that keeps its own.
+    pub fn set_variable_environment(&self, variable_environment: Option<Gc<Environment>>) {
+        debug_assert!(
+            self.keeps_variable_environment(),
+            "a context of a function without a function environment has its function's"
+        );
+        self.variable_environment_in_frame.set(variable_environment);
+    }
+
+    /// Whether the variable environment field holds the context's [[VariableEnvironment]], which the code of a
+    /// context that keeps its own sets when it starts.
+    fn holds_variable_environment(&self) -> bool {
+        let Some(function) = self.function.get() else {
+            return true;
+        };
+        match function.downcast::<EcmascriptFunctionObject>() {
+            Some(function) => {
+                function.function_environment_needed()
+                    || (self.frame_initialized.get() && self.runs_code_that_keeps_own_environments())
+            }
+            None => self.keeps_variable_environment(),
+        }
+    }
+
+    /// The [[PrivateEnvironment]] of the context. One that does not keep its own has its function's.
+    pub fn private_environment(&self) -> Option<Gc<PrivateEnvironment>> {
+        if self.keeps_private_environment() {
+            return self.private_environment_in_frame.get();
+        }
+        self.function
+            .get()
+            .and_then(|function| function.downcast::<EcmascriptFunctionObject>())
+            .and_then(|function| function.private_environment())
+    }
+
+    /// Sets the [[PrivateEnvironment]] of a context that keeps its own.
+    pub fn set_private_environment(&self, private_environment: Option<Gc<PrivateEnvironment>>) {
+        debug_assert!(
+            self.keeps_private_environment(),
+            "a context of code that makes no private environment has its function's"
+        );
+        self.private_environment_in_frame.set(private_environment);
+    }
+
+    /// Sets the [[ScriptOrModule]] of a context without a function.
+    pub fn set_script_or_module(&self, script_or_module: ScriptOrModule) {
+        debug_assert!(
+            self.function.get().is_none(),
+            "a context with a function has the function's ScriptOrModule"
+        );
+        self.script_or_module_without_function.set(script_or_module);
+    }
+
     /// Constructs a context for a frame of `slot_count` slots, the last `argument_count` of which hold arguments, at
     /// `context`.
     ///
@@ -25,20 +167,18 @@ impl ExecutionContext {
         registers_and_locals_count: u32,
         slot_count: u32,
         argument_count: u32,
-        frame_id: u64,
     ) {
         // SAFETY: The caller passes memory for the context and its slots.
         unsafe {
             context.write(ExecutionContext {
                 function: Cell::new(None),
-                realm: Cell::new(None),
-                script_or_module: ScriptOrModuleSlot::new(ScriptOrModule::Empty),
+                realm_without_function: Cell::new(None),
+                script_or_module_without_function: ScriptOrModuleSlot::new(ScriptOrModule::Empty),
                 lexical_environment: Cell::new(None),
-                variable_environment: Cell::new(None),
-                private_environment: Cell::new(None),
-                frame_id: Cell::new(frame_id),
+                variable_environment_in_frame: Cell::new(None),
+                private_environment_in_frame: Cell::new(None),
+                frame_id: Cell::new(0),
                 program_counter: Cell::new(0),
-                skip_when_determining_incumbent_counter: Cell::new(0),
                 yield_continuation: Cell::new(ExecutionContext::NO_YIELD_CONTINUATION),
                 yield_is_await: Cell::new(false),
                 yield_value_is_iterator_result: Cell::new(false),
@@ -54,6 +194,8 @@ impl ExecutionContext {
                 argument_count: Cell::new(argument_count),
                 returns_to_native_caller: Cell::new(false),
                 runs_jit_code: Cell::new(false),
+                caller_is_derived_construct: Cell::new(false),
+                new_target: Cell::new(Value::UNDEFINED),
             });
             // NB: Enter initializes the remaining registers, locals, and constants.
             for slot in (*context)
@@ -93,11 +235,14 @@ impl ExecutionContext {
         // NB: We pass the entire non-argument count as registers_and_locals_count with 0 constants.
         let copy = OwnedExecutionContext::create(slot_count - argument_count, 0, argument_count);
         copy.function.set(self.function.get());
-        copy.realm.set(self.realm.get());
-        copy.script_or_module.set(self.script_or_module.get());
+        copy.realm_without_function.set(self.realm_without_function.get());
+        copy.script_or_module_without_function
+            .set(self.script_or_module_without_function.get());
         copy.lexical_environment.set(self.lexical_environment.get());
-        copy.variable_environment.set(self.variable_environment.get());
-        copy.private_environment.set(self.private_environment.get());
+        copy.variable_environment_in_frame
+            .set(self.variable_environment_in_frame.get());
+        copy.private_environment_in_frame
+            .set(self.private_environment_in_frame.get());
         copy.program_counter.set(self.program_counter.get());
         copy.frame_id.set(self.frame_id.get());
         copy.yield_continuation.set(self.yield_continuation.get());
@@ -105,8 +250,11 @@ impl ExecutionContext {
         copy.yield_value_is_iterator_result
             .set(self.yield_value_is_iterator_result.get());
         copy.caller_is_construct.set(self.caller_is_construct.get());
+        copy.caller_is_derived_construct
+            .set(self.caller_is_derived_construct.get());
         copy.frame_initialized.set(self.frame_initialized.get());
         copy.this_value.set(self.this_value.get());
+        copy.new_target.set(self.new_target.get());
         copy.executable.set(self.executable.get());
         copy.passed_argument_count.set(self.passed_argument_count.get());
         let frame_initialized = self.frame_initialized.get();
@@ -127,15 +275,21 @@ impl ExecutionContext {
         let argument_count = self.argument_count.get();
         let copy = OwnedExecutionContext::create(slot_count - argument_count, 0, argument_count);
         copy.function.set(self.function.get());
-        copy.realm.set(self.realm.get());
-        copy.script_or_module.set(self.script_or_module.get());
+        copy.realm_without_function.set(self.realm_without_function.get());
+        copy.script_or_module_without_function
+            .set(self.script_or_module_without_function.get());
         copy.lexical_environment.set(self.lexical_environment.get());
-        copy.variable_environment.set(self.variable_environment.get());
-        copy.private_environment.set(self.private_environment.get());
+        copy.variable_environment_in_frame
+            .set(self.variable_environment_in_frame.get());
+        copy.private_environment_in_frame
+            .set(self.private_environment_in_frame.get());
         copy.program_counter.set(self.program_counter.get());
         copy.frame_id.set(self.frame_id.get());
         copy.caller_is_construct.set(self.caller_is_construct.get());
+        copy.caller_is_derived_construct
+            .set(self.caller_is_derived_construct.get());
         copy.this_value.set(self.this_value.get());
+        copy.new_target.set(self.new_target.get());
         copy.executable.set(self.executable.get());
         // NB: An uninitialized frame holds values only in its reserved registers, which the new context starts with
         //     empty, and its arguments.
@@ -151,16 +305,29 @@ impl ExecutionContext {
 unsafe impl Trace for ExecutionContext {
     fn trace(&self, visitor: &mut Visitor) {
         self.function.trace(visitor);
-        self.realm.trace(visitor);
-        self.variable_environment.trace(visitor);
+        if self.holds_variable_environment() {
+            self.variable_environment_in_frame.trace(visitor);
+        }
         self.lexical_environment.trace(visitor);
-        self.private_environment.trace(visitor);
         self.this_value.trace(visitor);
+        self.new_target.trace(visitor);
         self.executable.trace(visitor);
-        match self.script_or_module.get() {
-            ScriptOrModule::Empty => {}
-            ScriptOrModule::Script(script) => script.trace(visitor),
-            ScriptOrModule::Module(module) => module.trace(visitor),
+        // NB: The field of a frame with a function holds an old value, as script_or_module() says.
+        // NB: Until it is initialized, a frame of code that makes private environments holds an old value.
+        if self.function.get().is_none() || (self.frame_initialized.get() && self.keeps_private_environment()) {
+            self.private_environment_in_frame.trace(visitor);
+        }
+        // NB: A frame with a function holds an old value there too, apart from the lightweight frame of a native
+        //     function call, which has no executable and keeps the caller's realm.
+        if self.function.get().is_none() || self.executable.get().is_none() {
+            self.realm_without_function.trace(visitor);
+        }
+        if self.function.get().is_none() {
+            match self.script_or_module_without_function.get() {
+                ScriptOrModule::Empty => {}
+                ScriptOrModule::Script(script) => script.trace(visitor),
+                ScriptOrModule::Module(module) => module.trace(visitor),
+            }
         }
         let slots = self.slots();
         if self.frame_initialized.get() {
@@ -249,13 +416,7 @@ impl OwnedExecutionContext {
         });
         // SAFETY: The memory has room for the context and its slots, and nothing else uses it.
         unsafe {
-            ExecutionContext::initialize_at(
-                context.as_ptr(),
-                registers_and_locals_count,
-                slot_count,
-                argument_count,
-                0,
-            );
+            ExecutionContext::initialize_at(context.as_ptr(), registers_and_locals_count, slot_count, argument_count);
         }
         Self { context }
     }
@@ -330,4 +491,35 @@ impl Drop for OwnedExecutionContext {
             );
         }
     }
+}
+
+/// Binds the this value of `frame` like OrdinaryCallBindThis(), if it runs a sloppy function that uses it and has an
+/// unbound one: callers pass the this value as it is, and the function starts with `EnterCoercingThis` (or
+/// `EnterWithOwnEnvironments`). Frames that the runtime made have a bound one already.
+pub fn coerce_this(vm: &Vm, frame: &ExecutionContext) {
+    let register = frame.register(libjs_abi::register::THIS_VALUE);
+    let this_argument = register.get();
+    if this_argument.is_object() || this_argument.is_empty() {
+        return;
+    }
+    let Some(function) = frame
+        .function
+        .get()
+        .and_then(|function| function.downcast::<EcmascriptFunctionObject>())
+    else {
+        return;
+    };
+    let shared_data = function.shared_data();
+    if !shared_data.uses_this() || function.this_mode() != ThisMode::Global {
+        return;
+    }
+    // NB: A call into another realm goes through the runtime, so the function runs in the current realm.
+    let this_value = if this_argument.is_nullish() {
+        let realm = vm.current_realm().expect("a function runs in a realm");
+        Value::from_object(realm.global_environment().global_this_value())
+    } else {
+        Value::from_object(this_argument.to_object(vm).must())
+    };
+    register.set(this_value);
+    frame.this_value.set(this_value);
 }

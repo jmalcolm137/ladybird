@@ -27,6 +27,13 @@ namespace WebView {
 
 using namespace Core::CrashReportData;
 
+static DisableSandbox s_disable_sandbox { DisableSandbox::No };
+
+void CrashReport::set_sandbox_is_disabled(DisableSandbox disable_sandbox)
+{
+    s_disable_sandbox = disable_sandbox;
+}
+
 #if !defined(AK_OS_WINDOWS)
 
 // A record keeps a description of the build that wrote it after its last frame, where the crash handler never writes,
@@ -93,6 +100,8 @@ static void append_system_description(StringBuilder& builder)
             ++length;
         builder.appendff("Kernel release: {}\n", release.substring_view(0, length));
     }
+    if (s_disable_sandbox == DisableSandbox::Yes)
+        builder.append("Sandbox: off\n"sv);
 }
 
 ByteString CrashReport::describe_current_build(ProcessType process_type)
@@ -168,6 +177,11 @@ ErrorOr<void> CrashReport::save(int wait_status, ByteString const& path, Optiona
         builder.appendff("Process uptime (seconds): {}\n", (MonotonicTime::now() - m_started_at).to_seconds());
         append_system_description(builder);
     }
+    // A process without features says so, which tells it apart from a report written before there were any.
+    if (m_platform_features_description.is_empty())
+        builder.append("Platform features: []\n"sv);
+    else
+        builder.append(m_platform_features_description);
     if (WIFSIGNALED(wait_status))
         builder.appendff("Termination signal: {}\nTermination signal number: {}\n", signal_name(WTERMSIG(wait_status)), WTERMSIG(wait_status));
     else if (WIFEXITED(wait_status))
@@ -179,9 +193,9 @@ ErrorOr<void> CrashReport::save(int wait_status, ByteString const& path, Optiona
         if (header.signal)
             builder.appendff("Captured signal: {}\nCaptured signal number: {}\nSignal code: {}\n", signal_name(header.signal), header.signal, header.code);
         auto const& assertion = header.assertion;
-        if ((assertion.kind == 1 || assertion.kind == 2 || assertion.kind == 3) && assertion.length <= assertion.message.size()) {
-            builder.append(assertion.kind == 1 ? "Verification failed: "sv : assertion.kind == 2 ? "Assertion failed: "sv
-                                                                                                 : "Rust panic: "sv);
+        if (assertion.kind >= 1 && assertion.kind <= 4 && assertion.length <= assertion.message.size()) {
+            static constexpr StringView prefixes[] = { "Verification failed: "sv, "Assertion failed: "sv, "Rust panic: "sv, "Sandbox violation: "sv };
+            builder.append(prefixes[assertion.kind - 1]);
             for (u32 i = 0; i < assertion.length; ++i) {
                 auto ch = assertion.message[i];
                 builder.append(is_ascii_printable(ch) ? ch : '?');

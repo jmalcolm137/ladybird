@@ -14,10 +14,11 @@ use core::ptr::NonNull;
 use ak::Utf16String;
 use libjs_rust::api::{Gc, GcRefCell, MarkedVec, Realm, Trace, Vm};
 
-use crate::bindings::conversions::{CppInterface, DOMStringOrDOMStringSequence};
+use crate::bindings::conversions::DOMStringOrDOMStringSequence;
 use crate::bindings::event_target::{CppEventTarget, GetTheParent};
 use crate::bindings::interface::{Ref, Wrappable, allocate};
 use crate::bindings::{CallContext, Exception, WebIdlResult};
+use crate::html::dom_string_list::DOMStringList;
 use crate::indexed_db::cpp::{current_event_loop, enqueue_post_gc_task};
 use crate::indexed_db::idb_object_store::{
     IDBObjectStore, constraint_error, invalid_state_error, not_found_error, transaction_inactive_error,
@@ -92,6 +93,8 @@ pub(crate) struct IDBDatabase {
     realm: Gc<Realm>,
 
     // NOTE: We need to keep track of what transactions were created by this connection
+    // NB: Only the ones that have yet to finish, which is all that closing the connection and scheduling transactions
+    //     look at. Keeping the finished ones would keep every transaction of a long-lived connection alive.
     transactions: GcRefCell<Vec<Ref<IDBTransaction>>>,
 }
 
@@ -193,6 +196,17 @@ impl IDBDatabase {
         self.transactions.borrow_mut(vm).push(transaction);
     }
 
+    pub(crate) fn remove_finished_transaction(&self, vm: &Vm, transaction: Ref<IDBTransaction>) {
+        assert!(transaction.is_finished());
+        let mut transactions = self.transactions.borrow_mut(vm);
+        let position = transactions
+            .iter()
+            .position(|entry| *entry == transaction)
+            .expect("a transaction finishes once, on the connection that created it");
+        // NB: Keep the order, which block_on_conflicting_transactions() relies on to find earlier transactions.
+        transactions.remove(position);
+    }
+
     pub(crate) fn name(&self, _: &mut CallContext) -> WebIdlResult<Utf16String> {
         Ok(self.name.clone())
     }
@@ -292,7 +306,7 @@ impl IDBDatabase {
     }
 
     // https://w3c.github.io/IndexedDB/#dom-idbdatabase-objectstorenames
-    pub(crate) fn object_store_names(&self, cx: &mut CallContext) -> WebIdlResult<CppInterface> {
+    pub(crate) fn object_store_names(&self, cx: &mut CallContext) -> WebIdlResult<Ref<DOMStringList>> {
         // 1. Let names be a list of the names of the object stores in this's object store set.
         let names = self
             .object_store_set
@@ -302,7 +316,7 @@ impl IDBDatabase {
             .collect();
 
         // 2. Return the result (a DOMStringList) of creating a sorted name list with names.
-        Ok(create_a_sorted_name_list(cx, names))
+        Ok(create_a_sorted_name_list(cx.vm(), names))
     }
 
     // https://w3c.github.io/IndexedDB/#dom-idbdatabase-deleteobjectstore
@@ -532,6 +546,10 @@ impl IDBDatabase {
             vm,
             &blocking.values(),
             create_function(vm, transaction, |vm, &transaction, ()| {
+                // NB: The transaction may have been aborted while it was blocked, and must not be committed after.
+                if transaction.is_finished() {
+                    return;
+                }
                 assert!(transaction.state() != TransactionState::Active);
                 if transaction.request_list().is_empty() {
                     // https://w3c.github.io/IndexedDB/#transaction-commit
@@ -545,7 +563,10 @@ impl IDBDatabase {
 
                     // FIXME: Update if this becomes explicit:
                     //        https://github.com/w3c/IndexedDB/issues/489#issuecomment-3994928473
-                    commit_a_transaction(vm, transaction);
+                    // NB: A transaction that commit() was called on while it was blocked is already committing.
+                    if transaction.state() != TransactionState::Committing {
+                        commit_a_transaction(vm, transaction);
+                    }
                     return;
                 }
                 if !transaction.is_readonly() {

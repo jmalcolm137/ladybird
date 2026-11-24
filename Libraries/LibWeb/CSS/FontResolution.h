@@ -33,6 +33,7 @@ struct AK::Traits<Web::CSS::ComputedFontCacheKey> : public AK::DefaultTraits<Web
         hash = pair_int_hash(hash, Traits<Web::CSSPixels>::hash(key.font_size));
         if (key.font_size_adjust.has_value())
             hash = pair_int_hash(hash, pair_int_hash(to_underlying(key.font_size_adjust->metric), Traits<double>::hash(key.font_size_adjust->value)));
+        hash = pair_int_hash(hash, key.is_font_size_adjust_probe);
         hash = pair_int_hash(hash, key.font_slope);
         hash = pair_int_hash(hash, Traits<double>::hash(key.font_weight));
         hash = pair_int_hash(hash, Traits<double>::hash(key.font_width.value()));
@@ -51,8 +52,8 @@ namespace Web::CSS {
 // The @font-feature-values a resolution reads for a family, in the tree scope the request comes from.
 using FontFeatureValuesProvider = Function<FontFeatureValues const&(Utf16FlyString const&)>;
 
-// Resolve a font cascade from the @font-face snapshot and the process-wide font services alone. It cannot start a
-// load: a web face it selects is only noted, and request_wanted_web_faces() loads it.
+// Resolve a font cascade from the @font-face snapshot and the process-wide font services alone. It starts no load: a web
+// face it selects waits in the cascade until a rendered code point or a font-relative length wants it.
 [[nodiscard]] NonnullRefPtr<Gfx::FontCascadeList const> resolve_font_cascade(FontFaceSnapshot const&, ComputedFontCacheKey const&, FontFeatureValuesProvider const&);
 
 // The font-family list as font matching wants it: generic families kept apart from names, and a name's syntax kept.

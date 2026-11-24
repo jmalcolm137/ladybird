@@ -18,6 +18,7 @@ use flapc::metadata::SpecializedParameterBinding;
 use flapc::metadata::compute_layouts;
 use flapc::metadata::field_type_info;
 use flapc::metadata::user_fields;
+use flapc::rust_bytecode::ArrayFields;
 use flapc::rust_bytecode::InstructionSet;
 use flapc::rust_bytecode::count_field_name;
 use flapc::rust_bytecode::generate_encode_method;
@@ -30,6 +31,7 @@ use flapc::rust_bytecode::generate_num_opcodes_const;
 use flapc::rust_bytecode::generate_opcode_enum;
 use flapc::rust_bytecode::generate_typed_instructions;
 use flapc::rust_bytecode::rust_field_name;
+use flapc::rust_bytecode::scaled;
 use std::fs;
 use std::io::Write;
 use std::path::Path;
@@ -51,13 +53,14 @@ fn generate_rust_code(
 
     generate_opcode_enum(&mut w, ops)?;
     generate_num_opcodes_const(&mut w, ops)?;
-    generate_instruction_enum(&mut w, ops, "Debug, Clone")?;
+    generate_instruction_enum(&mut w, ops, "Debug, Clone", ArrayFields::Owned)?;
     generate_instruction_impl(&mut w, ops)?;
     generate_instruction_length_from_bytes(&mut w, ops, "super::operand::InstructionLengthError")?;
     generate_instruction_name_from_opcode(&mut w, ops)?;
     generate_instruction_feedback_slots_from_bytes(&mut w, ops)?;
     generate_instruction_dump_from_bytes(&mut w, ops)?;
     generate_visit_labels_from_bytes(&mut w, ops)?;
+    generate_visit_operands_from_bytes(&mut w, ops)?;
     generate_instruction_is_terminator_from_opcode(&mut w, ops)?;
     generate_specialization_selector(&mut w, ops, specializations, specialized_ops)?;
     generate_typed_instructions(
@@ -93,19 +96,21 @@ fn generate_instruction_feedback_slots_from_bytes(
     mut w: impl Write,
     ops: &[InstructionDefinition],
 ) -> Result<(), Box<dyn std::error::Error>> {
-    const KINDS: [&str; 4] = [
+    const KINDS: [&str; 5] = [
         "ArithFeedbackIndex",
         "ValueFeedbackIndex",
         "CallFeedbackIndex",
         "KeyedFeedbackIndex",
+        "ProfiledPropertyLookupCacheIndex",
     ];
     writeln!(
         w,
-        "/// The feedback slot indices of the instruction at `bytes[at..]`: arith, value, call and keyed."
+        "/// The feedback slot indices of the instruction at `bytes[at..]`: arith, value, call, keyed and the property"
     )?;
+    writeln!(w, "/// lookup cache whose site's value feedback it records.")?;
     writeln!(
         w,
-        "pub fn instruction_feedback_slots_from_bytes(opcode: u8, bytes: &[u8], at: usize) -> [Option<u16>; 4] {{"
+        "pub fn instruction_feedback_slots_from_bytes(opcode: u8, bytes: &[u8], at: usize) -> [Option<u16>; 5] {{"
     )?;
     writeln!(w, "    match opcode {{")?;
     for (i, op) in ops.iter().enumerate() {
@@ -126,7 +131,7 @@ fn generate_instruction_feedback_slots_from_bytes(
         }
         writeln!(w, "        {i} => [{}], // {}", slots.join(", "), op.name)?;
     }
-    writeln!(w, "        _ => [None; 4],")?;
+    writeln!(w, "        _ => [None; 5],")?;
     writeln!(w, "    }}")?;
     writeln!(w, "}}")?;
     writeln!(w)?;
@@ -255,10 +260,8 @@ fn generate_array_bounds(
         let elem_size = field_type_info(&f.ty).size;
         writeln!(w, "            let {rname}_offset = at + {offset};")?;
         writeln!(w, "            let {rname}_count = {count_name} as usize;")?;
-        writeln!(
-            w,
-            "            let {rname}_end = {rname}_offset + {rname}_count * {elem_size};"
-        )?;
+        let length = scaled(&format!("{rname}_count"), elem_size);
+        writeln!(w, "            let {rname}_end = {rname}_offset + {length};")?;
     }
     Ok(())
 }
@@ -463,11 +466,19 @@ fn generate_instruction_dump_from_bytes(
                     w,
                     "            dumper.append_piece(|dumper| dumper.append_put_kind(\"{label}\", {rname}));"
                 )?,
-                "ArithFeedbackIndex" | "ValueFeedbackIndex" | "CallFeedbackIndex" | "KeyedFeedbackIndex" => writeln!(
+                "ArithFeedbackIndex"
+                | "ValueFeedbackIndex"
+                | "CallFeedbackIndex"
+                | "KeyedFeedbackIndex"
+                | "PropertyLookupCacheIndex"
+                | "ProfiledPropertyLookupCacheIndex"
+                | "GlobalVariableCacheIndex"
+                | "EnvironmentCoordinateCacheIndex"
+                | "ObjectShapeCacheIndex" => writeln!(
                     w,
                     "            dumper.append_piece(|dumper| dumper.append_number(\"{label}\", {rname}));"
                 )?,
-                _ if (ty == "i32" || ty == "u32" || ty == "u64" || ty == "u8")
+                _ if (ty == "i32" || ty == "u32" || ty == "u64" || ty == "u8" || ty == "u16")
                     && !count_fields.contains(f.name.as_str()) =>
                 {
                     writeln!(
@@ -483,6 +494,57 @@ fn generate_instruction_dump_from_bytes(
     }
 
     writeln!(w, "        _ => unreachable!(\"unknown bytecode opcode\"),")?;
+    writeln!(w, "    }}")?;
+    writeln!(w, "}}")?;
+    writeln!(w)?;
+    Ok(())
+}
+
+/// Emit the function that finds every operand of the instruction at an offset, for the code that rewrites what
+/// has been assembled. It calls the visitor with the offset of the operand and whether the instruction reads it,
+/// writes it, and may leave it out.
+fn generate_visit_operands_from_bytes(
+    mut w: impl Write,
+    ops: &[InstructionDefinition],
+) -> Result<(), Box<dyn std::error::Error>> {
+    writeln!(w, "#[allow(unused_variables)]")?;
+    writeln!(
+        w,
+        "pub fn visit_operands_from_bytes(opcode: u8, bytes: &[u8], at: usize, visitor: &mut dyn FnMut(usize, bool, bool, bool)) {{"
+    )?;
+    writeln!(w, "    match opcode {{")?;
+    for (i, op) in ops.iter().enumerate() {
+        let operand_fields: Vec<&Field> = user_fields(op)
+            .into_iter()
+            .filter(|f| f.ty == "Operand" || f.ty == "Optional<Operand>")
+            .collect();
+        if operand_fields.is_empty() {
+            continue;
+        }
+        writeln!(w, "        {i} => {{")?;
+        generate_field_reads(&mut w, op, READER)?;
+        for f in operand_fields {
+            let offset = op.layout.field_offsets[&f.name];
+            let reads = f.mode != flapc::metadata::ParameterMode::Out;
+            let writes = f.mode != flapc::metadata::ParameterMode::In;
+            let optional = f.ty != "Operand";
+            if f.is_array {
+                let count = rust_field_name(count_field_name(op, f));
+                let element_size = op.array.as_ref().expect("array metadata").element_size;
+                writeln!(w, "            for index in 0..{count} as usize {{")?;
+                let element_offset = scaled("index", element_size);
+                writeln!(
+                    w,
+                    "                visitor(at + {offset} + {element_offset}, {reads}, {writes}, {optional});"
+                )?;
+                writeln!(w, "            }}")?;
+            } else {
+                writeln!(w, "            visitor(at + {offset}, {reads}, {writes}, {optional});")?;
+            }
+        }
+        writeln!(w, "        }}")?;
+    }
+    writeln!(w, "        _ => {{}}")?;
     writeln!(w, "    }}")?;
     writeln!(w, "}}")?;
     writeln!(w)?;
@@ -541,6 +603,7 @@ fn generate_instruction_impl(
         ops,
         "encode_into_block",
         "crate::bytecode::codegen::emitter::BlockEncoder<'_>",
+        ArrayFields::Owned,
     )?;
     generate_visit_labels_method(&mut w, ops)?;
     writeln!(w, "    }}")?;

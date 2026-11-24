@@ -6,6 +6,7 @@
 
 #include <AK/Checked.h>
 #include <AK/ConditionVariable.h>
+#include <AK/Math.h>
 #include <AK/Queue.h>
 #include <AK/Variant.h>
 #include <LibCore/EventLoop.h>
@@ -28,6 +29,7 @@ public:
         AK::Duration decode_timestamp;
         AK::Duration duration;
         FrameFlags flags { FrameFlags::None };
+        Optional<float> maximum_scene_luminance;
         Optional<ByteBuffer> new_codec_configuration;
         DecodeIntent intent { DecodeIntent::Output };
         Optional<AK::Duration> output_target;
@@ -91,7 +93,7 @@ private:
         Mutex mutex;
         ConditionVariable condition { mutex };
         bool storage_was_freed { false };
-        bool output_arrived { false };
+        bool decode_completed { false };
     };
 
     DecoderSession(ThreadSafeWeakRef<VideoDecoderServerConnection> connection, Core::EventLoop& connection_event_loop, ReadonlySpan<VideoDecoderRegistration> hosted_decoders, u64 decoder_id, u32 generation, CodecID codec_id, ByteBuffer codec_initialization_data)
@@ -111,19 +113,19 @@ private:
         create_decoder();
         while (true) {
             Optional<Command> command;
-            auto output_arrived = false;
+            auto decode_completed = false;
             {
                 MutexLocker locker { m_wait_state->mutex };
-                while (m_commands.is_empty() && !m_wait_state->output_arrived && !m_exit_requested)
+                while (m_commands.is_empty() && !m_wait_state->decode_completed && !m_exit_requested)
                     m_wait_state->condition.wait();
                 if (m_exit_requested)
                     break;
-                output_arrived = exchange(m_wait_state->output_arrived, false);
+                decode_completed = exchange(m_wait_state->decode_completed, false);
                 if (!m_commands.is_empty())
                     command = m_commands.dequeue();
             }
             // Output the decoder finished on its own goes out before the next command, which it does not depend on.
-            if (output_arrived && !m_failure.has_value())
+            if (decode_completed && !m_failure.has_value())
                 take_outputs();
             if (command.has_value()) {
                 command->visit(
@@ -132,6 +134,7 @@ private:
                     [&](Flush const& flush) { apply_flush(flush.generation); },
                     [&](ReplaceRing& replace_ring) { m_ring = move(replace_ring.ring); });
             }
+            report_whether_any_decode_is_in_progress();
         }
         m_decoder.clear();
     }
@@ -156,9 +159,9 @@ private:
             wait_state->storage_was_freed = true;
             wait_state->condition.broadcast();
         });
-        m_decoder->set_output_arrived_callback([wait_state = m_wait_state] {
+        m_decoder->set_decode_completed_callback([wait_state = m_wait_state](DecodeCompletion) {
             MutexLocker locker { wait_state->mutex };
-            wait_state->output_arrived = true;
+            wait_state->decode_completed = true;
             wait_state->condition.broadcast();
         });
     }
@@ -183,8 +186,20 @@ private:
         });
     }
 
+    void report_whether_any_decode_is_in_progress()
+    {
+        auto any_decode_is_in_progress = m_decoder && m_decoder->has_any_decode_in_progress();
+        if (any_decode_is_in_progress == m_any_decode_was_reported_in_progress)
+            return;
+        m_any_decode_was_reported_in_progress = any_decode_is_in_progress;
+        m_connection.with_target([&](auto& connection) {
+            connection.async_any_decode_in_progress_changed(m_decoder_id, any_decode_is_in_progress);
+        });
+    }
+
     void acknowledge_submission()
     {
+        report_whether_any_decode_is_in_progress();
         m_connection.with_target([&](auto& connection) {
             connection.async_coded_frame_consumed(m_decoder_id);
         });
@@ -197,11 +212,16 @@ private:
         if (!m_ring.is_valid() || end.has_overflow() || end.value() > m_ring.size())
             return DecoderError::with_description(DecoderErrorCategory::Invalid, "A coded frame lies outside its ring"sv);
 
+        if (auto luminance = submission.maximum_scene_luminance; luminance.has_value() && (!isfinite(*luminance) || *luminance <= 0))
+            return DecoderError::with_description(DecoderErrorCategory::Invalid, "A coded frame's scene peak is not a positive luminance"sv);
+
         auto data = DECODER_TRY_ALLOC(FixedArray<u8>::create(m_ring.bytes().slice(submission.ring_offset, submission.size)));
         Optional<FixedArray<u8>> new_codec_configuration;
         if (submission.new_codec_configuration.has_value())
             new_codec_configuration = DECODER_TRY_ALLOC(FixedArray<u8>::create(submission.new_codec_configuration->bytes()));
-        return CodedFrame { m_codec_id, submission.presentation_timestamp, submission.decode_timestamp, submission.duration, submission.flags, move(data), move(new_codec_configuration) };
+        CodedFrame coded_frame { m_codec_id, submission.presentation_timestamp, submission.decode_timestamp, submission.duration, submission.flags, move(data), move(new_codec_configuration) };
+        coded_frame.set_maximum_scene_luminance(submission.maximum_scene_luminance);
+        return coded_frame;
     }
 
     void decode_submission(Submission& submission)
@@ -332,6 +352,7 @@ private:
     // Only the decoder thread uses these.
     OwnPtr<VideoDecoder> m_decoder;
     Optional<DecoderError> m_failure;
+    bool m_any_decode_was_reported_in_progress { false };
     u32 m_generation { 0 };
     // The latest submission's, which output the decoder finishes later is taken with as well.
     Optional<AK::Duration> m_output_target;
@@ -411,7 +432,7 @@ void VideoDecoderServerConnection::replace_coded_data_ring(u64 decoder_id, Core:
         (*session)->enqueue(DecoderSession::ReplaceRing { move(ring) });
 }
 
-void VideoDecoderServerConnection::submit_coded_frame(u64 decoder_id, u32 generation, u64 ring_offset, u64 size, AK::Duration presentation_timestamp, AK::Duration decode_timestamp, AK::Duration duration, FrameFlags flags, Optional<ByteBuffer> new_codec_configuration, DecodeIntent intent, Optional<AK::Duration> output_target)
+void VideoDecoderServerConnection::submit_coded_frame(u64 decoder_id, u32 generation, u64 ring_offset, u64 size, AK::Duration presentation_timestamp, AK::Duration decode_timestamp, AK::Duration duration, FrameFlags flags, Optional<float> maximum_scene_luminance, Optional<ByteBuffer> new_codec_configuration, DecodeIntent intent, Optional<AK::Duration> output_target)
 {
     auto session = m_sessions.get(decoder_id);
     if (!session.has_value())
@@ -424,6 +445,7 @@ void VideoDecoderServerConnection::submit_coded_frame(u64 decoder_id, u32 genera
         .decode_timestamp = decode_timestamp,
         .duration = duration,
         .flags = flags,
+        .maximum_scene_luminance = maximum_scene_luminance,
         .new_codec_configuration = move(new_codec_configuration),
         .intent = intent,
         .output_target = output_target,

@@ -1,4 +1,4 @@
-$1a7f12f1 expression-identifier-number-format.js:1:5
+$51c7d872 expression-identifier-number-format.js:1:5
   Registers: 8
   Blocks:    1
   Constants:
@@ -8,15 +8,15 @@ $1a7f12f1 expression-identifier-number-format.js:1:5
 
 block0:
   [   0] Enter
-  [   8] Mov dst:reg5, src:Undefined
-  [  18] NewObject dst:reg6
-  [  28] SetGlobal `x`, src:reg6
-  [  38] GetGlobal value_feedback:0, dst:reg6, `x`
-  [  48] NewObject dst:reg7
-  [  58] PutByValue keyed_feedback:0, base:reg6, property:Double(1.1e-32), src:reg7, kind:Normal
-  [  78] Mov dst:reg5, src:reg7
-  [  88] GetGlobal value_feedback:1, dst:reg6, `x`
-  [  98] GetByValue value_feedback:2, keyed_feedback:1, dst:reg6, base:reg6, property:Double(1.1e-32)
-  [  b8] PutById base:reg6, `foo`, src:Int32(42), kind:Normal
-  [  d8] Mov dst:reg5, src:Int32(42)
-  [  e8] End value:reg5
+  [   1] Mov dst:reg5, src:Undefined
+  [   4] NewObject dst:reg6
+  [   8] SetGlobal `x`, src:reg6
+  [   e] GetGlobal value_feedback:0, dst:reg6, `x`
+  [  16] NewObject dst:reg7
+  [  1a] PutByValue keyed_feedback:0, base:reg6, property:Double(1.1e-32), src:reg7, kind:Normal
+  [  23] Mov dst:reg5, src:reg7
+  [  26] GetGlobal value_feedback:1, dst:reg6, `x`
+  [  2e] GetByValue keyed_feedback:1, dst:reg6, base:reg6, property:Double(1.1e-32)
+  [  36] PutById base:reg6, `foo`, src:Int32(42), kind:Normal
+  [  3e] Mov dst:reg5, src:Int32(42)
+  [  41] End value:reg5

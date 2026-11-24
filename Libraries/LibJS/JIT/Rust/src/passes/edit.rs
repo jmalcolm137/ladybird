@@ -7,31 +7,36 @@
 //! Graph edits shared by the passes: replacing values, removing nodes, and
 //! cleaning up the control flow graph after control nodes lost successors.
 
-use crate::bitset::BitSet;
 use crate::code::Repr;
-use crate::fast_hash::HashMap;
-use crate::inline_vec::InlineVec;
 use crate::ir::BlockId;
 use crate::ir::FrameState;
 use crate::ir::FrameStateId;
 use crate::ir::Graph;
-use crate::ir::Node;
 use crate::ir::NodeId;
 use crate::ir::Op;
-use crate::ir::Successors;
+use ak::Zone;
+use ak::ZoneBitSet;
+use ak::ZoneMap;
+use ak::ZoneVec;
 
 /// Values to replace by other values, as a pass decides them.
-pub struct Replacements {
-    map: Vec<Option<NodeId>>,
+pub struct Replacements<'w> {
+    map: ZoneVec<'w, Option<NodeId>>,
     initial_node_count: usize,
 }
 
-impl Replacements {
-    pub fn new(graph: &Graph) -> Self {
+impl<'w> Replacements<'w> {
+    /// No replacements, which keep their table in `work`.
+    pub fn new(graph: &Graph, work: &'w Zone) -> Self {
         Self {
-            map: Vec::new(),
+            map: ZoneVec::new_in(work),
             initial_node_count: graph.nodes.len(),
         }
+    }
+
+    /// Forgets all replacements. The table keeps its memory.
+    pub fn clear(&mut self) {
+        self.map.clear();
     }
 
     /// Makes every use of `value` a use of `replacement` instead.
@@ -77,10 +82,10 @@ impl Replacements {
 /// the value it refines, once the passes no longer move or share nodes:
 /// `Refine` nodes go away, and checks no longer have a value, so that
 /// refining costs no register.
-pub fn remove_refinements(graph: &mut Graph) {
-    let mut replacements = Replacements::new(graph);
-    let mut removed = BitSet::new(graph.nodes.len());
-    let mut checks = Vec::new();
+pub fn remove_refinements(graph: &mut Graph, work: &Zone) {
+    let mut replacements = Replacements::new(graph, work);
+    let mut removed = ZoneBitSet::new_in(graph.nodes.len(), work);
+    let mut checks = ZoneVec::new_in(work);
     for block in &graph.blocks {
         for node in &block.body {
             let data = graph.node(*node);
@@ -105,7 +110,7 @@ pub fn remove_refinements(graph: &mut Graph) {
 
 /// Removes the nodes in `removed` from the blocks they are in. Nodes added
 /// after `removed` was made are kept.
-pub fn remove_nodes(graph: &mut Graph, removed: &BitSet) {
+pub fn remove_nodes(graph: &mut Graph, removed: &ZoneBitSet) {
     let is_removed = |node: &NodeId| node.index() < removed.capacity() && removed.contains(node.index());
     for block in &mut graph.blocks {
         block.body.retain(|node| !is_removed(node));
@@ -127,21 +132,24 @@ pub fn make_wrapping(graph: &mut Graph, node: NodeId) {
 /// The constant nodes of a graph by their bits and representation, for
 /// passes that need constants: `get()` and `get_typed()` add those the
 /// graph does not have yet.
-pub struct Constants {
-    nodes: HashMap<(u64, Repr), NodeId>,
+pub struct Constants<'w> {
+    nodes: ZoneMap<'w, (u64, Repr), NodeId>,
 }
 
-impl Constants {
-    pub fn new(graph: &Graph) -> Self {
-        let nodes = graph
-            .nodes
-            .iter()
-            .enumerate()
-            .filter_map(|(index, node)| match (&node.op, node.repr) {
-                (Op::Constant(bits), Some(repr)) => Some(((*bits, repr), NodeId::from_index(index))),
-                _ => None,
-            })
-            .collect();
+impl<'w> Constants<'w> {
+    /// The constants of `graph`, with their table in `work`.
+    pub fn new(graph: &Graph, work: &'w Zone) -> Self {
+        let nodes = ZoneMap::from_iter_in(
+            graph
+                .nodes
+                .iter()
+                .enumerate()
+                .filter_map(|(index, node)| match (&node.op, node.repr) {
+                    (Op::Constant(bits), Some(repr)) => Some(((*bits, repr), NodeId::from_index(index))),
+                    _ => None,
+                }),
+            work,
+        );
         Self { nodes }
     }
 
@@ -155,20 +163,20 @@ impl Constants {
         *self
             .nodes
             .entry((bits, repr))
-            .or_insert_with(|| graph.add_node(Node::new(Op::Constant(bits), Vec::new(), Some(repr), 0)))
+            .or_insert_with(|| graph.add(Op::Constant(bits), &[], Some(repr), 0))
     }
 }
 
 /// Whether an entry reaches each block over the edges the control nodes
 /// have.
-fn reachable_blocks(graph: &Graph) -> Vec<bool> {
+fn reachable_blocks<'w>(graph: &Graph, work: &'w Zone) -> ZoneVec<'w, bool> {
     let block_count = graph.blocks.len();
-    let mut reachable = vec![false; block_count];
+    let mut reachable = ZoneVec::from_elem_in(false, block_count, work);
     // NB: A loop header that only its back edges would reach has no
     //     predecessors if none of them was built, but is no entry.
-    let mut pending = graph.entries().map(BlockId::index).collect::<Vec<_>>();
+    let mut pending = ZoneVec::from_iter_in(graph.entries().map(BlockId::index), work);
     while let Some(block) = pending.pop() {
-        if std::mem::replace(&mut reachable[block], true) {
+        if core::mem::replace(&mut reachable[block], true) {
             continue;
         }
         pending.extend(
@@ -182,51 +190,43 @@ fn reachable_blocks(graph: &Graph) -> Vec<bool> {
 }
 
 /// Drops the blocks no entry reaches, if there are any.
-pub fn remove_unreachable_blocks(graph: &mut Graph) {
-    if reachable_blocks(graph).iter().any(|reachable| !reachable) {
-        clean_up_control_flow(graph);
+pub fn remove_unreachable_blocks(graph: &mut Graph, work: &Zone) {
+    if reachable_blocks(graph, work).iter().any(|reachable| !reachable) {
+        clean_up_control_flow(graph, work);
     }
 }
 
 /// Brings predecessor lists and phis in line with the control nodes after
 /// passes changed them to branch to fewer blocks, then drops the blocks no
 /// entry reaches anymore and the phis left with a single distinct input.
-pub fn clean_up_control_flow(graph: &mut Graph) {
+pub fn clean_up_control_flow(graph: &mut Graph, work: &Zone) {
     let block_count = graph.blocks.len();
-    let reachable = reachable_blocks(graph);
+    let reachable = reachable_blocks(graph, work);
 
     // Keep the predecessor entries (and their phi inputs) of reachable
     // blocks that still branch here, as many times as they do.
-    let mut remaining_edges = (0..block_count)
-        .map(|block| graph.successors(BlockId::from_index(block)))
-        .collect::<Vec<_>>();
+    let mut remaining_edges = ZoneVec::from_iter_in(
+        (0..block_count).map(|block| ZoneVec::from_slice_in(&graph.successors(BlockId::from_index(block)), work)),
+        work,
+    );
+    let mut keep = ZoneVec::new_in(work);
     for block in 0..block_count {
         if !reachable[block] {
             continue;
         }
         let predecessors = &graph.blocks[block].predecessors;
-        let keep = predecessors
-            .iter()
-            .map(|predecessor| {
-                if !reachable[predecessor.index()] {
-                    return false;
-                }
-                let successors = &mut remaining_edges[predecessor.index()];
-                let Some(index) = successors.iter().position(|successor| successor.index() == block) else {
-                    return false;
-                };
-                match successors {
-                    Successors::Inline { blocks, count } => {
-                        *count -= 1;
-                        blocks[index] = blocks[usize::from(*count)];
-                    }
-                    Successors::Cases(blocks) => {
-                        blocks.swap_remove(index);
-                    }
-                }
-                true
-            })
-            .collect::<InlineVec<bool, 4>>();
+        keep.clear();
+        keep.extend(predecessors.iter().map(|predecessor| {
+            if !reachable[predecessor.index()] {
+                return false;
+            }
+            let successors = &mut remaining_edges[predecessor.index()];
+            let Some(index) = successors.iter().position(|successor| successor.index() == block) else {
+                return false;
+            };
+            successors.swap_remove(index);
+            true
+        }));
         if keep.iter().all(|keep| *keep) {
             continue;
         }
@@ -246,14 +246,16 @@ pub fn clean_up_control_flow(graph: &mut Graph) {
         }
     }
 
-    let order = (0..block_count)
-        .filter(|block| reachable[*block])
-        .map(BlockId::from_index)
-        .collect::<Vec<_>>();
+    let order = ZoneVec::from_iter_in(
+        (0..block_count)
+            .filter(|block| reachable[*block])
+            .map(BlockId::from_index),
+        work,
+    );
     if order.len() != block_count {
-        graph.reorder_blocks(&order);
+        graph.reorder_blocks(&order, work);
     }
-    remove_trivial_phis(graph);
+    remove_trivial_phis(graph, work);
 }
 
 /// Makes the control node `control` jump to `target`, without inputs and
@@ -268,7 +270,7 @@ pub fn make_jump(graph: &mut Graph, control: NodeId, target: BlockId) {
 /// Makes branches whose edges both lead to the same place, through blocks
 /// that only jump on, jumps: where the target's phis get the same values
 /// from both. Returns whether it changed any.
-pub fn fold_branches_to_one_target(graph: &mut Graph) -> bool {
+pub fn fold_branches_to_one_target(graph: &mut Graph, work: &Zone) -> bool {
     // NB: Where an edge leads, and the block it enters that from.
     // NB: Blocks that only jump on can make a loop, which leads nowhere.
     let end_of = |graph: &Graph, mut block: BlockId, mut from: BlockId| {
@@ -313,7 +315,7 @@ pub fn fold_branches_to_one_target(graph: &mut Graph) -> bool {
         changed = true;
     }
     if changed {
-        clean_up_control_flow(graph);
+        clean_up_control_flow(graph, work);
     }
     changed
 }
@@ -322,7 +324,27 @@ pub fn fold_branches_to_one_target(graph: &mut Graph) -> bool {
 /// start of the bytecode block `block` with the values flowing into it from
 /// there, if `block` has a start frame state (see
 /// `Block::start_frame_state`).
-pub fn frame_state_entering(graph: &Graph, block: BlockId, predecessor: BlockId) -> Option<FrameState> {
+pub fn frame_state_entering<'z>(
+    graph: &Graph<'z>,
+    block: BlockId,
+    predecessor: BlockId,
+    work: &Zone,
+) -> Option<FrameState<'z>> {
+    let (template, values) = values_entering(graph, block, predecessor, work)?;
+    Some(frame_state_with_values(graph, template, values))
+}
+
+/// The values of a frame state, with the frame state it is made from (see `values_entering()`).
+pub type EnteringValues<'w> = (FrameStateId, &'w [(u32, NodeId)]);
+
+/// The values of the frame state of `frame_state_entering()`, in `work`, with the start frame state of `block` that it
+/// is made from.
+pub fn values_entering<'w>(
+    graph: &Graph,
+    block: BlockId,
+    predecessor: BlockId,
+    work: &'w Zone,
+) -> Option<EnteringValues<'w>> {
     let data = graph.block(block);
     let template = data.start_frame_state?;
     let entry_index = data
@@ -331,38 +353,66 @@ pub fn frame_state_entering(graph: &Graph, block: BlockId, predecessor: BlockId)
         .position(|block| *block == predecessor)
         .expect("the predecessor enters the block");
     let phis = &data.phis;
-    let mut state: FrameState = graph.frame_state(template).clone();
-    for (_, value) in &mut state.values {
-        if phis.contains(value) {
-            *value = graph.node(*value).inputs[entry_index];
-        } else if data.body.contains(value) {
-            // NB: Values made in the block do not exist before it.
-            return None;
-        }
+    let values = &graph.frame_state(template).values;
+    // NB: Values made in the block do not exist before it.
+    if values
+        .iter()
+        .any(|(_, value)| !phis.contains(value) && data.body.contains(value))
+    {
+        return None;
     }
-    Some(state)
+    let values = work.alloc_slice_from_iter(values.iter().map(|(slot, value)| {
+        if phis.contains(value) {
+            (*slot, graph.node(*value).inputs[entry_index])
+        } else {
+            (*slot, *value)
+        }
+    }));
+    Some((template, values))
+}
+
+/// The frame state `template` with `values` in place of its values.
+pub fn frame_state_with_values<'z>(
+    graph: &Graph<'z>,
+    template: FrameStateId,
+    values: &[(u32, NodeId)],
+) -> FrameState<'z> {
+    let template = graph.frame_state(template);
+    FrameState {
+        executable: template.executable,
+        pc: template.pc,
+        mode: template.mode,
+        values: graph.list(values),
+        in_frame: template.in_frame.clone(),
+        parent: template.parent,
+        passed_argument_count: template.passed_argument_count,
+        legacy_arguments: template.legacy_arguments.clone(),
+    }
 }
 
 /// Moves the cold blocks after all other blocks, keeping the order of
 /// each, so that the code of every other block comes first and the cold
 /// code is out of the way.
-pub fn move_cold_blocks_last(graph: &mut Graph) {
+pub fn move_cold_blocks_last(graph: &mut Graph, work: &Zone) {
     if !graph.blocks.iter().any(|block| block.is_cold) {
         return;
     }
-    let (hot, cold): (Vec<_>, Vec<_>) = (0..graph.blocks.len())
-        .map(BlockId::from_index)
-        .partition(|block| !graph.block(*block).is_cold);
-    let order = hot.into_iter().chain(cold).collect::<Vec<_>>();
-    graph.reorder_blocks(&order);
+    let blocks = || (0..graph.blocks.len()).map(BlockId::from_index);
+    let hot = blocks().filter(|block| !graph.block(*block).is_cold);
+    let cold = blocks().filter(|block| graph.block(*block).is_cold);
+    let order = ZoneVec::from_iter_in(hot.chain(cold), work);
+    graph.reorder_blocks(&order, work);
 }
 
 /// Replaces phis whose inputs are all one value (or the phi itself) by
 /// that value, until none is left.
-pub fn remove_trivial_phis(graph: &mut Graph) {
+pub fn remove_trivial_phis(graph: &mut Graph, work: &Zone) {
+    // NB: Nothing adds nodes here.
+    let mut replacements = Replacements::new(graph, work);
+    let mut removed = ZoneBitSet::new_in(graph.nodes.len(), work);
     loop {
-        let mut replacements = Replacements::new(graph);
-        let mut removed = BitSet::new(graph.nodes.len());
+        replacements.clear();
+        removed.clear();
         for block in &graph.blocks {
             for phi in &block.phis {
                 let mut distinct = graph.nodes[phi.index()]
@@ -389,18 +439,18 @@ pub fn remove_trivial_phis(graph: &mut Graph) {
 
 /// Drops the frame states no node uses anymore (directly or as the parent
 /// of one it uses) and renumbers the others in their order.
-pub fn remove_unused_frame_states(graph: &mut Graph) {
+pub fn remove_unused_frame_states(graph: &mut Graph, work: &Zone) {
     // NB: No pass exits to the start of blocks anymore.
     for block in &mut graph.blocks {
         block.start_frame_state = None;
     }
     let count = graph.frame_states.len();
-    let mut used = vec![false; count];
+    let mut used = ZoneVec::from_elem_in(false, count, work);
     for block in &graph.blocks {
         for node in block.nodes() {
             let mut frame_state = graph.nodes[node.index()].frame_state;
             while let Some(id) = frame_state {
-                if std::mem::replace(&mut used[id.index()], true) {
+                if core::mem::replace(&mut used[id.index()], true) {
                     break;
                 }
                 frame_state = graph.frame_states[id.index()].parent;
@@ -410,7 +460,7 @@ pub fn remove_unused_frame_states(graph: &mut Graph) {
     if used.iter().all(|used| *used) {
         return;
     }
-    let mut new_index = vec![None; count];
+    let mut new_index = ZoneVec::from_elem_in(None, count, work);
     let mut next = 0;
     for (index, used) in used.iter().enumerate() {
         if *used {
@@ -419,16 +469,15 @@ pub fn remove_unused_frame_states(graph: &mut Graph) {
         }
     }
     let remap = |id: FrameStateId| new_index[id.index()].expect("used frame states only refer to used ones");
-    let old = std::mem::take(&mut graph.frame_states);
-    graph.frame_states = old
-        .into_iter()
-        .zip(&used)
-        .filter(|(_, used)| **used)
-        .map(|(mut frame_state, _)| {
+    let mut index = 0;
+    graph.frame_states.retain_mut(|frame_state| {
+        let used = used[index];
+        index += 1;
+        if used {
             frame_state.parent = frame_state.parent.map(remap);
-            frame_state
-        })
-        .collect();
+        }
+        used
+    });
     for block in &graph.blocks {
         for node in block.nodes() {
             let node = &mut graph.nodes[node.index()];
@@ -445,9 +494,9 @@ mod tests {
     fn replacements_allocate_lazily_and_follow_updated_chains() {
         let mut graph = Graph::default();
         for _ in 0..4 {
-            graph.add_node(Node::new(Op::Constant(0), vec![], Some(Repr::Tagged), 0));
+            graph.add(Op::Constant(0), &[], Some(Repr::Tagged), 0);
         }
-        let mut replacements = Replacements::new(&graph);
+        let mut replacements = Replacements::new(&graph, crate::test_zone());
         assert_eq!(replacements.map.capacity(), 0);
         assert!(replacements.is_empty());
         assert_eq!(replacements.resolve(NodeId(0)), NodeId(0));
@@ -456,7 +505,7 @@ mod tests {
         assert_eq!(replacements.resolve(NodeId(0)), NodeId(2));
         replacements.replace(NodeId(1), NodeId(3));
         assert_eq!(replacements.resolve(NodeId(0)), NodeId(3));
-        let added = graph.add_node(Node::new(Op::Constant(0), vec![], Some(Repr::Tagged), 0));
+        let added = graph.add(Op::Constant(0), &[], Some(Repr::Tagged), 0);
         replacements.replace(added, NodeId(0));
         assert_eq!(replacements.resolve(added), NodeId(3));
         assert!(!replacements.is_empty());

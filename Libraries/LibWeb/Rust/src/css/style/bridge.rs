@@ -434,6 +434,20 @@ impl FfiFontResolutionRequest {
     pub fn font_size(&self) -> f64 {
         crate::css::css_pixels::CssPixels::from_raw(self.font_size_raw).to_double()
     }
+
+    /// The font size the lengths of the element whose values made this request scale: its
+    /// computed `font-size`, unrounded, where `computed` holds one in pixels, and the request's
+    /// otherwise.
+    pub fn font_size_for_lengths(&self, computed: Option<&crate::css::style_value::StyleValueData>) -> f64 {
+        match computed {
+            Some(crate::css::style_value::StyleValueData::Length { value, unit })
+                if *unit == crate::css::style_compute::px_length_unit() =>
+            {
+                *value
+            }
+            _ => self.font_size(),
+        }
+    }
 }
 
 #[repr(C)]
@@ -445,7 +459,9 @@ pub struct FfiResolvedFont {
     pub font_cascade_list: FfiHostHandle,
     pub ascent: f32,
     pub descent: f32,
+    pub line_gap: f32,
     pub x_height: f32,
+    pub cap_height: f32,
     pub zero_advance: f32,
     /// For a request naming `from-font`, the number it computes to: the request's metric of the
     /// first available font, divided by that font's size. Zero for other requests, and where the
@@ -782,6 +798,11 @@ pub mod element_construction_fact {
     pub const IS_SVG_RESOURCE_ELEMENT: u32 = 1 << 7;
     pub const IS_SVG_GEOMETRY_ELEMENT: u32 = 1 << 8;
     pub const IS_HTML_SELECT_ELEMENT: u32 = 1 << 9;
+    pub const IS_HTML_PROGRESS_OR_METER_ELEMENT: u32 = 1 << 10;
+    /// The element's default block-start or block-end margin is one a quirks-mode body or table cell ignores where it
+    /// collapses into the cell's or the body's own start or end.
+    pub const HAS_QUIRKY_BLOCK_START_MARGIN: u32 = 1 << 11;
+    pub const HAS_QUIRKY_BLOCK_END_MARGIN: u32 = 1 << 12;
     /// The layout algorithm a MathML element's tag name selects, as a `MathLayoutKind` in these bits.
     pub const MATHML_LAYOUT_KIND_SHIFT: u32 = 16;
     pub const MATHML_LAYOUT_KIND_MASK: u32 = 0x1f << MATHML_LAYOUT_KIND_SHIFT;
@@ -826,6 +847,8 @@ pub enum ElementBoxKind {
     /// A `<frame>` whose parent is a `<frameset>`.
     Frame = 23,
     FrameSet = 24,
+    /// A `<wbr>`: a line break opportunity, whatever its display says.
+    WordBreakOpportunity = 25,
 }
 
 impl ElementBoxKind {
@@ -878,7 +901,8 @@ pub enum FfiReplacedContentInputKind {
     TextArea = 1,
     /// An `<input>` whose type makes it no text entry widget: `first` is its `size`.
     Input = 2,
-    /// An `<input>` whose type makes it a text entry widget: `first` is its `size`.
+    /// A text entry `<input>`: `first` is its preferred character count. For a number input, a nonzero
+    /// `second` reserves its stepper beside an explicit or range-derived count.
     TextEntryInput = 3,
     /// A `<canvas>`: `first` is its `width`, and `second` its `height`.
     Canvas = 4,
@@ -888,6 +912,8 @@ pub enum FfiReplacedContentInputKind {
     NaturalSize = 5,
     /// An SVG `<image>` whose image has decoded: its natural size, as `NaturalSize`.
     DecodedSvgImage = 6,
+    /// An `<input>` in the Range state, which has no values.
+    RangeInput = 7,
 }
 
 /// The bits of a replaced content input's `present`, for the kinds whose values can be missing.
@@ -1170,67 +1196,18 @@ impl StyleEngine {
     }
 }
 
-/// The definition a plan last applied to one of the host's CSS animations, published beside the
-/// animation's name: what the style computation handed the host for it, field for field, so that a
-/// definition just computed and one published back compare directly. A plan whose every definition
-/// equals what its animation last had applied changes nothing, and the engine does not hand it
-/// over.
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct FfiAppliedAnimationDefinition {
-    pub values: FfiAppliedAnimationValues,
-    /// The keyframe set the plan gave the animation's effect, which the animation retains.
-    pub keyframe_set: *const c_void,
-    /// The computed `animation-timing-function`, which the animation retains, or null where no plan
-    /// has described the animation yet.
-    pub timing_function: *const c_void,
-    /// The calculations the edges of the attachment range resolve, which the animation retains, or null.
-    pub range_start_calculated: *const c_void,
-    pub range_end_calculated: *const c_void,
-}
-
-/// What an applied animation definition holds by value, its numbers before its bytes, which pack
-/// behind them.
-#[repr(C)]
-#[derive(Clone, Copy, PartialEq)]
-pub struct FfiAppliedAnimationValues {
-    pub duration: f64,
-    pub iteration_count: f64,
-    pub delay: f64,
-    pub range_start_px: f64,
-    pub range_start_percentage: f64,
-    pub range_end_px: f64,
-    pub range_end_percentage: f64,
-    pub duration_is_auto: bool,
-    pub direction: u8,
-    pub play_state: u8,
-    pub fill_mode: u8,
-    pub composition: u8,
-    /// An `FfiAnimationTimelineKind`.
-    pub timeline_kind: u8,
-    pub scroll_scroller: u8,
-    pub scroll_axis: u8,
-    pub range_start_name: u8,
-    pub range_end_name: u8,
-}
-
-const _: () = assert!(size_of::<FfiAppliedAnimationValues>() == 72);
-
-// SAFETY: the keyframe set is only compared by address, and the timing function is immutable style
-// value data the animation retains for as long as the definition is published, read only to
-// compare it.
-unsafe impl Send for FfiAppliedAnimationDefinition {}
-unsafe impl Sync for FfiAppliedAnimationDefinition {}
-
 /// Replaces the `@keyframes` row of one style scope: each name the scope defines, packed into one
-/// buffer of code units with a length each, with the host's keyframe set for it. An empty row gives
-/// the scope's row up; a shadow root's scope is named by the root's pointer identity as well.
+/// buffer of code units with a length each, with the keyframe set for it, by the address of a set
+/// the host holds a reference to. The row takes references of its own. An empty row gives the
+/// scope's row up; a shadow root's scope is named by the root's pointer identity as well.
 ///
-/// The host publishes a scope whenever its rule cache is built, and keeps a reference to every set
-/// the row names until it replaces or gives the row up. The row is written as the host's other
-/// writes are, ahead of the next job, which is the first that resolves keyframes from it.
+/// The host publishes a scope whenever its rule cache is built. The row is written as the host's
+/// other writes are, ahead of the next job, which is the first that resolves keyframes from it.
+///
+/// # Safety
+/// Every set must be a keyframe set the host holds a reference to.
 #[unsafe(no_mangle)]
-pub extern "C" fn style_engine_set_tree_scope_animation_keyframes(
+pub unsafe extern "C" fn style_engine_set_tree_scope_animation_keyframes(
     host: &DocumentHost,
     tree_scope: u32,
     name_lengths: ak::Span<'_, u32>,
@@ -1242,11 +1219,19 @@ pub extern "C" fn style_engine_set_tree_scope_animation_keyframes(
         keyframe_sets.as_slice().len(),
         "each keyframes name has a set"
     );
-    let row = super::animations::AnimationKeyframes::row(
-        name_lengths.as_slice(),
-        name_units.as_slice(),
-        keyframe_sets.as_slice(),
-    );
+    let keyframe_sets: Vec<_> = keyframe_sets
+        .as_slice()
+        .iter()
+        .map(|&set| {
+            let set = set as *const crate::animations::keyframes::KeyframeSet;
+            // SAFETY: Guaranteed by the caller; the row takes a reference of its own.
+            unsafe {
+                std::sync::Arc::increment_strong_count(set);
+                std::sync::Arc::from_raw(set)
+            }
+        })
+        .collect();
+    let row = super::animations::AnimationKeyframes::row(name_lengths.as_slice(), name_units.as_slice(), keyframe_sets);
     let write = super::engine_calls::EngineWrite::AnimationKeyframes {
         tree_scope: TreeScopeID(tree_scope),
         row,
@@ -1350,6 +1335,18 @@ pub(crate) struct BoundScopeChain {
     pub(crate) limits_name_the_root: Vec<bool>,
     pub(crate) levels: Vec<(u32, u32)>,
     pub(crate) implicit_roots: Vec<Option<ImplicitScopeRoot>>,
+}
+
+// NB: The arenas of the levels' selectors are their sheets', which count them.
+impl crate::heap_size::HeapSize for BoundScopeChain {
+    fn heap_size(&self, _: &mut crate::heap_size::HeapSizer) -> usize {
+        use crate::heap_size::vec_bytes;
+        vec_bytes(&self.roots)
+            + vec_bytes(&self.limits)
+            + vec_bytes(&self.limits_name_the_root)
+            + vec_bytes(&self.levels)
+            + vec_bytes(&self.implicit_roots)
+    }
 }
 
 impl BoundScopeChain {

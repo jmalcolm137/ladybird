@@ -202,8 +202,8 @@ pub unsafe extern "C" fn js_error_data_stack_string(
     owned_utf16_string_into_abi(error_data.stack_string(compact))
 }
 
-/// How many frames the call stack of `error_data` has, the outermost execution context included. Call on the VM's
-/// thread.
+/// How many frames the call stack of `error_data` has, the outermost execution context included when the stack was not
+/// cut at Error.stackTraceLimit. Call on the VM's thread.
 ///
 /// # Safety
 ///
@@ -212,6 +212,22 @@ pub unsafe extern "C" fn js_error_data_stack_string(
 pub unsafe extern "C" fn js_error_data_traceback_length(error_data: *const JSErrorData) -> usize {
     // SAFETY: The caller passes error data of a live cell.
     unsafe { error_data_from_abi(error_data) }.traceback().len()
+}
+
+/// How many frames of the call stack of `error_data`, from the innermost, script can observe: those the error would
+/// keep if the VM kept no long stack traces, which js_error_data_traceback_frame writes as it writes the others. The
+/// embedder reads only these for what script can observe, so that does not change while a debugger is attached. Call
+/// on the VM's thread.
+///
+/// # Safety
+///
+/// `error_data` must be error data, or an error data cell, of a live cell of the embedder's VM.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn js_error_data_script_visible_traceback_length(error_data: *const JSErrorData) -> usize {
+    // SAFETY: The caller passes error data of a live cell.
+    unsafe { error_data_from_abi(error_data) }
+        .script_visible_traceback()
+        .len()
 }
 
 /// A frame of the call stack of an error, as C++ TracebackFrame: the name of the frame's function, and where in its
@@ -275,4 +291,17 @@ pub unsafe extern "C" fn js_error_data_cell_capture(vm: *mut JSVM) -> *mut JSErr
     // SAFETY: The caller passes its VM.
     let vm = unsafe { vm_from_abi(vm) };
     cell_into_abi(ErrorDataCell::capture(vm))
+}
+
+/// ErrorDataCell::capture_whole_stack(vm): error data with every frame of the current call stack, whatever
+/// Error.stackTraceLimit is, for a trace of the running code that is not the stack of an error. Call on the VM's thread.
+///
+/// # Safety
+///
+/// `vm` must be the embedder's VM.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn js_error_data_cell_capture_whole_stack(vm: *mut JSVM) -> *mut JSErrorDataCell {
+    // SAFETY: The caller passes its VM.
+    let vm = unsafe { vm_from_abi(vm) };
+    cell_into_abi(ErrorDataCell::capture_whole_stack(vm))
 }

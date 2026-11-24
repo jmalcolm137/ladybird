@@ -9,10 +9,12 @@
 #include <AK/Optional.h>
 #include <AK/Utf16FlyString.h>
 #include <AK/Utf16String.h>
+#include <LibHTTP/Cache/CacheMode.h>
 #include <LibIPC/Forward.h>
 #include <LibURL/Origin.h>
 #include <LibURL/URL.h>
 #include <LibWebCommon/CSS/PreferredColorScheme.h>
+#include <LibWebCommon/ContentSecurityPolicy/SerializedPolicy.h>
 #include <LibWebCommon/Export.h>
 #include <LibWebCommon/HTML/CrossOrigin/OpenerPolicy.h>
 #include <LibWebCommon/HTML/CrossProcessId.h>
@@ -29,6 +31,7 @@ struct ReplicatedContainerState {
     // Whether the container is in its node document's tree rather than a shadow tree, which makes the navigable a
     // document-tree child navigable of that document.
     bool is_in_document_tree { false };
+    bool suppresses_viewport_scrolling { false };
 
     // https://html.spec.whatwg.org/multipage/browsers.html#iframe-sandboxing-flag-set
     SandboxingFlagSet iframe_sandboxing_flag_set {};
@@ -66,9 +69,17 @@ struct ReplicatedContainerState {
     // node document's policy container.
     UpgradeInsecureRequests::UpgradeInsecureNavigationsSet document_upgrade_insecure_navigations_set {};
 
+    // https://html.spec.whatwg.org/multipage/browsers.html#policy-container-csp-list, of the container's node
+    // document's policy container, whose frame-src governs where the navigable can be navigated to.
+    Vector<ContentSecurityPolicy::SerializedPolicy> document_csp_list {};
+
     // https://drafts.csswg.org/css-color-adjust-1/#color-scheme-effect
     // The container's used color scheme, which decides whether the canvas of the navigable's document is opaque.
     CSS::PreferredColorScheme used_color_scheme { CSS::PreferredColorScheme::Light };
+
+    // The cache mode that the container's node document loads with, which the navigations of the navigable use while
+    // that document loads.
+    HTTP::CacheMode document_cache_mode_while_loading { HTTP::CacheMode::Default };
 };
 
 // What the process hosting a navigable's active document reports of it to the UI process, which composes the

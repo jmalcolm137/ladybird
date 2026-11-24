@@ -37,11 +37,16 @@ Endpoints:
     - Echo responses accept request_body_read_size=<bytes> and request_body_read_delay_ms=<ms> query parameters,
       which read the request's body that many bytes at a time, waiting that long before each read.
       Each named token holds the response after the corresponding chunk until GET /unblock/<token>.
+    - An echo response's body may contain $BODY, which the server replaces with the request's body.
+    - An echo answers a Range request with the requested part of its body, unless it was created with
+      "ignore_range": true. Then it sends the entire body, as a server that doesn't support ranges does.
     - GET <any path> with an "Upgrade: websocket" header: Performs a WebSocket handshake and then echoes
       every text/binary frame back to the client verbatim. With a "send-binary=<size>" query parameter, the
       server first sends a binary frame of that many bytes: a 1, zeros, and then a 2.
     - GET /reflect-websocket-cookie with an "Upgrade: websocket" header: As above, but first sends the
       handshake's Cookie header (or an empty string) as a text frame.
+    - GET /websocket-close-without-response with an "Upgrade: websocket" header: Closes the connection without
+      responding to the handshake.
     - GET /recorded-request-count/<echo path>: Responds with the number of requests the server has seen at <echo path>,
       with any query ignored.
     - GET /downloads/<name>: Reports the browser's download of <name> into the --downloads-directory: 404 while
@@ -61,6 +66,7 @@ class Echo:
     reason_phrase: Optional[str]
     reflect_headers_in_body: bool
     close_connection: bool
+    ignore_range: bool
     wait_for_unblock: Optional[str]
 
     def __eq__(self, other):
@@ -78,6 +84,7 @@ class Echo:
             and self.reason_phrase == other.reason_phrase
             and self.reflect_headers_in_body == other.reflect_headers_in_body
             and self.close_connection == other.close_connection
+            and self.ignore_range == other.ignore_range
             and self.wait_for_unblock == other.wait_for_unblock
         )
 
@@ -490,6 +497,12 @@ class TestHTTPRequestHandler(http.server.SimpleHTTPRequestHandler):
     def do_DELETE(self):
         self.do_other()
 
+    def do_PROPFIND(self):
+        self.do_other()
+
+    def do_REPORT(self):
+        self.do_other()
+
     def do_SAFE(self):
         self.do_other()
 
@@ -513,6 +526,7 @@ class TestHTTPRequestHandler(http.server.SimpleHTTPRequestHandler):
         echo.reason_phrase = data.get("reason_phrase", None)
         echo.reflect_headers_in_body = data.get("reflect_headers_in_body", False)
         echo.close_connection = data.get("close_connection", False)
+        echo.ignore_range = data.get("ignore_range", False)
         echo.wait_for_unblock = data.get("wait_for_unblock", None)
 
         is_invalid_echo_path = echo.path is None or not echo.path.startswith("/echo/")
@@ -636,6 +650,7 @@ class TestHTTPRequestHandler(http.server.SimpleHTTPRequestHandler):
 
         # The request's body is read before responding, so closing the connection does not reset it.
         content_length = int(self.headers.get("Content-Length", 0))
+        request_body = bytearray()
         if content_length:
             read_size = int(query.get("request_body_read_size", [content_length])[0])
             read_delay_ms = int(query.get("request_body_read_delay_ms", [0])[0])
@@ -643,11 +658,12 @@ class TestHTTPRequestHandler(http.server.SimpleHTTPRequestHandler):
             while remaining > 0:
                 if read_delay_ms:
                     time.sleep(read_delay_ms / 1000)
-                read = len(self.rfile.read(min(read_size, remaining)))
+                data = self.rfile.read(min(read_size, remaining))
                 # The client closed the connection before sending the whole body.
-                if read == 0:
+                if not data:
                     break
-                remaining -= read
+                request_body += data
+                remaining -= len(data)
 
         is_revalidation_request = "If-Modified-Since" in self.headers
         send_not_modified = is_revalidation_request and "X-Ladybird-Respond-With-Not-Modified" in self.headers
@@ -716,10 +732,11 @@ class TestHTTPRequestHandler(http.server.SimpleHTTPRequestHandler):
             response_body = echo.body.replace("$HEADERS", headers) if echo.body else headers
         else:
             response_body = echo.body or ""
+        response_body = response_body.replace("$BODY", request_body.decode("utf-8", "replace"))
 
         # FIXME: This only supports "Range: bytes=start-end" and "Range: bytes=start-". There are other formats to
         #        support if needed: https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/Range#syntax
-        if "Range" in self.headers:
+        if "Range" in self.headers and not echo.ignore_range:
             range_value = self.headers["Range"].strip()
             assert range_value.startswith("bytes=")
             assert range_value.count("-") == 1
@@ -774,6 +791,10 @@ class TestHTTPRequestHandler(http.server.SimpleHTTPRequestHandler):
     # text/binary frame it sends is echoed back verbatim.
 
     def _serve_websocket_echo(self):
+        if self.path == "/websocket-close-without-response":
+            self.close_connection = True
+            return
+
         key = self.headers.get("Sec-WebSocket-Key")
         if not key:
             self.send_error(400, "Missing Sec-WebSocket-Key")

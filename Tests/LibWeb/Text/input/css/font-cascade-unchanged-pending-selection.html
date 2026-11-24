@@ -1,5 +1,6 @@
 <!doctype html>
 <script src="../include.js"></script>
+<script src="../work-test.js"></script>
 <script>
     promiseTest(async () => {
         const resident = new FontFace("PendingSelection", 'url("../../../Ref/data/fonts/Ahem.ttf")', { weight: "400", unicodeRange: "U+0-7F" });
@@ -13,28 +14,32 @@
         const width = target.getBoundingClientRect().width;
         internals.updateStyle();
         const results = [];
+        const styleSummary = work => `passes [${work.passes().join(", ")}], restyled [${work.restyled().map(shortStyleName).join(", ")}]`;
 
-        const layoutBefore = internals.fullLayoutCount();
-        target.style.color = "red";
-        target.getBoundingClientRect();
-        results.push(`paint change relaid out pending cascade: ${internals.fullLayoutCount() !== layoutBefore}`);
+        const paintChangeWork = layoutWork(() => {
+            target.style.color = "red";
+            target.getBoundingClientRect();
+        });
+        results.push(`layout after paint change with pending cascade: ${paintChangeWork.passes().join(" | ") || "(no layout)"}`);
 
         const unused = new FontFace("PendingSelection", 'url("../../../Ref/data/fonts/Ahem.ttf")', { weight: "700", unicodeRange: "U+0-7F" });
         await unused.load();
-        internals.resetStyleCounters();
-        document.fonts.add(unused);
-        internals.updateStyle();
-        results.push(`unused weight registration recomputed style: ${internals.styleCounters().passes > 0}`);
+        const registrationWork = styleWork(() => document.fonts.add(unused));
+        results.push(`unused weight registration style work: ${styleSummary(registrationWork)}`);
         document.fonts.delete(unused);
         internals.updateStyle();
 
         const loading = new FontFace("PendingSelection", 'url("../../../Ref/data/fonts/Ahem.ttf")', { weight: "700", unicodeRange: "U+0-7F" });
         document.fonts.add(loading);
         target.getBoundingClientRect();
-        internals.resetStyleCounters();
+        internals.updateStyle();
+        internals.beginStyleTrace();
         await loading.load();
         internals.updateStyle();
-        results.push(`unused weight completion recomputed style: ${internals.styleCounters().passes > 0}`);
+        const completionEvents = parseStyleTrace(internals.takeStyleTrace(), { stylePassesOnly: true });
+        const completionPasses = completionEvents.filter(event => event.event === "pass").map(event => event.kind);
+        const completionRestyled = completionEvents.filter(event => event.event === "restyle" && event.outcome !== "kept").map(event => shortStyleName(event.element));
+        results.push(`unused weight completion style work: passes [${completionPasses.join(", ")}], restyled [${completionRestyled.join(", ")}]`);
         results.push(`unchanged selection preserves width: ${target.getBoundingClientRect().width === width}`);
         results.push(`unused subset stays unloaded: ${pending.status === "unloaded"}`);
 
@@ -43,10 +48,12 @@
         document.fonts.delete(loading);
         document.fonts.delete(resident);
         target.getBoundingClientRect();
-        internals.resetStyleCounters();
-        document.fonts.add(replacement);
-        const changedWidth = target.getBoundingClientRect().width;
-        results.push(`matching weight registration recomputed style: ${internals.styleCounters().passes > 0}`);
+        let changedWidth;
+        const matchingWork = styleWork(() => {
+            document.fonts.add(replacement);
+            changedWidth = target.getBoundingClientRect().width;
+        }, internals, { flush: false });
+        results.push(`matching weight registration style work: ${styleSummary(matchingWork)}`);
         results.push(`matching selection changes width: ${changedWidth !== width}`);
         document.fonts.delete(replacement);
         document.fonts.add(resident);

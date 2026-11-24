@@ -4,17 +4,22 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+pub mod code_units;
 pub mod entities;
+pub mod fragment;
 mod known_names;
 pub mod meta_charset_scanner;
 pub mod parser;
 pub mod preload_scanner;
+mod scan;
 pub mod token;
 pub mod tokenizer;
 
+use ak::Utf16View;
 use std::ptr;
 use token::Attribute;
 use token::Position;
+use token::SourceOffset;
 use token::TokenPayload;
 use token::TokenType;
 use tokenizer::HtmlTokenizer;
@@ -122,24 +127,20 @@ impl Default for RustFfiToken {
     }
 }
 
-fn position_to_ffi(pos: &Position) -> (u64, u64) {
+fn position_to_ffi(pos: Position) -> (u64, u64) {
     (pos.line, pos.column)
 }
 
 /// Create a new Rust HTML tokenizer directly from a UTF-16 code unit buffer.
 #[unsafe(no_mangle)]
 pub extern "C" fn rust_html_tokenizer_create_from_utf16(input: ak::Span<'_, u16>) -> *mut RustFfiTokenizerHandle {
-    let code_units = input.as_slice().to_vec();
-
-    make_handle(HtmlTokenizer::new(code_units))
+    make_handle(HtmlTokenizer::new(input.as_slice().to_vec()))
 }
 
-/// Create a new Rust HTML tokenizer directly from an ASCII byte buffer.
+/// Create a new Rust HTML tokenizer directly from a Latin-1 byte buffer.
 #[unsafe(no_mangle)]
 pub extern "C" fn rust_html_tokenizer_create_from_latin1(input: ak::Span<'_, u8>) -> *mut RustFfiTokenizerHandle {
-    let code_units = input.as_slice().iter().map(|byte| u16::from(*byte)).collect();
-
-    make_handle(HtmlTokenizer::new(code_units))
+    make_handle(HtmlTokenizer::new(input.as_slice().to_vec()))
 }
 
 fn make_handle(tokenizer: HtmlTokenizer) -> *mut RustFfiTokenizerHandle {
@@ -178,7 +179,9 @@ pub extern "C" fn rust_html_tokenizer_next_token(
     // Fast-path text character in the Data state. For ASCII text runs
     // this skips the whole state-machine function call plus Token
     // construction/drop. Most real HTML is dominated by such runs.
-    if !stop_at_insertion_point && let Some((cp, pos)) = handle.tokenizer.try_fast_data_char() {
+    if !stop_at_insertion_point && let Some(cp) = handle.tokenizer.try_fast_data_char() {
+        let offset = SourceOffset::new(handle.tokenizer.current_offset);
+        let pos = handle.tokenizer.position_at(offset);
         out.token_type = TokenType::Character as u8;
         out.code_point = cp;
         out.start_line = pos.line;
@@ -214,10 +217,8 @@ fn next_token_slow(
         TokenType::Character | TokenType::EndOfFile => {
             out.token_type = token.token_type as u8;
             out.code_point = token.code_point;
-            out.start_line = token.start_position.line;
-            out.start_column = token.start_position.column;
-            out.end_line = token.end_position.line;
-            out.end_column = token.end_position.column;
+            (out.start_line, out.start_column) = position_to_ffi(handle.tokenizer.position_at(token.start_offset));
+            (out.end_line, out.end_column) = position_to_ffi(handle.tokenizer.position_at(token.end_offset));
             return true;
         }
         _ => {}
@@ -226,17 +227,15 @@ fn next_token_slow(
     *out = RustFfiToken::default();
     out.token_type = token.token_type as u8;
 
-    let (sl, sc) = position_to_ffi(&token.start_position);
-    let (el, ec) = position_to_ffi(&token.end_position);
-    out.start_line = sl;
-    out.start_column = sc;
-    out.end_line = el;
-    out.end_column = ec;
+    // NB: Positions are asked for in the order they come in the input, which is the order they are cheapest to find.
+    let end_offset = token.end_offset;
+    (out.start_line, out.start_column) = position_to_ffi(handle.tokenizer.position_at(token.start_offset));
 
     // Store string data in handle so pointers stay valid.
     match token.payload {
         TokenPayload::Tag {
             tag_name,
+            tag_id: _,
             self_closing,
             had_duplicate_attribute,
             attributes,
@@ -257,13 +256,20 @@ fn next_token_slow(
                 let Attribute {
                     local_name,
                     value,
-                    name_start_position,
-                    name_end_position,
-                    value_start_position,
-                    value_end_position,
+                    name_start_offset,
+                    name_end_offset,
+                    value_start_offset,
+                    value_end_offset,
                 } = attr;
+                let (name_start_line, name_start_column) =
+                    position_to_ffi(handle.tokenizer.position_at(name_start_offset));
+                let (name_end_line, name_end_column) = position_to_ffi(handle.tokenizer.position_at(name_end_offset));
+                let (value_start_line, value_start_column) =
+                    position_to_ffi(handle.tokenizer.position_at(value_start_offset));
+                let (value_end_line, value_end_column) =
+                    position_to_ffi(handle.tokenizer.position_at(value_end_offset));
                 handle.last_attr_names.push(local_name);
-                handle.last_attr_values.push(value.encode_utf16().collect());
+                handle.last_attr_values.push(value.to_utf16());
                 let last_idx = handle.last_attr_names.len() - 1;
                 let name = &handle.last_attr_names[last_idx];
                 let value_code_units = &handle.last_attr_values[last_idx];
@@ -271,28 +277,28 @@ fn next_token_slow(
                     name: name.raw_identity(),
                     value_ptr: value_code_units.as_ptr(),
                     value_len: value_code_units.len(),
-                    name_start_line: name_start_position.line,
-                    name_start_column: name_start_position.column,
-                    name_end_line: name_end_position.line,
-                    name_end_column: name_end_position.column,
-                    value_start_line: value_start_position.line,
-                    value_start_column: value_start_position.column,
-                    value_end_line: value_end_position.line,
-                    value_end_column: value_end_position.column,
+                    name_start_line,
+                    name_start_column,
+                    name_end_line,
+                    name_end_column,
+                    value_start_line,
+                    value_start_column,
+                    value_end_line,
+                    value_end_column,
                 });
             }
             out.attributes_ptr = handle.last_attributes.as_ptr();
             out.attributes_len = handle.last_attributes.len();
         }
         TokenPayload::Comment(data) => {
-            handle.last_comment = data.encode_utf16().collect();
+            handle.last_comment = data.to_utf16();
             out.comment_ptr = handle.last_comment.as_ptr();
             out.comment_len = handle.last_comment.len();
         }
         TokenPayload::Doctype(doctype) => {
-            handle.last_doctype_name = doctype.name.encode_utf16().collect();
-            handle.last_public_id = doctype.public_identifier.encode_utf16().collect();
-            handle.last_system_id = doctype.system_identifier.encode_utf16().collect();
+            handle.last_doctype_name = doctype.name.to_utf16();
+            handle.last_public_id = doctype.public_identifier.to_utf16();
+            handle.last_system_id = doctype.system_identifier.to_utf16();
             out.doctype_name_ptr = handle.last_doctype_name.as_ptr();
             out.doctype_name_len = handle.last_doctype_name.len();
             out.public_id_ptr = handle.last_public_id.as_ptr();
@@ -306,6 +312,7 @@ fn next_token_slow(
         }
         TokenPayload::None => {}
     }
+    (out.end_line, out.end_column) = position_to_ffi(handle.tokenizer.position_at(end_offset));
 
     true
 }
@@ -331,11 +338,12 @@ pub extern "C" fn rust_html_tokenizer_insert_utf16_input(
     let Some(handle) = handle else {
         return;
     };
-    let code_units = input.as_slice();
-    handle.tokenizer.insert_input_at_insertion_point(code_units);
+    handle
+        .tokenizer
+        .insert_input_at_insertion_point(Utf16View::Utf16(input.as_slice()));
 }
 
-/// Insert ASCII input at the current insertion point.
+/// Insert Latin-1 input at the current insertion point.
 #[unsafe(no_mangle)]
 pub extern "C" fn rust_html_tokenizer_insert_latin1_input(
     handle: Option<&mut RustFfiTokenizerHandle>,
@@ -344,8 +352,9 @@ pub extern "C" fn rust_html_tokenizer_insert_latin1_input(
     let Some(handle) = handle else {
         return;
     };
-    let input = input.as_slice();
-    handle.tokenizer.insert_latin1_input_at_insertion_point(input);
+    handle
+        .tokenizer
+        .insert_input_at_insertion_point(Utf16View::Latin1(input.as_slice()));
 }
 
 /// Append UTF-16 input to the tokenizer input stream.
@@ -357,11 +366,10 @@ pub extern "C" fn rust_html_tokenizer_append_utf16_input(
     let Some(handle) = handle else {
         return;
     };
-    let code_units = input.as_slice();
-    handle.tokenizer.append_input(code_units);
+    handle.tokenizer.append_input(Utf16View::Utf16(input.as_slice()));
 }
 
-/// Append ASCII input to the tokenizer input stream.
+/// Append Latin-1 input to the tokenizer input stream.
 #[unsafe(no_mangle)]
 pub extern "C" fn rust_html_tokenizer_append_latin1_input(
     handle: Option<&mut RustFfiTokenizerHandle>,
@@ -370,8 +378,7 @@ pub extern "C" fn rust_html_tokenizer_append_latin1_input(
     let Some(handle) = handle else {
         return;
     };
-    let input = input.as_slice();
-    handle.tokenizer.append_latin1_input(input);
+    handle.tokenizer.append_input(Utf16View::Latin1(input.as_slice()));
 }
 
 /// Get the tokenizer input that has not been consumed yet.
@@ -384,7 +391,7 @@ pub extern "C" fn rust_html_tokenizer_unparsed_input(
     let (Some(handle), Some(out_ptr), Some(out_len)) = (handle, out_ptr, out_len) else {
         return;
     };
-    handle.last_unparsed_input = handle.tokenizer.unparsed_input().encode_utf16().collect();
+    handle.last_unparsed_input = handle.tokenizer.unparsed_input().to_utf16();
     *out_ptr = handle.last_unparsed_input.as_ptr();
     *out_len = handle.last_unparsed_input.len();
 }
@@ -428,6 +435,14 @@ pub extern "C" fn rust_html_tokenizer_undefine_insertion_point(handle: Option<&m
         return;
     };
     handle.tokenizer.undefine_insertion_point();
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn rust_html_tokenizer_discard_insertion_points(handle: Option<&mut RustFfiTokenizerHandle>) {
+    let Some(handle) = handle else {
+        return;
+    };
+    handle.tokenizer.discard_insertion_points();
 }
 
 #[unsafe(no_mangle)]

@@ -34,7 +34,9 @@ public:
             add_range(range.start, range.end);
     }
 
-    void add_range(AK::Duration start, AK::Duration end);
+    void add_range(AK::Duration start, AK::Duration end, AK::Duration maximum_gap_to_bridge = AK::Duration::zero());
+    // Takes linear time when the ranges are in order, and O(n log n) time in any order.
+    void add_ranges(Vector<Range> const&, AK::Duration maximum_gap_to_bridge = AK::Duration::zero());
     void remove_range(AK::Duration start, AK::Duration end);
 
     size_t size() const { return m_ranges.size(); }
@@ -115,6 +117,12 @@ struct AK::Formatter<Media::TimeRanges> : StandardFormatter {
 };
 
 namespace IPC {
+
+template<>
+MEDIA_API ErrorOr<void> encode(Encoder&, Media::TimeRanges::Range const&);
+
+template<>
+MEDIA_API ErrorOr<Media::TimeRanges::Range> decode(Decoder&);
 
 template<>
 MEDIA_API ErrorOr<void> encode(Encoder&, Media::TrackBufferedRanges const&);

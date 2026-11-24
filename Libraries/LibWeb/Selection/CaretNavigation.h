@@ -13,6 +13,12 @@
 #include <LibWeb/TextAffinity.h>
 #include <LibWebCommon/PixelUnits.h>
 
+namespace Web::Layout::RustFFI {
+
+struct FfiInlineLine;
+
+}
+
 namespace Web::Selection {
 
 enum class SelectionAlteration : u8 {
@@ -45,6 +51,10 @@ struct CaretLocation {
     TextAffinity affinity { TextAffinity::Downstream };
 };
 
+// One grapheme step in the text. At a soft wrap, the offset has a caret position at the end of the earlier line and at
+// the start of the next, and a step visits both.
+Optional<CaretLocation> location_after_character_step(DOM::Text&, size_t offset, TextAffinity, SelectionDirection);
+
 // Resolves visible caret positions without mutating Selection. Editing operations use this service to share the same
 // model of rendered text, atomic inline content, empty lines, and editing-host boundaries as keyboard navigation.
 class CaretNavigator {
@@ -65,6 +75,8 @@ private:
     Optional<CaretLocation> move_to_editing_host_boundary(CaretLocation const&, SelectionDirection);
     Optional<CaretLocation> move_to_paragraph_boundary(CaretLocation const&, SelectionDirection);
     Optional<CaretLocation> move_by_page(CaretLocation const&, SelectionDirection, CSSPixels inline_coordinate);
+    Optional<CaretLocation> position_on_adjacent_line(CaretLocation const&, SelectionDirection, CSSPixels inline_coordinate);
+    Optional<CaretLocation> first_position_on_another_line(CaretLocation const&, DOM::Node& editing_host, SelectionDirection, Layout::RustFFI::FfiInlineLine const* line);
     Optional<CaretLocation> move_by_word(CaretLocation const&, SelectionAlteration, SelectionDirection);
     GC::Ptr<DOM::Node> adjacent_caret_host(DOM::Node&, DOM::Node& editing_host, SelectionDirection);
     Optional<CaretLocation> location_before_atomic_inline(DOM::Node&, SelectionAlteration);

@@ -9,6 +9,7 @@ use crate::painting::record::trace::Observer;
 
 use crate::css::css_pixels::{CssPixelRect, CssPixels};
 use crate::layout::node_data::{NodeFlag, NodeSlotId};
+use crate::painting::display_list::builder::PendingInlineClip;
 use crate::painting::display_list::commands::{DisplayListGlyph, FontResourceId, TextShadowLayer};
 use crate::painting::display_list::recorder::GlyphRunForRecording;
 use crate::painting::force_dark::ForceDarkRole;
@@ -17,7 +18,9 @@ use crate::painting::record::PaintRecorder;
 use crate::painting::record::inputs::CaretTarget;
 use crate::painting::selection::{HighlightPseudoElement, SelectionRange};
 use crate::painting::text_fragment::{self, SelectionOffsets};
-use libgfx_rust::{Color, FloatPoint, IntPoint, IntRect, Orientation};
+use libgfx_rust::path::Path;
+use libgfx_rust::{Color, FloatPoint, IntPoint, IntRect, Orientation, WindingRule};
+use std::collections::HashSet;
 use std::sync::Arc;
 
 #[derive(Clone, Copy)]
@@ -512,12 +515,8 @@ pub(crate) fn glyph_run_emission(
     }
 }
 
-pub(crate) fn paint_fragments_foreground<O: Observer>(
-    recorder: &mut PaintRecorder<'_, O>,
-    block: NodeSlotId,
-    owner: Option<NodeSlotId>,
-) {
-    let filter = crate::painting::fragment_ownership::effective_filter(recorder.source, owner.unwrap_or(block));
+pub(crate) fn paint_fragments_foreground<O: Observer>(recorder: &mut PaintRecorder<'_, O>, block: NodeSlotId) {
+    let filter = crate::painting::fragment_ownership::effective_filter(recorder.source, block);
     let fragment_count = recorder.source.committed_side_data(block).fragments().len();
     let mut indices = Vec::with_capacity(fragment_count);
     filter.for_each_owned_fragment_index(fragment_count, |index| indices.push(index as u32));
@@ -535,9 +534,68 @@ pub(crate) fn paint_fragments<O: Observer>(recorder: &mut PaintRecorder<'_, O>, 
     for span in &spans {
         paint_text_shadow(recorder, block, span, &span.shadow_layers);
     }
+    // Glyph strokes can extend beyond a highlight rectangle. Keep the normal glyphs outside the highlights, then
+    // let each overlay redraw the text inside its rectangle without a stroke.
+    let mut stroked_highlights = HashSet::new();
+    for fragment_spans in spans.chunk_by(|a, b| a.fragment_index == b.fragment_index) {
+        let Some(span) = fragment_spans.iter().find(|span| !span.highlights.is_empty()) else {
+            continue;
+        };
+        let side = recorder.source.committed_side_data(block);
+        let fragment = &side.fragments()[span.fragment_index as usize];
+        let style = recorder.source.node_style_if_live(fragment.style_source).unwrap();
+        let text = style.inherited_text();
+        if text.webkit_text_stroke_width <= 0.0 {
+            continue;
+        }
+        let normal_span = RenderSpan {
+            fragment_index: span.fragment_index,
+            start_code_unit: 0,
+            end_code_unit: fragment.length_in_code_units,
+            text_color: text.webkit_text_fill_color,
+            shadow_layers: Vec::new(),
+            highlights: Vec::new(),
+            decoration_color: None,
+        };
+        let mut highlight_path = Path::new();
+        for rect in fragment_spans
+            .iter()
+            .filter(|other| !other.highlights.is_empty())
+            .flat_map(|other| highlight_rects(recorder, block, other))
+        {
+            let rect = recorder.converter.rounded_device_rect(rect).to_float();
+            highlight_path.move_to(FloatPoint { x: rect.x, y: rect.y });
+            highlight_path.line_to(FloatPoint {
+                x: rect.x + rect.width,
+                y: rect.y,
+            });
+            highlight_path.line_to(FloatPoint {
+                x: rect.x + rect.width,
+                y: rect.y + rect.height,
+            });
+            highlight_path.line_to(FloatPoint {
+                x: rect.x,
+                y: rect.y + rect.height,
+            });
+            highlight_path.close();
+        }
+        let clip = PendingInlineClip::subtracting_path(&highlight_path, WindingRule::Nonzero);
+        let clip_depth = recorder.recorder.ambient_inline_clip_depth();
+        recorder.recorder.push_ambient_inline_clips(&[clip]);
+        paint_text_fragment(recorder, block, &normal_span, &[], true);
+        recorder.recorder.truncate_ambient_inline_clips(clip_depth);
+        stroked_highlights.insert(span.fragment_index);
+    }
     for span in spans.iter().filter(|span| span.highlights.is_empty()) {
-        let sets = crate::painting::record::paint::text_decoration::decoration_sets_for_span(recorder, block, span);
-        paint_text_fragment(recorder, block, span, &sets);
+        let sets =
+            crate::painting::record::paint::text_decoration::decoration_sets_for_span(recorder.source, block, span);
+        paint_text_fragment(
+            recorder,
+            block,
+            span,
+            &sets,
+            !stroked_highlights.contains(&span.fragment_index),
+        );
     }
 
     let highlight_backdrop = recorder
@@ -564,14 +622,15 @@ pub(crate) fn paint_fragments<O: Observer>(recorder: &mut PaintRecorder<'_, O>, 
         // highlight overlay, painting it immediately below any positioned descendants.
         for (span, overlay) in overlays() {
             if Color(overlay.background_color).alpha() > 0 {
-                let highlight_rect = highlight_rect(recorder, block, span);
                 let converter = recorder.converter;
                 let previous = recorder.recorder.set_contrast_backdrop(highlight_backdrop);
-                recorder.recorder.fill_rect(
-                    converter.rounded_device_rect(highlight_rect),
-                    Color(overlay.background_color),
-                    ForceDarkRole::Selection,
-                );
+                for highlight_rect in highlight_rects(recorder, block, span) {
+                    recorder.recorder.fill_rect(
+                        converter.rounded_device_rect(highlight_rect),
+                        Color(overlay.background_color),
+                        ForceDarkRole::Selection,
+                    );
+                }
                 recorder.recorder.set_contrast_backdrop(previous);
             }
         }
@@ -584,21 +643,63 @@ pub(crate) fn paint_fragments<O: Observer>(recorder: &mut PaintRecorder<'_, O>, 
     }
 
     for span in spans.iter().filter(|span| !span.highlights.is_empty()) {
-        let sets = crate::painting::record::paint::text_decoration::decoration_sets_for_span(recorder, block, span);
-        paint_text_fragment(recorder, block, span, &sets);
+        let sets =
+            crate::painting::record::paint::text_decoration::decoration_sets_for_span(recorder.source, block, span);
+        paint_text_fragment(recorder, block, span, &sets, true);
     }
 }
 
-fn highlight_rect<O: Observer>(recorder: &PaintRecorder<'_, O>, block: NodeSlotId, span: &RenderSpan) -> CssPixelRect {
+fn highlight_rects<O: Observer>(
+    recorder: &PaintRecorder<'_, O>,
+    block: NodeSlotId,
+    span: &RenderSpan,
+) -> Vec<CssPixelRect> {
     let side = recorder.source.committed_side_data(block);
     let fragment = &side.fragments()[span.fragment_index as usize];
     let offsets = SelectionOffsets {
         start: span.start_code_unit,
         end: span.end_code_unit,
     };
-    text_fragment::rect_for_selection_offsets(recorder.source, fragment, offsets, || {
-        text_fragment::first_available_font(recorder.source, fragment)
-    })
+    text_fragment::rects_for_selection_offsets(recorder.source, fragment, offsets)
+}
+
+pub(crate) fn text_shadow_layers_and_bounds(
+    shadow_layers: &[ShadowLayer],
+    fragment_device_rect: IntRect,
+    scale: f64,
+) -> (Vec<TextShadowLayer>, IntRect) {
+    let converter = crate::painting::display_list::device_pixels::DevicePixelConverter::new(scale);
+    let mut shadows_bounding_rect = IntRect::default();
+    let layers: Vec<TextShadowLayer> = shadow_layers
+        .iter()
+        .rev()
+        .map(|layer| {
+            let blur_radius = converter.rounded_device_pixels(layer.blur_radius);
+            let offset = FloatPoint {
+                x: layer.offset_x.to_float() * scale as f32,
+                y: layer.offset_y.to_float() * scale as f32,
+            };
+            let rounded_offset = IntPoint {
+                x: offset.x.round() as i32,
+                y: offset.y.round() as i32,
+            };
+            // Space around the painted text to allow it to blur.
+            let margin = blur_radius * 2;
+            shadows_bounding_rect = shadows_bounding_rect.united(IntRect::new(
+                fragment_device_rect.x + rounded_offset.x - margin,
+                fragment_device_rect.y + rounded_offset.y - margin,
+                fragment_device_rect.width + margin * 2,
+                fragment_device_rect.height + margin * 2,
+            ));
+            TextShadowLayer {
+                offset,
+                rounded_offset,
+                blur_radius,
+                color: Color(layer.color),
+            }
+        })
+        .collect();
+    (layers, shadows_bounding_rect)
 }
 
 fn paint_text_shadow<O: Observer>(
@@ -651,41 +752,18 @@ fn paint_text_shadow<O: Observer>(
         }
     }
 
+    let text = recorder
+        .recorder
+        .notes_record_origins()
+        .then(|| fragment_text(recorder.source, fragment, span.start_code_unit..span.end_code_unit));
+    recorder.recorder.set_glyph_run_text(text);
+
     // NB: Force-dark leaves text shadows alone. Light text keeps its color under force-dark, so inverting the dark
     // outline set behind it would put a light halo around light glyphs — which reads as blurred text. Blink doesn't
     // filter text shadows either: DarkModeFilter::ApplyToFlagsIfNeeded recolors only the paint flags, never the
     // shadow filter that TextShadowPainter puts on the text's layer.
     // Shadow layers are ordered front-to-back, so we paint them in reverse.
-    let mut shadows_bounding_rect = IntRect::default();
-    let layers: Vec<TextShadowLayer> = shadow_layers
-        .iter()
-        .rev()
-        .map(|layer| {
-            let blur_radius = converter.rounded_device_pixels(layer.blur_radius);
-            let offset = FloatPoint {
-                x: layer.offset_x.to_float() * scale as f32,
-                y: layer.offset_y.to_float() * scale as f32,
-            };
-            let rounded_offset = IntPoint {
-                x: offset.x.round() as i32,
-                y: offset.y.round() as i32,
-            };
-            // Space around the painted text to allow it to blur.
-            let margin = blur_radius * 2;
-            shadows_bounding_rect = shadows_bounding_rect.united(IntRect::new(
-                fragment_device_rect.x + rounded_offset.x - margin,
-                fragment_device_rect.y + rounded_offset.y - margin,
-                fragment_device_rect.width + margin * 2,
-                fragment_device_rect.height + margin * 2,
-            ));
-            TextShadowLayer {
-                offset,
-                rounded_offset,
-                blur_radius,
-                color: Color(layer.color),
-            }
-        })
-        .collect();
+    let (layers, shadows_bounding_rect) = text_shadow_layers_and_bounds(shadow_layers, fragment_device_rect, scale);
     recorder.recorder.paint_text_shadow(
         &layers,
         shadows_bounding_rect,
@@ -711,6 +789,21 @@ fn paint_text_shadow<O: Observer>(
         orientation,
         ForceDarkRole::None,
     );
+    recorder.recorder.set_glyph_run_text(None);
+}
+
+/// The text a fragment holds between code unit offsets into it.
+fn fragment_text(
+    source: &crate::painting::paint_read::PaintSource<'_>,
+    fragment: &FragmentRecord,
+    offsets: std::ops::Range<usize>,
+) -> String {
+    let Some(rendered_text) = source.rendered_text(fragment.layout_node) else {
+        return String::new();
+    };
+    let end = (fragment.start + offsets.end.min(fragment.length_in_code_units)).min(rendered_text.text.len());
+    let start = (fragment.start + offsets.start).min(end);
+    String::from_utf16_lossy(&rendered_text.text[start..end])
 }
 
 fn paint_text_fragment<O: Observer>(
@@ -718,6 +811,7 @@ fn paint_text_fragment<O: Observer>(
     block: NodeSlotId,
     span: &RenderSpan,
     decoration_sets: &[crate::painting::record::paint::text_decoration::TextDecorationSet],
+    draw_glyphs: bool,
 ) {
     if span.start_code_unit == span.end_code_unit {
         return;
@@ -767,13 +861,18 @@ fn paint_text_fragment<O: Observer>(
         orientation,
         glyph_bounding_rect,
     } = glyph_run_emission(fragment, run, fragment_absolute_rect, fragment_device_rect, scale);
-    let run_for_recording = GlyphRunForRecording {
-        font_smoothing: recorder
-            .source
-            .node_style_if_live(fragment.style_source)
-            .unwrap()
-            .inherited_text()
-            .font_smoothing,
+    let style = recorder.source.node_style_if_live(fragment.style_source).unwrap();
+    let text = style.inherited_text();
+    let font_smoothing = text.font_smoothing;
+    let stroke_width = if span.highlights.is_empty() {
+        (text.webkit_text_stroke_width * scale) as f32
+    } else {
+        0.0
+    };
+    let stroke_color = Color(text.webkit_text_stroke_color.resolve(style.current_color()));
+    let paint_order = style.inherited_svg().paint_order;
+    let run_for_recording = || GlyphRunForRecording {
+        font_smoothing,
         font_id: FontResourceId(font_id),
         glyphs: run
             .glyphs
@@ -782,46 +881,56 @@ fn paint_text_fragment<O: Observer>(
             .map(DisplayListGlyph::from),
     };
 
-    // Paint text, clipped to span range if not full fragment.
-    let is_full_fragment = span.start_code_unit == 0 && span.end_code_unit == fragment.length_in_code_units;
-    let mut decoration_box = fragment_absolute_rect;
-    if is_full_fragment {
-        recorder.recorder.draw_glyph_run(
-            baseline_start,
-            run_for_recording,
-            Color(span.text_color),
-            fragment_device_rect,
-            scale,
-            orientation,
-            glyph_bounding_rect,
-            ForceDarkRole::Foreground,
-        );
-    } else {
-        let range_rect = text_fragment::rect_for_selection_offsets(
-            recorder.source,
-            fragment,
-            SelectionOffsets {
-                start: span.start_code_unit,
-                end: span.end_code_unit,
-            },
-            || text_fragment::first_available_font(recorder.source, fragment),
-        );
-        let span_rect = converter.rounded_device_rect(range_rect);
-        recorder.recorder.record_clipped_to(span_rect, |recorder| {
+    let paint_glyphs = |recorder: &mut crate::painting::display_list::recorder::DisplayListRecorder| {
+        for operation in paint_order {
+            let (color, width) = match operation {
+                crate::css::css_enums::paint_order::FILL => (Color(span.text_color), 0.0),
+                crate::css::css_enums::paint_order::STROKE if stroke_width > 0.0 => (stroke_color, stroke_width),
+                _ => continue,
+            };
             recorder.draw_glyph_run(
                 baseline_start,
-                run_for_recording,
-                Color(span.text_color),
+                run_for_recording(),
+                color,
+                width,
                 fragment_device_rect,
                 scale,
                 orientation,
                 glyph_bounding_rect,
                 ForceDarkRole::Foreground,
             );
-        });
+        }
+    };
+    let text = recorder
+        .recorder
+        .notes_record_origins()
+        .then(|| fragment_text(recorder.source, fragment, span.start_code_unit..span.end_code_unit));
+    recorder.recorder.set_glyph_run_text(text);
+    // Paint text, clipped to span range if not full fragment.
+    let is_full_fragment = span.start_code_unit == 0 && span.end_code_unit == fragment.length_in_code_units;
+    let mut decoration_box = fragment_absolute_rect;
+    if is_full_fragment {
+        if draw_glyphs {
+            paint_glyphs(&mut recorder.recorder);
+        }
+    } else {
+        let offsets = SelectionOffsets {
+            start: span.start_code_unit,
+            end: span.end_code_unit,
+        };
+        let range_rects = text_fragment::rects_for_selection_offsets(recorder.source, fragment, offsets);
+        for range_rect in &range_rects {
+            let span_rect = converter.rounded_device_rect(*range_rect);
+            if draw_glyphs {
+                recorder.recorder.record_clipped_to(span_rect, paint_glyphs);
+            }
+        }
+        let range_rect = text_fragment::rect_for_selection_offsets(recorder.source, fragment, offsets);
         decoration_box.x = range_rect.x;
         decoration_box.width = range_rect.width;
     }
+
+    recorder.recorder.set_glyph_run_text(None);
 
     for set in decoration_sets {
         crate::painting::record::paint::text_decoration::paint_decoration_lines(

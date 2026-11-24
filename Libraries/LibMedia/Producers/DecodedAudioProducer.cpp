@@ -51,17 +51,13 @@ DecodedAudioProducer::DecodedAudioProducer(NonnullRefPtr<ThreadData> const& thre
 
 DecodedAudioProducer::~DecodedAudioProducer()
 {
+    m_thread_data->set_read_unblocked_handler(nullptr);
     m_thread_data->exit();
 }
 
 void DecodedAudioProducer::set_error_handler(ErrorHandler&& handler)
 {
     m_thread_data->set_error_handler(move(handler));
-}
-
-void DecodedAudioProducer::set_read_blocked_change_handler(ReadBlockedChangeHandler handler)
-{
-    m_thread_data->set_read_blocked_change_handler(move(handler));
 }
 
 ErrorOr<void> DecodedAudioProducer::set_output_sample_specification(Audio::SampleSpecification sample_specification)
@@ -84,6 +80,16 @@ void DecodedAudioProducer::set_wake_handler(PipelineWakeHandler handler)
     m_thread_data->set_wake_handler(move(handler));
 }
 
+void DecodedAudioProducer::set_read_unblocked_handler(Function<void()> handler)
+{
+    m_thread_data->set_read_unblocked_handler(move(handler));
+}
+
+void DecodedAudioProducer::set_checkpoint(PipelineCheckpoint checkpoint)
+{
+    m_thread_data->set_checkpoint(checkpoint);
+}
+
 void DecodedAudioProducer::start()
 {
     m_thread_data->start();
@@ -101,8 +107,30 @@ DecodedAudioProducer::ThreadData::ThreadData(Core::EventLoop& main_thread_event_
     , m_converter(move(converter))
     , m_auto_suspend_idle_timeout(auto_suspend_idle_timeout)
 {
-    m_demuxer->set_read_blocked_change_handler_for_track(m_track, [this](ReadBlocked blocked) {
-        dispatch_read_blocked_change(blocked);
+    set_read_unblocked_handler(nullptr);
+}
+
+void DecodedAudioProducer::ThreadData::set_read_unblocked_handler(Function<void()> on_read_unblocked)
+{
+    m_demuxer->set_read_blocked_change_handler_for_track(m_track, [this, on_read_unblocked = move(on_read_unblocked)](ReadBlocked blocked) {
+        m_demuxer_read_is_blocked.store(blocked == ReadBlocked::Yes);
+        if (blocked == ReadBlocked::No && on_read_unblocked)
+            on_read_unblocked();
+        dispatch_wake_later();
+    });
+}
+
+void DecodedAudioProducer::ThreadData::set_checkpoint(PipelineCheckpoint checkpoint)
+{
+    m_checkpoint.store(checkpoint);
+    dispatch_wake_later();
+}
+
+void DecodedAudioProducer::ThreadData::dispatch_wake_later()
+{
+    m_main_thread_event_loop.deferred_invoke([self = NonnullRefPtr(*this)] {
+        auto locker = self->take_lock();
+        self->dispatch_wake_if_needed_while_locked();
     });
 }
 
@@ -114,19 +142,6 @@ DecodedAudioProducer::ThreadData::~ThreadData()
 void DecodedAudioProducer::ThreadData::set_error_handler(ErrorHandler&& handler)
 {
     m_error_handler = move(handler);
-}
-
-void DecodedAudioProducer::ThreadData::set_read_blocked_change_handler(ReadBlockedChangeHandler handler)
-{
-    m_read_blocked_change_handler = move(handler);
-}
-
-void DecodedAudioProducer::ThreadData::dispatch_read_blocked_change(ReadBlocked blocked)
-{
-    m_main_thread_event_loop.deferred_invoke([self = NonnullRefPtr(*this), blocked] {
-        if (self->m_read_blocked_change_handler)
-            self->m_read_blocked_change_handler(blocked);
-    });
 }
 
 ErrorOr<void> DecodedAudioProducer::ThreadData::set_output_sample_specification(Audio::SampleSpecification sample_specification)
@@ -313,11 +328,17 @@ AudioProducerOutput DecodedAudioProducer::ThreadData::peek()
 
 AudioProducerOutput DecodedAudioProducer::ThreadData::peek_while_locked()
 {
+    // A read stops being reported as blocked before its unblocked handler sets a checkpoint, so the checkpoint is read
+    // first.
+    auto checkpoint = m_checkpoint.load();
+    auto read_is_blocked = m_demuxer_read_is_blocked.load();
     if (m_last_processed_seek_id != m_seek_id)
-        return { nullptr, PipelineStatus::Pending };
+        return { nullptr, read_is_blocked ? PipelineStatus::Blocked : PipelineStatus::Pending, checkpoint };
     if (!m_queue.is_empty())
-        return { &m_queue.head().block, PipelineStatus::HaveData };
-    return { nullptr, m_current_halting_status };
+        return { &m_queue.head().block, PipelineStatus::HaveData, checkpoint };
+    if (m_current_halting_status == PipelineStatus::Pending && read_is_blocked)
+        return { nullptr, PipelineStatus::Blocked, checkpoint };
+    return { nullptr, m_current_halting_status, checkpoint };
 }
 
 void DecodedAudioProducer::ThreadData::consume()
@@ -355,6 +376,8 @@ void DecodedAudioProducer::ThreadData::seek(AK::Duration timestamp)
     m_seek_timestamp = timestamp;
     m_downstream_needs_wake = true;
     m_demuxer->set_blocking_reads_aborted_for_track(m_track);
+    // The aborted read reports that it stopped blocking only once the decode thread wakes.
+    m_demuxer_read_is_blocked.store(false);
     wake();
 }
 
@@ -558,7 +581,12 @@ void DecodedAudioProducer::ThreadData::handle_seek()
             }
 
             m_current_halting_status = PipelineStatus::Pending;
-            m_frame_awaiting_decoder_replacement.clear();
+            // A seek makes the drain pointless, and the demuxer has already given us the frame and its configuration, so
+            // start over with a new decoder and have the demuxer provide the configuration again.
+            if (m_frame_awaiting_decoder_replacement.has_value()) {
+                m_frame_awaiting_decoder_replacement.clear();
+                m_decoder.clear();
+            }
             m_decoder_is_draining_before_unavailable_data = false;
         }
 
@@ -699,13 +727,8 @@ void DecodedAudioProducer::ThreadData::push_data_and_decode_a_block()
         auto locker = take_lock();
         enter_halting_state(status, move(error));
 
-        while (true) {
-            if (m_seek_id != m_last_processed_seek_id)
-                return;
+        while (m_seek_id == m_last_processed_seek_id && !should_thread_exit_while_locked())
             m_wait_condition.wait();
-            if (should_thread_exit_while_locked())
-                return;
-        }
     };
 
     // If a prior seek encountered a decoding error, stop here to ensure that the pipeline state stays Error.

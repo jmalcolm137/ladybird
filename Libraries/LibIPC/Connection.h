@@ -15,10 +15,14 @@
 #include <AK/NonnullRefPtr.h>
 #include <AK/Queue.h>
 #include <AK/ThreadID.h>
+#include <AK/Time.h>
 #include <LibCore/EventReceiver.h>
 #include <LibIPC/Attachment.h>
+#include <LibIPC/FfiConnection.h>
 #include <LibIPC/Forward.h>
 #include <LibIPC/Message.h>
+#include <LibIPC/RawMessage.h>
+#include <LibIPC/ReceivedMessageBytes.h>
 #include <LibIPC/Transport.h>
 
 namespace IPC {
@@ -90,6 +94,8 @@ public:
     // Dispatch every message the peer has already sent on this connection, without waiting for new ones.
     void dispatch_pending_messages();
 
+    FfiConnection to_ffi_with_one_reference();
+
     template<typename RequestType, typename... Args>
     NonnullOwnPtr<typename RequestType::ResponseType> send_sync(Args&&... args)
     {
@@ -110,6 +116,29 @@ public:
         return wait_for_specific_endpoint_message<typename RequestType::ResponseType>(MayCancel::Yes);
     }
 
+    // NB: Responses have no ID, so the response to a request that missed its deadline would pass for the response to
+    //     the next request of that type. A caller that gets none while the connection is open must not use the
+    //     connection again.
+    template<typename RequestType, typename... Args>
+    OwnPtr<typename RequestType::ResponseType> send_sync_until(MonotonicTime deadline, Args&&... args)
+    {
+        if (post_sync_request(RequestType(forward<Args>(args)...)).is_error())
+            return nullptr;
+        if (auto message = wait_for_specific_endpoint_message_impl(RequestType::ResponseType::ENDPOINT_MAGIC, RequestType::ResponseType::static_message_id(), MayCancel::Yes, deadline))
+            return message.template release_nonnull<typename RequestType::ResponseType>();
+        return nullptr;
+    }
+
+    // Waits for a message from the peer and handles none of the others meanwhile, which stay queued in order. None if
+    // the deadline passes first, or the peer goes away.
+    template<typename MessageType>
+    OwnPtr<MessageType> wait_for_specific_endpoint_message_until(MonotonicTime deadline)
+    {
+        if (auto message = wait_for_specific_endpoint_message_impl(MessageType::ENDPOINT_MAGIC, MessageType::static_message_id(), MayCancel::No, deadline))
+            return message.template release_nonnull<MessageType>();
+        return {};
+    }
+
 protected:
     enum class MayCancel {
         No,
@@ -127,11 +156,12 @@ protected:
     explicit ConnectionBase(IPC::Stub&, NonnullOwnPtr<Transport>, u32 local_endpoint_magic);
 
     virtual void shutdown_with_error(Error const&);
-    virtual OwnPtr<Message> try_parse_message(ReadonlyBytes, Queue<Attachment>&) = 0;
+    virtual OwnPtr<Message> try_parse_message(ReceivedMessageBytes const&, Queue<Attachment>&) = 0;
 
     ErrorOr<void> post_sync_request(Message const&);
-    OwnPtr<IPC::Message> wait_for_specific_endpoint_message_impl(u32 endpoint_magic, int message_id, MayCancel = MayCancel::No);
-    void wait_for_transport_to_become_readable();
+    ErrorOr<void> post_sync_request(MessageBuffer&);
+    OwnPtr<IPC::Message> wait_for_specific_endpoint_message_impl(u32 endpoint_magic, int message_id, MayCancel = MayCancel::No, Optional<MonotonicTime> deadline = {});
+    void wait_for_transport_to_become_readable(Optional<MonotonicTime> deadline = {});
     enum class PeerEOF {
         No,
         Yes
@@ -139,6 +169,11 @@ protected:
     PeerEOF drain_messages_from_peer();
 
     void handle_messages();
+
+    bool send_raw_sync_request(MessageBuffer&, u32 response_endpoint_magic, i32 response_message_id, Function<void(FfiRawMessage)> const& hand_over_response);
+    static bool send_sync_request_from_rust(void* connection, ReadonlyBytes, ReadonlySpan<RawAttachment>, u32 response_endpoint_magic, i32 response_message_id, void* response_sink, void (*take_response)(void* response_sink, FfiRawMessage));
+    static void ref_from_rust(void* connection);
+    static void unref_from_rust(void* connection);
 
     AK::ThreadID m_owner_thread_id { AK::ThreadID::current() };
 
@@ -165,8 +200,23 @@ public:
     }
 
 protected:
-    virtual OwnPtr<Message> try_parse_message(ReadonlyBytes bytes, Queue<Attachment>& attachments) override
+    virtual OwnPtr<Message> try_parse_message(ReceivedMessageBytes const& received_bytes, Queue<Attachment>& attachments) override
     {
+        auto bytes = received_bytes.bytes();
+        if (auto header = RawMessage::read_header(bytes); header.has_value()) {
+            Optional<StringView> message_name;
+            if (header->endpoint_magic == LocalEndpoint::static_magic())
+                message_name = LocalEndpoint::name_of_request_that_arrives_raw(header->message_id);
+            else if (header->endpoint_magic == PeerEndpoint::static_magic())
+                message_name = PeerEndpoint::name_of_response_that_arrives_raw(header->message_id);
+            if (message_name.has_value()) {
+                Vector<Attachment> attachments_of_message;
+                while (!attachments.is_empty())
+                    attachments_of_message.append(attachments.dequeue());
+                return make<RawMessage>(*header, *message_name, received_bytes, move(attachments_of_message));
+            }
+        }
+
         auto local_message = LocalEndpoint::decode_message(bytes, attachments);
         if (!local_message.is_error())
             return local_message.release_value();

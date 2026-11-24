@@ -20,7 +20,7 @@
 #include <LibMedia/Track.h>
 #include <LibMediaCodecs/CodecID.h>
 #include <LibMediaCodecs/CodecParameters.h>
-#include <LibMediaCodecs/Color/CodingIndependentCodePoints.h>
+#include <LibMediaCodecs/Color/ColorMetadata.h>
 
 namespace Media::ISOBMFF {
 
@@ -48,11 +48,6 @@ struct FileType {
     FourCC major_brand;
     u32 minor_version { 0 };
     Vector<FourCC> compatible_brands;
-
-    bool is_compatible_with(FourCC brand) const
-    {
-        return major_brand == brand || compatible_brands.contains_slow(brand);
-    }
 };
 
 enum class HandlerType : u8 {
@@ -66,6 +61,8 @@ struct VideoSampleData {
     u16 width { 0 };
     u16 height { 0 };
     Optional<CodingIndependentCodePoints> cicp;
+    Optional<MasteringDisplayColorVolume> mastering_display_color_volume;
+    Optional<ContentLightLevelInformation> content_light_level_information;
 };
 
 struct AudioSampleData {
@@ -324,7 +321,12 @@ inline Track track_from_track_entry(TrackEntry const& track_entry, bool is_first
         track.set_video_data({
             .pixel_width = video.width,
             .pixel_height = video.height,
-            .cicp = video.cicp.value_or({}),
+            .color_metadata = {
+                .cicp = video.cicp.value_or({}),
+                .mastering_display_color_volume = video.mastering_display_color_volume,
+                .content_light_level_information = video.content_light_level_information,
+                .maximum_scene_luminance = {},
+            },
         });
     } else if (track.type() == TrackType::Audio && sample_entry->audio.has_value()) {
         auto const& audio = sample_entry->audio.value();

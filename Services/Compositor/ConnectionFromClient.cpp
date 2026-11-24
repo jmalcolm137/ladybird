@@ -18,9 +18,9 @@ namespace Compositor {
 
 static IDAllocator s_web_content_connection_ids;
 
-ConnectionFromClient::ConnectionFromClient(NonnullOwnPtr<IPC::Transport> transport, RefPtr<Gfx::SkiaBackendContext> skia_backend_context)
+ConnectionFromClient::ConnectionFromClient(NonnullOwnPtr<IPC::Transport> transport, RefPtr<Gfx::SkiaBackendContext> skia_backend_context, bool scrollbars_always_shown)
     : IPC::ConnectionFromClient<CompositorControlClientEndpoint, CompositorControlServerEndpoint>(*this, move(transport), 1)
-    , m_compositor_state(CompositorState::create(move(skia_backend_context)))
+    , m_compositor_state(CompositorState::create(move(skia_backend_context), scrollbars_always_shown))
 {
 }
 
@@ -65,7 +65,6 @@ void ConnectionFromClient::connect_video_presentation(i32 web_content_connection
 Messages::CompositorControlServer::CreatePresentationConnectionResponse ConnectionFromClient::create_presentation_connection(bool synthesizes_scroll_momentum, bool scrolls_elastically, Optional<u64> gpu_presentation_adapter_luid)
 {
     auto paired_transport = MUST(IPC::Transport::create_paired());
-    auto presentation_id = m_next_presentation_id++;
     // NB: The capabilities come with the connection, so the first backing stores of a context bound to it match them.
     auto capabilities = CompositorState::PresentationCapabilities {
         .synthesizes_scroll_momentum = synthesizes_scroll_momentum,
@@ -73,6 +72,7 @@ Messages::CompositorControlServer::CreatePresentationConnectionResponse Connecti
         .gpu_presentation_adapter_luid = gpu_presentation_adapter_luid,
     };
     auto connection = ConnectionFromPresentation::construct(move(paired_transport.local), m_compositor_state, capabilities);
+    auto presentation_id = connection->presentation_id().value();
     connection->set_on_death([this, presentation_id] {
         m_presentation_connections.remove(presentation_id);
     });
@@ -88,6 +88,16 @@ void ConnectionFromClient::bind_presentation(Web::CompositorContextId context_id
         return;
     }
     m_compositor_state->bind_presentation(context_id, **connection);
+}
+
+ErrorOr<OwnPtr<IPC::MessageBuffer>> ConnectionFromClient::handle_raw(IPC::RawMessage& message)
+{
+    auto outcome = m_compositor_state->handle_message_from_control(message);
+    if (outcome.misbehavior.has_value()) {
+        did_misbehave(outcome.misbehavior->characters());
+        return nullptr;
+    }
+    return move(outcome.response);
 }
 
 void ConnectionFromClient::create_context(Web::CompositorContextId context_id, Optional<u64> page_id, i32 web_content_connection_id)
@@ -128,6 +138,11 @@ void ConnectionFromClient::set_context_visibility(Web::CompositorContextId conte
 void ConnectionFromClient::set_context_presents_from_cpu_memory(Web::CompositorContextId context_id, bool presents_from_cpu_memory)
 {
     m_compositor_state->set_context_presents_from_cpu_memory(context_id, presents_from_cpu_memory);
+}
+
+void ConnectionFromClient::set_context_scales_frames_to_fit(Web::CompositorContextId context_id, bool scales_frames_to_fit)
+{
+    m_compositor_state->set_context_scales_frames_to_fit(context_id, scales_frames_to_fit);
 }
 
 void ConnectionFromClient::crash()

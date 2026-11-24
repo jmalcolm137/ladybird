@@ -28,9 +28,15 @@ pub enum ReplacedContentInput {
     None,
     /// A `<textarea>`'s `cols` and `rows`: its natural size is that many `ch` by that many `lh`.
     TextArea { cols: u32, rows: u32 },
-    /// An `<input>`'s `size`, and whether its type makes it a text entry widget, whose default
-    /// preferred size is that many `ch` by one line.
-    Input { size: u32, is_text_entry: bool },
+    /// An `<input>`'s preferred character count and whether its type makes it a text entry widget.
+    /// Number inputs with a range-derived or explicit count reserve space for their stepper too.
+    Input {
+        size: u32,
+        is_text_entry: bool,
+        include_number_stepper: bool,
+    },
+    /// An `<input>` in the Range state, a slider.
+    RangeInput,
     /// A `<canvas>`'s `width` and `height`, its natural size in CSS pixels.
     Canvas { width: u32, height: u32 },
     /// The natural size of what an element has loaded, such as a video's or an image's.
@@ -69,7 +75,9 @@ impl ReplacedContentInput {
             kind if kind == Kind::Input as u8 || kind == Kind::TextEntryInput as u8 => Self::Input {
                 size: values[0],
                 is_text_entry: kind == Kind::TextEntryInput as u8,
+                include_number_stepper: values[1] != 0,
             },
+            kind if kind == Kind::RangeInput as u8 => Self::RangeInput,
             kind if kind == Kind::Canvas as u8 => Self::Canvas {
                 width: values[0],
                 height: values[1],
@@ -96,17 +104,45 @@ pub struct TextStyleParentFacts {
 pub struct PublishedBoxFacts {
     pub display: crate::css::display::FfiDisplay,
     pub content_visibility: u8,
-    pub position: u8,
-    pub float_: u8,
-    pub appearance: u8,
 }
 
-/// What a published record says about the content a box is generated from.
-pub struct PublishedContentFacts {
-    pub counters_are_none: bool,
-    pub content_is_keyword: bool,
-    pub content_is_strings_only: bool,
-    pub opens_or_closes_quotes: bool,
+/// See [`RetainedState::element_layout_inputs`].
+#[derive(Clone, Copy)]
+pub(crate) struct ElementLayoutInputs<'a> {
+    /// See `bridge::element_adjustment_fact`.
+    pub(crate) adjustment_facts: u32,
+    /// See `bridge::element_construction_fact`.
+    pub(crate) construction_facts: u32,
+    pub(crate) box_kind: super::bridge::ElementBoxKind,
+    pub(crate) record: Option<PublishedLayoutRecord<'a>>,
+}
+
+/// What [`RetainedState::prefetch_element_layout_inputs`] fetches.
+#[derive(Clone, Copy)]
+pub(crate) enum LayoutInputsPrefetch {
+    /// The element's rows of the tables its inputs are read from.
+    Rows,
+    /// The record the element holds.
+    Record,
+    /// The sets of groups of the record the element holds.
+    Groups,
+}
+
+/// An element's published style record, as a layout tree build reads it.
+#[derive(Clone, Copy)]
+pub(crate) struct PublishedLayoutRecord<'a> {
+    /// The record's identity.
+    pub(crate) raw: u64,
+    pub(crate) payloads: &'a crate::css::computed_values::StyleGroups,
+}
+
+impl PublishedLayoutRecord<'_> {
+    /// What a tree build reads of the record's style.
+    pub(crate) fn summary(&self) -> crate::layout::tree_plan::style_summary::StyleBoxSummary {
+        crate::layout::tree_plan::style_summary::StyleBoxSummary::of(
+            crate::css::computed_value_views::ComputedValuesView::of(self.payloads),
+        )
+    }
 }
 
 /// The custom-property environment one element holds: the store the host holds as the environment,
@@ -170,6 +206,11 @@ impl HeldStyleRecords {
     #[must_use]
     pub(crate) fn get(&self, node: StyleNodeID) -> Option<&std::sync::Arc<super::pipeline::Record>> {
         self.by_element.get(node.element_index()? as usize)?.0.as_ref()
+    }
+
+    /// Where the column keeps the record `node` holds.
+    fn slot_of(&self, node: StyleNodeID) -> Option<*const u8> {
+        Some(std::ptr::from_ref(self.by_element.get(node.element_index()? as usize)?).cast())
     }
 
     #[must_use]
@@ -555,6 +596,47 @@ impl RetainedState {
         self.projection.construction_facts(node)
     }
 
+    /// https://drafts.csswg.org/css-values-4/#font-relative-lengths
+    /// Wants the loads of the faces still loading ahead of the first available fonts that `reads`
+    /// names for `node`, or for its pseudo-element `pseudo`, as the lengths that read their metrics
+    /// would once they load: the element's or pseudo-element's own, its parent's, and the document
+    /// element's.
+    pub(crate) fn want_first_available_font_loads_for(
+        &self,
+        node: StyleNodeID,
+        pseudo: Option<u8>,
+        reads: crate::css::animation::FontMetricReads,
+    ) {
+        let want = |record: Option<u64>| {
+            let font = record
+                .and_then(|record| self.published_record_view(record))
+                .map(|view| view.font());
+            if let Some(list) = font.and_then(|font| font.frozen_font_list.list()) {
+                list.want_first_available_font_loads();
+            }
+        };
+        let element_record =
+            |node: Option<StyleNodeID>| node.and_then(|node| self.element_published_style_record(node));
+        if reads.own {
+            want(match pseudo {
+                Some(kind) => self.published_pseudo_record(node, kind).map(|record| record.raw()),
+                None => element_record(Some(node)),
+            });
+        }
+        // NB: A pseudo-element inherits from its originating element.
+        if reads.parent {
+            want(element_record(match pseudo {
+                Some(_) => Some(node),
+                None => self.inheritance_parent(node),
+            }));
+        }
+        if reads.root {
+            want(element_record(
+                std::iter::successors(Some(node), |&ancestor| self.inheritance_parent(ancestor)).last(),
+            ));
+        }
+    }
+
     /// The record the element published, which its box is built from: the one a clock frame shows in its place, the
     /// record the element holds, or the one the engine assigned it before it holds one. `None` while the element has
     /// no record: a text node, a retired identity, or an element style has not reached yet.
@@ -569,6 +651,71 @@ impl RetainedState {
                     .assigned_style_record(node)
                     .map(computed::FinalStyleRecordID::raw)
             })
+    }
+
+    /// What a layout tree build reads of the element in one go: the facts the host published for it, and the record
+    /// [`Self::element_published_style_record`] answers, with its groups. The record is `None` while the element has
+    /// none.
+    #[must_use]
+    pub(crate) fn element_layout_inputs(&self, node: StyleNodeID) -> ElementLayoutInputs<'_> {
+        let host_facts = self.projection.host_facts(node);
+        ElementLayoutInputs {
+            adjustment_facts: host_facts.adjustment_facts,
+            construction_facts: host_facts.construction_facts,
+            box_kind: host_facts.box_kind,
+            record: self.element_published_layout_record(node),
+        }
+    }
+
+    /// Asks the processor to fetch what [`Self::element_layout_inputs`] reads of the element `node` at `stage`,
+    /// without waiting for it. Each stage reads what the stage before fetched, so a walk asks for the stages of an
+    /// element some steps apart, the first one furthest ahead.
+    pub(crate) fn prefetch_element_layout_inputs(&self, node: StyleNodeID, stage: LayoutInputsPrefetch) {
+        use crate::css::declaration_block::prefetch;
+        match stage {
+            LayoutInputsPrefetch::Rows => {
+                if let Some(row) = self.projection.host_facts_row(node) {
+                    prefetch(row);
+                }
+                if let Some(held) = self.held_style_records.slot_of(node) {
+                    prefetch(held);
+                }
+            }
+            LayoutInputsPrefetch::Record => {
+                if let Some(record) = self.held_style_records.get(node) {
+                    let address = std::sync::Arc::as_ptr(record).cast::<u8>();
+                    prefetch(address);
+                    prefetch(address.wrapping_add(64));
+                }
+            }
+            LayoutInputsPrefetch::Groups => {
+                if let Some(record) = self.held_style_records.get(node) {
+                    record.payloads.prefetch_sets();
+                }
+            }
+        }
+    }
+
+    fn element_published_layout_record(&self, node: StyleNodeID) -> Option<PublishedLayoutRecord<'_>> {
+        fn of(raw: u64, record: &super::pipeline::Record) -> PublishedLayoutRecord<'_> {
+            PublishedLayoutRecord {
+                raw,
+                payloads: &record.payloads,
+            }
+        }
+        if !self.tick_shown.is_empty()
+            && let Some(shown) = self.tick_shown.element(node)
+        {
+            return Some(of(shown.raw(), self.computed_group_sets.host_record(shown.raw())?));
+        }
+        if let Some(record) = self.held_style_records.get(node) {
+            let identity = bridge::host_record_identity(record);
+            if identity != 0 {
+                return Some(of(identity, record));
+            }
+        }
+        let assigned = self.computed_group_sets.assigned_style_record(node)?.raw();
+        Some(of(assigned, self.computed_group_sets.host_record(assigned)?))
     }
 
     /// The style the element published for one pseudo-element kind. `None` while the element
@@ -589,6 +736,12 @@ impl RetainedState {
             .map(computed::FinalStyleRecordID::raw)
     }
 
+    /// Whether the element published a record for no pseudo-element at all, which spares asking for each kind.
+    #[must_use]
+    pub(crate) fn publishes_no_pseudo_element_records(&self, node: StyleNodeID) -> bool {
+        !self.tick_shown.shows_any(node) && self.computed_group_sets.has_no_pseudo_rows(node)
+    }
+
     #[must_use]
     pub fn pseudo_published_custom_highlight_records(&self, node: StyleNodeID) -> SmallVec<[(StyleAtomID, u64); 2]> {
         self.computed_group_sets
@@ -602,26 +755,6 @@ impl RetainedState {
     #[must_use]
     pub fn element_published_box_facts(&self, node: StyleNodeID) -> Option<PublishedBoxFacts> {
         self.published_box_facts(self.published_element_record(node))
-    }
-
-    /// The box facts the element's published record for one pseudo-element kind holds. `None`
-    /// while the element styles no such pseudo-element.
-    #[must_use]
-    pub fn pseudo_published_box_facts(&self, node: StyleNodeID, pseudo_kind: u8) -> Option<PublishedBoxFacts> {
-        self.published_box_facts(self.published_pseudo_record(node, pseudo_kind))
-    }
-
-    /// What the element's published record for one pseudo-element kind says about its generated
-    /// content. `None` while the element styles no such pseudo-element.
-    #[must_use]
-    pub fn pseudo_published_content_facts(&self, node: StyleNodeID, pseudo_kind: u8) -> Option<PublishedContentFacts> {
-        let view = self.published_style_record_view(self.published_pseudo_record(node, pseudo_kind))?;
-        Some(PublishedContentFacts {
-            counters_are_none: view.counter_properties_are_none(),
-            content_is_keyword: view.content_is_keyword(),
-            content_is_strings_only: view.content_is_strings_only(),
-            opens_or_closes_quotes: view.content_opens_or_closes_quotes(),
-        })
     }
 
     /// Whether the element's published style record counts a counter down from its own last item,
@@ -688,9 +821,6 @@ impl RetainedState {
         Some(PublishedBoxFacts {
             display: view.display(),
             content_visibility: view.content_visibility(),
-            position: view.position(),
-            float_: view.float_(),
-            appearance: view.appearance(),
         })
     }
 
@@ -837,13 +967,6 @@ impl RetainedState {
     /// Record which kind of tree the text node arrived in.
     pub fn set_text_is_in_user_agent_shadow_tree(&mut self, node: StyleNodeID, value: bool) {
         self.tree.set_text_is_in_user_agent_shadow_tree(node, value);
-    }
-
-    /// Whether the element's published style record replaces its contents with a single image.
-    #[must_use]
-    pub fn element_content_is_single_image(&self, node: StyleNodeID) -> bool {
-        self.published_style_record_view(self.published_element_record(node))
-            .is_some_and(crate::css::computed_value_views::ComputedValuesView::content_is_single_image)
     }
 
     /// The tree scope a counter style name `node` uses is looked up from: its own, unless its shadow
@@ -1248,18 +1371,11 @@ impl RetainedState {
     ) {
         let style_record = record.as_deref().map_or(0, bridge::host_record_identity);
         let previous = self.held_style_records.set(node, record);
-        // NB: Font-relative size queries can change even when the container's box keeps the same dimensions.
-        let font_group = crate::css::table_group_builder::group_index::FONT;
-        let font_inputs_changed = self.size_container_queries.is_queried_container(node)
-            && previous.is_some_and(|previous| {
-                self.held_style_records.get(node).is_some_and(|current| {
-                    previous.payloads[font_group].as_ptr() != current.payloads[font_group].as_ptr()
-                })
-            });
-        self.set_element_container_query_inputs(node, style_record);
-        if font_inputs_changed {
-            self.size_container_queries.note_font_input_change(node);
+        if let (Some(previous), Some(current)) = (previous, self.held_style_records.get(node)) {
+            self.size_container_queries
+                .note_held_record_change(node, previous, current);
         }
+        self.set_element_container_query_inputs(node, style_record);
         // A `rem` the host resolves reads the font of the record it holds for the document element,
         // which it can install in the middle of a style update.
         if self.projection.adjustment_facts(node) & bridge::element_adjustment_fact::IS_DOCUMENT_ELEMENT != 0 {
@@ -1403,14 +1519,13 @@ impl RetainedState {
 
     /// Record the CSS animations the host holds for one of an element's animation lists, in the
     /// order it holds them: each one's name, and the definition the last plan applied to it.
-    pub fn set_element_css_defined_animations(
+    pub(crate) fn set_element_css_defined_animations(
         &mut self,
         node: StyleNodeID,
         slot: animations::AnimationSlot,
-        names: Box<[crate::css::css_string::CssString]>,
-        definitions: Box<[animations::HeldAppliedAnimationDefinition]>,
+        animations: Box<[animations::CssDefinedAnimation]>,
     ) {
-        self.css_defined_animations.set(node, slot, names, definitions);
+        self.css_defined_animations.set(node, slot, animations);
     }
 
     /// The CSS animations the host holds for one of an element's animation lists.
@@ -1463,8 +1578,8 @@ impl RetainedState {
     pub(crate) fn refresh_element_animation_effect_timing(
         &mut self,
         node: StyleNodeID,
-        identity: u64,
-        timing: &crate::css::style_compute::FfiEffectTiming,
+        identity: crate::animations::effect::AnimationEffectId,
+        timing: &crate::animations::snapshot::EffectTimingSnapshot,
     ) {
         self.animation_effect_descriptions
             .refresh_timing(node, identity, timing);
@@ -1473,22 +1588,15 @@ impl RetainedState {
     /// Keeps the timing the host samples one of an element's described effects with, and answers the
     /// key the effect samples its keyframes at (see
     /// [`super::effect_descriptions::AnimationEffectDescriptions::time_effect`]).
-    ///
-    /// # Safety
-    /// The linear points `easing` names must be live.
-    pub(crate) unsafe fn time_element_animation_effect(
+    pub(crate) fn time_element_animation_effect(
         &mut self,
         node: StyleNodeID,
         slot: animations::AnimationSlot,
-        identity: u64,
-        timing: &crate::css::style_compute::FfiEffectTiming,
-        easing: &crate::css::easing::FfiEasingDescriptor,
-        host_key: Option<f64>,
+        description: &std::sync::Arc<super::effect_descriptions::EffectDescription>,
+        timing: crate::animations::snapshot::CompactEffectTiming,
     ) -> Option<f64> {
-        unsafe {
-            self.animation_effect_descriptions
-                .time_effect(node, slot, identity, timing, easing, host_key)
-        }
+        self.animation_effect_descriptions
+            .time_effect(node, slot, description, timing)
     }
 
     pub fn set_tree_scope_root(&mut self, tree_scope: TreeScopeID, root: StyleNodeID) {
@@ -1569,15 +1677,6 @@ impl StyleEngine {
                 document_media: Default::default(),
                 document_functions: Default::default(),
                 custom_property_registry: None,
-                monospace_font_family: RetainedStyleValueData::from_owned(
-                    crate::css::parser::value_parser::value_list(
-                        vec![StyleValueData::Keyword {
-                            keyword: crate::css::style_compute::keyword::MONOSPACE,
-                        }],
-                        1,
-                        true,
-                    ),
-                ),
                 font_resolution: None,
                 pass_fonts: None,
                 computed_group_sets: Default::default(),
@@ -1609,10 +1708,8 @@ impl StyleEngine {
                 html_element_namespace: StyleAtomID::NONE,
                 sibling_positions: crate::fork::ForkReset::default(),
                 containers_counted_by_style_queries: Default::default(),
-                cold_pass_report: [0; pipeline::ReportField::COUNT],
                 live_style: None,
                 live_style_may_start: crate::fork::ForkReset::original(),
-                cold_passes: std::sync::Arc::default(),
                 live_counters: Default::default(),
                 style_layout_pool: None,
                 substituted_font_values: std::sync::Arc::default(),
@@ -1635,6 +1732,7 @@ impl StyleEngine {
             host: HostState {
                 hover_seal: Default::default(),
                 font_resolver: None,
+                settling_composition: None,
                 element_inputs: PendingElementInputs::default(),
                 deferred_element_style_inputs: Default::default(),
                 deferred_element_style_inputs_moved: false,
@@ -2231,6 +2329,9 @@ impl StyleEngine {
         version.scope = scope;
         self.replace_rule_version(rule, version);
         self.retained.counters.bump(Counter::StyleRulesCompiled);
+        self.retained
+            .live_counters
+            .note_program_event(super::pipeline::counters::ProgramEvent::StyleRulesCompiled, 1);
         rule
     }
 
@@ -2269,6 +2370,9 @@ impl StyleEngine {
         version.scope = self.scope_of_chain(scope);
         self.replace_rule_version(rule, version);
         self.retained.counters.bump(Counter::StyleRulesCompiled);
+        self.retained
+            .live_counters
+            .note_program_event(super::pipeline::counters::ProgramEvent::StyleRulesCompiled, 1);
     }
 
     /// Report that a rule's declarations moved, without touching anything else about it.
@@ -2472,7 +2576,6 @@ impl RetainedState {
             custom_property_registry: _,
             font_resolution: _,
             pass_fonts: _,
-            monospace_font_family: _,
             computed_group_sets,
             style_record_view_epoch_depth: _,
             custom_property_environments: _,
@@ -2512,11 +2615,9 @@ impl RetainedState {
             // Dropped in `forget_departed_elements` when a relation holds a departed element.
             // Scratch of one transaction.
             // Not keyed by style node.
-            cold_pass_report: _,
             // Keyed by style node, and only ever started by a test.
             live_style: _,
             live_style_may_start: _,
-            cold_passes: _,
             // The last pass's elements, which a reader leaves out where they departed.
             live_counters: _,
             style_layout_pool: _,

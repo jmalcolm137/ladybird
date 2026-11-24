@@ -15,9 +15,17 @@
 #include <LibWeb/Fetch/Infrastructure/HTTP/Responses.h>
 #include <LibWeb/HTML/LocalTraversableNavigable.h>
 #include <LibWeb/HTML/PolicyContainers.h>
-#include <LibWeb/WebDriver/BiDi/Network.h>
 
 namespace Web::Fetch::Infrastructure {
+
+extern "C" {
+
+// Called by Bindings/Rust/src/fetch/infrastructure/http/requests.rs.
+bool web_fetch_request_done(Request*);
+void web_fetch_request_set_header(Request*, ReadonlyBytes name, ReadonlyBytes value);
+void web_fetch_request_delete_header(Request*, ReadonlyBytes name);
+void web_fetch_request_unref(Request*);
+}
 
 NonnullRefPtr<Request> Request::create()
 {
@@ -32,14 +40,11 @@ Request::Request(NonnullRefPtr<HTTP::HeaderList> header_list)
 
 Request::~Request() = default;
 
-RefPtr<WebDriver::BiDi::NetworkRequest> Request::webdriver_bidi_network_request() const
+NonnullRefPtr<NetworkObservation> Request::ensure_network_observation()
 {
-    return m_webdriver_bidi_network_request;
-}
-
-void Request::set_webdriver_bidi_network_request(RefPtr<WebDriver::BiDi::NetworkRequest> state)
-{
-    m_webdriver_bidi_network_request = move(state);
+    if (!m_network_observation)
+        m_network_observation = NetworkObservation::create();
+    return *m_network_observation;
 }
 
 // https://fetch.spec.whatwg.org/#concept-request-url
@@ -256,6 +261,7 @@ NonnullRefPtr<Request> Request::clone() const
     new_request->set_client(m_client);
     new_request->set_client_snapshot(m_client_snapshot);
     new_request->set_remote_client_navigation(m_remote_client_navigation);
+    new_request->set_child_navigable_navigation(m_child_navigable_navigation);
     new_request->set_reserved_client_snapshot(m_reserved_client_snapshot);
     new_request->set_replaces_client_id(m_replaces_client_id);
     new_request->set_traversable_for_user_prompts(m_traversable_for_user_prompts);
@@ -642,6 +648,26 @@ Optional<Request::Priority> request_priority_from_string(Utf16View string)
 Optional<Request::Priority> request_priority_from_string(Utf16String const& string)
 {
     return request_priority_from_string(string.utf16_view());
+}
+
+bool web_fetch_request_done(Request* request)
+{
+    return request->done();
+}
+
+void web_fetch_request_set_header(Request* request, ReadonlyBytes name, ReadonlyBytes value)
+{
+    request->header_list()->set({ ByteString { name }, ByteString { value } });
+}
+
+void web_fetch_request_delete_header(Request* request, ReadonlyBytes name)
+{
+    request->header_list()->delete_(StringView { name });
+}
+
+void web_fetch_request_unref(Request* request)
+{
+    request->unref();
 }
 
 }

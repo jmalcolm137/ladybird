@@ -121,6 +121,13 @@ Messages::WebContentTestClient::DidRequestSiteIsolationProcessTreeForTestingResp
     return String {};
 }
 
+Messages::WebContentTestClient::DidRequestNowPlayingStateForTestingResponse WebContentTestClient::did_request_now_playing_state_for_testing(Web::PageId page_id)
+{
+    if (auto* page = m_client.page(page_id))
+        return page->did_request_now_playing_state_for_testing();
+    return Optional<Web::MediaSession::MediaSessionState> {};
+}
+
 Messages::WebContentTestClient::DidRequestTabIsPlayingAudioForTestingResponse WebContentTestClient::did_request_tab_is_playing_audio_for_testing(Web::PageId page_id)
 {
     if (auto* page = m_client.page(page_id))
@@ -165,12 +172,12 @@ void WebContentTestClient::retire_picture_in_picture_window_for_testing(Web::Pag
         page->retire_picture_in_picture_window_for_testing();
 }
 
-Messages::WebContentTestClient::DidRequestTabAudibilityChangeCountForTestingResponse WebContentTestClient::did_request_tab_audibility_change_count_for_testing(Web::PageId page_id)
+Messages::WebContentTestClient::DidRequestTabAudibilityTransitionsForTestingResponse WebContentTestClient::did_request_tab_audibility_transitions_for_testing(Web::PageId page_id)
 {
     if (auto* page = m_client.page(page_id))
-        return page->did_request_tab_audibility_change_count_for_testing();
+        return page->did_request_tab_audibility_transitions_for_testing();
 
-    return 0;
+    return Vector<bool> {};
 }
 
 Messages::WebContentTestClient::DidRequestHasPopulatedDocumentForTestingResponse WebContentTestClient::did_request_has_populated_document_for_testing(Web::PageId page_id, Web::HTML::CrossProcessId navigable_id)

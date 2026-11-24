@@ -8,16 +8,18 @@
 //!
 //! Code is carved out of large chunks that are mapped read+execute, and every write makes the affected pages writable
 //! (and not executable) for the duration of the copy: memory is never writable and executable at once. On Linux
-//! x86-64 with memory protection keys, the pages are writable and executable, but a protection key keeps every thread
-//! from writing them except the one writing code, while it writes. On macOS, chunks are MAP_JIT mappings whose write
-//! protection is toggled per thread instead. On Windows, chunks are only reserved, and pages get committed when code is
-//! first written to them.
+//! x86-64 with memory protection keys, the pages are writable and executable, but a protection key, allocated before
+//! the process has threads, keeps every thread from writing them except the one writing code, while it writes. On
+//! macOS, chunks are MAP_JIT mappings whose write protection is toggled per thread instead. On Windows, chunks are only
+//! reserved, and pages get committed when code is first written to them.
 //!
 //! Every VM has its own chunks, which only the VM's thread writes and runs code in, so flipping the protection of
 //! pages that hold other installed code is safe.
 
 use core::cell::RefCell;
 use std::rc::Rc;
+
+use libjs_jit::artifact::Patch;
 
 #[cfg(windows)]
 use ak::windows_code_memory;
@@ -68,21 +70,45 @@ mod protection_key {
         ) -> libc::c_int;
     }
 
+    static KEY: OnceLock<libc::c_int> = OnceLock::new();
+
+    // NB: pkey_alloc() sets the rights to the key for the running thread only, and a new thread copies the rights of
+    //     the thread that creates it. Allocating the key while the library loads, before there is a second thread, is
+    //     what makes every thread start out unable to write with it.
+    #[used]
+    #[unsafe(link_section = ".init_array")]
+    static ALLOCATE_KEY_ON_LOAD: extern "C" fn() = allocate_key;
+
+    extern "C" fn allocate_key() {
+        // NB: A thread that exists already would keep whatever rights it has to the key.
+        if !process_has_one_thread() {
+            return;
+        }
+        let key = pkey_alloc(0, PKEY_DISABLE_WRITE);
+        if key >= 0 {
+            let _ = KEY.set(key);
+        }
+    }
+
+    fn process_has_one_thread() -> bool {
+        // NB: A directory that cannot be read to its end may list any number of threads.
+        std::fs::read_dir("/proc/self/task")
+            .and_then(|threads| threads.collect::<Result<Vec<_>, _>>())
+            .is_ok_and(|threads| threads.len() == 1)
+    }
+
     /// The memory protection key of chunks whose write access is toggled per thread with the key instead of with
-    /// mprotect(), or None if the CPU or kernel lacks protection keys. Threads may write the chunks only while they
-    /// write code; the pages themselves are writable and executable. One key serves every VM in the process.
+    /// mprotect(), or None if the CPU or kernel lacks protection keys, or the process had threads when this library
+    /// loaded. Threads may write the chunks only while they write code; the pages themselves are writable and
+    /// executable. One key serves every VM in the process.
     pub fn key() -> Option<libc::c_int> {
-        static KEY: OnceLock<Option<libc::c_int>> = OnceLock::new();
-        *KEY.get_or_init(|| {
-            let key = pkey_alloc(0, PKEY_DISABLE_WRITE);
-            (key >= 0).then_some(key)
-        })
+        KEY.get().copied()
     }
 
     /// Allows (or forbids again) the running thread to write memory with the key.
     pub fn set_writable(key: libc::c_int, writable: bool) {
         let rights = if writable { 0 } else { PKEY_DISABLE_WRITE };
-        // SAFETY: The key was allocated by key().
+        // SAFETY: The key was allocated by allocate_key().
         let result = unsafe { pkey_set(key, rights) };
         assert_eq!(result, 0, "pkey_set() failed");
     }
@@ -460,19 +486,19 @@ impl ExecutableMemory {
         self.address
     }
 
-    /// Overwrites the code at each offset with the bytes that go there, which the code is not running at the time.
-    pub fn patch(&self, patches: &[(u32, Vec<u8>)]) {
+    /// Overwrites the code at the offset of each patch with its bytes, which the code is not running at the time.
+    pub fn patch(&self, patches: &[Patch]) {
         if patches.is_empty() {
             return;
         }
         let writes: Vec<CodeWrite<'_>> = patches
             .iter()
-            .map(|(offset, bytes)| {
-                assert!(*offset as usize + bytes.len() <= self.size);
+            .map(|patch| {
+                assert!(patch.offset as usize + patch.bytes().len() <= self.size);
                 CodeWrite {
                     // NB: The offset is within the memory, as asserted.
-                    destination: self.address.wrapping_add(*offset as usize),
-                    code: bytes,
+                    destination: self.address.wrapping_add(patch.offset as usize),
+                    code: patch.bytes(),
                 }
             })
             .collect();

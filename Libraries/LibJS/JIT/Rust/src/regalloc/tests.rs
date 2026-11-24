@@ -5,6 +5,8 @@
  */
 
 use super::*;
+use crate::artifact::Artifact;
+use crate::artifact::Tail;
 use crate::builder::tests::build;
 use crate::builder::tests::build_with_layout;
 use crate::bytecode::FrameLayout;
@@ -12,17 +14,23 @@ use crate::bytecode::Instruction;
 use crate::bytecode::Operand;
 use crate::bytecode::test_support::*;
 use crate::code::ExitKind;
-use crate::code::FrameState as CodeFrameState;
-use crate::code::Site;
 use crate::code::SiteKind;
 use crate::code::ValueLocation;
+use crate::codegen::sites::SiteSource;
 use crate::ir::value;
 
+/// A register allocation, in the zone of the thread of the test.
+type Allocated = Allocation<'static>;
+
+fn allocate_with(graph: &Graph, registers: &RegisterSet) -> Allocated {
+    allocate(graph, registers, crate::test_zone()).unwrap()
+}
+
 #[track_caller]
-fn allocate_and_verify(graph: &Graph) -> Allocation {
+fn allocate_and_verify(graph: &Graph) -> Allocated {
     let registers = RegisterSet::test_configuration();
-    let allocation = allocate(graph, &registers);
-    if let Err(errors) = verify(graph, &registers, &allocation) {
+    let allocation = allocate_with(graph, &registers);
+    if let Err(errors) = verify(graph, &registers, &allocation, crate::test_zone()) {
         panic!("{errors}\n{}", dump_allocation(graph, &allocation));
     }
     allocation
@@ -64,17 +72,17 @@ fn straight_line_code() {
     let graph = build(&program);
     let allocation = allocate_and_verify(&graph);
     assert_text(
-        &dump_allocation(&graph, &allocation),
+        &dump_allocation(&graph, &allocation).to_string(),
         "
         b0:
-          v0 Jump
+          v6 LoadSlot -> r0
+          v7 Jump
         b1:
-          v5 LoadSlot -> r0
-          v9 InitializeFrame temps r1, r2
-          v6 CallSlowPath (#10, r0) -> r0
-          v7 EmptyToUndefined (r0) -> r1
+          v14 InitializeFrame temps r1, r2
+          v11 CallSlowPath (#10, r0) -> r0
+          v12 EmptyToUndefined (r0) -> r1
           moves r1 -> r0
-          v8 Return (r0)
+          v13 Return (r0)
         spill slots: 0
         ",
     );
@@ -82,18 +90,55 @@ fn straight_line_code() {
 
 #[test]
 fn values_live_across_calls_are_spilled_at_their_definition() {
+    // NB: The argument is written later, so its frame slot is no home for the value loaded from it.
     let program = assemble(|_| {
         vec![
             Instruction::Mov { dst: r(6), src: a(0) },
             Instruction::Call {
-                value_feedback: 0,
                 call_feedback: 0,
                 dst: r(7),
                 callee: r(5),
                 this_value: r(5),
                 argument_count: 1,
-                expression_string: None,
-                arguments: vec![r(6)],
+                arguments: crate::test_zone().alloc_slice_copy(&[r(6)]),
+            },
+            Instruction::Mov { dst: a(0), src: r(7) },
+            Instruction::Return { value: r(6) },
+        ]
+    });
+    let graph = build(&program);
+    let allocation = allocate_and_verify(&graph);
+    let argument = find_node(&graph, |node| node.op == Op::LoadSlot { slot: a(0).raw() });
+    assert_eq!(frame_home(&graph, argument), None);
+    assert!(allocation.node(argument).spill_slot.is_some());
+    assert_text(
+        &dump_allocation(&graph, &allocation).to_string(),
+        "
+        b0:
+          v6 LoadSlot -> r0
+          v7 LoadSlot -> r1 spill s0
+          v8 Jump
+        b1:
+          v9 CallSlowPath (r0, r0, r1) -> r0 exit {6=s0}
+          moves s0 -> r0
+          v10 Return (r0)
+        spill slots: 1
+        ",
+    );
+}
+
+#[test]
+fn values_loaded_from_unwritten_slots_are_reloaded_from_the_frame() {
+    let program = assemble(|_| {
+        vec![
+            Instruction::Mov { dst: r(6), src: a(0) },
+            Instruction::Call {
+                call_feedback: 0,
+                dst: r(7),
+                callee: r(5),
+                this_value: r(5),
+                argument_count: 1,
+                arguments: crate::test_zone().alloc_slice_copy(&[r(6)]),
             },
             Instruction::Return { value: r(6) },
         ]
@@ -101,19 +146,20 @@ fn values_live_across_calls_are_spilled_at_their_definition() {
     let graph = build(&program);
     let allocation = allocate_and_verify(&graph);
     let argument = find_node(&graph, |node| node.op == Op::LoadSlot { slot: a(0).raw() });
-    assert!(allocation.node(argument).spill_slot.is_some());
+    assert_eq!(frame_home(&graph, argument), Some(a(0).raw()));
+    assert_eq!(allocation.node(argument).spill_slot, None);
     assert_text(
-        &dump_allocation(&graph, &allocation),
+        &dump_allocation(&graph, &allocation).to_string(),
         "
         b0:
-          v0 Jump
+          v6 LoadSlot -> r0
+          v7 LoadSlot -> r1
+          v8 Jump
         b1:
-          v1 LoadSlot -> r0 spill s0
-          v2 LoadSlot -> r1
-          v3 CallSlowPath (r1, r1, r0) -> r0 exit {6=s0}
-          moves s0 -> r0
-          v4 Return (r0)
-        spill slots: 1
+          v9 CallSlowPath (r0, r0, r1) -> r0 exit {6=frame12}
+          moves frame12 -> r0
+          v10 Return (r0)
+        spill slots: 0
         ",
     );
 }
@@ -142,9 +188,8 @@ fn many_simultaneously_live_values_are_spilled() {
     // Ten values are live at once, but there are only six registers.
     assert!(allocation.spill_slot_count >= 4);
     let reloads = allocation
-        .nodes
+        .moves()
         .iter()
-        .flat_map(|node| &node.moves_before)
         .filter(|m| matches!(m.from, Location::Stack(_)))
         .count();
     assert!(reloads >= 4);
@@ -242,43 +287,43 @@ fn swapping_loop_phis_go_through_a_temp_slot() {
     let back_edge = graph.blocks[header].predecessors[1];
     // NB: The back edge's block starts with the phis in their registers,
     //     like the merge it is, so the swap goes through a temp slot.
-    let moves = &allocation.block_end_moves[back_edge.index()];
+    let moves = allocation.block_end_moves(back_edge);
     assert_eq!(moves.len(), 3, "{moves:?}");
     assert!(moves.iter().any(|m| matches!(m.to, Location::Stack(_))), "{moves:?}");
     // The loop header starts with the registers of the block entering the
     // loop: the condition, a phi, stays in r0, with no reload in the loop.
     assert_text(
-        &dump_allocation(&graph, &allocation),
+        &dump_allocation(&graph, &allocation).to_string(),
         "
         b0:
-          v0 Jump
+          v6 Jump
         b1:
           moves #0 -> r0, #10 -> r1
-          v6 Jump
-        b2:
-          v7 Phi -> r0
-          v8 Phi -> r1
-          v9 BranchTruthy (r0)
-        b3:
-          v10 Jump
-        b4:
           v11 Jump
+        b2:
+          v12 Phi -> r0
+          v13 Phi -> r1
+          v14 BranchTruthy (r0)
+        b3:
+          v15 Jump
+        b4:
+          v16 Jump
         b5:
           moves r0 -> r1
-          v12 ToBoolean (r1) -> r0
-          v13 Branch (r0)
+          v17 ToBoolean (r1) -> r0
+          v18 Branch (r0)
         b6:
           moves s0 -> r0, s1 -> r1
-          v14 Jump
+          v19 Jump
         b7:
           moves s1 -> r1
-          v15 Jump
+          v20 Jump
         b8:
           moves r1 -> r0
-          v16 Return (r0)
+          v21 Return (r0)
         b9:
           moves r0 -> s2, r1 -> r0, s2 -> r1
-          v17 Jump
+          v22 Jump
         spill slots: 3
         ",
     );
@@ -351,10 +396,7 @@ fn loop_phis_share_spill_slots_with_their_inputs() {
     let (mut shared, mut filled) = (0, 0);
     for phi in &graph.blocks[header].phis {
         let input = graph.node(*phi).inputs[back_edge];
-        let (phi_slot, input_slot) = (
-            allocation.nodes[phi.index()].spill_slot,
-            allocation.nodes[input.index()].spill_slot,
-        );
+        let (phi_slot, input_slot) = (allocation.node(*phi).spill_slot, allocation.node(input).spill_slot);
         if let (Some(phi_slot), Some(input_slot)) = (phi_slot, input_slot) {
             assert_eq!(phi_slot, input_slot, "{}", dump_allocation(&graph, &allocation));
             shared += 1;
@@ -364,7 +406,7 @@ fn loop_phis_share_spill_slots_with_their_inputs() {
             .node(*phi)
             .inputs
             .iter()
-            .all(|input| allocation.nodes[input.index()].spill_slot == phi_slot)
+            .all(|input| allocation.node(*input).spill_slot == phi_slot)
         {
             assert_eq!(phi_spill_store(&graph, &allocation, *phi), None);
             filled += 1;
@@ -404,14 +446,12 @@ fn loops_leave_the_values_they_only_carry_through_in_their_stack_slots() {
             xor(4, r(9), r(8), argument),
             xor(14, r(11), r(9), argument),
             Instruction::Call {
-                value_feedback: 0,
                 call_feedback: 0,
                 dst: r(14),
                 callee: r(15),
                 this_value: r(15),
                 argument_count: 0,
-                expression_string: None,
-                arguments: vec![],
+                arguments: &[],
             },
             xor(5, r(10), r(5), r(6)),
             xor(6, r(12), r(7), r(11)),
@@ -442,7 +482,7 @@ fn loops_leave_the_values_they_only_carry_through_in_their_stack_slots() {
         ]
     });
     let mut snapshot = crate::builder::tests::snapshot_for(&program, layout);
-    snapshot.executables[0].feedback.arith = vec![crate::snapshot::arith_feedback::INT32; 16];
+    snapshot.executables[0].feedback.arith = snapshot.add(&[crate::snapshot::arith_feedback::INT32; 16]);
     let graph = crate::builder::tests::optimized_graph(&snapshot);
     let allocation = allocate_and_verify(&graph);
     let header = graph.blocks.iter().position(|block| block.is_loop_header).unwrap();
@@ -458,7 +498,8 @@ fn loops_leave_the_values_they_only_carry_through_in_their_stack_slots() {
         .find(|predecessor| predecessor.index() > header)
         .unwrap();
     assert!(
-        allocation.block_end_moves[back_edge.index()]
+        allocation
+            .block_end_moves(back_edge)
             .iter()
             .all(|m| !matches!(m.from, Location::Stack(_)) && !matches!(m.to, Location::Stack(_))),
         "{}",
@@ -496,7 +537,7 @@ fn int32_operations_write_over_their_first_input_where_it_dies() {
         ]
     });
     let mut snapshot = crate::builder::tests::snapshot_for(&program, crate::bytecode::test_support::test_layout());
-    snapshot.executables[0].feedback.arith = vec![crate::snapshot::arith_feedback::INT32; 2];
+    snapshot.executables[0].feedback.arith = snapshot.add(&[crate::snapshot::arith_feedback::INT32; 2]);
     let graph = crate::builder::tests::optimized_graph(&snapshot);
     let allocation = allocate_and_verify(&graph);
     let xors = graph
@@ -512,10 +553,123 @@ fn int32_operations_write_over_their_first_input_where_it_dies() {
         .map(|(index, _)| index)
         .collect::<Vec<_>>();
     assert_eq!(xors.len(), 2, "{}", dump_allocation(&graph, &allocation));
-    let second = &allocation.nodes[xors[1]];
+    let second = allocation.node(NodeId::from_index(xors[1]));
     assert_eq!(
         second.output,
         Some(second.inputs[0]),
+        "{}",
+        dump_allocation(&graph, &allocation)
+    );
+}
+
+#[test]
+fn shift_amounts_are_in_the_targets_shift_register_or_immediates() {
+    let program = assemble(|_| {
+        vec![
+            Instruction::Enter,
+            Instruction::BitwiseXorRhsInt32 {
+                arith_feedback: 2,
+                dst: r(4),
+                lhs: a(0),
+                rhs: 5,
+            },
+            Instruction::LeftShift {
+                arith_feedback: 0,
+                dst: r(5),
+                lhs: a(0),
+                rhs: r(4),
+            },
+            Instruction::RightShiftRhsInt32 {
+                arith_feedback: 1,
+                dst: r(6),
+                lhs: r(5),
+                rhs: 3,
+            },
+            Instruction::Return { value: r(6) },
+        ]
+    });
+    let mut snapshot = crate::builder::tests::snapshot_for(&program, crate::bytecode::test_support::test_layout());
+    snapshot.executables[0].feedback.arith = snapshot.add(&[crate::snapshot::arith_feedback::INT32; 3]);
+    let graph = crate::builder::tests::optimized_graph(&snapshot);
+    let shift = |op| find_node(&graph, |node| node.op == Op::Int32Binary { op });
+    let (variable, constant) = (
+        shift(crate::ir::BinaryOp::LeftShift),
+        shift(crate::ir::BinaryOp::RightShift),
+    );
+    for shift_amount_gpr in [None, Some(3), Some(4)] {
+        let registers = RegisterSet {
+            shift_amount_gpr,
+            ..RegisterSet::test_configuration()
+        };
+        let allocation = allocate_with(&graph, &registers);
+        if let Err(errors) = verify(&graph, &registers, &allocation, crate::test_zone()) {
+            panic!("{errors}\n{}", dump_allocation(&graph, &allocation));
+        }
+        let dump = dump_allocation(&graph, &allocation);
+        let amount = allocation.node(variable).inputs[1];
+        match shift_amount_gpr {
+            Some(register) => assert_eq!(amount, Location::Register(register), "{dump}"),
+            None => assert!(matches!(amount, Location::Register(_)), "{dump}"),
+        }
+        assert!(
+            matches!(allocation.node(constant).inputs[1], Location::Constant(bits) if bits as u32 == 3),
+            "{dump}"
+        );
+    }
+}
+
+#[test]
+fn float64_operations_write_over_their_first_input_where_it_dies() {
+    // The first product dies at the second, whose output then takes its register, also for non-commutative
+    // operations; the argument stays live, so the first product does not take its register.
+    let program = assemble(|_| {
+        vec![
+            Instruction::Enter,
+            Instruction::Mul {
+                arith_feedback: 0,
+                dst: r(5),
+                lhs: a(0),
+                rhs: a(0),
+            },
+            Instruction::Sub {
+                arith_feedback: 1,
+                dst: r(6),
+                lhs: r(5),
+                rhs: a(0),
+            },
+            Instruction::Return { value: r(6) },
+        ]
+    });
+    let mut snapshot = crate::builder::tests::snapshot_for(&program, crate::bytecode::test_support::test_layout());
+    snapshot.executables[0].feedback.arith = snapshot.add(&[crate::snapshot::arith_feedback::DOUBLE; 2]);
+    let graph = crate::builder::tests::optimized_graph(&snapshot);
+    let allocation = allocate_and_verify(&graph);
+    let binaries = graph
+        .nodes
+        .iter()
+        .enumerate()
+        .filter(|(_, node)| matches!(node.op, Op::Float64Binary { .. }))
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    assert_eq!(binaries.len(), 2, "{}", dump_allocation(&graph, &allocation));
+    let (first, second) = (
+        allocation.node(NodeId::from_index(binaries[0])),
+        allocation.node(NodeId::from_index(binaries[1])),
+    );
+    assert_ne!(
+        first.output,
+        Some(first.inputs[0]),
+        "{}",
+        dump_allocation(&graph, &allocation)
+    );
+    assert_eq!(
+        second.output,
+        Some(second.inputs[0]),
+        "{}",
+        dump_allocation(&graph, &allocation)
+    );
+    assert!(
+        matches!(second.output, Some(Location::Register(register)) if register >= FPR_BASE),
         "{}",
         dump_allocation(&graph, &allocation)
     );
@@ -539,37 +693,47 @@ fn exits_find_constants_registers_and_spilled_values() {
     let graph = build_with_layout(&program, test_layout(), &[2]);
     let allocation = allocate_and_verify(&graph);
     let exit = find_node(&graph, |node| matches!(node.op, Op::Exit { .. }));
-    let descriptor = crate::codegen::site(
-        &graph,
-        &allocation,
-        exit,
-        SiteKind::Exit(ExitKind::NoFeedback),
-        &|slot| -8 * (i32::try_from(slot).unwrap() + 1),
-    );
+    let work = crate::test_work();
+    let mut sites = crate::codegen::sites::SiteScratch::new_in(&graph, &work).unwrap();
+    let mut artifact = crate::artifact::ArtifactWriter::new_in(&work);
+    SiteSource {
+        graph: &graph,
+        allocation: &allocation,
+        node: exit,
+        kind: SiteKind::Exit(ExitKind::NoFeedback),
+        stack_slot_offset: &|slot| -8 * (i32::try_from(slot).unwrap() + 1),
+        saves: &[],
+        work: crate::test_zone(),
+    }
+    .write(&mut sites, &mut artifact)
+    .unwrap();
+    let mut words = ak::Column::new(crate::artifact::MAX_WORDS, c"test");
+    let layout = artifact.finish(&Tail::default(), &mut words).unwrap();
+    let artifact = Artifact::new(&words, &layout);
     let argument = find_node(&graph, |node| node.op == Op::LoadSlot { slot: a(0).raw() });
     let Some(Location::Register(argument_register)) = allocation.node(argument).output else {
         panic!("the argument is in a register");
     };
+    assert_eq!(artifact.site_count(), 1);
+    let site = artifact.site(0);
+    assert_eq!(site.kind(), SiteKind::Exit(ExitKind::NoFeedback));
+    assert_eq!(site.frame_count(), 1);
+    assert_eq!(site.object_count(), 0);
+    assert_eq!(site.inlined_frame_bytes(), 0);
+    let frame = site.frame(0);
+    assert_eq!(frame.executable(), 0);
+    assert_eq!(frame.pc(), program.offsets[2]);
+    assert_eq!(frame.mode(), crate::code::ResumeMode::ResumeAt);
     assert_eq!(
-        descriptor,
-        Site {
-            kind: SiteKind::Exit(ExitKind::NoFeedback),
-            frames: vec![CodeFrameState {
-                executable: 0,
-                pc: program.offsets[2],
-                mode: crate::code::ResumeMode::ResumeAt,
-                values: vec![
-                    (r(5).raw(), ValueLocation::Constant(value::int32(10))),
-                    (r(6).raw(), ValueLocation::Register(argument_register, Repr::Tagged)),
-                ],
-                in_frame: Vec::new(),
-                passed_argument_count: None,
-                legacy_arguments: 0..0,
-            }],
-            objects: Vec::new(),
-            inlined_frame_bytes: 0,
-        }
+        frame.values().collect::<Vec<_>>(),
+        [
+            (r(5).raw(), ValueLocation::Constant(value::int32(10))),
+            (r(6).raw(), ValueLocation::Register(argument_register, Repr::Tagged)),
+        ]
     );
+    assert!(frame.in_frame().is_empty());
+    assert_eq!(frame.passed_argument_count(), None);
+    assert_eq!(frame.legacy_arguments(), 0..0);
 }
 
 #[test]
@@ -578,37 +742,96 @@ fn the_verifier_finds_values_in_the_wrong_place() {
         vec![
             Instruction::Mov { dst: r(6), src: a(0) },
             Instruction::Call {
-                value_feedback: 0,
                 call_feedback: 0,
                 dst: r(7),
                 callee: r(5),
                 this_value: r(5),
                 argument_count: 1,
-                expression_string: None,
-                arguments: vec![r(6)],
+                arguments: crate::test_zone().alloc_slice_copy(&[r(6)]),
+            },
+            Instruction::Mov { dst: a(0), src: r(7) },
+            Instruction::Return { value: r(6) },
+        ]
+    });
+    let graph = build(&program);
+    let registers = RegisterSet::test_configuration();
+    let allocation = allocate_with(&graph, &registers);
+    verify(&graph, &registers, &allocation, crate::test_zone()).unwrap();
+
+    // Forgetting to spill a value that is live across a call loses it.
+    let argument = find_node(&graph, |node| node.op == Op::LoadSlot { slot: a(0).raw() });
+    let mut broken = allocate_with(&graph, &registers);
+    broken.set_spill_slot(argument, None);
+    assert!(verify(&graph, &registers, &broken, crate::test_zone()).is_err());
+
+    // Reading an input from a register that holds something else.
+    let call = find_node(&graph, |node| matches!(node.op, Op::CallSlowPath { .. }));
+    let mut broken = allocation;
+    let Location::Register(register) = broken.node(call).inputs[2] else {
+        panic!("the argument is in a register");
+    };
+    broken.set_input(call, 2, Location::Register((register + 1) % 6));
+    assert!(verify(&graph, &registers, &broken, crate::test_zone()).is_err());
+}
+
+#[test]
+fn the_verifier_finds_values_reloaded_from_frame_slots_that_do_not_hold_them() {
+    let program = assemble(|_| {
+        vec![
+            Instruction::Mov { dst: r(6), src: a(0) },
+            Instruction::Call {
+                call_feedback: 0,
+                dst: r(7),
+                callee: r(5),
+                this_value: r(5),
+                argument_count: 1,
+                arguments: crate::test_zone().alloc_slice_copy(&[r(6)]),
             },
             Instruction::Return { value: r(6) },
         ]
     });
     let graph = build(&program);
     let registers = RegisterSet::test_configuration();
-    let allocation = allocate(&graph, &registers);
-    verify(&graph, &registers, &allocation).unwrap();
+    let allocation = allocate_with(&graph, &registers);
+    verify(&graph, &registers, &allocation, crate::test_zone()).unwrap();
+    let returned = find_node(&graph, |node| matches!(node.op, Op::Return));
+    assert_eq!(
+        allocation.node(returned).moves_before,
+        [Move {
+            from: Location::Frame(a(0).raw()),
+            to: Location::Register(0),
+        }]
+    );
 
-    // Forgetting to spill a value that is live across a call loses it.
-    let argument = find_node(&graph, |node| node.op == Op::LoadSlot { slot: a(0).raw() });
-    let mut broken = allocation.clone();
-    broken.nodes[argument.index()].spill_slot = None;
-    assert!(verify(&graph, &registers, &broken).is_err());
+    // A frame slot that the code may write is no home.
+    let mut written = graph.clone_in(crate::test_zone());
+    written.unwritten_slots = ak::ZoneBitSet::new_in(0, written.zone);
+    assert!(verify(&written, &registers, &allocation, crate::test_zone()).is_err());
 
-    // Reading an input from a register that holds something else.
-    let call = find_node(&graph, |node| matches!(node.op, Op::CallSlowPath { .. }));
-    let mut broken = allocation;
-    let Location::Register(register) = broken.nodes[call.index()].inputs[2] else {
-        panic!("the argument is in a register");
+    // Another frame slot holds another value.
+    let mut broken = allocate_with(&graph, &registers);
+    let wrong_move = Move {
+        from: Location::Frame(r(5).raw()),
+        ..broken.node(returned).moves_before[0]
     };
-    broken.nodes[call.index()].inputs[2] = Location::Register((register + 1) % 6);
-    assert!(verify(&graph, &registers, &broken).is_err());
+    broken.set_move_before(returned, 0, wrong_move);
+    assert!(verify(&graph, &registers, &broken, crate::test_zone()).is_err());
+
+    // A store to the slot, which nothing may do, makes it hold another value.
+    let mut stored = graph.clone_in(crate::test_zone());
+    let undefined = stored.add(Op::Constant(value::UNDEFINED), &[], Some(Repr::Tagged), 0);
+    let store = stored.add(Op::StoreSlot { slot: a(0).raw() }, &[undefined], None, 0);
+    let block = stored
+        .blocks
+        .iter()
+        .position(|block| block.control == Some(returned))
+        .unwrap();
+    stored.blocks[block].body.push(store);
+    let mut allocation = allocation;
+    allocation.push_node(&[], None);
+    allocation.push_node(&[Location::Constant(value::UNDEFINED)], None);
+    let errors = verify(&stored, &registers, &allocation, crate::test_zone()).unwrap_err();
+    assert!(errors.contains("nothing writes"), "{errors}");
 }
 
 /// A tiny deterministic random number generator (xorshift64).
@@ -634,7 +857,7 @@ impl Random {
 /// An instruction whose jump targets are instruction indices.
 #[derive(Clone)]
 enum Item {
-    Plain(Instruction),
+    Plain(Instruction<'static>),
     Jump(usize),
     JumpIf(Operand, usize, usize),
     JumpTrue(Operand, usize),
@@ -687,16 +910,14 @@ impl ProgramGenerator {
         }
     }
 
-    fn plain(&mut self) -> Instruction {
+    fn plain(&mut self) -> Instruction<'static> {
         if self.property_access && self.random.chance(30) {
             let cache = u32::try_from(self.random.below(2)).unwrap();
             return if self.random.chance(60) {
                 Instruction::GetById {
-                    value_feedback: 0,
                     dst: self.writable(),
                     base: self.object_operand(),
                     property: crate::bytecode::PropertyKeyTableIndex(0),
-                    base_identifier: None,
                     cache,
                 }
             } else {
@@ -706,7 +927,6 @@ impl ProgramGenerator {
                     src: self.readable(),
                     kind: 0,
                     cache: 2 + cache,
-                    base_identifier: None,
                 }
             };
         }
@@ -741,14 +961,12 @@ impl ProgramGenerator {
             11 => {
                 let argument_count = self.random.below(3);
                 Instruction::Call {
-                    value_feedback: 0,
                     call_feedback: 0,
                     dst: self.writable(),
                     callee: self.readable(),
                     this_value: self.readable(),
                     argument_count: u32::try_from(argument_count).unwrap(),
-                    expression_string: None,
-                    arguments: (0..argument_count).map(|_| self.readable()).collect(),
+                    arguments: crate::test_zone().alloc_slice_from_iter((0..argument_count).map(|_| self.readable())),
                 }
             }
             _ => Instruction::ToBoolean {
@@ -868,8 +1086,8 @@ fn make_cold(graph: &mut Graph, blocks: &[BlockId]) {
     for block in blocks {
         graph.blocks[block.index()].is_cold = true;
     }
-    crate::passes::edit::move_cold_blocks_last(graph);
-    if let Err(errors) = crate::passes::verify::verify(graph) {
+    crate::passes::edit::move_cold_blocks_last(graph, crate::test_zone());
+    if let Err(errors) = crate::passes::verify::verify_with(graph, &crate::test_work()) {
         panic!("{errors}\n{}", crate::ir::dump(graph, &test_layout()));
     }
 }
@@ -940,13 +1158,14 @@ fn random_structured_programs_with_cold_blocks_allocate_correctly() {
         for block in &cold {
             graph.blocks[block.index()].is_cold = true;
         }
-        crate::passes::edit::move_cold_blocks_last(&mut graph);
-        if let Err(errors) = crate::passes::verify::verify(&graph) {
+        crate::passes::edit::move_cold_blocks_last(&mut graph, crate::test_zone());
+        if let Err(errors) = crate::passes::verify::verify_with(&graph, &crate::test_work()) {
             panic!("seed {seed}: {errors}\n{}", crate::ir::dump(&graph, &layout));
         }
         let registers = RegisterSet::test_configuration();
-        let allocation = allocate(&graph, &registers);
-        if let Err(errors) = verify(&graph, &registers, &allocation) {
+        let work = crate::test_work();
+        let allocation = allocate(&graph, &registers, &work).unwrap();
+        if let Err(errors) = verify(&graph, &registers, &allocation, &work) {
             panic!(
                 "seed {seed}: {errors}\n{}\n{}",
                 crate::ir::dump(&graph, &layout),
@@ -972,8 +1191,9 @@ fn random_structured_programs_allocate_correctly() {
             .collect::<Vec<_>>();
         let graph = build_with_layout(&program, layout, &never_ran);
         let registers = RegisterSet::test_configuration();
-        let allocation = allocate(&graph, &registers);
-        if let Err(errors) = verify(&graph, &registers, &allocation) {
+        let work = crate::test_work();
+        let allocation = allocate(&graph, &registers, &work).unwrap();
+        if let Err(errors) = verify(&graph, &registers, &allocation, &work) {
             panic!(
                 "seed {seed}: {errors}\n{}\n{}",
                 crate::ir::dump(&graph, &layout),
@@ -989,30 +1209,35 @@ fn float64_values_get_floating_point_registers() {
         vec![
             Instruction::Enter,
             Instruction::Call {
-                value_feedback: 0,
                 call_feedback: 0,
                 dst: r(5),
                 callee: r(6),
                 this_value: r(7),
                 argument_count: 1,
-                expression_string: None,
-                arguments: vec![a(0)],
+                arguments: crate::test_zone().alloc_slice_copy(&[a(0)]),
             },
             Instruction::Return { value: r(5) },
         ]
     });
     let mut snapshot = crate::builder::tests::snapshot_for(&program, test_layout());
     snapshot.runtime.layout.builtin_math_sqrt = 13;
-    snapshot.executables[0].feedback.call = vec![crate::snapshot::CallFeedbackSnapshot {
+    snapshot.executables[0].feedback.call = snapshot.add(&[crate::snapshot::CallFeedbackSnapshot {
         target_builtin: Some(13),
         ..Default::default()
-    }];
-    let mut graph = crate::builder::build_graph_with_feedback(&snapshot, &|_| true).unwrap();
-    crate::passes::optimize(&mut graph, &snapshot.executables[0].layout, true);
+    }]);
+    let mut graph = crate::builder::build_graph_with_feedback(&snapshot, &|_| true, crate::test_zone()).unwrap();
+    crate::passes::optimize(
+        &mut graph,
+        &snapshot.executables[0].layout,
+        true,
+        &mut crate::test_work(),
+        &mut crate::test_steps(),
+    )
+    .unwrap();
     let allocation = allocate_and_verify(&graph);
     let mut floats = 0;
     for (index, node) in graph.nodes.iter().enumerate() {
-        let output = allocation.nodes[index].output;
+        let output = allocation.node(NodeId::from_index(index)).output;
         match (node.repr, output) {
             (Some(Repr::Float64), Some(Location::Register(register))) => {
                 assert!(register >= FPR_BASE, "v{index} is a float64 in r{register}");

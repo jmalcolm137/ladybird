@@ -16,7 +16,6 @@ use std::rc::Rc;
 pub struct CaptureLog {
     pub(crate) events: Vec<Event>,
     pub(crate) open_events: Vec<usize>,
-    pub(crate) damage: Option<DamageSummary>,
 }
 
 // The normal recorder carries no observation state. Keeping the policy static also removes
@@ -59,7 +58,8 @@ impl Observer for Trace {
 /// What a recording did with a scope or producer. A scope is assembled when its published child
 /// list is walked, replanned when its plan is rebuilt, recorded when it has no published
 /// counterpart and copied when it is clean. A producer is recorded, copied, or skipped when its
-/// phase is masked off; an inactive stacking context is skipped as a whole.
+/// phase is masked off; an inactive stacking context is skipped as a whole. Either is left out when it lies outside
+/// the window of the recording.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Action {
     Assemble,
@@ -67,6 +67,7 @@ pub(crate) enum Action {
     Record,
     Copy,
     Skip,
+    LeaveOut,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -85,16 +86,6 @@ pub(crate) struct Event {
     pub empty: bool,
 }
 
-/// The damage a recording started from, for tests that pin the exact amount of work.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) struct DamageSummary {
-    pub rows: usize,
-    pub moved: usize,
-    pub order: usize,
-    pub eligibility: usize,
-    pub all: bool,
-}
-
 impl<O: Observer> super::PaintRecorder<'_, O> {
     pub(crate) fn trace_scope<R>(
         &mut self,
@@ -111,7 +102,17 @@ impl<O: Observer> super::PaintRecorder<'_, O> {
     pub(crate) fn trace_paint(&mut self, operation: Operation, body: impl FnOnce(&mut Self)) {
         self.observer.observe(|log| log.begin(operation, Action::Record));
         let before = if O::ENABLED { self.recorder.byte_size() } else { 0 };
+        let outside_the_boxes = match operation {
+            Operation::Named(None, name) => Some(name),
+            _ => None,
+        };
+        if let Some(name) = outside_the_boxes {
+            self.recorder.begin_record_origin(NodeSlotId::INVALID, name);
+        }
         body(self);
+        if outside_the_boxes.is_some() {
+            self.recorder.end_record_origin();
+        }
         self.observer
             .observe(|log| log.end(self.recorder.byte_size() == before));
     }
@@ -142,14 +143,6 @@ impl CaptureLog {
     pub(crate) fn format(&self, mut name: impl FnMut(NodeSlotId) -> String) -> String {
         assert!(self.open_events.is_empty(), "incomplete recording trace");
         let mut output = String::new();
-        if let Some(damage) = self.damage {
-            writeln!(
-                output,
-                "damage: rows={} moved={} order={} eligibility={} all={}",
-                damage.rows, damage.moved, damage.order, damage.eligibility, damage.all
-            )
-            .unwrap();
-        }
         let mut depths = Vec::with_capacity(self.events.len());
         for event in &self.events {
             let depth = event.parent.map_or(0, |parent| depths[parent] + 1);
@@ -172,6 +165,7 @@ impl CaptureLog {
                 Action::Record => "RECORD",
                 Action::Copy => "COPY",
                 Action::Skip => "SKIP",
+                Action::LeaveOut => "OUTSIDE",
             };
             let empty = if event.empty && event.action == Action::Record {
                 " (empty)"
@@ -184,7 +178,7 @@ impl CaptureLog {
     }
 }
 
-fn producer_name(kind: ProducerKind) -> &'static str {
+pub(crate) fn producer_name(kind: ProducerKind) -> &'static str {
     match kind {
         ProducerKind::DrawBackground => "background",
         ProducerKind::DrawBorder => "border",
@@ -192,14 +186,23 @@ fn producer_name(kind: ProducerKind) -> &'static str {
         ProducerKind::DrawForeground => "foreground",
         ProducerKind::DrawOutline => "outline",
         ProducerKind::DrawOverlay => "overlay",
-        ProducerKind::HitBackground => "background/hit-test",
-        ProducerKind::HitForeground => "foreground/hit-test",
-        ProducerKind::HitOverlay => "overlay/hit-test",
         ProducerKind::ScrollMetadata => "scroll-metadata",
         ProducerKind::ScopePreamble => "preamble",
         ProducerKind::Svg => "svg",
         ProducerKind::InlinePiece(_) => "inline-piece",
         ProducerKind::TextFragment(_) => "text-fragment",
+    }
+}
+
+pub(crate) fn paint_phase_name(phase: super::PaintPhase) -> &'static str {
+    use super::PaintPhase::*;
+    match phase {
+        Background => "background",
+        Border => "border",
+        TableCollapsedBorder => "table-collapsed-border",
+        Foreground => "foreground",
+        Outline => "outline",
+        Overlay => "overlay",
     }
 }
 
@@ -227,10 +230,6 @@ mod tests {
     fn nested_work_is_indented_and_only_recording_reports_emptiness() {
         let mut log = CaptureLog::default();
         let owner = NodeSlotId::new(0, 1);
-        log.damage = Some(DamageSummary {
-            rows: 1,
-            ..DamageSummary::default()
-        });
         log.begin(Operation::Scope(PaintScope::stacking_context(owner)), Action::Assemble);
         log.leaf(
             Operation::Producer(owner, ProducerKind::DrawBackground),
@@ -251,7 +250,7 @@ mod tests {
         let text = log.format(|_| "box".to_string());
         assert_eq!(
             text,
-            "damage: rows=1 moved=0 order=0 eligibility=0 all=false\nbox ASSEMBLE\n  box/background COPY\n  box/foreground RECORD (empty)\n  box/outline SKIP\n"
+            "box ASSEMBLE\n  box/background COPY\n  box/foreground RECORD (empty)\n  box/outline SKIP\n"
         );
     }
 }

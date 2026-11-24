@@ -9,6 +9,7 @@
 //! the runtime only through this module (Meta/Linters/check_libjs_rust_api.py), so the rest of the crate stays the
 //! runtime's own business.
 
+pub use crate::console_log_level::ConsoleLogLevel;
 pub use crate::embedding::abi_types::{completion_into_abi, object_from_abi, vm_from_abi};
 pub use crate::embedding::host::host_function::HostFunction;
 pub use crate::embedding::host::host_module::{HostModule, host_class_of as host_module_class_of};
@@ -78,7 +79,7 @@ pub use crate::runtime::native_function::{NativeFunction, RawNativeFunction};
 pub use crate::runtime::number_object::NumberObject;
 pub use crate::runtime::object::{IntegrityLevel, Object, PropertyKind, ShouldThrowExceptions};
 pub use crate::runtime::primitive_string::PrimitiveString;
-pub use crate::runtime::promise::{Promise, PromiseState, RejectionOperation};
+pub use crate::runtime::promise::{Promise, PromiseState, RejectionOperation, safe_promise_resolve};
 pub use crate::runtime::promise_capability::{PromiseCapability, new_promise_capability};
 pub use crate::runtime::property_attributes::{Attribute, PropertyAttributes};
 pub use crate::runtime::property_key::PropertyKey;
@@ -97,6 +98,8 @@ pub use crate::runtime::typed_array::{
     typed_array_byte_length, typed_array_length,
 };
 pub use crate::runtime::value::{number_to_string, same_value};
-pub use crate::utf16::{Utf16Display, Utf16View, to_well_formed, utf16_formatted};
+pub use crate::utf16::{
+    Utf16Display, Utf16StringBuilder, Utf16View, to_well_formed, utf16_formatted, utf16_string_external_memory_size,
+};
 /// Derives Trace for a type of the embedder, which marks the type `#[gc(crate = libjs_rust)]`.
 pub use libjs_runtime_macros::Trace;

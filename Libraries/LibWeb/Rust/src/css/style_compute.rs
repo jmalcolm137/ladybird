@@ -685,16 +685,17 @@ fn absolute_size_font_mapping(keyword: u16, default_font_size: CssPixels) -> Opt
 
 /// A <relative-size> keyword is interpreted relative to the computed font-size of the parent
 /// element. User agents may use a simple ratio, which should be around 1.2-1.5.
-fn relative_size_font_mapping(keyword: u16, inherited_font_size: CssPixels) -> Option<CssPixels> {
-    let entry = |numerator: i64, denominator: i64| {
-        Some(
-            (inherited_font_size * CssPixels::from_integer(numerator))
-                .div_as_fraction(CssPixels::from_integer(denominator)),
-        )
-    };
+/// A font size computed from another, in the single precision a computed font size is kept in, so
+/// that a percentage of a size like 13.333333px comes out whole: 300% of it is 40px.
+pub(crate) fn single_precision_font_size(px: f64) -> f64 {
+    f64::from(px as f32)
+}
+
+/// The factor a relative-size keyword scales the inherited font size by.
+fn relative_size_font_ratio(keyword: u16) -> Option<f64> {
     match keyword {
-        keyword::SMALLER => entry(5, 6),
-        keyword::LARGER => entry(6, 5),
+        keyword::SMALLER => Some(5.0 / 6.0),
+        keyword::LARGER => Some(6.0 / 5.0),
         _ => None,
     }
 }
@@ -702,17 +703,17 @@ fn relative_size_font_mapping(keyword: u16, inherited_font_size: CssPixels) -> O
 // https://drafts.csswg.org/css-fonts/#font-size-prop
 // an absolute length
 //
-// The keyword mappings use CSSPixels fixed-point arithmetic, exactly as the
-// C++ implementation does.
+// The absolute-size keywords map through CSSPixels fixed-point arithmetic. A size relative to the
+// inherited one scales it unrounded, as the computed value holds it.
 fn compute_font_size(
     value: &StyleValueData,
     computed_math_depth: i32,
-    inherited_font_size: CssPixels,
+    inherited_font_size: f64,
     inherited_math_depth: i32,
     default_font_size: CssPixels,
     default_font_size_scale: f64,
 ) -> Option<ComputedNumber> {
-    let computed = |px: f64| Some(ComputedNumber::Computed(px));
+    let computed = |px: f64| Some(ComputedNumber::Computed(single_precision_font_size(px)));
     match value {
         // <length-percentage [0,inf]>
         // A length value specifies an absolute font size (independent of the user agent's font
@@ -720,13 +721,13 @@ fn compute_font_size(
         StyleValueData::Length { .. } => Some(ComputedNumber::Unchanged),
         // A percentage value specifies an absolute font size relative to the parent element's
         // computed font-size. Negative percentages are invalid.
-        StyleValueData::Percentage { value } => computed(inherited_font_size.to_double() * (value / 100.0)),
+        StyleValueData::Percentage { value } => computed(inherited_font_size * (value / 100.0)),
         StyleValueData::Keyword { keyword } => {
             if let Some(px) = absolute_size_font_mapping(*keyword, default_font_size) {
-                return computed(px.scaled(default_font_size_scale).to_double());
+                return computed(px.to_double() * default_font_size_scale);
             }
-            if let Some(px) = relative_size_font_mapping(*keyword, inherited_font_size) {
-                return computed(px.to_double());
+            if let Some(ratio) = relative_size_font_ratio(*keyword) {
+                return computed(inherited_font_size * ratio);
             }
             match *keyword {
                 // math
@@ -769,7 +770,7 @@ fn compute_font_size(
                         // 6. Return S if InvertScaleFactor is false and 1/S otherwise.
                         if !invert_scale_factor { scale } else { 1.0 / scale }
                     };
-                    computed(inherited_font_size.scaled(math_scaling_factor).to_double())
+                    computed(inherited_font_size * math_scaling_factor)
                 }
                 _ => None,
             }
@@ -777,8 +778,8 @@ fn compute_font_size(
         // Calc lengths and percentages resolve in the calc core against the inherited
         // font size; anything the core cannot resolve is left to the caller.
         StyleValueData::Calculated { .. } => {
-            crate::css::calc::resolve_calculated_length_without_context(value, inherited_font_size.to_double())
-                .map(ComputedNumber::Computed)
+            crate::css::calc::resolve_calculated_length_without_context(value, inherited_font_size)
+                .map(|px| ComputedNumber::Computed(single_precision_font_size(px)))
         }
         _ => None,
     }
@@ -797,7 +798,7 @@ pub extern "C" fn rust_compute_font_size(
     compute_font_size(
         absolutized_value,
         computed_math_depth,
-        CssPixels::from_raw(inherited_font_size_raw),
+        CssPixels::from_raw(inherited_font_size_raw).to_double(),
         inherited_math_depth,
         CssPixels::from_raw(default_font_size_raw),
         1.0,
@@ -821,7 +822,8 @@ pub enum FontSizeRecascadeStatus {
 pub struct FontSizeRecascadeBatch {
     pub status: FontSizeRecascadeStatus,
     pub next_index: usize,
-    pub current_size_raw: i32,
+    /// The font size reached so far, in pixels, unrounded.
+    pub current_size: f64,
     pub depends_on_viewport_metrics: bool,
 }
 
@@ -867,14 +869,14 @@ pub(crate) fn recascade_font_size_batch<'a>(
     effective_zoom_at: impl Fn(usize) -> f64,
     applies_zoom_at: impl Fn(usize) -> bool,
     start_index: usize,
-    current_size_raw: i32,
+    current_size: f64,
     current_depends_on_viewport_metrics: bool,
     default_size_raw: i32,
     document_inputs: FontSizeRecascadeDocumentInputs,
     supplied_length_resolution_context: Option<&FfiLengthResolutionContext>,
 ) -> FontSizeRecascadeBatch {
     assert!(start_index <= value_count);
-    let mut current_size = CssPixels::from_raw(current_size_raw);
+    let mut current_size = current_size;
     let mut depends_on_viewport_metrics = current_depends_on_viewport_metrics;
     let default_size = CssPixels::from_raw(default_size_raw);
     let root_zoom = if document_inputs.root_effective_zoom > 0.0 {
@@ -882,14 +884,16 @@ pub(crate) fn recascade_font_size_batch<'a>(
     } else {
         1.0
     };
-    let stopped = |status, next_index, current_size: CssPixels, depends_on_viewport_metrics| FontSizeRecascadeBatch {
+    let stopped = |status, next_index, current_size: f64, depends_on_viewport_metrics| FontSizeRecascadeBatch {
         status,
         next_index,
-        current_size_raw: current_size.raw_value(),
+        current_size: single_precision_font_size(current_size),
         depends_on_viewport_metrics,
     };
 
     for index in start_index..value_count {
+        // NB: Each ancestor's size is computed in single precision, as the cascade computes it.
+        current_size = single_precision_font_size(current_size);
         // NB: Keep the size before this ancestor for a batch that must retry this index with font metrics.
         let inherited_size = current_size;
         let zoom = effective_zoom_at(index);
@@ -898,28 +902,29 @@ pub(crate) fn recascade_font_size_batch<'a>(
         let own_zoom = if applies_zoom { zoom / parent_zoom } else { 1.0 };
         let length_zoom = if applies_zoom { zoom } else { 1.0 };
         let root_metric_zoom = if applies_zoom { zoom / root_zoom } else { 1.0 };
-        current_size = current_size.scaled(own_zoom);
-        let zoomed_default_size = default_size.scaled(length_zoom);
+        current_size *= own_zoom;
+        let zoomed_default_size = default_size.to_double() * length_zoom;
         let Some(value) = value_at(index) else {
             continue;
         };
         match value {
             StyleValueData::Keyword { keyword } => {
-                if *keyword == keyword::INITIAL || *keyword == keyword::UNSET {
+                if *keyword == keyword::INITIAL {
                     current_size = zoomed_default_size;
                     depends_on_viewport_metrics = false;
                     continue;
                 }
-                if *keyword == keyword::INHERIT {
+                // NB: font-size is an inherited property, so unset inherits it.
+                if *keyword == keyword::INHERIT || *keyword == keyword::UNSET {
                     continue;
                 }
                 if let Some(px) = absolute_size_font_mapping(*keyword, default_size) {
-                    current_size = px.scaled(length_zoom);
+                    current_size = px.to_double() * length_zoom;
                     depends_on_viewport_metrics = false;
                     continue;
                 }
-                if let Some(px) = relative_size_font_mapping(*keyword, current_size) {
-                    current_size = px;
+                if let Some(ratio) = relative_size_font_ratio(*keyword) {
+                    current_size *= ratio;
                     continue;
                 }
                 // FIXME: Resolve `font-size: math`
@@ -928,7 +933,7 @@ pub(crate) fn recascade_font_size_batch<'a>(
                 }
             }
             StyleValueData::Percentage { value } => {
-                current_size = CssPixels::nearest_value_for(value / 100.0 * current_size.to_double());
+                current_size *= value / 100.0;
                 continue;
             }
             StyleValueData::Length { value, unit } => {
@@ -945,7 +950,7 @@ pub(crate) fn recascade_font_size_batch<'a>(
                     Some(LengthUnitKind::FontRelative {
                         metric: FontMetricSelector::FontSize,
                         root: false,
-                    }) => Some((*value * current_size.to_double(), depends_on_viewport_metrics)),
+                    }) => Some((*value * current_size, depends_on_viewport_metrics)),
                     // NB: Logical viewport units need the ancestor's writing mode from its resolution context.
                     Some(LengthUnitKind::ViewportRelative {
                         axis: ViewportAxis::Inline | ViewportAxis::Block,
@@ -963,7 +968,7 @@ pub(crate) fn recascade_font_size_batch<'a>(
                     _ => None,
                 };
                 if let Some((px, resolved_viewport_relative_length)) = directly_resolved {
-                    current_size = CssPixels::nearest_value_for(px);
+                    current_size = px;
                     depends_on_viewport_metrics = resolved_viewport_relative_length;
                     continue;
                 }
@@ -987,8 +992,15 @@ pub(crate) fn recascade_font_size_batch<'a>(
                         depends_on_viewport_metrics,
                     );
                 }
-                current_size = CssPixels::nearest_value_for(result.px);
+                current_size = result.px;
                 depends_on_viewport_metrics = result.resolved_viewport_relative_length;
+                continue;
+            }
+            calculated @ StyleValueData::Calculated { .. } if calculated_font_size_is_percentage(calculated) => {
+                if let Some(px) = crate::css::calc::resolve_calculated_length_without_context(calculated, current_size)
+                {
+                    current_size = px;
+                }
                 continue;
             }
             StyleValueData::Calculated { .. } => {
@@ -1189,6 +1201,37 @@ pub(crate) fn viewport_length_unit_axes(unit: u8) -> u8 {
         | "svmax" | "lvmax" | "dvmax" => VIEWPORT_WIDTH_AXIS | VIEWPORT_HEIGHT_AXIS,
         _ => 0,
     }
+}
+
+/// Which metrics of a first available font the lengths in `value` read: whether one is an `lh`,
+/// relative to a line height, and whether one is an `ex`, `cap` or `ch`, relative to a glyph metric.
+pub(crate) fn font_metric_length_reads(value: &StyleValueData) -> (bool, bool) {
+    fn read_unit(unit: u8, reads: &mut (bool, bool)) {
+        if let Some(LengthUnitKind::FontRelative { metric, root: false }) = length_unit_kinds().get(usize::from(unit)) {
+            match metric {
+                FontMetricSelector::LineHeight => reads.0 = true,
+                FontMetricSelector::FontSize => {}
+                _ => reads.1 = true,
+            }
+        }
+    }
+    fn read_calculation(node: &crate::css::calc::CalcNode, reads: &mut (bool, bool)) {
+        if let crate::css::calc::CalcNode::Numeric(crate::css::calc::CalcNumericValue::Length { unit, .. }) = node {
+            read_unit(*unit, reads);
+        }
+        node.for_each_child(&mut |child| read_calculation(child, reads));
+    }
+    fn read(value: &StyleValueData, reads: &mut (bool, bool)) {
+        match value {
+            StyleValueData::Length { unit, .. } => read_unit(*unit, reads),
+            StyleValueData::Calculated(payload) => read_calculation(payload.rust_calculation.node(), reads),
+            _ => {}
+        }
+        value.for_each_child(&mut |child| read(child, reads));
+    }
+    let mut reads = (false, false);
+    read(value, &mut reads);
+    reads
 }
 
 /// Whether `unit` is relative to a metric of the element's or its parent's first available font,
@@ -1436,7 +1479,7 @@ fn compute_math_depth(value: &StyleValueData, inherited_math_depth: i32, inherit
 }
 
 // https://drafts.csswg.org/css-inline-3/#line-height-property
-fn compute_line_height(value: &StyleValueData, computed_font_size: CssPixels) -> ComputedLineHeight {
+fn compute_line_height(value: &StyleValueData, computed_font_size: f64) -> ComputedLineHeight {
     match value {
         // normal
         // <length [0,inf]>
@@ -1447,17 +1490,12 @@ fn compute_line_height(value: &StyleValueData, computed_font_size: CssPixels) ->
         | StyleValueData::Length { .. }
         | StyleValueData::Number { .. } => ComputedLineHeight::Unchanged,
         // <percentage [0,inf]>
-        StyleValueData::Percentage { value } => {
-            ComputedLineHeight::Px(computed_font_size.to_double() * (value / 100.0))
-        }
+        StyleValueData::Percentage { value } => ComputedLineHeight::Px(computed_font_size * (value / 100.0)),
         // Calc lengths, percentages, and numbers resolve in the calc core against the
         // computed font size.
         StyleValueData::Calculated { .. } => {
-            match crate::css::calc::resolve_calculated_line_height_without_context(
-                value,
-                computed_font_size.to_double(),
-            )
-            .expect("a calculated line-height resolves to a length or a number")
+            match crate::css::calc::resolve_calculated_line_height_without_context(value, computed_font_size)
+                .expect("a calculated line-height resolves to a length or a number")
             {
                 crate::css::calc::ResolvedLineHeightCalc::Px(px) => ComputedLineHeight::Px(px),
                 crate::css::calc::ResolvedLineHeightCalc::Number(number) => ComputedLineHeight::Number(number),
@@ -1558,6 +1596,62 @@ fn compute_corner_shape_parameter(value: &StyleValueData) -> Option<f64> {
     }
 }
 
+/// Whether a calc() font size is a percentage alone, which scales the inherited size as a percentage
+/// does, and so carries a keyword size through to the element.
+pub(crate) fn calculated_font_size_is_percentage(value: &StyleValueData) -> bool {
+    use crate::css::calc::{BASE_TYPE_PERCENT, CalcNumericType};
+    let StyleValueData::Calculated(payload) = value else {
+        return false;
+    };
+    // NB: The type the calculation has with its percentages kept as percentages, rather than as the lengths they
+    //     resolve to.
+    let mut percentage = CalcNumericType::default();
+    percentage.exponents[BASE_TYPE_PERCENT] = Some(1);
+    payload
+        .rust_calculation
+        .node()
+        .numeric_type(&percentage)
+        .is_some_and(|numeric_type| {
+            numeric_type.percent_hint.is_none()
+                && numeric_type
+                    .exponents
+                    .iter()
+                    .enumerate()
+                    .all(|(base, exponent)| match base {
+                        BASE_TYPE_PERCENT => *exponent == Some(1),
+                        _ => matches!(exponent, None | Some(0)),
+                    })
+        })
+}
+
+/// The font size a cascaded font-size computes to from `inherited_font_size`, where it's relative
+/// to it: a percentage, alone or in a calc(), an `em` length, `larger` or `smaller`, or the size
+/// itself through `inherit` or `unset`.
+pub(crate) fn font_size_relative_to_inherited_size(value: &StyleValueData, inherited_font_size: f64) -> Option<f64> {
+    let size = match value {
+        StyleValueData::Percentage { value } => Some(inherited_font_size * (value / 100.0)),
+        calculated @ StyleValueData::Calculated { .. } if calculated_font_size_is_percentage(calculated) => {
+            crate::css::calc::resolve_calculated_length_without_context(calculated, inherited_font_size)
+        }
+        StyleValueData::Keyword { keyword } if matches!(*keyword, keyword::INHERIT | keyword::UNSET) => {
+            Some(inherited_font_size)
+        }
+        StyleValueData::Keyword { keyword } => {
+            relative_size_font_ratio(*keyword).map(|ratio| inherited_font_size * ratio)
+        }
+        StyleValueData::Length { value, unit } => matches!(
+            length_unit_kinds().get(usize::from(*unit)),
+            Some(LengthUnitKind::FontRelative {
+                metric: FontMetricSelector::FontSize,
+                root: false,
+            })
+        )
+        .then(|| value * inherited_font_size),
+        _ => None,
+    };
+    size.map(single_precision_font_size)
+}
+
 /// Whether a font-family value is a single monospace keyword, which triggers
 /// the monospace font-size recascade. The list entry's keyword is read through
 /// the nested value's shared Rust data handle.
@@ -1647,6 +1741,8 @@ pub(crate) fn value_depends_on_inherited_info_for_property(value: &StyleValueDat
                 || matches!(value, StyleValueData::Keyword { keyword }
                     if matches!(*keyword, keyword::LARGER | keyword::SMALLER | keyword::MATH))
         }
+        prop::_WEBKIT_TEXT_STROKE_WIDTH => matches!(value, StyleValueData::Keyword { keyword }
+            if matches!(*keyword, keyword::THIN | keyword::MEDIUM | keyword::THICK)),
         prop::LINE_HEIGHT => value_contains_percentage(value),
         prop::TEXT_ALIGN => matches!(value, StyleValueData::Keyword { keyword }
             if matches!(*keyword, keyword::MATCH_PARENT | keyword::_LIBWEB_INHERIT_OR_CENTER)),
@@ -2211,7 +2307,7 @@ struct ComputedStoreEntry<'a> {
     computed: NativeValue,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum FfiAnimationTimelineKind {
     Document,
@@ -2271,8 +2367,8 @@ pub struct FfiComputedAnimation {
     /// The index, in the list of CSS animations the host already holds for this element or
     /// pseudo-element, of the animation this definition claims, or -1 where it asks for a new one.
     pub matched_existing_index: i32,
-    /// The host's keyframe set for this definition's name, from the `@keyframes` the scopes in the
-    /// name's chain published, or null where none of them defines it.
+    /// The `KeyframeSet` for this definition's name, from the `@keyframes` the scopes in the name's
+    /// chain published, which the plan holds, or null where none of them defines it.
     pub keyframe_set: *const c_void,
 }
 
@@ -2326,6 +2422,9 @@ pub struct FfiStyleComputationEnvironment {
     pub color_scheme_input: FfiEffectiveColorSchemeInput,
     pub is_th_element: bool,
     pub has_new_font_size: bool,
+    /// Whether the new font size already accounts for the element's own cascaded `font-size`, which
+    /// the drive then leaves alone.
+    pub new_font_size_includes_cascaded_value: bool,
     pub has_tree_counting_context: bool,
     pub sibling_count: u64,
     pub sibling_index: u64,
@@ -2439,7 +2538,8 @@ fn property_has_dedicated_compute_rule(property_id: u16) -> bool {
     use crate::css::property_metadata::property_id as prop;
     matches!(
         property_id,
-        prop::ANIMATION_NAME
+        prop::_WEBKIT_TEXT_STROKE_WIDTH
+            | prop::ANIMATION_NAME
             | prop::BACKGROUND_ATTACHMENT
             | prop::BACKGROUND_CLIP
             | prop::BACKGROUND_ORIGIN
@@ -3131,6 +3231,7 @@ pub(crate) unsafe fn drive_property_computation(
     results: &mut LonghandDriverResults,
     effective_color_scheme: &mut i16,
     coordinate_overflow_keywords: bool,
+    preserve_background_lists: bool,
 ) {
     use crate::css::property_metadata::{
         NUMBER_OF_LONGHAND_PROPERTIES, REQUIRES_COMPUTATION_ALWAYS, REQUIRES_COMPUTATION_CASCADED,
@@ -3142,6 +3243,7 @@ pub(crate) unsafe fn drive_property_computation(
     let color_scheme_input = &environment.color_scheme_input;
     let is_th_element = environment.is_th_element;
     let has_new_font_size = environment.has_new_font_size;
+    let new_font_size_includes_cascaded_value = has_new_font_size && environment.new_font_size_includes_cascaded_value;
     let device_pixels_per_css_pixel = environment.device_pixels_per_css_pixel;
     let initial_font_size_raw = environment.initial_font_size_raw;
     let default_font_size_raw = environment.default_font_size_raw;
@@ -3199,8 +3301,7 @@ pub(crate) unsafe fn drive_property_computation(
     let mut computed_math_depth: Option<i32> = None;
     // The background-image list length, for the coordinated background properties.
     let mut background_image_list_length: Option<usize> = None;
-    // The computed writing-mode and direction, tracked for logical alias pairing;
-    // both properties only take keywords, whose computed value is the specified one.
+    // Logical properties use the computed writing mode and direction to find their physical counterparts.
     let mut computed_writing_mode = writer.get(prop::WRITING_MODE).and_then(|value| match value.data() {
         StyleValueData::Keyword { keyword } => keyword_to_writing_mode(*keyword),
         _ => None,
@@ -3230,6 +3331,9 @@ pub(crate) unsafe fn drive_property_computation(
             || (background_image_is_selected && BACKGROUND_LAYER_LONGHANDS.contains(&property_id));
         if !required_driver_input && !property_is_selected && computed_property_words.is_some() {
             continue;
+        }
+        if BACKGROUND_LAYER_LONGHANDS.contains(&property_id) {
+            writer.set_uncoordinated_background_value(property_id, None);
         }
         set_longhand_bit(&mut evaluated_words, property_id);
         results.longhand_evaluations = results
@@ -3275,13 +3379,15 @@ pub(crate) unsafe fn drive_property_computation(
         let mut source_slot = -1;
         let mut has_style_sheet_context = false;
         let mut external_dependencies = None;
+        let winning_declaration = store.winning_declaration(cascaded_property_id);
+        let has_winning_declaration = winning_declaration.is_some();
         if let Some((
             value_data,
             important,
             cascaded_source_slot,
             cascaded_has_style_sheet_context,
             cascaded_external_dependencies,
-        )) = store.winning_declaration(cascaded_property_id)
+        )) = winning_declaration
         {
             // An empty winning value cascades nothing, as no declaration would.
             value = Some(value_data).filter(|value| value.optional_data().is_some());
@@ -3294,15 +3400,16 @@ pub(crate) unsafe fn drive_property_computation(
             if property_id == crate::css::property_metadata::property_id::FONT_SIZE {
                 writer.flags_mut().set_raw_cascaded_font_size(Some(value_data.clone()));
             }
-        } else if property_id == crate::css::property_metadata::property_id::FONT_SIZE && has_new_font_size {
+        }
+        if property_id == crate::css::property_metadata::property_id::FONT_SIZE
+            && has_new_font_size
+            && (!has_winning_declaration || new_font_size_includes_cascaded_value)
+        {
             // NB: The recascade walks the ancestors. The inherited result still takes this element's own zoom.
             if zoom.length_zoom() != 1.0 {
                 let recascaded = writer.get(property_id).and_then(|value| {
                     if let StyleValueData::Length { value, unit } = value.data() {
-                        Some((
-                            CssPixels::nearest_value_for(value * zoom.length_zoom()).to_double(),
-                            *unit,
-                        ))
+                        Some((value * zoom.length_zoom(), *unit))
                     } else {
                         None
                     }
@@ -3312,7 +3419,7 @@ pub(crate) unsafe fn drive_property_computation(
                 }
             }
             continue;
-        } else if property_id == crate::css::property_metadata::property_id::FONT_SIZE {
+        } else if property_id == crate::css::property_metadata::property_id::FONT_SIZE && !has_winning_declaration {
             writer.flags_mut().set_raw_cascaded_font_size(None);
         }
 
@@ -3435,6 +3542,13 @@ pub(crate) unsafe fn drive_property_computation(
         // Whether the computed value depends on inherited information, so the specified
         // value must be kept for re-resolution when an ancestor changes.
         let value = value.expect("a longhand has a cascaded, inherited or initial value");
+        let value = if property_id == prop::WRITING_MODE
+            && let StyleValueData::Keyword { keyword } = value.data()
+        {
+            RetainedStyleValueData::shared_keyword(computed_writing_mode_keyword(*keyword))
+        } else {
+            value
+        };
         let value_data = value.data();
         let external_dependencies = external_dependencies.unwrap_or_else(|| external_value_dependencies(value_data));
 
@@ -3615,6 +3729,28 @@ pub(crate) unsafe fn drive_property_computation(
                 })
             };
             let native = match (absolutized, inherited_property_id) {
+                (_, prop::_WEBKIT_TEXT_STROKE_WIDTH) if matches!(value_data, StyleValueData::Keyword { .. }) => {
+                    let StyleValueData::Keyword { keyword } = value_data else {
+                        unreachable!()
+                    };
+                    let multiplier = match *keyword {
+                        keyword::THIN => 1.0,
+                        keyword::MEDIUM => 3.0,
+                        keyword::THICK => 5.0,
+                        _ => unreachable!("a text stroke width keyword is thin, medium or thick"),
+                    };
+                    let context = length_resolution_context.expect("text stroke widths require font metrics");
+                    results.depends_on_viewport_metrics |= context.font_metrics_depend_on_viewport_metrics;
+                    NativeValue::Px(context.font_metrics.font_size * context.zoom * multiplier / 48.0)
+                }
+                (Some(absolutized), prop::_WEBKIT_TEXT_STROKE_WIDTH) => {
+                    absolutized.map_or(NativeValue::Unchanged, NativeValue::Px)
+                }
+                (None, prop::_WEBKIT_TEXT_STROKE_WIDTH) => NativeValue::Px(
+                    crate::css::calc::resolve_calculated_length_without_context(value_data, 0.0)
+                        .expect("a calculated text stroke width resolves to a length"),
+                ),
+
                 (
                     Some(absolutized),
                     prop::BORDER_BOTTOM_WIDTH
@@ -3746,12 +3882,12 @@ pub(crate) unsafe fn drive_property_computation(
                                     // https://drafts.csswg.org/css-viewport/#zoom-property
                                     // NB: The parent's font-size is zoomed by its effective zoom already, so it takes
                                     //     the element's own zoom alone.
-                                    Some((CssPixels::nearest_value_for(*value * zoom.length_zoom()), math_depth))
+                                    Some((*value * zoom.length_zoom(), math_depth))
                                 }
                                 _ => None,
                             },
                             None => Some((
-                                CssPixels::from_raw(initial_font_size_raw).scaled(zoom.length_effective_zoom()),
+                                CssPixels::from_raw(initial_font_size_raw).to_double() * zoom.length_effective_zoom(),
                                 0,
                             )),
                         };
@@ -3851,13 +3987,10 @@ pub(crate) unsafe fn drive_property_computation(
                     ) {
                         let resolution_context =
                             length_resolution_context.expect("line-height must run with a resolution context");
-                        compute_line_height(
-                            value_data,
-                            CssPixels::nearest_value_for(resolution_context.font_metrics.font_size),
-                        )
+                        compute_line_height(value_data, resolution_context.font_metrics.font_size)
                     } else {
                         let synthesized = synthesized_px_length(absolutized);
-                        compute_line_height(synthesized.as_ref().unwrap_or(value_data), CssPixels::from_raw(0))
+                        compute_line_height(synthesized.as_ref().unwrap_or(value_data), 0.0)
                     };
                     match result {
                         ComputedLineHeight::Unchanged => absolutized.map_or(NativeValue::Unchanged, NativeValue::Px),
@@ -3882,7 +4015,14 @@ pub(crate) unsafe fn drive_property_computation(
                 ) => {
                     // NB: The background properties are coordinated at compute time rather
                     //     than use time, unlike other coordinating list property groups.
-                    let layer_count = background_image_list_length
+                    let declared_count = match value_data {
+                        StyleValueData::ValueList { values, .. } if preserve_background_lists => {
+                            Some(values.as_slice().len())
+                        }
+                        _ => None,
+                    };
+                    let layer_count = declared_count
+                        .or(background_image_list_length)
                         .or_else(|| {
                             writer.get(prop::BACKGROUND_IMAGE).and_then(|value| match value.data() {
                                 StyleValueData::ValueList { values, .. } => Some(values.as_slice().len()),
@@ -3892,21 +4032,29 @@ pub(crate) unsafe fn drive_property_computation(
                         .expect("background-image must be a computed value list");
                     let resolution_context =
                         length_resolution_context.expect("background lists require a length resolution context");
-                    match absolutize_for_rule(value_data, resolution_context, current_effective_color_scheme, results) {
-                        Absolutized::Unchanged => {
-                            match repeat_style_value_list_to_n_elements(value_data, layer_count) {
-                                Some(None) => NativeValue::Unchanged,
-                                Some(Some(value)) => NativeValue::StyleValue(value),
-                                None => unsupported(),
-                            }
-                        }
+                    let full = match absolutize_for_rule(
+                        value_data,
+                        resolution_context,
+                        current_effective_color_scheme,
+                        results,
+                    ) {
+                        Absolutized::Unchanged => match &externally_absolutized {
+                            Some(value) => std::borrow::Cow::Owned(RetainedStyleValueData::from_arc(value.clone())),
+                            None => std::borrow::Cow::Borrowed(value),
+                        },
                         Absolutized::Changed(value) => {
-                            match repeat_style_value_list_to_n_elements(value.data(), layer_count) {
-                                Some(None) => NativeValue::StyleValue(value.into_arc()),
-                                Some(Some(value)) => NativeValue::StyleValue(value),
-                                None => unsupported(),
-                            }
+                            std::borrow::Cow::Owned(RetainedStyleValueData::from_arc(value.into_arc()))
                         }
+                    };
+                    let excess = matches!(full.data(), StyleValueData::ValueList { values, .. } if values.as_slice().len() > layer_count);
+                    writer.set_uncoordinated_background_value(property_id, excess.then(|| full.clone().into_owned()));
+                    match repeat_style_value_list_to_n_elements(full.data(), layer_count) {
+                        Some(None) => match full {
+                            std::borrow::Cow::Borrowed(_) => NativeValue::Unchanged,
+                            std::borrow::Cow::Owned(value) => NativeValue::StyleValue(value.into_arc()),
+                        },
+                        Some(Some(value)) => NativeValue::StyleValue(value),
+                        None => unsupported(),
                     }
                 }
                 (Some(_), prop::ANIMATION_NAME)
@@ -4327,6 +4475,7 @@ fn adjust_computed_box(
     )
     .0;
     box_type_input.position = inputs.position;
+    box_type_input.force_line_height_normal &= keyword_of(prop::APPEARANCE) != keyword::NONE;
     box_type_input.webkit_box_layout_transformation_applies =
         keyword_of(prop::_WEBKIT_BOX_ORIENT) == keyword::VERTICAL && keyword_of(prop::CONTINUE) != keyword::AUTO;
     let adjustments = compute_element_style_adjustments(&box_type_input, inputs.text_align);
@@ -4873,10 +5022,8 @@ pub(crate) fn compute_font_values<'a>(
                     _ => None,
                 };
                 let inherited_size = match (parentless_font_size, inherited(prop::FONT_SIZE)) {
-                    (Some(size), _) => size,
-                    (None, Some(StyleValueData::Length { value, unit })) if *unit == px_length_unit() => {
-                        CssPixels::nearest_value_for(*value)
-                    }
+                    (Some(size), _) => size.to_double(),
+                    (None, Some(StyleValueData::Length { value, unit })) if *unit == px_length_unit() => *value,
                     _ => return false,
                 };
                 // NB: The element declares no math-depth of its own, so its computed one is the
@@ -4941,7 +5088,7 @@ pub(crate) fn compute_font_values<'a>(
                         (true, false) => value.clone(),
                     }
                 }
-                _ => match compute_line_height(data, CssPixels::nearest_value_for(length.font_metrics.font_size)) {
+                _ => match compute_line_height(data, length.font_metrics.font_size) {
                     ComputedLineHeight::Unchanged => value.clone(),
                     ComputedLineHeight::Number(value) => {
                         RetainedStyleValueData::from_owned(StyleValueData::Number { value })
@@ -4993,9 +5140,10 @@ pub(crate) fn compute_font_values<'a>(
 }
 
 /// The inputs every drive evaluates, selected or not.
-pub(crate) const REQUIRED_DRIVER_INPUTS: [u16; 10] = {
+pub(crate) const REQUIRED_DRIVER_INPUTS: [u16; 11] = {
     use crate::css::property_metadata::property_id as prop;
     [
+        prop::APPEARANCE,
         prop::COLOR_SCHEME,
         prop::DIRECTION,
         prop::DISPLAY,
@@ -5013,7 +5161,8 @@ pub(crate) fn is_required_driver_input(property_id: u16) -> bool {
     use crate::css::property_metadata::property_id as prop;
     matches!(
         property_id,
-        prop::COLOR_SCHEME
+        prop::APPEARANCE
+            | prop::COLOR_SCHEME
             | prop::DIRECTION
             | prop::DISPLAY
             | prop::FLOAT
@@ -5358,8 +5507,7 @@ fn calculated_offset(value: &StyleValueData) -> *const c_void {
 }
 
 /// The pixels of a computed length-percentage, resolving its percentages against `basis`.
-#[unsafe(no_mangle)]
-pub extern "C" fn rust_length_percentage_px(value: &StyleValueData, basis: f64) -> f64 {
+pub(crate) fn length_percentage_px(value: &StyleValueData, basis: f64) -> f64 {
     crate::css::computed_value_views::LengthPercentageRef::over(value)
         .to_px(CssPixels::nearest_value_for(basis))
         .to_double()
@@ -5367,8 +5515,7 @@ pub extern "C" fn rust_length_percentage_px(value: &StyleValueData, basis: f64) 
 
 /// Whether a computed length-percentage is a length plus a percentage of what it resolves against, which only a
 /// calculation may not be.
-#[unsafe(no_mangle)]
-pub extern "C" fn rust_length_percentage_is_linear(value: &StyleValueData) -> bool {
+pub(crate) fn length_percentage_is_linear(value: &StyleValueData) -> bool {
     match value {
         StyleValueData::Calculated(calculated) => calculated.rust_calculation.node().is_linear_in_percentages(),
         _ => true,
@@ -5417,9 +5564,8 @@ fn view_timeline_inset(value: Option<&StyleValueData>) -> FfiViewTimelineInset {
     }
 }
 
-/// The insets a computed `view-timeline-inset` item describes, for a timeline the host builds from script.
-#[unsafe(no_mangle)]
-pub extern "C" fn rust_view_timeline_inset(value: &StyleValueData) -> FfiViewTimelineInset {
+/// The insets a computed `view-timeline-inset` item describes, for a timeline script builds.
+pub(crate) fn script_view_timeline_inset(value: &StyleValueData) -> FfiViewTimelineInset {
     let value = match value {
         StyleValueData::ValueList { values, separator, .. } if *separator == 1 => values.as_slice()[0].data(),
         value => value,
@@ -5579,8 +5725,7 @@ pub extern "C" fn rust_animation_values_declare_timelines(
 }
 
 /// Whether a parsed `view-timeline-inset` value has a length in a unit that is not absolute.
-#[unsafe(no_mangle)]
-pub extern "C" fn rust_view_timeline_inset_has_relative_length(value: &StyleValueData) -> bool {
+pub(crate) fn view_timeline_inset_has_relative_length(value: &StyleValueData) -> bool {
     let is_absolute = |unit: u8| {
         matches!(
             length_unit_kinds().get(unit as usize),
@@ -5728,12 +5873,7 @@ pub struct FfiAnimationRangeEdge {
 
 /// The edge a computed `animation-range-start` or `animation-range-end` value with a single item describes, for a range
 /// script sets. Answers false where the value has more than one item.
-#[unsafe(no_mangle)]
-pub extern "C" fn rust_animation_range_edge(
-    value: &StyleValueData,
-    is_end: bool,
-    out: &mut FfiAnimationRangeEdge,
-) -> bool {
+pub(crate) fn rust_animation_range_edge(value: &StyleValueData, is_end: bool, out: &mut FfiAnimationRangeEdge) -> bool {
     let item = match value {
         StyleValueData::ValueList { values, separator, .. } if *separator == 1 => match values.as_slice() {
             [item] => item.data(),
@@ -5803,12 +5943,12 @@ fn settled_animation_plan(
     node: crate::css::style::tree::StyleNodeID,
     pseudo_kind: u8,
     record: &std::sync::Arc<crate::css::style::pipeline::Record>,
-) -> Option<(smallvec::SmallVec<[FfiComputedAnimation; 1]>, bool)> {
-    let definitions = style_engine.animation_plan_of_record(node, pseudo_kind, record)?;
+) -> Option<(AnimationPlan, bool)> {
+    let plan = style_engine.animation_plan_of_record(node, pseudo_kind, record)?;
     let longhands = crate::css::style::StyleRecordView::of_host_record(record).longhands();
     let in_display_none_subtree =
-        in_display_none_subtree_for_animations(style_engine, node, pseudo_kind, longhands, &definitions);
-    Some((definitions, in_display_none_subtree))
+        in_display_none_subtree_for_animations(style_engine, node, pseudo_kind, longhands, &plan.definitions);
+    Some((plan, in_display_none_subtree))
 }
 
 /// Hands `apply` the animation plan of an element, or of its pseudo-element `pseudo_kind`, whose
@@ -5849,19 +5989,31 @@ pub unsafe extern "C" fn rust_settled_animation_plan(
         return;
     }
     // Applying the plan publishes the element's animations to the engine, so nothing of the
-    // engine is borrowed while the host applies it: the definitions only point into the record.
-    let Some((definitions, in_display_none_subtree)) =
-        crate::css::style::engine_calls::with_engine(read, host, |engine| {
-            settled_animation_plan(engine, node, pseudo_kind, &record)
-        })
-    else {
+    // engine is borrowed while the host applies it: the definitions only point into the record and
+    // the keyframe sets the plan holds.
+    let Some((plan, in_display_none_subtree)) = crate::css::style::engine_calls::with_engine(read, host, |engine| {
+        settled_animation_plan(engine, node, pseudo_kind, &record)
+    }) else {
         return;
     };
+    // https://drafts.csswg.org/css-animations-1/#animations
+    // Setting the 'display' property to 'none' will terminate any running animation applied to the element and its
+    // descendants. If an element has a 'display' of 'none', updating 'display' to a value other than 'none' will
+    // start all animations applied to the element by the 'animation-name' property, as well as all animations
+    // applied to descendants with 'display' other than 'none'.
+    // NB: We must not start animations on elements that are not rendered due to display:none. Once display becomes
+    //     something other than none, the resulting style recomputation applies the plan again and starts them.
+    //     Termination of running animations when display becomes none is handled by
+    //     Element::play_or_cancel_animations_after_display_property_change(). An element that has no animations and
+    //     starts none has nothing to hold or publish.
+    if !has_animations && (plan.definitions.is_empty() || in_display_none_subtree) {
+        return;
+    }
     unsafe {
         apply(
             context,
-            definitions.as_ptr(),
-            definitions.len(),
+            plan.definitions.as_ptr(),
+            plan.definitions.len(),
             in_display_none_subtree,
         );
     }
@@ -5878,14 +6030,26 @@ pub(crate) fn animation_names_declare_css_animations(names: &RetainedStyleValueD
         .any(|name| !matches!(name.data(), StyleValueData::Keyword { keyword } if *keyword == keyword::NONE))
 }
 
+/// The animation definitions a record decides for an element or pseudo-element, with the keyframe
+/// sets they name, which the plan holds while the host applies it.
+#[derive(Default)]
+pub(crate) struct AnimationPlan {
+    pub(crate) definitions: smallvec::SmallVec<[FfiComputedAnimation; 1]>,
+    keyframe_sets: smallvec::SmallVec<[std::sync::Arc<crate::animations::keyframes::KeyframeSet>; 1]>,
+}
+
 // https://drafts.csswg.org/css-values-4/#linked-properties
 // https://drafts.csswg.org/css-animations-1/#animations
-pub(crate) fn build_computed_animation_list(
+pub(crate) fn build_computed_animation_list<'k>(
     longhands: crate::css::style::ViewLonghands<'_>,
     existing_animations: &[crate::css::style::animations::CssDefinedAnimation],
-    resolve_keyframes: impl Fn(&[u16]) -> Option<usize>,
-    animations: &mut smallvec::SmallVec<[FfiComputedAnimation; 1]>,
+    resolve_keyframes: impl Fn(&[u16]) -> Option<&'k std::sync::Arc<crate::animations::keyframes::KeyframeSet>>,
+    plan: &mut AnimationPlan,
 ) {
+    let AnimationPlan {
+        definitions: animations,
+        keyframe_sets,
+    } = plan;
     use crate::css::property_metadata::property_id as prop;
 
     let name_values = computed_value_list(longhands, prop::ANIMATION_NAME);
@@ -5959,7 +6123,10 @@ pub(crate) fn build_computed_animation_list(
             range_end_percentage,
             range_end_calculated,
             matched_existing_index: crate::css::style::animations::NO_MATCHED_ANIMATION,
-            keyframe_set: resolve_keyframes(name.units()).map_or(std::ptr::null(), |set| set as *const c_void),
+            keyframe_set: resolve_keyframes(name.units()).map_or(std::ptr::null(), |set| {
+                keyframe_sets.push(set.clone());
+                std::sync::Arc::as_ptr(set).cast()
+            }),
         });
     }
 
@@ -5997,6 +6164,19 @@ fn keyword_from_style_value(value: &StyleValueData) -> u16 {
         unreachable!("keyword longhand must have a keyword value")
     };
     *keyword
+}
+
+// https://drafts.csswg.org/css-writing-modes-4/#svg-writing-mode-css
+fn computed_writing_mode_keyword(keyword: u16) -> u16 {
+    match keyword {
+        keyword::LR | keyword::LR_TB | keyword::RL | keyword::RL_TB => keyword::HORIZONTAL_TB,
+        keyword::TB | keyword::TB_RL => keyword::VERTICAL_RL,
+        _ => keyword,
+    }
+}
+
+pub(crate) fn writing_mode_from_specified_keyword(keyword: u16) -> Option<u8> {
+    keyword_to_writing_mode(computed_writing_mode_keyword(keyword))
 }
 
 /// The writing mode a computed `writing-mode` value holds.
@@ -6071,10 +6251,12 @@ unsafe fn create_document_style_record(
             force_position_static: false,
             force_symbol_display_inline: false,
             webkit_box_layout_transformation_applies: false,
+            in_top_layer: false,
         },
         color_scheme_input: input.color_scheme_input,
         is_th_element: false,
         has_new_font_size: false,
+        new_font_size_includes_cascaded_value: false,
         has_tree_counting_context: false,
         sibling_count: 0,
         sibling_index: 0,
@@ -6122,6 +6304,7 @@ unsafe fn create_document_style_record(
                     &mut results,
                     &mut effective_color_scheme,
                     true,
+                    false,
                 );
             }
         }
@@ -6184,6 +6367,7 @@ pub(crate) struct AnimationKeyframeLonghands {
 /// from the underlying style, then all of that keyframe's specified values are
 /// cascaded together before its selected properties are evaluated. A custom
 /// property's value is the one `custom_property_values` holds at its index.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn compute_animation_keyframe_longhands(
     underlying_longhands: crate::css::style::ViewLonghands<'_>,
     style_engine: &crate::css::style::StyleEngine,
@@ -6192,8 +6376,8 @@ pub(crate) fn compute_animation_keyframe_longhands(
     environment: &FfiStyleComputationEnvironment,
     length_contexts: &FfiAnimationLengthContexts,
     custom_property_values: &[Option<RetainedStyleValueData>],
+    preserve_background_lists: bool,
 ) -> AnimationKeyframeLonghands {
-    crate::css::ffi_stats::bump(crate::css::ffi_stats::FfiOp::AnimationKeyframeLonghandEntry);
     use crate::css::property_metadata::{
         FIRST_LONGHAND_PROPERTY_ID, LAST_LONGHAND_PROPERTY_ID, NUMBER_OF_LONGHAND_PROPERTIES,
     };
@@ -6347,6 +6531,7 @@ pub(crate) fn compute_animation_keyframe_longhands(
                         &mut results,
                         &mut effective_color_scheme,
                         false,
+                        preserve_background_lists,
                     );
                 }
             }
@@ -6382,81 +6567,6 @@ pub const SUBSTITUTION_MARK_IF: u8 = 1 << 2;
 pub const SUBSTITUTION_MARK_INHERIT: u8 = 1 << 3;
 pub const SUBSTITUTION_MARK_CUSTOM_FUNCTION: u8 = 1 << 4;
 
-/// One animation effect's timing as the host holds it when it samples the effect: what its
-/// animation contributes, the effect's own timing, and the time its timeline was sampled at. Every
-/// time is in milliseconds. The host describes an effect whose times are not, or whose local time is
-/// overridden for observation, as one the engine cannot decide.
-///
-/// Its easing travels beside it, as a descriptor the call borrows.
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
-pub struct FfiEffectTiming {
-    pub scroll_timeline: u64,
-    pub minimum_timeline_time: f64,
-    pub maximum_timeline_time: f64,
-    pub timeline_time: f64,
-    pub timeline_origin_time: f64,
-    pub start_time: f64,
-    pub hold_time: f64,
-    pub playback_rate: f64,
-    pub start_delay: f64,
-    pub end_delay: f64,
-    pub iteration_duration: f64,
-    pub iteration_count: f64,
-    pub iteration_start: f64,
-    pub decidable: bool,
-    pub is_relevant: bool,
-    pub is_removed: bool,
-    pub has_timeline_time: bool,
-    /// The effect's animation runs on a document timeline, whose time is a timestamp less this origin
-    /// time.
-    pub has_timeline_origin_time: bool,
-    /// The effect's animation runs on the scroll timeline `scroll_timeline` names, whose time is its progress, in
-    /// percent, where the scroller it follows is scrolled to.
-    pub has_timeline_scroller: bool,
-    /// The effect's animation runs on a progress-based timeline, whose minimum and maximum timeline times
-    /// `minimum_timeline_time` and `maximum_timeline_time` are.
-    pub has_timeline_boundaries: bool,
-    pub has_start_time: bool,
-    pub has_hold_time: bool,
-    /// The effect's animation is paused, which holds its time, as one whose play is pending does too.
-    pub paused: bool,
-    /// `Bindings::FillMode`, in IDL order.
-    pub fill_mode: u8,
-    /// `Bindings::PlaybackDirection`, in IDL order.
-    pub playback_direction: u8,
-}
-
-const _: () = assert!(size_of::<FfiEffectTiming>() == 120);
-
-/// ABI mirror of `AK::Optional<double>`.
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct OptionalF64 {
-    value: std::mem::MaybeUninit<f64>,
-    has_value: bool,
-}
-
-impl From<OptionalF64> for Option<f64> {
-    fn from(value: OptionalF64) -> Self {
-        // SAFETY: The host's Optional initializes its storage whenever it has a value.
-        value.has_value.then(|| unsafe { value.value.assume_init() })
-    }
-}
-
-/// One effect the host samples: which of the element's described effects it is, which version of
-/// it, and its timing, from which the engine computes how far along it is on the scale the host keys
-/// keyframes by. Where the engine cannot decide the timing, the host computes that key itself.
-#[repr(C)]
-pub struct FfiSampledAnimationEffect {
-    pub identity: u64,
-    pub generation: u64,
-    pub timing: FfiEffectTiming,
-    pub easing: crate::css::easing::FfiEasingDescriptor,
-    /// The host's key, for a timing the engine cannot decide.
-    pub current_key: OptionalF64,
-}
-
 /// The length-resolution contexts keyframe values compute in: a font's, a line height's, and every
 /// other longhand's.
 #[repr(C)]
@@ -6475,8 +6585,12 @@ pub struct FfiHostAnimationSample {
     pub style_node: u32,
     /// The pseudo-element sampled, or `NO_PSEUDO_ELEMENT` for the element itself.
     pub pseudo_kind: u8,
-    pub effects: *const FfiSampledAnimationEffect,
+    /// The element's effects that target what is sampled, in composite order, which the host describes to the engine
+    /// and samples where they have an animation.
+    pub effects: *const crate::animations::ffi::FfiSampledEffect,
     pub effect_count: usize,
+    /// The element's animations, which follow what the host published of their effects to the engine.
+    pub animations: *mut crate::animations::element_animations::ElementAnimations,
     /// The style record whose longhands the working set reads, which the animations compose over.
     pub record: *const c_void,
     /// The working set's overlay before this sample, or null.
@@ -6598,32 +6712,23 @@ pub(crate) fn animation_length_resolution_context(
     }
 }
 
-/// The effects a host samples, whose easings stay live for as long as the effects are borrowed.
-#[derive(Clone, Copy)]
-pub(crate) struct HostSampledEffects<'a>(&'a [FfiSampledAnimationEffect]);
-
-impl<'a> HostSampledEffects<'a> {
-    /// # Safety
-    /// The linear points each effect's easing names must be live for `'a`.
-    pub(crate) unsafe fn new(effects: &'a [FfiSampledAnimationEffect]) -> Self {
-        Self(effects)
-    }
-
-    pub(crate) fn none() -> Self {
-        Self(&[])
-    }
-
-    pub(crate) fn as_slice(&self) -> &'a [FfiSampledAnimationEffect] {
-        self.0
-    }
+/// One effect the host samples: its description, and the timing the host samples it with, from which the engine
+/// computes how far along it is on the scale the host keys keyframes by.
+pub(crate) struct HostSampledEffect {
+    pub(crate) description: std::sync::Arc<crate::css::style::effect_descriptions::EffectDescription>,
+    pub(crate) timing: crate::animations::snapshot::CompactEffectTiming,
 }
+
+/// The effects a host samples on an element, in composite order.
+pub(crate) type HostSampledEffects = smallvec::SmallVec<[HostSampledEffect; 4]>;
 
 /// What a sample reads of the element it samples and of the working set it samples over.
 pub(crate) struct AnimationSampleInput<'a> {
     pub(crate) style_node: u32,
+    pub(crate) record_dependencies: bool,
     /// The pseudo-element sampled, or `NO_PSEUDO_ELEMENT` for the element itself.
     pub(crate) pseudo_kind: u8,
-    pub(crate) effects: HostSampledEffects<'a>,
+    pub(crate) effects: HostSampledEffects,
     /// The working set's longhands, which the animations compose over.
     pub(crate) longhands: crate::css::style::ViewLonghands<'a>,
     /// Whether the working set held an overlay before this sample.
@@ -6722,18 +6827,52 @@ impl AnimationSampleHost for HostSampleCallbacks {
 }
 
 impl FfiHostAnimationSample {
-    /// What the sample reads, and the callbacks through which it asks the host.
+    /// Publishes the descriptions of the effects the sample reads to `host`'s engine, where they differ from those the
+    /// host last published for the element or pseudo-element it samples, and answers the effects it samples.
+    ///
+    /// # Safety
+    /// The effects, animations and element animations the input names must be live for the call.
+    unsafe fn publish_effect_descriptions(&self, host: &crate::render_state::DocumentHost) -> HostSampledEffects {
+        // SAFETY: Guaranteed by the caller.
+        let described = unsafe {
+            crate::animations::ffi::describe_sampled_effects(ak::slice_from_raw_parts(self.effects, self.effect_count))
+        };
+        let Some(node) = crate::css::style::tree::StyleNodeID::from_raw(self.style_node) else {
+            return described.sampled;
+        };
+        let slot = animation_slot(self.pseudo_kind);
+        // SAFETY: Guaranteed by the caller.
+        let animations = unsafe { &mut *self.animations };
+        if animations.publish_effect_descriptions(
+            crate::animations::element_animations::AnimationOwnerSlot(slot),
+            &described.descriptions,
+        ) {
+            host.queue_change(crate::render_state::ArenaChange::Engine(
+                crate::css::style::engine_calls::EngineWrite::AnimationEffectDescriptions {
+                    node,
+                    slot,
+                    effects: described
+                        .descriptions
+                        .into_iter()
+                        .map(crate::css::style::effect_descriptions::PublishedEffect::new)
+                        .collect(),
+                },
+            ));
+        }
+        described.sampled
+    }
+
+    /// What the sample reads, with `effects`, the effects it samples, and the callbacks through which it asks the host.
     ///
     /// # Safety
     /// Every pointer and callback the input names must be live for the sample, and nothing but the
     /// sample may write the working set's overlay while it runs.
-    unsafe fn adopt(&self) -> (AnimationSampleInput<'_>, HostSampleCallbacks) {
+    unsafe fn adopt(&self, effects: HostSampledEffects) -> (AnimationSampleInput<'_>, HostSampleCallbacks) {
         // SAFETY: Guaranteed by the caller.
-        let (longhands, animated_overlay, effects, environment, style_record, inheritance_parent_record) = unsafe {
+        let (longhands, animated_overlay, environment, style_record, inheritance_parent_record) = unsafe {
             (
                 crate::css::style::ViewLonghands::of_raw_record(self.record),
                 self.animated_overlay.cast::<AnimatedOverlay>().as_ref(),
-                HostSampledEffects::new(ak::slice_from_raw_parts(self.effects, self.effect_count)),
                 &*self.environment,
                 crate::css::style::bridge::retain_host_record(self.style_record),
                 crate::css::style::bridge::retain_host_record(self.inheritance_parent_record),
@@ -6741,6 +6880,7 @@ impl FfiHostAnimationSample {
         };
         let input = AnimationSampleInput {
             style_node: self.style_node,
+            record_dependencies: true,
             pseudo_kind: self.pseudo_kind,
             effects,
             longhands,
@@ -6768,6 +6908,174 @@ impl FfiHostAnimationSample {
     }
 }
 
+#[repr(C)]
+pub struct FfiReflectedKeyframeProperty {
+    pub keyframe_index: usize,
+    pub property_id: u16,
+    pub value: *const StyleValueData,
+}
+
+/// Compute CSS keyframe declarations without sampling or publishing an effect.
+/// The callback receives underlying values with `keyframe_count` as their index.
+///
+/// # Safety
+/// The input, declarations, resource context, and callback must be live for the call.
+/// No caller may hold a borrow of the style engine.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rust_compute_css_keyframe_values(
+    input: &FfiHostAnimationSample,
+    read: &crate::render_state::BegunRead,
+    properties: *const FfiReflectedKeyframeProperty,
+    property_count: usize,
+    keyframe_count: usize,
+    resource_context: &FfiStyleSheetResourceContext,
+    context: *mut c_void,
+    emit: unsafe extern "C" fn(*mut c_void, usize, u16, *const StyleValueData),
+) {
+    use crate::animations::keyframes::{KeyframeSet, ResourceContext};
+    use crate::css::animation as anim;
+    use crate::css::style::effect_descriptions::{EffectAnimation, EffectDescription, PublishedEffect};
+    use crate::css::style::engine_calls::{document_host, with_engine};
+
+    // SAFETY: Guaranteed by the caller.
+    let (host, (sample, mut callbacks), properties) = unsafe {
+        (
+            document_host(input.host),
+            input.adopt(HostSampledEffects::new()),
+            ak::slice_from_raw_parts(properties, property_count),
+        )
+    };
+    let Some(node) = crate::css::style::tree::StyleNodeID::from_raw(sample.style_node) else {
+        return;
+    };
+    let mut frames = vec![Vec::new(); keyframe_count];
+    for property in properties {
+        // SAFETY: Each declaration's value is live for the call.
+        let value = unsafe {
+            RetainedStyleValueData::from_retained_pointer(crate::css::style_value::retain_style_value(property.value))
+        };
+        frames[property.keyframe_index].push((property.property_id, value));
+    }
+    let resource_context = resource_context.has_value.then(|| ResourceContext {
+        // SAFETY: The resource context's URL is live for the call.
+        base_url: unsafe { ak::slice_from_raw_parts(resource_context.base_url, resource_context.base_url_length) }
+            .into(),
+        origin_clean: resource_context.origin_clean,
+    });
+    // NB: The keyframes compute as those of an effect of no animation of its own, which the style engine is not told of.
+    let mut description = EffectDescription::new(Default::default());
+    description.keyframe_set = Some(std::sync::Arc::new(KeyframeSet::for_value_computation(
+        frames,
+        resource_context,
+    )));
+    description.animation = EffectAnimation::Animation(crate::animations::easing::CompactEasing::Linear);
+    let effect = PublishedEffect::new(std::sync::Arc::new(description));
+    let resolved = with_engine(read, host, |engine| {
+        let (writing_mode, direction) = computed_writing_mode_and_direction(sample.longhands);
+        let conversions = std::cell::RefCell::new(anim::KeyframeConversionCache::new(
+            None,
+            sample.stores,
+            sample.custom_property_registration_generation,
+        ));
+        anim::resolve_published_animation_declarations(
+            engine,
+            node,
+            sample.pseudo(),
+            &[anim::SelectedEffect {
+                effect: &effect,
+                current_key: 0.0,
+            }],
+            sample.longhands,
+            sample.stores,
+            writing_mode,
+            direction,
+            &[],
+            &conversions,
+        )
+        .resolved
+    });
+    let length_contexts = callbacks.length_contexts(resolved.container_relative_length_unit_mask);
+    let values = with_engine(read, host, |engine| {
+        let sibling_position = resolved
+            .uses_tree_counting_function
+            .then(|| engine.element_sibling_position(node))
+            .flatten();
+        let random_base_values = resolved
+            .unfixed_random_sharings
+            .iter()
+            .map(|sharing| FfiRandomBaseValue {
+                source: sharing.source.cast(),
+                value: engine.ensure_random_base_value(Some(node), &sharing.name, sharing.element_shared),
+            })
+            .collect::<Vec<_>>();
+        let mut environment = *sample.environment;
+        environment.has_tree_counting_context = sibling_position.is_some();
+        environment.sibling_count = sibling_position.map_or(0, |(count, _)| u64::from(count));
+        environment.sibling_index = sibling_position.map_or(0, |(_, index)| u64::from(index));
+        environment.random_base_values = random_base_values.as_ptr();
+        environment.random_base_value_count = random_base_values.len();
+        compute_animation_keyframe_longhands(
+            sample.longhands,
+            engine,
+            sample.inheritance_parent_record.as_ref(),
+            &resolved.properties,
+            &environment,
+            &length_contexts,
+            &[],
+            true,
+        )
+        .values
+    });
+    for (property, value) in resolved.properties.iter().zip(&values) {
+        let coordinated = sample
+            .longhands
+            .handle(property.physical_property_id)
+            .expect("an animated longhand has an underlying value");
+        let underlying = sample
+            .longhands
+            .uncoordinated_background_value(property.physical_property_id)
+            .unwrap_or(coordinated);
+        let mut reflected = value.clone();
+        // AD-HOC: Computed keyframe values need not have the underlying background list's length. For web
+        // compatibility, reflection preserves underlying layers beyond a shorter keyframe declaration.
+        if BACKGROUND_LAYER_LONGHANDS.contains(&property.physical_property_id)
+            && let StyleValueData::ValueList {
+                values: declared,
+                separator,
+                collapsible,
+            } = value.data()
+            && let StyleValueData::ValueList { values: base, .. } = coordinated.data()
+            && declared.as_slice().len() < base.as_slice().len()
+        {
+            let mut items = declared.as_slice().to_vec();
+            items.extend_from_slice(&base.as_slice()[items.len()..]);
+            reflected = RetainedStyleValueData::from_owned(StyleValueData::ValueList {
+                values: crate::css::style_value::RetainedStyleValueDataList::from_retained_values(items),
+                separator: *separator,
+                collapsible: *collapsible,
+            });
+        }
+        // SAFETY: The callback and underlying value are live for this call.
+        unsafe {
+            emit(
+                context,
+                keyframe_count,
+                property.physical_property_id,
+                underlying.pointer(),
+            );
+        }
+        // SAFETY: The callback is live, and each computed value stays live until it returns.
+        unsafe {
+            emit(
+                context,
+                property.keyframe_index,
+                property.physical_property_id,
+                reflected.pointer(),
+            );
+        };
+    }
+}
+
 /// Sample one element's animation effects onto its working set's overlay.
 ///
 /// The effects are sampled from the descriptions the host published of them: the style engine
@@ -6786,13 +7094,82 @@ pub unsafe extern "C" fn rust_sample_animation_effects(
     use crate::css::style::engine_calls::{document_host, with_engine_and_arena};
 
     // SAFETY: Guaranteed by the caller.
-    let (host, (sample, mut callbacks)) = unsafe { (document_host(input.host), input.adopt()) };
+    let host = unsafe { document_host(input.host) };
+    // SAFETY: As above.
+    let (sample, mut callbacks) = unsafe { input.adopt(input.publish_effect_descriptions(host)) };
     // The first sample of the transitions a step just started rides the style job that decided the step.
     if let Some(result) = host.answer_fresh_transition_sample(&sample, &mut callbacks) {
         return result;
     }
     let step = with_engine_and_arena(read, host, |engine, arena| {
         sample_in_engine(&sample, &mut callbacks, engine, arena)
+    });
+    finish_sample_with_host(&sample, &mut callbacks, host, read, step)
+}
+
+/// https://drafts.csswg.org/web-animations-1/#commit-computed-styles
+/// Sample the effects `input` names onto its working set's overlay as committing computed styles does: each at the key
+/// its timing gives with the endpoint-inclusive active interval flag set, from descriptions the sample makes of its own,
+/// publishing nothing to the style engine and recording nothing the element's style depends on.
+///
+/// # Safety
+/// As for [`rust_sample_animation_effects`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rust_sample_animation_effects_for_commit_styles(
+    input: &FfiHostAnimationSample,
+    read: &crate::render_state::BegunRead,
+) -> FfiHostAnimationSampleResult {
+    use crate::css::style::effect_descriptions::PublishedEffect;
+    use crate::css::style::engine_calls::{document_host, with_engine_and_arena};
+
+    // SAFETY: Guaranteed by the caller.
+    let (host, described) = unsafe {
+        (
+            document_host(input.host),
+            crate::animations::ffi::describe_sampled_effects(ak::slice_from_raw_parts(
+                input.effects,
+                input.effect_count,
+            )),
+        )
+    };
+    let descriptions: Vec<_> = described
+        .descriptions
+        .iter()
+        .cloned()
+        .map(PublishedEffect::new)
+        .collect();
+    let composed: SampledEffects = described
+        .sampled
+        .iter()
+        .filter(|effect| effect.description.keyframes().len() >= 2)
+        .filter_map(|effect| {
+            Some(crate::css::animation::SampledAnimationEffect {
+                description: effect.description.clone(),
+                current_key: effect
+                    .timing
+                    .endpoint_inclusive_key(effect.description.timing_function.as_easing())?,
+            })
+        })
+        .collect();
+    // SAFETY: Guaranteed by the caller.
+    let (mut sample, mut callbacks) = unsafe { input.adopt(described.sampled) };
+    sample.record_dependencies = false;
+    let step = with_engine_and_arena(read, host, |engine, arena| {
+        let element_box = crate::layout::node_data::NodeSlotId {
+            index: sample.element_box_slot,
+        };
+        let reference_box =
+            crate::painting::ffi::committed_transform_reference_box(&arena.paintable_rows(), element_box);
+        let step = begin_animation_sample(
+            &sample,
+            &mut callbacks,
+            engine,
+            &descriptions,
+            composed,
+            reference_box,
+            Default::default(),
+        );
+        finish_sample_in_engine(&sample, &mut callbacks, engine, reference_box, step)
     });
     finish_sample_with_host(&sample, &mut callbacks, host, read, step)
 }
@@ -6825,7 +7202,10 @@ pub unsafe extern "C" fn rust_sample_animation_effects_each(
     // SAFETY: As above.
     let host = unsafe { document_host(first.host) };
     // SAFETY: As above.
-    let mut samples: Vec<_> = inputs.iter().map(|input| unsafe { input.adopt() }).collect();
+    let mut samples: Vec<_> = inputs
+        .iter()
+        .map(|input| unsafe { input.adopt(input.publish_effect_descriptions(host)) })
+        .collect();
     let steps: Vec<_> = with_engine_and_arena(read, host, |engine, arena| {
         samples
             .iter_mut()
@@ -6853,7 +7233,7 @@ fn sample_in_engine(
     };
     let reference_box = crate::painting::ffi::committed_transform_reference_box(&arena.paintable_rows(), element_box);
     let composed = host_sampled_effects(input, engine);
-    match begin_animation_sample(
+    let step = begin_animation_sample(
         input,
         host,
         engine,
@@ -6861,7 +7241,18 @@ fn sample_in_engine(
         composed,
         reference_box,
         Default::default(),
-    ) {
+    );
+    finish_sample_in_engine(input, host, engine, reference_box, step)
+}
+
+fn finish_sample_in_engine(
+    input: &AnimationSampleInput,
+    host: &mut dyn AnimationSampleHost,
+    engine: &mut crate::css::style::StyleEngine,
+    reference_box: Option<CssPixelRect>,
+    step: AnimationSampleStep,
+) -> AnimationSampleStep {
+    match step {
         AnimationSampleStep::Resolved(sample) => match engine_length_contexts(input, engine, &sample) {
             Some(length_contexts) => AnimationSampleStep::Sampled(finish_animation_sample(
                 input,
@@ -6933,50 +7324,35 @@ struct ResolvedAnimationSample {
     composed: SampledEffects,
     resolved: Box<crate::css::animation::ResolvedAnimationDeclarations>,
     custom_properties: crate::css::animation::AnimatedCustomProperties,
+    /// The effects that custom property intervals were selected from, indexed by each interval's effect index, which
+    /// keep the interval values the sample retains.
+    interval_effects: Vec<crate::css::style::effect_descriptions::PublishedEffect>,
     result: FfiHostAnimationSampleResult,
 }
 
 /// The effects the host samples that the sample composes, each at the key its timing gives at the time
 /// the host sampled its timeline, keeping each timing for a sample at another time.
 fn host_sampled_effects(input: &AnimationSampleInput, engine: &mut crate::css::style::StyleEngine) -> SampledEffects {
-    use crate::css::animation as anim;
-
     let Some(node) = crate::css::style::tree::StyleNodeID::from_raw(input.style_node) else {
         return SampledEffects::new();
     };
     let slot = animation_slot(input.pseudo_kind);
     input
         .effects
-        .as_slice()
         .iter()
         .filter_map(|effect| {
-            // SAFETY: The host's easings are live for as long as its effects are borrowed.
-            let key = unsafe {
-                engine.time_element_animation_effect(
-                    node,
-                    slot,
-                    effect.identity,
-                    &effect.timing,
-                    &effect.easing,
-                    effect.current_key.into(),
-                )
-            };
-            let description = engine
+            let key = engine.time_element_animation_effect(node, slot, &effect.description, effect.timing);
+            let described = engine
                 .element_animation_effects(node, slot)
                 .iter()
-                .find(|description| description.identity == effect.identity);
-            debug_assert!(description.is_some(), "the host describes every effect it samples");
-            description
-                .is_some_and(|description| {
-                    description.generation == effect.generation && description.keyframes().len() >= 2
-                })
-                .then_some(anim::FfiSampledAnimationEffect {
-                    effect: anim::FfiAnimationPreparationEffect {
-                        identity: effect.identity,
-                        generation: effect.generation,
-                    },
+                .any(|described| std::sync::Arc::ptr_eq(described.description(), &effect.description));
+            debug_assert!(described, "the host describes every effect it samples");
+            (described && effect.description.keyframes().len() >= 2).then_some(
+                crate::css::animation::SampledAnimationEffect {
+                    description: effect.description.clone(),
                     current_key: key?,
-                })
+                },
+            )
         })
         .collect()
 }
@@ -6992,7 +7368,7 @@ fn described_effects<'a>(
 }
 
 /// The effects a sample composes, in composite order, each at the key it samples its keyframes at.
-pub(crate) type SampledEffects = smallvec::SmallVec<[crate::css::animation::FfiSampledAnimationEffect; 4]>;
+pub(crate) type SampledEffects = smallvec::SmallVec<[crate::css::animation::SampledAnimationEffect; 4]>;
 
 fn implicit_will_change_properties(
     descriptions: &[crate::css::style::effect_descriptions::PublishedEffect],
@@ -7010,9 +7386,9 @@ fn implicit_will_change_properties(
     });
 
     for effect in applicable_effects {
-        for &property in effect.target_properties() {
+        effect.for_each_animated_longhand(|property| {
             properties.push(map_logical_alias_to_physical(property, writing_mode, direction));
-        }
+        });
     }
 
     properties.sort_unstable();
@@ -7040,7 +7416,11 @@ fn begin_animation_sample(
     };
     let pseudo = input.pseudo();
     let (writing_mode, direction) = computed_writing_mode_and_direction(input.longhands);
-    let description = |identity| descriptions.iter().find(|description| description.identity == identity);
+    let description = |composed: &crate::css::animation::SampledAnimationEffect| {
+        descriptions
+            .iter()
+            .find(|description| std::sync::Arc::ptr_eq(description.description(), &composed.description))
+    };
     let new_implicit_will_change_properties =
         implicit_will_change_properties(descriptions, timeline_samples, writing_mode, direction);
     if composed.is_empty() && new_implicit_will_change_properties.is_empty() {
@@ -7086,7 +7466,7 @@ fn begin_animation_sample(
         .iter()
         .filter_map(|composed| {
             Some(anim::SelectedEffect {
-                effect: description(composed.effect.identity)?,
+                effect: description(composed)?,
                 current_key: composed.current_key,
             })
         })
@@ -7124,6 +7504,11 @@ fn begin_animation_sample(
         };
         declarations
     };
+    let interval_effects = if custom_properties.intervals.is_empty() {
+        Vec::new()
+    } else {
+        selected.iter().map(|selection| selection.effect.clone()).collect()
+    };
     drop(selected);
     let mut result = FfiHostAnimationSampleResult::with_outcome(if implicit_will_change_entries_changed {
         Evaluated
@@ -7155,6 +7540,7 @@ fn begin_animation_sample(
         composed,
         resolved,
         custom_properties,
+        interval_effects,
         result,
     })
 }
@@ -7175,11 +7561,12 @@ fn finish_animation_sample(
         node,
         composed,
         resolved,
-        custom_properties,
+        mut custom_properties,
+        interval_effects,
         mut result,
     } = sample;
     let table = input.longhands;
-    if input.pseudo_kind == crate::css::cascaded_properties::NO_PSEUDO_ELEMENT {
+    if input.record_dependencies && input.pseudo_kind == crate::css::cascaded_properties::NO_PSEUDO_ELEMENT {
         engine
             .note_keyframes_read_parent_reset_values(node, result.keyframes_inherited_non_inherited_style_groups != 0);
     }
@@ -7213,14 +7600,31 @@ fn finish_animation_sample(
             .unwrap_or(environment.color_scheme_input.preferred_color_scheme),
         draw_random_base_value: None,
     };
+    let mut custom_value_reads = crate::css::custom_properties::RegisteredValueReads::default();
     let custom_values = resolved
         .properties
         .iter()
         .map(|property| match property.custom_name_id {
             0 => None,
-            _ => Some(custom_properties.computed_value(registry, property, &finalization)),
+            _ => {
+                let (value, reads) = custom_properties.computed_value(registry, property, &finalization);
+                custom_value_reads |= reads;
+                Some(value)
+            }
         })
         .collect::<Vec<_>>();
+    // https://drafts.csswg.org/css-values-4/#font-relative-lengths
+    // NB: A registered custom property's keyframe value relative to a metric of the element's or the document
+    //     element's first available font reads that font, as any other keyframe value does.
+    engine.want_first_available_font_loads_for(
+        node,
+        input.pseudo(),
+        crate::css::animation::FontMetricReads {
+            own: custom_value_reads.font_metrics,
+            parent: false,
+            root: custom_value_reads.root_font == RootFontReads::Metrics,
+        },
+    );
     let (underlying_values, initial_values) = custom_properties.underlying_and_initial_values(registry);
 
     let computed_keyframes = compute_animation_keyframe_longhands(
@@ -7231,6 +7635,7 @@ fn finish_animation_sample(
         &environment,
         length_contexts,
         &custom_values,
+        false,
     );
     result.depends_on_viewport_metrics = computed_keyframes.depends_on_viewport_metrics;
     result.font_metrics_depend_on_viewport_metrics = computed_keyframes.font_metrics_depend_on_viewport_metrics;
@@ -7255,7 +7660,7 @@ fn finish_animation_sample(
 
     let has_non_custom_property_animation = resolved.properties.iter().any(|property| property.custom_name_id == 0);
 
-    let custom_results = anim::evaluate_animations(anim::ComputedAnimationBatch {
+    let mut batch = anim::ComputedAnimationBatch {
         context: input.animation_context(Some(&length_contexts.remaining), reference_box),
         device_pixels_per_css_pixel: input.environment.device_pixels_per_css_pixel,
         sampled_effects: &composed,
@@ -7270,7 +7675,9 @@ fn finish_animation_sample(
         overlay: host.overlay_for_mutation(),
         custom_underlying_values: &underlying_values,
         custom_initial_values: &initial_values,
-    });
+    };
+    let mut preparation = anim::prepare_animations(&mut batch);
+    let custom_results = anim::evaluate_prepared_animations(&preparation, &mut batch);
     result.outcome = FfiHostAnimationSampleOutcome::Evaluated;
     if !custom_results.is_empty() {
         let mut retained = custom_results
@@ -7291,19 +7698,33 @@ fn finish_animation_sample(
                 .cast::<crate::css::custom_properties::CustomPropertyStore>()
                 .as_ref()
         };
-        let names_in_a_cycle = engine.custom_properties_in_an_animated_cycle(
+        let cyclic_declarations = engine.check_custom_property_animation_cycles(
             node,
             cycle_pseudo,
             input.stores.base,
             input.stores.inheritance,
             &retained,
+            &mut custom_properties.intervals,
         );
-        for name in names_in_a_cycle {
-            let value = registry.invalid_at_computed_value_time(&name, inherited);
-            match retained.iter_mut().find(|(animated, _)| *animated == name) {
-                Some((_, animated)) => *animated = value,
-                None => retained.push((name, value)),
+        // NB: Preparations containing custom properties are not cached, so this sample owns its preparation.
+        let preparation =
+            std::sync::Arc::get_mut(&mut preparation).expect("custom-property preparations are not shared");
+        if preparation.replace_cyclic_custom_property_endpoints(&custom_properties.intervals, registry, inherited) {
+            retained = anim::evaluate_prepared_animations(preparation, &mut batch)
+                .into_iter()
+                .map(|(custom_name_id, value)| (custom_properties.name(custom_name_id).clone(), value))
+                .collect();
+            // NB: Resolve surviving unset markers to the inherited or initial value. See the AD-HOC comment
+            //     in PreparedAnimationBatch::replace_cyclic_custom_property_endpoints for why this is deferred.
+            for (name, value) in &mut retained {
+                if matches!(value.data(), StyleValueData::Keyword { keyword } if *keyword == keyword::UNSET) {
+                    *value = registry.invalid_at_computed_value_time(name, inherited);
+                }
             }
+        }
+        for name in cyclic_declarations {
+            let value = registry.invalid_at_computed_value_time(&name, inherited);
+            retained.push((name, value));
         }
         // The element's own custom properties that read an animated one move with it, whether or
         // not they resolved to what it inherits.
@@ -7333,6 +7754,15 @@ fn finish_animation_sample(
                 uncached_interval_values_may_need_substitution,
                 input.custom_property_registration_generation,
             );
+        }
+        assert_eq!(
+            custom_properties.registration_generation,
+            engine.custom_property_registration_generation(),
+            "animation sampling preserves custom property registrations"
+        );
+        let registry = engine.custom_property_registry();
+        for interval in custom_properties.intervals {
+            interval_effects[interval.effect_index].update_retained_custom_property_interval_values(interval, registry);
         }
         let rows = retained
             .iter()
@@ -7454,6 +7884,13 @@ fn post_compute_adjusted_values(
         StyleValueData::Keyword { keyword: keyword::NONE },
     );
     adjust(
+        transformation.set_position_absolute,
+        prop::POSITION,
+        StyleValueData::Keyword {
+            keyword: keyword::ABSOLUTE,
+        },
+    );
+    adjust(
         adjusted_display != adjustment.display_before,
         prop::DISPLAY,
         StyleValueData::Display {
@@ -7484,6 +7921,7 @@ fn post_compute_adjusted_values(
     );
     for (changed, property_id) in [
         (transformation.set_float_none, prop::FLOAT),
+        (transformation.set_position_absolute, prop::POSITION),
         (
             transformation.changed_display || element_adjustment.changed_display,
             prop::DISPLAY,
@@ -7502,19 +7940,6 @@ fn post_compute_adjusted_values(
 fn property_affects_font_metrics(property_id: u16) -> bool {
     property_id == crate::css::property_metadata::property_id::FONT_SIZE
         || property_id == crate::css::property_metadata::property_id::LINE_HEIGHT
-}
-
-#[repr(C)]
-pub struct FfiExpandedProperty {
-    pub property_id: u16,
-    pub data: *const c_void,
-}
-
-#[repr(C)]
-pub struct FfiShorthandExpansion {
-    pub properties: *const FfiExpandedProperty,
-    pub count: usize,
-    pub storage: *mut c_void,
 }
 
 pub(crate) fn value_is_css_wide_keyword(value: &StyleValueData) -> bool {
@@ -7588,51 +8013,6 @@ pub(crate) fn expand_shorthands_with<Sink>(
     }
 
     sink(property_id, data, has_style_sheet_context);
-}
-
-pub struct ShorthandExpansion {
-    properties: Vec<FfiExpandedProperty>,
-    _values: Vec<RetainedStyleValueData>,
-}
-
-fn expand_shorthands(property_id: u16, data: &RetainedStyleValueData) -> ShorthandExpansion {
-    let mut properties = Vec::new();
-    let mut values = Vec::new();
-    expand_shorthands_with(property_id, data, false, &mut |longhand_id, longhand_data, _| {
-        let value = longhand_data.clone();
-        properties.push(FfiExpandedProperty {
-            property_id: longhand_id,
-            data: value.pointer().cast(),
-        });
-        values.push(value);
-    });
-    ShorthandExpansion {
-        properties,
-        _values: values,
-    }
-}
-
-/// Expands a declared property into one owned batch of longhand assignments, recursing through
-/// shorthand and pending-substitution values.
-#[unsafe(no_mangle)]
-pub extern "C" fn rust_expand_property_shorthands(
-    property_id: u16,
-    data: crate::css::style_value_arc::StyleValueRef<'_>,
-) -> FfiShorthandExpansion {
-    let data = RetainedStyleValueData::from_arc(data.to_arc());
-    let expansion = Box::new(expand_shorthands(property_id, &data));
-    let properties = expansion.properties.as_ptr();
-    let count = expansion.properties.len();
-    FfiShorthandExpansion {
-        properties,
-        count,
-        storage: Box::into_raw(expansion).cast(),
-    }
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn rust_shorthand_expansion_destroy(storage: OwnedBox<ShorthandExpansion>) {
-    drop(storage);
 }
 
 mod adjustments;

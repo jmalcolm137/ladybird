@@ -50,11 +50,12 @@ public:
     virtual ~RemoteVideoDecoder() override;
 
     virtual void set_storage_freed_callback(Function<void()>) override;
-    virtual void set_output_arrived_callback(Function<void()>) override;
+    virtual void set_decode_completed_callback(Function<void(DecodeCompletion)>) override;
+    virtual bool has_any_decode_in_progress() const override;
 
     virtual DecoderErrorOr<void> receive_coded_data(CodedFrame const&, DecodeIntent) override;
     virtual void signal_end_of_stream() override;
-    virtual DecoderErrorOr<NonnullRefPtr<VideoFrame>> take_next_output(CodingIndependentCodePoints const& container_cicp, Optional<AK::Duration> target = {}) override;
+    virtual DecoderErrorOr<NonnullRefPtr<VideoFrame>> take_next_output(ColorMetadata const& container_color_metadata, Optional<AK::Duration> target = {}) override;
     virtual void flush() override;
 
     struct State;

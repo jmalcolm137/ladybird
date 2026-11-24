@@ -9,6 +9,7 @@
 //! offsets, and Rust functions standing in for the slow paths and helpers.
 
 use super::*;
+use crate::artifact::Layout;
 use crate::bytecode::FrameLayout;
 use crate::bytecode::Instruction;
 use crate::bytecode::NUM_OPCODES;
@@ -38,8 +39,10 @@ fn offsets() -> RuntimeOffsets {
         execution_context_private_environment: 16,
         execution_context_frame_initialized: 24,
         execution_context_executable: 32,
+        executable_idle_collection_count: 0,
         execution_context_slots: (8 * FRAME_HEADER_WORDS) as u32,
         vm_running_execution_context: 0,
+        vm_current_realm: 8 * VM_CURRENT_REALM_WORD as u32,
         vm_jit_native_stack_limit: 8,
         private_environment_outer: 0,
         object_shape: 0,
@@ -52,11 +55,9 @@ fn offsets() -> RuntimeOffsets {
         accessor_getter: 8,
         accessor_setter: 16,
         execution_context_function: 64,
-        execution_context_realm: 72,
-        execution_context_script_or_module: 80,
+        execution_context_realm_without_function: 72,
         execution_context_variable_environment: 96,
         execution_context_frame_id: 104,
-        execution_context_skip_when_determining_incumbent_counter: 4,
         execution_context_yield_continuation: 112,
         execution_context_yield_is_await: 116,
         execution_context_yield_value_is_iterator_result: 117,
@@ -70,9 +71,10 @@ fn offsets() -> RuntimeOffsets {
         execution_context_argument_count: 152,
         execution_context_returns_to_native_caller: 156,
         execution_context_runs_jit_code: 157,
+        execution_context_caller_is_derived_construct: 158,
+        execution_context_new_target: 160,
         ecmascript_function_environment: 0,
         ecmascript_function_private_environment: 8,
-        shared_function_script_or_module: 24,
         object_class_bits: 40,
         ecmascript_function_flag_has_rare_data: 8,
         vm_execution_generation: 8 * VM_EXECUTION_GENERATION_WORD as u32,
@@ -81,6 +83,7 @@ fn offsets() -> RuntimeOffsets {
 
 /// Words of the fake VM.
 const VM_EXECUTION_GENERATION_WORD: usize = 6;
+const VM_CURRENT_REALM_WORD: usize = 7;
 const VM_WORDS: usize = 9;
 #[cfg(target_arch = "x86_64")]
 /// The word of the fake VM with its native function table.
@@ -130,7 +133,9 @@ struct TestState {
     cells: Vec<u64>,
     /// Every frame of every exit taken.
     exit_frames: Vec<Vec<ExitFrame>>,
-    exits: Vec<Site>,
+    /// The tables of the code, which have `layout`.
+    tables: Vec<u32>,
+    layout: Layout,
     exits_taken: Vec<u32>,
     /// Make the slow path of the instruction at this pc return this control word.
     fail: Option<(u32, i64)>,
@@ -175,16 +180,20 @@ fn continuation_after(vm: *mut u64, pc: u32) -> i64 {
     {
         return control;
     }
-    let next_pc = decode_instruction(&state.bytecodes[running_executable(vm)], pc)
+    let next_pc = decode_instruction(&state.bytecodes[running_executable(vm)], pc, crate::test_zone())
         .unwrap()
         .next_pc();
     (CONTINUATION_BIT | u64::from(next_pc)) as i64
 }
 
-fn decoded(vm: *mut u64, pc: u32) -> Instruction {
-    decode_instruction(&test_state(vm).borrow().bytecodes[running_executable(vm)], pc)
-        .unwrap()
-        .instruction
+fn decoded(vm: *mut u64, pc: u32) -> Instruction<'static> {
+    decode_instruction(
+        &test_state(vm).borrow().bytecodes[running_executable(vm)],
+        pc,
+        crate::test_zone(),
+    )
+    .unwrap()
+    .instruction
 }
 
 fn int(value: u64) -> i32 {
@@ -197,7 +206,7 @@ fn is_int32(bits: u64) -> bool {
 }
 
 #[cfg(target_arch = "x86_64")]
-fn add(dst: Operand, lhs: Operand, rhs: Operand) -> Instruction {
+fn add(dst: Operand, lhs: Operand, rhs: Operand) -> Instruction<'static> {
     Instruction::Add {
         arith_feedback: 0,
         dst,
@@ -240,7 +249,15 @@ struct SlowPathResult {
 }
 
 #[jit_abi]
-extern "C" fn add_values(vm: *mut u64, pc: u32, dst: *mut u64, lhs: u64, rhs: u64) -> i64 {
+extern "C" fn add_values(vm: *mut u64, pc: u32, dst: *mut u64, lhs: u64, rhs: u64, length: u32) -> i64 {
+    let next_pc = decode_instruction(
+        &test_state(vm).borrow().bytecodes[running_executable(vm)],
+        pc,
+        crate::test_zone(),
+    )
+    .unwrap()
+    .next_pc();
+    assert_eq!(pc + length, next_pc);
     let control = continuation_after(vm, pc);
     if control >= 0 && control as u64 & CONTINUATION_BIT != 0 {
         // SAFETY: Compiled code passes the address of a frame slot.
@@ -374,7 +391,7 @@ extern "C" fn jit_call(vm: *mut u64, frame: *mut u64, pc: u32) -> i64 {
     // SAFETY: The frame is the fake frame of the running test.
     unsafe {
         let mut result = int(*frame.add(slot(callee)));
-        for argument in arguments {
+        for &argument in arguments {
             result = result.wrapping_add(int(*frame.add(slot(argument))));
         }
         *frame.add(slot(dst)) = value::int32(result);
@@ -437,14 +454,17 @@ extern "C" fn to_boolean(value: u64) -> u64 {
 /// like the runtime does. Leaves neither count as exits nor move the pc.
 #[jit_abi]
 extern "C" fn jit_exit(vm: *mut u64, frame: *mut u64, exit_index: u32, dump: *const u64) {
-    if test_state(vm).borrow().exits[exit_index as usize].kind == SiteKind::Publish {
+    let kind = {
+        let state = test_state(vm).borrow();
+        Artifact::new(&state.tables, &state.layout).site(exit_index).kind()
+    };
+    if kind == SiteKind::Publish {
         publish_frames(vm, exit_index);
         return;
     }
     // NB: Unlike the runtime, the fake pushes no frames for slow paths of
     //     fast paths in inlined callees.
-    let is_leave = matches!(test_state(vm).borrow().exits[exit_index as usize].kind, SiteKind::Leave);
-    if is_leave {
+    if kind == SiteKind::Leave {
         write_frame_states(vm, frame, exit_index, dump, Leaving::Yes);
         return;
     }
@@ -456,23 +476,27 @@ extern "C" fn jit_exit(vm: *mut u64, frame: *mut u64, exit_index: u32, dump: *co
 /// calls of a publish site on the fake interpreter stack, linked to their
 /// callers, uninitialized, with their pc.
 fn publish_frames(vm: *mut u64, exit_index: u32) {
-    let (site, layouts, cells) = {
+    let (tables, tables_layout, layouts, cells) = {
         let state = test_state(vm).borrow();
         (
-            state.exits[exit_index as usize].clone(),
+            state.tables.clone(),
+            state.layout,
             state.layouts.clone(),
             state.cells.clone(),
         )
     };
-    for frame_state in site.frames.iter().rev().skip(1) {
-        let layout = layouts[frame_state.executable as usize];
+    let site = Artifact::new(&tables, &tables_layout).site(exit_index);
+    // NB: The last frame is the compiled function's.
+    for index in (0..site.frame_count() - 1).rev() {
+        let frame_state = site.frame(index);
+        let layout = layouts[frame_state.executable() as usize];
         // SAFETY: The fake VM and interpreter stack of the running test are alive.
         unsafe {
             let frame = *vm.add(3) as *mut u64;
             *frame.add(FRAME_CALLER_WORD) = *vm;
-            *frame.cast::<u32>() = frame_state.pc;
+            *frame.cast::<u32>() = frame_state.pc();
             *frame.add(3) &= !0xff;
-            *frame.add(FRAME_EXECUTABLE_WORD) = cells[frame_state.executable as usize];
+            *frame.add(FRAME_EXECUTABLE_WORD) = cells[frame_state.executable() as usize];
             *vm = frame as u64;
             *vm.add(3) =
                 frame.add(FRAME_HEADER_WORDS + (layout.arguments_base() + layout.number_of_arguments) as usize) as u64;
@@ -487,31 +511,31 @@ enum Leaving {
 }
 
 fn write_frame_states(vm: *mut u64, frame: *mut u64, exit_index: u32, dump: *const u64, leaving: Leaving) {
-    let descriptor = test_state(vm).borrow().exits[exit_index as usize].clone();
-    assert_eq!(descriptor.kind == SiteKind::Leave, leaving == Leaving::Yes);
+    let (tables, tables_layout) = {
+        let state = test_state(vm).borrow();
+        (state.tables.clone(), state.layout)
+    };
+    let site = Artifact::new(&tables, &tables_layout).site(exit_index);
+    assert_eq!(site.kind() == SiteKind::Leave, leaving == Leaving::Yes);
     let frame_pointer_index = <crate::asm::MacroAssembler as PortableMacroAssembler>::FRAME_POINTER.0 as usize;
     let gpr_dump_count = register_dump_counts::<crate::asm::MacroAssembler>().0 as usize;
     // SAFETY: The dump and the JIT frame it points into are alive during the call.
     let frames = unsafe {
         let frame_pointer = *dump.add(frame_pointer_index);
-        descriptor
-            .frames
-            .iter()
+        site.frames()
             .map(|frame_state| {
                 // NB: Like the runtime, create one arguments object per frame.
                 if frame_state
-                    .values
-                    .iter()
+                    .values()
                     .any(|(_, location)| matches!(location, ValueLocation::ArgumentsObject { .. }))
                 {
                     test_state(vm).borrow_mut().arguments_created += 1;
                 }
                 let values = frame_state
-                    .values
-                    .iter()
+                    .values()
                     .map(|(slot, location)| {
                         // NB: Like the runtime, box unboxed values.
-                        let value = match *location {
+                        let value = match location {
                             ValueLocation::Register(register, repr) => {
                                 // NB: Like the runtime, read float64 values from the FPRs, which the dump
                                 //     holds after the GPRs.
@@ -526,13 +550,15 @@ fn write_frame_states(vm: *mut u64, frame: *mut u64, exit_index: u32, dump: *con
                                 value::boxed_constant(*((frame_pointer as i64 + i64::from(offset)) as *const u64), repr)
                             }
                             ValueLocation::Constant(bits) => bits,
+                            // NB: Exit stubs pass the compiled function's frame.
+                            ValueLocation::Frame(slot) => *frame.add(FRAME_HEADER_WORDS + slot as usize),
                             ValueLocation::ArgumentsObject { mapped } => fake_arguments_object(mapped),
                             ValueLocation::VirtualObject(_) => unreachable!("tests make no virtual objects"),
                         };
-                        (*slot, value)
+                        (slot, value)
                     })
                     .collect::<Vec<_>>();
-                (frame_state.executable, frame_state.pc, frame_state.mode, values)
+                (frame_state.executable(), frame_state.pc(), frame_state.mode(), values)
             })
             .collect::<Vec<_>>()
     };
@@ -563,7 +589,7 @@ fn write_frame_states(vm: *mut u64, frame: *mut u64, exit_index: u32, dump: *con
         test_state(vm).borrow_mut().exit_frames.push(frames);
         return;
     }
-    if descriptor.frames.len() < 2 {
+    if site.frame_count() < 2 {
         return;
     }
     // NB: Like the runtime, write the frames compiled code pushed, which are
@@ -618,7 +644,7 @@ fn runtime() -> RuntimeInfo {
     set(OpCode::ConcatString, concat_string as *const () as u64);
     set(OpCode::NewArray, new_array as *const () as u64);
     RuntimeInfo {
-        slow_paths: slow_paths.into(),
+        slow_paths: slow_paths.leak(),
         jit_call: jit_call as *const () as u64,
         jit_exit: jit_exit as *const () as u64,
         to_boolean: to_boolean as *const () as u64,
@@ -636,6 +662,8 @@ fn runtime() -> RuntimeInfo {
             primitive_string_length: 16,
             ..RuntimeLayout::default()
         },
+        // NB: The functions of the tests run in the realm of the compiled code.
+        realm: CellId(crate::builder::tests::inlining::REALM),
         ..RuntimeInfo::default()
     }
 }
@@ -911,12 +939,12 @@ impl Machine {
             state.bytecodes = snapshot
                 .executables
                 .iter()
-                .map(|executable| executable.bytecode.clone())
+                .map(|executable| snapshot[executable.bytecode].to_vec())
                 .collect();
             state.constants = snapshot
                 .executables
                 .iter()
-                .map(|executable| executable.constants.clone())
+                .map(|executable| snapshot[executable.constants].to_vec())
                 .collect();
             state.layouts = snapshot
                 .executables
@@ -928,7 +956,8 @@ impl Machine {
                 .iter()
                 .map(|executable| executable.cell.0)
                 .collect();
-            state.exits = compiled.sites.clone();
+            state.tables = compiled.words.to_vec();
+            state.layout = compiled.layout;
             state.exits_taken.clear();
         }
         let code = crate::asm::executable_code::ExecutableCode::new(&compiled.code);
@@ -965,22 +994,70 @@ fn compile_program_with(
 ) -> (Snapshot, CompiledCode) {
     let mut snapshot = crate::builder::tests::snapshot_for(program, layout);
     snapshot.runtime = runtime();
-    snapshot.executables[0].feedback.arith = vec![NUMBERS_AND_STRINGS_FEEDBACK];
+    snapshot.executables[0].feedback.arith = snapshot.add(&[NUMBERS_AND_STRINGS_FEEDBACK]);
     configure(&mut snapshot);
     let never_ran_pcs = never_ran
         .iter()
         .map(|index| program.offsets[*index])
         .collect::<Vec<_>>();
-    let compiled = compile_for::<crate::asm::MacroAssembler>(&snapshot, &|pc| !never_ran_pcs.contains(&pc))
-        .unwrap_or_else(|failure| panic!("compilation failed: {failure:?}"));
+    let compiled = compile_for::<crate::asm::MacroAssembler>(
+        &snapshot,
+        &|pc| !never_ran_pcs.contains(&pc),
+        &mut crate::scratch::Scratch::new(),
+    )
+    .unwrap_or_else(|failure| panic!("compilation failed: {failure:?}"));
     (snapshot, compiled)
+}
+
+#[test]
+fn a_compile_makes_no_block_in_the_heap() {
+    let program = assemble(|label| {
+        vec![
+            Instruction::Enter,
+            Instruction::Mov { dst: l(0), src: c(0) },
+            Instruction::Mov { dst: l(1), src: c(0) },
+            Instruction::JumpLessThan {
+                arith_feedback: 0,
+                lhs: l(0),
+                rhs: a(0),
+                true_target: label(4),
+                false_target: label(7),
+            },
+            Instruction::AddRhsInt32 {
+                arith_feedback: 1,
+                dst: l(0),
+                lhs: l(0),
+                rhs: 1,
+            },
+            Instruction::Add {
+                arith_feedback: 2,
+                dst: l(1),
+                lhs: l(1),
+                rhs: l(0),
+            },
+            Instruction::Jump { target: label(3) },
+            Instruction::Return { value: l(1) },
+        ]
+    });
+    let mut snapshot = crate::builder::tests::snapshot_for(&program, test_layout());
+    snapshot.runtime = runtime();
+    snapshot.executables[0].feedback.arith = snapshot.add(&[NUMBERS_AND_STRINGS_FEEDBACK; 3]);
+    snapshot.options = crate::snapshot::CompileOptions::default();
+    let mut scratch = crate::scratch::Scratch::new();
+    let mut compiled = CompiledCode::new();
+    crate::compile(&snapshot, &mut scratch, &mut compiled).unwrap();
+    let mut result = Ok(());
+    let blocks = crate::count_heap_blocks(|| result = crate::compile(&snapshot, &mut scratch, &mut compiled));
+    assert_eq!(result, Ok(()));
+    assert!(!compiled.code.is_empty());
+    assert_eq!(blocks, 0);
 }
 
 #[cfg(target_arch = "x86_64")]
 /// The pc of the (only) loop back edge of `program`, which on-stack
 /// replacement entries start at.
 fn back_edge_pc(program: &Program) -> u32 {
-    crate::bytecode::decode_all(&program.bytes)
+    crate::bytecode::decode_all(&program.bytes, crate::test_zone())
         .unwrap()
         .iter()
         .find(|decoded| crate::builder::is_loop_back_edge(decoded.instruction.opcode()))
@@ -1022,7 +1099,7 @@ mod execution {
     use super::*;
 
     /// A generic instruction whose fake slow path adds.
-    fn add(dst: Operand, lhs: Operand, rhs: Operand) -> Instruction {
+    fn add(dst: Operand, lhs: Operand, rhs: Operand) -> Instruction<'static> {
         Instruction::Exp {
             arith_feedback: 0,
             dst,
@@ -1168,12 +1245,13 @@ mod execution {
             let (snapshot, compiled) = compile_program_with(program, test_layout(), never_ran, |snapshot| {
                 snapshot.options.osr_pc = Some(back_edge_pc(program));
             });
-            assert_eq!(compiled.osr_entries.len(), 1);
-            let (pc, offset) = compiled.osr_entries[0];
+            let osr_entries = compiled.artifact().osr_entries().collect::<Vec<_>>();
+            assert_eq!(osr_entries.len(), 1);
+            let (pc, offset) = osr_entries[0];
             assert_eq!(pc, program.offsets[back_edge]);
             // The interpreter ran Enter and five iterations of the loop.
             let mut machine = Machine::new(test_layout(), &[value::int32(10)]);
-            for (index, constant) in snapshot.executables[0].constants.iter().enumerate() {
+            for (index, constant) in snapshot[snapshot.executables[0].constants].iter().enumerate() {
                 machine.frame[FRAME_HEADER_WORDS + c(index as u32).raw() as usize] = *constant;
             }
             for index in crate::bytecode::RESERVED_REGISTER_COUNT..test_layout().registers_and_locals_count {
@@ -1221,12 +1299,13 @@ mod execution {
         let (snapshot, compiled) = compile_program_with(&program, test_layout(), &[], |snapshot| {
             snapshot.options.osr_pc = Some(back_edge_pc(&program));
         });
-        assert_eq!(compiled.osr_entries.len(), 1);
-        let (pc, offset) = compiled.osr_entries[0];
+        let osr_entries = compiled.artifact().osr_entries().collect::<Vec<_>>();
+        assert_eq!(osr_entries.len(), 1);
+        let (pc, offset) = osr_entries[0];
         assert_eq!(pc, program.offsets[7]);
         // The interpreter ran five iterations.
         let mut machine = Machine::new(test_layout(), &[value::int32(10)]);
-        for (index, constant) in snapshot.executables[0].constants.iter().enumerate() {
+        for (index, constant) in snapshot[snapshot.executables[0].constants].iter().enumerate() {
             machine.frame[FRAME_HEADER_WORDS + c(index as u32).raw() as usize] = *constant;
         }
         for index in crate::bytecode::RESERVED_REGISTER_COUNT..test_layout().registers_and_locals_count {
@@ -1270,7 +1349,7 @@ mod execution {
         let (_, compiled) = compile_program_with(&program, test_layout(), &[], |snapshot| {
             snapshot.options.osr_pc = Some(back_edge_pc(&program));
         });
-        assert_eq!(compiled.osr_entries.len(), 1);
+        assert_eq!(compiled.artifact().osr_entries().len(), 1);
     }
 
     #[test]
@@ -1327,12 +1406,13 @@ mod execution {
             snapshot.options.osr_pc = Some(back_edge_pc(&program));
             snapshot.options.verify_ir = true;
         });
-        assert_eq!(compiled.osr_entries.len(), 1);
-        let (pc, offset) = compiled.osr_entries[0];
+        let osr_entries = compiled.artifact().osr_entries().collect::<Vec<_>>();
+        assert_eq!(osr_entries.len(), 1);
+        let (pc, offset) = osr_entries[0];
         assert_eq!(pc, program.offsets[8]);
         // The interpreter ran five iterations of the inner loop.
         let mut machine = Machine::new(test_layout(), &[value::int32(10)]);
-        for (index, constant) in snapshot.executables[0].constants.iter().enumerate() {
+        for (index, constant) in snapshot[snapshot.executables[0].constants].iter().enumerate() {
             machine.frame[FRAME_HEADER_WORDS + c(index as u32).raw() as usize] = *constant;
         }
         for index in crate::bytecode::RESERVED_REGISTER_COUNT..test_layout().registers_and_locals_count {
@@ -1440,14 +1520,12 @@ mod execution {
                 Instruction::Enter,
                 Instruction::Mov { dst: r(6), src: a(0) },
                 Instruction::Call {
-                    value_feedback: 0,
                     call_feedback: 0,
                     dst: r(7),
                     callee: c(1),
                     this_value: c(0),
                     argument_count: 2,
-                    expression_string: None,
-                    arguments: vec![r(6), c(1)],
+                    arguments: crate::test_zone().alloc_slice_copy(&[r(6), c(1)]),
                 },
                 // r6 still holds the argument, which lived across the call.
                 Instruction::IsCallable { dst: l(1), value: r(6) },
@@ -1470,7 +1548,7 @@ mod execution {
                 Instruction::NewArray {
                     dst: r(6),
                     element_count: 3,
-                    elements: vec![r(5), c(1), a(0)],
+                    elements: crate::test_zone().alloc_slice_copy(&[r(5), c(1), a(0)]),
                 },
                 Instruction::Return { value: r(6) },
             ]
@@ -1576,7 +1654,7 @@ mod execution {
         let program = assemble(|_| {
             vec![
                 Instruction::Enter,
-                Instruction::Mov { dst: r(6), src: a(0) },
+                add(r(6), a(0), c(1)),
                 Instruction::ConcatString { dst: r(5), src: c(1) },
                 Instruction::Mov { dst: l(0), src: r(6) },
                 Instruction::Mov { dst: l(1), src: r(5) },
@@ -1586,8 +1664,34 @@ mod execution {
         });
         let (result, machine) = run_with(&program, test_layout(), &[value::int32(5)], &[5], |_| {});
         assert_eq!(result.status, RESUME);
-        assert_eq!(machine.slot(l(0)), value::int32(5));
+        assert_eq!(machine.slot(l(0)), value::int32(15));
         // Enter emptied r5, which the fake ConcatString treats as 0.
+        assert_eq!(machine.slot(l(1)), value::int32(10));
+    }
+
+    #[test]
+    fn exit_values_survive_in_frame_slots_that_nothing_writes_across_calls() {
+        // r6 holds the argument across a call, and its frame slot holds it for the exit after the call.
+        let program = assemble(|_| {
+            vec![
+                Instruction::Enter,
+                Instruction::Mov { dst: r(6), src: a(0) },
+                Instruction::ConcatString { dst: r(5), src: c(1) },
+                Instruction::Mov { dst: l(0), src: r(6) },
+                Instruction::Mov { dst: l(1), src: r(5) },
+                add(r(7), l(0), l(1)),
+                Instruction::Return { value: r(7) },
+            ]
+        });
+        let (_, compiled) = compile_program(&program, test_layout(), &[5]);
+        assert!(compiled.artifact().sites().any(|site| {
+            site.frame(0)
+                .values()
+                .any(|(slot, location)| slot == l(0).raw() && location == ValueLocation::Frame(a(0).raw()))
+        }));
+        let (result, machine) = run_with(&program, test_layout(), &[value::int32(5)], &[5], |_| {});
+        assert_eq!(result.status, RESUME);
+        assert_eq!(machine.slot(l(0)), value::int32(5));
         assert_eq!(machine.slot(l(1)), value::int32(10));
     }
 
@@ -1619,7 +1723,7 @@ mod execution {
             (value::int32(1), value::FALSE),
         ] {
             let (snapshot, compiled) = compile_program_with(&program, test_layout(), &[], |snapshot| {
-                fake_heap::use_in(&mut snapshot.runtime)
+                fake_heap::use_in(&mut snapshot.runtime);
             });
             let mut machine = Machine::new(test_layout(), &[argument]);
             machine.frame[1] = lexical_environment.as_ptr() as u64;
@@ -1654,7 +1758,7 @@ mod execution {
             instructions.push(Instruction::NewArray {
                 dst: register(15),
                 element_count: 10,
-                elements: (5..15).map(register).collect(),
+                elements: crate::test_zone().alloc_slice_from_iter((5..15).map(register)),
             });
             instructions.push(Instruction::Return { value: register(15) });
             instructions
@@ -1779,7 +1883,7 @@ mod execution {
             if never_ran.contains(&pc) {
                 return ReferenceEnd::Exited { pc, slots };
             }
-            let decoded = decode_instruction(&program.bytes, pc).unwrap();
+            let decoded = decode_instruction(&program.bytes, pc, crate::test_zone()).unwrap();
             let read = |slots: &[u64], operand: Operand| slots[operand.raw() as usize];
             let mut next_pc = decoded.next_pc();
             match decoded.instruction {
@@ -1827,7 +1931,7 @@ mod execution {
                     dst, callee, arguments, ..
                 } => {
                     let mut result = int(read(&slots, callee));
-                    for argument in arguments {
+                    for &argument in arguments {
                         result = result.wrapping_add(int(read(&slots, argument)));
                     }
                     slots[dst.raw() as usize] = value::int32(result);
@@ -1934,7 +2038,12 @@ mod execution {
             let mut machine = Machine::new(layout, &arguments);
             let environment = [0u64; 2];
             machine.frame[1] = environment.as_ptr() as u64;
-            let expected = run_reference(&program, &machine, &snapshot.executables[0].constants, &never_ran_pcs);
+            let expected = run_reference(
+                &program,
+                &machine,
+                &snapshot[snapshot.executables[0].constants],
+                &never_ran_pcs,
+            );
             if expected == ReferenceEnd::OutOfFuel {
                 continue;
             }
@@ -1948,14 +2057,18 @@ mod execution {
                     assert_eq!(result.status, RESUME, "seed {seed}");
                     assert_eq!(machine.program_counter(), pc, "seed {seed}");
                     // Every slot the interpreter can still read must be right.
-                    let instructions = crate::bytecode::decode_all(&program.bytes).unwrap();
-                    let cfg = crate::bytecode::cfg::Cfg::new(&instructions, &[], &layout).unwrap();
-                    let liveness = crate::bytecode::liveness::Liveness::compute(&instructions, &cfg, &layout, false);
+                    let instructions = crate::bytecode::decode_all(&program.bytes, crate::test_zone()).unwrap();
+                    let work = crate::test_work();
+                    let cfg = crate::bytecode::cfg::Cfg::new(&instructions, &[], &layout, &work).unwrap();
+                    let liveness =
+                        crate::bytecode::liveness::Liveness::compute(&instructions, &cfg, &layout, false, &work);
                     let index = instructions
                         .iter()
                         .position(|instruction| instruction.pc == pc)
                         .unwrap();
-                    for slot in liveness.live_in(index).iter() {
+                    let mut live = ak::ZoneBitSet::new_in(0, &work);
+                    liveness.live_in(index, &mut live);
+                    for slot in live.iter() {
                         let operand = layout.operand_for_tracked_index(slot);
                         assert_eq!(
                             machine.slot(operand),
@@ -1975,6 +2088,7 @@ mod execution {
 
     #[test]
     fn random_programs_with_property_access_match_a_reference_interpreter() {
+        use crate::builder::tests::property_access::add_caches;
         use crate::builder::tests::property_access::cache;
         use crate::builder::tests::property_access::own;
         use crate::regalloc::tests::ProgramGenerator;
@@ -2040,7 +2154,7 @@ mod execution {
             let arguments = [argument(), argument()];
 
             let (snapshot, compiled) = compile_program_with(&program, layout, &[], |snapshot| {
-                snapshot.executables[0].property_caches = caches.clone();
+                snapshot.executables[0].property_caches = add_caches(snapshot, &caches);
             });
             let mut machine = Machine::new(layout, &arguments);
             let environment = [0u64; 2];
@@ -2054,8 +2168,13 @@ mod execution {
                 // know, so code relying on stale shape facts would misbehave.
                 call_toggles: toggles.then(|| (shape(0), shape(2))),
             };
-            let expected =
-                run_reference_with_heap(&program, &machine, &snapshot.executables[0].constants, &[], &mut heap);
+            let expected = run_reference_with_heap(
+                &program,
+                &machine,
+                &snapshot[snapshot.executables[0].constants],
+                &[],
+                &mut heap,
+            );
             if expected == ReferenceEnd::OutOfFuel {
                 continue;
             }
@@ -2095,7 +2214,7 @@ mod execution {
                     &program,
                     &machine,
                     machine.program_counter(),
-                    &snapshot.executables[0].constants,
+                    &snapshot[snapshot.executables[0].constants],
                     &[],
                     &mut resumed_heap,
                 );
@@ -2111,15 +2230,18 @@ mod execution {
                         },
                     ) => {
                         assert_eq!(resumed_pc, *pc, "seed {seed}: resumed exit");
-                        let instructions = crate::bytecode::decode_all(&program.bytes).unwrap();
-                        let cfg = crate::bytecode::cfg::Cfg::new(&instructions, &[], &layout).unwrap();
+                        let instructions = crate::bytecode::decode_all(&program.bytes, crate::test_zone()).unwrap();
+                        let work = crate::test_work();
+                        let cfg = crate::bytecode::cfg::Cfg::new(&instructions, &[], &layout, &work).unwrap();
                         let liveness =
-                            crate::bytecode::liveness::Liveness::compute(&instructions, &cfg, &layout, false);
+                            crate::bytecode::liveness::Liveness::compute(&instructions, &cfg, &layout, false, &work);
                         let index = instructions
                             .iter()
                             .position(|instruction| instruction.pc == *pc)
                             .unwrap();
-                        for slot in liveness.live_in(index).iter() {
+                        let mut live = ak::ZoneBitSet::new_in(0, &work);
+                        liveness.live_in(index, &mut live);
+                        for slot in live.iter() {
                             let slot = layout.operand_for_tracked_index(slot).raw() as usize;
                             assert_eq!(resumed_slots[slot], slots[slot], "seed {seed}: slot {slot} at pc {pc}");
                         }
@@ -2140,14 +2262,18 @@ mod execution {
                     exits += 1;
                     assert_eq!(result.status, RESUME, "seed {seed}");
                     assert_eq!(machine.program_counter(), pc, "seed {seed}");
-                    let instructions = crate::bytecode::decode_all(&program.bytes).unwrap();
-                    let cfg = crate::bytecode::cfg::Cfg::new(&instructions, &[], &layout).unwrap();
-                    let liveness = crate::bytecode::liveness::Liveness::compute(&instructions, &cfg, &layout, false);
+                    let instructions = crate::bytecode::decode_all(&program.bytes, crate::test_zone()).unwrap();
+                    let work = crate::test_work();
+                    let cfg = crate::bytecode::cfg::Cfg::new(&instructions, &[], &layout, &work).unwrap();
+                    let liveness =
+                        crate::bytecode::liveness::Liveness::compute(&instructions, &cfg, &layout, false, &work);
                     let index = instructions
                         .iter()
                         .position(|instruction| instruction.pc == pc)
                         .unwrap();
-                    for slot in liveness.live_in(index).iter() {
+                    let mut live = ak::ZoneBitSet::new_in(0, &work);
+                    liveness.live_in(index, &mut live);
+                    for slot in live.iter() {
                         let operand = layout.operand_for_tracked_index(slot);
                         assert_eq!(
                             machine.slot(operand),
@@ -2178,9 +2304,16 @@ mod execution {
         let program = assemble(|_| vec![Instruction::Enter, Instruction::Return { value: a(0) }]);
         let (result, machine) = run_with(&program, test_layout(), &[value::int32(1)], &[], |machine| {
             machine.vm[1] = u64::MAX - 1;
+            // NB: The code has to make the frame the running one before it resumes in the interpreter.
+            machine.vm[0] = 0;
         });
         assert_eq!(result.status, RESUME);
         assert_eq!(machine.frame[3], 0, "the frame was not initialized");
+        assert_eq!(
+            machine.vm[0],
+            machine.frame.as_ptr() as u64,
+            "the frame is the running one"
+        );
     }
 }
 
@@ -2200,7 +2333,9 @@ fn jumps_skip_blocks_that_only_jump_on() {
     });
     let mut snapshot = crate::builder::tests::snapshot_for(&program, test_layout());
     snapshot.runtime = runtime();
-    let compiled = compile_for::<crate::asm::x86_64::MacroAssembler>(&snapshot, &|_| true).unwrap();
+    let compiled =
+        compile_for::<crate::asm::x86_64::MacroAssembler>(&snapshot, &|_| true, &mut crate::scratch::Scratch::new())
+            .unwrap();
     let listing = crate::asm::disassembler::listing_with_data(
         crate::asm::Architecture::X86_64,
         &compiled.code,
@@ -2231,6 +2366,66 @@ fn jumps_skip_blocks_that_only_jump_on() {
 }
 
 #[test]
+fn prologues_check_the_stack_limit_before_they_move_the_stack_pointer() {
+    // NB: A frame larger than the headroom below the native stack limit could otherwise skip past the guard page at
+    //     the end of the stack, and the prologue would write past it.
+    let program = assemble(|_| vec![Instruction::Enter, Instruction::Return { value: a(0) }]);
+    let mut snapshot = crate::builder::tests::snapshot_for(&program, test_layout());
+    snapshot.runtime = runtime();
+    let x86_64 =
+        compile_for::<crate::asm::x86_64::MacroAssembler>(&snapshot, &|_| true, &mut crate::scratch::Scratch::new())
+            .unwrap();
+    let aarch64 =
+        compile_for::<crate::asm::aarch64::MacroAssembler>(&snapshot, &|_| true, &mut crate::scratch::Scratch::new())
+            .unwrap();
+    for (architecture, compiled, is_branch, writes_stack) in [
+        (
+            crate::asm::Architecture::X86_64,
+            &x86_64,
+            (|text: &str| text.starts_with('j') && !text.starts_with("jmp ")) as fn(&str) -> bool,
+            (|text: &str| {
+                let (mnemonic, operands) = text.split_once(' ').unwrap_or((text, ""));
+                let destination = operands.split(',').next().unwrap_or("");
+                matches!(mnemonic, "push" | "call")
+                    || destination == "rsp"
+                    || (mnemonic.starts_with("mov") && destination.contains('['))
+            }) as fn(&str) -> bool,
+        ),
+        (
+            crate::asm::Architecture::AArch64,
+            &aarch64,
+            |text: &str| text.starts_with("b.") || text.starts_with("cb") || text.starts_with("tb"),
+            |text: &str| {
+                let (mnemonic, operands) = text.split_once(' ').unwrap_or((text, ""));
+                mnemonic.starts_with("st") || mnemonic == "bl" || operands.starts_with("sp,")
+            },
+        ),
+    ] {
+        let listing =
+            crate::asm::disassembler::listing_with_data(architecture, &compiled.code, compiled.data_offset as usize);
+        let check = listing
+            .iter()
+            .position(|instruction| is_branch(&instruction.text))
+            .unwrap_or_else(|| panic!("{architecture:?}: the prologue does not branch"));
+        assert!(check > 0);
+        for instruction in &listing[..check] {
+            assert!(
+                !writes_stack(&instruction.text),
+                "{architecture:?}: {} at {:#x} comes before the stack limit check",
+                instruction.text,
+                instruction.offset
+            );
+        }
+        assert!(
+            listing[check..]
+                .iter()
+                .any(|instruction| writes_stack(&instruction.text)),
+            "{architecture:?}: the test does not recognize the prologue"
+        );
+    }
+}
+
+#[test]
 fn aarch64_code_disassembles() {
     let program = assemble(|label| {
         vec![
@@ -2246,7 +2441,7 @@ fn aarch64_code_disassembles() {
             Instruction::NewArray {
                 dst: r(6),
                 element_count: 2,
-                elements: vec![l(0), a(0)],
+                elements: crate::test_zone().alloc_slice_copy(&[l(0), a(0)]),
             },
             Instruction::JumpIf {
                 condition: r(6),
@@ -2260,29 +2455,58 @@ fn aarch64_code_disassembles() {
     let mut snapshot = crate::builder::tests::snapshot_for(&program, test_layout());
     snapshot.runtime = runtime();
     let never_ran = program.offsets[5];
-    let compiled = compile_for::<crate::asm::aarch64::MacroAssembler>(&snapshot, &|pc| pc != never_ran).unwrap();
+    let compiled = compile_for::<crate::asm::aarch64::MacroAssembler>(
+        &snapshot,
+        &|pc| pc != never_ran,
+        &mut crate::scratch::Scratch::new(),
+    )
+    .unwrap();
     let lines = crate::asm::disassembler::aarch64(&compiled.code[..compiled.data_offset as usize]);
     let text = lines.join("\n");
-    // The prologue links the frame, slow paths and helpers are called through registers.
-    assert!(lines[0].starts_with("stp x29, x30, [sp"), "{text}");
+    // The prologue links the frame right after the stack limit check, slow paths and helpers are called through
+    // registers.
+    let check = lines
+        .iter()
+        .position(|line| line.starts_with("b."))
+        .expect("a stack limit check");
+    assert!(lines[check + 1].starts_with("stp x29, x30, [sp"), "{text}");
     assert!(text.contains("blr"), "{text}");
     assert!(text.contains("ret"), "{text}");
     // NB: The slow paths of JumpLessThan and NewArray leave through sites.
-    let kinds = compiled.sites.iter().map(|site| site.kind).collect::<Vec<_>>();
+    let kinds = compiled.artifact().sites().map(|site| site.kind()).collect::<Vec<_>>();
     assert_eq!(
         kinds,
         [SiteKind::Exit(ExitKind::NoFeedback), SiteKind::Leave, SiteKind::Leave]
     );
 
-    let compiled = compile_for::<crate::asm::x86_64::MacroAssembler>(&snapshot, &|pc| pc != never_ran).unwrap();
+    let compiled = compile_for::<crate::asm::x86_64::MacroAssembler>(
+        &snapshot,
+        &|pc| pc != never_ran,
+        &mut crate::scratch::Scratch::new(),
+    )
+    .unwrap();
     let lines = crate::asm::disassembler::x86_64(&compiled.code[..compiled.data_offset as usize]);
-    assert_eq!(lines[0], "push rbp");
+    let check = lines
+        .iter()
+        .position(|line| line.starts_with('j'))
+        .expect("a stack limit check");
+    assert_eq!(lines[check + 1], "push rbp");
 
     // The dump names exits, slow paths and the shared tails on both architectures.
     snapshot.options.dump_asm = true;
-    let x86_64 = compile_for::<crate::asm::x86_64::MacroAssembler>(&snapshot, &|pc| pc != never_ran).unwrap();
-    let aarch64 = compile_for::<crate::asm::aarch64::MacroAssembler>(&snapshot, &|pc| pc != never_ran).unwrap();
-    for dump in [x86_64.dump.unwrap(), aarch64.dump.unwrap()] {
+    let x86_64 = compile_for::<crate::asm::x86_64::MacroAssembler>(
+        &snapshot,
+        &|pc| pc != never_ran,
+        &mut crate::scratch::Scratch::new(),
+    )
+    .unwrap();
+    let aarch64 = compile_for::<crate::asm::aarch64::MacroAssembler>(
+        &snapshot,
+        &|pc| pc != never_ran,
+        &mut crate::scratch::Scratch::new(),
+    )
+    .unwrap();
+    for dump in [x86_64.dump().unwrap(), aarch64.dump().unwrap()] {
         assert!(dump.contains("Exit NoFeedback [fs"), "{dump}");
         assert!(dump.contains("exit #0 (NoFeedback) of v"), "{dump}");
         assert!(dump.contains("exit stub (shared by all exits):\n"), "{dump}");
@@ -2326,13 +2550,18 @@ fn slow_paths_share_initialization_of_large_frames() {
     });
     let mut snapshot = crate::builder::tests::snapshot_for(&program, layout);
     snapshot.runtime = runtime();
-    snapshot.executables[0].constants = (0..layout.number_of_constants)
+    let constants = (0..layout.number_of_constants)
         .map(|index| 0x1234_5678_9abc_0000 | u64::from(index))
-        .collect();
-    snapshot.executables[0].feedback.arith = vec![1 | 1 << 1 | 1 << 2 | 1 << 3];
+        .collect::<Vec<_>>();
+    snapshot.executables[0].constants = snapshot.add(&constants);
+    snapshot.executables[0].feedback.arith = snapshot.add(&[1 | 1 << 1 | 1 << 2 | 1 << 3]);
     snapshot.options.dump_asm = true;
-    let aarch64 = compile_for::<crate::asm::aarch64::MacroAssembler>(&snapshot, &|_| true).unwrap();
-    let x86_64 = compile_for::<crate::asm::x86_64::MacroAssembler>(&snapshot, &|_| true).unwrap();
+    let aarch64 =
+        compile_for::<crate::asm::aarch64::MacroAssembler>(&snapshot, &|_| true, &mut crate::scratch::Scratch::new())
+            .unwrap();
+    let x86_64 =
+        compile_for::<crate::asm::x86_64::MacroAssembler>(&snapshot, &|_| true, &mut crate::scratch::Scratch::new())
+            .unwrap();
     for compiled in [aarch64, x86_64] {
         assert!(
             compiled.code.len() < 64 * 1024,
@@ -2340,7 +2569,7 @@ fn slow_paths_share_initialization_of_large_frames() {
         );
         assert_eq!(
             compiled
-                .dump
+                .dump()
                 .unwrap()
                 .matches("frame initialization (shared by slow paths):\n")
                 .count(),
@@ -2355,12 +2584,15 @@ fn slow_paths_save_no_more_registers_than_the_saves_area_holds() {
         let words = slow_path_calls::slow_path_saved_registers::<M>().len();
         for register in target_registers::<M>().0.allocatable_gprs.iter() {
             let allocation = crate::regalloc::NodeAllocation {
-                inputs: crate::inline_vec::InlineVec::from_elem(Location::Register(register), 1),
+                moves_before: &[],
+                inputs: &[Location::Register(register)],
+                temps: &[],
                 output: Some(Location::Register(register)),
-                ..Default::default()
+                spill_slot: None,
+                exit_values: &[],
             };
             assert!(
-                slow_path_calls::slow_path_saved_registers_of::<M>(&allocation).len() <= words,
+                slow_path_calls::slow_path_saved_registers_of::<M>(allocation).len() <= words,
                 "an output in register {register} that an input is in too"
             );
         }
@@ -2370,14 +2602,47 @@ fn slow_paths_save_no_more_registers_than_the_saves_area_holds() {
 }
 
 #[test]
+fn x86_64_shifts_find_their_amount_in_cl() {
+    let program = assemble(|_| {
+        vec![
+            Instruction::Enter,
+            Instruction::BitwiseXorRhsInt32 {
+                arith_feedback: 1,
+                dst: r(4),
+                lhs: a(0),
+                rhs: 5,
+            },
+            Instruction::LeftShift {
+                arith_feedback: 0,
+                dst: r(5),
+                lhs: a(0),
+                rhs: r(4),
+            },
+            Instruction::Return { value: r(5) },
+        ]
+    });
+    let mut snapshot = crate::builder::tests::snapshot_for(&program, test_layout());
+    snapshot.runtime = runtime();
+    snapshot.executables[0].feedback.arith = snapshot.add(&[crate::snapshot::arith_feedback::INT32; 2]);
+    let compiled =
+        compile_for::<crate::asm::x86_64::MacroAssembler>(&snapshot, &|_| true, &mut crate::scratch::Scratch::new())
+            .unwrap();
+    let text = crate::asm::disassembler::x86_64(&compiled.code[..compiled.data_offset as usize]).join("\n");
+    // NB: The macro assembler shifts amounts in other registers in a scratch register, saving RCX in another.
+    assert!(text.contains(", cl"), "{text}");
+    assert!(!text.contains("r11d, cl") && !text.contains("mov r10, rcx"), "{text}");
+}
+
+#[test]
 fn dumps_ir_and_code_on_request() {
     let program = assemble(|_| vec![Instruction::Enter, Instruction::Return { value: a(0) }]);
     let mut snapshot = crate::builder::tests::snapshot_for(&program, test_layout());
     snapshot.runtime = runtime();
     snapshot.options.dump_ir = true;
     snapshot.options.dump_asm = true;
-    let compiled = compile_for::<crate::asm::MacroAssembler>(&snapshot, &|_| true).unwrap();
-    let dump = compiled.dump.unwrap();
+    let compiled =
+        compile_for::<crate::asm::MacroAssembler>(&snapshot, &|_| true, &mut crate::scratch::Scratch::new()).unwrap();
+    let dump = compiled.dump().unwrap();
     assert!(dump.contains("LoadSlot a0"), "{dump}");
     assert!(dump.contains("prologue:"), "{dump}");
     assert!(dump.contains("Return (v"), "{dump}");
@@ -2399,7 +2664,8 @@ fn missing_slow_paths_fail_compilation_cleanly() {
     });
     let mut snapshot = crate::builder::tests::snapshot_for(&program, test_layout());
     snapshot.runtime = runtime();
-    let failure = compile_for::<crate::asm::MacroAssembler>(&snapshot, &|_| true).unwrap_err();
+    let failure = compile_for::<crate::asm::MacroAssembler>(&snapshot, &|_| true, &mut crate::scratch::Scratch::new())
+        .unwrap_err();
     assert_eq!(
         failure,
         CompileFailure::MissingRuntimeHelper {
@@ -2414,6 +2680,8 @@ fn missing_slow_paths_fail_compilation_cleanly() {
 #[cfg(target_arch = "x86_64")]
 mod property_access {
     use super::*;
+    use crate::builder::tests::property_access::PropertyCache;
+    use crate::builder::tests::property_access::add_caches;
     use crate::builder::tests::property_access::cache;
     use crate::builder::tests::property_access::get_by_id;
     use crate::builder::tests::property_access::own;
@@ -2423,7 +2691,6 @@ mod property_access {
     use crate::snapshot::PropertyCacheEntryType::ChangeOwnProperty;
     use crate::snapshot::PropertyCacheEntryType::GetOwnProperty;
     use crate::snapshot::PropertyCacheEntryType::GetPropertyInPrototypeChain;
-    use crate::snapshot::PropertyCacheSnapshot;
 
     /// A fake cell, in the low fake heap so that objects can have it as
     /// their compressed shape.
@@ -2470,13 +2737,13 @@ mod property_access {
 
     fn run_with_caches(
         program: &Program,
-        caches: Vec<PropertyCacheSnapshot>,
+        caches: Vec<PropertyCache>,
         argument: u64,
         call_writes: Option<(*mut u64, u64)>,
     ) -> (JitResult, Machine, CompiledCode) {
         let layout = test_layout();
         let (snapshot, compiled) = compile_program_with(program, layout, &[], |snapshot| {
-            snapshot.executables[0].property_caches = caches;
+            snapshot.executables[0].property_caches = add_caches(snapshot, &caches);
         });
         let mut machine = Machine::new(layout, &[argument]);
         machine.state.borrow_mut().call_writes = call_writes;
@@ -2488,7 +2755,7 @@ mod property_access {
         let taken = machine.state.borrow().exits_taken.clone();
         taken
             .iter()
-            .map(|index| match compiled.sites[*index as usize].kind {
+            .map(|index| match compiled.artifact().site(*index).kind() {
                 SiteKind::Exit(kind) => kind,
                 kind => panic!("{kind:?} is no exit"),
             })
@@ -2516,7 +2783,7 @@ mod property_access {
         let hit = Object::new(&shape, &[0, value::int32(5)]);
         let (result, _, compiled) = run_with_caches(&program, caches(), hit.value(), None);
         assert_eq!(result, returned(value::int32(15)));
-        assert_eq!(compiled.embedded_cells, [shape.id()]);
+        assert!(compiled.artifact().embedded_cells().eq([shape.id()]));
 
         let miss = Object::new(&other_shape, &[0, value::int32(5)]);
         let (result, machine, compiled) = run_with_caches(&program, caches(), miss.value(), None);
@@ -2578,7 +2845,7 @@ mod property_access {
 
         let (result, _, compiled) = run_with_caches(&program, vec![cache(vec![entry])], receiver.value(), None);
         assert_eq!(result, returned(value::int32(42)));
-        assert_eq!(compiled.embedded_cells.len(), 3);
+        assert_eq!(compiled.artifact().embedded_cells().len(), 3);
 
         // A changed dictionary generation means the shape changed in place.
         let changed_receiver_shape = Cell::new([8, 0, 0]);
@@ -2679,14 +2946,12 @@ mod property_access {
                         Instruction::Enter,
                         get_by_id(r(6), a(0), 0),
                         Instruction::Call {
-                            value_feedback: 0,
                             call_feedback: 0,
                             dst: r(5),
                             callee: r(6),
                             this_value: a(0),
                             argument_count: 1,
-                            expression_string: None,
-                            arguments: vec![c(1)],
+                            arguments: crate::test_zone().alloc_slice_copy(&[c(1)]),
                         },
                         Instruction::Return { value: r(5) },
                     ]
@@ -2698,7 +2963,7 @@ mod property_access {
                 entry.prototype_property_intrinsic = Some(Intrinsic::ArrayPrototypePush);
                 let layout = test_layout();
                 let (snapshot, compiled) = compile_program_with(&program, layout, &[], |snapshot| {
-                    snapshot.executables[0].property_caches = vec![cache(vec![entry])];
+                    snapshot.executables[0].property_caches = add_caches(snapshot, &[cache(vec![entry])]);
                     let runtime = &mut snapshot.runtime;
                     runtime.array_push = grow as *const () as u64;
                     runtime.array_prototype = CellId(self.array_prototype.address());
@@ -2800,14 +3065,12 @@ mod property_access {
                 get_by_id(r(5), a(0), 1),
                 get_by_id(r(6), a(0), 1),
                 Instruction::Call {
-                    value_feedback: 0,
                     call_feedback: 0,
                     dst: l(1),
                     callee: c(0),
                     this_value: c(0),
                     argument_count: 0,
-                    expression_string: None,
-                    arguments: Vec::new(),
+                    arguments: &[],
                 },
                 get_by_id(r(7), a(0), 1),
                 add(l(0), r(5), r(7)),
@@ -2860,6 +3123,7 @@ mod property_access {
 
 #[test]
 fn aarch64_property_access_disassembles() {
+    use crate::builder::tests::property_access::add_caches;
     use crate::builder::tests::property_access::cache;
     use crate::builder::tests::property_access::get_by_id;
     use crate::builder::tests::property_access::own;
@@ -2884,18 +3148,25 @@ fn aarch64_property_access_disassembles() {
     prototype_entry.prototype_chain_validity = Some(CellId(0x2_0000_2000));
     prototype_entry.shape_dictionary_generation = 9;
     prototype_entry.shape_is_dictionary = true;
-    snapshot.executables[0].property_caches = vec![
-        cache(vec![own(GetOwnProperty, 0x1000, 1), own(GetOwnProperty, 0x2000, 4)]),
-        cache(vec![prototype_entry]),
-        cache(vec![own(ChangeOwnProperty, 0x3000, 2)]),
-    ];
-    let compiled = compile_for::<crate::asm::aarch64::MacroAssembler>(&snapshot, &|_| true).unwrap();
+    snapshot.executables[0].property_caches = add_caches(
+        &mut snapshot,
+        &[
+            cache(vec![own(GetOwnProperty, 0x1000, 1), own(GetOwnProperty, 0x2000, 4)]),
+            cache(vec![prototype_entry]),
+            cache(vec![own(ChangeOwnProperty, 0x3000, 2)]),
+        ],
+    );
+    let compiled =
+        compile_for::<crate::asm::aarch64::MacroAssembler>(&snapshot, &|_| true, &mut crate::scratch::Scratch::new())
+            .unwrap();
     let text = crate::asm::disassembler::aarch64(&compiled.code[..compiled.data_offset as usize]).join("\n");
     assert!(text.contains("ldrb"), "{text}");
     // Object check, shape switch and two loads; object, shape, chain and
     // holder load checks; object, shape and store checks.
-    assert_eq!(compiled.sites.len(), 11, "{text}");
-    let compiled = compile_for::<crate::asm::x86_64::MacroAssembler>(&snapshot, &|_| true).unwrap();
+    assert_eq!(compiled.artifact().site_count(), 11, "{text}");
+    let compiled =
+        compile_for::<crate::asm::x86_64::MacroAssembler>(&snapshot, &|_| true, &mut crate::scratch::Scratch::new())
+            .unwrap();
     assert!(!crate::asm::disassembler::x86_64(&compiled.code[..compiled.data_offset as usize]).is_empty());
 }
 
@@ -2968,17 +3239,19 @@ mod inlining {
         function.function = CellId(function_object.as_ptr() as u64);
         let mut snapshot = snapshot_with_callee(caller, callee, function);
         snapshot.runtime = runtime();
-        for executable in &mut snapshot.executables {
-            executable.feedback.arith = vec![NUMBERS_AND_STRINGS_FEEDBACK];
+        let arith = snapshot.add(&[NUMBERS_AND_STRINGS_FEEDBACK]);
+        for executable in snapshot.executables.iter_mut() {
+            executable.feedback.arith = arith;
             // NB: The words of a function its frames start with are constants in code.
             executable.function_fields = Some(FunctionFrameFields {
                 script_or_module: FUNCTION_WORDS[2],
                 environment: FUNCTION_WORDS[0],
-                private_environment: FUNCTION_WORDS[1],
             });
         }
         configure(&mut snapshot);
-        let compiled = compile_for::<crate::asm::MacroAssembler>(&snapshot, &|_| true).unwrap();
+        let compiled =
+            compile_for::<crate::asm::MacroAssembler>(&snapshot, &|_| true, &mut crate::scratch::Scratch::new())
+                .unwrap();
         let mut machine = Machine::new(test_layout(), &[callee_value(boxed(&function_object))]);
         prepare(&mut machine);
         let result = machine.run(&snapshot, &compiled);
@@ -2992,7 +3265,7 @@ mod inlining {
         // Compiled code published the callee's frame for its Exp, linked to
         // the caller like an interpreter inline call and uninitialized, and
         // popped it again.
-        assert!(!compiled.sites.iter().any(|site| site.kind == SiteKind::Publish));
+        assert!(!compiled.artifact().sites().any(|site| site.kind() == SiteKind::Publish));
         assert_eq!(machine.vm[0], machine.frame.as_ptr() as u64);
         assert_eq!(machine.vm[3], machine.interpreter_stack.as_ptr() as u64);
         let pushed = &machine.interpreter_stack;
@@ -3053,16 +3326,16 @@ mod inlining {
         assert!(machine.state.borrow().exits_taken.is_empty(), "leaves are no exits");
         assert!(
             compiled
-                .sites
-                .iter()
-                .any(|site| site.kind == SiteKind::Leave && site.frames.len() > 1)
+                .artifact()
+                .sites()
+                .any(|site| site.kind() == SiteKind::Leave && site.frame_count() > 1)
         );
         assert_eq!(slot(&machine, l(1)), value::int32(10));
         assert_eq!(machine.slot(r(6)), machine.slot(c(1)));
     }
 
     /// `function plus(v) { return v + other; }`, with `other` from `src`.
-    fn plus(src: Instruction) -> Program {
+    fn plus(src: Instruction<'static>) -> Program {
         assemble(|_| {
             vec![
                 Instruction::Enter,
@@ -3086,12 +3359,15 @@ mod inlining {
             &caller(),
             &callee,
             |function| function,
-            |snapshot| snapshot.executables[1].constants[0] = value::int32(5),
+            |snapshot| {
+                let constants = snapshot.executables[1].constants;
+                snapshot[constants][0] = value::int32(5);
+            },
             |_| {},
         );
         assert_eq!(result, returned(value::int32(25)));
         assert_eq!(machine.vm[3], machine.interpreter_stack.as_ptr() as u64);
-        assert!(!compiled.sites.iter().any(|site| site.kind == SiteKind::Publish));
+        assert!(!compiled.artifact().sites().any(|site| site.kind() == SiteKind::Publish));
 
         // The slow path of an Add of undefined runs in the callee's frame,
         // which compiled code publishes, and continues after popping it: 10
@@ -3104,7 +3380,7 @@ mod inlining {
         assert_eq!(machine.vm[0], machine.frame.as_ptr() as u64);
         assert_eq!(machine.vm[3], machine.interpreter_stack.as_ptr() as u64);
         // NB: Compiled code publishes the frames, not the runtime.
-        assert!(!compiled.sites.iter().any(|site| site.kind == SiteKind::Publish));
+        assert!(!compiled.artifact().sites().any(|site| site.kind() == SiteKind::Publish));
 
         // A slow path that does not continue leaves the interpreter in the
         // callee's frame.
@@ -3134,7 +3410,7 @@ mod inlining {
         assert_eq!(result.status, RESUME);
         let state = machine.state.borrow();
         assert_eq!(
-            compiled.sites[state.exits_taken[0] as usize].kind,
+            compiled.artifact().site(state.exits_taken[0]).kind(),
             SiteKind::Exit(ExitKind::BadCallTarget)
         );
         assert_eq!(state.exit_frames[0].len(), 1);
@@ -3148,7 +3424,7 @@ mod inlining {
             &caller(),
             &twice(),
             |function| function,
-            |snapshot| snapshot.executables[1].feedback.arith = vec![0],
+            |snapshot| snapshot.executables[1].feedback.arith = snapshot.add(&[0]),
             |_| {},
         );
         assert_eq!(result.status, RESUME);
@@ -3218,29 +3494,23 @@ mod virtual_arguments {
                     creates_parameter_bindings: false,
                 },
                 Instruction::GetLength {
-                    value_feedback: 0,
                     keyed_feedback: 0,
                     dst: r(5),
                     base: l(0),
-                    base_identifier: None,
                     cache: 0,
                 },
                 Instruction::GetByValue {
-                    value_feedback: 0,
                     keyed_feedback: 0,
                     dst: r(6),
                     base: l(0),
                     property: argument(2),
-                    base_identifier: None,
                     cache: 0,
                 },
                 add(r(7), r(5), r(6)),
                 Instruction::GetLength {
-                    value_feedback: 0,
                     keyed_feedback: 0,
                     dst: r(6),
                     base: l(0),
-                    base_identifier: None,
                     cache: 0,
                 },
                 add(r(7), r(7), r(6)),
@@ -3291,7 +3561,7 @@ mod virtual_arguments {
             assert_eq!(result.status, RESUME);
             let state = machine.state.borrow();
             assert_eq!(
-                compiled.sites[state.exits_taken[0] as usize].kind,
+                compiled.artifact().site(state.exits_taken[0]).kind(),
                 SiteKind::Exit(ExitKind::ArgumentsIndex)
             );
             let (_, _, _, values) = &state.exit_frames[0][0];
@@ -3325,7 +3595,7 @@ mod direct_calls {
     use crate::snapshot::DirectCallTarget;
     use crate::snapshot::InlinedFunctionSnapshot;
 
-    const REALM: u64 = 0x5eed_0000;
+    const REALM: u64 = crate::builder::tests::inlining::REALM;
     const GLOBAL_THIS: u64 = 0x6000;
     /// The fake function object: environment, private environment and two
     /// words of script or module.
@@ -3447,6 +3717,8 @@ mod direct_calls {
         fn target(&self, strict: bool, uses_this: bool) -> DirectCallTarget {
             DirectCallTarget {
                 function: InlinedFunctionSnapshot {
+                    super_base: None,
+                    has_own_new_target: true,
                     function: CellId(self.function.as_ptr() as u64),
                     formal_parameter_count: 3,
                     strict,
@@ -3463,7 +3735,6 @@ mod direct_calls {
                 function_fields: FunctionFrameFields {
                     script_or_module: self.function[2],
                     environment: self.function[0],
-                    private_environment: self.function[1],
                 },
                 environment: None,
                 closures: false,
@@ -3496,11 +3767,11 @@ mod direct_calls {
 
     fn compile_caller(target: DirectCallTarget) -> (Snapshot, CompiledCode) {
         compile_program_with(&caller(), caller_layout(), &[], |snapshot| {
-            snapshot.executables[0].feedback.call = vec![CallFeedbackSnapshot {
+            snapshot.executables[0].feedback.call = snapshot.add(&[CallFeedbackSnapshot {
                 target: Some(target.function.function),
                 direct_call: Some(target),
                 ..CallFeedbackSnapshot::default()
-            }];
+            }]);
         })
     }
 
@@ -3526,10 +3797,20 @@ mod direct_calls {
     fn direct_calls_store_constant_frame_fields_16_bytes_at_a_time() {
         let callee = Callee::new();
         let (snapshot, _) = compile_caller(callee.target(true, true));
-        let compiled = compile_for::<crate::asm::aarch64::MacroAssembler>(&snapshot, &|_| true).unwrap();
+        let compiled = compile_for::<crate::asm::aarch64::MacroAssembler>(
+            &snapshot,
+            &|_| true,
+            &mut crate::scratch::Scratch::new(),
+        )
+        .unwrap();
         let text = crate::asm::disassembler::aarch64(&compiled.code[..compiled.data_offset as usize]).join("\n");
         assert!(text.contains("str q0, [x"), "{text}");
-        let compiled = compile_for::<crate::asm::x86_64::MacroAssembler>(&snapshot, &|_| true).unwrap();
+        let compiled = compile_for::<crate::asm::x86_64::MacroAssembler>(
+            &snapshot,
+            &|_| true,
+            &mut crate::scratch::Scratch::new(),
+        )
+        .unwrap();
         let text = crate::asm::disassembler::x86_64(&compiled.code[..compiled.data_offset as usize]).join("\n");
         assert!(text.contains("movups xmmword ptr ["), "{text}");
     }
@@ -3544,7 +3825,13 @@ mod direct_calls {
             REALM,
             GLOBAL_THIS,
         ] {
-            assert!(compiled.embedded_cells.contains(&CellId(cell)), "{cell:#x}");
+            assert!(
+                compiled
+                    .artifact()
+                    .embedded_cells()
+                    .any(|embedded| embedded == CellId(cell)),
+                "{cell:#x}"
+            );
         }
     }
 
@@ -3569,16 +3856,10 @@ mod direct_calls {
             let half = |offset: usize| (frame[offset / 8] >> (8 * (offset % 8))) as u32;
             let byte = |offset: usize| (frame[offset / 8] >> (8 * (offset % 8))) as u8;
             assert_eq!(word(64), callee.function.as_ptr() as u64, "function");
-            assert_eq!(word(72), REALM);
-            assert_eq!(word(80), FUNCTION_WORDS[2]);
-            assert_eq!(
-                (word(8), word(96), word(16)),
-                (FUNCTION_WORDS[0], FUNCTION_WORDS[0], FUNCTION_WORDS[1])
-            );
+            assert_eq!(word(8), FUNCTION_WORDS[0], "lexical environment");
             assert_eq!(word(104), 0, "no frame id yet");
-            assert_eq!(word(0), 0, "program counter and incumbent counter");
-            assert_eq!(half(112), u32::MAX, "no yield continuation");
-            assert_eq!((byte(116), byte(117), byte(118), byte(24)), (0, 0, 0, 0));
+            assert_eq!(half(0), 0, "program counter");
+            assert_eq!((byte(118), byte(24)), (0, 0), "not a construct call, not initialized");
             assert_eq!(word(120), value::EMPTY, "no this value");
             assert_eq!(word(32), callee.executable.as_ptr() as u64);
             assert_eq!(word(8 * FRAME_CALLER_WORD), machine.frame.as_ptr() as u64);
@@ -3701,27 +3982,29 @@ mod direct_calls {
                     FreeCell::NeverAllocated => vec![0, address, address + 14 * 8, 14 * 8],
                     FreeCell::None => vec![0, 0, 0, 14 * 8],
                 };
-                let template = crate::snapshot::EnvironmentTemplateSnapshot {
-                    allocator: free_list.as_mut_ptr() as u64,
+                let allocator = free_list.as_mut_ptr() as u64;
+                let template = |snapshot: &mut Snapshot| crate::snapshot::EnvironmentTemplateSnapshot {
+                    allocator,
                     cell_size: 14 * 8,
-                    words: (0..12).map(|index| 0x1000 + index).collect(),
+                    words: snapshot.add(&(0..12).map(|index| 0x1000 + index).collect::<Vec<_>>()),
                     inline_binding_values: true,
                     binding_values_offset: 48,
                     binds_this: true,
                     this_value_offset: 72,
-                    cells: vec![CellId(0xcafe)],
+                    cells: snapshot.add(&[CellId(0xcafe)]),
                 };
                 let target = DirectCallTarget {
                     environment: Some(0),
                     ..callee.target(true, true)
                 };
                 let (snapshot, compiled) = compile_program_with(&caller(), caller_layout(), &[], |snapshot| {
-                    snapshot.executables[0].feedback.call = vec![CallFeedbackSnapshot {
+                    snapshot.executables[0].feedback.call = snapshot.add(&[CallFeedbackSnapshot {
                         target: Some(target.function.function),
                         direct_call: Some(target),
                         ..CallFeedbackSnapshot::default()
-                    }];
-                    snapshot.executables[0].environment_templates = vec![template.clone()];
+                    }]);
+                    let template = template(snapshot);
+                    snapshot.executables[0].environment_templates = snapshot.add(&[template]);
                     let allocation = &mut snapshot.runtime.object_allocation;
                     allocation.heap = heap.as_mut_ptr() as u64;
                     allocation.heap_allocated_bytes_offset = 0;
@@ -3734,7 +4017,12 @@ mod direct_calls {
                     allocation.local_end_offset = 16;
                     allocation.local_cell_size_offset = 24;
                 });
-                assert!(compiled.embedded_cells.contains(&CellId(0xcafe)));
+                assert!(
+                    compiled
+                        .artifact()
+                        .embedded_cells()
+                        .any(|embedded| embedded == CellId(0xcafe))
+                );
                 let mut machine = Machine::new(
                     caller_layout(),
                     &[callee.function_value(), value::int32(7), value::TRUE],
@@ -3933,17 +4221,18 @@ mod direct_calls {
         fn run_dynamic(callee: &mut DynamicCallee, arguments: &[u64], through_call: bool) -> (JitResult, Machine) {
             let (snapshot, compiled) = compile_program_with(&caller(), caller_layout(), &[], |snapshot| {
                 dynamic_runtime(&mut snapshot.runtime, &callee);
-                snapshot.executables[0].feedback.call = vec![CallFeedbackSnapshot {
+                snapshot.executables[0].feedback.call = snapshot.add(&[CallFeedbackSnapshot {
                     target: Some(CellId(CALL_FUNCTION)),
                     flags: if through_call { 0 } else { 1 },
                     target_intrinsic: through_call.then_some(crate::snapshot::Intrinsic::FunctionPrototypeCall),
                     ..CallFeedbackSnapshot::default()
-                }];
+                }]);
             });
             let mut machine = Machine::new(caller_layout(), arguments);
             let stack = callee.callee.interpreter_stack.as_mut_ptr() as u64;
             machine.vm[3] = stack;
             machine.vm[4] = stack + 8 * callee.callee.interpreter_stack.len() as u64;
+            machine.vm[VM_CURRENT_REALM_WORD] = callee.realm;
             callee.callee.executable[EXECUTABLE_TEST_STATE_WORD] =
                 std::ptr::from_ref::<RefCell<TestState>>(&machine.state) as u64;
             machine.state.borrow_mut().direct.callee_result = Some((value::int32(99), RETURNED));
@@ -3966,16 +4255,7 @@ mod direct_calls {
             let half = |offset: usize| (frame[offset / 8] >> (8 * (offset % 8))) as u32;
             let byte = |offset: usize| (frame[offset / 8] >> (8 * (offset % 8))) as u8;
             assert_eq!(word(64), callee.function.as_ptr() as u64, "function");
-            assert_eq!(word(72), callee.realm);
-            assert_eq!(word(80), FUNCTION_WORDS[2]);
-            assert_eq!(
-                (word(8), word(96), word(16)),
-                (
-                    environment(FUNCTION_WORDS[0]),
-                    environment(FUNCTION_WORDS[0]),
-                    environment(FUNCTION_WORDS[1])
-                )
-            );
+            assert_eq!(word(8), environment(FUNCTION_WORDS[0]), "lexical environment");
             assert_eq!(word(104), 0, "no frame id yet");
             assert_eq!(word(120), value::EMPTY, "no this value");
             assert_eq!(word(32), callee.callee.executable.as_ptr() as u64);
@@ -4098,16 +4378,17 @@ mod direct_calls {
                     snapshot.runtime.dynamic_calls.prepare_call_environment =
                         prepare_call_environment as *const () as u64;
                     install_call_stub(&mut snapshot.runtime);
-                    snapshot.executables[0].feedback.call = vec![CallFeedbackSnapshot {
+                    snapshot.executables[0].feedback.call = snapshot.add(&[CallFeedbackSnapshot {
                         target: Some(CellId(CALL_FUNCTION)),
                         flags: 1,
                         ..CallFeedbackSnapshot::default()
-                    }];
+                    }]);
                 });
                 let mut machine = Machine::new(caller_layout(), &arguments);
                 let stack = callee.callee.interpreter_stack.as_mut_ptr() as u64;
                 machine.vm[3] = stack;
                 machine.vm[4] = stack + 8 * callee.callee.interpreter_stack.len() as u64;
+                machine.vm[VM_CURRENT_REALM_WORD] = callee.realm;
                 callee.callee.executable[EXECUTABLE_TEST_STATE_WORD] =
                     std::ptr::from_ref::<RefCell<TestState>>(&machine.state) as u64;
                 {
@@ -4126,7 +4407,6 @@ mod direct_calls {
                         (ENVIRONMENT, ENVIRONMENT),
                         "environments"
                     );
-                    assert_eq!(frame[16 / 8], environment(FUNCTION_WORDS[1]), "private environment");
                     assert_eq!(frame[120 / 8], value::int32(5), "this");
                     assert_eq!(
                         frame[FRAME_HEADER_WORDS + crate::bytecode::THIS_VALUE_REGISTER as usize],
@@ -4221,16 +4501,17 @@ mod direct_calls {
                     allocation.local_end_offset = 16;
                     allocation.local_cell_size_offset = 24;
                     install_call_stub(&mut snapshot.runtime);
-                    snapshot.executables[0].feedback.call = vec![CallFeedbackSnapshot {
+                    snapshot.executables[0].feedback.call = snapshot.add(&[CallFeedbackSnapshot {
                         target: Some(CellId(CALL_FUNCTION)),
                         flags: 1,
                         ..CallFeedbackSnapshot::default()
-                    }];
+                    }]);
                 });
                 let mut machine = Machine::new(caller_layout(), &arguments);
                 let stack = callee.callee.interpreter_stack.as_mut_ptr() as u64;
                 machine.vm[3] = stack;
                 machine.vm[4] = stack + 8 * callee.callee.interpreter_stack.len() as u64;
+                machine.vm[VM_CURRENT_REALM_WORD] = callee.realm;
                 callee.callee.executable[EXECUTABLE_TEST_STATE_WORD] =
                     std::ptr::from_ref::<RefCell<TestState>>(&machine.state) as u64;
                 {
@@ -4394,18 +4675,20 @@ mod direct_calls {
                     layout.native_function_table_entry_size = 16;
                     layout.native_function_table_entry_function = 0;
                     install_call_stub(&mut snapshot.runtime);
-                    snapshot.executables[0].feedback.call = vec![CallFeedbackSnapshot {
+                    snapshot.executables[0].feedback.call = snapshot.add(&[CallFeedbackSnapshot {
                         target: Some(CellId(CALL_FUNCTION)),
                         flags: if through_call { 0 } else { 1 },
                         target_intrinsic: through_call.then_some(crate::snapshot::Intrinsic::FunctionPrototypeCall),
                         ..CallFeedbackSnapshot::default()
-                    }];
+                    }]);
                 });
                 let mut machine = Machine::new(caller_layout(), &arguments);
                 let stack = callee.callee.interpreter_stack.as_mut_ptr() as u64;
                 machine.vm[3] = stack;
                 machine.vm[4] = stack + 8 * callee.callee.interpreter_stack.len() as u64;
+                machine.vm[VM_CURRENT_REALM_WORD] = callee.realm;
                 machine.vm[VM_NATIVE_FUNCTION_TABLE_WORD] = table.as_ptr() as u64;
+                machine.vm[VM_CURRENT_REALM_WORD] = realm;
                 let result = machine.run(&snapshot, &compiled);
                 // this + 10, plus a1 (7) when called directly with this = 1.
                 assert_eq!(result, returned(value::int32(if through_call { 17 } else { 18 })));
@@ -4413,7 +4696,6 @@ mod direct_calls {
                 assert_eq!(state.generic_calls, 0);
                 let frame = &state.direct.callee_frames[0];
                 assert_eq!(frame[64 / 8], native.as_ptr() as u64, "function");
-                assert_eq!(frame[72 / 8], realm);
                 assert_eq!(frame[32 / 8], 0, "no executable");
                 assert_eq!(machine.vm[0], machine.frame.as_ptr() as u64);
                 assert_eq!(machine.vm[3], stack);
@@ -4463,6 +4745,8 @@ fn aarch64_direct_calls_disassemble() {
     snapshot.runtime = runtime();
     let target = DirectCallTarget {
         function: InlinedFunctionSnapshot {
+            super_base: None,
+            has_own_new_target: true,
             function: CellId(0x5000),
             formal_parameter_count: 2,
             strict: false,
@@ -4479,12 +4763,14 @@ fn aarch64_direct_calls_disassemble() {
         environment: None,
         closures: false,
     };
-    snapshot.executables[0].feedback.call = vec![CallFeedbackSnapshot {
+    snapshot.executables[0].feedback.call = snapshot.add(&[CallFeedbackSnapshot {
         target: Some(target.function.function),
         direct_call: Some(target),
         ..CallFeedbackSnapshot::default()
-    }];
-    let compiled = compile_for::<crate::asm::aarch64::MacroAssembler>(&snapshot, &|_| true).unwrap();
+    }]);
+    let compiled =
+        compile_for::<crate::asm::aarch64::MacroAssembler>(&snapshot, &|_| true, &mut crate::scratch::Scratch::new())
+            .unwrap();
     let text = crate::asm::disassembler::aarch64(&compiled.code[..compiled.data_offset as usize]).join("\n");
     // The callee's entry, the runtime's finish helper, and the generic path.
     assert!(text.matches("blr").count() >= 3, "{text}");
@@ -4517,7 +4803,9 @@ fn aarch64_inlined_calls_disassemble() {
     });
     let mut snapshot = snapshot_with_callee(&caller, &callee, function(true, false));
     snapshot.runtime = runtime();
-    let compiled = compile_for::<crate::asm::aarch64::MacroAssembler>(&snapshot, &|_| true).unwrap();
+    let compiled =
+        compile_for::<crate::asm::aarch64::MacroAssembler>(&snapshot, &|_| true, &mut crate::scratch::Scratch::new())
+            .unwrap();
     let text = crate::asm::disassembler::aarch64(&compiled.code[..compiled.data_offset as usize]).join("\n");
     // The slow path, the exit stub and the leave stub are the only calls:
     // the callee's frame is published and popped inline.

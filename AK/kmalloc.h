@@ -31,13 +31,9 @@ void ak_kfree(void* ptr);
 [[nodiscard]] void* ak_krealloc(HeapPartition, void* ptr, size_t size);
 [[nodiscard]] size_t ak_kmalloc_usable_size(void const* ptr);
 void ak_kmalloc_collect();
-
-// Sends the calling thread's general allocations to a heap of their own, until ak_leave_scratch_heap() is given what
-// this returned. Work that frees nearly everything it allocates can use it to keep its temporary data out of the pages
-// of what outlives it. Blocks stay valid and are freed as usual after leaving. The heap belongs to the thread and is
-// reused, so what it held goes back to the system with ak_kmalloc_collect(), which must be called outside of it.
-[[nodiscard]] void* ak_enter_scratch_heap();
-void ak_leave_scratch_heap(void* previous_heap);
+// Gives back the memory that the calling thread keeps outside the allocator for its next jobs, for a thread that goes
+// idle (see ladybird_set_idle_thread_memory_release()).
+void ak_release_idle_thread_memory();
 
 [[nodiscard]] inline void* kcalloc(size_t count, size_t size)
 {

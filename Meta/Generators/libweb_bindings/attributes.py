@@ -8,6 +8,7 @@ from io import StringIO
 from typing import TextIO
 
 from Generators.libweb_bindings.context import GenerationContext
+from Generators.libweb_bindings.cpp_types import cpp_type
 from Generators.libweb_bindings.cpp_types import cpp_type_for_idl_type_details
 from Generators.libweb_bindings.cpp_types import fully_qualified_name_for_interface
 from Generators.libweb_bindings.cpp_types import idl_identifier_cpp_name
@@ -18,12 +19,16 @@ from Generators.libweb_bindings.extended_attributes import wrap_with_extended_at
 from Generators.libweb_bindings.glue_headers import bindings_glue_header_for_interface
 from Generators.libweb_bindings.includes import GeneratedIncludes
 from Generators.libweb_bindings.realms import member_realm_expr
+from Generators.libweb_bindings.rust_types import is_member_implemented_in_rust
+from Generators.libweb_bindings.rust_types import rust_member_definition_entry_point
 from Generators.libweb_bindings.security_checks import implementation_check
 from Generators.libweb_bindings.security_checks import interface_needs_security_check
 from Generators.libweb_bindings.security_checks import on_the_window
 from Generators.libweb_bindings.security_checks import perform_a_security_check
 from Generators.libweb_bindings.security_checks import the_remote_window
 from Generators.libweb_bindings.security_checks import window_member_is_cross_origin_accessible
+from Generators.libweb_bindings.to_idl_value import argument_with_string_to_idl_value
+from Generators.libweb_bindings.to_idl_value import string_argument_to_idl_value
 from Generators.libweb_bindings.to_idl_value import to_idl_value
 from Generators.libweb_bindings.to_js_value import to_javascript_value
 from Utils.webidl_parser import Attribute
@@ -219,6 +224,16 @@ def define_the_attributes(
 
     # 1. For each attribute attr of attributes:
     for attribute in attributes:
+        if is_member_implemented_in_rust(attribute):
+            # NB: The Rust bindings define the accessor properties of an attribute that they implement.
+            out.write(
+                wrap_with_extended_attribute_exposure_checks(
+                    includes,
+                    attribute.extended_attributes,
+                    f"    {rust_member_definition_entry_point(interface, attribute)}(&vm, &realm, &object);\n",
+                )
+            )
+            continue
         if "FIXME" in attribute.extended_attributes:
             definition = f'    object.define_unimplemented_property("{attribute.name}"_utf16_fly_string);\n'
             out.write(
@@ -342,7 +357,7 @@ def write_attribute_getters(
     out: TextIO, context: GenerationContext, includes: GeneratedIncludes, interface: Interface
 ) -> None:
     for attribute in interface.regular_attributes:
-        if "FIXME" in attribute.extended_attributes:
+        if "FIXME" in attribute.extended_attributes or is_member_implemented_in_rust(attribute):
             continue
         write_attribute_getter(out, context, includes, interface, attribute)
 
@@ -679,7 +694,7 @@ def write_attribute_setters(
     out: TextIO, context: GenerationContext, includes: GeneratedIncludes, interface: Interface
 ) -> None:
     for attribute in interface.regular_attributes:
-        if "FIXME" in attribute.extended_attributes:
+        if "FIXME" in attribute.extended_attributes or is_member_implemented_in_rust(attribute):
             continue
         if not attribute_has_setter(attribute):
             continue
@@ -908,6 +923,31 @@ def write_attribute_setter(
             return JS::js_undefined();
 
         auto idl_value = maybe_idl_value.release_value();
+
+"""
+        )
+    elif (string_argument := string_argument_to_idl_value(attribute, "V", includes)) is not None:
+        out.write(
+            f"""        auto V_string = {string_argument};
+        auto const& idl_value = V_string.string();
+
+"""
+        )
+    elif (
+        argument := argument_with_string_to_idl_value(
+            attribute,
+            cpp_type(attribute, context),
+            "V",
+            lambda: (
+                f"TRY(WebIDL::throw_dom_exception_if_needed(vm, realm, [&] {{ return {to_idl_value(attribute, 'V', includes, context)}; }}))"
+            ),
+            includes,
+            context,
+        )
+    ) is not None:
+        out.write(
+            f"""        auto V_argument = {argument};
+        auto const& idl_value = V_argument.value();
 
 """
         )

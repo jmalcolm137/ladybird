@@ -7,6 +7,7 @@
 //! Finds a document's encoding declaration before the HTML parser starts, by tokenizing the document's first bytes as
 //! the parser will: the prescan proposed in https://github.com/whatwg/html/issues/6962.
 
+use crate::code_units::RustFfiHtmlUtf16View;
 use crate::known_names::attribute_name;
 use crate::known_names::tag_name;
 use crate::preload_scanner::tokenizer_state_after_start_tag;
@@ -16,6 +17,7 @@ use crate::token::KnownName;
 use crate::token::TokenPayload;
 use crate::token::TokenType;
 use crate::tokenizer::HtmlTokenizer;
+use ak::Utf16View;
 use std::ffi::c_void;
 
 #[repr(C)]
@@ -56,7 +58,7 @@ pub struct MetaCharsetScanner {
 impl MetaCharsetScanner {
     pub fn new(scripting_enabled: bool) -> Self {
         // The bytes arrive in pieces, so the end of the ones so far isn't the end of the input until the caller says so.
-        let mut tokenizer = HtmlTokenizer::new(Vec::new());
+        let mut tokenizer = HtmlTokenizer::new(Vec::<u8>::new());
         tokenizer.set_input_stream_closed(false);
         Self {
             tokenizer,
@@ -76,14 +78,14 @@ impl MetaCharsetScanner {
         &mut self,
         bytes: &[u8],
         input_complete: bool,
-        mut is_encoding: impl FnMut(&str, bool) -> bool,
+        mut is_encoding: impl FnMut(Utf16View<'_>, bool) -> bool,
     ) -> RustFfiMetaCharsetScanResult {
         if self.finished {
             return RustFfiMetaCharsetScanResult::NotFound;
         }
         // Bytes before a declaration only ever matter as ASCII, which every encoding a declaration can name reads the
         // same way, so reading them as Latin-1 tokenizes them as the parser will.
-        self.tokenizer.append_latin1_input(bytes);
+        self.tokenizer.append_input(Utf16View::Latin1(bytes));
         if input_complete {
             self.tokenizer.set_input_stream_closed(true);
         }
@@ -173,7 +175,7 @@ impl MetaCharsetScanner {
 }
 
 // https://html.spec.whatwg.org/multipage/parsing.html#parsing-main-inhead (a start tag whose tag name is "meta")
-fn declares_encoding(attributes: &[Attribute], is_encoding: &mut impl FnMut(&str, bool) -> bool) -> bool {
+fn declares_encoding(attributes: &[Attribute], is_encoding: &mut impl FnMut(Utf16View<'_>, bool) -> bool) -> bool {
     // If the element has a charset attribute, and getting an encoding from its value results in an encoding, ...
     if let Some(charset) = attribute_value(attributes, attribute_name!("charset"))
         && is_encoding(charset, false)
@@ -192,11 +194,11 @@ fn declares_encoding(attributes: &[Attribute], is_encoding: &mut impl FnMut(&str
     attribute_value(attributes, attribute_name!("content")).is_some_and(|content| is_encoding(content, true))
 }
 
-fn attribute_value(attributes: &[Attribute], name: KnownName) -> Option<&str> {
+fn attribute_value(attributes: &[Attribute], name: KnownName) -> Option<Utf16View<'_>> {
     attributes
         .iter()
         .find(|attribute| attribute.local_name == name)
-        .map(|attribute| attribute.value.as_str())
+        .map(|attribute| attribute.value.as_slice())
 }
 
 // https://html.spec.whatwg.org/multipage/parsing.html#parsing-main-inhead
@@ -268,11 +270,11 @@ pub unsafe extern "C" fn rust_html_meta_charset_scanner_scan(
     input: ak::Span<'_, u8>,
     input_complete: bool,
     ctx: *mut c_void,
-    is_encoding: unsafe extern "C" fn(ctx: *mut c_void, value: *const u8, value_len: usize, is_content: bool) -> bool,
+    is_encoding: unsafe extern "C" fn(ctx: *mut c_void, value: RustFfiHtmlUtf16View, is_content: bool) -> bool,
 ) -> RustFfiMetaCharsetScanResult {
     let scanner = unsafe { &mut *scanner };
     scanner.scan(input.as_slice(), input_complete, |value, is_content| unsafe {
-        is_encoding(ctx, value.as_ptr(), value.len(), is_content)
+        is_encoding(ctx, value.into(), is_content)
     })
 }
 
@@ -280,8 +282,10 @@ pub unsafe extern "C" fn rust_html_meta_charset_scanner_scan(
 mod tests {
     use super::*;
 
-    fn is_utf8(value: &str, _: bool) -> bool {
-        value.to_ascii_lowercase().contains("utf-8")
+    fn is_utf8(value: Utf16View<'_>, _: bool) -> bool {
+        String::from_utf16_lossy(&value.to_utf16())
+            .to_ascii_lowercase()
+            .contains("utf-8")
     }
 
     fn scan_all(input: &[u8]) -> RustFfiMetaCharsetScanResult {

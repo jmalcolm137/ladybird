@@ -39,6 +39,8 @@ static MTLPixelFormat metal_pixel_format(MetalTextureFormat format)
     switch (format) {
     case MetalTextureFormat::BGRA8:
         return MTLPixelFormatBGRA8Unorm;
+    case MetalTextureFormat::RGBA8:
+        return MTLPixelFormatRGBA8Unorm;
     case MetalTextureFormat::R8:
         return MTLPixelFormatR8Unorm;
     case MetalTextureFormat::RG8:
@@ -66,8 +68,9 @@ public:
 
     OwnPtr<MetalTexture> create_texture_from_iosurface(Core::IOSurfaceHandle const& iosurface, MetalTextureFormat format, size_t plane) override
     {
+        auto pixel_format = metal_pixel_format(format);
         auto* const descriptor = [[MTLTextureDescriptor alloc] init];
-        descriptor.pixelFormat = metal_pixel_format(format);
+        descriptor.pixelFormat = pixel_format;
         descriptor.width = iosurface.plane_count() > 0 ? iosurface.plane_width(plane) : iosurface.width();
         descriptor.height = iosurface.plane_count() > 0 ? iosurface.plane_height(plane) : iosurface.height();
         descriptor.storageMode = MTLStorageModeShared;
@@ -78,6 +81,12 @@ public:
         if (!texture)
             return {};
         return make<MetalTextureImpl>(texture);
+    }
+
+    bool rows_have_linear_texture_alignment(Core::IOSurfaceHandle const& iosurface, MetalTextureFormat format, size_t plane) const override
+    {
+        auto bytes_per_row = iosurface.plane_count() > 0 ? iosurface.bytes_per_row_of_plane(plane) : iosurface.bytes_per_row();
+        return bytes_per_row % [m_device minimumLinearTextureAlignmentForPixelFormat:metal_pixel_format(format)] == 0;
     }
 
     void when_committed_work_is_scheduled(Function<void()>&& callback) override

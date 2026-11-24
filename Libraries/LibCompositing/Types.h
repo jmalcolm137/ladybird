@@ -11,11 +11,14 @@
 #include <AK/EnumBits.h>
 #include <AK/Math.h>
 #include <AK/Optional.h>
+#include <AK/String.h>
 #include <AK/Time.h>
 #include <AK/Types.h>
 #include <AK/Vector.h>
 #include <LibCompositing/Export.h>
 #include <LibCompositing/Scrolling/AsyncScrollingState.h>
+#include <LibCompositing/Scrolling/ScrollSnapSelection.h>
+#include <LibGfx/Rect.h>
 #include <LibIPC/Forward.h>
 #include <LibWebCommon/Page/CompositorContextId.h>
 #include <LibWebCommon/Page/InputEvent.h>
@@ -37,6 +40,19 @@ enum class ContextVisibility : u8 {
     Hidden,
 };
 
+enum class RemoteLayerHostKind : u8 {
+    None,
+    CoreAnimationContext,
+    Win32ChildWindow,
+};
+
+struct RemoteLayerHostHandle {
+    RemoteLayerHostKind kind { RemoteLayerHostKind::None };
+    u64 id { 0 };
+
+    bool operator==(RemoteLayerHostHandle const&) const = default;
+};
+
 // Where a reader of the compositor's async scroll updates takes them from: the ones the compositor pushed
 // (already here, in order with the input it forwarded), or the compositor's state as of now, asked for
 // synchronously, for a reader that routes input against the offsets the compositor holds this instant.
@@ -49,6 +65,18 @@ enum class ScrollAnimationKind : u8 {
     SmoothScroll,
     Wheel,
     Momentum,
+};
+
+// Where the first step of a wheel gesture over a position goes, as far as the admission and the hit test decide it.
+struct FirstWheelStepRoute {
+    Web::InputRoutingDecision decision;
+    Optional<Web::AsyncScrollNodeStableID> scroller {};
+};
+
+struct FirstWheelStepRouteForTesting {
+    FirstWheelStepRoute route;
+    // The document whose scrolling state decided the route.
+    Optional<Web::UniqueNodeID> document_id;
 };
 
 // A scroll the compositor started for user input of its own: the main thread registers it as a user scroll in
@@ -100,14 +128,6 @@ struct PendingAsyncScrollUpdates {
     Vector<Web::AsyncScrollNodeStableID> boxes_in_user_scroll_gesture;
     Vector<Web::AsyncScrollNodeStableID> boxes_whose_user_scroll_gesture_ended;
     Optional<Web::AsyncScrollNodeStableID> wheel_latched_scroller;
-};
-
-struct AsyncScrollEnqueueResult {
-    bool accepted { false };
-    Optional<AsyncScrollOperationID> operation_id {};
-    // Why the compositor took or turned away a wheel step, and the scroller it routed the step to.
-    Optional<Web::InputRoutingDecision> routing_decision {};
-    Optional<Web::AsyncScrollNodeStableID> routed_scroller {};
 };
 
 // What the compositor did with a wheel event that WebContent's main thread passed on to it, as the compositor does with
@@ -293,6 +313,56 @@ struct ScrollRequest {
     }
 };
 
+enum class VisualContextNodeKind : u8 {
+    Spatial,
+    Effect,
+};
+
+// A node of the visual context tree that the name of a layer mentions, with the element whose box owns it. The
+// compositor names the node, and the view asks the page for the element.
+struct CompositorLayerNodeDescription {
+    VisualContextNodeKind kind { VisualContextNodeKind::Spatial };
+    u32 index { 0 };
+    String element;
+
+    bool operator==(CompositorLayerNodeDescription const&) const = default;
+};
+
+struct CompositorLayerDescription {
+    u64 id { 0 };
+    String name;
+    String details;
+    u32 rgb_of_outline { 0 };
+    bool hidden { false };
+    // In the device pixels of the viewport: what of the layer's outline the frame shows.
+    Gfx::IntRect visible_rect_in_viewport;
+    Vector<CompositorLayerNodeDescription> nodes;
+    u64 tiles_rastered_since_reset { 0 };
+    String raster_causes_since_reset;
+
+    bool operator==(CompositorLayerDescription const&) const = default;
+};
+
+struct CompositorTileHighlightDescription {
+    String raster_cause;
+    u32 rgb { 0 };
+
+    bool operator==(CompositorTileHighlightDescription const&) const = default;
+};
+
+struct CompositorLayersDescription {
+    // From the base layer up.
+    Vector<CompositorLayerDescription> layers;
+    Vector<String> notes;
+    String summary_of_last_frame;
+    Vector<CompositorTileHighlightDescription> tile_highlights;
+    String summary_since_reset;
+    // The tree whose nodes the layers name, which the page names the elements of only while it holds the same tree.
+    u64 visual_context_tree_structural_epoch { 0 };
+
+    bool operator==(CompositorLayersDescription const&) const = default;
+};
+
 // AD-HOC: Wheel events carry no gesture phase information, so a wheel gesture is considered finished once no input of
 //         it has moved a scrolling box for this long. The side that scrolled the gesture's steps decides when its
 //         input ran out: the compositor reports the end of a gesture whose steps it chained, and the main thread
@@ -301,66 +371,4 @@ inline constexpr AK::Duration user_scroll_settle_delay = AK::Duration::from_mill
 
 }
 
-namespace IPC {
-
-template<>
-COMPOSITING_API ErrorOr<void> encode(Encoder&, Compositing::KeyboardScrollState const&);
-template<>
-COMPOSITING_API ErrorOr<Compositing::KeyboardScrollState> decode(Decoder&);
-
-template<>
-COMPOSITING_API ErrorOr<void> encode(Encoder&, Compositing::AsyncScrollOffset const&);
-template<>
-COMPOSITING_API ErrorOr<Compositing::AsyncScrollOffset> decode(Decoder&);
-
-template<>
-COMPOSITING_API ErrorOr<void> encode(Encoder&, Compositing::SnapAreaIdentity const&);
-template<>
-COMPOSITING_API ErrorOr<Compositing::SnapAreaIdentity> decode(Decoder&);
-
-template<>
-COMPOSITING_API ErrorOr<void> encode(Encoder&, Compositing::SnapDestination const&);
-template<>
-COMPOSITING_API ErrorOr<Compositing::SnapDestination> decode(Decoder&);
-
-template<>
-COMPOSITING_API ErrorOr<void> encode(Encoder&, Compositing::StartedUserScroll const&);
-template<>
-COMPOSITING_API ErrorOr<Compositing::StartedUserScroll> decode(Decoder&);
-
-template<>
-COMPOSITING_API ErrorOr<void> encode(Encoder&, Compositing::AppliedScrollRequest const&);
-template<>
-COMPOSITING_API ErrorOr<Compositing::AppliedScrollRequest> decode(Decoder&);
-
-template<>
-COMPOSITING_API ErrorOr<void> encode(Encoder&, Compositing::PendingAsyncScrollUpdates const&);
-template<>
-COMPOSITING_API ErrorOr<Compositing::PendingAsyncScrollUpdates> decode(Decoder&);
-
-template<>
-COMPOSITING_API ErrorOr<void> encode(Encoder&, Compositing::RequestedRelativeScroll const&);
-template<>
-COMPOSITING_API ErrorOr<Compositing::RequestedRelativeScroll> decode(Decoder&);
-
-template<>
-COMPOSITING_API ErrorOr<void> encode(Encoder&, Compositing::RequestedSmoothScroll const&);
-template<>
-COMPOSITING_API ErrorOr<Compositing::RequestedSmoothScroll> decode(Decoder&);
-
-template<>
-COMPOSITING_API ErrorOr<void> encode(Encoder&, Compositing::ScrollRequest const&);
-template<>
-COMPOSITING_API ErrorOr<Compositing::ScrollRequest> decode(Decoder&);
-
-template<>
-COMPOSITING_API ErrorOr<void> encode(Encoder&, Compositing::WheelEventAnswer const&);
-template<>
-COMPOSITING_API ErrorOr<Compositing::WheelEventAnswer> decode(Decoder&);
-
-template<>
-COMPOSITING_API ErrorOr<void> encode(Encoder&, Compositing::WheelStepLetThrough const&);
-template<>
-COMPOSITING_API ErrorOr<Compositing::WheelStepLetThrough> decode(Decoder&);
-
-}
+#include <LibCompositing/TypesCodecs.h>

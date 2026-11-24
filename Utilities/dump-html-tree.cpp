@@ -21,6 +21,7 @@
 #include <LibWeb/DOM/DocumentFragment.h>
 #include <LibWeb/DOM/DocumentType.h>
 #include <LibWeb/DOM/Element.h>
+#include <LibWeb/DOM/ElementFactory.h>
 #include <LibWeb/DOM/ShadowRoot.h>
 #include <LibWeb/HTML/CustomElements/CustomElementRegistry.h>
 #include <LibWeb/HTML/HTMLTemplateElement.h>
@@ -34,6 +35,7 @@
 #include <LibWebCommon/CSS/PreferredColorScheme.h>
 #include <LibWebCommon/CSS/PreferredContrast.h>
 #include <LibWebCommon/CSS/PreferredMotion.h>
+#include <LibWebCommon/HTML/CrossProcessId.h>
 
 class DumpHTMLTreePageClient final : public Web::PageClient {
     GC_CELL(DumpHTMLTreePageClient, Web::PageClient);
@@ -50,6 +52,8 @@ public:
     void set_page(GC::Ref<Web::Page> page) { m_page = page; }
 
     virtual Web::PageId id() const override { return Web::PageId { 0 }; }
+    // This page never talks to a UI process, so its ids only need to be unique within it.
+    virtual Web::HTML::CrossProcessId allocate_cross_process_id() override { return m_cross_process_id_allocator.allocate(); }
     virtual Web::Page& page() override { return *m_page; }
     virtual Web::Page const& page() const override { return *m_page; }
     virtual bool is_connection_open() const override { return true; }
@@ -74,7 +78,6 @@ private:
         auto buffer = MUST(Core::AnonymousBuffer::create_with_size(sizeof(Gfx::SystemTheme)));
         auto* theme = buffer.data<Gfx::SystemTheme>();
         theme->color[to_underlying(Gfx::ColorRole::Window)] = Color(Color::White).value();
-        theme->color[to_underlying(Gfx::ColorRole::WindowText)] = Color(Color::Black).value();
         m_palette_impl = Gfx::PaletteImpl::create_with_anonymous_buffer(buffer);
     }
 
@@ -87,6 +90,7 @@ private:
     GC::Ptr<Web::Page> m_page;
     RefPtr<Gfx::PaletteImpl> m_palette_impl;
     Queue<Web::QueuedInputEvent> m_input_event_queue;
+    Web::HTML::CrossProcessIdAllocator m_cross_process_id_allocator { .namespace_id = NumericLimits<u64>::max() };
 };
 
 GC_DEFINE_ALLOCATOR(DumpHTMLTreePageClient);
@@ -294,10 +298,18 @@ static GC::Ref<Web::DOM::Document> parse_html(Web::Page& page, Web::DOM::Documen
     return document;
 }
 
+static GC::Ref<Web::DOM::DocumentFragment> parse_html_fragment(Web::DOM::Element& context, Utf16View input, Web::HTML::FragmentFastPath fast_path)
+{
+    return MUST(Web::HTML::HTMLParser::parse_html_fragment(GC::Ref { context }, input,
+        Web::HTML::HTMLParser::AllowDeclarativeShadowRoots::No, Web::HTML::ParserScriptingMode::Inert, fast_path));
+}
+
 ErrorOr<int> ladybird_main(Main::Arguments arguments)
 {
     StringView file_path;
+    StringView fragment_context;
     bool silent = false;
+    bool skip_fragment_fast_path = false;
     int iterations = 1;
 
     Core::ArgsParser args_parser;
@@ -306,6 +318,8 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
         "Use --silent for perf work on the parser itself.");
     args_parser.add_positional_argument(file_path, "Path to HTML file (or - for stdin)", "file", Core::ArgsParser::Required::No);
     args_parser.add_option(silent, "Don't print anything (for benchmarking)", "silent", 'q');
+    args_parser.add_option(fragment_context, "Parse the input as a fragment in an element with this tag name", "fragment", 'f', "tag");
+    args_parser.add_option(skip_fragment_fast_path, "Parse fragments with the tree builder only", "skip-fragment-fast-path");
     args_parser.add_option(iterations, "Run the parser N times, reporting timing unless --silent is used", "iterations", 'n', "count");
     args_parser.parse(arguments);
 
@@ -343,19 +357,31 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
 
     auto timer = Core::ElapsedTimer::start_new();
 
-    for (int i = 0; i < iterations; i++) {
-        auto document = parse_html(page, origin_document, input);
-        if (!silent && i == 0)
-            dump_tree(document);
+    if (fragment_context.is_empty()) {
+        for (int i = 0; i < iterations; i++) {
+            auto document = parse_html(page, origin_document, input);
+            if (!silent && i == 0)
+                dump_tree(document);
+        }
+    } else {
+        auto document = parse_html(page, origin_document, "<!DOCTYPE html>"sv);
+        auto context = MUST(Web::DOM::create_element(document, Utf16FlyString::from_utf8(fragment_context), Web::Namespace::HTML));
+        auto fragment_input = Utf16String::from_utf8_with_replacement_character(input);
+        auto fast_path = skip_fragment_fast_path ? Web::HTML::FragmentFastPath::Skip : Web::HTML::FragmentFastPath::Allow;
+        for (int i = 0; i < iterations; i++) {
+            auto fragment = parse_html_fragment(context, fragment_input, fast_path);
+            if (!silent && i == 0)
+                dump_tree(fragment);
+        }
     }
 
     if (iterations > 1 && !silent) {
-        auto elapsed_ms = timer.elapsed_milliseconds();
-        warnln("input={}B iterations={} total={}ms ({:.3f}ms/iter)",
+        auto elapsed_us = timer.elapsed_time().to_microseconds();
+        warnln("input={}B iterations={} total={}ms ({:.4f}ms/iter)",
             input_data.size(),
             iterations,
-            elapsed_ms,
-            static_cast<double>(elapsed_ms) / iterations);
+            elapsed_us / 1000,
+            static_cast<double>(elapsed_us) / 1000 / iterations);
     }
 
     return 0;

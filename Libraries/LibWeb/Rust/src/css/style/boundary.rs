@@ -14,8 +14,7 @@
 
 use super::ReplacedContentInput;
 use super::StyleEngine;
-use super::animations::HeldAppliedAnimationDefinition;
-use super::bridge::{ElementBoxKind, FfiAppliedAnimationDefinition, borrow};
+use super::bridge::{ElementBoxKind, borrow};
 use super::bridge::{FfiFrameSetBorder, FfiFrameSetDimension};
 use super::engine_calls::EngineWrite;
 use super::engine_calls::with_engine;
@@ -98,9 +97,6 @@ carried! {
         |span| unsafe { borrow(span.data, span.size) }.iter().copied().map(StyleAtomID).collect();
     Box<[StyleNodeID]>: FfiSpan<u32> as "ReadonlySpan<StyleNodeID>" =
         |span| unsafe { borrow(span.data, span.size) }.iter().copied().filter_map(StyleNodeID::from_raw).collect();
-    Box<[HeldAppliedAnimationDefinition]>: FfiSpan<FfiAppliedAnimationDefinition>
-        as "ReadonlySpan<FfiAppliedAnimationDefinition>" =
-        |span| unsafe { borrow(span.data, span.size) }.iter().map(|&definition| unsafe { HeldAppliedAnimationDefinition::retained(definition) }).collect();
     FfiSpan<u16>: FfiSpan<u16> as "ReadonlySpan<u16>" = |span| span;
     FfiSpan<u32>: FfiSpan<u32> as "ReadonlySpan<StyleNodeID>" = |span| span;
 }
@@ -431,9 +427,6 @@ style_boundary! {
             engine.set_held_pseudo_style_record(node, target, style_record);
             drop(released);
         };
-        set_element_css_defined_animations => SetElementCssDefinedAnimations {
-            node: StyleNodeID, slot: u8, names: Box<[CssString]>, definitions: Box<[HeldAppliedAnimationDefinition]>
-        } => engine.set_element_css_defined_animations(node, slot, names, definitions);
         set_sheet_conditions_hold => SetSheetConditionsHold { sheet: SheetID, conditions_hold: bool };
     }
 
@@ -507,29 +500,24 @@ style_boundary! {
         defer_pending_transaction_for_geometry_read() -> ();
         begin_deferred_geometry_transaction_flush() -> bool;
         has_deferred_geometry_transaction() -> bool;
-        cold_pass(root: Option<StyleNodeID>, verify: bool, threads: u32) -> u64 => root.map_or(0, |root| engine.run_cold_pass(root, verify, threads));
-        cold_pass_report(index: u32) -> u64 => engine.cold_pass_report(index);
-        live_report(root: Option<StyleNodeID>, verify: bool, index: u32) -> u64 =>
-            root.map_or(0, |root| engine.retained.live_report(root, verify, index));
-        style_counter(index: u32) -> u64 => engine.retained.live_counters.get(index);
-        reset_style_counters() -> bool => {
-            engine.retained.live_counters.reset();
+        begin_style_trace() -> bool => {
+            engine.retained.live_counters.begin_trace();
             true
         };
-        last_pass_is_full() -> bool => engine.retained.live_counters.last_pass_is_full();
-        last_pass_size(root: Option<StyleNodeID>, changed: bool) -> u32 => root.map_or(0, |root| {
+        end_style_trace() -> bool => {
+            engine.retained.live_counters.end_trace();
+            true
+        };
+        style_trace_size(root: Option<StyleNodeID>) -> u32 => root.map_or(0, |root| {
             let retained = &mut engine.retained;
-            retained.live_counters.last_pass_elements(&retained.projection, root, changed).len() as u32
+            retained.live_counters.trace_entries(&retained.projection, root).len() as u32
         });
-        last_pass_element(root: Option<StyleNodeID>, changed: bool, index: u32) -> u32 => root.map_or(0, |root| {
+        style_trace_entry(root: Option<StyleNodeID>, index: u32) -> u64 => root.map_or(0, |root| {
             let retained = &mut engine.retained;
-            let elements = retained.live_counters.last_pass_elements(&retained.projection, root, changed);
-            elements.get(index as usize).map_or(0, |node| node.raw())
+            let entries = retained.live_counters.trace_entries(&retained.projection, root);
+            entries.get(index as usize).copied().unwrap_or(0)
         });
-        animated_style_samples(rebuilt_every_group: bool, reset: bool) -> u64 =>
-            engine.retained.live_counters.animated_samples(rebuilt_every_group, reset);
         layer_index(tree_scope: TreeScopeID, layer: CascadeLayerID) -> u32;
-        size_query_container_scan_visits(reset: bool) -> u64;
         ensure_random_base_value(node: Option<StyleNodeID>, name: FfiSpan<u16>, element_shared: bool) -> u64 => {
             // SAFETY: The host lends the name for the call.
             let name = unsafe { borrow(name.data, name.size) };

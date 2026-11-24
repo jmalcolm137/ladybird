@@ -370,7 +370,7 @@ impl<'a, Arena: PaintRead> ChromeGeometry<'a, Arena> {
                         rect.x += metrics.resize_gripper_size;
                     }
                 }
-                rect.y = (rect.bottom() - rect_thickness).max(zero);
+                rect.y = (rect.bottom() - rect_thickness).max(rect.y);
                 rect.height = rect_thickness;
             }
             ScrollDirection::Vertical => {
@@ -378,7 +378,7 @@ impl<'a, Arena: PaintRead> ChromeGeometry<'a, Arena> {
                     rect.height = self.available_scrollbar_length(slot, direction);
                 }
                 if !mirrored {
-                    rect.x = (rect.right() - rect_thickness).max(zero);
+                    rect.x = (rect.right() - rect_thickness).max(rect.x);
                 }
                 rect.width = rect_thickness;
             }
@@ -479,7 +479,7 @@ pub(crate) struct ScrollbarColors {
 
 /// The color behind what `slot` paints, as far as background colors tell: the canvas's, with the backgrounds of `slot`
 /// and its ancestors composited over it. Background images, and content of other boxes painted underneath, don't count.
-pub(crate) fn estimated_backdrop_color(
+fn estimated_backdrop_color(
     arena: &impl PaintRead,
     slot: NodeSlotId,
     root_background_source: RootBackgroundSource,

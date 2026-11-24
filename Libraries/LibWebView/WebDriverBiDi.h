@@ -23,6 +23,7 @@
 #include <LibWebCommon/WebDriver/BiDi.h>
 #include <LibWebCommon/WebDriver/Response.h>
 #include <LibWebView/Forward.h>
+#include <LibWebView/LocalFileRoot.h>
 
 namespace WebView {
 
@@ -139,7 +140,7 @@ private:
         Interactive,
         Complete,
     };
-    void await_a_navigation(CanonicalNavigable&, URL::URL, WaitCondition, CommandResult);
+    void await_a_navigation(CanonicalNavigable&, URL::URL, WaitCondition, LocalFileAccess, CommandResult);
     void await_navigation_completion(Web::HTML::CrossProcessId navigable_id, Utf16String const& navigation_id, WaitCondition, CommandResult);
 
     void browsing_context_activate(JsonObject const& params, CommandResult);
@@ -169,6 +170,9 @@ private:
         RefPtr<WebContentPage> page;
         Web::HTML::CrossProcessId navigable_id;
         u64 generation;
+        Optional<URL::URL> url;
+        // The id of the navigation the request fetches the response of, if it does.
+        Optional<Utf16String> navigation_id;
     };
     u64 m_next_network_interception_generation { 0 };
     HashMap<String, BlockedNetworkRequest> m_blocked_network_requests;

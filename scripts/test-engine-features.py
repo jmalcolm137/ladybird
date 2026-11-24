@@ -148,7 +148,7 @@ def main():
     for key in ("LD_LIBRARY_PATH", "WAYLAND_DISPLAY", "DISPLAY"):
         env.pop(key, None)
 
-    crash_report_dir = os.path.join(tmp, "data", "Ladybird", "CrashReports")
+    crash_report_dir = os.path.join(tmp, "data", "Ladybird", "Profiles", "feature-test", "CrashReports")
     os.makedirs(crash_report_dir)
     crash_report_name = "2026-11-01T00-00-00Z-WebContent-abc123.txt"
     crash_report_text = """Ladybird crash report, format 1

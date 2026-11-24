@@ -28,6 +28,7 @@ struct FaceStyle {
 struct FaceVerticalMetrics {
     i32 ascender { 0 };
     i32 descender { 0 };
+    i32 line_gap { 0 };
     // The sxHeight of the OS/2 table, or 0 if the table does not give it.
     i32 x_height { 0 };
 };
@@ -40,6 +41,10 @@ public:
     FlyString const& family() const { return m_family; }
     FaceStyle style() const { return m_style; }
     FaceVerticalMetrics const& vertical_metrics() const { return m_vertical_metrics; }
+
+    // Whether the face has a cmap subtable of the Windows symbol encoding, which marks a font of symbols rather than of
+    // text, even where its other subtables map letters (to ornaments, e.g.).
+    bool is_symbol_font() const { return m_is_symbol_font; }
 
     // The style of the face with these variations applied.
     FaceStyle style_for_variations(ReadonlySpan<FontVariationAxis>) const;
@@ -60,6 +65,7 @@ private:
     };
 
     FlyString m_family;
+    bool m_is_symbol_font { false };
     // The style that the OS/2 and head tables give, which the axes of a variable face can change.
     FaceStyle m_declared_style;
     FaceStyle m_style;

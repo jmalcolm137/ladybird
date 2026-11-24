@@ -24,10 +24,10 @@ def run_test(webdriver_binary, graphical):
             json.dumps(
                 {
                     "searchEngine": {
-                        "name": "Google",
+                        "engine": "Google",
+                        "suggestions": True,
                         "custom": [{"name": "Plain custom", "url": "https://example.com/search?q=%s"}],
                     },
-                    "autocompleteEngine": {"name": "Google"},
                 }
             )
         )
@@ -158,7 +158,7 @@ def run_test(webdriver_binary, graphical):
             )
             script("""
                 document.querySelector('#search-custom-name').value = 'Custom suggestions';
-                document.querySelector('#search-custom-url').value = 'https://example.com/search?q=%s';
+                document.querySelector('#search-custom-url').value = 'example.com/search?q=%s';
             """)
             for url in ("https://example.com/suggest", "file:///tmp/%s", "data:text/plain,%s"):
                 script(
@@ -174,20 +174,25 @@ def run_test(webdriver_binary, graphical):
 
             change_settings(
                 """
-                document.querySelector('#search-custom-suggestions-url').value = 'https://example.com/suggest?q=%s';
+                document.querySelector('#search-custom-suggestions-url').value = 'example.com/suggest?q=%s';
                 document.querySelector('#search-custom-add').click();
             """,
                 "settings.searchEngine.custom.some(engine => engine.name === 'Custom suggestions')",
             )
+            custom = next(
+                engine
+                for engine in json.loads(settings_file.read_text())["searchEngine"]["custom"]
+                if engine["name"] == "Custom suggestions"
+            )
+            assert custom["url"] == "https://example.com/search?q=%s", custom
+            assert custom["suggestionsUrl"] == "https://example.com/suggest?q=%s", custom
             script("document.querySelector('#search-close').click()")
             select_engine("Custom suggestions")
             assert state()[:2] == [False, False]
             toggle_suggestions(True)
             saved = json.loads(settings_file.read_text())
-            assert "autocompleteEngine" not in saved
             assert saved["searchEngine"]["engine"] == "Custom suggestions"
             assert saved["searchEngine"]["suggestions"]
-            assert "name" not in saved["searchEngine"]
             assert saved["searchEngine"]["custom"][1]["suggestionsUrl"] == "https://example.com/suggest?q=%s"
 
             helpers["request"](port, "DELETE", f"/session/{session}")
@@ -203,7 +208,7 @@ def run_test(webdriver_binary, graphical):
                 "!settings.searchEngine.engine",
             )
             assert state() == [True, True, "Choose a search engine to use search suggestions."]
-            print("PASS: search and suggestions use one engine, migrate, and preserve the user's toggle")
+            print("PASS: search and suggestions use one engine and preserve the user's toggle")
         finally:
             if session is not None:
                 helpers["request"](port, "DELETE", f"/session/{session}")

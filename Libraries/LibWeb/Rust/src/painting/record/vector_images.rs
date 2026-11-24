@@ -7,6 +7,7 @@
 use crate::css::css_pixels::CssPixels;
 use crate::layout::node_data::NodeSlotId;
 use crate::painting::display_list::commands::DisplayListResourceId;
+use crate::painting::force_dark::ForceDarkSettings;
 use crate::painting::host::{FfiLayerImageList, FfiVectorImageRenderRequest};
 use libgfx_rust::{FloatRect, FloatSize, IntSize};
 
@@ -47,11 +48,15 @@ pub(crate) struct VectorImageRenderRequest {
     css_width_raw: i32,
     css_height_raw: i32,
     raster_scale_bits: u32,
-    /// What the SVG image shows, which the host renders it from: a request with the same identity, size, scale and
-    /// color scheme renders the same display list.
+    /// What the SVG image shows, which the host renders it from: a request with the same identity, size, scale, color
+    /// scheme and force-dark settings renders the same display list.
     content_identity: u64,
     /// The color scheme the host renders the SVG image in.
     color_scheme: u8,
+    /// The force-dark settings of the page that draws the image, which the host renders the image's content with.
+    force_dark_enabled: bool,
+    force_dark_foreground_threshold: i32,
+    force_dark_background_threshold: i32,
 }
 
 impl VectorImageRenderRequest {
@@ -62,7 +67,9 @@ impl VectorImageRenderRequest {
         raster_scale: f32,
         content_identity: u64,
         color_scheme: u8,
+        force_dark: Option<ForceDarkSettings>,
     ) -> Self {
+        let force_dark_settings = force_dark.unwrap_or_default();
         Self {
             source,
             css_width_raw: css_width.raw_value(),
@@ -70,6 +77,9 @@ impl VectorImageRenderRequest {
             raster_scale_bits: raster_scale.to_bits(),
             content_identity,
             color_scheme,
+            force_dark_enabled: force_dark.is_some(),
+            force_dark_foreground_threshold: force_dark_settings.foreground_brightness_threshold,
+            force_dark_background_threshold: force_dark_settings.background_brightness_threshold,
         }
     }
 
@@ -95,6 +105,9 @@ impl VectorImageRenderRequest {
             css_height: CssPixels::from_raw(self.css_height_raw),
             raster_scale: self.raster_scale(),
             color_scheme: self.color_scheme,
+            force_dark_enabled: self.force_dark_enabled,
+            force_dark_foreground_threshold: self.force_dark_foreground_threshold,
+            force_dark_background_threshold: self.force_dark_background_threshold,
         }
     }
 }
@@ -122,9 +135,13 @@ pub(crate) fn vector_image_render_geometry(
     has_active_view_box: bool,
 ) -> VectorImageRenderGeometry {
     if has_active_view_box {
+        // The image is rendered at one scale in both axes, since a viewport of other proportions than those of its
+        // destination can change how the image is laid out.
+        let scale = positive_scale_or_one(accumulated_scale.width.max(accumulated_scale.height))
+            .min(MAXIMUM_RASTER_DIMENSION as f32 / dest_rect.width.max(dest_rect.height));
         let raster_size = IntSize {
-            width: raster_dimension(dest_rect.width, accumulated_scale.width),
-            height: raster_dimension(dest_rect.height, accumulated_scale.height),
+            width: raster_dimension(dest_rect.width, scale),
+            height: raster_dimension(dest_rect.height, scale),
         };
         return VectorImageRenderGeometry {
             css_width: CssPixels::from_integer(i64::from(raster_size.width)),
@@ -148,5 +165,35 @@ pub(crate) fn vector_image_render_geometry(
             width: ((css_width.to_float() * raster_scale).round() as i32).max(1),
             height: ((css_height.to_float() * raster_scale).round() as i32).max(1),
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn list_size(width: f32, height: f32, scale_x: f32, scale_y: f32, has_active_view_box: bool) -> (i32, i32) {
+        let geometry = vector_image_render_geometry(
+            FloatRect::new(0.0, 0.0, width, height),
+            FloatSize {
+                width: scale_x,
+                height: scale_y,
+            },
+            has_active_view_box,
+        );
+        (geometry.list_size.width, geometry.list_size.height)
+    }
+
+    #[test]
+    fn vector_image_keeps_the_proportions_of_its_destination() {
+        for has_active_view_box in [true, false] {
+            assert_eq!(list_size(24.0, 12.0, 1.0, 1.0, has_active_view_box), (24, 12));
+            assert_eq!(list_size(24.0, 12.0, 4.0, 4.0, has_active_view_box), (96, 48));
+            assert_eq!(list_size(24.0, 12.0, 2.0, 3.0, has_active_view_box), (72, 36));
+            assert_eq!(list_size(24.0, 12.0, 3.0, 0.5, has_active_view_box), (72, 36));
+            assert_eq!(list_size(24.0, 12.0, 0.5, 0.25, has_active_view_box), (12, 6));
+            assert_eq!(list_size(24.0, 12.0, f32::NAN, 2.0, has_active_view_box), (48, 24));
+            assert_eq!(list_size(8192.0, 4096.0, 4.0, 4.0, has_active_view_box), (16384, 8192));
+        }
     }
 }

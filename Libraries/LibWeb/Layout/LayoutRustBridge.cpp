@@ -56,7 +56,6 @@
 #include <LibWeb/SVG/SVGPolylineElement.h>
 #include <LibWeb/SVG/SVGRectElement.h>
 #include <LibWeb/SVG/SVGSVGElement.h>
-#include <LibWeb/SVG/SVGSymbolElement.h>
 #include <LibWeb/SVG/SVGTextElement.h>
 #include <LibWeb/SVG/SVGTextPathElement.h>
 #include <LibWeb/SVG/SVGTextPositioningElement.h>
@@ -280,6 +279,11 @@ static RustFFI::FfiSvgAttributeFacts build_svg_attribute_facts(DOM::Element& dom
     if (auto const* text_positioning_element = as_if<SVG::SVGTextPositioningElement>(dom_node))
         text_positioning = text_positioning_element->parsed_text_positioning();
 
+    // NB: Only the text length of a <text> adjusts its text. One on a <tspan> or a <textPath> is left alone.
+    SVG::SVGTextContentElement::ParsedTextLength text_length;
+    if (auto const* text_element = as_if<SVG::SVGTextElement>(dom_node))
+        text_length = text_element->parsed_text_length();
+
     CSS::StyleAtomID reference_fragment;
     SVG::NumberPercentage start_offset = SVG::NumberPercentage::create_number(0);
     if (auto const* text_path_element = as_if<SVG::SVGTextPathElement>(dom_node)) {
@@ -317,8 +321,6 @@ static RustFFI::FfiSvgAttributeFacts build_svg_attribute_facts(DOM::Element& dom
     return {
         .is_graphics_element = is<SVG::SVGGraphicsElement>(dom_node),
         .is_use_element = is<SVG::SVGUseElement>(dom_node),
-        .is_svg_svg_element = is<SVG::SVGSVGElement>(dom_node),
-        .is_symbol_element = is<SVG::SVGSymbolElement>(dom_node),
         .is_text_element = is<SVG::SVGTextElement>(dom_node),
         .is_fit_to_view_box = fit_to_view_box != nullptr,
         .has_active_view_box = active_view_box.has_value(),
@@ -345,6 +347,8 @@ static RustFFI::FfiSvgAttributeFacts build_svg_attribute_facts(DOM::Element& dom
         .text_y = to_ffi_svg_length_value(text_positioning.y),
         .text_dx = to_ffi_svg_length_value(text_positioning.dx),
         .text_dy = to_ffi_svg_length_value(text_positioning.dy),
+        .text_length = to_ffi_svg_length_value(text_length.text_length),
+        .text_length_adjusts_glyphs = text_length.adjusts_glyphs,
         .reference_fragment_atom = reference_fragment.value(),
         .mask_reference_atom = style_references[0].value(),
         .clip_path_reference_atom = style_references[1].value(),

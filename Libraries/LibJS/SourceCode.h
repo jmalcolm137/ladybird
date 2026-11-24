@@ -17,6 +17,12 @@
 #include <LibJS/Forward.h>
 #include <LibJS/Position.h>
 
+namespace JS::FFI {
+
+struct WeakSourceCode;
+
+}
+
 namespace JS {
 
 // The source code that scripts, modules and functions are compiled from. A pointer to it is the Rust runtime's source
@@ -32,16 +38,31 @@ public:
     static NonnullRefPtr<SourceCode const> create(Utf16String filename, Utf16String code);
 
     Utf16String const& filename() const;
-    Utf16String const& code() const;
+    // NB: The runtime may hold the code compressed, so this is a string of its own, not a reference to one.
+    Utf16String code() const;
     size_t length_in_code_units() const;
-
-    Utf16String source_text_from_offsets(size_t start_offset, size_t length) const;
 
     void ref() const;
     void unref() const;
 
     SourceCode() = delete;
     ~SourceCode() = delete;
+};
+
+// A weak reference to source code, which tells whether anything still holds it. Only the VM's thread may use it.
+class JS_API WeakSourceCode {
+    AK_MAKE_NONCOPYABLE(WeakSourceCode);
+
+public:
+    explicit WeakSourceCode(SourceCode const&);
+    WeakSourceCode(WeakSourceCode&&);
+    WeakSourceCode& operator=(WeakSourceCode&&);
+    ~WeakSourceCode();
+
+    bool is_alive() const;
+
+private:
+    FFI::WeakSourceCode* m_weak { nullptr };
 };
 
 }

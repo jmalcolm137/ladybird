@@ -38,9 +38,9 @@ pub(super) fn verification_is_enabled() -> bool {
 /// progress around it already. Nothing it does is traced.
 pub(super) fn lay_out_discarded_run(
     pass: &LayoutPass<'_>,
-    run: impl for<'discarded> FnOnce(LayoutPass<'discarded>) -> formatting_context::RunOutputs,
-) -> Option<formatting_context::RunOutputs> {
-    if run_repeatability_verification() == RunRepeatabilityVerification::Off || pass.reads_no_memoized_layout() {
+    run: impl for<'discarded> FnOnce(LayoutPass<'discarded>) -> formatting_context::LayoutResult,
+) -> Option<formatting_context::LayoutResult> {
+    if run_repeatability_verification() == RunRepeatabilityVerification::Off || pass.is_discarded_run() {
         return None;
     }
     Some(pass.lay_out_discarded_run(run))
@@ -49,8 +49,8 @@ pub(super) fn lay_out_discarded_run(
 /// Checks that the run of `box_` that produced `used` repeated what the discarded run that produced `discarded` did.
 pub(super) fn verify_repeated_run(
     box_: Node,
-    discarded: &formatting_context::RunOutputs,
-    used: &formatting_context::RunOutputs,
+    discarded: &formatting_context::LayoutResult,
+    used: &formatting_context::LayoutResult,
 ) {
     ComparedLayouts {
         checked: &format!("the run of {box_:?}"),
@@ -179,23 +179,23 @@ pub(super) fn verify_run_ignores_its_unobserved_own_block_size_and_block_margins
     box_: Node,
     root_cells: used_values::RootInputCells,
     input: &LayoutInput,
-    outputs: &formatting_context::RunOutputs,
+    outputs: &formatting_context::LayoutResult,
     lay_out: impl for<'discarded> Fn(
         LayoutPass<'discarded>,
         used_values::RootInputCells,
         LayoutInput,
-    ) -> formatting_context::RunOutputs,
+    ) -> formatting_context::LayoutResult,
 ) {
-    if !unobserved_own_block_size_verification_is_enabled() || pass.reads_no_memoized_layout() {
+    if !unobserved_own_block_size_verification_is_enabled() || pass.is_discarded_run() {
         return;
     }
     let checked = format!("the run of {box_:?}, which never observed its own block size or block margins,");
-    let own_block_size = outputs.inputs_never_observed.own_block_size;
+    let own_block_size = outputs.observed.never_observed.own_block_size;
     let mut reference_inputs = root_inputs_at_other_own_block_sizes(
         root_cells,
         input.clone(),
         own_block_size,
-        outputs.result.automatic_content_block_size,
+        outputs.outcome.automatic_content_block_size,
     )
     .into_iter()
     .map(|(cells, input)| {
@@ -233,42 +233,51 @@ impl ComparedLayouts<'_> {
     fn verify(
         &self,
         box_: Node,
-        checked_outputs: &formatting_context::RunOutputs,
-        reference_outputs: &formatting_context::RunOutputs,
+        checked_outputs: &formatting_context::LayoutResult,
+        reference_outputs: &formatting_context::LayoutResult,
     ) {
         let Self { checked, reference } = self;
         assert_eq!(
-            checked_outputs.result, reference_outputs.result,
+            checked_outputs.outcome, reference_outputs.outcome,
             "{checked} returned a result {reference} does not"
         );
+        // NB: Where the parent owns the root's cells, they are those of the layout's own input.
+        let cells_left_by_run = |outputs: &formatting_context::LayoutResult| {
+            (!outputs.observed.parent_owns_root_cells).then_some(outputs.cells)
+        };
         assert_eq!(
-            checked_outputs.root_outcome.input_cells_left_by_run,
-            reference_outputs.root_outcome.input_cells_left_by_run,
+            cells_left_by_run(checked_outputs),
+            cells_left_by_run(reference_outputs),
             "{checked} left root cells {reference} does not"
         );
         assert!(
-            checked_outputs.root_outcome.line_data.as_deref() == reference_outputs.root_outcome.line_data.as_deref(),
+            checked_outputs.line_data().map(|line_data| &**line_data)
+                == reference_outputs.line_data().map(|line_data| &**line_data),
             "{checked} left line data {reference} does not"
         );
         assert_eq!(
-            checked_outputs.inputs_never_observed, reference_outputs.inputs_never_observed,
+            checked_outputs.observed, reference_outputs.observed,
             "{checked} claims to have never observed inputs {reference} does not"
         );
         assert!(
             host_findings_match(
-                checked_outputs.host_findings.as_deref(),
-                reference_outputs.host_findings.as_deref()
+                checked_outputs.residue.as_deref().map(|residue| &residue.host_findings),
+                reference_outputs
+                    .residue
+                    .as_deref()
+                    .map(|residue| &residue.host_findings)
             ),
             "{checked} found out for the host what {reference} does not"
         );
-        let (checked_root, reference_root) = match (&checked_outputs.root, &reference_outputs.root) {
+        let (checked_root, reference_root) = match (&checked_outputs.fragment, &reference_outputs.fragment) {
             (None, None) => return,
             (Some(checked_root), Some(reference_root)) => (checked_root, reference_root),
             _ => panic!("{checked} and {reference} do not both build fragments"),
         };
         assert!(
-            fragment_tree::FragmentPayloads::of_fragment(&checked_root.fragment)
-                == fragment_tree::FragmentPayloads::of_fragment(&reference_root.fragment),
+            checked_root
+                .fragment
+                .has_payloads_of_same_value_as(&reference_root.fragment),
             "{checked} hands its root's fragment payloads {reference} does not"
         );
         assert!(
@@ -386,15 +395,15 @@ fn nodes_of(links: &[fragment_tree::FragmentLink]) -> Vec<Node> {
 fn describe_placement(link: &fragment_tree::FragmentLink) -> String {
     format!(
         "offset ({:?}, {:?}) insets ({:?} {:?} {:?} {:?}) line box {:?} in {:?}, abspos inputs {}",
-        link.committed_offset.x,
-        link.committed_offset.y,
-        link.inset_top,
-        link.inset_right,
-        link.inset_bottom,
-        link.inset_left,
-        link.containing_line_box_index,
-        link.containing_block,
-        if link.abspos_layout_inputs.is_some() {
+        link.offset.x,
+        link.offset.y,
+        link.placement.insets.top,
+        link.placement.insets.right,
+        link.placement.insets.bottom,
+        link.placement.insets.left,
+        link.placement.containing_line_box_index,
+        link.placement.containing_block,
+        if link.placement.abspos_layout_inputs.is_some() {
             "present"
         } else {
             "absent"

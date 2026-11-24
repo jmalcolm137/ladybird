@@ -4,23 +4,25 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+use crate::cow_map::CowMap;
 use crate::css::css_enums::{overflow, positioning, writing_mode};
 use crate::css::css_pixels::{CssPixelPoint, CssPixelRect, CssPixels};
 use crate::css::display::FfiDisplay;
 use crate::layout::LayoutNodeArena;
-use crate::layout::fragment_tree::{Fragment, FragmentLink};
-use crate::layout::geometry::Frame;
+use crate::layout::fragment_tree::{Fragment, FragmentLink, OuterLinks, SvgPayload};
+use crate::layout::geometry::{Frame, Side, Sides};
 use crate::layout::inline_content::{InlineContent, PhysicalPlane};
 use crate::layout::node_data::{NodeFlag, NodeKind, NodeSlotId};
 use crate::layout::node_facts::{self, NodeShape};
-use crate::layout::used_values::{self, FfiCssPixelSize};
+use crate::layout::svg_formatting_context::SvgGeometry;
+use crate::layout::used_transform::TransformGeometry;
+use crate::layout::used_values::FfiCssPixelSize;
 use crate::painting::paint_read::{GeometryRead, PaintRead, PaintRow};
-use crate::painting::paintable_data::FfiPixelBox;
-use crate::painting::paintable_geometry::sides_to_physical;
 use crate::painting::scrollable_overflow::physical_overflow_directions_of_style;
-use crate::painting::visual_context::node_values::{self, TransformGeometry};
+use crate::painting::visual_context::node_values;
 use crate::painting::{node_painting, scroll_snap, style_queries};
 use libgfx_rust::AffineTransform;
+use smallvec::SmallVec;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub(crate) struct FragmentScrollableOverflow {
@@ -28,58 +30,15 @@ pub(crate) struct FragmentScrollableOverflow {
     pub(crate) has_scrollable_overflow: bool,
 }
 
-pub(crate) fn physical_content_size(fragment: &Fragment, frame: Frame) -> FfiCssPixelSize {
-    frame.size_to_physical(fragment.content_inline_size, fragment.content_block_size)
-}
-
-pub(crate) fn physical_padding(fragment: &Fragment, frame: Frame) -> FfiPixelBox {
-    sides_to_physical(
-        frame,
-        FfiPixelBox {
-            top: fragment.padding_top,
-            right: fragment.padding_right,
-            bottom: fragment.padding_bottom,
-            left: fragment.padding_left,
-        },
-    )
-}
-
-fn physical_border(fragment: &Fragment, frame: Frame) -> FfiPixelBox {
-    sides_to_physical(
-        frame,
-        FfiPixelBox {
-            top: fragment.border_top,
-            right: fragment.border_right,
-            bottom: fragment.border_bottom,
-            left: fragment.border_left,
-        },
-    )
-}
-
-fn physical_border_box_edges(fragment: &Fragment, frame: Frame) -> FfiPixelBox {
-    let border = physical_border(fragment, frame);
-    if !fragment.uses_collapsing_borders_model {
-        return border;
-    }
-    let is_table_box = fragment.is_collapsed_borders_table_box;
-    FfiPixelBox {
-        top: used_values::collapsed_border_share(border.top, true, is_table_box),
-        right: used_values::collapsed_border_share(border.right, false, is_table_box),
-        bottom: used_values::collapsed_border_share(border.bottom, false, is_table_box),
-        left: used_values::collapsed_border_share(border.left, true, is_table_box),
-    }
-}
-
-fn inflated_by(rect: CssPixelRect, sides: FfiPixelBox) -> CssPixelRect {
+fn inflated_by(rect: CssPixelRect, sides: Sides) -> CssPixelRect {
     rect.inflated(sides.top, sides.right, sides.bottom, sides.left)
 }
 
-/// The physical border box of `fragment` around its physical content box `content_box`, where the fragment holds its
-/// geometry in `frame`.
-pub(crate) fn physical_border_box_around(content_box: CssPixelRect, fragment: &Fragment, frame: Frame) -> CssPixelRect {
+/// The physical border box of `fragment` around its physical content box `content_box`.
+pub(crate) fn physical_border_box_around(content_box: CssPixelRect, fragment: &Fragment) -> CssPixelRect {
     inflated_by(
-        inflated_by(content_box, physical_padding(fragment, frame)),
-        physical_border_box_edges(fragment, frame),
+        inflated_by(content_box, fragment.sides.padding),
+        fragment.sides.border_box_edges(),
     )
 }
 
@@ -91,16 +50,16 @@ struct BoxesRelativeToOwnPaddingBox {
 }
 
 impl BoxesRelativeToOwnPaddingBox {
-    fn of(fragment: &Fragment, frame: Frame) -> Self {
-        let content_size = physical_content_size(fragment, frame);
-        let padding = physical_padding(fragment, frame);
+    fn of(fragment: &Fragment) -> Self {
+        let content_size = fragment.sides.content_size;
+        let padding = fragment.sides.padding;
         let content_box = CssPixelRect::new(padding.left, padding.top, content_size.width, content_size.height);
         let padding_box = inflated_by(content_box, padding);
         Self {
             content_size,
             padding_box,
             content_box,
-            border_box: inflated_by(padding_box, physical_border_box_edges(fragment, frame)),
+            border_box: inflated_by(padding_box, fragment.sides.border_box_edges()),
         }
     }
 }
@@ -114,23 +73,13 @@ struct ContainedBoxesRelativeToContainerPaddingBox {
 impl ContainedBoxesRelativeToContainerPaddingBox {
     fn of(link: &FragmentLink, container: &BoxesRelativeToOwnPaddingBox) -> Self {
         let fragment = &link.fragment;
-        let content_box = link
-            .frame
-            .rect_to_physical(
-                CssPixelRect::new(
-                    link.committed_offset.x,
-                    link.committed_offset.y,
-                    fragment.content_inline_size,
-                    fragment.content_block_size,
-                ),
-                container.content_size,
-            )
+        let content_box = CssPixelRect::from_location_and_size(link.offset.into(), fragment.sides.content_size.into())
             .translated_by(container.content_box.location());
-        let padding_box = inflated_by(content_box, physical_padding(fragment, link.frame));
+        let padding_box = inflated_by(content_box, fragment.sides.padding);
         Self {
             content_box,
             padding_box,
-            border_box: inflated_by(padding_box, physical_border_box_edges(fragment, link.frame)),
+            border_box: inflated_by(padding_box, fragment.sides.border_box_edges()),
         }
     }
 }
@@ -138,7 +87,7 @@ impl ContainedBoxesRelativeToContainerPaddingBox {
 struct ContainedBoxTransformGeometry<'boxes> {
     contained: &'boxes ContainedBoxesRelativeToContainerPaddingBox,
     container: &'boxes BoxesRelativeToOwnPaddingBox,
-    svg_additional_element_transform: Option<AffineTransform>,
+    svg: Option<&'boxes SvgPayload>,
 }
 
 impl TransformGeometry for ContainedBoxTransformGeometry<'_> {
@@ -154,8 +103,8 @@ impl TransformGeometry for ContainedBoxTransformGeometry<'_> {
         None
     }
 
-    fn nearest_svg_viewport_user_rect(&self) -> Option<CssPixelRect> {
-        None
+    fn svg_geometry(&self) -> Option<SvgGeometry> {
+        self.svg.map(|svg| svg.geometry)
     }
 
     fn containing_block_box(&self, coord_box: u16) -> CssPixelRect {
@@ -168,21 +117,19 @@ impl TransformGeometry for ContainedBoxTransformGeometry<'_> {
     }
 
     fn svg_additional_element_transform(&self) -> Option<AffineTransform> {
-        self.svg_additional_element_transform
+        self.svg?.facts.additional_element_transform.map(Into::into)
     }
 }
 
 pub(crate) fn contained_links(fragment: &Fragment) -> impl Iterator<Item = &FragmentLink> {
     let node = fragment.node;
     fragment.children.iter().flat_map(move |link| {
-        let outer_links = link
-            .fragment
-            .holds_links_of_outer_containing_blocks
+        let outer_links = (link.fragment.outer_links != OuterLinks::None)
             .then_some(&link.fragment.children)
             .into_iter()
             .flatten()
-            .filter(move |outer_link| outer_link.containing_block == node);
-        (link.containing_block == node)
+            .filter(move |outer_link| outer_link.placement.containing_block == node);
+        (link.placement.containing_block == node)
             .then_some(link)
             .into_iter()
             .chain(outer_links)
@@ -196,8 +143,11 @@ pub(crate) fn include_links_held_beside_their_containing_blocks(
 ) {
     let mut held_beside: crate::fast_hash::FastMap<NodeSlotId, smallvec::SmallVec<[usize; 2]>> = Default::default();
     for (index, link) in links.iter().enumerate() {
-        if !link.containing_block.is_invalid() && link.containing_block != run_root {
-            held_beside.entry(link.containing_block).or_default().push(index);
+        if !link.placement.containing_block.is_invalid() && link.placement.containing_block != run_root {
+            held_beside
+                .entry(link.placement.containing_block)
+                .or_default()
+                .push(index);
         }
     }
     for index in 0..links.len() {
@@ -208,7 +158,6 @@ pub(crate) fn include_links_held_beside_their_containing_blocks(
         let overflow = scrollable_overflow_of(
             arena,
             fragment,
-            links[index].frame,
             contained_links(fragment).chain(held_beside_indices.iter().map(|&held| &links[held])),
         );
         if overflow != fragment.scrollable_overflow {
@@ -220,7 +169,7 @@ pub(crate) fn include_links_held_beside_their_containing_blocks(
 pub(crate) fn holds_links_of_outer_containing_blocks(node: NodeSlotId, children: &[FragmentLink]) -> bool {
     children
         .iter()
-        .any(|link| !link.containing_block.is_invalid() && link.containing_block != node)
+        .any(|link| !link.placement.containing_block.is_invalid() && link.placement.containing_block != node)
 }
 
 // NB: The nearest line-clamp container among a hidden box's ancestors is the one whose formatting context hid it.
@@ -232,8 +181,8 @@ fn hidden_content_is_scrollable_overflow(
     let mut ancestor = arena.node_parent_if_live(hidden_box);
     while let Some(node) = ancestor {
         if node == fragment_being_built.node {
-            if fragment_being_built.has_line_clamp_point {
-                return fragment_being_built.clamped_content_is_scrollable_overflow;
+            if fragment_being_built.line_clamp.has_line_clamp_point {
+                return fragment_being_built.line_clamp.clamped_content_is_scrollable_overflow;
             }
         } else if let Some(keeps_clamped_content) = line_clamp_container_keeps_clamped_content_scrollable(arena, node) {
             return keeps_clamped_content;
@@ -268,8 +217,8 @@ fn inline_box_unions(
     link: &FragmentLink,
     content_origin: CssPixelPoint,
 ) -> Option<InlineBoxUnions> {
-    let padding_widths = physical_padding(&link.fragment, link.frame);
-    let border_widths = physical_border(&link.fragment, link.frame);
+    let padding_widths = link.fragment.sides.padding;
+    let border_widths = link.fragment.sides.border;
     let unite = |union: &mut Option<CssPixelRect>, rect: CssPixelRect| match union {
         None => *union = Some(rect),
         Some(_) if rect.is_empty() => {}
@@ -280,6 +229,10 @@ fn inline_box_unions(
     let mut border_union = None;
     for &piece_index in content.inline_boxes.piece_indices_of(link.fragment.node) {
         let piece = &content.inline_box_pieces[piece_index as usize];
+        // An interrupting block's placeholder records inline geometry; the block supplies its own overflow.
+        if piece.is_geometry_only_placeholder && piece.fragment_count != 0 {
+            continue;
+        }
         let border_rect = plane.piece_border_box_rect(piece);
         if piece.is_geometry_only_placeholder {
             let padding_rect = inflated_by(border_rect, padding_widths);
@@ -293,7 +246,7 @@ fn inline_box_unions(
         };
         unite(
             &mut padding_union,
-            physical_piece.shrunken_by_present_edges(border_rect, border_widths),
+            physical_piece.shrunken_by_present_edges(border_rect, border_widths.into()),
         );
         unite(&mut border_union, border_rect);
     }
@@ -307,11 +260,10 @@ fn inline_box_unions(
 pub(crate) fn scrollable_overflow_of<'link>(
     arena: &LayoutNodeArena,
     fragment: &Fragment,
-    frame: Frame,
     contained_links: impl Iterator<Item = &'link FragmentLink>,
 ) -> FragmentScrollableOverflow {
     let node = fragment.node;
-    let own = BoxesRelativeToOwnPaddingBox::of(fragment, frame);
+    let own = BoxesRelativeToOwnPaddingBox::of(fragment);
     let Some(row) = GeometryRead::node(arena, node) else {
         return FragmentScrollableOverflow {
             rect_relative_to_padding_box: own.padding_box,
@@ -330,8 +282,9 @@ pub(crate) fn scrollable_overflow_of<'link>(
     }
 
     let box_is_scroll_container = node_facts::kind_and_style_make_scroll_container(kind, style);
+    let line_clamp = fragment.line_clamp;
     let line_clamp_clip =
-        (fragment.has_line_clamp_point && !fragment.clamped_content_is_scrollable_overflow).then(|| {
+        (line_clamp.has_line_clamp_point && !line_clamp.clamped_content_is_scrollable_overflow).then(|| {
             Frame::of(style.map_or(writing_mode::HORIZONTAL_TB, |style| style.writing_mode()))
                 .half_plane_before_block_end(own.content_size)
                 .translated_by(own.content_box.location())
@@ -353,7 +306,13 @@ pub(crate) fn scrollable_overflow_of<'link>(
     let plane = line_content.map(|content| PhysicalPlane::of(content, own.content_size));
     if let (Some(content), Some(plane)) = (line_content, &plane) {
         let origin = own.content_box.location();
-        let line_rects = content.lines.iter().map(|line| plane.rect(line.rect));
+        // A block that interrupts inline layout contributes through its own transformed box. Its line record and
+        // inline fragments describe its untransformed position, not an additional CSS line box.
+        let line_rects = content
+            .lines
+            .iter()
+            .filter(|line| !line.has_block_level_box)
+            .map(|line| plane.rect(line.rect));
         let elided_content_rects = content.elided_content_rects.iter().map(|&(_, rect)| plane.rect(rect));
         let lines_after_clamp_point = content
             .lines_after_clamp_point_rect
@@ -366,6 +325,9 @@ pub(crate) fn scrollable_overflow_of<'link>(
             in_flow_and_floated_content_bounds.unite_vertically(line_rect);
         }
         for text_fragment in &content.fragments {
+            if content.lines[text_fragment.line_index as usize].has_block_level_box {
+                continue;
+            }
             let mut fragment_rect = plane.fragment_rect(text_fragment).translated_by(origin);
             if arena.node_is_in_focused_text_control(text_fragment.layout_node)
                 && let Some(style_source_style) = arena.node_style_if_live(text_fragment.style_source)
@@ -396,7 +358,7 @@ pub(crate) fn scrollable_overflow_of<'link>(
     // The grid is also included in a grid container's scrollable overflow region.
     // INTEROP: Blink only does this when the grid container is a scroll container, so the grid does not reach the
     //          scrollable overflow of its ancestors.
-    if box_is_scroll_container && let Some(tracks) = &fragment.used_grid_tracks {
+    if box_is_scroll_container && let Some(tracks) = fragment.grid().and_then(|grid| grid.used_tracks.as_ref()) {
         let grid_area = tracks.grid_area.translated_by(own.content_box.location());
         // NB: A grid with tracks in one axis only, e.g. columns but no rows, still reaches the overflow in that axis.
         if grid_area.width > CssPixels::default() {
@@ -415,6 +377,7 @@ pub(crate) fn scrollable_overflow_of<'link>(
     //          its 3D rendering context. [CSS3-TRANSFORMS]
     let container_inline_axis_is_horizontal =
         style.is_none_or(|style| style.writing_mode() == writing_mode::HORIZONTAL_TB);
+    let container_frame = Frame::of(style.map_or(writing_mode::HORIZONTAL_TB, |style| style.writing_mode()));
     for link in contained_links {
         let child = &link.fragment;
         let child_node = child.node;
@@ -436,7 +399,9 @@ pub(crate) fn scrollable_overflow_of<'link>(
         if child_position == positioning::FIXED {
             continue;
         }
-        if link.is_invisible_for_line_clamp && !hidden_content_is_scrollable_overflow(arena, fragment, child_node) {
+        if link.placement.shown_as.facts.is_invisible_for_line_clamp
+            && !hidden_content_is_scrollable_overflow(arena, fragment, child_node)
+        {
             continue;
         }
 
@@ -466,15 +431,7 @@ pub(crate) fn scrollable_overflow_of<'link>(
         if box_is_scroll_container && (child_is_in_flow || child_is_floating) {
             let mut normal_flow_border_box = untransformed_child_border_box;
             if child_position == positioning::RELATIVE {
-                let inset = sides_to_physical(
-                    link.frame,
-                    FfiPixelBox {
-                        top: link.inset_top,
-                        right: link.inset_right,
-                        bottom: link.inset_bottom,
-                        left: link.inset_left,
-                    },
-                );
+                let inset = link.placement.insets;
                 normal_flow_border_box = normal_flow_border_box.translated(-inset.left, -inset.top);
             }
             // INTEROP: The edges of in-flow and floated content, after which the container's end padding comes,
@@ -505,6 +462,19 @@ pub(crate) fn scrollable_overflow_of<'link>(
                     } else {
                         (zero, zero)
                     };
+                    // NB: Past the block end of a box in the flow of a block container, the margin that counts is
+                    //     what that flow collapsed there, not the box's own: The margins of the box's contents that
+                    //     collapse through its block end count too, and those that collapse through the box itself
+                    //     count once.
+                    let [top, right, bottom, left] =
+                        match link.placement.shown_as.facts.block_end_margin_collapsed_in_flow {
+                            Some(block_end_margin) => {
+                                let mut margins = [top, right, bottom, left];
+                                margins[container_frame.physical_side(Side::Bottom) as usize] = block_end_margin;
+                                margins
+                            }
+                            None => [top, right, bottom, left],
+                        };
                     let (left, right) = if overflow_directions.horizontal_axis_is_positive {
                         (left.max(zero), right.max(-border_box.width))
                     } else {
@@ -525,17 +495,15 @@ pub(crate) fn scrollable_overflow_of<'link>(
         }
         let transform = child_has_css_transform
             .then(|| {
-                let svg_additional_element_transform = style_queries::kind_is_svg_element_box(child_row.kind())
-                    .then(|| child.svg.as_ref()?.additional_element_transform)
-                    .flatten()
-                    .map(Into::into);
                 node_values::compute_transform_against(
                     arena,
                     child_node,
                     &ContainedBoxTransformGeometry {
                         contained: &contained,
                         container: &own,
-                        svg_additional_element_transform,
+                        svg: child
+                            .svg()
+                            .filter(|_| style_queries::kind_is_svg_element_box(child_row.kind())),
                     },
                     1.0,
                 )
@@ -625,8 +593,10 @@ pub(crate) fn scrollable_overflow_of<'link>(
     if box_is_scroll_container {
         // NB: The box's own padding surrounds its in-flow and floated content. Whatever of it falls inside the padding
         //     box, or in the unreachable scrollable overflow region, adds nothing. This matches Blink.
-        let padding = physical_padding(fragment, frame);
-        scrollable_overflow_rect.unite(inflated_by(clip_in_flow(in_flow_and_floated_content_bounds), padding));
+        scrollable_overflow_rect.unite(inflated_by(
+            clip_in_flow(in_flow_and_floated_content_bounds),
+            fragment.sides.padding,
+        ));
     }
 
     let mut has_scrollable_overflow =
@@ -676,6 +646,60 @@ pub(crate) fn scrollable_overflow_of<'link>(
     }
 }
 
+/// The boxes whose committed links a box other than their containing block holds, by the containing block they were
+/// committed with, which a containing block reads its own from without walking every other one's.
+#[derive(Clone, Default)]
+pub(crate) struct LinksHeldApartFromTheirContainingBlocks {
+    containing_block_of: CowMap<NodeSlotId, NodeSlotId>,
+    by_containing_block: CowMap<NodeSlotId, SmallVec<[NodeSlotId; 4]>>,
+}
+
+impl LinksHeldApartFromTheirContainingBlocks {
+    fn insert(&mut self, node: NodeSlotId, containing_block: NodeSlotId) {
+        match self.containing_block_of.insert(node, containing_block) {
+            Some(previous) if previous == containing_block => return,
+            Some(previous) => self.remove_from(previous, node),
+            None => {}
+        }
+        self.by_containing_block
+            .get_or_insert_with(containing_block, SmallVec::new)
+            .push(node);
+    }
+
+    pub(super) fn remove(&mut self, node: NodeSlotId) {
+        if let Some(containing_block) = self.containing_block_of.remove(&node) {
+            self.remove_from(containing_block, node);
+        }
+    }
+
+    fn remove_from(&mut self, containing_block: NodeSlotId, node: NodeSlotId) {
+        let Some(nodes) = self.by_containing_block.get_mut(&containing_block) else {
+            return;
+        };
+        if let Some(position) = nodes.iter().position(|held| *held == node) {
+            nodes.swap_remove(position);
+        }
+        if nodes.is_empty() {
+            self.by_containing_block.remove(&containing_block);
+        }
+    }
+
+    fn held_apart_from(&self, containing_block: NodeSlotId) -> &[NodeSlotId] {
+        self.by_containing_block
+            .get(&containing_block)
+            .map_or(&[], |nodes| nodes.as_slice())
+    }
+
+    fn is_empty(&self) -> bool {
+        self.containing_block_of.is_empty()
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.containing_block_of.clear();
+        self.by_containing_block.clear();
+    }
+}
+
 impl LayoutNodeArena {
     pub(crate) fn request_fragment_overflow_recalculation(&mut self, node: NodeSlotId) {
         if !node.is_invalid() {
@@ -690,10 +714,11 @@ impl LayoutNodeArena {
         is_held_apart: bool,
     ) {
         if is_held_apart {
-            self.links_held_apart_from_their_containing_blocks.insert(node);
+            self.links_held_apart_from_their_containing_blocks
+                .insert(node, containing_block);
             self.request_fragment_overflow_recalculation(containing_block);
         } else if !self.links_held_apart_from_their_containing_blocks.is_empty() {
-            self.links_held_apart_from_their_containing_blocks.remove(&node);
+            self.links_held_apart_from_their_containing_blocks.remove(node);
         }
     }
 
@@ -727,12 +752,12 @@ impl LayoutNodeArena {
         );
     }
 
-    fn recalculated_fragment_overflow(
+    pub(crate) fn links_in_containing_block_fragment(
         &self,
         node: NodeSlotId,
         link: &FragmentLink,
         fragment_index: u32,
-    ) -> FragmentScrollableOverflow {
+    ) -> Vec<FragmentLink> {
         let mut met = crate::fast_hash::FastSet::default();
         let mut contained = Vec::new();
         let holder_fragment = self
@@ -744,16 +769,21 @@ impl LayoutNodeArena {
                     .committed_fragment_link_cloned(holder.slot_index(), holder.generation())
             })
             .map(|holder_link| holder_link.fragment)
-            .filter(|holder_fragment| holder_fragment.holds_links_of_outer_containing_blocks);
+            .filter(|holder_fragment| holder_fragment.outer_links != OuterLinks::None);
         let links_held_beside = holder_fragment
             .iter()
             .flat_map(|holder_fragment| holder_fragment.children.iter())
-            .filter(|held| held.containing_block == node)
+            .filter(|held| held.placement.containing_block == node)
             .map(|held| held.fragment.node);
         let candidates = contained_links(&link.fragment)
             .map(|contained_link| contained_link.fragment.node)
             .chain(links_held_beside)
-            .chain(self.links_held_apart_from_their_containing_blocks.iter().copied());
+            .chain(
+                self.links_held_apart_from_their_containing_blocks
+                    .held_apart_from(node)
+                    .iter()
+                    .copied(),
+            );
         for candidate in candidates {
             if met.insert(candidate)
                 && self.slot_is_live(candidate)
@@ -763,7 +793,17 @@ impl LayoutNodeArena {
                 self.committed_links_in_containing_block_fragment(candidate, fragment_index, &mut contained);
             }
         }
-        scrollable_overflow_of(self, &link.fragment, link.frame, contained.iter())
+        contained
+    }
+
+    fn recalculated_fragment_overflow(
+        &self,
+        node: NodeSlotId,
+        link: &FragmentLink,
+        fragment_index: u32,
+    ) -> FragmentScrollableOverflow {
+        let contained = self.links_in_containing_block_fragment(node, link, fragment_index);
+        scrollable_overflow_of(self, &link.fragment, contained.iter())
     }
 
     fn has_scrollable_overflow_in_any_fragment(&self, node: NodeSlotId) -> bool {
@@ -832,7 +872,6 @@ impl LayoutNodeArena {
         if self.scrollable_overflow.recalculation_requests.is_empty() {
             return;
         }
-        self.scrollable_overflow.recalculations += 1;
         let requests = std::mem::take(&mut self.scrollable_overflow.recalculation_requests);
         let mut queued = crate::fast_hash::FastSet::default();
         let mut queue = std::collections::BinaryHeap::new();
@@ -866,6 +905,44 @@ mod tests {
     use crate::css::style::layout_style::LayoutScratchStyle;
 
     #[test]
+    fn discarded_fragment_links_leave_the_containing_block_index() {
+        let mut arena = LayoutNodeArena::new();
+        let container = arena.allocate_for_test().slot;
+        let cleared = arena.allocate_for_test().slot;
+        let freed = arena.allocate_for_test().slot;
+        for child in [cleared, freed] {
+            arena.set_committed_fragment_link(child, FragmentLink::for_test(child), None);
+            arena.note_whether_link_is_held_apart_from_its_containing_block(child, container, true);
+        }
+        assert_eq!(
+            arena
+                .links_held_apart_from_their_containing_blocks
+                .held_apart_from(container),
+            &[cleared, freed]
+        );
+
+        arena.clear_committed_fragment_link(cleared);
+        assert_eq!(
+            arena
+                .links_held_apart_from_their_containing_blocks
+                .held_apart_from(container),
+            &[freed]
+        );
+
+        let main_thread = crate::stage::MainThread::for_test();
+        arena
+            .free_subtree(freed)
+            .destroy_shells_and_invoke_callbacks(&main_thread);
+        assert!(arena.links_held_apart_from_their_containing_blocks.is_empty());
+
+        for row in [cleared, container] {
+            arena
+                .free_subtree(row)
+                .destroy_shells_and_invoke_callbacks(&main_thread);
+        }
+    }
+
+    #[test]
     fn overflow_percentage_margins_use_the_containing_blocks_inline_size() {
         for (mode, expected_bottom) in [
             (writing_mode::HORIZONTAL_TB, 260),
@@ -893,21 +970,16 @@ mod tests {
             arena.insert_child(container, child, NodeSlotId::INVALID);
             let mut container_link = FragmentLink::for_test(container);
             let fragment = std::sync::Arc::get_mut(&mut container_link.fragment).unwrap();
-            fragment.content_inline_size = CssPixels::from_integer(100);
-            fragment.content_block_size = CssPixels::from_integer(200);
-            fragment.padding_bottom = CssPixels::from_integer(10);
+            fragment.sides.content_size.width = CssPixels::from_integer(100);
+            fragment.sides.content_size.height = CssPixels::from_integer(200);
+            fragment.sides.padding.bottom = CssPixels::from_integer(10);
             let mut child_link = FragmentLink::for_test(child);
             let fragment = std::sync::Arc::get_mut(&mut child_link.fragment).unwrap();
-            fragment.content_inline_size = CssPixels::from_integer(20);
-            fragment.content_block_size = CssPixels::from_integer(20);
-            child_link.committed_offset.y = CssPixels::from_integer(180).into();
-            child_link.containing_block = container;
-            let overflow = scrollable_overflow_of(
-                &arena,
-                &container_link.fragment,
-                Frame::PHYSICAL,
-                std::iter::once(&child_link),
-            );
+            fragment.sides.content_size.width = CssPixels::from_integer(20);
+            fragment.sides.content_size.height = CssPixels::from_integer(20);
+            child_link.offset.y = CssPixels::from_integer(180).into();
+            child_link.placement.containing_block = container;
+            let overflow = scrollable_overflow_of(&arena, &container_link.fragment, std::iter::once(&child_link));
             assert_eq!(
                 overflow.rect_relative_to_padding_box.bottom(),
                 CssPixels::from_integer(expected_bottom),

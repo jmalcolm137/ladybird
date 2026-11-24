@@ -15,7 +15,6 @@
 #include <LibCore/System.h>
 #include <LibCrypto/Authentication/HMAC.h>
 #include <LibFileSystem/FileSystem.h>
-#include <LibHTTP/Cache/DiskCache.h>
 #include <LibHTTP/Cache/Utilities.h>
 #include <LibWebView/Application.h>
 #include <LibWebView/HelperProcess.h>
@@ -56,9 +55,6 @@ RequestServerManager::RequestServerManager()
 {
     if (!uses_site_request_servers())
         return;
-
-    // Older versions kept the responses of every site in the cache of the RequestServer with no site.
-    HTTP::DiskCache::remove(HTTP::DiskCache::Mode::Normal, LexicalPath { Application::request_server_options().cache_path });
 
     m_site_cache_key = load_or_create_site_cache_key();
 }
@@ -135,10 +131,11 @@ ErrorOr<void> RequestServerManager::launch_process(RequestServerInstance& instan
 {
     // Private sessions keep nothing on disk. Every RequestServer of a session would open the same cache otherwise.
     // A site's responses only pass through the RequestServer with no site on their way to the site's own.
-    auto keeps_disk_cache = instance.session().is_private() == IsPrivate::No && (instance.site().has_value() || !uses_site_request_servers());
+    auto is_private = instance.session().is_private();
+    auto keeps_disk_cache = is_private == IsPrivate::No && (instance.site().has_value() || !uses_site_request_servers());
     auto disk_cache_mode = keeps_disk_cache ? Application::request_server_options().http_disk_cache_mode : HTTPDiskCacheMode::Disabled;
     ChildIdentity identity;
-    auto control_client = TRY(launch_request_server_process(instance.cache_path(), instance.site(), disk_cache_mode, &identity));
+    auto control_client = TRY(launch_request_server_process(instance.cache_path(), instance.site(), is_private, disk_cache_mode, &identity));
     instance.m_pid = identity.pid;
 
     auto weak_instance = instance.make_weak_ptr();
@@ -173,7 +170,7 @@ ErrorOr<RequestServerClientConnection> RequestServerManager::connect_new_client(
 
     // Random client IDs can collide across RequestServers. The UI identifies clients by ID alone, so retry collisions.
     for (size_t attempt = 0; attempt < 8; ++attempt) {
-        auto response = instance.control_client().send_sync_but_allow_failure<Messages::RequestServerControl::ConnectNewClient>(is_private, site_binding);
+        auto response = send_sync_to_helper<Messages::RequestServerControl::ConnectNewClient>(instance.control_client(), is_private, site_binding);
         if (!response || response->client_id() < 0)
             return Error::from_string_literal("Failed to connect to RequestServer");
 
@@ -191,16 +188,30 @@ ErrorOr<RequestServerClientConnection> RequestServerManager::connect_new_client(
     return Error::from_string_literal("RequestServer keeps handing out client IDs that are in use");
 }
 
+void RequestServerManager::retire_without_delay_once_disconnected(int client_id)
+{
+    for (auto& instance : m_instances) {
+        if (instance->site().has_value() && instance->has_client(client_id)) {
+            instance->m_client_ids_retiring_without_delay.set(client_id);
+            return;
+        }
+    }
+}
+
 void RequestServerManager::client_disconnected(RequestServerInstance& instance, int client_id)
 {
     Application::the().did_disconnect_request_server_client(client_id);
     instance.m_client_ids.remove(client_id);
+    auto retires_without_delay = instance.m_client_ids_retiring_without_delay.remove(client_id);
 
     if (!instance.site().has_value() || !instance.m_client_ids.is_empty())
         return;
 
+    // NB: This runs inside a message handler of the instance's control connection, which retiring the instance drops.
+    //     So even an instance that retires without delay is retired from the event loop.
+    auto idle_timeout = retires_without_delay ? AK::Duration::zero() : Application::request_server_options().idle_site_request_server_timeout;
     auto weak_instance = instance.make_weak_ptr();
-    instance.m_idle_timer = Core::Timer::create_single_shot(Application::request_server_options().idle_site_request_server_timeout, [weak_instance] {
+    instance.m_idle_timer = Core::Timer::create_single_shot(idle_timeout, [weak_instance] {
         auto instance = weak_instance.strong_ref();
         if (instance && instance->m_client_ids.is_empty())
             the().retire(*instance);
@@ -264,7 +275,7 @@ void RequestServerManager::retire_idle_instances()
 
 void RequestServerManager::disk_cache_settings_changed()
 {
-    auto const& settings = Application::settings().browsing_data_settings().disk_cache_settings;
+    auto settings = Application::settings().disk_cache_settings();
     for (auto& instance : m_instances)
         instance->control_client().async_set_disk_cache_settings(settings);
 
@@ -299,9 +310,8 @@ ByteString RequestServerManager::sites_directory() const
 // itself would tell it which other sites the user has visited.
 ByteString RequestServerManager::cache_path_for_site(Utf16String const& site) const
 {
-    Crypto::Authentication::HMAC hmac(Crypto::Hash::HashKind::SHA256, m_site_cache_key);
     auto site_bytes = site.to_byte_string();
-    auto digest = hmac.process(site_bytes.view());
+    auto digest = MUST(Crypto::Authentication::hmac(Crypto::Hash::HashKind::SHA256, m_site_cache_key, site_bytes.bytes()));
     return LexicalPath::join(sites_directory(), encode_hex(digest.bytes())).string();
 }
 
@@ -314,7 +324,7 @@ ByteBuffer RequestServerManager::load_or_create_site_cache_key() const
             return key.release_value();
     }
 
-    // Nothing can find the caches of sites that were named with another key, or by older versions.
+    // Nothing can find the caches of sites that were named with another key.
     (void)FileSystem::remove(sites_directory(), FileSystem::RecursionMode::Allowed);
 
     auto key = MUST(ByteBuffer::create_uninitialized(site_cache_key_size));
@@ -460,7 +470,7 @@ HashMap<ByteString, RequestServerManager::DormantSiteCache>& RequestServerManage
 u64 RequestServerManager::maximum_disk_cache_size() const
 {
     // Apply the per-server free-space limit to the combined caches too.
-    auto maximum_size = Application::settings().browsing_data_settings().disk_cache_settings.maximum_size;
+    auto maximum_size = Application::settings().disk_cache_settings().maximum_size;
     auto disk_space = FileSystem::compute_disk_space(LexicalPath { Application::request_server_options().cache_path });
     if (disk_space.is_error())
         return maximum_size;

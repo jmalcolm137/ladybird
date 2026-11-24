@@ -27,6 +27,7 @@
 #include <LibJS/Runtime/ConsoleObject.h>
 #include <LibMedia/Sinks/AudioOutputFactory.h>
 #include <LibMediaClient/RemotePlaybackManager.h>
+#include <LibWeb/Bindings/MainThreadVM.h>
 #include <LibWeb/CSS/StyleScope.h>
 #include <LibWeb/CSS/StyleSheetIdentifier.h>
 #include <LibWeb/CSS/StyleSheetImport.h>
@@ -43,13 +44,13 @@
 #include <LibWeb/Fetch/Infrastructure/FetchController.h>
 #include <LibWeb/Fetch/Infrastructure/HTTP/Bodies.h>
 #include <LibWeb/Geolocation/GeolocationCoordinates.h>
-#include <LibWeb/Geolocation/GeolocationPositionError.h>
 #include <LibWeb/HTML/BrowsingContext.h>
 #include <LibWeb/HTML/EventLoop/EventLoop.h>
 #include <LibWeb/HTML/LocalNavigable.h>
 #include <LibWeb/HTML/LocalTraversableNavigable.h>
 #include <LibWeb/HTML/NavigableContainer.h>
 #include <LibWeb/HTML/RemoteNavigable.h>
+#include <LibWeb/HTML/Scripting/Agent.h>
 #include <LibWeb/HTML/Scripting/ClassicScript.h>
 #include <LibWeb/HTML/Scripting/Environments.h>
 #include <LibWeb/HTML/Scripting/RemoteEnvironmentSettings.h>
@@ -68,6 +69,7 @@
 #include <LibWeb/WebDriver/InputState.h>
 #include <LibWeb/WebDriver/UserPrompt.h>
 #include <LibWeb/WebIDL/Promise.h>
+#include <LibWebCommon/Geolocation/GeolocationPositionErrorCode.h>
 #include <LibWebCommon/HTML/NavigationPopulationRequest.h>
 #include <LibWebCommon/WebDriver/Input.h>
 #include <LibWebCommon/WebView/Debugger.h>
@@ -90,9 +92,9 @@ static constexpr size_t s_max_download_data_ipc_chunk_size = 16 * MiB;
 
 GC_DEFINE_ALLOCATOR(PageClient);
 
-static Web::Geolocation::GeolocationPositionError::ErrorCode geolocation_position_error_code_from_ipc(u16 error_code)
+static Web::Geolocation::GeolocationPositionErrorCode geolocation_position_error_code_from_ipc(u16 error_code)
 {
-    using ErrorCode = Web::Geolocation::GeolocationPositionError::ErrorCode;
+    using ErrorCode = Web::Geolocation::GeolocationPositionErrorCode;
 
     switch (error_code) {
     case to_underlying(ErrorCode::PermissionDenied):
@@ -152,6 +154,7 @@ PageClient::PageClient(PageHost& owner, Web::PageId id, Optional<Web::HTML::Cros
     , m_page(Web::Page::create(*this))
     , m_id(id)
     , m_pending_root_navigable_id(pending_root_navigable_id)
+    , m_network_activity_observers(Web::HTML::surrounding_agent().network_activity_observers)
 {
     setup_palette();
 
@@ -176,13 +179,31 @@ PageClient::PageClient(PageHost& owner, Web::PageId id, Optional<Web::HTML::Cros
 
 PageClient::~PageClient() = default;
 
+// How many pages of this process have a DevTools client.
+static size_t s_pages_with_devtools_client = 0;
+
+// Errors keep long stacks while a DevTools client or a WebDriver BiDi session may list their frames.
+void PageClient::update_keeps_long_stack_traces()
+{
+    Web::Bindings::main_thread_vm().set_keeps_long_stack_traces(s_pages_with_devtools_client > 0 || Web::WebDriver::BiDi::is_active());
+}
+
+void PageClient::finalize()
+{
+    Base::finalize();
+    if (m_has_devtools_client) {
+        m_network_activity_observers->page_did_lose_devtools_client();
+        --s_pages_with_devtools_client;
+        update_keeps_long_stack_traces();
+    }
+}
+
 void PageClient::visit_edges(JS::Cell::Visitor& visitor)
 {
     Base::visit_edges(visitor);
     visitor.visit(m_page);
     for (auto& command : m_webdriver_input_commands)
         visitor.visit(command.value);
-    visitor.visit(m_top_level_document_console_client);
     for (auto& range : m_pending_text_fragment_generation_ranges)
         visitor.visit(range.value);
     for (auto& promise : m_pending_delete_all_cookies_promises)
@@ -259,7 +280,6 @@ void PageClient::setup_palette()
     auto buffer = buffer_or_error.release_value();
     auto* theme = buffer.data<Gfx::SystemTheme>();
     theme->color[to_underlying(Gfx::ColorRole::Window)] = Color(Color::Magenta).value();
-    theme->color[to_underlying(Gfx::ColorRole::WindowText)] = Color(Color::Cyan).value();
     m_palette_impl = Gfx::PaletteImpl::create_with_anonymous_buffer(buffer);
 }
 
@@ -475,12 +495,25 @@ void PageClient::set_palette_impl(Gfx::PaletteImpl& impl)
 {
     m_palette_impl = impl;
     page().invalidate_style_for_preference_change();
+    // NB: Painting reads the palette's selection colors, which no style depends on.
+    for (auto const& navigable : page().hosted_navigables()) {
+        navigable->set_needs_to_record_display_list();
+        navigable->set_needs_repaint();
+    }
     request_frame();
 }
 
 void PageClient::set_preferred_color_scheme(Web::CSS::PreferredColorScheme color_scheme)
 {
     m_preferred_color_scheme = color_scheme;
+    page().invalidate_style_for_preference_change();
+}
+
+void PageClient::set_screen_shows_high_dynamic_range(bool screen_shows_high_dynamic_range)
+{
+    if (m_screen_shows_high_dynamic_range == screen_shows_high_dynamic_range)
+        return;
+    m_screen_shows_high_dynamic_range = screen_shows_high_dynamic_range;
     page().invalidate_style_for_preference_change();
 }
 
@@ -614,8 +647,12 @@ void PageClient::set_viewport(Web::DevicePixelSize const& size, double device_pi
 
     // A viewport can arrive after the tab's document moved to another process, which leaves this page's traversable
     // remote. The page takes the viewport again once it displays the tab anew.
-    if (page().has_local_traversable())
-        page().local_traversable()->set_viewport_size(page().device_to_css_size(size), invalidate);
+    if (page().has_local_traversable()) {
+        if (invalidate == Web::InvalidateDisplayList::No)
+            page().local_traversable()->set_viewport_size_after_rendering_update_in_flight(page().device_to_css_size(size));
+        else
+            page().local_traversable()->set_viewport_size(page().device_to_css_size(size), invalidate);
+    }
     if (invalidate == Web::InvalidateDisplayList::PaintCommandsAndHitTestList)
         device_pixels_per_css_pixel_did_change();
     hurry_outstanding_rendering_opportunity();
@@ -1025,7 +1062,7 @@ void PageClient::page_did_change_active_document_in_top_level_browsing_context(W
         m_web_ui.clear();
 
     // The output that DevTools gets once it asks belongs to the document that the tab shows.
-    if (m_top_level_document_console_client && document.console_client() != m_top_level_document_console_client)
+    if (!document.console_client() || document.console_client().ptr() != m_top_level_document_console_client.ptr().ptr())
         m_console_output_buffer = {};
 
     if (auto console_client = attach_js_console(document))
@@ -1326,7 +1363,7 @@ void PageClient::geolocation_position_response(u64 request_id, WebView::Geolocat
     else if (auto coordinates = geolocation_coordinates_from_ipc(position); coordinates.has_value())
         page().receive_geolocation_position(request_id, *coordinates);
     else
-        page().receive_geolocation_position(request_id, Web::Geolocation::GeolocationPositionError::ErrorCode::PositionUnavailable);
+        page().receive_geolocation_position(request_id, Web::Geolocation::GeolocationPositionErrorCode::PositionUnavailable);
 }
 
 void PageClient::page_did_request_geolocation_position(u64 request_id, Web::HTML::CrossProcessId requesting_document_id)
@@ -1380,6 +1417,16 @@ void PageClient::page_did_request_click_notification_by_id_for_testing(u64 brows
 void PageClient::page_did_request_dismiss_notification_for_testing(u64 notification_id)
 {
     client().async_did_request_dismiss_notification_for_testing(m_id, notification_id);
+}
+
+void PageClient::page_did_request_hold_next_notification_show_for_testing()
+{
+    client().async_did_request_hold_next_notification_show_for_testing(m_id);
+}
+
+void PageClient::page_did_request_fail_held_notification_show_for_testing()
+{
+    client().async_did_request_fail_held_notification_show_for_testing(m_id);
 }
 
 Optional<Web::Permissions::PermissionSnapshot> PageClient::page_did_request_permission_snapshot(URL::Origin const& top_level_origin)
@@ -1747,6 +1794,11 @@ void PageClient::page_did_report_navigation_violation_of_remote_client(Web::HTML
     client().async_did_report_navigation_violation(m_id, navigation.navigable_id, navigation.navigation_id, policy_index, directive, url_is_https);
 }
 
+void PageClient::page_did_report_navigation_violation_of_container_document(Web::HTML::CrossProcessId navigable_id, Utf16String const& navigation_id, u64 policy_index, Web::ContentSecurityPolicy::RemoteViolationDirective directive, bool url_is_https)
+{
+    client().async_did_report_container_document_navigation_violation(m_id, navigable_id, navigation_id, policy_index, directive, url_is_https);
+}
+
 void PageClient::page_did_update_resource_count(i32 count_waiting)
 {
     client().async_did_update_resource_count(m_id, count_waiting);
@@ -1789,6 +1841,13 @@ void PageClient::page_did_close()
     // The heap sweeps a closed page in slices, so its timers can still fire once the cells they would use are gone.
     m_is_closed = true;
 
+    // A closed page has no DevTools client.
+    if (exchange(m_has_devtools_client, false)) {
+        m_network_activity_observers->page_did_lose_devtools_client();
+        --s_pages_with_devtools_client;
+        update_keeps_long_stack_traces();
+    }
+
     // NOTE: This only removes the strong reference the PageHost has for this PageClient.
     //       It will be GC'd 'later'.
     m_owner.remove_page({}, m_id);
@@ -1797,6 +1856,11 @@ void PageClient::page_did_close()
 void PageClient::page_did_change_needs_beforeunload_check(bool needs_beforeunload_check)
 {
     client().async_did_change_needs_beforeunload_check(m_id, needs_beforeunload_check);
+}
+
+void PageClient::page_did_change_had_user_edits(bool had_user_edits)
+{
+    client().async_did_change_had_user_edits(m_id, had_user_edits);
 }
 
 void PageClient::page_did_consume_user_activation(Web::HTML::UserActivationConsumption consumption)
@@ -1947,6 +2011,19 @@ bool PageClient::page_did_request_has_populated_document_for_testing(Web::HTML::
     return false;
 }
 
+Optional<Web::MediaSession::MediaSessionState> PageClient::page_did_request_now_playing_state_for_testing()
+{
+    if (auto* test_connection = client().test_connection())
+        return test_connection->did_request_now_playing_state_for_testing(m_id);
+    return {};
+}
+
+void PageClient::page_did_trigger_now_playing_action_for_testing(Web::Bindings::MediaSessionAction action, Optional<double> seek_offset, Optional<double> seek_time, Optional<bool> fast_seek)
+{
+    if (auto* test_connection = client().test_connection())
+        test_connection->async_trigger_now_playing_action_for_testing(m_id, action, seek_offset, seek_time, fast_seek);
+}
+
 bool PageClient::page_did_request_tab_is_playing_audio_for_testing()
 {
     if (auto* test_connection = client().test_connection())
@@ -1987,11 +2064,11 @@ void PageClient::page_did_retire_picture_in_picture_window_for_testing()
         (void)test_connection->send_sync_but_allow_failure<Messages::WebContentTestClient::RetirePictureInPictureWindowForTesting>(m_id);
 }
 
-u64 PageClient::page_did_request_tab_audibility_change_count_for_testing()
+Vector<bool> PageClient::page_did_request_tab_audibility_transitions_for_testing()
 {
     if (auto* test_connection = client().test_connection())
-        return test_connection->did_request_tab_audibility_change_count_for_testing(m_id);
-    return 0;
+        return test_connection->did_request_tab_audibility_transitions_for_testing(m_id);
+    return {};
 }
 
 String PageClient::dump_site_isolation_process_tree_for_testing()
@@ -2085,6 +2162,11 @@ void PageClient::run_webdriver_user_prompt_handling(u64 request_id)
 void PageClient::request_file(Web::FileRequest file_request)
 {
     client().request_file(m_id, move(file_request));
+}
+
+void PageClient::request_file_for_webdriver(u64 command_id, Web::FileRequest file_request)
+{
+    client().request_file_for_webdriver(m_id, command_id, move(file_request));
 }
 
 URL::BlobURLEntry::Token PageClient::page_did_add_blob_url_entry(Web::HTML::EnvironmentSettingsObject const& environment, Utf16String const& url, Web::FileAPI::SerializedBlobURLEntry const& entry)
@@ -2228,6 +2310,11 @@ void PageClient::rebind_media_playback_manager(MediaClient::RemotePlaybackManage
 NonnullRefPtr<Audio::RecordStream::CreatePromise> PageClient::create_audio_record_stream(StringView device_id, Audio::RecordStream::RecordCallback callback)
 {
     return Audio::RecordStream::create(device_id, audio_playback_group(m_id), move(callback));
+}
+
+void PageClient::page_did_change_media_session_state(Optional<Web::MediaSession::MediaSessionState> const& state)
+{
+    client().async_did_change_media_session_state(m_id, state);
 }
 
 void PageClient::page_did_change_screen_wake_lock_state(Web::ScreenWakeLockState wake_lock_state)
@@ -2539,6 +2626,14 @@ void PageClient::set_has_devtools_client(bool has_devtools_client)
     if (m_has_devtools_client == has_devtools_client)
         return;
     m_has_devtools_client = has_devtools_client;
+    if (has_devtools_client) {
+        m_network_activity_observers->page_did_gain_devtools_client();
+        ++s_pages_with_devtools_client;
+    } else {
+        m_network_activity_observers->page_did_lose_devtools_client();
+        --s_pages_with_devtools_client;
+    }
+    update_keeps_long_stack_traces();
 
     for (auto& navigable : Web::HTML::all_local_navigables()) {
         if (&navigable->page() != &page())
@@ -2635,15 +2730,16 @@ ErrorOr<WebView::DebuggerObjectProperties> PageClient::console_object_properties
 
 void PageClient::js_console_input(StringView js_source)
 {
-    if (m_top_level_document_console_client)
-        m_top_level_document_console_client->handle_input(js_source);
+    if (auto console_client = m_top_level_document_console_client.ptr())
+        console_client->handle_input(js_source);
 }
 
 Optional<Web::HTML::ConsoleInputCompletion> PageClient::complete_js_console_input(StringView input)
 {
-    if (!m_top_level_document_console_client)
+    auto console_client = m_top_level_document_console_client.ptr();
+    if (!console_client)
         return {};
-    return m_top_level_document_console_client->complete_input(input);
+    return console_client->complete_input(input);
 }
 
 void PageClient::run_javascript(StringView js_source)

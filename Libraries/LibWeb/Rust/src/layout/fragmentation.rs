@@ -191,6 +191,7 @@ pub(crate) struct BlockBreakToken {
     pub(crate) node: Node,
     pub(crate) consumed_block_size: CssPixels,
     pub(crate) resume: BlockResume,
+    pub(crate) deferred_floats: Vec<Node>,
 }
 
 impl BlockResume {
@@ -213,10 +214,11 @@ impl BlockBreakToken {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct LineRootFragmentation {
     pub(crate) block_size: Option<CssPixels>,
     pub(crate) resume: Option<LinePosition>,
+    pub(crate) deferred_floats: Vec<Node>,
     pub(crate) fragmentainer_had_content: bool,
     pub(crate) break_before_is_avoided: bool,
 }
@@ -257,7 +259,9 @@ pub(crate) struct FragmentainerOutcome {
     pub(crate) overflows: bool,
 }
 
-pub(crate) struct FragmentainerContext {
+/// The space a fragmentainer run lays out in: the fragmentainer's size, the break the run continues from, how it
+/// breaks, and the memos the columns of a multi-column box share.
+pub(crate) struct FragmentainerSpace {
     pub(crate) block_size: Option<CssPixels>,
     pub(crate) honors_forced_breaks: bool,
     pub(crate) incoming: Option<Rc<BlockBreakToken>>,
@@ -267,47 +271,36 @@ pub(crate) struct FragmentainerContext {
     pub(crate) keeps_box_layouts: bool,
     pub(crate) early_break_before: Option<Node>,
     pub(crate) allows_early_break_requests: bool,
-    outcome: RefCell<FragmentainerOutcome>,
-    /// What the run laid out in the fragmentainer, which the run of the box it belongs to takes in, as the
-    /// fragmentainer has no fragment of its own.
-    contents: RefCell<Option<super::fragment_tree::RunContents>>,
 }
 
-impl FragmentainerContext {
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn new(
-        block_size: Option<CssPixels>,
-        honors_forced_breaks: bool,
-        incoming: Option<Rc<BlockBreakToken>>,
-        inline_items: Rc<inline_level_iterator::InlineItemCache>,
-        box_layouts: Rc<ColumnBoxLayouts>,
-        keeps_box_layouts: bool,
-        early_break_before: Option<Node>,
-        allows_early_break_requests: bool,
-    ) -> Self {
-        Self {
-            block_size,
-            honors_forced_breaks,
-            incoming,
-            inline_items,
-            box_layouts,
-            keeps_box_layouts,
-            early_break_before,
-            allows_early_break_requests,
-            outcome: RefCell::new(FragmentainerOutcome::default()),
-            contents: RefCell::new(None),
-        }
+impl FragmentainerSpace {
+    pub(crate) fn exceeds(&self, block_end: CssPixels) -> bool {
+        self.block_size.is_some_and(|block_size| block_end > block_size)
+    }
+}
+
+/// The fragmentainer a run lays out in, as the run sees it: its space, and what the run found out so far about
+/// breaking in it, which the run's state keeps.
+#[derive(Clone, Copy)]
+pub(crate) struct Fragmentainer<'run> {
+    space: &'run FragmentainerSpace,
+    outcome: &'run RefCell<FragmentainerOutcome>,
+}
+
+impl std::ops::Deref for Fragmentainer<'_> {
+    type Target = FragmentainerSpace;
+
+    fn deref(&self) -> &FragmentainerSpace {
+        self.space
+    }
+}
+
+impl<'run> Fragmentainer<'run> {
+    pub(crate) fn new(space: &'run FragmentainerSpace, outcome: &'run RefCell<FragmentainerOutcome>) -> Self {
+        Self { space, outcome }
     }
 
-    pub(crate) fn keep_contents(&self, contents: super::fragment_tree::RunContents) {
-        *self.contents.borrow_mut() = Some(contents);
-    }
-
-    pub(crate) fn take_contents(&self) -> Option<super::fragment_tree::RunContents> {
-        self.contents.take()
-    }
-
-    pub(crate) fn outcome_mut(&self) -> RefMut<'_, FragmentainerOutcome> {
+    pub(crate) fn outcome_mut(&self) -> RefMut<'run, FragmentainerOutcome> {
         self.outcome.borrow_mut()
     }
 
@@ -320,14 +313,6 @@ impl FragmentainerContext {
             outcome.needs_early_break_before = Some(node);
         }
         true
-    }
-
-    pub(crate) fn take_outcome(&self) -> FragmentainerOutcome {
-        self.outcome.take()
-    }
-
-    pub(crate) fn exceeds(&self, block_end: CssPixels) -> bool {
-        self.block_size.is_some_and(|block_size| block_end > block_size)
     }
 
     pub(crate) fn note_space_shortage(&self, block_end: CssPixels) {
@@ -350,4 +335,15 @@ impl FragmentainerContext {
         let mut outcome = self.outcome.borrow_mut();
         outcome.tallest_unbreakable_block_size = outcome.tallest_unbreakable_block_size.max(block_size);
     }
+}
+
+/// What the run of a fragmentainer hands the run of the box the fragmentainer belongs to.
+pub(crate) struct FragmentainerRunResult {
+    pub(crate) layout: super::formatting_context::LayoutResult,
+    pub(crate) outcome: FragmentainerOutcome,
+    /// What the run laid out in the fragmentainer, where it builds fragments, as the fragmentainer has no fragment of
+    /// its own.
+    pub(crate) contents: Option<super::fragment_tree::RunContents>,
+    /// The lines the run laid out in the fragmentainer.
+    pub(crate) root_line_data: Option<std::sync::Arc<super::inline_content::InlineContent>>,
 }

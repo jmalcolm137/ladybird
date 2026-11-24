@@ -26,8 +26,8 @@ pub fn js_number_to_utf16(value: f64) -> Utf16String {
 
 /// Check a regex pattern+flags with the host's regex engine, so that an invalid
 /// one becomes an early error. Returns the error message if it is invalid.
-pub fn validate_regex(pattern: &[u16], flags: &[u16]) -> Result<(), Utf16String> {
-    implementation::validate_regex(pattern, flags).map_err(|message| Utf16String::from_utf8(&message))
+pub fn validate_regex(pattern: &[u16], flags: &[u16]) -> Result<(), String> {
+    implementation::validate_regex(pattern, flags)
 }
 
 /// StringToNumber(str), which the host implements.
@@ -43,4 +43,19 @@ pub fn string_to_bigint(string: &[u16]) -> Option<BigInt> {
 /// Number::exponentiate(base, exponent), which the host implements.
 pub fn exponentiate(base: f64, exponent: f64) -> f64 {
     implementation::exponentiate(base, exponent)
+}
+
+/// BigInt::exponentiate(base, exponent), which the host implements. Returns None where it throws.
+pub fn bigint_exponentiate(base: &BigInt, exponent: &BigInt) -> Option<BigInt> {
+    implementation::bigint_exponentiate(base, exponent)
+}
+
+/// BigInt::leftShift(x, y), which the host implements. Returns None where it throws.
+pub fn bigint_left_shift(x: &BigInt, y: &BigInt) -> Option<BigInt> {
+    implementation::bigint_left_shift(x, y)
+}
+
+/// BigInt::signedRightShift(x, y), which the host implements. Returns None where it throws.
+pub fn bigint_signed_right_shift(x: &BigInt, y: &BigInt) -> Option<BigInt> {
+    implementation::bigint_signed_right_shift(x, y)
 }

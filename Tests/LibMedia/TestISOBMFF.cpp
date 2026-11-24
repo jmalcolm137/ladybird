@@ -19,6 +19,8 @@
 #include <LibTest/TestCase.h>
 #include <LibThreading/Thread.h>
 
+#include "TestMediaCommon.h"
+
 namespace {
 
 struct BoxMarker {
@@ -306,6 +308,44 @@ void append_vp9_configuration_box(ByteBuffer& bytes)
     finish_box(bytes, configuration);
 }
 
+// BT.2020 primaries and a D65 white point mastered from 0.005 to 1000 cd/m², with primaries in mdcv's green, blue, red
+// order.
+void append_vp9_configuration_and_high_dynamic_range_boxes(ByteBuffer& bytes)
+{
+    append_vp9_configuration_box(bytes);
+
+    auto mastering_display_colour_volume = begin_box(bytes, "mdcv");
+    for (u16 value : { 8500, 39850, 6550, 2300, 35400, 14600, 15635, 16450 })
+        append_u16(bytes, value);
+    append_u32(bytes, 10'000'000);
+    append_u32(bytes, 50);
+    finish_box(bytes, mastering_display_colour_volume);
+
+    auto content_light_level = begin_box(bytes, "clli");
+    append_u16(bytes, 1005);
+    append_u16(bytes, 315);
+    finish_box(bytes, content_light_level);
+}
+
+// Each box is a byte short of the fields it holds.
+void append_vp9_configuration_and_truncated_high_dynamic_range_boxes(ByteBuffer& bytes)
+{
+    append_vp9_configuration_box(bytes);
+
+    auto mastering_display_colour_volume = begin_box(bytes, "mdcv");
+    for (u16 value : { 8500, 39850, 6550, 2300, 35400, 14600, 15635, 16450 })
+        append_u16(bytes, value);
+    append_u32(bytes, 10'000'000);
+    append_u16(bytes, 0);
+    bytes.append(50);
+    finish_box(bytes, mastering_display_colour_volume);
+
+    auto content_light_level = begin_box(bytes, "clli");
+    append_u16(bytes, 1005);
+    bytes.append(1);
+    finish_box(bytes, content_light_level);
+}
+
 void append_video_movie(ByteBuffer& bytes, char const (&format)[5], void (*append_configuration_box)(ByteBuffer&), ColourBoxOrder colour_box_order, Function<void(ByteBuffer&)> const& append_tables = {}, bool fragmented = false)
 {
     auto movie = begin_box(bytes, "moov");
@@ -438,6 +478,8 @@ void append_audio_movie(ByteBuffer& bytes, u32 timescale, u32 sample_rate, u16 c
 struct SampleEntrySummary {
     Optional<Media::CodingIndependentCodePoints> cicp;
     Optional<Media::ParsedCodec> parsed_codec;
+    Optional<Media::MasteringDisplayColorVolume> mastering_display_color_volume;
+    Optional<Media::ContentLightLevelInformation> content_light_level_information;
 };
 
 Media::DecoderErrorOr<Media::ISOBMFF::Movie> parse_movie(ByteBuffer& bytes)
@@ -454,7 +496,8 @@ SampleEntrySummary parse_only_sample_entry(ByteBuffer& bytes)
     auto movie = MUST(Media::ISOBMFF::Reader::parse_movie_box(streamer, header));
     auto const& sample_entries = movie.tracks.get(1).value()->sample_entries;
     VERIFY(sample_entries.size() == 1);
-    return { sample_entries[0].video->cicp, sample_entries[0].parsed_codec };
+    auto const& video = *sample_entries[0].video;
+    return { video.cicp, sample_entries[0].parsed_codec, video.mastering_display_color_volume, video.content_light_level_information };
 }
 
 }
@@ -760,6 +803,30 @@ TEST_CASE(seeks_by_pts_and_skips_seeks_that_do_not_improve_position)
     EXPECT_EQ(demuxer->select_fast_seek_target_for_track(track, target, Media::SeekMode::FastAfter), AK::Duration::from_seconds(6));
 }
 
+TEST_CASE(keeps_its_position_while_reading_the_targets_group_of_pictures)
+{
+    auto stream = Media::IncrementallyPopulatedStream::create_from_buffer(seek_test_file());
+    auto demuxer = MUST(Media::ISOBMFF::ISOBMFFDemuxer::from_stream(stream));
+    auto track = MUST(demuxer->get_preferred_track_for_type(Media::TrackType::Video)).value();
+    MUST(demuxer->create_context_for_track(track));
+    auto target = AK::Duration::from_seconds(2);
+
+    // The second sample is presented after the target, but the samples presented before it have yet to be read.
+    EXPECT_EQ(MUST(demuxer->get_next_sample_for_track(track)).data()[0], 0);
+    EXPECT_EQ(MUST(demuxer->get_next_sample_for_track(track)).presentation_timestamp(), AK::Duration::from_seconds(3));
+    EXPECT_EQ(MUST(demuxer->seek_to_most_recent_keyframe(track, target)), Media::DemuxerSeekResult::KeptCurrentPosition);
+    EXPECT_EQ(MUST(demuxer->get_next_sample_for_track(track)).data()[0], 2);
+
+    // Reading the next keyframe leaves the target's group of pictures.
+    EXPECT_EQ(MUST(demuxer->get_next_sample_for_track(track)).data()[0], 3);
+    EXPECT(MUST(demuxer->get_next_sample_for_track(track)).is_keyframe());
+    EXPECT_EQ(MUST(demuxer->seek_to_most_recent_keyframe(track, target)), Media::DemuxerSeekResult::MovedPosition);
+
+    // The keyframe a seek moves to counts as read before it is.
+    EXPECT_EQ(MUST(demuxer->seek_to_most_recent_keyframe(track, target)), Media::DemuxerSeekResult::KeptCurrentPosition);
+    EXPECT_EQ(MUST(demuxer->get_next_sample_for_track(track)).data()[0], 0);
+}
+
 TEST_CASE(seeks_across_movie_and_fragment_samples_in_both_directions)
 {
     auto stream = Media::IncrementallyPopulatedStream::create_from_buffer(seek_test_file(true));
@@ -944,56 +1011,129 @@ TEST_CASE(aborted_sample_iteration_can_be_resumed)
 
 TEST_CASE(fragment_seeks_block_until_the_target_metadata_arrives_and_can_be_aborted)
 {
-    for (bool movie_has_samples : { false, true }) {
-        auto bytes = seek_test_file(true, {}, movie_has_samples);
-        auto reader = streamer_for(bytes);
-        MUST(reader.seek_to_position(14));
-        auto header = MUST(Media::ISOBMFF::Reader::read_box_header(reader));
-        auto available_end = header.end_position().value() + 16;
-        auto source = Media::IncrementallyPopulatedStream::create_empty();
-        // Leave a later box unavailable, so seeking must stop before reaching the end of the file.
-        source->set_expected_size(bytes.size() + 8);
-        source->add_chunk_at(0, bytes.bytes().trim(available_end));
-        auto demuxer = MUST(Media::ISOBMFF::ISOBMFFDemuxer::from_stream(source));
-        auto track = MUST(demuxer->get_preferred_track_for_type(Media::TrackType::Video)).value();
-        MUST(demuxer->create_context_for_track(track));
-        auto target = AK::Duration::from_milliseconds(movie_has_samples ? 8500 : 2500);
-        EXPECT_EQ(demuxer->select_fast_seek_target_for_track(track, target, Media::SeekMode::FastBefore), movie_has_samples ? AK::Duration::from_seconds(6) : target);
+    auto bytes = seek_test_file(true);
+    auto reader = streamer_for(bytes);
+    MUST(reader.seek_to_position(14));
+    auto header = MUST(Media::ISOBMFF::Reader::read_box_header(reader));
+    auto available_end = header.end_position().value() + 16;
+    auto source = Media::IncrementallyPopulatedStream::create_empty();
+    // Leave a later box unavailable, so seeking must stop before reaching the end of the file.
+    source->set_expected_size(bytes.size() + 8);
+    source->add_chunk_at(0, bytes.bytes().trim(available_end));
+    auto demuxer = MUST(Media::ISOBMFF::ISOBMFFDemuxer::from_stream(source));
+    auto track = MUST(demuxer->get_preferred_track_for_type(Media::TrackType::Video)).value();
+    MUST(demuxer->create_context_for_track(track));
+    auto target = AK::Duration::from_milliseconds(8500);
+    EXPECT_EQ(demuxer->select_fast_seek_target_for_track(track, target, Media::SeekMode::FastBefore), AK::Duration::from_seconds(6));
 
-        IGNORE_USE_IN_ESCAPING_LAMBDA Atomic<bool> blocked { false };
-        IGNORE_USE_IN_ESCAPING_LAMBDA Atomic<bool> completed { false };
-        demuxer->set_read_blocked_change_handler_for_track(track, [&](Media::ReadBlocked state) {
-            blocked = state == Media::ReadBlocked::Yes;
+    IGNORE_USE_IN_ESCAPING_LAMBDA Atomic<bool> blocked { false };
+    IGNORE_USE_IN_ESCAPING_LAMBDA Atomic<bool> completed { false };
+    demuxer->set_read_blocked_change_handler_for_track(track, [&](Media::ReadBlocked state) {
+        blocked = state == Media::ReadBlocked::Yes;
+    });
+    for (bool abort : { true, false }) {
+        completed = false;
+        demuxer->reset_blocking_reads_aborted_for_track(track);
+        auto thread = Threading::Thread::construct("TestSeek"sv, [&, demuxer, track, target, abort]() -> intptr_t {
+            auto result = demuxer->seek_to_most_recent_keyframe(track, target);
+            if (abort) {
+                EXPECT(result.is_error());
+                if (result.is_error())
+                    EXPECT_EQ(result.error().category(), Media::DecoderErrorCategory::Aborted);
+            } else {
+                EXPECT(!result.is_error());
+            }
+            completed = true;
+            return 0;
         });
-        for (bool abort : { true, false }) {
-            completed = false;
-            demuxer->reset_blocking_reads_aborted_for_track(track);
-            auto thread = Threading::Thread::construct("TestSeek"sv, [&, demuxer, track, target, abort]() -> intptr_t {
-                auto result = demuxer->seek_to_most_recent_keyframe(track, target);
-                if (abort) {
-                    EXPECT(result.is_error());
-                    if (result.is_error())
-                        EXPECT_EQ(result.error().category(), Media::DecoderErrorCategory::Aborted);
-                } else {
-                    EXPECT(!result.is_error());
-                }
-                completed = true;
-                return 0;
-            });
-            thread->start();
-            auto deadline = MonotonicTime::now() + AK::Duration::from_seconds(5);
-            while (!blocked.load() && !completed.load() && MonotonicTime::now() < deadline) { }
-            EXPECT(blocked.load());
-            EXPECT(!completed.load());
-            if (abort)
-                demuxer->set_blocking_reads_aborted_for_track(track);
-            else
-                source->add_chunk_at(available_end, bytes.bytes().slice(available_end));
-            MUST(thread->join());
-        }
-        EXPECT_EQ(MUST(demuxer->get_next_sample_for_track(track)).data()[0], 6);
-        demuxer->set_read_blocked_change_handler_for_track(track, {});
+        thread->start();
+        auto deadline = MonotonicTime::now() + AK::Duration::from_seconds(5);
+        while (!blocked.load() && !completed.load() && MonotonicTime::now() < deadline) { }
+        EXPECT(blocked.load());
+        EXPECT(!completed.load());
+        if (abort)
+            demuxer->set_blocking_reads_aborted_for_track(track);
+        else
+            source->add_chunk_at(available_end, bytes.bytes().slice(available_end));
+        MUST(thread->join());
     }
+    EXPECT_EQ(MUST(demuxer->get_next_sample_for_track(track)).data()[0], 6);
+    demuxer->set_read_blocked_change_handler_for_track(track, {});
+}
+
+// Reports each read that waits for data, so that a test can supply the data only once something waits for it.
+class BlockedReadReportingStream final : public Media::MediaStream {
+public:
+    BlockedReadReportingStream(NonnullRefPtr<Media::IncrementallyPopulatedStream> stream, Function<void()> on_read_blocked)
+        : m_stream(move(stream))
+        , m_on_read_blocked(move(on_read_blocked))
+    {
+    }
+
+    virtual NonnullRefPtr<Media::MediaStreamCursor> create_cursor() override
+    {
+        auto cursor = m_stream->create_cursor();
+        cursor->set_blocked_change_handler([this](Media::ReadBlocked blocked) {
+            if (blocked == Media::ReadBlocked::Yes)
+                m_on_read_blocked();
+        });
+        return cursor;
+    }
+    virtual Availability availability() const override { return m_stream->availability(); }
+    virtual Optional<u64> expected_size() const override { return m_stream->expected_size(); }
+    virtual bool is_closed() const override { return m_stream->is_closed(); }
+
+private:
+    NonnullRefPtr<Media::IncrementallyPopulatedStream> m_stream;
+    Function<void()> m_on_read_blocked;
+};
+
+TEST_CASE(creating_a_demuxer_waits_for_the_first_fragment_of_a_movie_without_samples)
+{
+    // The first sample's presentation time is needed for the earliest possible position.
+    auto bytes = seek_test_file(true, 5, false);
+    auto reader = streamer_for(bytes);
+    MUST(reader.seek_to_position(14));
+    auto header = MUST(Media::ISOBMFF::Reader::read_box_header(reader));
+    auto available_end = header.end_position().value() + 16;
+    auto source = Media::IncrementallyPopulatedStream::create_empty();
+    source->add_chunk_at(0, bytes.bytes().trim(available_end));
+
+    auto& loop = never_destroyed_event_loop();
+    IGNORE_USE_IN_ESCAPING_LAMBDA auto main_thread_event_loop = Core::EventLoop::current_weak();
+    IGNORE_USE_IN_ESCAPING_LAMBDA Atomic<bool> read_blocked { false };
+    IGNORE_USE_IN_ESCAPING_LAMBDA Atomic<bool> created { false };
+    auto wake_main_thread = [&] {
+        if (auto event_loop = main_thread_event_loop->take())
+            event_loop->wake();
+    };
+    auto stream = adopt_ref(*new BlockedReadReportingStream(source, [&] {
+        read_blocked = true;
+        wake_main_thread();
+    }));
+
+    IGNORE_USE_IN_ESCAPING_LAMBDA RefPtr<Media::Demuxer> demuxer;
+    auto thread = Threading::Thread::construct("TestCreate"sv, [&, stream]() -> intptr_t {
+        demuxer = MUST(Media::ISOBMFF::ISOBMFFDemuxer::from_stream(stream));
+        created = true;
+        wake_main_thread();
+        return 0;
+    });
+    thread->start();
+
+    // Creation reads the fragment that holds the first sample, so it waits until that fragment arrives.
+    loop.spin_until([&] { return read_blocked.load() || created.load(); });
+    EXPECT(read_blocked.load());
+    EXPECT(!created.load());
+    source->add_chunk_at(available_end, bytes.bytes().slice(available_end));
+    source->close();
+    MUST(thread->join());
+
+    auto track = MUST(demuxer->get_preferred_track_for_type(Media::TrackType::Video)).value();
+    MUST(demuxer->create_context_for_track(track));
+    auto first_sample = MUST(demuxer->get_next_sample_for_track(track));
+    EXPECT(first_sample.presentation_timestamp() > AK::Duration::zero());
+    EXPECT_EQ(demuxer->earliest_possible_position(), first_sample.presentation_timestamp());
 }
 
 TEST_CASE(seeking_uses_the_first_sample_when_no_samples_are_marked_sync)
@@ -1373,6 +1513,55 @@ TEST_CASE(parses_vp_codec_configuration_box)
     EXPECT_EQ(entry.cicp->transfer_characteristics(), Media::TransferCharacteristics::SMPTE2084);
 }
 
+static void append_vp9_configuration_box_and_quicktime_terminator(ByteBuffer& bytes)
+{
+    append_vp9_configuration_box(bytes);
+    append_u32(bytes, 0);
+}
+
+static void append_vp9_configuration_box_and_three_trailing_bytes(ByteBuffer& bytes)
+{
+    append_vp9_configuration_box(bytes);
+    bytes.append(1);
+    bytes.append(2);
+    bytes.append(3);
+}
+
+TEST_CASE(skips_trailing_bytes_too_short_for_a_box_at_the_end_of_a_sample_entry)
+{
+    for (auto append_configuration_box : { append_vp9_configuration_box_and_quicktime_terminator, append_vp9_configuration_box_and_three_trailing_bytes }) {
+        ByteBuffer bytes;
+        append_video_movie(bytes, "vp09", append_configuration_box, ColourBoxOrder::None);
+        auto entry = parse_only_sample_entry(bytes);
+
+        EXPECT(entry.parsed_codec.has_value());
+        EXPECT_EQ(entry.parsed_codec->vp9_parameters()->profile, 2);
+    }
+}
+
+TEST_CASE(leaves_the_streamer_at_the_parent_end_after_trailing_bytes_too_short_for_a_box)
+{
+    ByteBuffer bytes;
+    auto parent = begin_box(bytes, "moof");
+    auto child = begin_box(bytes, "free");
+    finish_box(bytes, child);
+    bytes.append(1);
+    bytes.append(2);
+    bytes.append(3);
+    finish_box(bytes, parent);
+    append_u32(bytes, 0); // Whatever follows the parent.
+
+    auto streamer = streamer_for(bytes);
+    auto header = MUST(Media::ISOBMFF::Reader::read_box_header(streamer));
+    size_t child_count = 0;
+    MUST(Media::ISOBMFF::Reader::parse_child_boxes(streamer, header, Media::ISOBMFF::IsTopLevel::No, [&](auto const&) -> Media::DecoderErrorOr<IterationDecision> {
+        ++child_count;
+        return IterationDecision::Continue;
+    }));
+    EXPECT_EQ(child_count, 1u);
+    EXPECT_EQ(streamer.position(), header.end_position().value());
+}
+
 TEST_CASE(colour_information_box_overrides_the_vp_configuration_box_in_either_order)
 {
     for (auto order : { ColourBoxOrder::BeforeConfiguration, ColourBoxOrder::AfterConfiguration }) {
@@ -1388,6 +1577,42 @@ TEST_CASE(colour_information_box_overrides_the_vp_configuration_box_in_either_or
         EXPECT(entry.parsed_codec.has_value());
         EXPECT_EQ(entry.parsed_codec->vp9_parameters()->profile, 2);
     }
+}
+
+TEST_CASE(parses_mastering_display_colour_volume_and_content_light_level_boxes)
+{
+    ByteBuffer bytes;
+    append_video_movie(bytes, "vp09", append_vp9_configuration_and_high_dynamic_range_boxes, ColourBoxOrder::None);
+    auto entry = parse_only_sample_entry(bytes);
+
+    EXPECT(entry.content_light_level_information.has_value());
+    EXPECT_EQ(entry.content_light_level_information->maximum_content_light_level, 1005);
+    EXPECT_EQ(entry.content_light_level_information->maximum_frame_average_light_level, 315);
+
+    EXPECT(entry.mastering_display_color_volume.has_value());
+    auto const& volume = *entry.mastering_display_color_volume;
+    EXPECT_APPROXIMATE(volume.red.x, 0.708f);
+    EXPECT_APPROXIMATE(volume.red.y, 0.292f);
+    EXPECT_APPROXIMATE(volume.green.x, 0.170f);
+    EXPECT_APPROXIMATE(volume.green.y, 0.797f);
+    EXPECT_APPROXIMATE(volume.blue.x, 0.131f);
+    EXPECT_APPROXIMATE(volume.blue.y, 0.046f);
+    EXPECT_APPROXIMATE(volume.white_point.x, 0.3127f);
+    EXPECT_APPROXIMATE(volume.white_point.y, 0.3290f);
+    EXPECT_APPROXIMATE(volume.maximum_luminance, 1000.0f);
+    EXPECT_APPROXIMATE(volume.minimum_luminance, 0.005f);
+}
+
+TEST_CASE(truncated_mastering_display_colour_volume_and_content_light_level_boxes_are_skipped)
+{
+    ByteBuffer bytes;
+    append_video_movie(bytes, "vp09", append_vp9_configuration_and_truncated_high_dynamic_range_boxes, ColourBoxOrder::AfterConfiguration);
+    auto entry = parse_only_sample_entry(bytes);
+
+    EXPECT(!entry.mastering_display_color_volume.has_value());
+    EXPECT(!entry.content_light_level_information.has_value());
+    EXPECT(entry.cicp.has_value());
+    EXPECT_EQ(entry.cicp->color_primaries(), Media::ColorPrimaries::BT709);
 }
 
 TEST_CASE(parses_av1_configuration_box_color_from_its_sequence_header)

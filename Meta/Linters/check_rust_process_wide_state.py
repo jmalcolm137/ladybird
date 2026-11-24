@@ -30,13 +30,22 @@ import sys
 # or a stub in a test binary.
 ALLOWED = {
     "Libraries/LibGfx/Rust/src/text_layout.rs:SHAPING_CACHE": "per-thread memo of a pure function; a second copy costs memory, never an answer",
+    "AK/Rust/src/row_block.rs:NEXT_BLOCK": "numbers the blocks, so that a block only gives the rows of its own lists; a block and its lists stay in the library that made them, so two copies never compare numbers; a block that another library reads needs the counter moved to C++",
     "AK/Rust/src/waiter_list.rs:LISTS": "only libjs_rust and libwasm_engine use it, which are in one library of a process, so they share a copy; a caller in another library needs the state moved to C++",
     "Libraries/LibCompositing/Rust/src/test_stubs.rs:NEXT": "test stub for LibGfx's C++ counters, in the cargo test binary that has no C++ side",
     "Libraries/LibCompositing/Rust/src/display_list/replay.rs:WARM_REPLAY_SCRATCH_STORAGE": "per-thread replay scratch; a second copy costs memory, never an answer",
+    "Libraries/LibIPC/Rust/src/transport.rs:IO_THREAD": "the IO thread of the Mach transports that one copy of the crate makes; a transport stays with the thread of its copy, so a second copy that makes transports, as a test binary that also links LibIPC does, only costs a second thread. Its claims on send-possible requests are per copy too, which holds while no two copies send to the same port: a shipped process makes transports through one copy, and the test binary's two copies send to each other",
+    "Libraries/LibIPC/Rust/src/transport.rs:STARTING": "serializes the start of IO_THREAD's thread, and is per copy with it",
+    "Libraries/LibIPC/Rust/src/transport.rs:IS_SHARED_IO_THREAD": "per-thread marker of the IO thread of IO_THREAD's copy, which only that copy's code reads",
     "Libraries/LibJS/Flap/src/low_ir/lowering.rs:LABELS": "per-thread scratch buffer; a second copy costs memory, never an answer",
     "Libraries/LibJS/JIT/Rust/src/asm/x86_64/sse.rs:FEATURES": "immutable CPU/OS feature cache; each copy computes the same supported instructions",
     "Libraries/LibJS/JIT/Rust/src/codegen/tests.rs:REGION": "the fake heap region of JIT unit tests, in the cargo test binary that has no runtime",
+    "Libraries/LibJS/JIT/Rust/src/lib.rs:BLOCKS": "per-thread count of the allocator of JIT unit tests, in the cargo test binary that has no runtime",
+    "Libraries/LibJS/JIT/Rust/src/lib.rs:COUNTING": "per-thread switch of the allocator of JIT unit tests, in the cargo test binary that has no runtime",
     "Libraries/LibRegex/Rust/src/vm.rs:INTERRUPT_FLAG": "per-thread, and only libjs_rust's copy sets it; the copy of LibURL's crate has no VM to interrupt, so it only ever sees null",
+    "Libraries/LibWeb/HTML/Parser/Rust/src/fragment.rs:SPARE_TAPE": "per-thread allocation pool; a second copy costs memory, never an answer",
+    "Libraries/LibWeb/HTML/Parser/Rust/src/fragment.rs:TAG_NAMES": "immutable table of the C++ fly strings of tag names; each copy reads the same strings",
+    "Libraries/LibWeb/HTML/Parser/Rust/src/parser/test_host.rs:FAKE_DOM": "the fake DOM of tree builder unit tests, in the cargo test binary that has no C++ side",
     "Libraries/LibWeb/HTML/Parser/Rust/src/token.rs:SPARE_ATTRIBUTE_LISTS": "per-thread allocation pool; a second copy costs memory, never an answer",
     "Libraries/LibWeb/HTML/Parser/Rust/src/token.rs:SPARE_ATTRIBUTE_VALUES": "per-thread allocation pool; a second copy costs memory, never an answer",
 }
@@ -83,14 +92,15 @@ RENDER_STATE_ALLOWED = {
         SCRATCH,
         [
             "css/cascaded_properties.rs:STORE_POOL",
+            "css/parser/syntax_parser/structure.rs:CHILDREN",
+            "css/parser/value_parser.rs:UNRESOLVED_SOURCE",
+            "css/serialize.rs:SERIALIZATION_SINK",
         ],
     ),
     **render_state_entries(
         DIAGNOSTIC,
         [
             "css/ffi_stats.rs:COMPLETE_STYLE_UPDATE_STATE",
-            "css/ffi_stats.rs:COUNTERS_ENABLED",
-            "css/ffi_stats.rs:COUNTS",
             "css/ffi_stats.rs:CPP_CALLBACK_COUNT",
             "css/ffi_stats.rs:THREAD_UNSAFE_CPP_CALLBACK_COUNT",
         ],
@@ -102,12 +112,20 @@ RENDER_STATE_ALLOWED = {
             "layout/parallel_layout.rs:SUBTREE_LEASES_ARE_VERIFIED",
             "layout/run_repeatability.rs:ENABLED",
             "layout/run_repeatability.rs:VERIFICATION",
+            "layout/tree_builder/list_unit.rs:ENABLED",
+            "painting/hit_test/walk.rs:VERIFIED",
+            "painting/paint_passes.rs:PAINTING_TIMING_ENABLED",
+            "painting/record/ink_bounds.rs:VERIFICATION",
+            "painting/record/traversal.rs:VERIFIED",
             "render_state/clock/hover.rs:LOGS",
         ],
     ),
     **render_state_entries(
         IDENTITY,
         [
+            "animations/animation.rs:NEXT",
+            "animations/effect.rs:NEXT",
+            "animations/timeline.rs:NEXT",
             "cow_column.rs:NEXT",
             "css/declaration_block.rs:NEXT_DECLARATION_BLOCK_IDENTITY",
             "css/rule.rs:NEXT_RULE_IDENTITY",
@@ -128,6 +146,7 @@ RENDER_STATE_ALLOWED = {
         "per-thread list of what the thread let go of in its hold of the render owner's slot, dropped as the hold ends",
         ["render_state/owner.rs:DROPPED_AFTER_HOLD"],
     ),
+    f"{RENDER_STATE_CRATE}/src/css/parser/value_parser.rs:INITIAL_VALUES": "per-thread cache of the initial values of longhands, parsed outside any document; every thread parses the same values",
     f"{RENDER_STATE_CRATE}/src/render_state.rs:STACK_BASE": "per-thread cache of the thread's own stack bounds",
     f"{RENDER_STATE_CRATE}/src/layout/parallel_layout.rs:SUBTREE_LEASE_OF_THIS_THREAD": "per-thread lease of the subtree the layout task running on the thread may write, held only while LIBWEB_VERIFY_LAYOUT_FORK_SCOPE checks it and only for that task",
     f"{RENDER_STATE_CRATE}/src/layout/layout_pass.rs:WORKER_SCRATCH_OF_THIS_THREAD": "per-thread spare layout buffers and the fragment identities the thread reserved; a thread without one only allocates more and reserves another range",
@@ -135,6 +154,7 @@ RENDER_STATE_ALLOWED = {
     **render_state_entries(
         BUILT_ONCE,
         [
+            "animations/easing.rs:LINEAR",
             "css/counter_representation.rs:DECIMAL",
             "css/css_string.rs:EMPTY",
             "css/custom_properties.rs:EMPTY",
@@ -157,6 +177,7 @@ RENDER_STATE_ALLOWED = {
     **render_state_entries(
         LOCKED,
         [
+            "css/parser/sheet_source_text.rs:QUEUE",
             "css/parser/stylesheet_cache.rs:CACHE",
         ],
     ),
@@ -187,6 +208,7 @@ RENDER_STATE_ALLOWED = {
     f"{RENDER_STATE_CRATE}/src/css/parser/value_parser.rs:LISTS": "built-once immutable lists of initial background values",
     f"{RENDER_STATE_CRATE}/src/painting/recording_slot.rs:RECORDING_HOLD": "a test's hold on the next recording that flies, behind a mutex; only internals arms it",
     f"{RENDER_STATE_CRATE}/src/painting/recording_slot.rs:RECORDING_HOLD_RELEASED": "wakes the recording a test held once it lets it go",
+    f"{RENDER_STATE_CRATE}/src/painting/recording_slot.rs:CLAIM_HOLD_BLOCKS_RENDER_THREAD": "whether a test's claim hold blocks the Render thread, which a thread about to wait for that thread reads without the hold's mutex",
     f"{RENDER_STATE_CRATE}/src/stage_thread.rs:THREAD_SETUP": "set once before the first stage thread starts, which runs it; read-only after",
     f"{RENDER_STATE_CRATE}/src/stage_thread.rs:FLIGHT_FINISHED": "set once before the first job is submitted, which a stage thread calls when one finishes; read-only after",
     f"{RENDER_STATE_CRATE}/src/stage_thread.rs:RENDER_THREAD": "the process's one Render thread, which every thread hands its jobs to",

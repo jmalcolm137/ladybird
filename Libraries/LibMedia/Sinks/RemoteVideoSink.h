@@ -37,7 +37,7 @@ public:
         // Called from the pump thread, in the order the frames are lent.
         Function<void(LentFrame)> send_frame;
         // Called from the pump thread, after the frames the status follows.
-        Function<void(PipelineStatus, u32 seek_id)> send_status;
+        Function<void(PipelineStatus, u32 seek_id, PipelineCheckpoint)> send_status;
         Function<void()> notify_clock_resumed;
         // A seek reaches the far-end consumer so that its cached frames are consulted. Unless the frames lent to it
         // could satisfy the seek, the input is seeked before the seek is transmitted, and the consumer's request for
@@ -45,6 +45,7 @@ public:
         Function<void(InvalidateHeldData)> transmit_seek;
         // Relays a replacement time reader (e.g. after audio is disabled) to the consumer; the initial one rides video_edge_ready.
         Function<void(MediaTimeReader const&)> transmit_time_reader;
+        Function<void(bool)> transmit_ticking;
     };
 
     static ErrorOr<NonnullRefPtr<RemoteVideoSink>> create(Delegates);
@@ -55,14 +56,16 @@ public:
 
     virtual void seek(AK::Duration timestamp, InvalidateHeldData = InvalidateHeldData::No) override;
     virtual void notify_clock_resumed() override;
+    virtual void set_ticking(bool) override;
     // The newest received lend ID is the last one the consumer had seen when it asked for the seek.
     void seek_upstream(AK::Duration timestamp, InvalidateHeldData, u64 newest_received_lend_id);
     virtual void set_time_reader(MediaTimeReader) override;
     virtual void set_state_change_handler(PipelineStateChangeHandler) override;
     virtual void set_resize_handler(PipelineResizeHandler) override;
     void start_input();
+    void suspend_input();
 
-    void report_remote_status(PipelineStatus);
+    void report_remote_status(PipelineStatus, PipelineCheckpoint);
     void report_remote_resize(Gfx::Size<u32>);
 
     // Callable from any thread.
@@ -81,6 +84,9 @@ private:
 
     PipelineStateChangeHandler m_on_state_changed;
     PipelineResizeHandler m_on_resize;
+    // A seek reaches the input directly, ahead of the consumer's request for it, only while the consumer ticks. One
+    // that doesn't may leave its suspended input be for the seek.
+    bool m_consumer_is_ticking { false };
 };
 
 }

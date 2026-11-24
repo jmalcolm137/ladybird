@@ -33,7 +33,9 @@ There are some optional features that can be enabled during compilation that are
 - `ENABLE_ALL_THE_DEBUG_MACROS`: used for checking whether debug code compiles on CI. This should not be set normally, as it clutters the console output and makes the system run very slowly. Instead, enable only the needed debug macros, as described below.
 - `ENABLE_COMPILETIME_FORMAT_CHECK`: checks for the validity of `std::format`-style format string during compilation. Enabled by default.
 - `ENABLE_JS_JIT`: builds the optimizing JIT for JavaScript. Enabled by default on x86-64 and AArch64 Linux and macOS and on x86-64 Windows, the platforms it generates code for. Without it, LibJS runs JavaScript in its interpreter alone, and the interpreter is built without the feedback collection and tier-up checks that only the JIT needs. See [the configuration of the JIT](../Libraries/LibJS/JIT/ARCHITECTURE.md#13-configuration).
-- `ENABLE_CI_BASELINE_CPU`: builds C++ and Rust for a common CPU target instead of the build machine. Disabled by default; explicitly set `-DENABLE_CI_BASELINE_CPU=ON` when packaging binaries for older machines. On x86-64 this is x86-64-v2 (SSE4.2 and POPCNT), so distributed binaries run without AVX, AVX2, BMI or LZCNT. Both the JavaScript and WebAssembly JITs remain available; WebAssembly selects newer instructions at runtime when supported.
+- `LADYBIRD_ENABLE_UPDATE_CHECK`: checks whether a newer release of Ladybird is available. Enabled by default. Without it, Ladybird never downloads the list of releases and has no menu item or notice about updates, and its setting in `about:settings` says that updates are managed externally. Turning it off also turns off `LADYBIRD_ENABLE_SPARKLE`.
+- `LADYBIRD_ENABLE_SPARKLE`: updates the macOS app with [Sparkle](https://sparkle-project.org). Enabled by default. Without it, vcpkg doesn't build Sparkle, which needs Xcode, and Ladybird links to the release page of a newer version instead of installing it.
+- `LADYBIRD_BASELINE_CPU_TARGET`: builds C++ and Rust for a common CPU target instead of the build machine. Disabled by default and enabled by the `Distribution` preset; explicitly set `-DLADYBIRD_BASELINE_CPU_TARGET=ON` when packaging binaries for older machines with another configuration. On x86-64 this is x86-64-v2 (SSE4.2 and POPCNT), so distributed binaries run without AVX, AVX2, BMI or LZCNT. Both the JavaScript and WebAssembly JITs remain available; WebAssembly selects newer instructions at runtime when supported.
 - `INCLUDE_WASM_SPEC_TESTS`: downloads and includes the WebAssembly spec testsuite tests. In order to use this option, you will need to install `prettier` and `wasm-tools`.
 - `BUILD_BROWSER_TESTS_ONLY`: only builds the tests that run the browser's own executables, such as the LibWeb test suite and the WebDriver tests, and leaves out the test programs for individual libraries. Enabled by the `Distribution` preset.
 - `LADYBIRD_CACHE_DIR`: sets the location of a shared cache of downloaded files. Should not need to be set manually unless managing a distribution package.
@@ -42,14 +44,15 @@ There are some optional features that can be enabled during compilation that are
 - `ENABLE_CLANG_PLUGINS_INVALID_FUNCTION_MEMBERS`: makes the Clang plugins also detect invalid function types as members of GC-allocated objects. Only applies with `ENABLE_CLANG_PLUGINS`.
 - `BUILD_SHARED_LIBS`: builds shared libraries instead of static ones. Enabled by default, and disabled by the `Distribution` preset.
 - `ENABLE_GUI_TARGETS`: builds the browser, its helper processes and the tests that need them. Enabled by default.
-- `ENABLE_LAGOM_CCACHE`: compiles through ccache when it is installed. Enabled by default.
+- `LADYBIRD_BUILD_QT`: builds and bundles Qt with vcpkg for Linux GUI builds. Disabled by default.
+- `LADYBIRD_ENABLE_CCACHE`: compiles through ccache when it is installed. Enabled by default.
 - `LAGOM_USE_LINKER`: sets the linker to use, such as `lld` or `mold`, instead of the compiler's default. On Linux and the BSDs, LLD or mold is picked automatically when one of them is installed.
 - `LAGOM_LINK_POOL_SIZE`: sets the maximum number of link jobs that run at once.
-- `ENABLE_LTO_FOR_RELEASE`: enables link-time optimization in Release builds. Enabled by default, except for static builds with GCC.
+- `LADYBIRD_ENABLE_LTO`: enables link-time optimization. Disabled by default and enabled by the `Distribution` preset. Static builds with GCC need a lot of memory with it.
 - `LADYBIRD_ENABLE_CPPTRACE`: uses cpptrace for stack traces when it is available, and `backtrace.h` otherwise. Enabled by default.
 - `LADYBIRD_GENERATE_SYMBOL_FILES`: builds with debug information and writes the symbols of the installed executables to separate files. Enabled by the `Distribution` preset. Not supported with MSVC-style toolchains.
 - `LADYBIRD_GENERATE_DSYM`: generates dSYM bundles for executables and libraries on macOS.
-- `LADYBIRD_VERSION`: sets the version of a release, as year.month.patch, such as `2026.11.0`. Empty for development builds.
+- `LADYBIRD_VERSION`: sets the version of a release, as three integers, such as `2026.46.0`. Empty for development builds.
 - `ENABLE_INSTALL_HEADERS`: installs the headers of the libraries. Enabled by default.
 - `ENABLE_INSTALL_FREEDESKTOP_FILES`: installs the desktop entry, D-Bus service, icon and AppStream metainfo files. Enabled by default on Linux and the BSDs.
 
@@ -132,6 +135,9 @@ flatpak-builder --user --force-clean --install-deps-from=flathub \
 This command will build the Flatpak bundle and install it into the local Flatpak repository at `Build/repo`. Expect this
 to take a long time, as it will download and build all the dependencies of Ladybird as well. `flatpak-builder` will drop
 caches and build files in `.flatpak-builder`, as well as in the two subfolders `Build/repo` and `Build/flatpak`.
+
+`flatpak-builder` 1.4.5 and newer record the license files of the dependencies, which the `LICENSES.txt` of the
+Flatpak reproduces. With an older version, `LICENSES.txt` only names the dependencies.
 
 The Flatpak can be run with the following command:
 

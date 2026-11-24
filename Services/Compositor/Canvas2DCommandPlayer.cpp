@@ -14,8 +14,8 @@
 #include <Compositor/Canvas2DCommandPlayer.h>
 #include <Compositor/FontSkia.h>
 #include <Compositor/PaintingSurface.h>
+#include <Compositor/SkiaBackendContext.h>
 #include <Compositor/SkiaUtils.h>
-#include <LibCompositing/DisplayList/Canvas2DTape.h>
 #include <LibCompositing/DisplayList/DisplayListCommand.h>
 #include <LibGfx/Bitmap.h>
 #include <LibGfx/Color.h>
@@ -53,6 +53,15 @@ Canvas2DCommandPlayer::Canvas2DCommandPlayer(NonnullRefPtr<Gfx::PaintingSurface>
 
 Canvas2DCommandPlayer::~Canvas2DCommandPlayer() = default;
 
+sk_sp<SkImage> Canvas2DCommandPlayer::image_of_frame(Gfx::DecodedImageFrame const& frame) const
+{
+    if (auto skia_backend_context = m_surface->skia_backend_context()) {
+        if (auto image = Gfx::sk_texture_image_sharing_pixels_of_decoded_image_frame(frame, *skia_backend_context))
+            return image;
+    }
+    return Gfx::sk_image_from_decoded_image_frame(frame);
+}
+
 NonnullRefPtr<Gfx::PaintingSurface> Canvas2DCommandPlayer::surface() const
 {
     return m_surface;
@@ -63,22 +72,20 @@ void Canvas2DCommandPlayer::clear(Gfx::Color color)
     clear_rect({ {}, m_surface->size().to_type<float>() }, color);
 }
 
-void Canvas2DCommandPlayer::play(ReadonlyBytes tape)
+void Canvas2DCommandPlayer::play_command(DisplayListCommandType command_type, ReadonlyBytes payload)
 {
-    for_each_canvas_2d_command(tape, [&](DisplayListCommandType command_type, ReadonlyBytes payload) {
-        m_payload = payload;
-        switch (command_type) {
+    m_payload = payload;
+    switch (command_type) {
 #define PLAY_CANVAS_2D_COMMAND(command_type)                                        \
     case DisplayListCommandType::command_type:                                      \
         play_command(read_display_list_object<Compositing::command_type>(payload)); \
         break;
-            ENUMERATE_CANVAS_2D_COMMANDS(PLAY_CANVAS_2D_COMMAND)
+        ENUMERATE_CANVAS_2D_COMMANDS(PLAY_CANVAS_2D_COMMAND)
 #undef PLAY_CANVAS_2D_COMMAND
-        default:
-            // NB: Validation lets only the commands of the canvas 2D stream onto the tape of a canvas.
-            VERIFY_NOT_REACHED();
-        }
-    });
+    default:
+        // NB: Validation lets only the commands of the canvas 2D stream onto the tape of a canvas.
+        VERIFY_NOT_REACHED();
+    }
     m_payload = {};
 }
 
@@ -178,7 +185,7 @@ Optional<SkPaint> Canvas2DCommandPlayer::paint_from(Canvas2DPaint const& style, 
         auto const* frame = m_resolvers.image_frame(style.pattern_image_id.value());
         if (!frame)
             return {};
-        auto image = Gfx::sk_image_from_bitmap(frame->bitmap(), frame->color_space());
+        auto image = image_of_frame(*frame);
         if (!image)
             break;
 
@@ -461,7 +468,7 @@ void Canvas2DCommandPlayer::play_command(Canvas2DDrawImageFrame const& command)
     auto const* frame = m_resolvers.image_frame(command.frame_id.value());
     if (!frame)
         return;
-    auto image = Gfx::sk_image_from_bitmap(frame->bitmap(), frame->color_space());
+    auto image = image_of_frame(*frame);
     if (!image)
         return;
     draw_image(*image, command.dst_rect, command.src_rect, command.scaling_mode, command.compositing);
@@ -571,7 +578,7 @@ void Canvas2DCommandPlayer::play_command(Canvas2DPutImageFrame const& command)
     auto const* frame = m_resolvers.image_frame(command.frame_id.value());
     if (!frame)
         return;
-    m_surface->write_from_bitmap(frame->bitmap(), command.position, frame->color_space());
+    m_surface->write_from_bitmap(*frame->bitmap_sharing_pixels(), command.position, frame->color_space());
 }
 
 }

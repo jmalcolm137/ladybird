@@ -1,0 +1,9 @@
+Harness status: OK
+
+Found 4 tests
+
+4 Pass
+Pass	cookieStore.set with maxAge set to a positive value
+Pass	cookieStore.set with maxAge set to a negative value
+Pass	cookieStore.set with maxAge set to zero, cookie change event not dispatched
+Pass	cookieStore.set fails with both maxAge and expires

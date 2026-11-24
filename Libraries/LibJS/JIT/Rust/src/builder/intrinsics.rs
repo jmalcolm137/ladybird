@@ -28,6 +28,7 @@ use crate::snapshot::HelperOperand;
 use crate::snapshot::HelperResult;
 use crate::snapshot::Intrinsic;
 use crate::snapshot::value_feedback;
+use ak::ZoneVec;
 
 /// What a call of a string builtin that reads a character returns.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -48,7 +49,7 @@ const MAX_INLINE_SPLICED_VALUES: usize = crate::codegen::DIRECT_CALL_MAX_INPUTS 
 /// How many arguments `try_build_math_min_max()` compares inline at most.
 const MAX_MIN_MAX_ARGUMENTS: usize = 8;
 
-impl GraphBuilder<'_> {
+impl<'a> GraphBuilder<'a, '_> {
     /// Calls the packed-array splice helper without a native frame. It
     /// declines before doing anything observable for receivers or species
     /// constructors that require the ordinary call.
@@ -89,7 +90,8 @@ impl GraphBuilder<'_> {
         }
         let mut slow_paths = self.start_slow_paths(Some(Repr::Tagged))?;
         let receiver = self.read(*this_value)?;
-        let mut inputs = vec![receiver];
+        let mut inputs = self.node_list();
+        inputs.push(receiver);
         for (index, argument) in arguments.iter().enumerate() {
             let value = self.read(*argument)?;
             inputs.push(if index < 2 {
@@ -98,7 +100,8 @@ impl GraphBuilder<'_> {
                 value
             });
         }
-        let result = self.emit(Op::CallArraySplice, inputs, Some(Repr::Tagged));
+        let result = self.emit(Op::CallArraySplice, &inputs, Some(Repr::Tagged));
+        self.release_node_list(inputs);
         let result = self.branch_if_empty(&mut slow_paths, result);
         let result = self
             .join_slow_paths(slow_paths, Some(result))
@@ -117,7 +120,7 @@ impl GraphBuilder<'_> {
             dst,
             callee,
             this_value,
-            ref arguments,
+            arguments,
             ..
         } = *instruction
         else {
@@ -126,7 +129,7 @@ impl GraphBuilder<'_> {
         let Some(feedback) = self.call_feedback(call_feedback) else {
             return Ok(None);
         };
-        if std::iter::once(&this_value)
+        if core::iter::once(&this_value)
             .chain(arguments)
             .any(|operand| self.holds_virtual_arguments(*operand))
         {
@@ -223,31 +226,31 @@ impl GraphBuilder<'_> {
         let mut slow_paths = self.start_slow_paths(Some(Repr::Tagged))?;
         self.exit_instead_of_slow_path(&mut slow_paths);
         if target.is_none() {
-            self.branch_to_slow_path(&mut slow_paths, BranchCondition::Builtin(builtin), vec![callee], true);
+            self.branch_to_slow_path(&mut slow_paths, BranchCondition::Builtin(builtin), &[callee], true);
         }
         let result = if let Some(integer) = self.int32_value_of(argument) {
             self.build_int32_math_function(&mut slow_paths, op, integer)
         } else if let Some(double) = self.float64_value_of(argument) {
-            let result = self.emit(Op::Float64Unary { op }, vec![double], Some(Repr::Float64));
-            self.emit(Op::BoxFloat64, vec![result], Some(Repr::Tagged))
+            let result = self.emit(Op::Float64Unary { op }, &[double], Some(Repr::Float64));
+            self.emit(Op::BoxFloat64, &[result], Some(Repr::Tagged))
         } else {
             // NB: Int32 arguments, then doubles.
-            let (int32, other) = self.branch_both_ways(BranchCondition::Int32Value, vec![argument]);
+            let (int32, other) = self.branch_both_ways(BranchCondition::Int32Value, &[argument]);
             self.block = other;
-            let double = self.branch_to_slow_path(&mut slow_paths, BranchCondition::Double, vec![argument], true);
-            let double = self.emit(Op::UnboxDouble, vec![double], Some(Repr::Float64));
-            let result = self.emit(Op::Float64Unary { op }, vec![double], Some(Repr::Float64));
-            let double_result = self.emit(Op::BoxFloat64, vec![result], Some(Repr::Tagged));
+            let double = self.branch_to_slow_path(&mut slow_paths, BranchCondition::Double, &[argument], true);
+            let double = self.emit(Op::UnboxDouble, &[double], Some(Repr::Float64));
+            let result = self.emit(Op::Float64Unary { op }, &[double], Some(Repr::Float64));
+            let double_result = self.emit(Op::BoxFloat64, &[result], Some(Repr::Tagged));
             let double = self.block;
 
             self.block = int32;
-            let integer = self.refine(BranchCondition::Int32Value, true, vec![argument]);
-            let integer = self.emit(Op::UnboxInt32, vec![integer], Some(Repr::Int32));
+            let integer = self.refine(BranchCondition::Int32Value, true, &[argument]);
+            let integer = self.emit(Op::UnboxInt32, &[integer], Some(Repr::Int32));
             let int32_result = self.build_int32_math_function(&mut slow_paths, op, integer);
             let int32 = self.block;
 
-            self.join_blocks(vec![int32, double]);
-            self.add_phi(vec![int32_result, double_result])
+            self.join_blocks(&[int32, double]);
+            self.add_phi(&[int32_result, double_result])
         };
         let result = self
             .join_slow_paths(slow_paths, Some(result))
@@ -285,21 +288,23 @@ impl GraphBuilder<'_> {
             self.check_callee(callee, target)?;
         }
         let callee = self.read(callee)?;
-        let arguments = arguments
-            .iter()
-            .map(|argument| self.read(*argument))
-            .collect::<Result<Vec<_>, _>>()?;
+        let mut values = self.node_list();
+        for argument in arguments {
+            values.push(self.read(*argument)?);
+        }
         let mut slow_paths = self.start_slow_paths(Some(Repr::Tagged))?;
         self.exit_instead_of_slow_path(&mut slow_paths);
         if target.is_none() {
-            self.branch_to_slow_path(&mut slow_paths, BranchCondition::Builtin(builtin), vec![callee], true);
+            self.branch_to_slow_path(&mut slow_paths, BranchCondition::Builtin(builtin), &[callee], true);
         }
-        let numbers = arguments
-            .into_iter()
-            .map(|argument| self.float64_of_number(&mut slow_paths, argument))
-            .collect();
-        let result = self.emit(Op::CallFloat64Function { function }, numbers, Some(Repr::Float64));
-        let result = self.emit(Op::BoxFloat64, vec![result], Some(Repr::Tagged));
+        let mut numbers = self.node_list();
+        for &value in &values {
+            numbers.push(self.float64_of_number(&mut slow_paths, value));
+        }
+        let result = self.emit(Op::CallFloat64Function { function }, &numbers, Some(Repr::Float64));
+        self.release_node_list(numbers);
+        self.release_node_list(values);
+        let result = self.emit(Op::BoxFloat64, &[result], Some(Repr::Tagged));
         let result = self
             .join_slow_paths(slow_paths, Some(result))
             .expect("the instruction has a value");
@@ -333,13 +338,13 @@ impl GraphBuilder<'_> {
     pub(super) fn int32_to_float64(&mut self, integer: NodeId) -> NodeId {
         match self.graph.constant_value(integer) {
             Some(bits) => self.typed_constant(f64::from((bits as u32).cast_signed()).to_bits(), Repr::Float64),
-            None => self.emit(Op::Int32ToFloat64, vec![integer], Some(Repr::Float64)),
+            None => self.emit(Op::Int32ToFloat64, &[integer], Some(Repr::Float64)),
         }
     }
 
     /// `value` as a `Repr::Float64`, where it is a number, taking a slow
     /// path of `slow_paths` otherwise.
-    pub(super) fn float64_of_number(&mut self, slow_paths: &mut SlowPaths, value: NodeId) -> NodeId {
+    pub(super) fn float64_of_number(&mut self, slow_paths: &mut SlowPaths<'a>, value: NodeId) -> NodeId {
         self.float64_of(value, |builder, condition, inputs| {
             builder.branch_to_slow_path(slow_paths, condition, inputs, true)
         })
@@ -347,13 +352,13 @@ impl GraphBuilder<'_> {
 
     /// `value` as a `Repr::Int32`, where it is an int32, taking a slow path
     /// of `slow_paths` otherwise.
-    pub(super) fn int32_or_slow_path(&mut self, slow_paths: &mut SlowPaths, value: NodeId) -> NodeId {
+    pub(super) fn int32_or_slow_path(&mut self, slow_paths: &mut SlowPaths<'a>, value: NodeId) -> NodeId {
         if let Some(integer) = self.int32_value_of(value) {
             return integer;
         }
         let value = self.tagged(value);
-        let refined = self.branch_to_slow_path(slow_paths, BranchCondition::Int32Value, vec![value], true);
-        self.emit(Op::UnboxInt32, vec![refined], Some(Repr::Int32))
+        let refined = self.branch_to_slow_path(slow_paths, BranchCondition::Int32Value, &[value], true);
+        self.emit(Op::UnboxInt32, &[refined], Some(Repr::Int32))
     }
 
     /// Branches on whether the tagged `value` is an int32, and if not on
@@ -368,7 +373,7 @@ impl GraphBuilder<'_> {
         repr: Repr,
         int32: fn(&mut Self, NodeId) -> NodeId,
         double: fn(&mut Self, NodeId) -> NodeId,
-        otherwise: impl FnOnce(&mut Self, BranchCondition, Vec<NodeId>) -> NodeId,
+        otherwise: impl FnOnce(&mut Self, BranchCondition, &[NodeId]) -> NodeId,
     ) -> NodeId {
         self.on_integer_or_double(BranchCondition::Int32Value, value, repr, int32, double, otherwise)
     }
@@ -383,23 +388,23 @@ impl GraphBuilder<'_> {
         repr: Repr,
         int32: fn(&mut Self, NodeId) -> NodeId,
         double: fn(&mut Self, NodeId) -> NodeId,
-        otherwise: impl FnOnce(&mut Self, BranchCondition, Vec<NodeId>) -> NodeId,
+        otherwise: impl FnOnce(&mut Self, BranchCondition, &[NodeId]) -> NodeId,
     ) -> NodeId {
-        let (int32_block, other) = self.branch_both_ways(integer, vec![value]);
+        let (int32_block, other) = self.branch_both_ways(integer, &[value]);
         self.block = int32_block;
-        let refined = self.refine(integer, true, vec![value]);
-        let integer = self.emit(Op::UnboxInt32, vec![refined], Some(Repr::Int32));
+        let refined = self.refine(integer, true, &[value]);
+        let integer = self.emit(Op::UnboxInt32, &[refined], Some(Repr::Int32));
         let int32_value = int32(self, integer);
         let int32_end = self.block;
 
         self.block = other;
-        let refined = otherwise(self, BranchCondition::Double, vec![value]);
-        let number = self.emit(Op::UnboxDouble, vec![refined], Some(Repr::Float64));
+        let refined = otherwise(self, BranchCondition::Double, &[value]);
+        let number = self.emit(Op::UnboxDouble, &[refined], Some(Repr::Float64));
         let double_value = double(self, number);
         let double_end = self.block;
 
-        self.join_blocks(vec![int32_end, double_end]);
-        let phi = self.add_phi(vec![int32_value, double_value]);
+        self.join_blocks(&[int32_end, double_end]);
+        let phi = self.add_phi(&[int32_value, double_value]);
         self.graph.nodes[phi.index()].repr = Some(repr);
         phi
     }
@@ -408,14 +413,19 @@ impl GraphBuilder<'_> {
     /// `integer`: itself for the functions that round, and the absolute
     /// value but for the smallest int32, whose absolute value is no int32
     /// and goes to a slow path of `slow_paths`.
-    fn build_int32_math_function(&mut self, slow_paths: &mut SlowPaths, op: Float64UnaryOp, integer: NodeId) -> NodeId {
+    fn build_int32_math_function(
+        &mut self,
+        slow_paths: &mut SlowPaths<'a>,
+        op: Float64UnaryOp,
+        integer: NodeId,
+    ) -> NodeId {
         match op {
             Float64UnaryOp::Floor | Float64UnaryOp::Ceil | Float64UnaryOp::Round => self.tagged(integer),
             // NB: Negating the smallest int32 overflows, and exits.
             Float64UnaryOp::Abs if self.may_speculate(ExitKind::Overflow) => {
                 let zero = self.int32_constant(0);
                 let negated = self.int32_binary(BinaryOp::Sub, zero, integer);
-                let result = self.emit(Op::Int32Max, vec![integer, negated], Some(Repr::Int32));
+                let result = self.emit(Op::Int32Max, &[integer, negated], Some(Repr::Int32));
                 self.tagged(result)
             }
             Float64UnaryOp::Abs => {
@@ -423,16 +433,16 @@ impl GraphBuilder<'_> {
                 let integer = self.branch_to_slow_path(
                     slow_paths,
                     BranchCondition::Int32(Comparison::StrictlyEquals),
-                    vec![integer, smallest],
+                    &[integer, smallest],
                     false,
                 );
-                let result = self.emit(Op::Int32Abs, vec![integer], Some(Repr::Int32));
+                let result = self.emit(Op::Int32Abs, &[integer], Some(Repr::Int32));
                 self.tagged(result)
             }
             Float64UnaryOp::Sqrt | Float64UnaryOp::Negate => {
                 let double = self.int32_to_float64(integer);
-                let result = self.emit(Op::Float64Unary { op }, vec![double], Some(Repr::Float64));
-                self.emit(Op::BoxFloat64, vec![result], Some(Repr::Tagged))
+                let result = self.emit(Op::Float64Unary { op }, &[double], Some(Repr::Float64));
+                self.emit(Op::BoxFloat64, &[result], Some(Repr::Tagged))
             }
         }
     }
@@ -460,11 +470,11 @@ impl GraphBuilder<'_> {
         let string = self.read(this_value)?;
         let index = self.read(argument)?;
         let mut slow_paths = self.start_slow_paths(Some(Repr::Tagged))?;
-        self.branch_to_slow_path(&mut slow_paths, BranchCondition::Builtin(builtin), vec![callee], true);
+        self.branch_to_slow_path(&mut slow_paths, BranchCondition::Builtin(builtin), &[callee], true);
         let index = self.int32_or_slow_path(&mut slow_paths, index);
         let code_unit = self.string_code_unit(&mut slow_paths, string, index);
         let result = match character {
-            StringCharacter::CodeUnit => self.emit(Op::BoxInt32, vec![code_unit], Some(Repr::Tagged)),
+            StringCharacter::CodeUnit => self.emit(Op::BoxInt32, &[code_unit], Some(Repr::Tagged)),
             StringCharacter::String => self.ascii_character_string(&mut slow_paths, code_unit),
         };
         let result = self
@@ -477,26 +487,26 @@ impl GraphBuilder<'_> {
     /// The code unit at `index`, a `Repr::Int32`, of the tagged `string`,
     /// taking a slow path of `slow_paths` unless it is a string whose
     /// characters can be read and the index is in its bounds.
-    pub(super) fn string_code_unit(&mut self, slow_paths: &mut SlowPaths, string: NodeId, index: NodeId) -> NodeId {
-        let string = self.branch_to_slow_path(slow_paths, BranchCondition::String, vec![string], true);
-        let address = self.emit(Op::StringAddress, vec![string], Some(Repr::Pointer));
-        let readable = self.branch_to_slow_path(slow_paths, BranchCondition::ResolvedString, vec![address], true);
-        let length = self.emit(Op::StringLength, vec![address], Some(Repr::Int32));
-        let index = self.branch_to_slow_path(slow_paths, BranchCondition::IndexInBounds, vec![index, length], true);
-        self.emit(Op::LoadStringCodeUnit, vec![readable, index], Some(Repr::Int32))
+    pub(super) fn string_code_unit(&mut self, slow_paths: &mut SlowPaths<'a>, string: NodeId, index: NodeId) -> NodeId {
+        let string = self.branch_to_slow_path(slow_paths, BranchCondition::String, &[string], true);
+        let address = self.emit(Op::StringAddress, &[string], Some(Repr::Pointer));
+        let readable = self.branch_to_slow_path(slow_paths, BranchCondition::ResolvedString, &[address], true);
+        let length = self.emit(Op::StringLength, &[address], Some(Repr::Int32));
+        let index = self.branch_to_slow_path(slow_paths, BranchCondition::IndexInBounds, &[index, length], true);
+        self.emit(Op::LoadStringCodeUnit, &[readable, index], Some(Repr::Int32))
     }
 
     /// The VM's string of `code_unit`, taking a slow path of `slow_paths`
     /// unless it is ASCII.
-    pub(super) fn ascii_character_string(&mut self, slow_paths: &mut SlowPaths, code_unit: NodeId) -> NodeId {
+    pub(super) fn ascii_character_string(&mut self, slow_paths: &mut SlowPaths<'a>, code_unit: NodeId) -> NodeId {
         let limit = self.int32_constant(0x80);
         let code_unit = self.branch_to_slow_path(
             slow_paths,
             BranchCondition::Int32(Comparison::LessThan),
-            vec![code_unit, limit],
+            &[code_unit, limit],
             true,
         );
-        self.emit(Op::SingleCharacterString, vec![code_unit], Some(Repr::Tagged))
+        self.emit(Op::SingleCharacterString, &[code_unit], Some(Repr::Tagged))
     }
 
     /// Builds `array.push(...values)`, a `Call` of up to
@@ -531,36 +541,36 @@ impl GraphBuilder<'_> {
             return Ok(None);
         }
         let receiver = self.read(*this_value)?;
-        let values = arguments
-            .iter()
-            .map(|value| self.read(*value))
-            .collect::<Result<Vec<_>, _>>()?;
+        let mut values = self.node_list();
+        for value in *arguments {
+            values.push(self.read(*value)?);
+        }
         self.embed(self.runtime.array_prototype);
         self.embed(self.runtime.object_prototype);
-        let receiver = self.emit_checked(Op::CheckAppendableArray, vec![receiver], Some(Repr::Tagged));
+        let receiver = self.emit_checked(Op::CheckAppendableArray, &[receiver], Some(Repr::Tagged));
         let array = self.cell_address(receiver);
-        let length = self.emit(Op::LoadElementsLength, vec![array], Some(Repr::Int32));
-        let capacity = self.emit(Op::LoadElementsCapacity, vec![array], Some(Repr::Int32));
+        let length = self.emit(Op::LoadElementsLength, &[array], Some(Repr::Int32));
+        let capacity = self.emit(Op::LoadElementsCapacity, &[array], Some(Repr::Int32));
         // NB: One value fits where the length is below the capacity, compared
         //     unsigned so that lengths above i32::MAX (negative as int32
         //     values) never fit. More values need that much room between
         //     them, which only overflows for such lengths, and exits for them.
         let (room_condition, room_inputs) = if values.len() == 1 {
-            (BranchCondition::IndexInBounds, vec![length, capacity])
+            (BranchCondition::IndexInBounds, &[length, capacity])
         } else {
             let room = self.emit_checked(
                 Op::Int32Binary { op: BinaryOp::Sub },
-                vec![capacity, length],
+                &[capacity, length],
                 Some(Repr::Int32),
             );
             let count = self.int32_constant(values.len() as i32);
-            (BranchCondition::Int32(Comparison::GreaterThanEquals), vec![room, count])
+            (BranchCondition::Int32(Comparison::GreaterThanEquals), &[room, count])
         };
-        let (hot, cold) = self.branch_with_cold_side(room_condition, room_inputs.clone(), true);
+        let (hot, cold) = self.branch_with_cold_side(room_condition, room_inputs, true);
         self.block = cold;
         let mut pushed = None;
         for value in &values {
-            pushed = Some(self.emit(Op::CallArrayPush, vec![receiver, *value], Some(Repr::Tagged)));
+            pushed = Some(self.emit(Op::CallArrayPush, &[receiver, *value], Some(Repr::Tagged)));
         }
         let pushed = pushed.expect("there are values to push");
         let cold = self.block;
@@ -570,13 +580,14 @@ impl GraphBuilder<'_> {
         } else {
             length
         };
-        for value in values {
-            new_length = self.emit(Op::AppendElement, vec![array, new_length, value], Some(Repr::Int32));
+        for &value in &values {
+            new_length = self.emit(Op::AppendElement, &[array, new_length, value], Some(Repr::Int32));
         }
-        let new_length = self.emit(Op::BoxInt32, vec![new_length], Some(Repr::Tagged));
+        self.release_node_list(values);
+        let new_length = self.emit(Op::BoxInt32, &[new_length], Some(Repr::Tagged));
         let hot = self.block;
-        self.join_blocks(vec![hot, cold]);
-        let length = self.add_phi(vec![new_length, pushed]);
+        self.join_blocks(&[hot, cold]);
+        let length = self.add_phi(&[new_length, pushed]);
         self.write(*dst, length)?;
         Ok(Some(Flow::Continue))
     }
@@ -590,11 +601,10 @@ impl GraphBuilder<'_> {
     /// call, or where arguments that were no numbers exited before.
     pub(super) fn try_build_math_min_max(&mut self, instruction: &Instruction) -> Result<Option<Flow>, CompileFailure> {
         let Instruction::Call {
-            value_feedback,
             call_feedback,
             dst,
             callee,
-            ref arguments,
+            arguments,
             ..
         } = *instruction
         else {
@@ -606,10 +616,10 @@ impl GraphBuilder<'_> {
         {
             return Ok(None);
         }
-        let Some((target, intrinsic)) = self
-            .call_feedback(call_feedback)
-            .and_then(|feedback| feedback.monomorphic_intrinsic())
-        else {
+        let Some(feedback) = self.call_feedback(call_feedback) else {
+            return Ok(None);
+        };
+        let Some((target, intrinsic)) = feedback.monomorphic_intrinsic() else {
             return Ok(None);
         };
         let max = match intrinsic {
@@ -620,43 +630,47 @@ impl GraphBuilder<'_> {
         if !self.may_speculate(ExitKind::BadCallTarget) {
             return Ok(None);
         }
-        let values = arguments
-            .iter()
-            .map(|operand| self.read_value(*operand))
-            .collect::<Result<Vec<_>, _>>()?;
+        let mut values = self.node_list();
+        for operand in arguments {
+            values.push(self.read_value(*operand)?);
+        }
         // NB: Int32 results do not prove int32 arguments (Math.min(1, 2.5)
         //     is 1). Arguments that are no int32 values exit, and code compiled
         //     after the exit computes with doubles. The results are numbers
         //     either way.
-        let results = self.function.executable.feedback.value.get(usize::from(value_feedback));
-        let int32 = results == Some(&value_feedback::INT32)
+        let int32 = feedback.value == value_feedback::INT32
             && self.may_speculate(ExitKind::NotInt32)
             && self.may_be_int32(&values);
         if !int32 && !self.may_speculate(ExitKind::BadType) {
+            self.release_node_list(values);
             return Ok(None);
         }
         self.check_callee(callee, target)?;
+        // NB: All the arguments are converted before the first of the operations on them.
         let result = if int32 {
             let op = if max { Op::Int32Max } else { Op::Int32Min };
+            for value in &mut values {
+                *value = self.int32(*value);
+            }
             let result = values
-                .into_iter()
-                .map(|value| self.int32(value))
-                .collect::<Vec<_>>()
-                .into_iter()
-                .reduce(|result, value| self.emit(op.clone(), vec![result, value], Some(Repr::Int32)))
+                .iter()
+                .copied()
+                .reduce(|result, value| self.emit(op.clone(), &[result, value], Some(Repr::Int32)))
                 .expect("there are arguments");
-            self.emit(Op::BoxInt32, vec![result], Some(Repr::Tagged))
+            self.emit(Op::BoxInt32, &[result], Some(Repr::Tagged))
         } else {
             let op = if max { Op::Float64Max } else { Op::Float64Min };
+            for value in &mut values {
+                *value = self.number(*value);
+            }
             let result = values
-                .into_iter()
-                .map(|value| self.number(value))
-                .collect::<Vec<_>>()
-                .into_iter()
-                .reduce(|result, number| self.emit(op.clone(), vec![result, number], Some(Repr::Float64)))
+                .iter()
+                .copied()
+                .reduce(|result, number| self.emit(op.clone(), &[result, number], Some(Repr::Float64)))
                 .expect("there are arguments");
-            self.emit(Op::BoxFloat64, vec![result], Some(Repr::Tagged))
+            self.emit(Op::BoxFloat64, &[result], Some(Repr::Tagged))
         };
+        self.release_node_list(values);
         self.write(dst, result)?;
         Ok(Some(Flow::Continue))
     }
@@ -669,7 +683,7 @@ impl GraphBuilder<'_> {
             call_feedback,
             dst,
             callee,
-            ref arguments,
+            arguments,
             ..
         } = *instruction
         else {
@@ -698,10 +712,10 @@ impl GraphBuilder<'_> {
         let [lhs, rhs] = values.map(|value| self.int32(value));
         let product = self.emit(
             Op::Int32WrappingBinary { op: BinaryOp::Mul },
-            vec![lhs, rhs],
+            &[lhs, rhs],
             Some(Repr::Int32),
         );
-        let result = self.emit(Op::BoxInt32, vec![product], Some(Repr::Tagged));
+        let result = self.emit(Op::BoxInt32, &[product], Some(Repr::Tagged));
         self.write(dst, result)?;
         Ok(Some(Flow::Continue))
     }
@@ -714,10 +728,10 @@ impl GraphBuilder<'_> {
         call_feedback: u16,
         callee: Operand,
     ) -> Result<Option<Intrinsic>, CompileFailure> {
-        let Some((target, intrinsic)) = self
-            .call_feedback(call_feedback)
-            .and_then(|feedback| feedback.monomorphic_intrinsic())
-        else {
+        let Some(feedback) = self.call_feedback(call_feedback) else {
+            return Ok(None);
+        };
+        let Some((target, intrinsic)) = feedback.monomorphic_intrinsic() else {
             return Ok(None);
         };
         if !self.may_speculate(ExitKind::SlowPath) || !self.may_speculate(ExitKind::BadCallTarget) {
@@ -741,7 +755,7 @@ impl GraphBuilder<'_> {
                 expected: expected_bits,
                 kind: ExitKind::BadCallTarget,
             },
-            vec![value],
+            &[value],
             None,
         );
         Ok(())
@@ -765,13 +779,13 @@ impl GraphBuilder<'_> {
                 // NB: Other numbers are lengths that throw, and other
                 //     values elements.
                 let length =
-                    self.branch_to_slow_path(&mut slow_paths, BranchCondition::NonNegativeInt32, vec![length], true);
-                self.emit(Op::UnboxInt32, vec![length], Some(Repr::Int32))
+                    self.branch_to_slow_path(&mut slow_paths, BranchCondition::NonNegativeInt32, &[length], true);
+                self.emit(Op::UnboxInt32, &[length], Some(Repr::Int32))
             }
             None => self.int32_constant(0),
         };
         let function = self.read(callee)?;
-        let array = self.emit(Op::ArrayCreate, vec![length, function], Some(Repr::Tagged));
+        let array = self.emit(Op::ArrayCreate, &[length, function], Some(Repr::Tagged));
         let array = self.branch_if_empty(&mut slow_paths, array);
         let array = self
             .join_slow_paths(slow_paths, Some(array))
@@ -810,7 +824,7 @@ impl GraphBuilder<'_> {
         if arguments.iter().any(|operand| self.holds_virtual_arguments(*operand)) {
             return Ok(None);
         }
-        if let [length] = arguments.as_slice() {
+        if let [length] = *arguments {
             if self.checked_intrinsic_callee(*call_feedback, *callee)?.is_none() {
                 return Ok(None);
             }
@@ -823,11 +837,10 @@ impl GraphBuilder<'_> {
         {
             return Ok(None);
         }
-        let elements = arguments
-            .iter()
-            .copied()
-            .map(super::allocation::ArrayElement::Operand)
-            .collect::<Vec<_>>();
+        let elements = ZoneVec::from_iter_in(
+            arguments.iter().copied().map(super::allocation::ArrayElement::Operand),
+            self.work,
+        );
         // NB: Arrays with holes are left to the generic construct, which reading the operands does not affect.
         if !self.try_build_new_array(*dst, &elements)? {
             return Ok(None);
@@ -897,42 +910,42 @@ impl GraphBuilder<'_> {
         let value = self.read(*argument)?;
         let result = if constructor == Intrinsic::StringConstructor {
             // 22.1.1.1 String ( value ), https://tc39.es/ecma262/#sec-string-constructor-string-value
-            let (string, other) = self.branch_both_ways(BranchCondition::String, vec![value]);
+            let (string, other) = self.branch_both_ways(BranchCondition::String, &[value]);
             self.block = string;
-            let string = self.refine(BranchCondition::String, true, vec![value]);
-            self.end_hot_path(&mut slow_paths, vec![string]);
+            let string = self.refine(BranchCondition::String, true, &[value]);
+            self.end_hot_path(&mut slow_paths, &[string]);
             // NB: The VM has the strings of small integers.
             self.block = other;
-            let (int32, other) = self.branch_both_ways(BranchCondition::Int32Value, vec![value]);
+            let (int32, other) = self.branch_both_ways(BranchCondition::Int32Value, &[value]);
             self.block = int32;
-            let integer = self.refine(BranchCondition::Int32Value, true, vec![value]);
-            let unboxed = self.emit(Op::UnboxInt32, vec![integer], Some(Repr::Int32));
-            let cached = self.emit(Op::IntegerToString, vec![unboxed], Some(Repr::Tagged));
+            let integer = self.refine(BranchCondition::Int32Value, true, &[value]);
+            let unboxed = self.emit(Op::UnboxInt32, &[integer], Some(Repr::Int32));
+            let cached = self.emit(Op::IntegerToString, &[unboxed], Some(Repr::Tagged));
             let empty = self.constant(crate::ir::value::EMPTY);
             let missing = BranchCondition::TaggedEquals { equal: true };
-            let (miss, hit) = self.branch_both_ways(missing, vec![cached, empty]);
+            let (miss, hit) = self.branch_both_ways(missing, &[cached, empty]);
             self.block = hit;
-            let cached = self.refine(missing, false, vec![cached, empty]);
-            self.end_hot_path(&mut slow_paths, vec![cached]);
+            let cached = self.refine(missing, false, &[cached, empty]);
+            self.end_hot_path(&mut slow_paths, &[cached]);
             self.block = miss;
-            let string = self.emit(Op::PrimitiveToString, vec![integer], Some(Repr::Tagged));
-            self.end_hot_path(&mut slow_paths, vec![string]);
+            let string = self.emit(Op::PrimitiveToString, &[integer], Some(Repr::Tagged));
+            self.end_hot_path(&mut slow_paths, &[string]);
             self.block = other;
-            let primitive = self.branch_to_slow_path(&mut slow_paths, BranchCondition::Object, vec![value], false);
-            self.emit(Op::PrimitiveToString, vec![primitive], Some(Repr::Tagged))
+            let primitive = self.branch_to_slow_path(&mut slow_paths, BranchCondition::Object, &[value], false);
+            self.emit(Op::PrimitiveToString, &[primitive], Some(Repr::Tagged))
         } else {
             // 20.1.1.1 Object ( [ value ] ), https://tc39.es/ecma262/#sec-object-value
-            let (object, other) = self.branch_both_ways(BranchCondition::Object, vec![value]);
+            let (object, other) = self.branch_both_ways(BranchCondition::Object, &[value]);
             self.block = object;
-            let object = self.refine(BranchCondition::Object, true, vec![value]);
-            self.end_hot_path(&mut slow_paths, vec![object]);
+            let object = self.refine(BranchCondition::Object, true, &[value]);
+            self.end_hot_path(&mut slow_paths, &[object]);
             self.block = other;
-            let primitive = self.branch_to_slow_path(&mut slow_paths, BranchCondition::Nullish, vec![value], false);
+            let primitive = self.branch_to_slow_path(&mut slow_paths, BranchCondition::Nullish, &[value], false);
             let function = self.read(*callee)?;
-            let object = self.emit(Op::ToObject, vec![primitive, function], Some(Repr::Tagged));
+            let object = self.emit(Op::ToObject, &[primitive, function], Some(Repr::Tagged));
             self.branch_if_empty(&mut slow_paths, object)
         };
-        self.end_hot_path(&mut slow_paths, vec![result]);
+        self.end_hot_path(&mut slow_paths, &[result]);
         let result = self.join_hot_paths(slow_paths).expect("calls have a value");
         self.write(*dst, result)?;
         Ok(Some(Flow::Continue))
@@ -995,15 +1008,15 @@ impl GraphBuilder<'_> {
             return Ok(None);
         }
         let mut slow_paths = self.start_slow_paths(Some(Repr::Tagged))?;
-        let mut inputs = Vec::with_capacity(1 + call.arguments.len());
-        let operands = std::iter::once(Some(*this_value))
+        let mut inputs = self.node_list();
+        let operands = core::iter::once(Some(*this_value))
             .chain((0..call.arguments.len()).map(|index| arguments.get(index).copied()));
-        for (operand, kind) in operands.zip(std::iter::once(call.receiver).chain(call.arguments.iter().copied())) {
+        for (operand, kind) in operands.zip(core::iter::once(call.receiver).chain(call.arguments.iter().copied())) {
             let input = match (operand, kind) {
                 (Some(operand), HelperOperand::Value) => self.read(operand)?,
                 (Some(operand), HelperOperand::String) => {
                     let value = self.read(operand)?;
-                    self.branch_to_slow_path(&mut slow_paths, BranchCondition::String, vec![value], true)
+                    self.branch_to_slow_path(&mut slow_paths, BranchCondition::String, &[value], true)
                 }
                 (Some(operand), HelperOperand::Int32 { .. }) => {
                     let value = self.read(operand)?;
@@ -1014,10 +1027,11 @@ impl GraphBuilder<'_> {
             };
             inputs.push(input);
         }
-        let result = self.emit(Op::CallIntrinsic { intrinsic }, inputs, Some(call.result.repr()));
+        let result = self.emit(Op::CallIntrinsic { intrinsic }, &inputs, Some(call.result.repr()));
+        self.release_node_list(inputs);
         let result = match call.result {
-            HelperResult::Int32 => self.emit(Op::BoxInt32, vec![result], Some(Repr::Tagged)),
-            HelperResult::Bool => self.emit(Op::BoxBool, vec![result], Some(Repr::Tagged)),
+            HelperResult::Int32 => self.emit(Op::BoxInt32, &[result], Some(Repr::Tagged)),
+            HelperResult::Bool => self.emit(Op::BoxBool, &[result], Some(Repr::Tagged)),
             HelperResult::String => result,
             HelperResult::Value => self.branch_if_empty(&mut slow_paths, result),
         };
@@ -1053,17 +1067,17 @@ impl GraphBuilder<'_> {
             Op::Int32Binary {
                 op: BinaryOp::BitwiseAnd,
             },
-            vec![code, mask],
+            &[code, mask],
             Some(Repr::Int32),
         );
         let ascii_limit = self.int32_constant(0x80);
         let code_unit = self.branch_to_slow_path(
             &mut slow_paths,
             BranchCondition::Int32(Comparison::LessThan),
-            vec![code_unit, ascii_limit],
+            &[code_unit, ascii_limit],
             true,
         );
-        let string = self.emit(Op::SingleCharacterString, vec![code_unit], Some(Repr::Tagged));
+        let string = self.emit(Op::SingleCharacterString, &[code_unit], Some(Repr::Tagged));
         let result = self
             .join_slow_paths(slow_paths, Some(string))
             .expect("calls have a value");
@@ -1105,7 +1119,7 @@ impl GraphBuilder<'_> {
         let key = self.read_value(property)?;
         let value = self.read(value)?;
         let index = self.int32_or_slow_path(&mut slow_paths, key);
-        let object = self.branch_to_slow_path(&mut slow_paths, BranchCondition::Object, vec![object], true);
+        let object = self.branch_to_slow_path(&mut slow_paths, BranchCondition::Object, &[object], true);
         let kinds = [ElementsKind::Packed, ElementsKind::Holey];
         let conditions = kinds.map(BranchCondition::ElementsKind);
         self.branch_on_cases(
@@ -1122,20 +1136,20 @@ impl GraphBuilder<'_> {
                     // NB: Filling a hole defines a new element, which takes an
                     //     extensible object. Filling the last one may make the
                     //     elements packed, which the slow path does.
-                    builder.branch_to_slow_path(slow_paths, BranchCondition::Extensible, vec![address], true);
+                    builder.branch_to_slow_path(slow_paths, BranchCondition::Extensible, &[address], true);
                     let (_, index) = builder.element_index_in_bounds(slow_paths, kind, address, index);
-                    let length = builder.emit(Op::LoadElementsLength, vec![address], Some(Repr::Int32));
+                    let length = builder.emit(Op::LoadElementsLength, &[address], Some(Repr::Int32));
                     let one = builder.int32_constant(1);
                     let last = builder.int32_binary(BinaryOp::Sub, length, one);
                     builder.branch_to_slow_path(
                         slow_paths,
                         BranchCondition::Int32(Comparison::LessThan),
-                        vec![index, last],
+                        &[index, last],
                         true,
                     )
                 };
-                builder.emit(Op::StoreElementAt { kind }, vec![address, index, value], None);
-                builder.end_hot_path(slow_paths, Vec::new());
+                builder.emit(Op::StoreElementAt { kind }, &[address, index, value], None);
+                builder.end_hot_path(slow_paths, &[]);
             },
         );
         self.join_hot_paths(slow_paths);

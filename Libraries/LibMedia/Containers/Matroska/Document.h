@@ -18,7 +18,7 @@
 #include <LibMedia/Track.h>
 #include <LibMediaCodecs/CodecParameters.h>
 #include <LibMediaCodecs/Codecs/AAC.h>
-#include <LibMediaCodecs/Color/CodingIndependentCodePoints.h>
+#include <LibMediaCodecs/Color/ColorMetadata.h>
 
 namespace Media::Matroska {
 
@@ -95,6 +95,8 @@ public:
         MatrixCoefficients matrix_coefficients = MatrixCoefficients::Unspecified;
         u64 bits_per_channel = 0;
         ColorRange range = ColorRange::Unspecified;
+        Optional<MasteringDisplayColorVolume> mastering_display_color_volume;
+        Optional<ContentLightLevelInformation> content_light_level_information;
 
         CodingIndependentCodePoints to_cicp() const
         {
@@ -116,6 +118,16 @@ public:
             }
 
             return { color_primaries, transfer_characteristics, matrix_coefficients, video_full_range_flag };
+        }
+
+        ColorMetadata to_color_metadata() const
+        {
+            return {
+                .cicp = to_cicp(),
+                .mastering_display_color_volume = mastering_display_color_volume,
+                .content_light_level_information = content_light_level_information,
+                .maximum_scene_luminance = {},
+            };
         }
     };
 
@@ -339,15 +351,15 @@ inline Track track_from_track_entry(TrackEntry const& track_entry, bool is_first
     if (track.type() == TrackType::Video) {
         auto video_track = track_entry.video_track();
         if (video_track.has_value()) {
-            auto cicp = CodingIndependentCodePoints {};
+            auto color_metadata = ColorMetadata {};
             if (track_entry.parsed_codec().has_value())
-                cicp = track_entry.parsed_codec()->color_information().value_or({});
-            cicp.adopt_specified_values(video_track->color_format.to_cicp());
+                color_metadata.cicp = track_entry.parsed_codec()->color_information().value_or({});
+            color_metadata.adopt_specified_values(video_track->color_format.to_color_metadata());
 
             track.set_video_data({
                 .pixel_width = video_track->pixel_width,
                 .pixel_height = video_track->pixel_height,
-                .cicp = cicp,
+                .color_metadata = color_metadata,
             });
         }
     }
@@ -378,6 +390,9 @@ public:
     void set_lacing(Lacing lacing) { m_lacing = lacing; }
     bool discardable() const { return m_discardable; }
     void set_discardable(bool discardable) { m_discardable = discardable; }
+    // The brightest light in the scene in cd/m², from HDR10+ carried alongside the block.
+    Optional<float> maximum_scene_luminance() const { return m_maximum_scene_luminance; }
+    void set_maximum_scene_luminance(Optional<float> luminance) { m_maximum_scene_luminance = luminance; }
     size_t data_position() const { return m_data_position; }
     size_t data_size() const { return m_data_size; }
     void set_data(size_t position, size_t size)
@@ -394,6 +409,7 @@ private:
     bool m_invisible { false };
     Lacing m_lacing { None };
     bool m_discardable { true };
+    Optional<float> m_maximum_scene_luminance;
     size_t m_data_position { 0 };
     size_t m_data_size { 0 };
 };
@@ -428,7 +444,6 @@ public:
     void set_timestamp(AK::Duration timestamp) { m_timestamp = timestamp; }
     OrderedHashMap<u64, CueTrackPosition>& track_positions() { return m_track_positions; }
     OrderedHashMap<u64, CueTrackPosition> const& track_positions() const { return m_track_positions; }
-    Optional<CueTrackPosition const&> position_for_track(u64 track_number) const { return m_track_positions.get(track_number); }
 
 private:
     AK::Duration m_timestamp = AK::Duration::min();

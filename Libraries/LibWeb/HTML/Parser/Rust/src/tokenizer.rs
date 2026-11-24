@@ -6,14 +6,18 @@
 
 use std::collections::VecDeque;
 
+use crate::code_units::CodeUnits;
+use crate::code_units::InputRun;
 use crate::entities::NamedCharacterReferenceMatcher;
-use crate::token::Attribute;
+use crate::scan;
 use crate::token::DoctypeData;
 use crate::token::HtmlName;
 use crate::token::Position;
+use crate::token::SourceOffset;
 use crate::token::Token;
 use crate::token::TokenPayload;
 use crate::token::TokenType;
+use ak::Utf16View;
 
 /// Tokenizer states per the WHATWG HTML spec section 13.2.5.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -203,28 +207,34 @@ impl State {
     }
 }
 
+/// The lines and columns of offsets into the input, which are only worked out when something asks for them.
+#[derive(Default)]
+struct SourcePositions {
+    /// The position of the start of the input buffer, which stops being the start of the input once consumed input
+    /// is discarded.
+    start: Position,
+    /// The last offset a position was worked out for, and that position. Offsets are mostly asked about in
+    /// increasing order, so the next one is usually found by going on from here.
+    known_offset: usize,
+    known_position: Position,
+}
+
 /// The HTML tokenizer state machine.
 ///
 /// Implements the WHATWG HTML tokenizer specification (section 13.2.5).
 pub struct HtmlTokenizer {
     pub state: State,
     return_state: State,
-    pub input: Vec<u16>,
+    pub input: CodeUnits,
     pub current_offset: usize,
     prev_offset: usize,
     current_token: Token,
-    current_builder: String,
+    current_builder: CodeUnits,
     pub queued_tokens: VecDeque<Token>,
     temporary_buffer: Vec<u32>,
     character_reference_code: u32,
     last_emitted_start_tag_name: Option<HtmlName>,
-    source_positions: Vec<Position>,
-    // Mirror of the most recent entry in source_positions, kept in sync
-    // with it on the slow path and updated directly on the fast
-    // character-emission path so we don't have to push into the Vec per
-    // character in Data-state text runs.
-    current_line: u64,
-    current_column: u64,
+    source_positions: SourcePositions,
     has_emitted_eof: bool,
     aborted: bool,
     insertion_point: Option<usize>,
@@ -233,6 +243,9 @@ pub struct HtmlTokenizer {
     stop_at_insertion_point: bool,
     cdata_allowed: bool,
     entity_matcher: NamedCharacterReferenceMatcher,
+    // Where the input that a speculative HTML parser's preload scanner has been given ends, while it's still a place
+    // the scanner can go on from.
+    speculative_scan_end: Option<usize>,
 }
 
 #[inline]
@@ -263,6 +276,134 @@ fn is_ascii_alphanumeric(c: u32) -> bool {
 #[inline]
 fn to_ascii_lowercase(c: u32) -> u32 {
     if is_ascii_upper_alpha(c) { c + 0x20 } else { c }
+}
+
+/// Reads the tag whose "<" ends right before `offset` into `token`, and returns the offset after its ">", if the tag
+/// is as plain as `HtmlTokenizer::try_scan_tag` describes and all of it is in `input`.
+fn scan_tag<T: scan::CodeUnit>(input: &[T], mut offset: usize, token: &mut Token) -> Option<usize> {
+    // NB: U+0000 NULL, which nothing here takes, stands in for the end of the input.
+    let at = |offset: usize| -> u16 { input.get(offset).map_or(0, |&code_unit| code_unit.into()) };
+    let is_tag_whitespace = |code_unit: u16| matches!(code_unit, 0x09 | 0x0A | 0x0C | 0x20);
+    let is_tag_end = |code_unit: u16| matches!(code_unit, 0x09 | 0x0A | 0x0C | 0x20 | 0x2F | 0x3E);
+
+    let is_end_tag = at(offset) == 0x2F;
+    if is_end_tag {
+        offset += 1;
+    }
+
+    let name_start = offset;
+    if !matches!(at(offset), 0x61..=0x7A) {
+        return None;
+    }
+    offset += 1;
+    while matches!(at(offset), 0x61..=0x7A | 0x30..=0x39 | 0x2D) {
+        offset += 1;
+    }
+    if !is_tag_end(at(offset)) {
+        return None;
+    }
+    let mut name_buffer = [0; 64];
+    let name = Utf16View::Latin1(scan::ascii_name_bytes(&input[name_start..offset], &mut name_buffer)?);
+    *token = Token {
+        token_type: if is_end_tag {
+            TokenType::EndTag
+        } else {
+            TokenType::StartTag
+        },
+        code_point: 0,
+        payload: TokenPayload::Tag {
+            tag_name: HtmlName::from_code_units(name),
+            tag_id: crate::token::TagId::for_code_units(name),
+            self_closing: false,
+            had_duplicate_attribute: false,
+            attributes: crate::token::AttributeList::new(),
+        },
+        start_offset: SourceOffset::new(name_start),
+        end_offset: SourceOffset::NONE,
+    };
+    let TokenPayload::Tag {
+        attributes,
+        self_closing,
+        ..
+    } = &mut token.payload
+    else {
+        unreachable!();
+    };
+
+    loop {
+        let after_whitespace = offset;
+        while is_tag_whitespace(at(offset)) {
+            offset += 1;
+        }
+        match at(offset) {
+            0x3E => return Some(offset + 1),
+            0x2F if !is_end_tag && at(offset + 1) == 0x3E => {
+                *self_closing = true;
+                return Some(offset + 2);
+            }
+            _ => {}
+        }
+        // NB: An attribute comes after whitespace, and an end tag with attributes is a parse error.
+        if is_end_tag || offset == after_whitespace {
+            return None;
+        }
+
+        let name_start = offset;
+        while matches!(at(offset), 0x61..=0x7A | 0x30..=0x39 | 0x2D | 0x2E | 0x3A | 0x5F) {
+            offset += 1;
+        }
+        if offset == name_start || !(is_tag_end(at(offset)) || at(offset) == 0x3D) {
+            return None;
+        }
+        let name = Utf16View::Latin1(scan::ascii_name_bytes(&input[name_start..offset], &mut name_buffer)?);
+        attributes.start_new_attribute();
+        let attribute = attributes.last_mut().unwrap();
+        attribute.local_name = HtmlName::from_code_units(name);
+        attribute.name_start_offset = SourceOffset::new(name_start);
+        attribute.name_end_offset = SourceOffset::new(offset);
+
+        let mut after_name = offset;
+        while is_tag_whitespace(at(after_name)) {
+            after_name += 1;
+        }
+        if at(after_name) != 0x3D {
+            // NB: The attribute has no value, and the whitespace after it is that before what comes next.
+            continue;
+        }
+        offset = after_name + 1;
+        while is_tag_whitespace(at(offset)) {
+            offset += 1;
+        }
+
+        let quote = at(offset);
+        attribute.value_start_offset = SourceOffset::new(offset);
+        if quote == 0x22 || quote == 0x27 {
+            offset += 1;
+            let length = scan::attribute_value_run(&input[offset..], quote as u8);
+            if at(offset + length) != quote {
+                return None;
+            }
+            attribute.value.push_slice(T::view(&input[offset..offset + length]));
+            offset += length + 1;
+            if !is_tag_end(at(offset)) {
+                return None;
+            }
+        } else {
+            let value_start = offset;
+            loop {
+                match at(offset) {
+                    0x09 | 0x0A | 0x0C | 0x20 | 0x3E => break,
+                    0x00 | 0x0D | 0x22 | 0x26 | 0x27 | 0x3C | 0x3D | 0x60 | 0xD800..=0xDFFF => return None,
+                    _ => offset += 1,
+                }
+            }
+            if offset == value_start {
+                return None;
+            }
+            attribute.value.push_slice(T::view(&input[value_start..offset]));
+        }
+        attribute.value_end_offset = SourceOffset::new(offset);
+    }
 }
 
 #[inline]
@@ -325,39 +466,31 @@ fn is_ascii_lower_alpha(c: u32) -> bool {
     matches!(c, 0x61..=0x7A)
 }
 
-/// Push a code point onto a `String` as UTF-8 without paying
-/// `char::from_u32`'s surrogate check or `String::push`'s len_utf8 branch
-/// for the common ASCII case. For `cp < 0x80` this is a single byte push
-/// to the underlying Vec; for wider code points we fall back to the
-/// normal slow path.
-#[inline(always)]
-fn push_code_point(buf: &mut String, cp: u32) {
-    if cp < 0x80 {
-        // SAFETY: ASCII is always valid UTF-8.
-        unsafe { buf.as_mut_vec().push(cp as u8) };
-    } else {
-        buf.push(char::from_u32(cp).unwrap_or('\u{FFFD}'));
-    }
+/// What ends a run of text that a state emits as it is, besides U+0000 NULL, U+000D CR and lone surrogates.
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum TextRunStops {
+    /// U+003C (<).
+    Markup,
+    /// U+003C (<) and U+0026 (&).
+    MarkupAndCharacterReferences,
 }
 
 impl HtmlTokenizer {
-    /// Create a new tokenizer for the given UTF-16 input.
-    pub fn new(input: Vec<u16>) -> Self {
+    /// Create a new tokenizer for the given input.
+    pub fn new(input: impl Into<CodeUnits>) -> Self {
         HtmlTokenizer {
             state: State::Data,
             return_state: State::Data,
-            input,
+            input: input.into(),
             current_offset: 0,
             prev_offset: 0,
             current_token: Token::default(),
-            current_builder: String::new(),
+            current_builder: CodeUnits::new(),
             queued_tokens: VecDeque::new(),
             temporary_buffer: Vec::new(),
             character_reference_code: 0,
             last_emitted_start_tag_name: None,
-            source_positions: vec![Position { line: 0, column: 0 }],
-            current_line: 0,
-            current_column: 0,
+            source_positions: SourcePositions::default(),
             has_emitted_eof: false,
             aborted: false,
             insertion_point: None,
@@ -366,6 +499,7 @@ impl HtmlTokenizer {
             stop_at_insertion_point: false,
             cdata_allowed: false,
             entity_matcher: NamedCharacterReferenceMatcher::new(),
+            speculative_scan_end: None,
         }
     }
 
@@ -392,6 +526,12 @@ impl HtmlTokenizer {
         self.insertion_point = None;
     }
 
+    /// Undefine the insertion point along with every old insertion point that is waiting to be restored.
+    pub fn discard_insertion_points(&mut self) {
+        self.insertion_point = None;
+        self.old_insertion_points.fill(None);
+    }
+
     pub fn is_insertion_point_defined(&self) -> bool {
         self.insertion_point.is_some()
     }
@@ -401,19 +541,21 @@ impl HtmlTokenizer {
             .is_some_and(|insertion_point| self.current_offset >= insertion_point)
     }
 
-    pub fn append_input(&mut self, code_units: &[u16]) {
-        self.input.extend_from_slice(code_units);
+    pub fn append_input(&mut self, code_units: Utf16View<'_>) {
+        self.input.append(code_units);
     }
 
-    pub fn append_latin1_input(&mut self, bytes: &[u8]) {
-        self.input.extend(bytes.iter().map(|byte| u16::from(*byte)));
-    }
-
-    pub fn insert_input_at_insertion_point(&mut self, code_units: &[u16]) {
+    pub fn insert_input_at_insertion_point(&mut self, code_units: Utf16View<'_>) {
         if let Some(ip) = self.insertion_point {
             let ip = ip.min(self.input.len());
-            self.input.splice(ip..ip, code_units.iter().copied());
+            self.input.insert(ip, code_units);
             self.insertion_point = Some(ip + code_units.len());
+            self.forget_speculative_scan_end_before(ip);
+            // NB: A line feed inserted right after a carriage return becomes part of its line end.
+            if ip <= self.source_positions.known_offset {
+                self.source_positions.known_offset = 0;
+                self.source_positions.known_position = self.source_positions.start;
+            }
             for old_insertion_point in &mut self.old_insertion_points {
                 if let Some(old_ip) = old_insertion_point
                     && ip <= *old_ip
@@ -424,27 +566,57 @@ impl HtmlTokenizer {
         }
     }
 
-    pub fn insert_latin1_input_at_insertion_point(&mut self, bytes: &[u8]) {
-        if let Some(ip) = self.insertion_point {
-            let ip = ip.min(self.input.len());
-            self.input.splice(ip..ip, bytes.iter().map(|byte| u16::from(*byte)));
-            self.insertion_point = Some(ip + bytes.len());
-            for old_insertion_point in &mut self.old_insertion_points {
-                if let Some(old_ip) = old_insertion_point
-                    && ip <= *old_ip
-                {
-                    *old_ip += bytes.len();
-                }
-            }
-        }
+    pub fn unparsed_input(&self) -> Utf16View<'_> {
+        self.input.slice_from(self.current_offset)
     }
 
-    pub fn unparsed_input(&self) -> String {
-        String::from_utf16_lossy(&self.input[self.current_offset..])
+    /// The input a speculative HTML parser's preload scanner hasn't been given yet, and whether the scanner can go on
+    /// from where it stopped. It can't once this tokenizer has got past that point, or input was inserted before it;
+    /// the input then runs from the current position, and the scanner has to start over there.
+    pub fn input_for_speculative_scan(&mut self) -> (Utf16View<'_>, bool) {
+        let (start, continues) = match self.speculative_scan_end {
+            Some(end) if end >= self.current_offset => (end, true),
+            _ => (self.current_offset, false),
+        };
+        self.speculative_scan_end = Some(self.input.len());
+        (self.input.slice_from(start), continues)
+    }
+
+    /// Makes the next speculative scan start over at the current position.
+    pub fn forget_speculative_scan_end(&mut self) {
+        self.speculative_scan_end = None;
+    }
+
+    fn forget_speculative_scan_end_before(&mut self, offset: usize) {
+        if self.speculative_scan_end.is_some_and(|end| offset < end) {
+            self.speculative_scan_end = None;
+        }
     }
 
     fn can_discard_consumed_input(&self) -> bool {
         if self.current_offset == 0 || self.current_offset != self.input.len() {
+            return false;
+        }
+
+        // Tokens say where they are with offsets into the input.
+        if !self.queued_tokens.is_empty() {
+            return false;
+        }
+
+        // A token that isn't finished has such offsets too, and the states that lead up to one work out where it
+        // starts from where they are, so the input stays until the tokenizer is back between tokens.
+        let is_between_tokens = matches!(
+            self.state,
+            State::Data
+                | State::RCDATA
+                | State::RAWTEXT
+                | State::ScriptData
+                | State::PLAINTEXT
+                | State::ScriptDataEscaped
+                | State::ScriptDataDoubleEscaped
+                | State::CDATASection
+        );
+        if !is_between_tokens {
             return false;
         }
 
@@ -454,9 +626,7 @@ impl HtmlTokenizer {
             return false;
         }
 
-        // Named character references can pause at the end of an open input stream with matcher state that still needs
-        // to backtrack through consumed input once more bytes arrive.
-        self.state != State::NamedCharacterReference
+        true
     }
 
     pub fn parser_did_run(&mut self) {
@@ -464,14 +634,20 @@ impl HtmlTokenizer {
             return;
         }
 
-        self.input = Vec::new();
+        // All of the input is consumed, so a preload scanner that has been given all of it can still go on from there.
+        self.speculative_scan_end = self
+            .speculative_scan_end
+            .filter(|end| *end == self.input.len())
+            .map(|_| 0);
+        let end_position = self.position_at(SourceOffset::new(self.input.len()));
+        self.source_positions = SourcePositions {
+            start: end_position,
+            known_offset: 0,
+            known_position: end_position,
+        };
+        self.input = CodeUnits::default();
         self.current_offset = 0;
         self.prev_offset = 0;
-        let last_position = *self.source_positions.last().unwrap_or(&Position::default());
-        self.source_positions.clear();
-        self.source_positions.push(last_position);
-        self.current_line = last_position.line;
-        self.current_column = last_position.column;
     }
 
     pub fn insert_eof(&mut self) {
@@ -506,10 +682,10 @@ impl HtmlTokenizer {
     #[inline(always)]
     fn code_point_at(&self, offset: usize) -> Option<(u32, usize)> {
         let limit = self.fast_scan_limit();
-        let first = *self.input.get(offset)?;
+        let first = self.input.get(offset)?;
         if is_high_surrogate(first) {
             if offset + 1 < limit {
-                let second = self.input[offset + 1];
+                let second = self.input.code_unit_at(offset + 1);
                 if (0xDC00..=0xDFFF).contains(&second) {
                     let code_point = 0x10000 + ((u32::from(first) - 0xD800) << 10) + (u32::from(second) - 0xDC00);
                     return Some((code_point, 2));
@@ -524,61 +700,18 @@ impl HtmlTokenizer {
     }
 
     #[inline(always)]
-    fn advance(&mut self, code_unit_count: usize, code_point: u32) {
-        if !self.source_positions.is_empty() {
-            let last = *self.source_positions.last().unwrap();
-            self.source_positions.push(last);
-        }
-        let (mut line, mut column) = if let Some(pos) = self.source_positions.last() {
-            (pos.line, pos.column)
-        } else {
-            (self.current_line, self.current_column)
-        };
+    fn advance(&mut self, code_unit_count: usize) {
         self.prev_offset = self.current_offset;
-        if code_point == 0x0A {
-            line += 1;
-            column = 0;
-        } else {
-            column += 1;
-        }
         self.current_offset += code_unit_count;
-        self.current_line = line;
-        self.current_column = column;
-        if let Some(pos) = self.source_positions.last_mut() {
-            pos.line = line;
-            pos.column = column;
-        }
     }
 
     #[inline(always)]
     fn skip_ascii(&mut self, count: usize) {
-        if !self.source_positions.is_empty() {
-            let last = *self.source_positions.last().unwrap();
-            self.source_positions.push(last);
-        }
-        let (mut line, mut column) = if let Some(pos) = self.source_positions.last() {
-            (pos.line, pos.column)
-        } else {
-            (self.current_line, self.current_column)
-        };
-        for _ in 0..count {
-            self.prev_offset = self.current_offset;
-            let code_point = self.input[self.current_offset];
-            debug_assert!(code_point < 0x80);
-            if code_point == 0x0A {
-                line += 1;
-                column = 0;
-            } else {
-                column += 1;
-            }
-            self.current_offset += 1;
-        }
-        self.current_line = line;
-        self.current_column = column;
-        if let Some(pos) = self.source_positions.last_mut() {
-            pos.line = line;
-            pos.column = column;
-        }
+        debug_assert!(
+            (self.current_offset..self.current_offset + count).all(|offset| self.input.code_unit_at(offset) < 0x80)
+        );
+        self.current_offset += count;
+        self.prev_offset = self.current_offset - 1;
     }
 
     #[inline(always)]
@@ -589,35 +722,67 @@ impl HtmlTokenizer {
         }
         let (cp, code_unit_count) = self.code_point_at(self.current_offset)?;
         if cp != 0x0D {
-            self.advance(code_unit_count, cp);
+            self.advance(code_unit_count);
             return Some(cp);
         }
         // Slow path: CR normalization
         let next = self.peek_code_point(1).unwrap_or(0);
         if next == 0x0A {
-            self.advance(2, 0x0A);
+            self.advance(2);
         } else {
-            self.advance(1, 0x0A);
+            self.advance(1);
         }
         Some(0x0A)
     }
 
+    /// Where the code point that was consumed last starts.
     #[inline(always)]
-    fn nth_last_position(&self, n: usize) -> Position {
-        if n + 1 > self.source_positions.len() {
-            return Position { line: 0, column: 0 };
+    fn offset_before_last_code_point(&self) -> SourceOffset {
+        let offset = self.current_offset;
+        if offset < 2 {
+            return SourceOffset::new(0);
         }
-        self.source_positions[self.source_positions.len() - 1 - n]
+        let last = self.input.code_unit_at(offset - 1);
+        let second_to_last = self.input.code_unit_at(offset - 2);
+        // NB: A CR and the LF after it are consumed as one line feed, and a surrogate pair is one code point.
+        let is_one_code_point = (second_to_last == 0x0D && last == 0x0A)
+            || (is_high_surrogate(second_to_last) && (0xDC00..=0xDFFF).contains(&last));
+        SourceOffset::new(offset - if is_one_code_point { 2 } else { 1 })
+    }
+
+    #[inline(always)]
+    fn offset(&self) -> SourceOffset {
+        SourceOffset::new(self.current_offset)
+    }
+
+    /// The line and column of an offset into the input, which must not be in the middle of a code point.
+    pub fn position_at(&mut self, offset: SourceOffset) -> Position {
+        let Some(offset) = offset.get() else {
+            return Position::default();
+        };
+        let offset = offset.min(self.input.len());
+        let positions = &mut self.source_positions;
+        if offset < positions.known_offset {
+            positions.known_offset = 0;
+            positions.known_position = positions.start;
+        }
+        let range = positions.known_offset..offset;
+        positions.known_position = match &self.input {
+            CodeUnits::Latin1(code_units) => scan::position_after(positions.known_position, &code_units[range]),
+            CodeUnits::Utf16(code_units) => scan::position_after(positions.known_position, &code_units[range]),
+        };
+        positions.known_offset = offset;
+        positions.known_position
     }
 
     /// Fast-path character emission from the Data state: if the tokenizer
     /// is positioned at a plain-text code point (not `<`, `&`, NUL, CR,
     /// or any non-ASCII character) and the queue is empty, advance one
-    /// code point and return the character's position, skipping the
+    /// code point and return it, skipping the
     /// full `next_token` state-machine dispatch and Token construction.
     /// Returns None if the slow path is required.
     #[inline(always)]
-    pub fn try_fast_data_char(&mut self) -> Option<(u32, Position)> {
+    pub fn try_fast_data_char(&mut self) -> Option<u32> {
         if self.aborted {
             return None;
         }
@@ -628,128 +793,154 @@ impl HtmlTokenizer {
             return None;
         }
         if self.current_offset >= self.input.len() {
-            self.sync_source_positions();
             return None;
         }
-        let cp = u32::from(self.input[self.current_offset]);
+        let cp = u32::from(self.input.code_unit_at(self.current_offset));
         if cp == 0x3C || cp == 0x26 || cp == 0x00 || cp == 0x0D || cp >= 0x80 {
-            self.sync_source_positions();
             return None;
         }
-        if cp == 0x0A {
-            self.current_line += 1;
-            self.current_column = 0;
-        } else {
-            self.current_column += 1;
-        }
-        let pos = Position {
-            line: self.current_line,
-            column: self.current_column,
-        };
         self.prev_offset = self.current_offset;
         self.current_offset += 1;
-        Some((cp, pos))
+        Some(cp)
     }
 
-    /// Append a run of ordinary ASCII characters from the Data state to
-    /// `output`. The caller can process the run as character tokens without
-    /// constructing and dispatching a `Token` for each code point.
+    /// Consume the run of input at the current position that the Data state would emit unchanged, one character
+    /// token per code point, and return where in the input it is. The caller can take the text straight from the
+    /// input instead of having a `Token` constructed and dispatched for each code point.
     #[inline(always)]
-    pub fn try_fast_data_run(&mut self, output: &mut String) -> Option<bool> {
+    pub fn try_fast_data_run(&mut self) -> Option<InputRun> {
         if !self.has_fast_data_run() {
             return None;
         }
+        Some(self.take_text_run(TextRunStops::MarkupAndCharacterReferences))
+    }
 
-        let start_offset = self.current_offset;
-        let input_len = self.fast_scan_limit();
-        let mut offset = start_offset;
-        let mut contains_non_whitespace = false;
-        while offset < input_len {
-            let code_point = u32::from(self.input[offset]);
-            if code_point == 0x3C
-                || code_point == 0x26
-                || code_point == 0x00
-                || code_point == 0x0D
-                || code_point >= 0x80
-            {
-                break;
-            }
-            if !is_whitespace(code_point) {
-                contains_non_whitespace = true;
-            }
-            offset += 1;
-        }
-        if offset == start_offset {
-            self.sync_source_positions();
+    /// Whether `try_fast_data_run()` would return a run.
+    #[inline(always)]
+    pub fn has_fast_data_run(&self) -> bool {
+        self.state == State::Data && self.has_text_run(TextRunStops::MarkupAndCharacterReferences)
+    }
+
+    /// Like `try_fast_data_run()`, for the text of an element whose content isn't markup: what the RCDATA, RAWTEXT
+    /// and script data states would emit unchanged.
+    #[inline(always)]
+    pub fn try_fast_element_text_run(&mut self) -> Option<InputRun> {
+        let stops = self.element_text_run_stops()?;
+        if !self.has_text_run(stops) {
             return None;
         }
-
-        output.reserve(offset - start_offset);
-        for &code_point in &self.input[start_offset..offset] {
-            // SAFETY: The scan above only accepts ASCII code points.
-            unsafe { output.as_mut_vec().push(code_point as u8) };
-            if code_point == 0x0A {
-                self.current_line += 1;
-                self.current_column = 0;
-            } else {
-                self.current_column += 1;
-            }
-        }
-        self.prev_offset = offset - 1;
-        self.current_offset = offset;
-        Some(contains_non_whitespace)
+        Some(self.take_text_run(stops))
     }
 
     #[inline(always)]
-    pub fn has_fast_data_run(&self) -> bool {
-        if self.aborted || self.state != State::Data || !self.queued_tokens.is_empty() {
+    fn element_text_run_stops(&self) -> Option<TextRunStops> {
+        match self.state {
+            State::RCDATA => Some(TextRunStops::MarkupAndCharacterReferences),
+            State::RAWTEXT | State::ScriptData => Some(TextRunStops::Markup),
+            _ => None,
+        }
+    }
+
+    #[inline(always)]
+    fn has_text_run(&self, stops: TextRunStops) -> bool {
+        if self.aborted || !self.queued_tokens.is_empty() {
             return false;
         }
         if self.current_offset >= self.fast_scan_limit() {
             return false;
         }
-        let code_point = u32::from(self.input[self.current_offset]);
-        code_point != 0x3C && code_point != 0x26 && code_point != 0x00 && code_point != 0x0D && code_point < 0x80
+        // NB: A surrogate pair can be inside a run, but a run that starts with one is left to the slow path, which
+        //     knows what to do when the surrogate turns out not to have its other half.
+        match self.input.code_unit_at(self.current_offset) {
+            0x3C | 0x00 | 0x0D | 0xD800..=0xDFFF => false,
+            0x26 => stops == TextRunStops::Markup,
+            _ => true,
+        }
     }
 
-    /// Resynchronise `source_positions` with the scalar current_line /
-    /// current_column after a run of fast-path character emissions.
-    #[inline(always)]
-    fn sync_source_positions(&mut self) {
-        self.source_positions.clear();
-        self.source_positions.push(Position {
-            line: self.current_line,
-            column: self.current_column,
-        });
+    fn take_text_run(&mut self, stops: TextRunStops) -> InputRun {
+        let start_offset = self.current_offset;
+        let limit = self.fast_scan_limit();
+        let scan::Run { length, is_ascii } = match (&self.input, stops) {
+            (CodeUnits::Latin1(code_units), TextRunStops::MarkupAndCharacterReferences) => {
+                scan::data_run(&code_units[start_offset..limit])
+            }
+            (CodeUnits::Utf16(code_units), TextRunStops::MarkupAndCharacterReferences) => {
+                scan::data_run(&code_units[start_offset..limit])
+            }
+            (CodeUnits::Latin1(code_units), TextRunStops::Markup) => {
+                scan::raw_text_run(&code_units[start_offset..limit])
+            }
+            (CodeUnits::Utf16(code_units), TextRunStops::Markup) => {
+                scan::raw_text_run(&code_units[start_offset..limit])
+            }
+        };
+        debug_assert!(length > 0);
+        let end_offset = start_offset + length;
+        let ends_with_surrogate_pair = (0xDC00..=0xDFFF).contains(&self.input.code_unit_at(end_offset - 1));
+        self.prev_offset = end_offset - if ends_with_surrogate_pair { 2 } else { 1 };
+        self.current_offset = end_offset;
+        InputRun {
+            range: start_offset..end_offset,
+            is_ascii,
+        }
+    }
+
+    /// Appends the code units that come next to the attribute value being read, as far as a value in quotes takes
+    /// them as they are. This is what the attribute value states do with them one at a time.
+    fn append_attribute_value_run(&mut self, quote: u8) {
+        let start_offset = self.current_offset;
+        let limit = self.fast_scan_limit();
+        if start_offset >= limit {
+            return;
+        }
+        let length = match &self.input {
+            CodeUnits::Latin1(code_units) => scan::attribute_value_run(&code_units[start_offset..limit], quote),
+            CodeUnits::Utf16(code_units) => scan::attribute_value_run(&code_units[start_offset..limit], quote),
+        };
+        if length == 0 {
+            return;
+        }
+        let end_offset = start_offset + length;
+        self.current_builder
+            .push_slice(self.input.slice(start_offset..end_offset));
+        self.prev_offset = end_offset - 1;
+        self.current_offset = end_offset;
     }
 
     fn restore_to(&mut self, offset: usize) {
-        if offset == self.prev_offset && self.current_offset > offset {
-            if self.source_positions.len() > 1 {
-                self.source_positions.pop();
-            }
-            self.current_offset = offset;
-        }
-        while self.current_offset > offset && self.source_positions.len() > 1 {
-            self.source_positions.pop();
-            self.current_offset -= 1;
-        }
         self.current_offset = offset;
-        if let Some(pos) = self.source_positions.last() {
-            self.current_line = pos.line;
-            self.current_column = pos.column;
-        }
     }
 
-    fn consume_current_builder(&mut self) -> String {
-        std::mem::take(&mut self.current_builder)
+    /// OPTIMIZATION: Most tags are written the same plain way: a lowercase name, attributes with lowercase names and
+    ///               values that hold no character references, and nothing out of place. Such a tag is read here in
+    ///               one go, right after its "<" in the data state, into the token that the tag open state and the
+    ///               states after it would have made of it one code point at a time. Any other tag is left to them,
+    ///               with nothing consumed.
+    fn try_scan_tag(&mut self) -> bool {
+        let limit = self.fast_scan_limit();
+        let offset = self.current_offset;
+        let end = match &self.input {
+            CodeUnits::Latin1(code_units) => scan_tag(&code_units[..limit], offset, &mut self.current_token),
+            CodeUnits::Utf16(code_units) => scan_tag(&code_units[..limit], offset, &mut self.current_token),
+        };
+        let Some(end) = end else {
+            self.current_token = Token::default();
+            return false;
+        };
+        self.prev_offset = end - 1;
+        self.current_offset = end;
+        true
+    }
+
+    fn consume_current_builder(&mut self) -> CodeUnits {
+        self.current_builder.take()
     }
 
     /// Commit `current_builder` into `current_token.tag_name`.
     #[inline]
     fn commit_current_builder_as_tag_name(&mut self) {
-        self.current_token
-            .set_tag_name(crate::token::HtmlName::from_utf8(&self.current_builder));
+        self.current_token.set_tag_name(self.current_builder.as_slice());
         self.current_builder.clear();
     }
 
@@ -757,24 +948,25 @@ impl HtmlTokenizer {
         let payload = match token_type {
             TokenType::StartTag | TokenType::EndTag => TokenPayload::Tag {
                 tag_name: Default::default(),
+                tag_id: Default::default(),
                 self_closing: false,
                 had_duplicate_attribute: false,
                 attributes: crate::token::AttributeList::new(),
             },
-            TokenType::Comment => TokenPayload::Comment(String::new()),
+            TokenType::Comment => TokenPayload::Comment(CodeUnits::new()),
             TokenType::Doctype => TokenPayload::Doctype(Box::default()),
             _ => TokenPayload::None,
         };
-        let pos = match token_type {
-            TokenType::StartTag | TokenType::EndTag => self.nth_last_position(1),
-            _ => self.nth_last_position(0),
+        let start_offset = match token_type {
+            TokenType::StartTag | TokenType::EndTag => self.offset_before_last_code_point(),
+            _ => self.offset(),
         };
         self.current_token = Token {
             token_type,
             code_point: 0,
             payload,
-            start_position: pos,
-            end_position: Position::default(),
+            start_offset,
+            end_offset: SourceOffset::NONE,
         };
     }
 
@@ -797,7 +989,7 @@ impl HtmlTokenizer {
 
     fn will_emit(&mut self, token_idx: usize) {
         // token_idx: 0 = current_token, 1+ = queued_tokens index
-        // For simplicity, we handle position setting here.
+        // For simplicity, we handle setting the end offset here.
         if token_idx == 0 {
             if self.current_token.token_type == TokenType::StartTag
                 || self.current_token.token_type == TokenType::EndTag
@@ -809,7 +1001,11 @@ impl HtmlTokenizer {
             }
             let is_start_or_end_tag = self.current_token.token_type == TokenType::StartTag
                 || self.current_token.token_type == TokenType::EndTag;
-            self.current_token.end_position = self.nth_last_position(if is_start_or_end_tag { 1 } else { 0 });
+            self.current_token.end_offset = if is_start_or_end_tag {
+                self.offset_before_last_code_point()
+            } else {
+                self.offset()
+            };
         }
     }
 
@@ -819,32 +1015,44 @@ impl HtmlTokenizer {
         self.queued_tokens.push_back(token);
     }
 
-    /// Fast-path version of `emit_current_token(); self.queued_tokens.pop_front()`.
+    /// Moves the token at the front of the queue to `out`, if there is one.
+    #[inline]
+    fn take_queued_token(&mut self, out: &mut Token) -> bool {
+        match self.queued_tokens.pop_front() {
+            Some(token) => {
+                *out = token;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Fast-path version of `emit_current_token(); self.take_queued_token(out)`.
     /// When the queue is empty we skip the push/pop round trip entirely,
     /// which removes two VecDeque ops and a Token move per emitted token
     /// for the overwhelmingly common single-emit case.
     #[inline]
-    fn emit_current_token_direct(&mut self) -> Option<Token> {
+    fn emit_current_token_direct(&mut self, out: &mut Token) -> bool {
         self.will_emit(0);
         let token = std::mem::take(&mut self.current_token);
         if self.queued_tokens.is_empty() {
-            Some(token)
-        } else {
-            self.queued_tokens.push_back(token);
-            self.queued_tokens.pop_front()
+            *out = token;
+            return true;
         }
+        self.queued_tokens.push_back(token);
+        self.take_queued_token(out)
     }
 
     #[inline(always)]
-    fn return_character_token(&mut self, code_point: u32) -> Option<Token> {
+    fn return_character_token(&mut self, out: &mut Token, code_point: u32) -> bool {
         let mut token = Token::new_character(code_point);
-        token.start_position = self.nth_last_position(0);
+        token.start_offset = self.offset();
         if self.queued_tokens.is_empty() {
-            Some(token)
-        } else {
-            self.queued_tokens.push_back(token);
-            self.queued_tokens.pop_front()
+            *out = token;
+            return true;
         }
+        self.queued_tokens.push_back(token);
+        self.take_queued_token(out)
     }
 
     fn emit_eof(&mut self) {
@@ -867,10 +1075,10 @@ impl HtmlTokenizer {
         for i in 0..self.temporary_buffer.len() {
             let code_point = self.temporary_buffer[i];
             if self.consumed_as_part_of_an_attribute() {
-                push_code_point(&mut self.current_builder, code_point);
+                self.current_builder.push_code_point(code_point);
             } else {
                 let mut token = Token::new_character(code_point);
-                token.start_position = self.nth_last_position(0);
+                token.start_offset = self.offset();
                 self.queued_tokens.push_back(token);
             }
         }
@@ -905,7 +1113,8 @@ impl HtmlTokenizer {
             }
 
             if self.current_offset < self.input.len()
-                && (self.input[self.current_offset] == 0x0D || is_high_surrogate(self.input[self.current_offset]))
+                && (self.input.code_unit_at(self.current_offset) == 0x0D
+                    || is_high_surrogate(self.input.code_unit_at(self.current_offset)))
                 && self.current_offset + 1 == ip
             {
                 return true;
@@ -920,7 +1129,8 @@ impl HtmlTokenizer {
             return true;
         }
 
-        (self.input[self.current_offset] == 0x0D || is_high_surrogate(self.input[self.current_offset]))
+        (self.input.code_unit_at(self.current_offset) == 0x0D
+            || is_high_surrogate(self.input.code_unit_at(self.current_offset)))
             && self.current_offset + 1 >= self.input.len()
     }
 
@@ -971,28 +1181,29 @@ impl HtmlTokenizer {
 
     /// Get the next token from the tokenizer.
     pub fn next_token(&mut self, stop_at_insertion_point: bool, cdata_allowed: bool) -> Option<Token> {
+        let mut token = Token::default();
+        self.next_token_into(&mut token, stop_at_insertion_point, cdata_allowed)
+            .then_some(token)
+    }
+
+    /// Puts the next token in `out`, and returns whether there was one. What `out` held before is dropped only then.
+    pub fn next_token_into(&mut self, out: &mut Token, stop_at_insertion_point: bool, cdata_allowed: bool) -> bool {
         self.stop_at_insertion_point = stop_at_insertion_point;
         self.cdata_allowed = cdata_allowed;
 
         // Return queued tokens first.
-        {
-            let last = *self.source_positions.last().unwrap_or(&Position::default());
-            self.source_positions.clear();
-            self.source_positions.push(last);
-        }
-
-        if let Some(token) = self.queued_tokens.pop_front() {
-            return Some(token);
+        if self.take_queued_token(out) {
+            return true;
         }
 
         if self.aborted {
-            return None;
+            return false;
         }
 
         loop {
             // Check insertion point before consuming.
             if self.should_pause_before_next_input_character() {
-                return None;
+                return false;
             }
 
             let current_input_character = self.next_code_point();
@@ -1009,19 +1220,22 @@ impl HtmlTokenizer {
                         }
                         Some(0x3C) => {
                             // '<'
+                            if self.try_scan_tag() {
+                                return self.emit_current_token_direct(out);
+                            }
                             self.state = State::TagOpen;
                             continue;
                         }
                         Some(0x00) => {
                             // NULL - parse error
-                            return self.return_character_token(0x00);
+                            return self.return_character_token(out, 0x00);
                         }
                         None => {
                             self.emit_eof();
-                            return self.queued_tokens.pop_front();
+                            return self.take_queued_token(out);
                         }
                         Some(cp) => {
-                            return self.return_character_token(cp);
+                            return self.return_character_token(out, cp);
                         }
                     }
                 }
@@ -1038,14 +1252,14 @@ impl HtmlTokenizer {
                         continue;
                     }
                     Some(0x00) => {
-                        return self.return_character_token(0xFFFD);
+                        return self.return_character_token(out, 0xFFFD);
                     }
                     None => {
                         self.emit_eof();
-                        return self.queued_tokens.pop_front();
+                        return self.take_queued_token(out);
                     }
                     Some(cp) => {
-                        return self.return_character_token(cp);
+                        return self.return_character_token(out, cp);
                     }
                 },
 
@@ -1056,14 +1270,14 @@ impl HtmlTokenizer {
                         continue;
                     }
                     Some(0x00) => {
-                        return self.return_character_token(0xFFFD);
+                        return self.return_character_token(out, 0xFFFD);
                     }
                     None => {
                         self.emit_eof();
-                        return self.queued_tokens.pop_front();
+                        return self.take_queued_token(out);
                     }
                     Some(cp) => {
-                        return self.return_character_token(cp);
+                        return self.return_character_token(out, cp);
                     }
                 },
 
@@ -1074,28 +1288,28 @@ impl HtmlTokenizer {
                         continue;
                     }
                     Some(0x00) => {
-                        return self.return_character_token(0xFFFD);
+                        return self.return_character_token(out, 0xFFFD);
                     }
                     None => {
                         self.emit_eof();
-                        return self.queued_tokens.pop_front();
+                        return self.take_queued_token(out);
                     }
                     Some(cp) => {
-                        return self.return_character_token(cp);
+                        return self.return_character_token(out, cp);
                     }
                 },
 
                 // 13.2.5.5 PLAINTEXT state
                 State::PLAINTEXT => match current_input_character {
                     Some(0x00) => {
-                        return self.return_character_token(0xFFFD);
+                        return self.return_character_token(out, 0xFFFD);
                     }
                     None => {
                         self.emit_eof();
-                        return self.queued_tokens.pop_front();
+                        return self.take_queued_token(out);
                     }
                     Some(cp) => {
-                        return self.return_character_token(cp);
+                        return self.return_character_token(out, cp);
                     }
                 },
 
@@ -1118,7 +1332,8 @@ impl HtmlTokenizer {
                         // FIXME: Set the temporary buffer to the empty string. Switch to the processing instruction open state.
                         // NB: Until processing instructions are supported, retain the bogus-comment fallback.
                         self.create_new_token(TokenType::Comment);
-                        self.current_token.start_position = self.nth_last_position(2);
+                        // NB: The comment starts at the "<" of the "<?" that was just consumed.
+                        self.current_token.start_offset = SourceOffset::new(self.current_offset - 2);
                         self.reconsume(State::BogusComment);
                         continue;
                     }
@@ -1126,7 +1341,7 @@ impl HtmlTokenizer {
                         // parse error
                         self.queued_tokens.push_back(self.make_character_token(0x3C));
                         self.emit_eof();
-                        return self.queued_tokens.pop_front();
+                        return self.take_queued_token(out);
                     }
                     Some(_) => {
                         // parse error
@@ -1153,7 +1368,7 @@ impl HtmlTokenizer {
                         self.queued_tokens.push_back(self.make_character_token(0x3C));
                         self.queued_tokens.push_back(self.make_character_token(0x2F));
                         self.emit_eof();
-                        return self.queued_tokens.pop_front();
+                        return self.take_queued_token(out);
                     }
                     Some(_) => {
                         // parse error
@@ -1178,71 +1393,57 @@ impl HtmlTokenizer {
                         && cp >= b'a' as u32
                         && cp <= b'z' as u32
                     {
-                        // SAFETY: pushing ASCII bytes into a String is
-                        // always valid UTF-8. We drop into a tight
-                        // inner loop that directly advances
-                        // current_offset and current_column without
-                        // going through skip(1) per character.
-                        unsafe { self.current_builder.as_mut_vec().push(cp as u8) };
+                        // The inner loop below advances current_offset
+                        // directly, one code unit of the name at a time.
+                        self.current_builder.push_ascii(cp as u8);
                         let start_offset = self.current_offset;
                         let mut off = start_offset;
                         let input_len = self.fast_scan_limit();
                         while off < input_len {
-                            let next = self.input[off];
+                            let next = self.input.code_unit_at(off);
                             if next < b'a' as u16 || next > b'z' as u16 {
                                 break;
                             }
-                            unsafe { self.current_builder.as_mut_vec().push(next as u8) };
+                            self.current_builder.push_ascii(next as u8);
                             off += 1;
                         }
                         let consumed = off - start_offset;
                         if consumed > 0 {
-                            self.current_column += consumed as u64;
                             self.prev_offset = off - 1;
                             self.current_offset = off;
-                            if let Some(pos) = self.source_positions.last_mut() {
-                                pos.line = self.current_line;
-                                pos.column = self.current_column;
-                            }
                         }
-                        self.current_token.end_position = self.nth_last_position(0);
                         continue;
                     }
                     match current_input_character {
                         Some(cp) if is_whitespace(cp) => {
                             self.commit_current_builder_as_tag_name();
-                            self.current_token.end_position = self.nth_last_position(1);
                             self.state = State::BeforeAttributeName;
                             continue;
                         }
                         Some(0x2F) => {
                             self.commit_current_builder_as_tag_name();
-                            self.current_token.end_position = self.nth_last_position(0);
                             self.state = State::SelfClosingStartTag;
                             continue;
                         }
                         Some(0x3E) => {
                             self.commit_current_builder_as_tag_name();
                             self.state = State::Data;
-                            return self.emit_current_token_direct();
+                            return self.emit_current_token_direct(out);
                         }
                         Some(cp) if is_ascii_upper_alpha(cp) => {
-                            push_code_point(&mut self.current_builder, to_ascii_lowercase(cp));
-                            self.current_token.end_position = self.nth_last_position(0);
+                            self.current_builder.push_code_point(to_ascii_lowercase(cp));
                             continue;
                         }
                         Some(0x00) => {
-                            self.current_builder.push('\u{FFFD}');
-                            self.current_token.end_position = self.nth_last_position(0);
+                            self.current_builder.push_code_point(0xFFFD);
                             continue;
                         }
                         None => {
                             self.emit_eof();
-                            return self.queued_tokens.pop_front();
+                            return self.take_queued_token(out);
                         }
                         Some(cp) => {
-                            push_code_point(&mut self.current_builder, cp);
-                            self.current_token.end_position = self.nth_last_position(0);
+                            self.current_builder.push_code_point(cp);
                             continue;
                         }
                     }
@@ -1259,17 +1460,13 @@ impl HtmlTokenizer {
                     }
                     Some(0x3D) => {
                         // '=' - parse error
-                        self.current_token
-                            .attributes_mut()
-                            .push(Attribute::with_spare_value_buffer());
-                        self.current_builder.push('=');
+                        self.current_token.start_new_attribute();
+                        self.current_builder.push_ascii(b'=');
                         self.state = State::AttributeName;
                         continue;
                     }
                     Some(_) => {
-                        self.current_token
-                            .attributes_mut()
-                            .push(Attribute::with_spare_value_buffer());
+                        self.current_token.start_new_attribute();
                         self.reconsume(State::AttributeName);
                         continue;
                     }
@@ -1285,12 +1482,12 @@ impl HtmlTokenizer {
                             || cp == b'-' as u32
                             || cp == b'_' as u32;
                         if is_name_char {
-                            unsafe { self.current_builder.as_mut_vec().push(cp as u8) };
+                            self.current_builder.push_ascii(cp as u8);
                             let start_offset = self.current_offset;
                             let mut off = start_offset;
                             let input_len = self.fast_scan_limit();
                             while off < input_len {
-                                let next = self.input[off];
+                                let next = self.input.code_unit_at(off);
                                 let ok = (next >= b'a' as u16 && next <= b'z' as u16)
                                     || (next >= b'0' as u16 && next <= b'9' as u16)
                                     || next == b'-' as u16
@@ -1298,18 +1495,13 @@ impl HtmlTokenizer {
                                 if !ok {
                                     break;
                                 }
-                                unsafe { self.current_builder.as_mut_vec().push(next as u8) };
+                                self.current_builder.push_ascii(next as u8);
                                 off += 1;
                             }
                             let consumed = off - start_offset;
                             if consumed > 0 {
-                                self.current_column += consumed as u64;
                                 self.prev_offset = off - 1;
                                 self.current_offset = off;
-                                if let Some(pos) = self.source_positions.last_mut() {
-                                    pos.line = self.current_line;
-                                    pos.column = self.current_column;
-                                }
                             }
                             continue;
                         }
@@ -1331,20 +1523,20 @@ impl HtmlTokenizer {
                             continue;
                         }
                         Some(cp) if is_ascii_upper_alpha(cp) => {
-                            push_code_point(&mut self.current_builder, to_ascii_lowercase(cp));
+                            self.current_builder.push_code_point(to_ascii_lowercase(cp));
                             continue;
                         }
                         Some(0x00) => {
-                            self.current_builder.push('\u{FFFD}');
+                            self.current_builder.push_code_point(0xFFFD);
                             continue;
                         }
                         Some(cp @ (0x22 | 0x27 | 0x3C)) => {
                             // '"', '\'', '<' - parse error
-                            push_code_point(&mut self.current_builder, cp);
+                            self.current_builder.push_code_point(cp);
                             continue;
                         }
                         Some(cp) => {
-                            push_code_point(&mut self.current_builder, cp);
+                            self.current_builder.push_code_point(cp);
                             continue;
                         }
                     }
@@ -1365,16 +1557,14 @@ impl HtmlTokenizer {
                     }
                     Some(0x3E) => {
                         self.state = State::Data;
-                        return self.emit_current_token_direct();
+                        return self.emit_current_token_direct(out);
                     }
                     None => {
                         self.emit_eof();
-                        return self.queued_tokens.pop_front();
+                        return self.take_queued_token(out);
                     }
                     Some(_) => {
-                        self.current_token
-                            .attributes_mut()
-                            .push(Attribute::with_spare_value_buffer());
+                        self.current_token.start_new_attribute();
                         self.reconsume(State::AttributeName);
                         continue;
                     }
@@ -1382,9 +1572,9 @@ impl HtmlTokenizer {
 
                 // 13.2.5.35 Before attribute value state
                 State::BeforeAttributeValue => {
-                    let pos = self.nth_last_position(1);
+                    let value_start = self.offset_before_last_code_point();
                     if let Some(attr) = self.current_token.attributes_mut().last_mut() {
-                        attr.value_start_position = pos;
+                        attr.value_start_offset = value_start;
                     }
                     match current_input_character {
                         Some(cp) if is_whitespace(cp) => {
@@ -1401,7 +1591,7 @@ impl HtmlTokenizer {
                         Some(0x3E) => {
                             // parse error
                             self.state = State::Data;
-                            return self.emit_current_token_direct();
+                            return self.emit_current_token_direct(out);
                         }
                         _ => {
                             self.reconsume(State::AttributeValueUnquoted);
@@ -1411,65 +1601,31 @@ impl HtmlTokenizer {
                 }
 
                 // 13.2.5.36 Attribute value (double-quoted) state
-                State::AttributeValueDoubleQuoted => {
-                    // Fast-path run: bulk-append printable ASCII until we
-                    // hit `"`, `&`, NUL, CR or non-ASCII. The inner loop
-                    // advances a local offset directly and only updates
-                    // tokenizer/position state once at the end.
-                    if let Some(cp) = current_input_character
-                        && (0x20..0x80).contains(&cp)
-                        && cp != 0x22
-                        && cp != 0x26
-                    {
-                        unsafe { self.current_builder.as_mut_vec().push(cp as u8) };
-                        let start_offset = self.current_offset;
-                        let mut off = start_offset;
-                        let input_len = self.fast_scan_limit();
-                        while off < input_len {
-                            let next = self.input[off];
-                            if !(0x20..0x80).contains(&next) || next == 0x22 || next == 0x26 {
-                                break;
-                            }
-                            unsafe { self.current_builder.as_mut_vec().push(next as u8) };
-                            off += 1;
-                        }
-                        let consumed = off - start_offset;
-                        if consumed > 0 {
-                            self.current_column += consumed as u64;
-                            self.prev_offset = off - 1;
-                            self.current_offset = off;
-                            if let Some(pos) = self.source_positions.last_mut() {
-                                pos.line = self.current_line;
-                                pos.column = self.current_column;
-                            }
-                        }
+                State::AttributeValueDoubleQuoted => match current_input_character {
+                    Some(0x22) => {
+                        self.set_attribute_value();
+                        self.state = State::AfterAttributeValueQuoted;
                         continue;
                     }
-                    match current_input_character {
-                        Some(0x22) => {
-                            self.set_attribute_value();
-                            self.state = State::AfterAttributeValueQuoted;
-                            continue;
-                        }
-                        Some(0x26) => {
-                            self.return_state = State::AttributeValueDoubleQuoted;
-                            self.state = State::CharacterReference;
-                            continue;
-                        }
-                        Some(0x00) => {
-                            self.current_builder.push('\u{FFFD}');
-                            continue;
-                        }
-                        None => {
-                            self.emit_eof();
-                            return self.queued_tokens.pop_front();
-                        }
-                        Some(cp) => {
-                            push_code_point(&mut self.current_builder, cp);
-                            continue;
-                        }
+                    Some(0x26) => {
+                        self.return_state = State::AttributeValueDoubleQuoted;
+                        self.state = State::CharacterReference;
+                        continue;
                     }
-                }
+                    Some(0x00) => {
+                        self.current_builder.push_code_point(0xFFFD);
+                        continue;
+                    }
+                    None => {
+                        self.emit_eof();
+                        return self.take_queued_token(out);
+                    }
+                    Some(cp) => {
+                        self.current_builder.push_code_point(cp);
+                        self.append_attribute_value_run(b'"');
+                        continue;
+                    }
+                },
 
                 // 13.2.5.37 Attribute value (single-quoted) state
                 State::AttributeValueSingleQuoted => match current_input_character {
@@ -1484,15 +1640,16 @@ impl HtmlTokenizer {
                         continue;
                     }
                     Some(0x00) => {
-                        self.current_builder.push('\u{FFFD}');
+                        self.current_builder.push_code_point(0xFFFD);
                         continue;
                     }
                     None => {
                         self.emit_eof();
-                        return self.queued_tokens.pop_front();
+                        return self.take_queued_token(out);
                     }
                     Some(cp) => {
-                        push_code_point(&mut self.current_builder, cp);
+                        self.current_builder.push_code_point(cp);
+                        self.append_attribute_value_run(b'\'');
                         continue;
                     }
                 },
@@ -1512,32 +1669,32 @@ impl HtmlTokenizer {
                     Some(0x3E) => {
                         self.set_attribute_value();
                         self.state = State::Data;
-                        return self.emit_current_token_direct();
+                        return self.emit_current_token_direct(out);
                     }
                     Some(0x00) => {
-                        self.current_builder.push('\u{FFFD}');
+                        self.current_builder.push_code_point(0xFFFD);
                         continue;
                     }
                     Some(cp @ (0x22 | 0x27 | 0x3C | 0x3D | 0x60)) => {
                         // parse error, treat as anything else
-                        push_code_point(&mut self.current_builder, cp);
+                        self.current_builder.push_code_point(cp);
                         continue;
                     }
                     None => {
                         self.emit_eof();
-                        return self.queued_tokens.pop_front();
+                        return self.take_queued_token(out);
                     }
                     Some(cp) => {
-                        push_code_point(&mut self.current_builder, cp);
+                        self.current_builder.push_code_point(cp);
                         continue;
                     }
                 },
 
                 // 13.2.5.39 After attribute value (quoted) state
                 State::AfterAttributeValueQuoted => {
-                    let pos = self.nth_last_position(1);
+                    let value_end = self.offset_before_last_code_point();
                     if let Some(attr) = self.current_token.attributes_mut().last_mut() {
-                        attr.value_end_position = pos;
+                        attr.value_end_offset = value_end;
                     }
                     match current_input_character {
                         Some(cp) if is_whitespace(cp) => {
@@ -1550,11 +1707,11 @@ impl HtmlTokenizer {
                         }
                         Some(0x3E) => {
                             self.state = State::Data;
-                            return self.emit_current_token_direct();
+                            return self.emit_current_token_direct(out);
                         }
                         None => {
                             self.emit_eof();
-                            return self.queued_tokens.pop_front();
+                            return self.take_queued_token(out);
                         }
                         Some(_) => {
                             // parse error
@@ -1569,11 +1726,11 @@ impl HtmlTokenizer {
                     Some(0x3E) => {
                         self.current_token.set_self_closing(true);
                         self.state = State::Data;
-                        return self.emit_current_token_direct();
+                        return self.emit_current_token_direct(out);
                     }
                     None => {
                         self.emit_eof();
-                        return self.queued_tokens.pop_front();
+                        return self.take_queued_token(out);
                     }
                     Some(_) => {
                         // parse error
@@ -1590,7 +1747,7 @@ impl HtmlTokenizer {
                             self.current_token.set_comment_data(data);
                         }
                         self.state = State::Data;
-                        return self.emit_current_token_direct();
+                        return self.emit_current_token_direct(out);
                     }
                     None => {
                         {
@@ -1598,14 +1755,14 @@ impl HtmlTokenizer {
                             self.current_token.set_comment_data(data);
                         }
                         self.emit_current_token_followed_by_eof();
-                        return self.queued_tokens.pop_front();
+                        return self.take_queued_token(out);
                     }
                     Some(0x00) => {
-                        self.current_builder.push('\u{FFFD}');
+                        self.current_builder.push_code_point(0xFFFD);
                         continue;
                     }
                     Some(cp) => {
-                        push_code_point(&mut self.current_builder, cp);
+                        self.current_builder.push_code_point(cp);
                         continue;
                     }
                 },
@@ -1620,11 +1777,12 @@ impl HtmlTokenizer {
                     match self.consume_next_if_match_exact("--") {
                         Some(true) => {
                             self.create_new_token(TokenType::Comment);
-                            self.current_token.start_position = self.nth_last_position(3);
+                            // NB: The comment starts at the "<" of the "<!--" that was just consumed.
+                            self.current_token.start_offset = SourceOffset::new(self.current_offset - 4);
                             self.state = State::CommentStart;
                             continue;
                         }
-                        None => return None,
+                        None => return false,
                         _ => {}
                     }
                     match self.consume_next_if_match("DOCTYPE") {
@@ -1632,7 +1790,7 @@ impl HtmlTokenizer {
                             self.state = State::DOCTYPE;
                             continue;
                         }
-                        None => return None,
+                        None => return false,
                         _ => {}
                     }
                     match self.consume_next_if_match_exact("[CDATA[") {
@@ -1641,12 +1799,12 @@ impl HtmlTokenizer {
                                 self.state = State::CDATASection;
                             } else {
                                 self.create_new_token(TokenType::Comment);
-                                self.current_builder.push_str("[CDATA[");
+                                self.current_builder.push_ascii_str("[CDATA[");
                                 self.state = State::BogusComment;
                             }
                             continue;
                         }
-                        None => return None,
+                        None => return false,
                         _ => {}
                     }
                     // parse error
@@ -1668,7 +1826,7 @@ impl HtmlTokenizer {
                             self.current_token.set_comment_data(data);
                         }
                         self.state = State::Data;
-                        return self.emit_current_token_direct();
+                        return self.emit_current_token_direct(out);
                     }
                     _ => {
                         self.reconsume(State::Comment);
@@ -1689,7 +1847,7 @@ impl HtmlTokenizer {
                             self.current_token.set_comment_data(data);
                         }
                         self.state = State::Data;
-                        return self.emit_current_token_direct();
+                        return self.emit_current_token_direct(out);
                     }
                     None => {
                         {
@@ -1697,10 +1855,10 @@ impl HtmlTokenizer {
                             self.current_token.set_comment_data(data);
                         }
                         self.emit_current_token_followed_by_eof();
-                        return self.queued_tokens.pop_front();
+                        return self.take_queued_token(out);
                     }
                     Some(_) => {
-                        self.current_builder.push('-');
+                        self.current_builder.push_ascii(b'-');
                         self.reconsume(State::Comment);
                         continue;
                     }
@@ -1709,7 +1867,7 @@ impl HtmlTokenizer {
                 // 13.2.5.45 Comment state
                 State::Comment => match current_input_character {
                     Some(0x3C) => {
-                        self.current_builder.push('<');
+                        self.current_builder.push_ascii(b'<');
                         self.state = State::CommentLessThanSign;
                         continue;
                     }
@@ -1718,7 +1876,7 @@ impl HtmlTokenizer {
                         continue;
                     }
                     Some(0x00) => {
-                        self.current_builder.push('\u{FFFD}');
+                        self.current_builder.push_code_point(0xFFFD);
                         continue;
                     }
                     None => {
@@ -1727,10 +1885,10 @@ impl HtmlTokenizer {
                             self.current_token.set_comment_data(data);
                         }
                         self.emit_current_token_followed_by_eof();
-                        return self.queued_tokens.pop_front();
+                        return self.take_queued_token(out);
                     }
                     Some(cp) => {
-                        push_code_point(&mut self.current_builder, cp);
+                        self.current_builder.push_code_point(cp);
                         continue;
                     }
                 },
@@ -1738,12 +1896,12 @@ impl HtmlTokenizer {
                 // 13.2.5.46 Comment less-than sign state
                 State::CommentLessThanSign => match current_input_character {
                     Some(0x21) => {
-                        self.current_builder.push('!');
+                        self.current_builder.push_ascii(b'!');
                         self.state = State::CommentLessThanSignBang;
                         continue;
                     }
                     Some(0x3C) => {
-                        self.current_builder.push('<');
+                        self.current_builder.push_ascii(b'<');
                         continue;
                     }
                     _ => {
@@ -1801,10 +1959,10 @@ impl HtmlTokenizer {
                             self.current_token.set_comment_data(data);
                         }
                         self.emit_current_token_followed_by_eof();
-                        return self.queued_tokens.pop_front();
+                        return self.take_queued_token(out);
                     }
                     Some(_) => {
-                        self.current_builder.push('-');
+                        self.current_builder.push_ascii(b'-');
                         self.reconsume(State::Comment);
                         continue;
                     }
@@ -1818,14 +1976,14 @@ impl HtmlTokenizer {
                             self.current_token.set_comment_data(data);
                         }
                         self.state = State::Data;
-                        return self.emit_current_token_direct();
+                        return self.emit_current_token_direct(out);
                     }
                     Some(0x21) => {
                         self.state = State::CommentEndBang;
                         continue;
                     }
                     Some(0x2D) => {
-                        self.current_builder.push('-');
+                        self.current_builder.push_ascii(b'-');
                         continue;
                     }
                     None => {
@@ -1834,10 +1992,10 @@ impl HtmlTokenizer {
                             self.current_token.set_comment_data(data);
                         }
                         self.emit_current_token_followed_by_eof();
-                        return self.queued_tokens.pop_front();
+                        return self.take_queued_token(out);
                     }
                     Some(_) => {
-                        self.current_builder.push_str("--");
+                        self.current_builder.push_ascii_str("--");
                         self.reconsume(State::Comment);
                         continue;
                     }
@@ -1846,7 +2004,7 @@ impl HtmlTokenizer {
                 // 13.2.5.52 Comment end bang state
                 State::CommentEndBang => match current_input_character {
                     Some(0x2D) => {
-                        self.current_builder.push_str("--!");
+                        self.current_builder.push_ascii_str("--!");
                         self.state = State::CommentEndDash;
                         continue;
                     }
@@ -1857,7 +2015,7 @@ impl HtmlTokenizer {
                             self.current_token.set_comment_data(data);
                         }
                         self.state = State::Data;
-                        return self.emit_current_token_direct();
+                        return self.emit_current_token_direct(out);
                     }
                     None => {
                         {
@@ -1865,10 +2023,10 @@ impl HtmlTokenizer {
                             self.current_token.set_comment_data(data);
                         }
                         self.emit_current_token_followed_by_eof();
-                        return self.queued_tokens.pop_front();
+                        return self.take_queued_token(out);
                     }
                     Some(_) => {
-                        self.current_builder.push_str("--!");
+                        self.current_builder.push_ascii_str("--!");
                         self.reconsume(State::Comment);
                         continue;
                     }
@@ -1894,7 +2052,7 @@ impl HtmlTokenizer {
                             ..Default::default()
                         };
                         self.emit_current_token_followed_by_eof();
-                        return self.queued_tokens.pop_front();
+                        return self.take_queued_token(out);
                     }
                     Some(_) => {
                         // parse error
@@ -1916,7 +2074,7 @@ impl HtmlTokenizer {
                             missing_system_identifier: true,
                             ..Default::default()
                         };
-                        push_code_point(&mut self.current_builder, to_ascii_lowercase(cp));
+                        self.current_builder.push_code_point(to_ascii_lowercase(cp));
                         self.state = State::DOCTYPEName;
                         continue;
                     }
@@ -1928,7 +2086,7 @@ impl HtmlTokenizer {
                             missing_system_identifier: true,
                             ..Default::default()
                         };
-                        self.current_builder.push('\u{FFFD}');
+                        self.current_builder.push_code_point(0xFFFD);
                         self.state = State::DOCTYPEName;
                         continue;
                     }
@@ -1943,7 +2101,7 @@ impl HtmlTokenizer {
                             ..Default::default()
                         };
                         self.state = State::Data;
-                        return self.emit_current_token_direct();
+                        return self.emit_current_token_direct(out);
                     }
                     None => {
                         self.create_new_token(TokenType::Doctype);
@@ -1955,7 +2113,7 @@ impl HtmlTokenizer {
                             ..Default::default()
                         };
                         self.emit_current_token_followed_by_eof();
-                        return self.queued_tokens.pop_front();
+                        return self.take_queued_token(out);
                     }
                     Some(cp) => {
                         self.create_new_token(TokenType::Doctype);
@@ -1965,7 +2123,7 @@ impl HtmlTokenizer {
                             missing_system_identifier: true,
                             ..Default::default()
                         };
-                        push_code_point(&mut self.current_builder, cp);
+                        self.current_builder.push_code_point(cp);
                         self.state = State::DOCTYPEName;
                         continue;
                     }
@@ -1993,14 +2151,14 @@ impl HtmlTokenizer {
                             }
                         }
                         self.state = State::Data;
-                        return self.emit_current_token_direct();
+                        return self.emit_current_token_direct(out);
                     }
                     Some(cp) if is_ascii_upper_alpha(cp) => {
-                        push_code_point(&mut self.current_builder, to_ascii_lowercase(cp));
+                        self.current_builder.push_code_point(to_ascii_lowercase(cp));
                         continue;
                     }
                     Some(0x00) => {
-                        self.current_builder.push('\u{FFFD}');
+                        self.current_builder.push_code_point(0xFFFD);
                         continue;
                     }
                     None => {
@@ -2011,10 +2169,10 @@ impl HtmlTokenizer {
                             dd.force_quirks = true;
                         }
                         self.emit_current_token_followed_by_eof();
-                        return self.queued_tokens.pop_front();
+                        return self.take_queued_token(out);
                     }
                     Some(cp) => {
-                        push_code_point(&mut self.current_builder, cp);
+                        self.current_builder.push_code_point(cp);
                         continue;
                     }
                 },
@@ -2026,7 +2184,7 @@ impl HtmlTokenizer {
                     }
                     Some(0x3E) => {
                         self.state = State::Data;
-                        return self.emit_current_token_direct();
+                        return self.emit_current_token_direct(out);
                     }
                     None => {
                         {
@@ -2034,7 +2192,7 @@ impl HtmlTokenizer {
                             dd.force_quirks = true;
                         }
                         self.emit_current_token_followed_by_eof();
-                        return self.queued_tokens.pop_front();
+                        return self.take_queued_token(out);
                     }
                     Some(_) => {
                         // Reconsume and try PUBLIC/SYSTEM
@@ -2046,7 +2204,7 @@ impl HtmlTokenizer {
                                 self.state = State::AfterDOCTYPEPublicKeyword;
                                 continue;
                             }
-                            None => return None,
+                            None => return false,
                             _ => {}
                         }
                         match self.consume_next_if_match("SYSTEM") {
@@ -2054,7 +2212,7 @@ impl HtmlTokenizer {
                                 self.state = State::AfterDOCTYPESystemKeyword;
                                 continue;
                             }
-                            None => return None,
+                            None => return false,
                             _ => {}
                         }
                         // Re-consume the character we put back
@@ -2096,7 +2254,7 @@ impl HtmlTokenizer {
                             dd.force_quirks = true;
                         }
                         self.state = State::Data;
-                        return self.emit_current_token_direct();
+                        return self.emit_current_token_direct(out);
                     }
                     None => {
                         {
@@ -2104,7 +2262,7 @@ impl HtmlTokenizer {
                             dd.force_quirks = true;
                         }
                         self.emit_current_token_followed_by_eof();
-                        return self.queued_tokens.pop_front();
+                        return self.take_queued_token(out);
                     }
                     Some(_) => {
                         {
@@ -2141,7 +2299,7 @@ impl HtmlTokenizer {
                             dd.force_quirks = true;
                         }
                         self.state = State::Data;
-                        return self.emit_current_token_direct();
+                        return self.emit_current_token_direct(out);
                     }
                     None => {
                         {
@@ -2149,7 +2307,7 @@ impl HtmlTokenizer {
                             dd.force_quirks = true;
                         }
                         self.emit_current_token_followed_by_eof();
-                        return self.queued_tokens.pop_front();
+                        return self.take_queued_token(out);
                     }
                     Some(_) => {
                         {
@@ -2175,7 +2333,7 @@ impl HtmlTokenizer {
                         continue;
                     }
                     Some(0x00) => {
-                        self.current_builder.push('\u{FFFD}');
+                        self.current_builder.push_code_point(0xFFFD);
                         continue;
                     }
                     Some(0x3E) => {
@@ -2188,7 +2346,7 @@ impl HtmlTokenizer {
                             }
                         }
                         self.state = State::Data;
-                        return self.emit_current_token_direct();
+                        return self.emit_current_token_direct(out);
                     }
                     None => {
                         {
@@ -2200,10 +2358,10 @@ impl HtmlTokenizer {
                             }
                         }
                         self.emit_current_token_followed_by_eof();
-                        return self.queued_tokens.pop_front();
+                        return self.take_queued_token(out);
                     }
                     Some(cp) => {
-                        push_code_point(&mut self.current_builder, cp);
+                        self.current_builder.push_code_point(cp);
                         continue;
                     }
                 },
@@ -2222,7 +2380,7 @@ impl HtmlTokenizer {
                         continue;
                     }
                     Some(0x00) => {
-                        self.current_builder.push('\u{FFFD}');
+                        self.current_builder.push_code_point(0xFFFD);
                         continue;
                     }
                     Some(0x3E) => {
@@ -2235,7 +2393,7 @@ impl HtmlTokenizer {
                             }
                         }
                         self.state = State::Data;
-                        return self.emit_current_token_direct();
+                        return self.emit_current_token_direct(out);
                     }
                     None => {
                         {
@@ -2247,10 +2405,10 @@ impl HtmlTokenizer {
                             }
                         }
                         self.emit_current_token_followed_by_eof();
-                        return self.queued_tokens.pop_front();
+                        return self.take_queued_token(out);
                     }
                     Some(cp) => {
-                        push_code_point(&mut self.current_builder, cp);
+                        self.current_builder.push_code_point(cp);
                         continue;
                     }
                 },
@@ -2263,12 +2421,12 @@ impl HtmlTokenizer {
                     }
                     Some(0x3E) => {
                         self.state = State::Data;
-                        return self.emit_current_token_direct();
+                        return self.emit_current_token_direct(out);
                     }
                     Some(0x22) => {
                         {
                             let dd = self.current_token.doctype_data_mut();
-                            dd.system_identifier = String::new();
+                            dd.system_identifier = CodeUnits::new();
                             dd.missing_system_identifier = false;
                         }
                         self.state = State::DOCTYPESystemIdentifierDoubleQuoted;
@@ -2277,7 +2435,7 @@ impl HtmlTokenizer {
                     Some(0x27) => {
                         {
                             let dd = self.current_token.doctype_data_mut();
-                            dd.system_identifier = String::new();
+                            dd.system_identifier = CodeUnits::new();
                             dd.missing_system_identifier = false;
                         }
                         self.state = State::DOCTYPESystemIdentifierSingleQuoted;
@@ -2289,7 +2447,7 @@ impl HtmlTokenizer {
                             dd.force_quirks = true;
                         }
                         self.emit_current_token_followed_by_eof();
-                        return self.queued_tokens.pop_front();
+                        return self.take_queued_token(out);
                     }
                     Some(_) => {
                         {
@@ -2306,12 +2464,12 @@ impl HtmlTokenizer {
                     Some(cp) if is_whitespace(cp) => continue,
                     Some(0x3E) => {
                         self.state = State::Data;
-                        return self.emit_current_token_direct();
+                        return self.emit_current_token_direct(out);
                     }
                     Some(0x22) => {
                         {
                             let dd = self.current_token.doctype_data_mut();
-                            dd.system_identifier = String::new();
+                            dd.system_identifier = CodeUnits::new();
                             dd.missing_system_identifier = false;
                         }
                         self.state = State::DOCTYPESystemIdentifierDoubleQuoted;
@@ -2320,7 +2478,7 @@ impl HtmlTokenizer {
                     Some(0x27) => {
                         {
                             let dd = self.current_token.doctype_data_mut();
-                            dd.system_identifier = String::new();
+                            dd.system_identifier = CodeUnits::new();
                             dd.missing_system_identifier = false;
                         }
                         self.state = State::DOCTYPESystemIdentifierSingleQuoted;
@@ -2332,7 +2490,7 @@ impl HtmlTokenizer {
                             dd.force_quirks = true;
                         }
                         self.emit_current_token_followed_by_eof();
-                        return self.queued_tokens.pop_front();
+                        return self.take_queued_token(out);
                     }
                     Some(_) => {
                         {
@@ -2353,7 +2511,7 @@ impl HtmlTokenizer {
                     Some(0x22) => {
                         {
                             let dd = self.current_token.doctype_data_mut();
-                            dd.system_identifier = String::new();
+                            dd.system_identifier = CodeUnits::new();
                             dd.missing_system_identifier = false;
                         }
                         self.state = State::DOCTYPESystemIdentifierDoubleQuoted;
@@ -2362,7 +2520,7 @@ impl HtmlTokenizer {
                     Some(0x27) => {
                         {
                             let dd = self.current_token.doctype_data_mut();
-                            dd.system_identifier = String::new();
+                            dd.system_identifier = CodeUnits::new();
                             dd.missing_system_identifier = false;
                         }
                         self.state = State::DOCTYPESystemIdentifierSingleQuoted;
@@ -2374,7 +2532,7 @@ impl HtmlTokenizer {
                             dd.force_quirks = true;
                         }
                         self.state = State::Data;
-                        return self.emit_current_token_direct();
+                        return self.emit_current_token_direct(out);
                     }
                     None => {
                         {
@@ -2382,7 +2540,7 @@ impl HtmlTokenizer {
                             dd.force_quirks = true;
                         }
                         self.emit_current_token_followed_by_eof();
-                        return self.queued_tokens.pop_front();
+                        return self.take_queued_token(out);
                     }
                     Some(_) => {
                         {
@@ -2400,7 +2558,7 @@ impl HtmlTokenizer {
                     Some(0x22) => {
                         {
                             let dd = self.current_token.doctype_data_mut();
-                            dd.system_identifier = String::new();
+                            dd.system_identifier = CodeUnits::new();
                             dd.missing_system_identifier = false;
                         }
                         self.state = State::DOCTYPESystemIdentifierDoubleQuoted;
@@ -2409,7 +2567,7 @@ impl HtmlTokenizer {
                     Some(0x27) => {
                         {
                             let dd = self.current_token.doctype_data_mut();
-                            dd.system_identifier = String::new();
+                            dd.system_identifier = CodeUnits::new();
                             dd.missing_system_identifier = false;
                         }
                         self.state = State::DOCTYPESystemIdentifierSingleQuoted;
@@ -2421,7 +2579,7 @@ impl HtmlTokenizer {
                             dd.force_quirks = true;
                         }
                         self.state = State::Data;
-                        return self.emit_current_token_direct();
+                        return self.emit_current_token_direct(out);
                     }
                     None => {
                         {
@@ -2429,7 +2587,7 @@ impl HtmlTokenizer {
                             dd.force_quirks = true;
                         }
                         self.emit_current_token_followed_by_eof();
-                        return self.queued_tokens.pop_front();
+                        return self.take_queued_token(out);
                     }
                     Some(_) => {
                         {
@@ -2453,7 +2611,7 @@ impl HtmlTokenizer {
                         continue;
                     }
                     Some(0x00) => {
-                        self.current_builder.push('\u{FFFD}');
+                        self.current_builder.push_code_point(0xFFFD);
                         continue;
                     }
                     Some(0x3E) => {
@@ -2464,7 +2622,7 @@ impl HtmlTokenizer {
                             dd.force_quirks = true;
                         }
                         self.state = State::Data;
-                        return self.emit_current_token_direct();
+                        return self.emit_current_token_direct(out);
                     }
                     None => {
                         let sys_id = self.consume_current_builder();
@@ -2474,10 +2632,10 @@ impl HtmlTokenizer {
                             dd.force_quirks = true;
                         }
                         self.emit_current_token_followed_by_eof();
-                        return self.queued_tokens.pop_front();
+                        return self.take_queued_token(out);
                     }
                     Some(cp) => {
-                        push_code_point(&mut self.current_builder, cp);
+                        self.current_builder.push_code_point(cp);
                         continue;
                     }
                 },
@@ -2494,7 +2652,7 @@ impl HtmlTokenizer {
                         continue;
                     }
                     Some(0x00) => {
-                        self.current_builder.push('\u{FFFD}');
+                        self.current_builder.push_code_point(0xFFFD);
                         continue;
                     }
                     Some(0x3E) => {
@@ -2505,7 +2663,7 @@ impl HtmlTokenizer {
                             dd.force_quirks = true;
                         }
                         self.state = State::Data;
-                        return self.emit_current_token_direct();
+                        return self.emit_current_token_direct(out);
                     }
                     None => {
                         let sys_id = self.consume_current_builder();
@@ -2515,10 +2673,10 @@ impl HtmlTokenizer {
                             dd.force_quirks = true;
                         }
                         self.emit_current_token_followed_by_eof();
-                        return self.queued_tokens.pop_front();
+                        return self.take_queued_token(out);
                     }
                     Some(cp) => {
-                        push_code_point(&mut self.current_builder, cp);
+                        self.current_builder.push_code_point(cp);
                         continue;
                     }
                 },
@@ -2528,7 +2686,7 @@ impl HtmlTokenizer {
                     Some(cp) if is_whitespace(cp) => continue,
                     Some(0x3E) => {
                         self.state = State::Data;
-                        return self.emit_current_token_direct();
+                        return self.emit_current_token_direct(out);
                     }
                     None => {
                         {
@@ -2536,7 +2694,7 @@ impl HtmlTokenizer {
                             dd.force_quirks = true;
                         }
                         self.emit_current_token_followed_by_eof();
-                        return self.queued_tokens.pop_front();
+                        return self.take_queued_token(out);
                     }
                     Some(_) => {
                         // parse error - do NOT set force_quirks
@@ -2549,12 +2707,12 @@ impl HtmlTokenizer {
                 State::BogusDOCTYPE => match current_input_character {
                     Some(0x3E) => {
                         self.state = State::Data;
-                        return self.emit_current_token_direct();
+                        return self.emit_current_token_direct(out);
                     }
                     Some(0x00) => continue,
                     None => {
                         self.emit_current_token_followed_by_eof();
-                        return self.queued_tokens.pop_front();
+                        return self.take_queued_token(out);
                     }
                     Some(_) => continue,
                 },
@@ -2567,10 +2725,10 @@ impl HtmlTokenizer {
                     }
                     None => {
                         self.emit_eof();
-                        return self.queued_tokens.pop_front();
+                        return self.take_queued_token(out);
                     }
                     Some(cp) => {
-                        return self.return_character_token(cp);
+                        return self.return_character_token(out, cp);
                     }
                 },
 
@@ -2590,7 +2748,7 @@ impl HtmlTokenizer {
                 // 13.2.5.71 CDATA section end state
                 State::CDATASectionEnd => match current_input_character {
                     Some(0x5D) => {
-                        return self.return_character_token(0x5D);
+                        return self.return_character_token(out, 0x5D);
                     }
                     Some(0x3E) => {
                         self.state = State::Data;
@@ -2625,7 +2783,7 @@ impl HtmlTokenizer {
                             self.flush_codepoints_consumed_as_character_reference();
                             self.reconsume_in_return_state(current_input_character);
                             if !self.queued_tokens.is_empty() {
-                                return self.queued_tokens.pop_front();
+                                return self.take_queued_token(out);
                             }
                             continue;
                         }
@@ -2646,7 +2804,7 @@ impl HtmlTokenizer {
                             self.restore_to(self.prev_offset);
                         } else if self.can_run_out_at(self.current_offset) {
                             // At insertion point with no more chars -- pause.
-                            return None;
+                            return false;
                         }
                         // Fall through to resolution.
                     } else {
@@ -2656,15 +2814,15 @@ impl HtmlTokenizer {
                         }
                         let limit = self.input.len();
                         while self.current_offset < limit {
-                            let cp = u32::from(self.input[self.current_offset]);
+                            let cp = u32::from(self.input.code_unit_at(self.current_offset));
                             if !self.entity_matcher.try_consume_code_point(cp) {
                                 break;
                             }
                             self.temporary_buffer.push(cp);
-                            self.advance(1, cp);
+                            self.advance(1);
                         }
                         if !self.input_stream_closed && self.current_offset >= limit {
-                            return None;
+                            return false;
                         }
                     }
 
@@ -2688,7 +2846,7 @@ impl HtmlTokenizer {
                             self.flush_codepoints_consumed_as_character_reference();
                             self.state = self.return_state;
                             if !self.queued_tokens.is_empty() {
-                                return self.queued_tokens.pop_front();
+                                return self.take_queued_token(out);
                             }
                             continue;
                         }
@@ -2705,7 +2863,7 @@ impl HtmlTokenizer {
                         self.flush_codepoints_consumed_as_character_reference();
                         self.state = self.return_state;
                         if !self.queued_tokens.is_empty() {
-                            return self.queued_tokens.pop_front();
+                            return self.take_queued_token(out);
                         }
                         continue;
                     } else {
@@ -2721,24 +2879,24 @@ impl HtmlTokenizer {
                 State::AmbiguousAmpersand => match current_input_character {
                     Some(cp) if is_ascii_alphanumeric(cp) => {
                         if self.consumed_as_part_of_an_attribute() {
-                            push_code_point(&mut self.current_builder, cp);
+                            self.current_builder.push_code_point(cp);
                             continue;
                         } else {
-                            return self.return_character_token(cp);
+                            return self.return_character_token(out, cp);
                         }
                     }
                     Some(0x3B) => {
                         // parse error
                         self.reconsume_in_return_state(current_input_character);
                         if !self.queued_tokens.is_empty() {
-                            return self.queued_tokens.pop_front();
+                            return self.take_queued_token(out);
                         }
                         continue;
                     }
                     _ => {
                         self.reconsume_in_return_state(current_input_character);
                         if !self.queued_tokens.is_empty() {
-                            return self.queued_tokens.pop_front();
+                            return self.take_queued_token(out);
                         }
                         continue;
                     }
@@ -2775,7 +2933,7 @@ impl HtmlTokenizer {
                         self.flush_codepoints_consumed_as_character_reference();
                         self.reconsume_in_return_state(current_input_character);
                         if !self.queued_tokens.is_empty() {
-                            return self.queued_tokens.pop_front();
+                            return self.take_queued_token(out);
                         }
                         continue;
                     }
@@ -2794,7 +2952,7 @@ impl HtmlTokenizer {
                         self.flush_codepoints_consumed_as_character_reference();
                         self.reconsume_in_return_state(current_input_character);
                         if !self.queued_tokens.is_empty() {
-                            return self.queued_tokens.pop_front();
+                            return self.take_queued_token(out);
                         }
                         continue;
                     }
@@ -2882,7 +3040,7 @@ impl HtmlTokenizer {
                     self.flush_codepoints_consumed_as_character_reference();
                     self.state = self.return_state;
                     if !self.queued_tokens.is_empty() {
-                        return self.queued_tokens.pop_front();
+                        return self.take_queued_token(out);
                     }
                     continue;
                 }
@@ -2920,7 +3078,7 @@ impl HtmlTokenizer {
                 State::RCDATAEndTagName => {
                     self.handle_rawtext_end_tag_name(current_input_character, State::RCDATA);
                     if !self.queued_tokens.is_empty() {
-                        return self.queued_tokens.pop_front();
+                        return self.take_queued_token(out);
                     }
                     continue;
                 }
@@ -2958,7 +3116,7 @@ impl HtmlTokenizer {
                 State::RAWTEXTEndTagName => {
                     self.handle_rawtext_end_tag_name(current_input_character, State::RAWTEXT);
                     if !self.queued_tokens.is_empty() {
-                        return self.queued_tokens.pop_front();
+                        return self.take_queued_token(out);
                     }
                     continue;
                 }
@@ -2974,7 +3132,7 @@ impl HtmlTokenizer {
                         self.queued_tokens.push_back(self.make_character_token(0x3C));
                         self.queued_tokens.push_back(self.make_character_token(0x21));
                         self.state = State::ScriptDataEscapeStart;
-                        return self.queued_tokens.pop_front();
+                        return self.take_queued_token(out);
                     }
                     _ => {
                         self.queued_tokens.push_back(self.make_character_token(0x3C));
@@ -3002,7 +3160,7 @@ impl HtmlTokenizer {
                 State::ScriptDataEndTagName => {
                     self.handle_rawtext_end_tag_name(current_input_character, State::ScriptData);
                     if !self.queued_tokens.is_empty() {
-                        return self.queued_tokens.pop_front();
+                        return self.take_queued_token(out);
                     }
                     continue;
                 }
@@ -3011,7 +3169,7 @@ impl HtmlTokenizer {
                 State::ScriptDataEscapeStart => match current_input_character {
                     Some(0x2D) => {
                         self.state = State::ScriptDataEscapeStartDash;
-                        return self.return_character_token(0x2D);
+                        return self.return_character_token(out, 0x2D);
                     }
                     _ => {
                         self.reconsume(State::ScriptData);
@@ -3023,7 +3181,7 @@ impl HtmlTokenizer {
                 State::ScriptDataEscapeStartDash => match current_input_character {
                     Some(0x2D) => {
                         self.state = State::ScriptDataEscapedDashDash;
-                        return self.return_character_token(0x2D);
+                        return self.return_character_token(out, 0x2D);
                     }
                     _ => {
                         self.reconsume(State::ScriptData);
@@ -3035,21 +3193,21 @@ impl HtmlTokenizer {
                 State::ScriptDataEscaped => match current_input_character {
                     Some(0x2D) => {
                         self.state = State::ScriptDataEscapedDash;
-                        return self.return_character_token(0x2D);
+                        return self.return_character_token(out, 0x2D);
                     }
                     Some(0x3C) => {
                         self.state = State::ScriptDataEscapedLessThanSign;
                         continue;
                     }
                     Some(0x00) => {
-                        return self.return_character_token(0xFFFD);
+                        return self.return_character_token(out, 0xFFFD);
                     }
                     None => {
                         self.emit_eof();
-                        return self.queued_tokens.pop_front();
+                        return self.take_queued_token(out);
                     }
                     Some(cp) => {
-                        return self.return_character_token(cp);
+                        return self.return_character_token(out, cp);
                     }
                 },
 
@@ -3057,7 +3215,7 @@ impl HtmlTokenizer {
                 State::ScriptDataEscapedDash => match current_input_character {
                     Some(0x2D) => {
                         self.state = State::ScriptDataEscapedDashDash;
-                        return self.return_character_token(0x2D);
+                        return self.return_character_token(out, 0x2D);
                     }
                     Some(0x3C) => {
                         self.state = State::ScriptDataEscapedLessThanSign;
@@ -3065,22 +3223,22 @@ impl HtmlTokenizer {
                     }
                     Some(0x00) => {
                         self.state = State::ScriptDataEscaped;
-                        return self.return_character_token(0xFFFD);
+                        return self.return_character_token(out, 0xFFFD);
                     }
                     None => {
                         self.emit_eof();
-                        return self.queued_tokens.pop_front();
+                        return self.take_queued_token(out);
                     }
                     Some(cp) => {
                         self.state = State::ScriptDataEscaped;
-                        return self.return_character_token(cp);
+                        return self.return_character_token(out, cp);
                     }
                 },
 
                 // Script data escaped dash dash state
                 State::ScriptDataEscapedDashDash => match current_input_character {
                     Some(0x2D) => {
-                        return self.return_character_token(0x2D);
+                        return self.return_character_token(out, 0x2D);
                     }
                     Some(0x3C) => {
                         self.state = State::ScriptDataEscapedLessThanSign;
@@ -3088,19 +3246,19 @@ impl HtmlTokenizer {
                     }
                     Some(0x3E) => {
                         self.state = State::ScriptData;
-                        return self.return_character_token(0x3E);
+                        return self.return_character_token(out, 0x3E);
                     }
                     Some(0x00) => {
                         self.state = State::ScriptDataEscaped;
-                        return self.return_character_token(0xFFFD);
+                        return self.return_character_token(out, 0xFFFD);
                     }
                     None => {
                         self.emit_eof();
-                        return self.queued_tokens.pop_front();
+                        return self.take_queued_token(out);
                     }
                     Some(cp) => {
                         self.state = State::ScriptDataEscaped;
-                        return self.return_character_token(cp);
+                        return self.return_character_token(out, cp);
                     }
                 },
 
@@ -3143,7 +3301,7 @@ impl HtmlTokenizer {
                 State::ScriptDataEscapedEndTagName => {
                     self.handle_rawtext_end_tag_name(current_input_character, State::ScriptDataEscaped);
                     if !self.queued_tokens.is_empty() {
-                        return self.queued_tokens.pop_front();
+                        return self.take_queued_token(out);
                     }
                     continue;
                 }
@@ -3156,15 +3314,15 @@ impl HtmlTokenizer {
                         } else {
                             self.state = State::ScriptDataEscaped;
                         }
-                        return self.return_character_token(cp);
+                        return self.return_character_token(out, cp);
                     }
                     Some(cp) if is_ascii_upper_alpha(cp) => {
                         self.temporary_buffer.push(to_ascii_lowercase(cp));
-                        return self.return_character_token(cp);
+                        return self.return_character_token(out, cp);
                     }
                     Some(cp) if is_ascii_lower_alpha(cp) => {
                         self.temporary_buffer.push(cp);
-                        return self.return_character_token(cp);
+                        return self.return_character_token(out, cp);
                     }
                     _ => {
                         self.reconsume(State::ScriptDataEscaped);
@@ -3176,21 +3334,21 @@ impl HtmlTokenizer {
                 State::ScriptDataDoubleEscaped => match current_input_character {
                     Some(0x2D) => {
                         self.state = State::ScriptDataDoubleEscapedDash;
-                        return self.return_character_token(0x2D);
+                        return self.return_character_token(out, 0x2D);
                     }
                     Some(0x3C) => {
                         self.state = State::ScriptDataDoubleEscapedLessThanSign;
-                        return self.return_character_token(0x3C);
+                        return self.return_character_token(out, 0x3C);
                     }
                     Some(0x00) => {
-                        return self.return_character_token(0xFFFD);
+                        return self.return_character_token(out, 0xFFFD);
                     }
                     None => {
                         self.emit_eof();
-                        return self.queued_tokens.pop_front();
+                        return self.take_queued_token(out);
                     }
                     Some(cp) => {
-                        return self.return_character_token(cp);
+                        return self.return_character_token(out, cp);
                     }
                 },
 
@@ -3198,50 +3356,50 @@ impl HtmlTokenizer {
                 State::ScriptDataDoubleEscapedDash => match current_input_character {
                     Some(0x2D) => {
                         self.state = State::ScriptDataDoubleEscapedDashDash;
-                        return self.return_character_token(0x2D);
+                        return self.return_character_token(out, 0x2D);
                     }
                     Some(0x3C) => {
                         self.state = State::ScriptDataDoubleEscapedLessThanSign;
-                        return self.return_character_token(0x3C);
+                        return self.return_character_token(out, 0x3C);
                     }
                     Some(0x00) => {
                         self.state = State::ScriptDataDoubleEscaped;
-                        return self.return_character_token(0xFFFD);
+                        return self.return_character_token(out, 0xFFFD);
                     }
                     None => {
                         self.emit_eof();
-                        return self.queued_tokens.pop_front();
+                        return self.take_queued_token(out);
                     }
                     Some(cp) => {
                         self.state = State::ScriptDataDoubleEscaped;
-                        return self.return_character_token(cp);
+                        return self.return_character_token(out, cp);
                     }
                 },
 
                 // Script data double escaped dash dash state
                 State::ScriptDataDoubleEscapedDashDash => match current_input_character {
                     Some(0x2D) => {
-                        return self.return_character_token(0x2D);
+                        return self.return_character_token(out, 0x2D);
                     }
                     Some(0x3C) => {
                         self.state = State::ScriptDataDoubleEscapedLessThanSign;
-                        return self.return_character_token(0x3C);
+                        return self.return_character_token(out, 0x3C);
                     }
                     Some(0x3E) => {
                         self.state = State::ScriptData;
-                        return self.return_character_token(0x3E);
+                        return self.return_character_token(out, 0x3E);
                     }
                     Some(0x00) => {
                         self.state = State::ScriptDataDoubleEscaped;
-                        return self.return_character_token(0xFFFD);
+                        return self.return_character_token(out, 0xFFFD);
                     }
                     None => {
                         self.emit_eof();
-                        return self.queued_tokens.pop_front();
+                        return self.take_queued_token(out);
                     }
                     Some(cp) => {
                         self.state = State::ScriptDataDoubleEscaped;
-                        return self.return_character_token(cp);
+                        return self.return_character_token(out, cp);
                     }
                 },
 
@@ -3250,7 +3408,7 @@ impl HtmlTokenizer {
                     Some(0x2F) => {
                         self.temporary_buffer.clear();
                         self.state = State::ScriptDataDoubleEscapeEnd;
-                        return self.return_character_token(0x2F);
+                        return self.return_character_token(out, 0x2F);
                     }
                     _ => {
                         self.reconsume(State::ScriptDataDoubleEscaped);
@@ -3266,15 +3424,15 @@ impl HtmlTokenizer {
                         } else {
                             self.state = State::ScriptDataDoubleEscaped;
                         }
-                        return self.return_character_token(cp);
+                        return self.return_character_token(out, cp);
                     }
                     Some(cp) if is_ascii_upper_alpha(cp) => {
                         self.temporary_buffer.push(to_ascii_lowercase(cp));
-                        return self.return_character_token(cp);
+                        return self.return_character_token(out, cp);
                     }
                     Some(cp) if is_ascii_lower_alpha(cp) => {
                         self.temporary_buffer.push(cp);
-                        return self.return_character_token(cp);
+                        return self.return_character_token(out, cp);
                     }
                     _ => {
                         self.reconsume(State::ScriptDataDoubleEscaped);
@@ -3307,27 +3465,25 @@ impl HtmlTokenizer {
     }
 
     fn set_attribute_name(&mut self) {
-        let name = crate::token::HtmlName::from_utf8(&self.current_builder);
-        let name_length = self.current_builder.chars().count() as u64;
-        let name_end = self.nth_last_position(1);
-        let name_start = Position {
-            line: name_end.line,
-            column: name_end.column.saturating_sub(name_length),
-        };
+        let name = crate::token::HtmlName::from_code_units(self.current_builder.as_slice());
+        // NB: Every code point of a name is one code point of input, in as many code units.
+        let name_length = self.current_builder.len();
+        let name_end = self.offset_before_last_code_point();
+        let name_start = SourceOffset::new(name_end.get().unwrap().saturating_sub(name_length));
         self.current_builder.clear();
         if let Some(attr) = self.current_token.attributes_mut().last_mut() {
             attr.local_name = name;
-            attr.name_start_position = name_start;
-            attr.name_end_position = name_end;
+            attr.name_start_offset = name_start;
+            attr.name_end_offset = name_end;
         }
     }
 
     fn set_attribute_value(&mut self) {
-        let value_end = self.nth_last_position(1);
+        let value_end = self.offset_before_last_code_point();
         if let Some(attr) = self.current_token.attributes_mut().last_mut() {
             // The builder continues with the attribute's spare buffer, so neither side grows again.
             std::mem::swap(&mut attr.value, &mut self.current_builder);
-            attr.value_end_position = value_end;
+            attr.value_end_offset = value_end;
         }
         self.current_builder.clear();
     }
@@ -3371,11 +3527,11 @@ impl HtmlTokenizer {
                 self.reconsume(fallback_state);
             }
             Some(cp) if is_ascii_upper_alpha(cp) => {
-                push_code_point(&mut self.current_builder, to_ascii_lowercase(cp));
+                self.current_builder.push_code_point(to_ascii_lowercase(cp));
                 self.temporary_buffer.push(cp);
             }
             Some(cp) if is_ascii_lower_alpha(cp) => {
-                self.current_builder.push(char::from_u32(cp).unwrap());
+                self.current_builder.push_ascii(cp as u8);
                 self.temporary_buffer.push(cp);
             }
             _ => {
@@ -3411,9 +3567,9 @@ mod tests {
 
         tokenizer.parser_did_run();
         assert_eq!(tokenizer.current_offset, tokenizer.input.len());
-        assert_eq!(tokenizer.input, code_units("<p a=\"&tw"));
+        assert_eq!(tokenizer.input.to_utf16(), code_units("<p a=\"&tw"));
 
-        tokenizer.append_input(&code_units("s-checkout-success=4.1.0\">"));
+        tokenizer.append_input(Utf16View::Utf16(&code_units("s-checkout-success=4.1.0\">")));
         tokenizer.set_input_stream_closed(true);
 
         let token = tokenizer.next_token(false, false).expect("start tag token");
@@ -3424,5 +3580,55 @@ mod tests {
         };
         assert_eq!(attributes.len(), 1);
         assert_eq!(attributes[0].value, "&tws-checkout-success=4.1.0");
+    }
+
+    fn line_and_column(tokenizer: &mut HtmlTokenizer, offset: SourceOffset) -> (u64, u64) {
+        let position = tokenizer.position_at(offset);
+        (position.line, position.column)
+    }
+
+    /// The tokens of the tokenizer's input and then `second`, where the parser has run out of input in between.
+    fn tokens_of_two_chunks(tokenizer: &mut HtmlTokenizer, second: &str) -> Vec<Token> {
+        let mut tokens = Vec::new();
+        tokenizer.set_input_stream_closed(false);
+        while let Some(token) = tokenizer.next_token(false, false) {
+            tokens.push(token);
+        }
+        tokenizer.parser_did_run();
+        tokenizer.append_input(Utf16View::Utf16(&code_units(second)));
+        tokenizer.set_input_stream_closed(true);
+        while let Some(token) = tokenizer.next_token(false, false) {
+            tokens.push(token);
+        }
+        tokens
+    }
+
+    #[test]
+    fn parser_keeps_input_that_an_unfinished_tag_points_into() {
+        let mut tokenizer = HtmlTokenizer::new(code_units("\n\n<div class=\"a\" "));
+        let tokens = tokens_of_two_chunks(&mut tokenizer, "id=x>");
+        let tag = tokens
+            .iter()
+            .find(|token| token.token_type == TokenType::StartTag)
+            .expect("start tag token");
+        assert_eq!(line_and_column(&mut tokenizer, tag.start_offset), (2, 1));
+        let TokenPayload::Tag { attributes, .. } = &tag.payload else {
+            panic!("expected tag token");
+        };
+        let name_start = attributes[0].name_start_offset;
+        assert_eq!(line_and_column(&mut tokenizer, name_start), (2, 5));
+    }
+
+    #[test]
+    fn parser_keeps_input_that_leads_up_to_a_comment() {
+        for (first, second) in [("\n<!", "-- x -->"), ("\n<", "? x >")] {
+            let mut tokenizer = HtmlTokenizer::new(code_units(first));
+            let tokens = tokens_of_two_chunks(&mut tokenizer, second);
+            let comment = tokens
+                .iter()
+                .find(|token| token.token_type == TokenType::Comment)
+                .expect("comment token");
+            assert_eq!(line_and_column(&mut tokenizer, comment.start_offset), (1, 0));
+        }
     }
 }

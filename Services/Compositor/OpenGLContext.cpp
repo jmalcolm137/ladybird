@@ -33,6 +33,11 @@ extern "C" {
 #include <Compositor/OpenGLContext.h>
 #include <Compositor/SkiaBackendContext.h>
 #include <Compositor/SkiaUtils.h>
+#ifdef AK_OS_MACOS
+#    include <Compositor/CoreAnimationWindowServer.h>
+#elif defined(USE_DIRECTX)
+#    include <Compositor/DirectCompositionWindowServer.h>
+#endif
 
 #include <core/SkCanvas.h>
 #include <core/SkImage.h>
@@ -59,6 +64,9 @@ struct OpenGLContext::ColorBuffer {
 #ifdef AK_OS_MACOS
     OwnPtr<Gfx::SharedImageBuffer> shared_image_buffer;
 #endif
+#if defined(AK_OS_MACOS) || defined(USE_DIRECTX)
+    RefPtr<PresentableSurface> presentable_surface;
+#endif
     EGLSurface surface { EGL_NO_SURFACE };
 #if defined(USE_VULKAN_DMABUF_IMAGES) || defined(USE_DIRECTX)
     EGLImage egl_image { EGL_NO_IMAGE };
@@ -84,9 +92,11 @@ struct OpenGLContext::Impl {
     // A shared drawing buffer is composited straight from GPU memory, so presenting moves the default framebuffer
     // to another color buffer instead of letting the page draw over the frame being composited. Besides the
     // presented buffer and the one being drawn, a third holds the frame presented before, which a raster submitted
-    // before the latest present may still be reading on the GPU. The CPU painting surface is a copy made when
+    // before the latest present may still be reading on the GPU. A fourth is allocated only while the window server
+    // shows the buffers itself and still reads the other two. The CPU painting surface is a copy made when
     // presenting, so it only uses the first.
-    Array<ColorBuffer, 3> color_buffers {};
+    static constexpr size_t usual_color_buffer_count = 3;
+    Array<ColorBuffer, usual_color_buffer_count + 1> color_buffers {};
     // What Skia draws for an upload into one of the page's textures, at the size of the latest upload.
     ColorBuffer upload_color_buffer {};
     Gfx::IntSize upload_color_buffer_size {};
@@ -170,6 +180,9 @@ void OpenGLContext::free_color_buffer([[maybe_unused]] ColorBuffer& color_buffer
 #    ifdef AK_OS_MACOS
     color_buffer.shared_image_buffer = nullptr;
 #    endif
+#    if defined(AK_OS_MACOS) || defined(USE_DIRECTX)
+    color_buffer.presentable_surface = nullptr;
+#    endif
 #endif
 }
 
@@ -219,6 +232,15 @@ static Microsoft::WRL::ComPtr<ID3D11Device1> get_d3d11_device(EGLDisplay display
     return d3d11_device1;
 }
 #endif
+
+void const* OpenGLContext::address_of_function([[maybe_unused]] char const* name)
+{
+#ifdef ENABLE_WEBGL
+    return reinterpret_cast<void const*>(eglGetProcAddress(name));
+#else
+    return nullptr;
+#endif
+}
 
 OwnPtr<OpenGLContext> OpenGLContext::create(RefPtr<Gfx::SkiaBackendContext> skia_backend_context, WebGLVersion webgl_version, [[maybe_unused]] DrawingBufferOptions drawing_buffer_options)
 {
@@ -299,6 +321,9 @@ OwnPtr<OpenGLContext> OpenGLContext::create(RefPtr<Gfx::SkiaBackendContext> skia
         EGL_TRUE,
         EGL_CONTEXT_OPENGL_BACKWARDS_COMPATIBLE_ANGLE,
         EGL_FALSE,
+        // WebGL has no client arrays. With them, ANGLE's GL backend shares a default vertex array between contexts.
+        EGL_CONTEXT_CLIENT_ARRAYS_ENABLED_ANGLE,
+        EGL_FALSE,
 #    ifdef USE_VULKAN_DMABUF_IMAGES
         // we need GL_OES_EGL_image
         EGL_EXTENSIONS_ENABLED_ANGLE,
@@ -366,53 +391,6 @@ OwnPtr<OpenGLContext> OpenGLContext::create(RefPtr<Gfx::SkiaBackendContext> skia
 #endif
 }
 
-void OpenGLContext::clear_buffer_to_default_values()
-{
-#ifdef ENABLE_WEBGL
-    GLint original_framebuffer;
-    GLint original_renderbuffer;
-    GLenum framebuffer_target = GL_FRAMEBUFFER;
-    GLenum framebuffer_binding = GL_FRAMEBUFFER_BINDING;
-    if (m_webgl_version == WebGLVersion::WebGL2) {
-        framebuffer_target = GL_DRAW_FRAMEBUFFER;
-        framebuffer_binding = GL_DRAW_FRAMEBUFFER_BINDING;
-    }
-    glGetIntegerv(framebuffer_binding, &original_framebuffer);
-    glGetIntegerv(GL_RENDERBUFFER_BINDING, &original_renderbuffer);
-
-    glBindFramebuffer(framebuffer_target, default_framebuffer());
-    glBindRenderbuffer(GL_RENDERBUFFER, default_renderbuffer());
-
-    Array<GLfloat, 4> current_clear_color;
-    glGetFloatv(GL_COLOR_CLEAR_VALUE, current_clear_color.data());
-
-    GLfloat current_clear_depth;
-    glGetFloatv(GL_DEPTH_CLEAR_VALUE, &current_clear_depth);
-
-    GLint current_clear_stencil;
-    glGetIntegerv(GL_STENCIL_CLEAR_VALUE, &current_clear_stencil);
-
-    // The implicit clear value for the color buffer is (0, 0, 0, 0)
-    glClearColor(0, 0, 0, 0);
-
-    // The implicit clear value for the depth buffer is 1.0.
-    glClearDepthf(1.0f);
-
-    // The implicit clear value for the stencil buffer is 0.
-    glClearStencil(0);
-
-    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
-
-    // Restore the clear values.
-    glClearColor(current_clear_color[0], current_clear_color[1], current_clear_color[2], current_clear_color[3]);
-    glClearDepthf(current_clear_depth);
-    glClearStencil(current_clear_stencil);
-
-    glBindFramebuffer(framebuffer_target, original_framebuffer);
-    glBindRenderbuffer(GL_RENDERBUFFER, original_renderbuffer);
-#endif
-}
-
 #ifdef ENABLE_WEBGL
 u32 OpenGLContext::color_buffer_texture_target() const
 {
@@ -437,6 +415,7 @@ void OpenGLContext::allocate_iosurface_color_buffer(ColorBuffer& color_buffer, G
 {
     color_buffer.shared_image_buffer = make<Gfx::SharedImageBuffer>(Gfx::SharedImageBuffer::create(size));
     color_buffer.painting_surface = Gfx::PaintingSurface::create_from_shared_image_buffer(*color_buffer.shared_image_buffer, *m_skia_backend_context, origin);
+    color_buffer.presentable_surface = PresentableSurface::create(*color_buffer.painting_surface, origin, make<CoreAnimationSurface>(*color_buffer.shared_image_buffer));
 
     EGLint const surface_attributes[] = {
         EGL_WIDTH,
@@ -517,6 +496,7 @@ bool OpenGLContext::allocate_d3d_color_buffer(ColorBuffer& color_buffer, Gfx::In
         return false;
     }
     color_buffer.painting_surface = painting_surface.release_value();
+    color_buffer.presentable_surface = PresentableSurface::create(*color_buffer.painting_surface, origin, make<DirectCompositionSurface>());
 
     create_texture_from_egl_image(color_buffer);
     return true;
@@ -613,13 +593,14 @@ void OpenGLContext::allocate_cpu_painting_surface(ColorBuffer& color_buffer)
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
 
+        auto has_pixel_buffer_objects = supports_pixel_buffer_objects();
         GLint original_pixel_unpack_buffer = 0;
-        if (m_webgl_version == WebGLVersion::WebGL2) {
+        if (has_pixel_buffer_objects) {
             glGetIntegerv(GL_PIXEL_UNPACK_BUFFER_BINDING, &original_pixel_unpack_buffer);
             glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
         }
         glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, m_size.width(), m_size.height(), 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
-        if (m_webgl_version == WebGLVersion::WebGL2)
+        if (has_pixel_buffer_objects)
             glBindBuffer(GL_PIXEL_UNPACK_BUFFER, original_pixel_unpack_buffer);
     });
 }
@@ -654,14 +635,18 @@ void OpenGLContext::copy_default_framebuffer_to_cpu_painting_surface()
     glGetIntegerv(GL_PACK_ALIGNMENT, &original_pack_alignment);
     glPixelStorei(GL_PACK_ALIGNMENT, 4);
 
+    auto has_pixel_buffer_objects = supports_pixel_buffer_objects();
     GLint original_pixel_pack_buffer = 0;
+    if (has_pixel_buffer_objects) {
+        glGetIntegerv(GL_PIXEL_PACK_BUFFER_BINDING, &original_pixel_pack_buffer);
+        glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+    }
+
+    auto has_pack_subimage_parameters = supports_pack_subimage_parameters();
     GLint original_pack_row_length = 0;
     GLint original_pack_skip_pixels = 0;
     GLint original_pack_skip_rows = 0;
-    if (m_webgl_version == WebGLVersion::WebGL2) {
-        glGetIntegerv(GL_PIXEL_PACK_BUFFER_BINDING, &original_pixel_pack_buffer);
-        glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
-
+    if (has_pack_subimage_parameters) {
         glGetIntegerv(GL_PACK_ROW_LENGTH, &original_pack_row_length);
         glGetIntegerv(GL_PACK_SKIP_PIXELS, &original_pack_skip_pixels);
         glGetIntegerv(GL_PACK_SKIP_ROWS, &original_pack_skip_rows);
@@ -670,9 +655,11 @@ void OpenGLContext::copy_default_framebuffer_to_cpu_painting_surface()
         glPixelStorei(GL_PACK_SKIP_ROWS, 0);
     }
 
-    // ANGLE's Direct3D 11 backend waits for the GPU on every glReadPixels(), so the frame is read with one call.
+    // ANGLE's Direct3D 11 backend waits for the GPU on every glReadPixels(), so the frame is read with one call. The
+    // page's pack state decides where in the bitmap that call writes, so ANGLE is told the size of the bitmap and
+    // refuses to write past it.
     VERIFY(bitmap->pitch() == static_cast<size_t>(m_size.width()) * sizeof(Gfx::RawPixel));
-    glReadPixels(0, 0, m_size.width(), m_size.height(), GL_RGBA, GL_UNSIGNED_BYTE, bitmap->scanline_u8(0));
+    glReadPixelsRobustANGLE(0, 0, m_size.width(), m_size.height(), GL_RGBA, GL_UNSIGNED_BYTE, static_cast<GLsizei>(bitmap->size_in_bytes()), nullptr, nullptr, nullptr, bitmap->scanline_u8(0));
 
     // GL's rows go from the bottom of the image up, so flip them into the bitmap's top-down order.
     for (int top = 0, bottom = m_size.height() - 1; top < bottom; ++top, --bottom) {
@@ -682,12 +669,13 @@ void OpenGLContext::copy_default_framebuffer_to_cpu_painting_surface()
             swap(top_row[x], bottom_row[x]);
     }
 
-    if (m_webgl_version == WebGLVersion::WebGL2) {
+    if (has_pack_subimage_parameters) {
         glPixelStorei(GL_PACK_ROW_LENGTH, original_pack_row_length);
         glPixelStorei(GL_PACK_SKIP_PIXELS, original_pack_skip_pixels);
         glPixelStorei(GL_PACK_SKIP_ROWS, original_pack_skip_rows);
-        glBindBuffer(GL_PIXEL_PACK_BUFFER, original_pixel_pack_buffer);
     }
+    if (has_pixel_buffer_objects)
+        glBindBuffer(GL_PIXEL_PACK_BUFFER, original_pixel_pack_buffer);
     glPixelStorei(GL_PACK_ALIGNMENT, original_pack_alignment);
 
     glBindFramebuffer(framebuffer_target, original_framebuffer);
@@ -808,7 +796,7 @@ void OpenGLContext::present_drawing_buffer([[maybe_unused]] bool preserve_drawin
     auto& presented_color_buffer = m_impl->color_buffers[presented_index];
     presented_color_buffer.painting_surface->notify_content_will_change();
 
-    auto next_index = (presented_index + 1) % m_impl->color_buffers.size();
+    auto next_index = next_color_buffer_index_after(presented_index);
     auto& next_color_buffer = m_impl->color_buffers[next_index];
     // NB: Without a second color buffer the page keeps drawing into the presented one, which a frame composited
     //     while it draws can catch half drawn.
@@ -827,6 +815,32 @@ void OpenGLContext::present_drawing_buffer([[maybe_unused]] bool preserve_drawin
 }
 
 #ifdef ENABLE_WEBGL
+// The buffer after the presented one, unless the window server still reads it or a frame on its way there holds it.
+// Then the other usual buffer, and when that one is busy too, the spare.
+size_t OpenGLContext::next_color_buffer_index_after(size_t presented_index) const
+{
+    auto& color_buffers = m_impl->color_buffers;
+    auto is_busy = [&](size_t index) {
+#    if defined(AK_OS_MACOS) || defined(USE_DIRECTX)
+        auto const& presentable_surface = color_buffers[index].presentable_surface;
+        return presentable_surface && presentable_surface->is_busy();
+#    else
+        (void)index;
+        return false;
+#    endif
+    };
+    auto spare_index = Impl::usual_color_buffer_count;
+    auto buffer_count = color_buffers[spare_index].is_allocated() ? color_buffers.size() : Impl::usual_color_buffer_count;
+    for (size_t step = 1; step < buffer_count; ++step) {
+        auto index = (presented_index + step) % buffer_count;
+        if (!is_busy(index))
+            return index;
+    }
+    if (!color_buffers[spare_index].is_allocated())
+        return spare_index;
+    return (presented_index + 1) % buffer_count;
+}
+
 bool OpenGLContext::allocate_color_buffer(ColorBuffer& color_buffer)
 {
     return allocate_shared_color_buffer(color_buffer, m_size, Gfx::PaintingSurface::Origin::BottomLeft);
@@ -871,28 +885,25 @@ bool OpenGLContext::supports_copy_texture()
 }
 #endif
 
-GLenum OpenGLContext::get_error()
+// WebGL 2 runs on OpenGL ES 3, where this pixel store state is core. WebGL 1 runs on OpenGL ES 2, which only holds it
+// while ANGLE has the extension for it enabled.
+bool OpenGLContext::is_webgl2_or_has_enabled_extension([[maybe_unused]] StringView extension) const
 {
-    if (!m_stashed_errors.is_empty())
-        return m_stashed_errors.take_first();
-    return GLFunctions::get_error();
+#ifdef ENABLE_WEBGL
+    return m_webgl_version == WebGLVersion::WebGL2 || extension_list_contains(GL_EXTENSIONS, extension);
+#else
+    return false;
+#endif
 }
 
-bool OpenGLContext::stash_errors()
+bool OpenGLContext::supports_pixel_buffer_objects() const
 {
-    auto stashed_any_errors = false;
-    for (auto error = GLFunctions::get_error(); error != GL_NO_ERROR; error = GLFunctions::get_error()) {
-        if (!m_stashed_errors.contains_slow(error))
-            m_stashed_errors.append(error);
-        stashed_any_errors = true;
-    }
-    return stashed_any_errors;
+    return is_webgl2_or_has_enabled_extension("GL_NV_pixel_buffer_object"sv);
 }
 
-void OpenGLContext::discard_errors()
+bool OpenGLContext::supports_pack_subimage_parameters() const
 {
-    for (auto error = GLFunctions::get_error(); error != GL_NO_ERROR; error = GLFunctions::get_error())
-        dbgln("Compositor: Discarding GL error {:#x} raised by the Compositor's own work", error);
+    return is_webgl2_or_has_enabled_extension("GL_NV_pack_subimage"sv);
 }
 
 bool OpenGLContext::can_copy_images_into_textures()
@@ -925,7 +936,7 @@ static Optional<GLenum> texture_binding_for_copy_destination(GLenum target)
 }
 #endif
 
-bool OpenGLContext::copy_image_into_bound_texture([[maybe_unused]] SkImage const& image, [[maybe_unused]] Gfx::IntSize source_size, [[maybe_unused]] Gfx::IntSize size, [[maybe_unused]] GLenum target, [[maybe_unused]] GLint level, [[maybe_unused]] GLint xoffset, [[maybe_unused]] GLint yoffset, [[maybe_unused]] bool flip_y, [[maybe_unused]] bool premultiply_alpha)
+bool OpenGLContext::copy_image_into_bound_texture([[maybe_unused]] SkImage const& image, [[maybe_unused]] Gfx::IntSize source_size, [[maybe_unused]] Gfx::IntSize size, [[maybe_unused]] u32 target, [[maybe_unused]] i32 level, [[maybe_unused]] i32 xoffset, [[maybe_unused]] i32 yoffset, [[maybe_unused]] bool flip_y, [[maybe_unused]] bool premultiply_alpha)
 {
 #ifdef ENABLE_WEBGL
     auto destination_binding = texture_binding_for_copy_destination(target);
@@ -968,6 +979,21 @@ RefPtr<Gfx::PaintingSurface> OpenGLContext::presented_surface()
     return m_impl->color_buffers[*m_impl->presented_color_buffer_index].painting_surface;
 }
 
+RefPtr<PresentableSurface> OpenGLContext::presented_presentable_surface()
+{
+#if defined(AK_OS_MACOS) || defined(USE_DIRECTX)
+    if (!m_impl->presented_color_buffer_index.has_value() || m_impl->uses_cpu_painting_surface)
+        return nullptr;
+    // When presenting could not move the page onto another buffer, it goes on drawing into the presented one, which
+    // the window server would then show half drawn.
+    if (*m_impl->presented_color_buffer_index == m_impl->drawing_color_buffer_index)
+        return nullptr;
+    return m_impl->color_buffers[*m_impl->presented_color_buffer_index].presentable_surface;
+#else
+    return nullptr;
+#endif
+}
+
 u32 OpenGLContext::default_renderbuffer() const
 {
     return m_impl->depth_buffer;
@@ -976,32 +1002,6 @@ u32 OpenGLContext::default_renderbuffer() const
 u32 OpenGLContext::default_framebuffer() const
 {
     return m_impl->framebuffer;
-}
-
-Vector<String> OpenGLContext::get_supported_opengl_extensions()
-{
-#ifdef ENABLE_WEBGL
-    make_current();
-
-    Vector<String> extensions;
-
-    if (auto const* extensions_string = reinterpret_cast<char const*>(glGetString(GL_EXTENSIONS))) {
-        StringView extensions_view(extensions_string, strlen(extensions_string));
-        for (auto extension : extensions_view.split_view(' '))
-            extensions.append(MUST(String::from_utf8(extension)));
-    }
-
-    if (auto const* requestable_extensions_string = reinterpret_cast<char const*>(glGetString(GL_REQUESTABLE_EXTENSIONS_ANGLE))) {
-        StringView requestable_extensions_view(requestable_extensions_string, strlen(requestable_extensions_string));
-        for (auto extension : requestable_extensions_view.split_view(' '))
-            extensions.append(MUST(String::from_utf8(extension)));
-    }
-
-    return extensions;
-#else
-    (void)m_webgl_version;
-    return {};
-#endif
 }
 
 }

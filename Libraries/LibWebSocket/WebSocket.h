@@ -7,6 +7,7 @@
 
 #pragma once
 
+#include <AK/Queue.h>
 #include <AK/Span.h>
 #include <AK/Time.h>
 #include <LibCore/EventReceiver.h>
@@ -49,8 +50,7 @@ public:
         AK::Duration handshake_timeout { AK::Duration::from_seconds(10) };
     };
 
-    // The transport is already connected. start() reads the client's HTTP upgrade request; it never uses a
-    // transport's client-side handshake shortcut.
+    // The transport is already connected. start() reads the client's HTTP upgrade request.
     static NonnullRefPtr<WebSocket> create_server(NonnullRefPtr<WebSocketImpl>, ServerOptions);
     static ErrorOr<NonnullRefPtr<WebSocket>> accept(NonnullOwnPtr<Core::TCPSocket>, ServerOptions);
     virtual ~WebSocket() override;
@@ -84,6 +84,9 @@ public:
     Function<void(ReadyState)> on_ready_state_change;
     Function<void(ByteString)> on_subprotocol;
 
+    // Called with how many bytes of sent messages have been written to the connection, frame headers aside.
+    Function<void(u64)> on_message_bytes_transmitted;
+
     enum class Error {
         CouldNotEstablishConnection,
         ConnectionUpgradeFailed,
@@ -109,13 +112,13 @@ private:
 
     void drain_read();
 
-    void send_client_handshake();
-    void read_server_handshake();
     void read_client_handshake();
     void reject_client_handshake(StringView status);
 
     ErrorOr<void> read_frame();
     void send_frame(OpCode, ReadonlyBytes, bool is_final);
+    bool send_bytes(ReadonlyBytes, u64 message_byte_count = 0);
+    void did_write_bytes(size_t);
 
     void notify_open();
     void notify_close(u16 code, ByteString reason, bool was_clean);
@@ -127,8 +130,6 @@ private:
     enum class InternalState {
         NotStarted,
         EstablishingProtocolConnection,
-        SendingClientHandshake,
-        WaitingForServerHandshake,
         WaitingForClientHandshake,
         Open,
         Closing,
@@ -144,12 +145,6 @@ private:
 
     ByteString m_subprotocol_in_use { ByteString::empty() };
 
-    ByteString m_websocket_key;
-    bool m_has_read_server_handshake_first_line { false };
-    bool m_has_read_server_handshake_upgrade { false };
-    bool m_has_read_server_handshake_connection { false };
-    bool m_has_read_server_handshake_accept { false };
-
     bool m_discard_connection_requested { false };
 
     u16 m_last_close_code { to_underlying(CloseStatusCode::NoStatusReceived) };
@@ -161,6 +156,15 @@ private:
     RefPtr<WebSocketImpl> m_impl;
     RefPtr<Core::Timer> m_closing_handshake_timer;
     RefPtr<Core::Timer> m_opening_handshake_timer;
+
+    // Where the bytes of each sent message lie among all the bytes passed to the connection, until they are written.
+    struct MessageBytes {
+        u64 start { 0 };
+        u64 end { 0 };
+    };
+    Queue<MessageBytes> m_unwritten_message_bytes;
+    u64 m_bytes_passed_to_connection { 0 };
+    u64 m_bytes_written { 0 };
 
     Vector<u8> m_buffered_data;
     size_t m_buffered_data_offset { 0 };

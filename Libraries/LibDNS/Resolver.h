@@ -7,6 +7,7 @@
 #pragma once
 
 #include <AK/AnyOf.h>
+#include <AK/Atomic.h>
 #include <AK/AtomicRefCounted.h>
 #include <AK/HashTable.h>
 #include <AK/MaybeOwned.h>
@@ -186,6 +187,9 @@ public:
 
     struct LookupOptions {
         bool validate_dnssec_locally { false };
+        // Asks the system resolver for AAAA records even when no global IPv6 route exists, as a host on the local
+        // network may still be reachable over IPv6.
+        bool query_aaaa_without_global_ipv6 { false };
 
         static LookupOptions default_() { return {}; }
     };
@@ -207,6 +211,12 @@ public:
         Function<bool()> is_ipv6_globally_reachable;
     };
 
+    using SystemResolution = ErrorOr<Vector<Variant<IPv4Address, IPv6Address>>>;
+
+    // Resolves a name to the addresses of one family somewhere else, such as in another process, and calls back on the
+    // thread that asked, once it has them.
+    using RemoteSystemResolver = Function<void(ByteString const&, Core::Socket::AddressFamily, Function<void(SystemResolution)>)>;
+
     // An empty result means no server is configured and the system resolver should be used instead.
     Resolver(Function<ErrorOr<Optional<SocketResult>>()> create_socket, SystemResolverForTesting system_resolver_for_testing = {})
         : m_receive_buffer(MUST(ByteBuffer::create_uninitialized(NumericLimits<u16>::max())))
@@ -216,9 +226,20 @@ public:
             return query(name, type, Messages::Class::IN, true);
         })
     {
+        // A system lookup can outlive this resolver on a worker, so the worker takes the hook from the shared state.
+        m_shared_with_workers->resolve_host_for_testing = move(m_system_resolver_for_testing.resolve_host);
+    }
+
+    ~Resolver()
+    {
+        // A system lookup can still be running on a worker, or in the remote resolver, and its answer is dropped.
+        m_shared_with_workers->resolver_is_alive.store(false);
     }
 
     DNSSEC::Validator& validator() { return m_validator; }
+
+    // Once set, the system resolver's lookups go to the remote resolver, rather than to getaddrinfo() on a thread pool.
+    void set_remote_system_resolver(RemoteSystemResolver resolver) { m_remote_system_resolver = move(resolver); }
 
     // Names within these domains resolve to loopback, as names within "localhost" do.
     void set_loopback_domains(Vector<ByteString> domains) { m_loopback_domains = move(domains); }
@@ -429,7 +450,7 @@ public:
         //     platforms (mDNSResponder never suppresses multicast queries). Like Chromium's host cache, which keys a
         //     lookup without AAAA apart from one with it, a cached result without AAAA only serves while IPv6 stays
         //     unreachable.
-        auto skips_aaaa = uses_system_resolver && !is_link_local_name
+        auto skips_aaaa = uses_system_resolver && !is_link_local_name && !options.query_aaaa_without_global_ipv6
             && desired_types.contains_slow(Messages::ResourceType::A)
             && desired_types.contains_slow(Messages::ResourceType::AAAA)
             && !is_ipv6_globally_reachable();
@@ -519,13 +540,29 @@ public:
 
             auto& main_thread_event_loop = Core::EventLoop::current();
 
+            auto ask_remote_resolver = [&, this](Core::Socket::AddressFamily family) {
+                m_remote_system_resolver(name, family, [this, shared = m_shared_with_workers, name, pending_key, state = our_state, family](SystemResolution record_or_error) mutable {
+                    if (!shared->resolver_is_alive.load())
+                        return;
+                    PendingSystemResolution::SideTiming timing {
+                        .queue_ms = 0,
+                        .work_ms = (MonotonicTime::now() - state->dispatched_at).to_milliseconds(),
+                    };
+                    handle_system_resolver_completion(name, pending_key, *state, family, move(record_or_error), timing);
+                });
+            };
+
             auto submit_worker = [&, this](Core::Socket::AddressFamily family) {
+                if (m_remote_system_resolver) {
+                    ask_remote_resolver(family);
+                    return;
+                }
                 Threading::ThreadPool::the().submit(
-                    [this, name, pending_key, state = our_state, family,
+                    [this, shared = m_shared_with_workers, name, pending_key, state = our_state, family,
                         &main_thread_event_loop]() mutable {
                         auto worker_started_at = MonotonicTime::now();
-                        auto record_or_error = m_system_resolver_for_testing.resolve_host
-                            ? m_system_resolver_for_testing.resolve_host(name, family)
+                        auto record_or_error = shared->resolve_host_for_testing
+                            ? shared->resolve_host_for_testing(name, family)
                             : Core::Socket::resolve_host(name, Core::Socket::SocketType::Stream, family);
                         auto worker_finished_at = MonotonicTime::now();
                         PendingSystemResolution::SideTiming timing {
@@ -534,9 +571,11 @@ public:
                         };
 
                         main_thread_event_loop.deferred_invoke(
-                            [this, name, pending_key, state, family,
+                            [this, shared = move(shared), name, pending_key, state, family,
                                 record_or_error = move(record_or_error),
                                 timing]() mutable {
+                                if (!shared->resolver_is_alive.load())
+                                    return;
                                 handle_system_resolver_completion(name, pending_key, *state, family, move(record_or_error), timing);
                             });
                     });
@@ -1243,6 +1282,12 @@ private:
     bool m_attempting_restart { false };
     bool m_use_system_resolver { false };
     SystemResolverForTesting m_system_resolver_for_testing;
+    RemoteSystemResolver m_remote_system_resolver;
+    struct SharedWithWorkers : public AtomicRefCounted<SharedWithWorkers> {
+        Atomic<bool> resolver_is_alive { true };
+        Function<ErrorOr<Vector<Variant<IPv4Address, IPv6Address>>>(ByteString const&, Core::Socket::AddressFamily)> resolve_host_for_testing;
+    };
+    NonnullRefPtr<SharedWithWorkers> m_shared_with_workers { adopt_ref(*new SharedWithWorkers) };
     Optional<MonotonicTime> m_ipv6_reachability_checked_at;
     bool m_ipv6_is_globally_reachable { false };
     Vector<ByteString> m_loopback_domains;

@@ -13,7 +13,6 @@
 #include <LibWeb/HTML/Canvas/CanvasHost.h>
 #include <LibWeb/HTML/Canvas/CanvasSettings.h>
 #include <LibWeb/HTML/HTMLElement.h>
-#include <LibWeb/WebGL/WebGLContextAttributes.h>
 #include <LibWebCommon/WebIDL/Types.h>
 
 namespace Web::HTML {
@@ -25,7 +24,7 @@ class HTMLCanvasElement final
     GC_DECLARE_ALLOCATOR(HTMLCanvasElement);
 
 public:
-    using RenderingContext = Variant<GC::Ref<CanvasRenderingContext2D>, GC::Ref<WebGL::WebGLRenderingContext>, GC::Ref<WebGL::WebGL2RenderingContext>, Empty>;
+    using RenderingContext = Variant<GC::Ref<CanvasRenderingContext2D>, GC::Ref<WebGL::WebGLRenderingContext>, GC::Ref<WebGL::WebGL2RenderingContext>, GC::Ref<ImageBitmapRenderingContext>, Empty>;
 
     virtual ~HTMLCanvasElement() override;
 
@@ -33,6 +32,7 @@ public:
     virtual Gfx::IntSize bitmap_size_for_canvas() const override;
     virtual Canvas2DContextBase* canvas_2d_context() const override;
     virtual WebGL::WebGLRenderingContextBase* canvas_webgl_context() const override;
+    virtual ImageBitmapRenderingContext* canvas_bitmap_renderer_context() const override;
     virtual Page& canvas_page() override;
     virtual DOM::EventTarget& canvas_event_target() override { return *this; }
     virtual JS::Object& canvas_relevant_global_object() const override;
@@ -43,7 +43,7 @@ public:
     virtual CSS::ComputationContext canvas_font_computation_context() override;
     virtual CSS::ColorResolutionStyle canvas_color_resolution_style() override;
     virtual CSSPixelRect canvas_viewport_rect() const override;
-    virtual RefPtr<Gfx::Bitmap> get_bitmap_from_surface() override;
+    virtual Optional<Gfx::DecodedImageFrame> get_srgb_frame_from_surface() override;
     virtual bool is_origin_clean() const override;
 
     JS::ThrowCompletionOr<RenderingContext> get_context(Utf16View type, JS::Value options);
@@ -52,8 +52,6 @@ public:
         Yes,
     };
     HasOrCreatedContext create_2d_context(CanvasRenderingContext2DSettings);
-    HasOrCreatedContext create_webgl_context(WebGL::WebGLContextAttributes);
-    HasOrCreatedContext create_webgl2_context(WebGL::WebGLContextAttributes);
     RenderingContext const& context() const { return m_context; }
 
     WebIDL::UnsignedLong width() const;
@@ -84,13 +82,9 @@ public:
 
     Optional<Compositing::CanvasId> canvas_id() const;
 
-    u64 content_generation() const { return m_content_generation; }
-
     Optional<Gfx::IntSize> canvas_surface_content_size() const;
 
     void ensure_backing_storage();
-
-    void notify_compositor_connection_lost();
 
 private:
     HTMLCanvasElement(DOM::Document&, DOM::QualifiedName);
@@ -108,13 +102,14 @@ private:
 
     template<typename ContextType>
     JS::ThrowCompletionOr<HasOrCreatedContext> create_webgl_context(JS::Value options);
+    HasOrCreatedContext create_bitmap_renderer_context(bool alpha);
+    JS::ThrowCompletionOr<void> throw_if_control_transferred_to_offscreen() const;
     void reset_context_to_default_state();
     void notify_context_about_canvas_size_change();
     void did_commit_placeholder_frame(Gfx::IntSize, bool origin_clean);
 
-    Variant<GC::Ref<HTML::CanvasRenderingContext2D>, GC::Ref<WebGL::WebGLRenderingContext>, GC::Ref<WebGL::WebGL2RenderingContext>, Empty> m_context;
+    Variant<GC::Ref<HTML::CanvasRenderingContext2D>, GC::Ref<WebGL::WebGLRenderingContext>, GC::Ref<WebGL::WebGL2RenderingContext>, GC::Ref<ImageBitmapRenderingContext>, Empty> m_context;
     bool m_canvas_content_dirty { false };
-    u64 m_content_generation { 0 };
 
     bool m_is_placeholder { false };
     Optional<Compositing::CanvasId> m_placeholder_canvas_id;

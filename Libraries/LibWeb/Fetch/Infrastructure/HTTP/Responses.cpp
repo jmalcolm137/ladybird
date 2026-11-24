@@ -89,23 +89,31 @@ bool Response::is_network_error() const
     return true;
 }
 
+void Response::set_body_sizes(u64 encoded_size, u64 decoded_size)
+{
+    auto body_info = this->body_info();
+    body_info.encoded_size = encoded_size;
+    body_info.decoded_size = decoded_size;
+    set_body_info(move(body_info));
+}
+
 void Response::release_request_transfer_lease() const
 {
     if (m_network_transport.has_value())
         m_network_transport->handle->release_transfer_lease();
 }
 
-void Response::resume_body_delivery() const
+void Response::resume_body_delivery(Engine::FetchExecutor& executor) const
 {
     release_request_transfer_lease();
     if (m_network_transport.has_value())
-        m_network_transport->body_delivery_gate->release_hold();
+        m_network_transport->handle->post_release_navigation_hold(executor);
 }
 
-void Response::resume_body_delivery_up_to(size_t byte_count) const
+void Response::release_navigation_hold_up_to(Engine::FetchExecutor& executor, size_t byte_count) const
 {
     if (m_network_transport.has_value())
-        m_network_transport->body_delivery_gate->release_hold_up_to(byte_count);
+        m_network_transport->handle->post_release_navigation_hold_up_to(executor, byte_count);
 }
 
 Vector<Core::ImmutableBytes> Response::release_body_for_transfer() const

@@ -52,7 +52,7 @@ generation. Stale results can therefore neither reopen the popup nor become an E
 
 `AutocompleteSuggestion` contains:
 
-- Its source: literal URL, history, bookmark, adaptive engagement, or search.
+- Its source: literal URL, history, bookmark, adaptive engagement, search, or remote URL.
 - Destination text and optional title, subtitle, and favicon.
 - The input used for presentation highlighting.
 - A match class and separate relevance components.
@@ -69,12 +69,33 @@ URL destinations are compared semantically. Scheme differences remain meaningful
 serializations of the same URL are merged. `www.` and bare hosts share a diversity family but are
 not otherwise treated as the same destination.
 
+URLs that differ only by a trailing slash or by tracking query parameters are the same destination.
+Their row goes to the URL without tracking parameters when there is one, unless the user typed the
+other.
+
 Search destinations are identified by Unicode case-folded text with whitespace normalized. This
 allows an exact remote suggestion to merge with the verbatim search action.
 
+A remote suggestion that is an https address on a public site, taken as it would be if the user
+typed it, is a remote URL rather than a search. Rows do not show the scheme, so an http address
+stays a search rather than look like the https site. Addresses with an IP, localhost, a port or no
+public suffix stay searches, so the search engine cannot name the user's own machine or network
+directly. A public host name can still resolve there, as it can for any link on the web. Addresses
+with a user name, such as `https://bank.example@evil.example/`, also stay searches, since they name
+one site and go to another. An address without a scheme, such as `google.com`, may be a
+phrase like `setup.py` instead, so it is a remote URL only when a local candidate is on the same
+host, ignoring `www.`. Until the local candidates arrive, such an address on a site among the
+local candidates for the earlier text, from which remote suggestions carry over, stays a remote URL.
+Any other such address is left out, so a row does not turn from a search into a page. A remote URL
+merges with local candidates for the same URL, and with a local presentation of the same origin,
+whose title and favicon are kept.
+
 When history, bookmark, and adaptive candidates identify the same URL, their score components and
 eligibility flags are combined. Bookmark presentation is preferred so its title and favicon remain
-visible.
+visible. A bookmark without a title or favicon takes those of the other candidate.
+
+When rows for the root of the same origin are folded into one, such as `example.com` and
+`www.example.com`, the row that is kept takes the favicon and title of a folded row if it has none.
 
 ## Matching
 
@@ -162,7 +183,8 @@ constructs a bounded result list while preserving the verbatim action and limiti
 The current limits are soft:
 
 - At most four local navigation rows before deferred local rows.
-- At most three remote search rows before deferred remote rows.
+- At most three remote rows before deferred remote rows.
+- At most three past searches before deferred past searches. They do not count as remote rows.
 - At most two rows per origin for ordinary host queries.
 - At most one row per origin and five total rows for one- and two-character host queries.
 
@@ -191,6 +213,10 @@ for example:
 
 Title-only, folder, substring, previous-search, and remote suggestion matches are not automatic URL
 actions. The verbatim URL-or-search action remains available in every non-empty result list.
+
+When the typed text has no scheme but is taken for a web address, such as `setup.py`, the address
+is the verbatim action, and a search for the text follows it. That search is never selected
+automatically, and it merges with a remote suggestion of the same text.
 
 Automatic defaults use hysteresis during incremental refreshes. A challenger replaces the current
 default only when it exceeds the incumbent by both 10 percent and 100 relevance points. This avoids
@@ -238,8 +264,10 @@ An explicitly selected row remains selected across a refresh of the same generat
 with the same destination still exists. If it disappears, its preview is removed. Automatic
 selection is recalculated separately.
 
-Enter never waits for suggestions. If the displayed rows belong to an older query generation, the
-current input is immediately committed through normal URL-or-search resolution.
+Enter never waits for suggestions. If the displayed rows belong to an older query generation, Enter
+goes to the inline completion on display, since every key press checks that it still extends the
+text as typed. Without one, the current input is immediately committed through normal
+URL-or-search resolution. Either way, Enter goes where the field shows, however soon it is pressed.
 
 ## Persistence and deletion
 

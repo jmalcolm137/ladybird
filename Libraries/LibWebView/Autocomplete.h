@@ -10,10 +10,12 @@
 #include <AK/ByteBuffer.h>
 #include <AK/Error.h>
 #include <AK/Function.h>
+#include <AK/HashTable.h>
 #include <AK/Optional.h>
 #include <AK/RefPtr.h>
 #include <AK/String.h>
 #include <AK/StringView.h>
+#include <AK/Time.h>
 #include <AK/Vector.h>
 #include <AK/Weakable.h>
 #include <LibCore/Forward.h>
@@ -23,6 +25,7 @@
 #include <LibWebView/Forward.h>
 #include <LibWebView/OmniboxEngagement.h>
 #include <LibWebView/Settings.h>
+#include <LibWebView/URL.h>
 
 namespace WebView {
 
@@ -42,6 +45,8 @@ enum class AutocompleteSuggestionSource {
     Bookmark,
     Adaptive,
     Search,
+    // A remote suggestion that is an address rather than something to search for.
+    RemoteURL,
     // Without a search engine, a query that would be searched for offers to choose one instead.
     ChooseSearchEngine,
 };
@@ -88,12 +93,35 @@ struct WEBVIEW_API AutocompleteBookmark {
     Optional<ByteBuffer> favicon_png;
 };
 
+// A remote suggestion, classified once when it arrives.
+struct RemoteAutocompleteSuggestion {
+    String text;
+    // The address it goes to, if it is a web address on a public site.
+    Optional<String> url;
+    // Text without a scheme is an address only if the user has been to this site.
+    Optional<String> host_family_the_user_must_have_visited;
+};
+
+enum class LocalSuggestionsAreComplete {
+    No,
+    Yes,
+};
+
 WEBVIEW_API String autocomplete_suggestion_display_text(AutocompleteSuggestion const&);
 WEBVIEW_API Vector<AutocompleteMatchRange> autocomplete_match_ranges(StringView input, StringView text);
-WEBVIEW_API Vector<String> filter_remote_autocomplete_suggestions(StringView input, Vector<String> suggestions);
+// Remote suggestions for the previous text stay while the ones for the new text load, so that the list keeps its rows.
+// If none arrive, only those that still start with the text stay.
+WEBVIEW_API bool remote_autocomplete_suggestion_matches_input(StringView suggestion, StringView input);
+// The rows for remote suggestions. A web address without a scheme is a page only for a site among the local rows. Until
+// the local rows are complete, such an address for a site not among them yet is left out, rather than shown as a search
+// that turns into a page.
+WEBVIEW_API Vector<AutocompleteSuggestion> make_remote_autocomplete_suggestions(Vector<String> remote_suggestions, ReadonlySpan<AutocompleteSuggestion> local_suggestions = {}, LocalSuggestionsAreComplete = LocalSuggestionsAreComplete::Yes);
+// The row for the text as typed: the address it is, or else a search for it.
+WEBVIEW_API Optional<AutocompleteSuggestion> make_verbatim_autocomplete_suggestion(StringView query, ClassifiedUserInput const&, Optional<SearchEngine> const&);
+// For typed text without a scheme that is taken for a web address, such as "setup.py", a search for it as well.
+WEBVIEW_API Optional<AutocompleteSuggestion> make_search_suggestion_for_address_like_text(StringView query, ClassifiedUserInput const&, Optional<SearchEngine> const&);
 WEBVIEW_API Vector<AutocompleteSuggestion> web_ui_autocomplete_suggestions(StringView input);
 WEBVIEW_API size_t autocomplete_preliminary_limit(size_t max_suggestions);
-WEBVIEW_API bool autocomplete_urls_match(StringView left, StringView right);
 WEBVIEW_API bool autocomplete_url_can_complete(StringView query, StringView suggestion);
 
 // The application that runs the omnibox supplies the things suggestions are made from.
@@ -135,8 +163,10 @@ public:
 private:
     virtual void search_engine_settings_changed() override;
 
-    static ErrorOr<Vector<String>> received_autocomplete_response(SearchSuggestions const&, Optional<ByteString const&> content_type, StringView response);
+    static ErrorOr<Vector<String>> received_autocomplete_response(Optional<ByteString const&> content_type, StringView response);
     void start_remote_query(AutocompleteQueryID, SearchEngine, String query);
+    void stop_remote_query_timers();
+    void drop_remote_suggestions_for_other_text();
     void local_query_complete(AutocompleteQueryID, Vector<AutocompleteSuggestion>);
     void external_url_handler_query_complete(AutocompleteQueryID, RefPtr<ExternalURLHandler>);
     void deliver_current_result();
@@ -148,15 +178,24 @@ private:
     Optional<AutocompleteQueryID> m_query_id;
     String m_query;
     String m_trimmed_query;
+    // NB: Classifying the query looks at the file system, so it is classified once, when the query starts.
+    ClassifiedUserInput m_classified_query;
     size_t m_max_suggestions { default_autocomplete_suggestion_limit };
     bool m_local_query_complete { false };
     bool m_remote_query_complete { false };
+    // The search engine took too long, so the rows without its answer are final, until it answers after all.
+    bool m_stopped_waiting_for_remote_query { false };
     bool m_external_url_handler_query_complete { true };
     bool m_external_url_has_handler { false };
     Optional<URL::URL> m_external_url;
     Vector<AutocompleteSuggestion> m_local_suggestions;
-    Vector<String> m_remote_suggestions;
+    // NB: The sites among the local rows, which tell which remote addresses are pages. They are kept for as long as remote
+    //     rows carry over to the next text, so a remote page stays one while the local rows for that text load.
+    HashTable<String> m_visited_host_families;
+    Vector<RemoteAutocompleteSuggestion> m_remote_suggestions;
     RefPtr<Core::Timer> m_remote_query_timer;
+    RefPtr<Core::Timer> m_remote_query_deadline_timer;
+    Optional<MonotonicTime> m_last_remote_query_time;
     Function<void()> m_cancel_remote_query;
 };
 

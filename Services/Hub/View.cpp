@@ -23,22 +23,31 @@ public:
     }
 
 private:
-    virtual void install(Vector<i32> bitmap_ids, Vector<Gfx::SharedImage> backing_stores) override
+    // The UI imports these images, so they're checked here first: A publication the UI would refuse is refused here as
+    // well, and never sent, so both come to the same result.
+    virtual ErrorOr<void> install(Vector<i32> bitmap_ids, Vector<Gfx::SharedImage> backing_stores) override
     {
+        TRY(check_installed_backing_stores(backing_stores));
         track_installed_backing_stores(bitmap_ids);
         if (auto* ui = ConnectionFromUI::the())
             ui->async_view_install_backing_stores(m_view.view_id(), m_view.page().id().value(), move(bitmap_ids), move(backing_stores));
+        m_view.did_install_backing_stores_in_ui();
+        return {};
     }
 
-    virtual void add(Vector<i32> bitmap_ids, Vector<Gfx::SharedImage> backing_stores) override
+    virtual ErrorOr<void> add(Vector<i32> bitmap_ids, Vector<Gfx::SharedImage> backing_stores) override
     {
+        TRY(check_added_backing_stores(backing_stores));
         track_added_backing_stores(bitmap_ids);
         if (auto* ui = ConnectionFromUI::the())
             ui->async_view_add_backing_stores(m_view.view_id(), move(bitmap_ids), move(backing_stores));
+        return {};
     }
 
     virtual void retire(ReadonlySpan<i32> bitmap_ids) override
     {
+        if (refuses_backing_stores())
+            return;
         PageBackingStores::retire(bitmap_ids);
         if (auto* ui = ConnectionFromUI::the()) {
             Vector<i32> retired_bitmap_ids;
@@ -47,8 +56,14 @@ private:
         }
     }
 
+    // The UI hands back the backing stores it presents from, other than those of a refused installation, which it never
+    // got: Those go straight back from here.
     virtual PresentationResult present(i32 bitmap_id, Gfx::IntSize size, double device_pixel_ratio) override
     {
+        if (refuses_backing_stores()) {
+            m_view.page().release_presented_bitmap(bitmap_id);
+            return { .did_swap = false, .bitmap_id_to_release = bitmap_id };
+        }
         auto result = PageBackingStores::present(bitmap_id, size, device_pixel_ratio);
         if (auto* ui = ConnectionFromUI::the())
             ui->async_view_present_backing_store(m_view.view_id(), m_view.page().id().value(), bitmap_id, size, device_pixel_ratio);
@@ -84,10 +99,13 @@ View::View(InitialState initial_state)
     , m_system_theme(move(initial_state.system_theme))
     , m_screen_rects(move(initial_state.screen_rects))
     , m_websites_prefer_dark(initial_state.websites_prefer_dark)
+    , m_is_tab(initial_state.is_tab)
 {
     m_device_pixel_ratio = initial_state.device_pixel_ratio;
     m_maximum_frames_per_second = initial_state.maximum_frames_per_second;
     m_display_id = initial_state.display_id;
+    m_screen_shows_high_dynamic_range = initial_state.screen_shows_high_dynamic_range;
+    set_scales_frames_to_fit(initial_state.scales_frames_to_fit);
     m_backing_stores = make<BackingStoresInUI>(*this);
     forward_callbacks_to_ui(initial_state.is_tab);
 
@@ -110,6 +128,7 @@ View::InitialState View::initial_state_for_related_view() const
         .device_pixel_ratio = device_pixel_ratio(),
         .maximum_frames_per_second = maximum_frames_per_second(),
         .display_id = display_id(),
+        .screen_shows_high_dynamic_range = m_screen_shows_high_dynamic_range,
         .system_theme = m_system_theme,
         .screen_rects = m_screen_rects,
         .owner_view_id = {},
@@ -154,6 +173,13 @@ void View::did_get_permission_answer(u64 answer_id, Web::Permissions::PromptOutc
 {
     if (auto on_answer = m_pending_permission_answers.take(answer_id); on_answer.has_value())
         (*on_answer)(outcome);
+}
+
+// NB: The UI may keep the tab, such as when the user sees it after all. It then stays as it is.
+void View::did_request_discard()
+{
+    if (auto* ui = ConnectionFromUI::the())
+        ui->async_view_discard(view_id());
 }
 
 void View::forward_callbacks_to_ui(bool is_tab)
@@ -242,30 +268,34 @@ void View::forward_callbacks_to_ui(bool is_tab)
 
     on_finish_handling_key_event = [this](Web::KeyEvent const& event) {
         // NB: Input that the Hub came up with itself, such as WebDriver's, is nothing the UI knows about.
-        if (!event.browser_data)
+        auto input_id = ConnectionFromUI::input_id_of(event.browser_data.ptr());
+        if (!input_id.has_value())
             return;
         if (auto* ui = ConnectionFromUI::the()) {
             push_state_to_ui();
-            ui->async_view_finish_handling_key_event(view_id(), ConnectionFromUI::input_id_of(*event.browser_data), event.clone_without_browser_data());
+            ui->async_view_finish_handling_key_event(view_id(), *input_id, event.clone_without_browser_data());
         }
     };
 
     on_finish_handling_mouse_event = [this](Web::MouseEvent const& event, Web::EventResult result) {
-        if (!event.browser_data)
+        // NB: Input that the Hub came up with itself, such as WebDriver's, is nothing the UI knows about.
+        auto input_id = ConnectionFromUI::input_id_of(event.browser_data.ptr());
+        if (!input_id.has_value())
             return;
         if (auto* ui = ConnectionFromUI::the()) {
             push_state_to_ui();
-            ui->async_view_finish_handling_mouse_event(view_id(), ConnectionFromUI::input_id_of(*event.browser_data), event.clone_without_browser_data(), result);
+            ui->async_view_finish_handling_mouse_event(view_id(), *input_id, event.clone_without_browser_data(), result);
         }
     };
 
     on_finish_handling_drag_event = [this](Web::DragEvent const& event) {
         // NB: Input that the Hub came up with itself, such as WebDriver's, is nothing the UI knows about.
-        if (!event.browser_data)
+        auto input_id = ConnectionFromUI::input_id_of(event.browser_data.ptr());
+        if (!input_id.has_value())
             return;
         if (auto* ui = ConnectionFromUI::the()) {
             push_state_to_ui();
-            ui->async_view_finish_handling_drag_event(view_id(), ConnectionFromUI::input_id_of(*event.browser_data), event.clone_without_browser_data());
+            ui->async_view_finish_handling_drag_event(view_id(), *input_id, event.clone_without_browser_data());
         }
     };
 
@@ -604,6 +634,11 @@ void View::forward_callbacks_to_ui(bool is_tab)
             ui->async_view_performance_stats(view_id(), arguments...);
         }
     };
+
+    on_compositor_layers_change = [this](auto const&... arguments) {
+        if (auto* ui = ConnectionFromUI::the())
+            ui->async_view_compositor_layers_change(view_id(), arguments...);
+    };
 }
 
 ViewState View::current_state() const
@@ -645,7 +680,8 @@ ViewState View::current_state() const
     state.crash_report_name = crash_report_name();
     state.crash_report_website = crash_report_website();
     state.crash_overlay_failed_url = crash_overlay_failed_url();
-    state.force_dark_host = force_dark_host();
+    state.crash_overlay_is_for_memory_limit = crash_overlay_is_for_memory_limit();
+    state.host_for_settings = current_host_for_settings();
     state.can_report_website_issue = can_report_website_issue();
     state.can_undo = can_undo();
     state.can_redo = can_redo();
@@ -684,6 +720,41 @@ void View::did_accept_presented_backing_store(i32 bitmap_id, Gfx::IntRect damage
 {
     if (auto* ui = ConnectionFromUI::the())
         ui->async_view_accept_presented_backing_store(view_id(), bitmap_id, damage_rect);
+}
+
+void View::did_create_remote_layer(Compositing::RemoteLayerHostHandle host_handle)
+{
+    m_ui_hosts_remote_layer = host_handle.kind != Compositing::RemoteLayerHostKind::None;
+    m_ui_awaits_first_frame_in_remote_layer = m_ui_hosts_remote_layer;
+    if (auto* ui = ConnectionFromUI::the())
+        ui->async_view_set_remote_layer(view_id(), host_handle);
+}
+
+// The UI shows the backing stores it was given, as when a page from another process comes to display the tab, until it
+// hears of a frame shown in the remote layer again.
+void View::did_install_backing_stores_in_ui()
+{
+    m_ui_awaits_first_frame_in_remote_layer = m_ui_hosts_remote_layer;
+}
+
+void View::did_present_frame_in_remote_layer(Gfx::IntSize size, double device_pixel_ratio)
+{
+    if (!exchange(m_ui_awaits_first_frame_in_remote_layer, false) && !m_wants_frame_notifications)
+        return;
+    if (auto* ui = ConnectionFromUI::the())
+        ui->async_view_did_present_frame_in_remote_layer(view_id(), size, device_pixel_ratio);
+}
+
+void View::did_hold_synchronized_resize_frame(u64 token)
+{
+    if (auto* ui = ConnectionFromUI::the())
+        ui->async_view_did_hold_synchronized_resize_frame(view_id(), token);
+}
+
+void View::did_commit_synchronized_resize(u64 token)
+{
+    if (auto* ui = ConnectionFromUI::the())
+        ui->async_view_did_commit_synchronized_resize(view_id(), token);
 }
 
 void View::prepare_page_for_navigable(WebView::WebContentPage& page)

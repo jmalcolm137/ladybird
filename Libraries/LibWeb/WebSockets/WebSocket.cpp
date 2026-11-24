@@ -13,6 +13,7 @@
 #include <LibJS/Runtime/VM.h>
 #include <LibRequests/RequestClient.h>
 #include <LibURL/Origin.h>
+#include <LibWeb/Bindings/PrincipalHostDefined.h>
 #include <LibWeb/Bindings/Wrappable.h>
 #include <LibWeb/Bindings/WrapperWorld.h>
 #include <LibWeb/ContentSecurityPolicy/BlockingAlgorithms.h>
@@ -23,6 +24,7 @@
 #include <LibWeb/DOM/IDLEventListener.h>
 #include <LibWeb/DOMURL/DOMURL.h>
 #include <LibWeb/Fetch/Fetching/ClientContextSnapshots.h>
+#include <LibWeb/Fetch/Fetching/Fetching.h>
 #include <LibWeb/Fetch/Infrastructure/HTTP/Requests.h>
 #include <LibWeb/Fetch/Infrastructure/NetworkPartitionKey.h>
 #include <LibWeb/Fetch/Infrastructure/PortBlocking.h>
@@ -38,6 +40,7 @@
 #include <LibWeb/Loader/LoaderConfig.h>
 #include <LibWeb/Loader/ResourceLoader.h>
 #include <LibWeb/MixedContent/AbstractOperations.h>
+#include <LibWeb/Page/Page.h>
 #include <LibWeb/Platform/EventLoopPlugin.h>
 #include <LibWeb/UpgradeInsecureRequests/AbstractOperations.h>
 #include <LibWeb/WebIDL/AbstractOperations.h>
@@ -195,7 +198,8 @@ ErrorOr<void> WebSocket::establish_web_socket_connection(URL::URL const& url_rec
     request->set_redirect_mode(Fetch::Infrastructure::Request::RedirectMode::Error);
 
     // FIXME: Fetch request as per the remaining steps of https://websockets.spec.whatwg.org/#concept-websocket-establish
-    // AD-HOC: Until the opening handshake goes through fetch, run the blocking checks of main fetch here.
+    // AD-HOC: Until the opening handshake goes through fetch, run the blocking checks and the HSTS upgrade of main
+    //         fetch here.
     request->set_policy_container(client.policy_container()->clone());
     request->set_client_snapshot(Fetch::Fetching::snapshot_client_context(client));
     auto report_violation = ContentSecurityPolicy::violation_reporter_for_request(client.realm(), request);
@@ -206,6 +210,8 @@ ErrorOr<void> WebSocket::establish_web_socket_connection(URL::URL const& url_rec
         || ContentSecurityPolicy::should_request_be_blocked_by_content_security_policy(request, report_violation) == ContentSecurityPolicy::Directives::Directive::Result::Blocked) {
         return Error::from_string_literal("WebSocket connection was blocked");
     }
+
+    Fetch::Fetching::upgrade_request_to_https_for_known_hsts_host_if_appropriate(Bindings::principal_host_defined_page(client.realm()), *request);
 
     if (m_ready_state != Requests::WebSocket::ReadyState::Connecting)
         return Error::from_string_literal("The WebSocket was closed before it connected");
@@ -228,7 +234,7 @@ ErrorOr<void> WebSocket::establish_web_socket_connection(URL::URL const& url_rec
 
     auto additional_headers = HTTP::HeaderList::create();
 
-    auto user_agent = current_loader_config()->config.user_agent_for_websocket_url(connection_url);
+    auto user_agent = Fetch::Infrastructure::default_user_agent_value(current_loader_config()->config, request);
     additional_headers->append({ "User-Agent"sv, user_agent.to_byte_string() });
 
     if (ResourceLoader::proxy_autoconfig_url().has_value()) {
@@ -243,13 +249,20 @@ ErrorOr<void> WebSocket::establish_web_socket_connection(URL::URL const& url_rec
     if (!request_client)
         return Error::from_string_literal("RequestServer is currently unavailable");
 
-    m_websocket = request_client->websocket_connect(connection_url, move(network_isolation_key), origin_string, protocol_byte_strings, {}, additional_headers, { .status = request->same_site_status(), .is_safe_method = true });
+    // NB: As for its requests, a worker's page has no top-level traversable or browser page ID.
+    auto& page = Bindings::principal_host_defined_page(client.realm());
+    auto originating_page_id = page.has_top_level_traversable() ? page.client().id().value() : 0;
+
+    m_websocket = request_client->websocket_connect(connection_url, move(network_isolation_key), origin_string, protocol_byte_strings, {}, additional_headers, originating_page_id, { .status = request->same_site_status(), .is_safe_method = true });
 
     m_websocket->on_open = GC::weak_callback(*this, [](auto& self) {
         self.on_open();
     });
     m_websocket->on_message = GC::weak_callback(*this, [](auto& self, auto message) {
         self.on_message(move(message.data), message.is_text);
+    });
+    m_websocket->on_message_bytes_transmitted = GC::weak_callback(*this, [](auto& self, u64 byte_count) {
+        self.on_message_bytes_transmitted(byte_count);
     });
     m_websocket->on_close = GC::weak_callback(*this, [](auto& self, auto code, auto reason, bool was_clean) {
         self.on_close(code, Utf16String::from_utf8(StringView { reason.bytes() }), was_clean);
@@ -370,8 +383,19 @@ u64 WebSocket::buffered_amount() const
 {
     // The bufferedAmount getter steps are to return the number of bytes of application data (UTF-8 text and binary
     // data) that have been queued using send() but that, as of the last time the event loop reached step 1, had not
-    // yet been transmitted to the network.
+    // yet been transmitted to the network. (This thus includes any text sent during the execution of the current task,
+    // regardless of whether the user agent is able to transmit text in the background in parallel with script
+    // execution.) This does not include framing overhead incurred by the protocol, or buffering done by the operating
+    // system or network hardware.
     return m_buffered_amount;
+}
+
+void WebSocket::on_message_bytes_transmitted(u64 byte_count)
+{
+    // Applied in a task of its own, so that bufferedAmount never changes while a task runs.
+    HTML::queue_a_task(HTML::Task::Source::WebSocket, nullptr, nullptr, GC::create_function(GC::Heap::the(), GC::captures(GC::Ref { *this }, byte_count), [](auto& self, auto& byte_count) {
+        self->m_buffered_amount -= min(byte_count, self->m_buffered_amount);
+    }));
 }
 
 // https://websockets.spec.whatwg.org/#dom-websocket-send
@@ -420,14 +444,6 @@ WebIDL::ExceptionOr<void> WebSocket::send(WebSocketSendData const& data)
     //       agent must flag the WebSocket as full and then close the WebSocket connection.
 
     m_buffered_amount += message_size;
-
-    // NB: A sent message is handed to the network process right away, so it counts as transmitted to the network once
-    //     the event loop has moved on from the current task.
-    if (is_open && message_size > 0) {
-        HTML::queue_a_task(HTML::Task::Source::WebSocket, nullptr, nullptr, GC::create_function(GC::Heap::the(), GC::captures(GC::Ref { *this }, message_size), [](auto& self, auto& message_size) {
-            self->m_buffered_amount -= message_size;
-        }));
-    }
 
     return {};
 }
@@ -489,7 +505,7 @@ void WebSocket::on_message(ByteBuffer message, bool is_text)
         HTML::MessageEventInit event_init;
         event_init.data = data_for_event;
 
-        self.dispatch_event(HTML::MessageEvent::create(realm.global_object(), HTML::EventNames::message, event_init, self.m_url.origin()));
+        self.dispatch_event(HTML::create_message_event(realm, HTML::EventNames::message, event_init, self.m_url.origin()));
     }));
 }
 

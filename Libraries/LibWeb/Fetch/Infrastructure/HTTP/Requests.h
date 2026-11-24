@@ -25,23 +25,19 @@
 #include <LibHTTP/HeaderList.h>
 #include <LibURL/Origin.h>
 #include <LibURL/URL.h>
+#include <LibWeb/ContentSecurityPolicy/PolicyList.h>
 #include <LibWeb/Export.h>
 #include <LibWeb/Fetch/Infrastructure/ClientContextSnapshot.h>
 #include <LibWeb/Fetch/Infrastructure/HTTP.h>
-#include <LibWeb/Fetch/Infrastructure/HTTP/Bodies.h>
+#include <LibWeb/Fetch/Infrastructure/HTTP/FetchBody.h>
 #include <LibWeb/Fetch/Infrastructure/KeepaliveQuotaAccountant.h>
+#include <LibWeb/Fetch/Infrastructure/NetworkObservation.h>
 #include <LibWeb/HTML/Scripting/EnvironmentSettingsObjectAddress.h>
 #include <LibWeb/HTML/Scripting/RemoteEnvironmentSettings.h>
 #include <LibWebCommon/Fetch/Infrastructure/HTTP/RequestPriority.h>
 #include <LibWebCommon/Fetch/Infrastructure/HTTP/RequestReferrer.h>
 #include <LibWebCommon/HTML/CrossProcessId.h>
 #include <LibWebCommon/HTML/Scripting/EnvironmentId.h>
-
-namespace Web::WebDriver::BiDi {
-
-class NetworkRequest;
-
-}
 
 namespace Web::Fetch::Infrastructure {
 
@@ -207,6 +203,14 @@ public:
     [[nodiscard]] Optional<HTML::RemoteClientNavigation> const& remote_client_navigation() const { return m_remote_client_navigation; }
     void set_remote_client_navigation(Optional<HTML::RemoteClientNavigation> remote_client_navigation) { m_remote_client_navigation = move(remote_client_navigation); }
 
+    struct ChildNavigableNavigation {
+        HTML::CrossProcessId navigable_id;
+        Optional<Utf16String> navigation_id;
+        ContentSecurityPolicy::PolicyList container_document_csp_list;
+    };
+    [[nodiscard]] Optional<ChildNavigableNavigation> const& child_navigable_navigation() const { return m_child_navigable_navigation; }
+    void set_child_navigable_navigation(Optional<ChildNavigableNavigation> child_navigable_navigation) { m_child_navigable_navigation = move(child_navigable_navigation); }
+
     [[nodiscard]] RefPtr<ReservedClientContextSnapshot const> const& reserved_client_snapshot() const { return m_reserved_client_snapshot; }
     void set_reserved_client_snapshot(RefPtr<ReservedClientContextSnapshot const> reserved_client_snapshot) { m_reserved_client_snapshot = move(reserved_client_snapshot); }
 
@@ -358,8 +362,8 @@ public:
 
     UnixDateTime request_time() const { return m_request_time; }
 
-    RefPtr<WebDriver::BiDi::NetworkRequest> webdriver_bidi_network_request() const;
-    void set_webdriver_bidi_network_request(RefPtr<WebDriver::BiDi::NetworkRequest>);
+    [[nodiscard]] RefPtr<NetworkObservation> const& network_observation() const { return m_network_observation; }
+    [[nodiscard]] NonnullRefPtr<NetworkObservation> ensure_network_observation();
 
 private:
     explicit Request(NonnullRefPtr<HTTP::HeaderList>);
@@ -395,6 +399,12 @@ private:
     // The navigation of a navigation request whose client another process hosts, through which the UI process finds that
     // client.
     Optional<HTML::RemoteClientNavigation> m_remote_client_navigation;
+
+    // AD-HOC: The navigation of a navigation request whose navigable is a child navigable, with a copy of the CSP list
+    //         of the navigable's container's node document. That document's frame-src governs where the
+    //         navigable can be navigated to, whichever document started the navigation.
+    //         See https://github.com/w3c/webappsec-csp/issues/624.
+    Optional<ChildNavigableNavigation> m_child_navigable_navigation;
 
     // https://fetch.spec.whatwg.org/#concept-request-reserved-client
     // A request has an associated reserved client (null, an environment, or an environment settings object). Unless
@@ -586,7 +596,7 @@ private:
 
     // Non-standard
     UnixDateTime m_request_time;
-    RefPtr<WebDriver::BiDi::NetworkRequest> m_webdriver_bidi_network_request;
+    RefPtr<NetworkObservation> m_network_observation;
 };
 
 WEB_API StringView request_destination_to_string(Request::Destination);

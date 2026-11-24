@@ -44,20 +44,25 @@ set(SOURCES
     ImageDecoderControlClient.cpp
     ImageDecoderManager.cpp
     LingeringIndicator.cpp
+    LocalFileRoot.cpp
+    MediaSessionCoordinator.cpp
     NavigationLoader.cpp
     Omnibox.cpp
     OmniboxEngagement.cpp
     NotificationAttribution.cpp
     NotificationFreedesktopArguments.cpp
     NotificationManager.cpp
+    NowPlayingInfo.cpp
     PageBackingStores.cpp
     PageTranslation.cpp
     PictureInPictureManager.cpp
     PictureInPictureWindow.cpp
     PermissionManager.cpp
+    PlatformFeatureDecisions.cpp
     Process.cpp
     ProcessManager.cpp
     ProcessSnapshot.cpp
+    TabDiscarder.cpp
     TabIndicators.cpp
     TabPerformanceStats.cpp
     TabPerformanceMonitor.cpp
@@ -74,10 +79,12 @@ set(SOURCES
     SiteCompatibility.cpp
     StorageAreaRegistry.cpp
     StorageJar.cpp
+    SystemProbeClient.cpp
     TestSpellChecker.cpp
     TestTranslator.cpp
     Translator.cpp
     URL.cpp
+    UpdateCheck.cpp
     UserAgent.cpp
     Utilities.cpp
     VideoDecoderServerControlClient.cpp
@@ -90,8 +97,10 @@ set(SOURCES
     WebDriverBiDiNetwork.cpp
     WebDriverBrowserConnection.cpp
     WebUI.cpp
+    WebUI/AboutUI.cpp
     WebUI/ApplicationWebUI.cpp
     WebUI/CrashReportsUI.cpp
+    WebUI/SupportUI.cpp
     WebUI/SettingsUI.cpp
     WebWorkerClient.cpp
     WorkerAgentManager.cpp
@@ -100,13 +109,13 @@ set(SOURCES
 if (APPLE)
     list(APPEND SOURCES
         CrashReportPOSIX.cpp
+        MediaSessionPlatformBackendMacOS.mm
         NotificationBackendMacOS.mm
-        PlatformColorsMacOS.cpp
         ProcessReaper.cpp
         QuarantineMacOS.mm
         StringConversionsMacOS.mm
     )
-    set_source_files_properties(NotificationBackendMacOS.mm QuarantineMacOS.mm StringConversionsMacOS.mm PROPERTIES COMPILE_FLAGS "-fobjc-arc")
+    set_source_files_properties(MediaSessionPlatformBackendMacOS.mm NotificationBackendMacOS.mm QuarantineMacOS.mm StringConversionsMacOS.mm PROPERTIES COMPILE_FLAGS "-fobjc-arc")
 elseif (LINUX)
     list(APPEND SOURCES AudioDaemonSocket.cpp CrashReportPOSIX.cpp)
 endif()
@@ -169,7 +178,11 @@ add_custom_target(generate_build_information DEPENDS ${build_information_stamp})
 
 ladybird_lib(LibWebView webview EXPLICIT_SYMBOL_EXPORT)
 add_dependencies(LibWebView generate_build_information)
-target_link_libraries(LibWebView PUBLIC LibCompositing LibSandbox LibWebCommon)
+if (LADYBIRD_ENABLE_UPDATE_CHECK)
+    target_compile_definitions(LibWebView PUBLIC LADYBIRD_HAS_UPDATE_CHECK)
+endif()
+
+target_link_libraries(LibWebView PUBLIC LibCompositing LibPlatformFeatures LibSandbox LibWebCommon)
 target_link_libraries(LibWebView PRIVATE LibCore LibCrypto LibDatabase LibDevTools LibFileSystem LibGfx LibHTTP LibImageDecoderClient LibIPC LibRequests LibMedia LibMediaClient LibUnicode LibURL LibTextCodec LibThreading)
 
 if (LINUX)
@@ -182,7 +195,7 @@ if (LINUX)
 endif()
 
 if (APPLE)
-    target_link_libraries(LibWebView PRIVATE "-framework CoreServices" "-framework Foundation" "-framework UserNotifications")
+    target_link_libraries(LibWebView PRIVATE "-framework AppKit" "-framework CoreServices" "-framework Foundation" "-framework MediaPlayer" "-framework UserNotifications")
 endif()
 
 if (LINUX OR CMAKE_SYSTEM_NAME STREQUAL "FreeBSD")

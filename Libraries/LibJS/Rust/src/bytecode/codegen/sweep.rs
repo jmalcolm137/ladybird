@@ -23,14 +23,16 @@ use crate::bytecode::instruction::typed as op;
 use crate::bytecode::operand::IdentifierTableIndex;
 use crate::bytecode::operand::Operand;
 use crate::bytecode::source_map::SourceOffset;
-use crate::parser::OutOfStack;
-use crate::parser::columns::NONE;
-use crate::parser::columns::function_flag;
-use crate::parser::columns::tag;
-use crate::parser::token::N_PROTO;
+use libjs_parser::base::OutOfStack;
+use libjs_parser::columns::NONE;
+use libjs_parser::columns::function_flag;
+use libjs_parser::columns::tag;
+use libjs_parser::token::N_ARGUMENTS;
+use libjs_parser::token::N_PROTO;
 
 use super::context::Generator;
 use super::nodes::*;
+use super::stream::TargetBinding;
 use super::stream::ValKind;
 use crate::bytecode::constant_fold::ascii_code_units_to_string;
 
@@ -101,10 +103,10 @@ impl Generator<'_> {
     /// Goes through the rows from `first_row` up to `end_row`, which are all of some piece of code.
     pub(super) fn sweep_rows(&mut self, first_row: usize, end_row: usize) -> Result<(), OutOfStack> {
         let tree = self.tree;
-        let tags = &tree.ast.tag[..];
-        let positions = &tree.ast.pos[..];
-        let a_column = &tree.ast.a[..];
-        let b_column = &tree.ast.b[..];
+        let tags = tree.ast.tag;
+        let positions = tree.ast.pos;
+        let a_column = tree.ast.a;
+        let b_column = tree.ast.b;
         let mut declaration_kind = DeclarationKind::Var;
         let mut declared_ident = None;
         let mut declared_resource = None;
@@ -124,8 +126,12 @@ impl Generator<'_> {
             self.current_source_offset = SourceOffset(position);
             match row_tag {
                 tag::IDENT => {
-                    let ident = self.identifier_of(Name(a));
-                    self.value_of_identifier(ident);
+                    if let Some(kind) = (a == N_ARGUMENTS).then(|| self.arguments_from_frame()).flatten() {
+                        self.value_of_arguments_from_frame(kind);
+                    } else {
+                        let ident = self.identifier_of(Name(a));
+                        self.value_of_identifier(ident);
+                    }
                 }
                 tag::IDENT_CALLEE => {
                     let ident = self.identifier_of(Name(a));
@@ -141,11 +147,11 @@ impl Generator<'_> {
                 }
                 tag::IDENT_TARGET => {
                     let ident = self.identifier_of(Name(a));
-                    self.target_of_identifier(ident);
+                    self.target_of_identifier(ident, TargetBinding::MightAppear);
                 }
                 tag::IDENT_READ_TARGET => {
                     let ident = self.identifier_of(Name(a));
-                    self.target_of_identifier(ident);
+                    self.target_of_identifier(ident, TargetBinding::Known);
                     self.read_target(Some(ident));
                 }
                 tag::IDENT_DECLARATION => {
@@ -155,7 +161,10 @@ impl Generator<'_> {
                         self.begin_disposal(is_async);
                     }
                     let ident = self.declare_binding(Name(a), declaration_kind);
-                    self.target_of_declaration(ident);
+                    // NB: A `var` without an initializer does nothing, not even resolve its name.
+                    if declaration_kind != DeclarationKind::Var || tags[row + 1] != tag::DECLARATOR {
+                        self.target_of_declaration(ident);
+                    }
                     declared_ident = Some(ident);
                 }
                 tag::IDENT_TYPEOF => {
@@ -216,12 +225,12 @@ impl Generator<'_> {
                 tag::PAREN => {}
                 tag::CALL | tag::OPT_CALL => self.call(tree.node_list(b).len()),
                 tag::NEW => self.construct(tree.node_list(b).len()),
-                tag::CALL_SPREAD => self.call_with_array(),
+                tag::CALL_ARRAY => self.call_with_array(),
                 tag::CALL_DIRECT_EVAL => self.direct_eval(tree.node_list(b).len()),
-                tag::CALL_DIRECT_EVAL_SPREAD => self.direct_eval_with_array(),
-                tag::NEW_SPREAD => self.construct_with_array(),
+                tag::CALL_DIRECT_EVAL_ARRAY => self.direct_eval_with_array(),
+                tag::NEW_ARRAY => self.construct_with_array(),
                 tag::ARRAY_SPREAD => {}
-                tag::MARK_SPREAD_START => self.spread_begin(a as usize),
+                tag::MARK_ARRAY_START => self.array_begin(a as usize),
                 tag::SPREAD => self.append_element(true),
                 tag::MARK_APPEND => self.append_element(false),
                 tag::OBJECT_SPREAD => self.object_spread(),
@@ -241,14 +250,14 @@ impl Generator<'_> {
                 tag::SUPER => self.value_of_super_this(),
                 tag::SUPER_CALLEE => self.value_of_super_constructor(),
                 tag::SUPER_CALL => {
-                    if !tree
-                        .node_list(b)
-                        .iter()
-                        .any(|argument| tree.node_tag(argument) == tag::SPREAD)
+                    let arguments = tree.node_list(b);
+                    if arguments.len() <= super::inline_argument_limit(self.builtin_abstract_operations_enabled)
+                        && !arguments.iter().any(|argument| tree.node_tag(argument) == tag::SPREAD)
                     {
-                        self.array(tree.node_list(b).len());
+                        self.super_call_with_operands(arguments.len());
+                    } else {
+                        self.super_call();
                     }
-                    self.super_call();
                 }
                 tag::SUPER_MEMBER => self.value_of_super_property(Some(Name(b)), false),
                 tag::SUPER_MEMBER_CALLEE => self.value_of_super_property(Some(Name(b)), true),
@@ -314,7 +323,8 @@ impl Generator<'_> {
                         row += 1;
                         continue;
                     }
-                    let value_is_used = next_tag(tags, row) != tag::EXPR_STMT && !self.is_unused_value_row(row);
+                    let value_is_used = (next_tag(tags, row) != tag::EXPR_STMT || self.tracks_completion())
+                        && !self.is_unused_value_row(row);
                     self.update(tree.update_operator(node), row_tag == tag::PREFIX_UPDATE, value_is_used);
                 }
                 tag::CONDITIONAL => self.conditional_end(),
@@ -464,6 +474,10 @@ impl Generator<'_> {
                         row = a as usize + 1;
                         continue;
                     }
+                    // NB: The elements of an array literal come next, each as a value, which can be very many.
+                    if a == 0 {
+                        self.reserve_values(b as usize);
+                    }
                 }
                 other if (tag::BINARY_BASE..tag::MARK_CALLEE).contains(&other) => {
                     match crate::ast::SyntaxTree::binary_operator(other) {
@@ -573,7 +587,7 @@ impl Generator<'_> {
     /// value. Its rows go from `row` up to `next_row`.
     pub(super) fn name_of_anonymous_definition(&mut self, row: usize, next_row: usize) -> Option<IdentifierTableIndex> {
         let tree = self.tree;
-        let tags = &tree.ast.tag[..];
+        let tags = tree.ast.tag;
         if let Some(name) = self.context.stream.pending_function_name.take() {
             return Some(name);
         }
@@ -608,7 +622,7 @@ impl Generator<'_> {
 }
 
 /// Whether the function expression at `row` is what the code around it calls, directly or through `call` or `apply`.
-fn is_called_right_away(tree: &SyntaxTree, row: usize) -> bool {
+fn is_called_right_away(tree: &SyntaxTree<'_>, row: usize) -> bool {
     let mut next = row + 1;
     while tree.ast.tag[next] == tag::PAREN {
         next += 1;
@@ -624,7 +638,7 @@ fn is_called_right_away(tree: &SyntaxTree, row: usize) -> bool {
 }
 
 /// Whether `key` of a property is what makes a property set the prototype.
-fn is_proto_key(tree: &SyntaxTree, key: NodeId) -> bool {
+fn is_proto_key(tree: &SyntaxTree<'_>, key: NodeId) -> bool {
     match tree.node_tag(key) {
         tag::IDENT_KEY => tree.node_a(key) == N_PROTO,
         tag::STR_KEY => tree.string_literal_text(key).view() == crate::utf16::Utf16View::Ascii(b"__proto__"),
@@ -633,13 +647,49 @@ fn is_proto_key(tree: &SyntaxTree, key: NodeId) -> bool {
 }
 
 /// Whether the function at `function` has no name of its own.
-pub(super) fn is_anonymous(tree: &SyntaxTree, function: NodeId) -> bool {
+pub(super) fn is_anonymous(tree: &SyntaxTree<'_>, function: NodeId) -> bool {
     tree.script.index.name[tree.node_b(function) as usize] == NONE
+}
+
+/// https://tc39.es/ecma262/#sec-static-semantics-isfunctiondefinition
+#[inline(always)]
+fn is_function_definition(tree: &SyntaxTree<'_>, expression: NodeId) -> bool {
+    matches!(tree.node_tag(expression), tag::FUNCTION | tag::CLASS)
+}
+
+/// https://tc39.es/ecma262/#sec-static-semantics-hasname
+#[inline(always)]
+fn has_name(tree: &SyntaxTree<'_>, expression: NodeId) -> bool {
+    match tree.node_tag(expression) {
+        tag::FUNCTION => !is_anonymous(tree, expression),
+        tag::CLASS => tree.node_a(expression) != NONE,
+        _ => false,
+    }
+}
+
+/// https://tc39.es/ecma262/#sec-isanonymousfunctiondefinition
+pub(super) fn is_anonymous_function_definition(tree: &SyntaxTree<'_>, expression: NodeId) -> bool {
+    // NB: IsFunctionDefinition and HasName of a ParenthesizedExpression are those of the expression in it.
+    let expression = tree.skip_parens(expression);
+
+    // 1. If IsFunctionDefinition of expr is false, return false.
+    if !is_function_definition(tree, expression) {
+        return false;
+    }
+
+    // 2. Let hasName be HasName of expr.
+    // 3. If hasName is true, return false.
+    if has_name(tree, expression) {
+        return false;
+    }
+
+    // 4. Return true.
+    true
 }
 
 /// The operator of a logical assignment, by the token that it is.
 fn logical_operator_of_assignment(token: u8) -> crate::ast::LogicalOp {
-    use crate::parser::token::T;
+    use libjs_parser::token::T;
     if token == T::LogAndAssign as u8 {
         crate::ast::LogicalOp::And
     } else if token == T::LogOrAssign as u8 {

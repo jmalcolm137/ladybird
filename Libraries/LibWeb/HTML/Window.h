@@ -21,7 +21,6 @@
 #include <LibWeb/Bindings/Forward.h>
 #include <LibWeb/Bindings/IdleRequest.h>
 #include <LibWeb/DOM/EventTarget.h>
-#include <LibWeb/EventTiming/EventTiming.h>
 #include <LibWeb/Export.h>
 #include <LibWeb/Forward.h>
 #include <LibWeb/HTML/BarProp.h>
@@ -290,7 +289,6 @@ public:
     static void run_activation_notification_steps(DOM::Document&);
     void consume_user_activation();
 
-    HighResolutionTime::DOMHighResTimeStamp last_history_action_activation_timestamp() const { return m_last_history_action_activation_timestamp; }
     void set_last_history_action_activation_timestamp(HighResolutionTime::DOMHighResTimeStamp timestamp) { m_last_history_action_activation_timestamp = timestamp; }
 
     void consume_history_action_user_activation();
@@ -317,8 +315,6 @@ public:
     bool find(Utf16View string);
 
     static void for_each_active(Function<IterationDecision(Window&)> callback);
-
-    EventTiming::WindowEventTimingState& event_timing_state() { return m_event_timing_state; }
 
     // https://w3c.github.io/largest-contentful-paint/#has-dispatched-scroll-event
     bool has_dispatched_scroll_event() const { return m_has_dispatched_scroll_event; }
@@ -410,8 +406,6 @@ private:
 
     // https://html.spec.whatwg.org/multipage/obsolete.html#dom-external
     GC::Ptr<External> m_external;
-
-    EventTiming::WindowEventTimingState m_event_timing_state;
 
     // https://w3c.github.io/largest-contentful-paint/#has-dispatched-scroll-event
     // Each Window has has dispatched scroll event, a boolean which is initially set to false.

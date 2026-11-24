@@ -6,22 +6,27 @@
 
 #pragma once
 
+#include <AK/ByteBuffer.h>
+#include <AK/Error.h>
 #include <AK/Function.h>
 #include <AK/Optional.h>
 #include <AK/OwnPtr.h>
 #include <AK/RefCounted.h>
 #include <AK/RefPtr.h>
 #include <AK/Utf16String.h>
+#include <AK/WeakPtr.h>
 #include <AK/Weakable.h>
 #include <LibHTTP/Forward.h>
 #include <LibRequests/Forward.h>
 #include <LibRequests/Request.h>
+#include <LibRequests/RequestTransferLease.h>
 #include <LibWebCommon/HTML/NavigationPopulationRequest.h>
 #include <LibWebCommon/HTML/Scripting/EnvironmentId.h>
-#include <LibWebView/BrowsingSession.h>
 #include <LibWebView/Export.h>
 #include <LibWebView/Forward.h>
+#include <LibWebView/LocalFileRoot.h>
 #include <LibWebView/RequestServerManager.h>
+#include <time.h>
 
 namespace WebView {
 
@@ -33,9 +38,9 @@ class WEBVIEW_API NavigationLoader final
 public:
     AK_ALLOC_WITH_KMALLOC;
 
-    static NonnullRefPtr<NavigationLoader> create(IsPrivate is_private, Web::HTML::NavigationPopulationRequest request)
+    static NonnullRefPtr<NavigationLoader> create(Web::HTML::NavigationPopulationRequest request, LocalFileAccess local_file_access = {})
     {
-        return adopt_ref(*new NavigationLoader(is_private, move(request)));
+        return adopt_ref(*new NavigationLoader(move(request), move(local_file_access)));
     }
 
     ~NavigationLoader();
@@ -61,44 +66,94 @@ public:
     Optional<ResponseDocument> response_document() const;
     void set_document(CanonicalDocument const&, CanonicalNavigable const&);
 
+    void refuse_made_up_local_file_urls(WebContentClient const& population_worker, Web::HTML::NavigationPopulationResult&) const;
     void did_finish_navigation_params_creation(Web::HTML::NavigationPopulationResult);
-    void acquire_response_body(Function<void(bool)> completion_steps);
+    void acquire_response_body(WebContentClient const& population_worker, Function<void(bool)> completion_steps);
     void obtain_the_response_policies(CanonicalNavigable const&);
     void check_the_responses_adherence_to_its_embedder_policy(CanonicalNavigable const&);
     // Moves the response to the document host's RequestServer for its top-level site, if different.
     void move_response_body_to(RequestServerSiteBindings const& host_bindings, Function<void(bool)> completion_steps);
     bool response_body_matches(int request_server_client_id, u64 request_server_request_id) const;
+    Optional<Requests::RequestTransferLeaseKey> const& response_body_transfer_lease() const { return m_response_body_transfer_lease; }
+    // The host may adopt the response body once. The steps run once RequestServer has answered, or at once if there is
+    // nothing to designate.
+    void let_host_adopt_response_body(WebContentPage const& host, Function<void()> steps);
+    bool response_body_was_handed_to_another_process(WebContentClient const&) const;
+    // The host's client that RequestServer was told may adopt the response body.
+    Optional<int> response_body_adopter_client_id() const { return m_response_body_adopter_client_id; }
     Web::HTML::NavigationPopulationRequest const& request() const { return m_request; }
+    Optional<LocalFileRoot> const& local_file_root() const { return m_local_file_root; }
     Web::HTML::NavigationPopulationResult const& result() const;
     Web::HTML::NavigationPopulationResult take_result();
     void reclaim_response_body_after_failed_handoff();
 
-    static void discard(IsPrivate, Web::HTML::NavigationPopulationResult&);
+    // The response that WebDriver BiDi provides for this navigation's intercepted request, which the process running the
+    // request reports with the body that WebDriver gave it. The first command to provide one keeps it, until that
+    // command fails.
+    struct ResponseProvidedByWebDriver {
+        URL::URL url;
+        ByteBuffer body;
+        u64 command_id { 0 };
+    };
+    bool set_response_provided_by_webdriver(ResponseProvidedByWebDriver response)
+    {
+        if (m_response_provided_by_webdriver.has_value())
+            return false;
+        m_response_provided_by_webdriver = move(response);
+        return true;
+    }
+    void withdraw_response_provided_by_webdriver(u64 command_id)
+    {
+        if (m_response_provided_by_webdriver.has_value() && m_response_provided_by_webdriver->command_id == command_id)
+            m_response_provided_by_webdriver.clear();
+    }
+
+    static bool response_body_belongs_to_another_process(Web::HTML::NavigationPopulationResult const&, WebContentClient const&);
+    static void discard(WebContentClient const& population_worker, Web::HTML::NavigationPopulationResult&);
 
 private:
-    NavigationLoader(IsPrivate is_private, Web::HTML::NavigationPopulationRequest request)
-        : m_is_private(is_private)
-        , m_request(move(request))
+    NavigationLoader(Web::HTML::NavigationPopulationRequest request, LocalFileAccess local_file_access)
+        : m_request(move(request))
+        , m_requested_url(m_request.history_entry.url)
+        , m_local_file_access(move(local_file_access))
     {
     }
 
+    struct LocalFile {
+        ByteBuffer contents;
+        time_t modified_time { 0 };
+        ByteString canonical_path;
+    };
+    void read_local_file_for_response();
+    Optional<LocalFileRoot> root_of_local_file(ByteString const& canonical_path) const;
+    void did_read_local_file_for_response(ErrorOr<LocalFile>);
+
     void determine_the_origin_of_the_response();
+    bool reported_urls_match_the_response_url(URL::URL const&) const;
+    bool reports_an_http_response_of_its_own() const;
     void did_acquire(bool succeeded);
     void set_response_body_callbacks(Requests::Request&);
+    void did_designate_response_body_adopter();
     void release_response_body();
 
-    IsPrivate m_is_private { IsPrivate::No };
     Web::HTML::NavigationPopulationRequest m_request;
+    // The URL the request was made for, before the process that fetched the response reported where it ended up.
+    URL::URL m_requested_url;
+    LocalFileAccess m_local_file_access;
+    Optional<LocalFileRoot> m_local_file_root;
     Optional<Web::HTML::NavigationPopulationResult> m_result;
     RefPtr<Requests::Request> m_response_body_request;
     RefPtr<HTTP::HeaderList> m_response_header_list;
     RefPtr<RequestServerInstance> m_response_body_request_server;
-    Optional<int> m_response_body_request_server_client_id;
-    Optional<u64> m_response_body_request_server_request_id;
+    Optional<Requests::RequestTransferLeaseKey> m_response_body_transfer_lease;
     // The top-level site of the document the response creates.
     Optional<Utf16String> m_top_level_site;
     bool m_response_body_was_handed_off { false };
+    WeakPtr<WebContentClient> m_response_body_host;
+    Optional<int> m_response_body_adopter_client_id;
+    Optional<ResponseProvidedByWebDriver> m_response_provided_by_webdriver;
     Function<void(bool)> m_completion_steps;
+    Function<void()> m_steps_after_adopter_designation;
 };
 
 }

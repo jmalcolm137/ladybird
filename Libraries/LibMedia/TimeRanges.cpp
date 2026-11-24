@@ -11,7 +11,7 @@
 
 namespace Media {
 
-void TimeRanges::add_range(AK::Duration start, AK::Duration end)
+void TimeRanges::add_range(AK::Duration start, AK::Duration end, AK::Duration maximum_gap_to_bridge)
 {
     if (start >= end)
         return;
@@ -26,7 +26,7 @@ void TimeRanges::add_range(AK::Duration start, AK::Duration end)
     binary_search(m_ranges, start, &insert_index, [](AK::Duration needle, Range const& range) -> int {
         return needle <=> range.start;
     });
-    if (m_ranges[insert_index].end < start)
+    if (m_ranges[insert_index].end + maximum_gap_to_bridge < start)
         insert_index++;
 
     // Determine the range of ranges that will be made contiguous by this new range.
@@ -37,7 +37,7 @@ void TimeRanges::add_range(AK::Duration start, AK::Duration end)
     if (merge_end_index < m_ranges.size()) {
         merged_start = min(merged_start, m_ranges[merge_end_index].start);
 
-        while (merge_end_index < m_ranges.size() && m_ranges[merge_end_index].start <= merged_end) {
+        while (merge_end_index < m_ranges.size() && m_ranges[merge_end_index].start <= merged_end + maximum_gap_to_bridge) {
             merged_end = max(merged_end, m_ranges[merge_end_index].end);
             merge_end_index++;
         }
@@ -50,6 +50,57 @@ void TimeRanges::add_range(AK::Duration start, AK::Duration end)
     } else {
         m_ranges.insert(insert_index, { merged_start, merged_end });
     }
+}
+
+static void append_merging_with_last(Vector<TimeRanges::Range>& ranges, TimeRanges::Range const& range, AK::Duration maximum_gap_to_bridge)
+{
+    if (!ranges.is_empty() && range.start <= ranges.last().end + maximum_gap_to_bridge) {
+        ranges.last().end = max(ranges.last().end, range.end);
+        return;
+    }
+    ranges.append(range);
+}
+
+static Vector<TimeRanges::Range> merge_sorted_ranges(Vector<TimeRanges::Range> const& a, Vector<TimeRanges::Range> const& b, AK::Duration maximum_gap_to_bridge)
+{
+    Vector<TimeRanges::Range> result;
+    result.ensure_capacity(a.size() + b.size());
+    size_t a_index = 0;
+    size_t b_index = 0;
+    while (a_index < a.size() || b_index < b.size()) {
+        if (b_index == b.size() || (a_index < a.size() && a[a_index].start <= b[b_index].start))
+            append_merging_with_last(result, a[a_index++], maximum_gap_to_bridge);
+        else
+            append_merging_with_last(result, b[b_index++], maximum_gap_to_bridge);
+    }
+    return result;
+}
+
+void TimeRanges::add_ranges(Vector<Range> const& ranges, AK::Duration maximum_gap_to_bridge)
+{
+    // Split the ranges into ascending stretches, then merge neighboring stretches until one remains.
+    Vector<Vector<Range>> stretches;
+    for (auto const& range : ranges) {
+        if (range.start >= range.end)
+            continue;
+        if (stretches.is_empty() || range.start < stretches.last().last().start)
+            stretches.append({});
+        append_merging_with_last(stretches.last(), range, maximum_gap_to_bridge);
+    }
+    if (stretches.is_empty())
+        return;
+    stretches.append(move(m_ranges));
+
+    while (stretches.size() > 1) {
+        Vector<Vector<Range>> merged_stretches;
+        merged_stretches.ensure_capacity((stretches.size() + 1) / 2);
+        for (size_t index = 0; index + 1 < stretches.size(); index += 2)
+            merged_stretches.unchecked_append(merge_sorted_ranges(stretches[index], stretches[index + 1], maximum_gap_to_bridge));
+        if (stretches.size() % 2 == 1)
+            merged_stretches.unchecked_append(move(stretches.last()));
+        stretches = move(merged_stretches);
+    }
+    m_ranges = move(stretches.first());
 }
 
 void TimeRanges::remove_range(AK::Duration start, AK::Duration end)
@@ -143,6 +194,24 @@ Optional<TimeRanges::Range> TimeRanges::range_at_or_after(AK::Duration point) co
 namespace IPC {
 
 template<>
+ErrorOr<void> encode(Encoder& encoder, Media::TimeRanges::Range const& range)
+{
+    TRY(encoder.encode(range.start));
+    TRY(encoder.encode(range.end));
+    return {};
+}
+
+template<>
+ErrorOr<Media::TimeRanges::Range> decode(Decoder& decoder)
+{
+    auto start = TRY(decoder.decode<AK::Duration>());
+    auto end = TRY(decoder.decode<AK::Duration>());
+    if (end < start)
+        return Error::from_string_literal("IPC: Invalid time range");
+    return Media::TimeRanges::Range { start, end };
+}
+
+template<>
 ErrorOr<void> encode(Encoder& encoder, Media::TrackBufferedRanges const& track)
 {
     TRY(encoder.encode(track.track_identifier));
@@ -164,10 +233,8 @@ template<>
 ErrorOr<void> encode(Encoder& encoder, Media::TimeRanges const& ranges)
 {
     TRY(encoder.encode(static_cast<u64>(ranges.size())));
-    for (auto const& range : ranges) {
-        TRY(encoder.encode(range.start));
-        TRY(encoder.encode(range.end));
-    }
+    for (auto const& range : ranges)
+        TRY(encoder.encode(range));
     return {};
 }
 
@@ -177,11 +244,8 @@ ErrorOr<Media::TimeRanges> decode(Decoder& decoder)
     auto range_count = TRY(decoder.decode<u64>());
     Media::TimeRanges ranges;
     for (u64 i = 0; i < range_count; i++) {
-        auto start = TRY(decoder.decode<AK::Duration>());
-        auto end = TRY(decoder.decode<AK::Duration>());
-        if (end < start)
-            return Error::from_string_literal("IPC: Invalid time range");
-        ranges.add_range(start, end);
+        auto range = TRY(decoder.decode<Media::TimeRanges::Range>());
+        ranges.add_range(range.start, range.end);
     }
     return ranges;
 }

@@ -5,15 +5,18 @@
  */
 
 #include <AK/Array.h>
+#include <AK/ByteString.h>
 #include <AK/CharacterTypes.h>
 #include <AK/Diagnostics.h>
 #include <AK/Find.h>
 #include <AK/HashMap.h>
 #include <AK/NonnullOwnPtr.h>
+#include <AK/String.h>
 #include <AK/Traits.h>
 #include <LibUnicode/CharacterTypes.h>
 #include <LibUnicode/ICU.h>
 
+#include <unicode/locid.h>
 #include <unicode/uchar.h>
 #include <unicode/uniset.h>
 #include <unicode/uscript.h>
@@ -275,6 +278,16 @@ bool code_point_has_emoji_presentation_property(u32 code_point)
     return code_point_has_property(code_point, UCHAR_EMOJI_PRESENTATION);
 }
 
+bool code_point_has_emoji_modifier_base_property(u32 code_point)
+{
+    return code_point_has_property(code_point, UCHAR_EMOJI_MODIFIER_BASE);
+}
+
+bool code_point_has_extended_pictographic_property(u32 code_point)
+{
+    return code_point_has_property(code_point, UCHAR_EXTENDED_PICTOGRAPHIC);
+}
+
 bool code_point_has_default_ignorable_code_point_property(u32 code_point)
 {
     return code_point_has_property(code_point, UCHAR_DEFAULT_IGNORABLE_CODE_POINT);
@@ -444,6 +457,33 @@ bool code_point_has_script(u32 code_point, Script script)
     return false;
 }
 
+Optional<String> likely_language_for_script_of(u32 code_point)
+{
+    UErrorCode status = U_ZERO_ERROR;
+    auto script = uscript_getScript(static_cast<UChar32>(code_point), &status);
+    if (icu_failure(status))
+        return {};
+    switch (script) {
+    case USCRIPT_COMMON:
+    case USCRIPT_INHERITED:
+    case USCRIPT_UNKNOWN:
+    case USCRIPT_LATIN:
+    case USCRIPT_HAN:
+        return {};
+    default:
+        break;
+    }
+
+    auto locale = icu::Locale::createFromName(ByteString::formatted("und_{}", uscript_getShortName(script)).characters());
+    locale.addLikelySubtags(status);
+    if (icu_failure(status))
+        return {};
+    StringView language { locale.getLanguage(), strlen(locale.getLanguage()) };
+    if (language.is_empty() || language == "und"sv)
+        return {};
+    return MUST(String::from_utf8(language));
+}
+
 bool code_point_has_script_extension(u32 code_point, Script script)
 {
     auto icu_code_point = static_cast<UChar32>(code_point);
@@ -515,7 +555,7 @@ BidiClass bidirectional_class(u32 code_point)
     return char_direction_to_bidi_class(direction);
 }
 
-static LineBreakClass resolved_line_break_class(u32 code_point, bool allow_conditional_japanese_starters)
+LineBreakClass line_break_class(u32 code_point)
 {
     auto icu_code_point = static_cast<UChar32>(code_point);
     auto icu_line_break = static_cast<ULineBreak>(u_getIntPropertyValue(icu_code_point, UCHAR_LINE_BREAK));
@@ -530,22 +570,68 @@ static LineBreakClass resolved_line_break_class(u32 code_point, bool allow_condi
     case U_LB_H2:
     case U_LB_H3:
         return LineBreakClass::Ideographic;
+    case U_LB_JL:
+    case U_LB_JV:
+    case U_LB_JT:
+        return LineBreakClass::HangulJamo;
     case U_LB_AMBIGUOUS:
         return LineBreakClass::Ambiguous;
     case U_LB_COMPLEX_CONTEXT:
+        // https://www.unicode.org/reports/tr14/#LB1
+        // In the absence of such criteria all characters with a specific combination of original class and
+        // General_Category property value are resolved as follows:
+        // Resolved | Original | General_Category
+        // [...]
+        // CM       | SA       | Only Mn or Mc
+        if ((U_GET_GC_MASK(icu_code_point) & (U_GC_MN_MASK | U_GC_MC_MASK)) != 0)
+            return LineBreakClass::CombiningMark;
         return LineBreakClass::ComplexContext;
     case U_LB_COMBINING_MARK:
         return LineBreakClass::CombiningMark;
     case U_LB_CONDITIONAL_JAPANESE_STARTER:
-        return allow_conditional_japanese_starters ? LineBreakClass::Ideographic : LineBreakClass::Other;
+        return LineBreakClass::ConditionalJapaneseStarter;
+    case U_LB_OPEN_PUNCTUATION:
+        return LineBreakClass::OpenPunctuation;
+    case U_LB_CLOSE_PUNCTUATION:
+    case U_LB_CLOSE_PARENTHESIS:
+        return LineBreakClass::ClosePunctuation;
+    case U_LB_BREAK_SYMBOLS:
+        return LineBreakClass::BreakSymbols;
+    case U_LB_INFIX_NUMERIC:
+        return LineBreakClass::InfixNumericSeparator;
+    case U_LB_PREFIX_NUMERIC:
+        return LineBreakClass::PrefixNumeric;
+    case U_LB_POSTFIX_NUMERIC:
+        return LineBreakClass::PostfixNumeric;
+    case U_LB_HYPHEN:
+        return LineBreakClass::Hyphen;
+    case U_LB_GLUE:
+        return LineBreakClass::Glue;
+    case U_LB_WORD_JOINER:
+        return LineBreakClass::WordJoiner;
+    case U_LB_ZWJ:
+        return LineBreakClass::ZeroWidthJoiner;
     default:
         return LineBreakClass::Other;
     }
 }
 
-LineBreakClass line_break_class(u32 code_point)
+JoiningType joining_type(u32 code_point)
 {
-    return resolved_line_break_class(code_point, false);
+    switch (static_cast<UJoiningType>(u_getIntPropertyValue(static_cast<UChar32>(code_point), UCHAR_JOINING_TYPE))) {
+    case U_JT_TRANSPARENT:
+        return JoiningType::Transparent;
+    case U_JT_DUAL_JOINING:
+        return JoiningType::DualJoining;
+    case U_JT_JOIN_CAUSING:
+        return JoiningType::JoinCausing;
+    case U_JT_LEFT_JOINING:
+        return JoiningType::LeftJoining;
+    case U_JT_RIGHT_JOINING:
+        return JoiningType::RightJoining;
+    default:
+        return JoiningType::NonJoining;
+    }
 }
 
 // 22.2.2.7.3 Canonicalize ( rer, ch ), https://tc39.es/ecma262/#sec-runtime-semantics-canonicalize-ch
@@ -773,7 +859,8 @@ bool unicode_code_point_matches_range_ignoring_case(u32, u32, u32, bool);
 u32 unicode_get_case_closure(u32, u32*, u32);
 
 u8 unicode_layout_bidirectional_class(u32);
-u8 unicode_layout_line_break_class(u32, bool);
+u8 unicode_layout_line_break_class(u32);
+u8 unicode_layout_joining_type(u32);
 bool unicode_layout_code_point_has_emoji_property(u32);
 }
 
@@ -968,16 +1055,21 @@ extern "C" u32 unicode_get_case_closure(
     return count;
 }
 
-// LibWeb's text chunker classifies code points by these, mirroring the declaration order of BidiClass and
-// LineBreakClass.
+// LibWeb's text chunker classifies code points by these, mirroring the declaration order of BidiClass,
+// LineBreakClass and JoiningType.
 extern "C" u8 unicode_layout_bidirectional_class(u32 code_point)
 {
     return to_underlying(Unicode::bidirectional_class(code_point));
 }
 
-extern "C" u8 unicode_layout_line_break_class(u32 code_point, bool allow_conditional_japanese_starters)
+extern "C" u8 unicode_layout_line_break_class(u32 code_point)
 {
-    return to_underlying(Unicode::resolved_line_break_class(code_point, allow_conditional_japanese_starters));
+    return to_underlying(Unicode::line_break_class(code_point));
+}
+
+extern "C" u8 unicode_layout_joining_type(u32 code_point)
+{
+    return to_underlying(Unicode::joining_type(code_point));
 }
 
 extern "C" bool unicode_layout_code_point_has_emoji_property(u32 code_point)

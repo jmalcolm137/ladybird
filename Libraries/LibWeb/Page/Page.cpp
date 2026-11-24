@@ -6,6 +6,7 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <AK/AnyOf.h>
 #include <AK/SourceLocation.h>
 #include <AK/Utf16StringBuilder.h>
 #include <LibAudio/RecordStream.h>
@@ -14,6 +15,7 @@
 #include <LibGfx/Bitmap.h>
 #include <LibIPC/Decoder.h>
 #include <LibIPC/Encoder.h>
+#include <LibJS/HostClassBuilder.h>
 #include <LibWeb/Bindings/CSS.h>
 #include <LibWeb/CSS/StyleComputer.h>
 #include <LibWeb/CSS/StyleEngineInput.h>
@@ -25,6 +27,7 @@
 #include <LibWeb/Editing/SpellCheckController.h>
 #include <LibWeb/Editing/SpellingMarkers.h>
 #include <LibWeb/Editing/WritingSuggestionController.h>
+#include <LibWeb/Fetch/Engine/NetworkActivity.h>
 #include <LibWeb/HTML/BrowsingContext.h>
 #include <LibWeb/HTML/CheckUnloadingCanceledState.h>
 #include <LibWeb/HTML/EventLoop/EventLoop.h>
@@ -49,6 +52,7 @@
 #include <LibWeb/Layout/Viewport.h>
 #include <LibWeb/Loader/ContentBlocker.h>
 #include <LibWeb/MediaCapture/MediaDevices.h>
+#include <LibWeb/MediaSession/ActiveMediaSessionTracker.h>
 #include <LibWeb/NotificationsAPI/Notification.h>
 #include <LibWeb/Page/Page.h>
 #include <LibWeb/Page/RenderingStats.h>
@@ -64,6 +68,13 @@
 #include <LibWebCommon/HTML/SelectedFile.h>
 #include <LibWebCommon/Loader/ContentBlocking.h>
 
+extern "C" {
+
+// Defined in Bindings/Rust/src/web_gl/exports.rs.
+void web_webgl_lose_contexts_of_this_thread(JSVM*);
+void web_webgl_restore_contexts_of_this_thread(JSVM*);
+}
+
 namespace Web {
 
 GC_DEFINE_ALLOCATOR(Page);
@@ -77,6 +88,7 @@ Page::Page(GC::Ref<PageClient> client)
     : m_client(client)
     , m_history_executor(GC::Heap::the().allocate<HTML::HistoryExecutor>(*this))
     , m_picture_in_picture_controller(GC::Heap::the().allocate<PictureInPicture::PictureInPictureController>(*this))
+    , m_active_media_session_tracker(make<MediaSession::ActiveMediaSessionTracker>(*this))
 {
 }
 
@@ -153,6 +165,7 @@ void Page::visit_edges(JS::Cell::Visitor& visitor)
     visitor.visit(m_history_executor);
     visitor.visit(m_picture_in_picture_controller);
     visitor.visit(m_client);
+    m_active_media_session_tracker->visit_edges(visitor);
     visitor.visit(m_window_rect_observer);
     visitor.visit(m_on_pending_dialog_closed);
     visitor.visit(m_pending_clipboard_requests);
@@ -419,7 +432,7 @@ CSS::PreferredColorScheme Page::preferred_color_scheme() const
     // Force-dark presents a dark preference, the way Android WebView's force-dark does (Chrome itself leaves the
     // preference alone and darkens per element): a page that can style itself dark does, the color-scheme opt-out keeps
     // the filter away from it, and only pages with no dark support get filtered.
-    if (has_local_traversable() && local_traversable()->force_dark_enabled())
+    if (has_local_traversable() ? local_traversable()->force_dark_enabled() : m_force_dark_for_local_roots)
         return CSS::PreferredColorScheme::Dark;
 
     auto preferred_color_scheme = m_client->preferred_color_scheme();
@@ -492,17 +505,6 @@ DevicePixelRect Page::enclosing_device_rect(CSSPixelRect rect) const
         floor(rect.y().to_double() * scale),
         ceil(rect.width().to_double() * scale),
         ceil(rect.height().to_double() * scale));
-}
-
-DevicePixelRect Page::rounded_device_rect(CSSPixelRect rect) const
-{
-    auto scale = client().device_pixels_per_css_pixel();
-    return {
-        roundf(rect.x().to_double() * scale),
-        roundf(rect.y().to_double() * scale),
-        roundf(rect.width().to_double() * scale),
-        roundf(rect.height().to_double() * scale)
-    };
 }
 
 ChromeMetrics Page::chrome_metrics() const
@@ -809,6 +811,25 @@ void Page::update_needs_beforeunload_check()
     client().page_did_change_needs_beforeunload_check(m_needs_beforeunload_check);
 }
 
+// Whether the user edited a document this page hosts, so that they would lose what they typed if the page went away.
+void Page::update_had_user_edits()
+{
+    auto had_user_edits = false;
+    for (auto const& navigable : hosted_navigables()) {
+        // NB: A document that is leaving its navigable, such as that of a removed iframe, is still its active document.
+        if (auto document = navigable->active_document(); document && document->navigable().ptr() == navigable.ptr() && document->had_user_edits()) {
+            had_user_edits = true;
+            break;
+        }
+    }
+
+    if (m_had_user_edits == had_user_edits)
+        return;
+
+    m_had_user_edits = had_user_edits;
+    client().page_did_change_had_user_edits(m_had_user_edits);
+}
+
 void Page::set_top_level_traversable(GC::Ref<HTML::Navigable> navigable)
 {
     VERIFY(!m_top_level_traversable); // Replacement is not allowed!
@@ -830,6 +851,22 @@ bool Page::has_local_traversable() const
 GC::Ref<HTML::LocalNavigable> Page::local_traversable() const
 {
     return as<HTML::LocalNavigable>(*m_top_level_traversable);
+}
+
+void Page::set_force_dark_for_local_roots(bool enabled)
+{
+    if (m_force_dark_for_local_roots == enabled)
+        return;
+    m_force_dark_for_local_roots = enabled;
+    // NB: A local root can still be a stand-in that its remote parent doesn't list as a child yet, which local_roots()
+    //     wouldn't find, so this sets it on every local navigable of the page.
+    GC::RootVector<GC::Ref<HTML::LocalNavigable>> navigables;
+    for (auto navigable : HTML::all_local_navigables()) {
+        if (&navigable->page() == this && !navigable->has_been_destroyed())
+            navigables.append(*navigable);
+    }
+    for (auto const& navigable : navigables)
+        navigable->set_force_dark_enabled(enabled);
 }
 
 GC::RootVector<GC::Ref<HTML::LocalNavigable>> Page::local_roots() const
@@ -947,6 +984,7 @@ void Page::discard_provisional_navigable_of(HTML::RemoteNavigable& remote_naviga
     if (m_top_level_traversable.ptr() == navigable.ptr()) {
         m_top_level_traversable = remote_navigable;
         update_needs_beforeunload_check();
+        update_had_user_edits();
         retire_page_compositor_context(navigable->take_compositor_context());
     }
     navigable->set_has_been_destroyed();
@@ -982,6 +1020,7 @@ GC::Ref<HTML::LocalNavigable> Page::begin_hosting(HTML::CrossProcessId id, HTML:
         VERIFY(m_top_level_traversable.ptr() == navigable.ptr());
         m_top_level_traversable = stand_in;
         update_needs_beforeunload_check();
+        update_had_user_edits();
         return stand_in;
     }
     return HTML::LocalNavigable::create_stand_in({}, *navigable, current_history_entry);
@@ -1243,6 +1282,25 @@ void Page::did_complete_window_rect_request(u64 completion_id)
 {
     if (m_window_rect_observer)
         m_window_rect_observer->function()({ window_position(), window_size() }, completion_id);
+}
+
+void Page::did_receive_network_activity(Fetch::Engine::Event::NetworkActivity const& network_activity)
+{
+    auto request_id = network_activity.request_id.value();
+    network_activity.activity.visit(
+        [&](Fetch::Engine::Event::NetworkActivity::RequestStarted const& started) {
+            auto referrer_policy = MUST(String::from_utf8(ReferrerPolicy::to_string(started.referrer_policy)));
+            client().page_did_start_network_request(request_id, started.url, started.method, started.headers, started.body.bytes(), started.initiator_type, referrer_policy, started.is_navigation_request, started.priority);
+        },
+        [&](Fetch::Engine::Event::NetworkActivity::ResponseHeaders const& headers) {
+            client().page_did_receive_network_response_headers(request_id, headers.status_code, headers.reason_phrase, headers.headers, headers.cache_state);
+        },
+        [&](Fetch::Engine::Event::NetworkActivity::ResponseBodyBytes const& body_bytes) {
+            client().page_did_receive_network_response_body(request_id, body_bytes.bytes.bytes());
+        },
+        [&](Fetch::Engine::Event::NetworkActivity::RequestFinished const& finished) {
+            client().page_did_finish_network_request(request_id, finished.total_size, finished.timing_info, finished.network_error);
+        });
 }
 
 // NB: The response is named as a member of the page, so that the function waiting for it captures only the page.
@@ -1682,7 +1740,7 @@ void Page::set_emulated_position_data(Geolocation::EmulatedPositionData data)
 
 void Page::set_emulated_position_data(Geolocation::CoordinatesData coordinates_data)
 {
-    set_emulated_position_data(heap().allocate<Geolocation::GeolocationCoordinates>(move(coordinates_data)));
+    set_emulated_position_data(Geolocation::GeolocationCoordinates::create(coordinates_data));
 }
 
 u64 Page::register_emulated_position_data_observer(GC::Ref<GC::Function<void()>> observer)
@@ -1822,8 +1880,8 @@ void Page::receive_geolocation_position(u64 request_id, GeolocationPositionResul
 
     if (request->type == GeolocationRequestType::Watch) {
         auto callback = request->callback;
-        if (result.has<Geolocation::GeolocationPositionError::ErrorCode>()
-            && result.get<Geolocation::GeolocationPositionError::ErrorCode>() == Geolocation::GeolocationPositionError::ErrorCode::PermissionDenied)
+        if (result.has<Geolocation::GeolocationPositionErrorCode>()
+            && result.get<Geolocation::GeolocationPositionErrorCode>() == Geolocation::GeolocationPositionErrorCode::PermissionDenied)
             m_pending_geolocation_requests.remove(request_id);
         callback->function()(result);
         return;
@@ -1837,8 +1895,8 @@ void Page::receive_geolocation_position(u64 request_id, GeolocationPositionResul
     // A position, or a failure to get one, is the same answer for every document on the page, so the queued requests
     // complete with it too. A denial is the answer for the requesting document alone, so the others stay queued, and
     // the next of them is sent.
-    auto denied = result.has<Geolocation::GeolocationPositionError::ErrorCode>()
-        && result.get<Geolocation::GeolocationPositionError::ErrorCode>() == Geolocation::GeolocationPositionError::ErrorCode::PermissionDenied;
+    auto denied = result.has<Geolocation::GeolocationPositionErrorCode>()
+        && result.get<Geolocation::GeolocationPositionErrorCode>() == Geolocation::GeolocationPositionErrorCode::PermissionDenied;
 
     GC::RootVector<GeolocationPositionCallback> callbacks;
     Vector<u64> completed_request_ids;
@@ -1861,6 +1919,17 @@ void Page::receive_geolocation_position(u64 request_id, GeolocationPositionResul
         callback->function()(result);
 }
 
+// https://w3c.github.io/mediasession/#handle-media-session-action
+void Page::handle_media_session_action(Bindings::MediaSessionAction action, Optional<double> seek_offset, Optional<double> seek_time, Optional<bool> fast_seek)
+{
+    auto document = m_active_media_session_tracker->active_document();
+    if (!document)
+        return;
+    HTML::queue_global_task(HTML::Task::Source::UserInteraction, HTML::relevant_global_object(*document), GC::create_function(heap(), GC::captures(*this, action, seek_offset, seek_time, fast_seek), [](auto& page, auto action, auto seek_offset, auto seek_time, auto fast_seek) {
+        page.active_media_session_tracker().handle_action(action, seek_offset, seek_time, fast_seek);
+    }));
+}
+
 void Page::register_media_element(Badge<HTML::HTMLMediaElement>, UniqueNodeID media_id)
 {
     m_media_elements.append(media_id);
@@ -1871,10 +1940,10 @@ void Page::unregister_media_element(Badge<HTML::HTMLMediaElement>, UniqueNodeID 
     m_media_elements.remove_all_matching([&](auto candidate_id) {
         return candidate_id == media_id;
     });
+    m_active_media_session_tracker->media_element_unregistered(media_id);
 }
 
-template<typename Callback>
-void Page::for_each_media_element(Callback&& callback)
+void Page::for_each_media_element(Function<void(HTML::HTMLMediaElement&)> const& callback)
 {
     for (auto media_id : m_media_elements) {
         if (auto* node = DOM::Node::from_unique_id(media_id))
@@ -1902,10 +1971,11 @@ bool Page::has_media_element_playing_audio(DOM::Document const& document) const
     return false;
 }
 
-void Page::sync_media_element_video_sink_ticking()
+void Page::sync_media_element_video_sink_ticking(ReadonlySpan<GC::Root<DOM::Document>> laid_out_documents)
 {
     for_each_media_element([&](auto& media_element) {
-        media_element.sync_video_sink_ticking();
+        auto document_was_laid_out = any_of(laid_out_documents, [&](auto const& document) { return document.ptr() == &media_element.document(); });
+        media_element.sync_video_sink_ticking(document_was_laid_out ? HTML::HTMLMediaElement::DocumentWasLaidOut::Yes : HTML::HTMLMediaElement::DocumentWasLaidOut::No);
     });
 }
 
@@ -1969,6 +2039,7 @@ void Page::prepare_canvas_contexts_for_compositing()
 
 void Page::notify_all_canvas_elements_of_lost_backing_storage()
 {
+    web_webgl_restore_contexts_of_this_thread(JS::HostABI::vm_to_abi(JS::VM::the()));
     for_each_canvas_element([](auto& canvas_element) {
         canvas_element.notify_compositor_backing_storage_lost();
     });
@@ -1976,9 +2047,7 @@ void Page::notify_all_canvas_elements_of_lost_backing_storage()
 
 void Page::notify_all_webgl_contexts_lost()
 {
-    for_each_canvas_element([](auto& canvas_element) {
-        canvas_element.notify_compositor_connection_lost();
-    });
+    web_webgl_lose_contexts_of_this_thread(JS::HostABI::vm_to_abi(JS::VM::the()));
 }
 
 void Page::record_context_menu_request(Badge<EventHandler>, ContextMenuRequest request)
@@ -2664,6 +2733,11 @@ void Page::container_unfullscreen_complete(HTML::CrossProcessId hosted_root_id)
         return;
     exit->container_chain = ContainerChain::Complete;
     process_pending_fullscreen_operations();
+}
+
+Optional<MediaSession::MediaSessionState> PageClient::page_did_request_now_playing_state_for_testing()
+{
+    return {};
 }
 
 void PageClient::request_navigation_start(HTML::LocalNavigable&, NavigationTarget, URL::URL const&, Utf16String, Optional<HTML::NavigationStartRequest>)

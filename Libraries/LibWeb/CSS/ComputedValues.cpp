@@ -373,13 +373,7 @@ Vector<RefPtr<AbstractImageStyleValue const>> ComputedValues::MaskValues::mask_i
     return abstract_image_items(mask_image);
 }
 
-ComputedValues::Statistics ComputedValues::s_statistics;
-
-ComputedValues::ComputedValues()
-{
-    ++s_statistics.live_instance_count;
-    ++s_statistics.total_instances_created;
-}
+ComputedValues::ComputedValues() = default;
 
 StyleRecordRef::StyleRecordRef(void const* record)
     : m_record(record)
@@ -395,16 +389,11 @@ StyleRecordRef::~StyleRecordRef()
 }
 
 ComputedValues::ComputedValues(BorrowedStyleRecord)
-    : m_is_style_record_view(true)
 {
     m_ref_count = 0;
 }
 
-ComputedValues::~ComputedValues()
-{
-    if (!m_is_style_record_view)
-        --s_statistics.live_instance_count;
-}
+ComputedValues::~ComputedValues() = default;
 
 bool ComputedValues::is_property_important(PropertyID property_id) const
 {
@@ -443,7 +432,6 @@ RefPtr<StyleValue const> ComputedValues::style_value_from_handle(PropertyID prop
             return it->value;
     }
     auto value = StyleValue::adopt_rust_style_value_data(StyleValueFFI::rust_style_value_retain(handle.data()));
-    count_longhand_wrapper_mint();
     if (!m_style_value_cache)
         m_style_value_cache = make<HashMap<PropertyID, NonnullRefPtr<StyleValue const>>>();
     m_style_value_cache->set(property_id, value);
@@ -544,7 +532,6 @@ RefPtr<StyleValue const> ComputedValues::computed_style_value(PropertyID propert
             return it->value;
     }
     auto value = StyleValue::adopt_rust_style_value_data(StyleValueFFI::rust_style_value_retain(static_cast<StyleValueFFI::StyleValueData const*>(stored)));
-    count_longhand_wrapper_mint();
     if (!m_style_value_cache)
         m_style_value_cache = make<HashMap<PropertyID, NonnullRefPtr<StyleValue const>>>();
     m_style_value_cache->set(property_id, value);

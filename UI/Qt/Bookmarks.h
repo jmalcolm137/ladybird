@@ -6,8 +6,6 @@
 
 #pragma once
 
-#include <AK/ByteBuffer.h>
-#include <AK/HashMap.h>
 #include <AK/Optional.h>
 #include <AK/String.h>
 #include <AK/Vector.h>
@@ -30,10 +28,8 @@ public:
     virtual ~Bookmarks() override;
 
     Vector<WebView::AutocompleteSuggestion> suggestions_for(StringView query, size_t max_suggestions) const;
-    Optional<ByteBuffer> favicon_png(String const& favicon_hash) const;
 
     Menu& menu() { return *m_menu; }
-    Menu& show_bookmarks_bar_menu() { return *m_show_bookmarks_bar_menu; }
     Menu& bookmarks_bar_context_menu() { return *m_bookmarks_bar_context_menu; }
     Menu& bookmark_context_menu() { return *m_bookmark_context_menu; }
     Menu& bookmark_folder_context_menu() { return *m_bookmark_folder_context_menu; }
@@ -47,6 +43,7 @@ private:
     virtual void bookmarks_changed() override;
 
     virtual void appearance_changed() override;
+    virtual void tab_settings_changed() override;
 
     struct ContextMenuItem {
         String id;
@@ -70,7 +67,6 @@ private:
     void open_url_in_new_window(String const& bookmark_id, WebView::IsPrivate) const;
     void open_folder_in_new_tabs(String const& folder_id) const;
 
-    void read_missing_favicons();
     void update_autocomplete_bookmarks();
 
     BookmarkStore& m_store;
@@ -89,8 +85,6 @@ private:
     size_t m_menu_static_size { 0 };
     Optional<ContextMenuItem> m_context_menu_item;
 
-    // A favicon's hash is of its content, so what was read for a hash stays true.
-    HashMap<String, Optional<ByteBuffer>> m_favicons;
     Vector<WebView::AutocompleteBookmark> m_autocomplete_bookmarks;
 };
 

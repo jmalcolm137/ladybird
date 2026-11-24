@@ -40,6 +40,7 @@ public:
 
     void add_media_stream_source(u64 stream_id, NonnullRefPtr<Media::MediaStream> const&);
 
+    void start(u64 seek_request_id);
     void seek(u64 seek_request_id, AK::Duration timestamp, Media::SeekMode);
     void set_audio_track_enabled(u64 seek_request_id, Media::Track const&, bool enabled, bool resume_ended_playback);
     void reserve_video_sink(u64 seek_request_id, Media::Track const&, Media::VideoSinkHandle, bool resume_ended_playback);
@@ -107,6 +108,7 @@ private:
     NonnullRefPtr<Audio::OutputSession> m_audio_output_session;
     NonnullOwnPtr<Media::PlaybackManager> m_manager;
     u64 m_applied_seek_request_id { 0 };
+    bool m_reported_playback_state_is_settled { true };
 
     HashMap<u64, MediaStreamSource> m_media_stream_sources;
     HashMap<u64, SourceBuffer> m_source_buffers;

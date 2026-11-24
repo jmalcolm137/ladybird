@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <AK/Array.h>
 #include <AK/HashMap.h>
 #include <AK/QuickSort.h>
 #include <AK/kmalloc.h>
@@ -73,6 +74,7 @@ enum Column {
     CPU,
     Memory,
     PID,
+    CanUnload,
 };
 
 enum class RowKind {
@@ -84,10 +86,10 @@ enum class RowKind {
 };
 
 // Process rows are identified by the process's child ID, which, unlike its PID, never comes to name another process.
-// Site rows are identified by their site.
+// Site rows are identified by their site and privacy.
 constexpr int ChildIDRole = Qt::UserRole + 1;
 constexpr int KindRole = Qt::UserRole + 2;
-constexpr int SiteRole = Qt::UserRole + 3;
+constexpr int SiteKeyRole = Qt::UserRole + 3;
 // What a site row says after the site's name, such as how many tabs show it.
 constexpr int NoteRole = Qt::UserRole + 4;
 
@@ -279,6 +281,107 @@ public:
     }
 };
 
+static QString duration_text(i64 seconds)
+{
+    if (seconds < 60)
+        return QObject::tr("less than a minute");
+    auto minutes = seconds / 60;
+    if (minutes < 60)
+        return QObject::tr("%1 min").arg(minutes);
+    return QObject::tr("%1 h %2 min").arg(minutes / 60).arg(minutes % 60);
+}
+
+struct CanUnloadState {
+    bool can_unload { false };
+    QString explanation;
+};
+
+// Whether a tab can be unloaded to save memory, and when it will be, or what keeps it loaded.
+static CanUnloadState can_unload_state(WebView::ProcessTabSnapshot const& tab)
+{
+    using WebView::DiscardBlockers;
+    auto blockers = tab.discard_blockers_after_inactivity.value_or(tab.discard_blockers_under_memory_pressure);
+
+    if (blockers == DiscardBlockers::None) {
+        if (!tab.discard_blockers_after_inactivity.has_value())
+            return { true, QObject::tr("Only when the system is about to run out of memory") };
+        if (tab.seconds_until_discarded_after_inactivity.has_value())
+            return { true, QObject::tr("Unloads in %1 if it stays hidden").arg(duration_text(*tab.seconds_until_discarded_after_inactivity)) };
+        return { true, {} };
+    }
+
+    struct Description {
+        DiscardBlockers blocker;
+        char const* text;
+    };
+    static constexpr Array descriptions {
+        Description { DiscardBlockers::NotATab, QT_TRANSLATE_NOOP("QObject", "It isn't a tab") },
+        Description { DiscardBlockers::NotRestorable, QT_TRANSLATE_NOOP("QObject", "Its window doesn't keep its history") },
+        Description { DiscardBlockers::Visible, QT_TRANSLATE_NOOP("QObject", "It's visible") },
+        Description { DiscardBlockers::Pinned, QT_TRANSLATE_NOOP("QObject", "It's pinned") },
+        Description { DiscardBlockers::CurrentTabOfWindow, QT_TRANSLATE_NOOP("QObject", "It's the current tab of its window") },
+        Description { DiscardBlockers::Loading, QT_TRANSLATE_NOOP("QObject", "It's loading") },
+        Description { DiscardBlockers::Crashed, QT_TRANSLATE_NOOP("QObject", "It crashed") },
+        Description { DiscardBlockers::PlayingAudio, QT_TRANSLATE_NOOP("QObject", "It's playing sound") },
+        Description { DiscardBlockers::RecentlyPlayedAudio, QT_TRANSLATE_NOOP("QObject", "It played sound in the last minute") },
+        Description { DiscardBlockers::CapturingAudio, QT_TRANSLATE_NOOP("QObject", "It's using the microphone") },
+        Description { DiscardBlockers::UsingLocation, QT_TRANSLATE_NOOP("QObject", "It's using your location") },
+        Description { DiscardBlockers::OwnsAView, QT_TRANSLATE_NOOP("QObject", "It has a Picture-in-Picture window") },
+        Description { DiscardBlockers::DevToolsConnected, QT_TRANSLATE_NOOP("QObject", "DevTools are open for it") },
+        Description { DiscardBlockers::UserEdits, QT_TRANSLATE_NOOP("QObject", "You typed into the page") },
+        Description { DiscardBlockers::Downloading, QT_TRANSLATE_NOOP("QObject", "It's downloading a file") },
+        Description { DiscardBlockers::AwaitingPermissionPrompt, QT_TRANSLATE_NOOP("QObject", "It's waiting for you to answer a permission request") },
+        Description { DiscardBlockers::ChangedTitleWhileHidden, QT_TRANSLATE_NOOP("QObject", "It changed its title while hidden") },
+        Description { DiscardBlockers::ChangedFaviconWhileHidden, QT_TRANSLATE_NOOP("QObject", "It changed its icon while hidden") },
+        Description { DiscardBlockers::MayShowNotifications, QT_TRANSLATE_NOOP("QObject", "The site may show notifications") },
+    };
+    QStringList lines { QObject::tr("Stays loaded:") };
+    for (auto const& description : descriptions) {
+        if (has_flag(blockers, description.blocker))
+            lines.append(QStringLiteral("• ") + QObject::tr(description.text));
+    }
+    // NB: A tab that only inactivity keeps loaded can still be unloaded, as one is when the timer is off.
+    auto can_unload_under_memory_pressure = tab.discard_blockers_after_inactivity.has_value() && tab.discard_blockers_under_memory_pressure == DiscardBlockers::None;
+    if (can_unload_under_memory_pressure)
+        lines.append(QObject::tr("It can still be unloaded when the system is about to run out of memory."));
+    return { can_unload_under_memory_pressure, lines.join('\n') };
+}
+
+// A row for several tabs, such as a site's, says whether all, some, or none of them can be unloaded, and why for each.
+static void set_can_unload(QTreeWidgetItem& item, Vector<WebView::ProcessTabSnapshot const*> const& tabs)
+{
+    if (tabs.is_empty())
+        return;
+
+    size_t unloadable_count = 0;
+    QStringList explanations;
+    for (auto const* tab : tabs) {
+        auto state = can_unload_state(*tab);
+        if (state.can_unload)
+            ++unloadable_count;
+        if (tabs.size() == 1) {
+            explanations.append(state.explanation);
+            continue;
+        }
+        auto title = tab->title.is_empty() ? QObject::tr("Untitled") : qstring_from_utf16_string(tab->title);
+        explanations.append(state.explanation.isEmpty() ? title : title + QStringLiteral("\n") + state.explanation);
+    }
+
+    // NB: Rows sort by how much of them can be unloaded, after the rows of processes that show no tab.
+    item.setTextAlignment(CanUnload, Qt::AlignRight | Qt::AlignVCenter);
+    if (unloadable_count == tabs.size()) {
+        item.setText(CanUnload, QObject::tr("Yes"));
+        item.setData(CanUnload, Qt::UserRole, 3);
+    } else if (unloadable_count == 0) {
+        item.setText(CanUnload, QObject::tr("No"));
+        item.setData(CanUnload, Qt::UserRole, 1);
+    } else {
+        item.setText(CanUnload, QObject::tr("Some"));
+        item.setData(CanUnload, Qt::UserRole, 2);
+    }
+    item.setToolTip(CanUnload, explanations.join(QStringLiteral("\n\n")));
+}
+
 // A frame's URL without what follows its path, which on the frames this names most often is a long tracking query.
 static QString frame_name(URL::URL const& url)
 {
@@ -406,7 +509,7 @@ ProcessManagerWindow::ProcessManagerWindow(Source source)
     process_tree->on_context_menu = [this](auto const& position) { show_context_menu(position); };
     m_processes = process_tree;
     m_processes->setHeader(new ProcessHeader(m_processes));
-    m_processes->setHeaderLabels({ tr("Name"), tr("CPU"), tr("Memory"), tr("PID") });
+    m_processes->setHeaderLabels({ tr("Name"), tr("CPU"), tr("Memory"), tr("PID"), tr("Can unload") });
     m_processes->headerItem()->setTextAlignment(Name, Qt::AlignLeft | Qt::AlignVCenter);
     m_processes->setIconSize(QSize(16, 16));
     m_processes->setAccessibleName(tr("Processes"));
@@ -423,7 +526,7 @@ ProcessManagerWindow::ProcessManagerWindow(Source source)
     m_processes->header()->setFixedHeight(30);
     m_processes->header()->setStretchLastSection(false);
     m_processes->header()->setSectionResizeMode(Name, QHeaderView::Stretch);
-    for (auto column : { CPU, Memory, PID }) {
+    for (auto column : { CPU, Memory, PID, CanUnload }) {
         m_processes->header()->setSectionResizeMode(column, QHeaderView::Interactive);
         m_processes->setColumnWidth(column, column == Memory ? 122 : 102);
         m_processes->headerItem()->setTextAlignment(column, Qt::AlignRight | Qt::AlignVCenter);
@@ -434,13 +537,13 @@ ProcessManagerWindow::ProcessManagerWindow(Source source)
     connect(m_search, &QLineEdit::textChanged, this, &ProcessManagerWindow::apply_filter);
     connect(m_processes, &QTreeWidget::itemExpanded, this, [this](QTreeWidgetItem* item) {
         if (row_kind(item) == RowKind::Site)
-            m_expanded_sites.set(ak_string_from_qstring(item->data(Name, SiteRole).toString()));
+            m_expanded_sites.set(ak_string_from_qstring(item->data(Name, SiteKeyRole).toString()));
     });
     connect(m_processes, &QTreeWidget::itemCollapsed, this, [this](QTreeWidgetItem* item) {
         if (row_kind(item) == RowKind::Process)
             item->setExpanded(true);
         if (row_kind(item) == RowKind::Site)
-            m_expanded_sites.remove(ak_string_from_qstring(item->data(Name, SiteRole).toString()));
+            m_expanded_sites.remove(ak_string_from_qstring(item->data(Name, SiteKeyRole).toString()));
     });
 
     m_footer = new QWidget(content);
@@ -534,14 +637,13 @@ QLineEdit#LadybirdTaskManagerFilter {{
     border: none;
     border-radius: 7px;
     padding: 0 8px;
-    selection-background-color: {5};
 }}
 QWidget#LadybirdTaskManagerFooter {{
     background: {0};
     border-top: 1px solid {2};
 }}
 QLabel#LadybirdTaskManagerSummary {{
-    color: {6};
+    color: {5};
 }}
 QPushButton#LadybirdTaskManagerEndButton {{
     color: {3};
@@ -551,10 +653,10 @@ QPushButton#LadybirdTaskManagerEndButton {{
     padding: 0 14px;
 }}
 QPushButton#LadybirdTaskManagerEndButton:pressed {{
-    background: {7};
+    background: {6};
 }}
 QPushButton#LadybirdTaskManagerEndButton:disabled {{
-    color: {6};
+    color: {5};
 }}
 QTreeWidget {{
     background: {0};
@@ -566,8 +668,9 @@ QTreeWidget::item {{
     padding: 0px 4px;
 }}
 )",
-        color(panel.page), color(Theme::chrome().toolbar), color(panel.separator), color(panel.text), color(panel.control),
-        color(Theme::selection()), color(panel.muted), color(panel.pressed)));
+                               color(panel.page), color(Theme::chrome().toolbar), color(panel.separator), color(panel.text), color(panel.control),
+                               color(panel.muted), color(panel.pressed))
+        + ChromeStyle::panel_text_selection_style_sheet({ "QLineEdit#LadybirdTaskManagerFilter" }, panel.text));
 
     // NB: The tree draws the selected row's fill itself, so the style's highlight under the branch area is left clear.
     auto tree_palette = m_processes->palette();
@@ -621,7 +724,7 @@ QIcon ProcessManagerWindow::favicon_for(WebView::ProcessPageSnapshot const& page
         return *icon;
     QIcon icon;
     if (auto png = m_source.favicon_png ? m_source.favicon_png(*favicon_hash) : Optional<ByteBuffer> {}; png.has_value())
-        icon = favicon_with_rounded_corners(icon_from_png(png->bytes(), 16), 16);
+        icon = favicon_from_png(png->bytes(), 16);
     if (icon.isNull())
         icon = create_chrome_icon(ChromeIcon::Globe, Theme::panel().body);
     m_favicons.set(*favicon_hash, icon);
@@ -668,6 +771,7 @@ void ProcessManagerWindow::refresh()
     };
 
     struct Site {
+        QString key;
         QString name;
         Vector<WebView::ProcessSnapshot const*> processes;
         size_t tab_count { 0 };
@@ -695,10 +799,13 @@ void ProcessManagerWindow::refresh()
             own_processes.append(&process);
             continue;
         }
-        auto site = sites.find_if([&](auto const& site) { return site.name == site_name; });
+        auto is_private = process.is_private == WebView::IsPrivate::Yes;
+        auto site_key = (is_private ? QStringLiteral("private:") : QStringLiteral("regular:")) + site_name;
+        auto site = sites.find_if([&](auto const& site) { return site.key == site_key; });
         if (site == sites.end()) {
             Site new_site;
-            new_site.name = site_name;
+            new_site.key = site_key;
+            new_site.name = is_private ? tr("%1 (Private)").arg(site_name) : site_name;
             sites.append(AK::move(new_site));
             site = sites.end() - 1;
         }
@@ -713,7 +820,7 @@ void ProcessManagerWindow::refresh()
 
     auto selected = m_processes->currentItem() && m_processes->currentItem()->isSelected() ? m_processes->currentItem() : nullptr;
     auto selected_child_id = selected && row_kind(selected) == RowKind::Process ? selected->data(PID, ChildIDRole) : QVariant {};
-    auto selected_site = selected && row_kind(selected) == RowKind::Site ? selected->data(Name, SiteRole) : QVariant {};
+    auto selected_site = selected && row_kind(selected) == RowKind::Site ? selected->data(Name, SiteKeyRole) : QVariant {};
     auto scroll_position = m_processes->verticalScrollBar()->value();
 
     QSignalBlocker selection_blocker(m_processes);
@@ -735,12 +842,16 @@ void ProcessManagerWindow::refresh()
             item.setTextAlignment(column, Qt::AlignRight | Qt::AlignVCenter);
     };
 
-    auto make_process_item = [&](WebView::ProcessSnapshot const& process, bool shows_title) {
+    auto make_process_item = [&](WebView::ProcessSnapshot const& process, bool is_ungrouped) {
         auto* item = new QTreeWidgetItem;
         item->setData(Name, KindRole, static_cast<int>(RowKind::Process));
         auto name = qstring_from_ak_string(WebView::process_name_from_type(process.type));
-        if (shows_title && process.title.has_value() && process.type != WebView::ProcessType::WebContent)
-            name += QStringLiteral(" — ") + qstring_from_utf16_string(*process.title);
+        if (is_ungrouped) {
+            if (process.title.has_value() && process.type != WebView::ProcessType::WebContent)
+                name += QStringLiteral(" — ") + qstring_from_utf16_string(*process.title);
+            if (process.is_private == WebView::IsPrivate::Yes)
+                name = tr("%1 (Private)").arg(name);
+        }
         item->setText(Name, name);
         item->setToolTip(Name, name);
         switch (process.type) {
@@ -773,6 +884,7 @@ void ProcessManagerWindow::refresh()
         item->setData(PID, Qt::UserRole, static_cast<qlonglong>(process.pid));
         item->setData(PID, ChildIDRole, static_cast<qulonglong>(process.child_id));
         set_numbers(*item, process.cpu_percent, process.memory_usage_bytes);
+        Vector<WebView::ProcessTabSnapshot const*> process_tabs;
         for (auto const& tab : process.tabs) {
             auto title = tab.title.is_empty() ? tr("Untitled") : qstring_from_utf16_string(tab.title);
             auto* tab_item = new QTreeWidgetItem(item, { title });
@@ -780,7 +892,10 @@ void ProcessManagerWindow::refresh()
             tab_item->setFlags(Qt::ItemIsEnabled);
             tab_item->setToolTip(Name, title);
             tab_item->setIcon(Name, favicon_for(tab.page));
+            set_can_unload(*tab_item, { &tab });
+            process_tabs.append(&tab);
         }
+        set_can_unload(*item, process_tabs);
         size_t sandboxed_frame_count = 0;
         for (auto const& frame : process.frames) {
             auto* frame_item = new QTreeWidgetItem(item, { frame_name(frame.url) });
@@ -855,7 +970,7 @@ void ProcessManagerWindow::refresh()
         for (auto& site : sites) {
             auto* item = new QTreeWidgetItem;
             item->setData(Name, KindRole, static_cast<int>(RowKind::Site));
-            item->setData(Name, SiteRole, site.name);
+            item->setData(Name, SiteKeyRole, site.key);
             item->setText(Name, site.name);
             item->setToolTip(Name, site.name);
             auto font = item->font(Name);
@@ -870,18 +985,24 @@ void ProcessManagerWindow::refresh()
                 note.append(site.frame_count == 1 ? tr("1 embedded frame") : tr("%1 embedded frames").arg(site.frame_count));
             item->setData(Name, NoteRole, note.join(QStringLiteral(" · ")));
             set_numbers(*item, site.cpu, site.memory);
+            Vector<WebView::ProcessTabSnapshot const*> site_tabs;
+            for (auto const* process : site.processes) {
+                for (auto const& tab : process->tabs)
+                    site_tabs.append(&tab);
+            }
+            set_can_unload(*item, site_tabs);
             site_items.append(item);
 
             Vector<QTreeWidgetItem*> process_items;
             for (auto const* process : site.processes)
                 process_items.append(make_process_item(*process, false));
             add_items(item, process_items);
-            if (selected_site.isValid() && selected_site.toString() == site.name)
+            if (selected_site.isValid() && selected_site.toString() == site.key)
                 item_to_select = item;
         }
         add_items(nullptr, site_items);
         for (auto* item : site_items) {
-            item->setExpanded(m_expanded_sites.contains(ak_string_from_qstring(item->data(Name, SiteRole).toString())));
+            item->setExpanded(m_expanded_sites.contains(ak_string_from_qstring(item->data(Name, SiteKeyRole).toString())));
             for (int i = 0; i < item->childCount(); ++i)
                 item->child(i)->setExpanded(true);
         }

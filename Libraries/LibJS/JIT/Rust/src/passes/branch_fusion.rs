@@ -15,16 +15,17 @@
 //! is a constant, so that its comparison fuses with the branch there.
 
 use super::edit;
-use crate::bitset::BitSet;
 use crate::code::Repr;
 use crate::ir::Block;
 use crate::ir::BlockId;
 use crate::ir::BranchCondition;
 use crate::ir::Comparison;
 use crate::ir::Graph;
-use crate::ir::Node;
 use crate::ir::NodeId;
 use crate::ir::Op;
+use ak::Zone;
+use ak::ZoneBitSet;
+use ak::ZoneVec;
 
 /// The comparison of swapped operands that has the same result.
 fn mirrored(comparison: Comparison) -> Comparison {
@@ -45,11 +46,11 @@ fn mirrored(comparison: Comparison) -> Comparison {
 }
 
 /// How many nodes and frame states use each node.
-fn count_uses(graph: &Graph) -> Vec<u32> {
-    let mut uses = vec![0u32; graph.nodes.len()];
+fn count_uses<'w>(graph: &Graph, work: &'w Zone) -> ZoneVec<'w, u32> {
+    let mut uses = ZoneVec::from_elem_in(0u32, graph.nodes.len(), work);
     for block in &graph.blocks {
         for node in block.nodes() {
-            for value in graph.used_values(node) {
+            for value in graph.used_values(node, work) {
                 uses[value.index()] += 1;
             }
         }
@@ -61,10 +62,14 @@ fn count_uses(graph: &Graph) -> Vec<u32> {
 /// booleans, which nothing else uses, branch on their input of the phi
 /// themselves (through a new block on each edge, which jumps on), or jump
 /// to the target of a constant one.
-fn thread_boolean_phis(graph: &mut Graph, uses: &[u32]) {
+fn thread_boolean_phis(graph: &mut Graph, uses: &[u32], work: &Zone) {
     let block_count = graph.blocks.len();
-    let mut new_blocks: Vec<Vec<BlockId>> = vec![Vec::new(); block_count];
-    let mut threaded = BitSet::new(block_count);
+    // NB: A block whose jump becomes a branch gets the two blocks of its edges. It then jumps nowhere, so it gets
+    //     no more.
+    let mut new_blocks: ZoneVec<Option<[BlockId; 2]>> = ZoneVec::from_elem_in(None, block_count, work);
+    let mut threaded = ZoneBitSet::new_in(block_count, work);
+    let mut predecessors = ZoneVec::new_in(work);
+    let mut inputs = ZoneVec::new_in(work);
     for block in 0..block_count {
         let data = &graph.blocks[block];
         let (Some(control), [phi]) = (data.control, data.phis.as_slice()) else {
@@ -80,7 +85,6 @@ fn thread_boolean_phis(graph: &mut Graph, uses: &[u32]) {
             continue;
         };
         let block_id = BlockId::from_index(block);
-        let predecessors = data.predecessors.clone();
         let jumps_here = |predecessor: &BlockId| {
             graph.control(*predecessor).op == Op::Jump { target: block_id } && predecessor.index() < block
         };
@@ -90,13 +94,14 @@ fn thread_boolean_phis(graph: &mut Graph, uses: &[u32]) {
             || uses[phi.index()] != 1
             || if_true.index() <= block
             || if_false.index() <= block
-            || !predecessors.iter().all(jumps_here)
+            || !data.predecessors.iter().all(jumps_here)
         {
             continue;
         }
         let pc = graph.node(control).pc;
-        let inputs = graph.node(phi).inputs.clone();
-        for (predecessor, input) in predecessors.into_iter().zip(inputs) {
+        predecessors.assign(&data.predecessors);
+        inputs.assign(&graph.node(phi).inputs);
+        for (predecessor, input) in predecessors.iter().copied().zip(inputs.iter().copied()) {
             let truth = (graph.node(input).repr == Some(Repr::Bool))
                 .then(|| graph.constant_value(input))
                 .flatten();
@@ -110,11 +115,11 @@ fn thread_boolean_phis(graph: &mut Graph, uses: &[u32]) {
             let is_cold = graph.block(predecessor).is_cold;
             let edges = [if_true, if_false].map(|target| {
                 let edge = graph.add_block(Block {
-                    predecessors: vec![predecessor],
+                    predecessors: graph.list(&[predecessor]),
                     is_cold,
-                    ..Block::default()
+                    ..graph.new_block()
                 });
-                let jump = graph.add_node(Node::new(Op::Jump { target }, Vec::new(), None, pc));
+                let jump = graph.add(Op::Jump { target }, &[], None, pc);
                 graph.blocks[edge.index()].control = Some(jump);
                 add_predecessor(graph, target, edge, block_id);
                 edge
@@ -125,8 +130,12 @@ fn thread_boolean_phis(graph: &mut Graph, uses: &[u32]) {
                 if_true: edges[0],
                 if_false: edges[1],
             };
-            data.inputs = vec![input];
-            new_blocks[predecessor.index()].extend(edges);
+            data.inputs.assign(&[input]);
+            assert!(
+                new_blocks[predecessor.index()].is_none(),
+                "a block gets the blocks of one branch"
+            );
+            new_blocks[predecessor.index()] = Some(edges);
         }
         // NB: Nothing reaches the block anymore.
         for target in [if_true, if_false] {
@@ -138,11 +147,15 @@ fn thread_boolean_phis(graph: &mut Graph, uses: &[u32]) {
         return;
     }
     // NB: The new blocks follow their predecessor, before their targets.
-    let order = (0..block_count)
-        .filter(|block| !threaded.contains(*block))
-        .flat_map(|block| std::iter::once(BlockId::from_index(block)).chain(new_blocks[block].iter().copied()))
-        .collect::<Vec<_>>();
-    graph.reorder_blocks(&order);
+    let order = ZoneVec::from_iter_in(
+        (0..block_count)
+            .filter(|block| !threaded.contains(*block))
+            .flat_map(|block| {
+                core::iter::once(BlockId::from_index(block)).chain(new_blocks[block].into_iter().flatten())
+            }),
+        work,
+    );
+    graph.reorder_blocks(&order, work);
 }
 
 /// Removes `predecessor` from the predecessors of `target`, and its inputs
@@ -176,12 +189,13 @@ fn add_predecessor(graph: &mut Graph, target: BlockId, predecessor: BlockId, lik
     }
 }
 
-pub fn run(graph: &mut Graph) {
+pub fn run(graph: &mut Graph, work: &Zone) {
     // NB: Threading moves the uses of each phi's inputs to the branches.
-    let uses = count_uses(graph);
-    thread_boolean_phis(graph, &uses);
+    let uses = count_uses(graph, work);
+    thread_boolean_phis(graph, &uses, work);
     let count = graph.nodes.len();
-    let mut removed = BitSet::new(count);
+    let mut removed = ZoneBitSet::new_in(count, work);
+    let mut inputs = ZoneVec::new_in(work);
     for block in 0..graph.blocks.len() {
         let control = graph.control_id(BlockId::from_index(block));
         let Op::Branch {
@@ -204,7 +218,7 @@ pub fn run(graph: &mut Graph) {
             Op::TaggedEquals { equal } => BranchCondition::TaggedEquals { equal },
             _ => continue,
         };
-        let mut inputs = graph.node(comparison).inputs.clone();
+        inputs.assign(&graph.node(comparison).inputs);
         // NB: Code generation takes a constant on the right as an immediate.
         let constant = |input| graph.constant_value(input).is_some();
         let condition = if constant(inputs[0]) && !constant(inputs[1]) {
@@ -223,7 +237,7 @@ pub fn run(graph: &mut Graph) {
             if_true,
             if_false,
         };
-        data.inputs = inputs;
+        data.inputs.assign(&inputs);
         removed.insert(comparison.index());
     }
     edit::remove_nodes(graph, &removed);

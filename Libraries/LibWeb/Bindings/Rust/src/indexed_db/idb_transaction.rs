@@ -19,6 +19,7 @@ use crate::bindings::cpp_cell::CppCell;
 use crate::bindings::event_target::{CppEventTarget, GetTheParent};
 use crate::bindings::interface::{Ref, Wrappable, allocate};
 use crate::bindings::{CallContext, WebIdlResult};
+use crate::html::dom_string_list::DOMStringList;
 use crate::indexed_db::cpp::{DomException, devtools_client_is_active, notify_devtools_of_committed_changes};
 use crate::indexed_db::idb_database::{IDBDatabase, IDBTransactionDurability};
 use crate::indexed_db::idb_index::IDBIndex;
@@ -202,7 +203,14 @@ impl IDBTransaction {
     }
 
     pub(crate) fn set_state(&self, state: TransactionState) {
+        // NB: Finishing also has to remove the transaction from its connection, which set_finished() does.
+        assert!(state != TransactionState::Finished);
         self.state.set(state);
+    }
+
+    pub(crate) fn set_finished(vm: &Vm, transaction: Ref<Self>) {
+        transaction.state.set(TransactionState::Finished);
+        transaction.connection.remove_finished_transaction(vm, transaction);
     }
 
     pub(crate) fn is_upgrade_transaction(&self) -> bool {
@@ -348,7 +356,7 @@ impl IDBTransaction {
     }
 
     // https://w3c.github.io/IndexedDB/#dom-idbtransaction-objectstorenames
-    pub(crate) fn object_store_names(&self, cx: &mut CallContext) -> WebIdlResult<CppInterface> {
+    pub(crate) fn object_store_names(&self, cx: &mut CallContext) -> WebIdlResult<Ref<DOMStringList>> {
         // 1. Let names be a list of the names of the object stores in this's scope.
         let names = self
             .scope
@@ -358,7 +366,7 @@ impl IDBTransaction {
             .collect();
 
         // 2. Return the result (a DOMStringList) of creating a sorted name list with names.
-        Ok(create_a_sorted_name_list(cx, names))
+        Ok(create_a_sorted_name_list(cx.vm(), names))
     }
 
     pub(crate) fn mode(&self, _: &mut CallContext) -> WebIdlResult<IDBTransactionMode> {

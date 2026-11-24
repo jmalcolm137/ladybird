@@ -355,9 +355,9 @@ impl NativeRule {
             RulePayload::Style(style) => {
                 let selectors = style.selectors();
                 if !selectors.selectors.is_nested_in(context) {
-                    style.replace_selectors(Arc::new(RustParsedSelectorList {
+                    style.replace_selectors(RustParsedSelectorList {
                         selectors: selectors.selectors.nested_in(context),
-                    }));
+                    });
                 }
                 let selectors = style.selectors();
                 let own = NestingContext::Rule(&selectors.selectors);
@@ -369,9 +369,9 @@ impl NativeRule {
                     && !start.selectors.is_nested_in(parent)
                 {
                     *scope.borrow_mut() = Arc::new(ScopeSelectors {
-                        start: Some(Arc::new(RustParsedSelectorList {
+                        start: Some(RustParsedSelectorList {
                             selectors: start.selectors.nested_in(parent),
-                        })),
+                        }),
                         end: current.end.clone(),
                     });
                 }
@@ -943,7 +943,7 @@ pub unsafe extern "C" fn rust_rule_set_selector_text(
 
 #[unsafe(no_mangle)]
 pub extern "C" fn rust_rule_selectors(rule: &NativeRule) -> *const c_void {
-    Arc::as_ptr(&rule.style_rule().selectors()).cast()
+    rule.style_rule().selectors_pointer().cast()
 }
 
 /// Call only for style or nested-declaration rules. The returned list must be released with
@@ -1136,10 +1136,7 @@ pub extern "C" fn rust_rule_list_source_text(list: &NativeRuleList, has_text: &m
         return ak::Utf16String::from_utf16(&[]).into_raw();
     };
     *has_text = true;
-    match sheet.source_text().units() {
-        crate::css::css_tokenizer::TokenizerInput::Latin1(bytes) => ak::Utf16String::from_latin1(bytes).into_raw(),
-        crate::css::css_tokenizer::TokenizerInput::Utf16(units) => ak::Utf16String::from_utf16(units).into_raw(),
-    }
+    sheet.source_text().to_utf16_string().into_raw()
 }
 
 #[unsafe(no_mangle)]
@@ -1269,12 +1266,6 @@ pub enum RuleRemovalResult {
     Success,
     IndexSizeError,
     InvalidStateError,
-}
-
-/// https://drafts.csswg.org/cssom/#remove-a-css-rule
-#[unsafe(no_mangle)]
-pub extern "C" fn rust_rule_list_validate_removal(list: &NativeRuleList, index: usize) -> RuleRemovalResult {
-    list.validate_removal(index)
 }
 
 #[unsafe(no_mangle)]

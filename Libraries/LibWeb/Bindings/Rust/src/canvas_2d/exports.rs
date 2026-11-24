@@ -174,8 +174,8 @@ pub extern "C" fn web_canvas_2d_context_color_space(context: &ContextCell) -> Co
     with_context(context, |context| context.context_attributes.color_space.into())
 }
 
-/// A Gfx::Bitmap with a reference that the caller takes over, or null. Unpremultiplied pixels come back as RGBA8888,
-/// and premultiplied pixels as BGRA8888, in the color space.
+/// A Gfx::DecodedImageFrame allocated with new that the caller takes over, or null. Unpremultiplied pixels come back
+/// as RGBA8888, and premultiplied pixels as BGRA8888, in the color space.
 #[unsafe(no_mangle)]
 pub extern "C" fn web_canvas_2d_context_read_pixels(
     context: &ContextCell,
@@ -184,7 +184,7 @@ pub extern "C" fn web_canvas_2d_context_read_pixels(
     color_space: ColorSpace,
 ) -> *mut c_void {
     with_context(context, |context| context.read_pixels(rect, alpha_type, color_space))
-        .map_or(core::ptr::null_mut(), super::host::Bitmap::into_raw)
+        .map_or(core::ptr::null_mut(), |frame| frame.hand_over_copy())
 }
 
 #[unsafe(no_mangle)]
@@ -207,7 +207,8 @@ pub unsafe extern "C" fn web_canvas_2d_context_draw_image_bitmap(
     // SAFETY: The caller passes a live cell of an ImageBitmap.
     let image_bitmap = unsafe { cell_from_abi::<ImageBitmap>(image_bitmap) };
     let image = CanvasImageSource::ImageBitmap(image_bitmap);
-    let (width, height) = image.size();
+    // An ImageBitmap has a size of its own, so no default object size applies to it.
+    let (width, height) = image.size(IntSize::default());
     #[allow(
         clippy::cast_precision_loss,
         reason = "a size of an image becomes a float, as the C++ had it"

@@ -64,10 +64,11 @@ static ChromeColors const light_chrome {
     .field_focused = rgb(0xffffff),
     .text = rgb(0x1d1d1f),
     .muted = rgb(0x5d5d64),
-    .tab_title = rgb(0x3a3a40),
+    .tab_title = rgb(0x55555c),
     .icon = rgb(0x3a3a40),
     .disabled = rgb(0xb3b3b9),
     .hover = rgba(0, 0, 0, 0.06),
+    .strip_hover = rgba(0, 0, 0, 0.06),
     .row_title = rgb(0x3f3f45),
     .separator = rgb(0xbcbcc2),
     .divider = rgb(0xd2d2d6),
@@ -87,10 +88,11 @@ static ChromeColors const dark_chrome {
     .field_focused = rgb(0x3a3a3e),
     .text = rgb(0xf2f2f5),
     .muted = rgb(0xacacb4),
-    .tab_title = rgb(0xacacb4),
+    .tab_title = rgb(0x8f8f97),
     .icon = rgb(0xdcdce1),
     .disabled = rgb(0x5b5b61),
     .hover = rgba(255, 255, 255, 0.06),
+    .strip_hover = rgba(255, 255, 255, 0.06),
     .row_title = rgb(0xcfcfd6),
     .separator = rgb(0x3d3d42),
     .divider = rgb(0x0a0a0c),
@@ -103,17 +105,19 @@ static ChromeColors const dark_chrome {
 };
 
 static ChromeColors const private_chrome {
-    .strip = rgb(0x1d1430),
+    .strip = rgb(0x110a20),
     .toolbar = rgb(0x2f2347),
     .sidebar = rgb(0x2f2347),
     .field = rgba(255, 255, 255, 0.09),
     .field_focused = rgb(0x3b2e55),
     .text = rgb(0xf3f0fa),
     .muted = rgb(0xb3aac4),
-    .tab_title = rgb(0xb3aac4),
+    .tab_title = rgb(0x958ca8),
     .icon = rgb(0xe2dcef),
     .disabled = rgb(0x5e566e),
     .hover = rgba(255, 255, 255, 0.07),
+    // NB: The strip and the active tab are close in lightness here, so the normal hover would look like the active tab.
+    .strip_hover = rgba(255, 255, 255, 0.06),
     .row_title = rgb(0xd5cee2),
     .separator = rgb(0x4a3d63),
     .divider = rgb(0x0f0a19),
@@ -137,6 +141,7 @@ static ChromeColors const light_increased_contrast_chrome {
     .icon = rgb(0x1d1d1f),
     .disabled = rgb(0x8e8e93),
     .hover = rgba(0, 0, 0, 0.10),
+    .strip_hover = rgba(0, 0, 0, 0.10),
     .row_title = rgb(0x1d1d1f),
     .separator = rgb(0x8e8e93),
     .divider = rgb(0x6e6e73),
@@ -160,6 +165,7 @@ static ChromeColors const dark_increased_contrast_chrome {
     .icon = rgb(0xf2f2f5),
     .disabled = rgb(0x8a8a90),
     .hover = rgba(255, 255, 255, 0.14),
+    .strip_hover = rgba(255, 255, 255, 0.14),
     .row_title = rgb(0xf2f2f5),
     .separator = rgb(0x8a8a90),
     .divider = rgb(0x8a8a90),
@@ -394,6 +400,26 @@ bool is_dark(QWidget const& widget)
     return is_dark(chrome_palette(widget));
 }
 
+QPalette interface_palette(QPalette palette)
+{
+    auto palette_is_dark = palette.color(QPalette::Window).lightness() < 128;
+    if (palette_is_dark == is_dark())
+        return palette;
+
+    auto const& colors = panel();
+    palette.setColor(QPalette::Window, colors.surface);
+    palette.setColor(QPalette::WindowText, colors.text);
+    palette.setColor(QPalette::Base, colors.page);
+    palette.setColor(QPalette::Text, colors.text);
+    palette.setColor(QPalette::Button, colors.surface);
+    palette.setColor(QPalette::ButtonText, colors.body);
+    palette.setColor(QPalette::PlaceholderText, colors.muted);
+    palette.setColor(QPalette::Link, colors.link);
+    for (auto role : { QPalette::WindowText, QPalette::Text, QPalette::ButtonText })
+        palette.setColor(QPalette::Disabled, role, colors.muted);
+    return palette;
+}
+
 PanelColors const& panel()
 {
     return is_dark() ? s_dark_panel : s_light_panel;
@@ -437,15 +463,30 @@ static AccentColor const& system_accent_color()
     return *closest;
 }
 
+static Optional<QColor> s_desktop_accent;
+
+void set_desktop_accent(Optional<QColor> color)
+{
+    s_desktop_accent = move(color);
+}
+
+Optional<QColor> const& desktop_accent()
+{
+    return s_desktop_accent;
+}
+
 // The theme's accent clears 3:1 on the toolbar, darker on the light appearance and lighter on the dark one.
+static QColor accent(bool dark, QColor const& toolbar)
+{
+    if (auto const& base_color = s_color_theme.accent.has_value() ? s_color_theme.accent : s_desktop_accent; base_color.has_value())
+        return with_contrast(*base_color, toolbar, 3, dark ? Adjustment::Lighten : Adjustment::Darken);
+    auto const& accent = system_accent_color();
+    return dark ? accent.dark : accent.light;
+}
+
 QColor accent()
 {
-    if (s_color_theme.accent.has_value()) {
-        auto dark = is_dark();
-        return with_contrast(*s_color_theme.accent, chrome().toolbar, 3, dark ? Adjustment::Lighten : Adjustment::Darken);
-    }
-    auto const& accent = system_accent_color();
-    return is_dark() ? accent.dark : accent.light;
+    return accent(is_dark(), chrome().toolbar);
 }
 
 // On the dark appearance, the focus ring is a lighter tint of the accent, as the accent itself is too deep there.
@@ -473,17 +514,43 @@ QColor focus_ring()
     return color;
 }
 
-QColor selection()
+static TextSelectionColors text_selection(QPalette::ColorGroup group, bool dark, QColor const& toolbar, QColor const& text)
 {
-    auto color = accent();
-    color.setAlphaF(is_dark() ? 0.40f : 0.22f);
-    return color;
+    // NB: The system's colors suit only chrome of the system's own appearance, which a private window may not have. A
+    //     desktop accent is tinted like a theme's, as the desktop's own text fields show it.
+    if (!s_color_theme.accent.has_value() && !s_desktop_accent.has_value()) {
+        auto system_palette = QGuiApplication::palette();
+        auto system_is_dark = system_palette.color(QPalette::Window).lightness() < 128;
+        if (system_is_dark == dark)
+            return { system_palette.color(group, QPalette::Highlight), system_palette.color(group, QPalette::HighlightedText) };
+    }
+
+    if (group != QPalette::Active)
+        return { dark ? rgba(255, 255, 255, 0.14) : rgba(0, 0, 0, 0.10), text };
+
+    auto background = accent(dark, toolbar);
+    background.setAlphaF(dark ? 0.40f : 0.28f);
+    return { background, text };
 }
 
-// The theme's accent fills primary buttons and selected rows deep enough that white text on them clears 4.5:1.
-static QColor accent_fill()
+TextSelectionColors address_field_text_selection(QPalette const& palette, QPalette::ColorGroup group)
 {
-    return with_contrast(*s_color_theme.accent, Qt::white, 4.5f, Adjustment::Darken);
+    auto const& colors = chrome(palette);
+    return text_selection(group, is_dark(palette), colors.toolbar, colors.text);
+}
+
+TextSelectionColors panel_text_selection(QPalette::ColorGroup group, QColor const& text)
+{
+    return text_selection(group, is_dark(), chrome().toolbar, text);
+}
+
+// The accent fills primary buttons, selected rows and checked buttons deep enough that white text on them clears 4.5:1.
+QColor accent_fill()
+{
+    if (auto const& base_color = s_color_theme.accent.has_value() ? s_color_theme.accent : s_desktop_accent; base_color.has_value())
+        return with_contrast(*base_color, Qt::white, 4.5f, Adjustment::Darken);
+    auto const& accent = system_accent_color();
+    return with_contrast(is_dark() ? accent.dark : accent.light, Qt::white, 4.5f, Adjustment::Darken);
 }
 
 QColor primary()

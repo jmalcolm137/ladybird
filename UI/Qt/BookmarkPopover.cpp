@@ -139,7 +139,7 @@ void BookmarkPopover::set_bookmark(String id, JustAdded just_added)
         return;
 
     auto const& bookmark = item->bookmark();
-    m_name_field->setText(qstring_from_ak_string(bookmark.title.value_or(bookmark.url.serialize())));
+    m_name_field->setText(qstring_from_ak_string(bookmark.title.value_or({})));
 
     auto place = find_bookmark_place(store.root_items(), m_bookmark_id);
     auto folder_id = place.has_value() ? place->folder_id : Optional<String> {};
@@ -159,6 +159,9 @@ void BookmarkPopover::set_bookmark(String id, JustAdded just_added)
         delete item;
     }
     m_folder_row->layout()->addWidget(m_folder_picker);
+    // NB: The popover was polished when it first opened, so sizing it no longer applies the style sheet to its new
+    //     picker, which would still have the platform style's height.
+    m_folder_picker->ensurePolished();
     adjustSize();
 }
 
@@ -170,10 +173,10 @@ void BookmarkPopover::save()
         return;
 
     auto url = item->bookmark().url;
-    // NB: A bookmark without a title is shown by its URL, which is only kept as its title once it is edited.
-    auto title = ak_string_from_qstring(m_name_field->text().trimmed());
-    auto shown_title = item->bookmark().title.value_or(url.serialize());
-    if (!title.is_empty() && title != shown_title)
+    Optional<String> title;
+    if (auto name = ak_string_from_qstring(m_name_field->text()); !name.is_empty())
+        title = AK::move(name);
+    if (title != item->bookmark().title)
         store.edit_bookmark(m_bookmark_id, url, AK::move(title));
 
     auto place = find_bookmark_place(store.root_items(), m_bookmark_id);

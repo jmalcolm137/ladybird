@@ -984,16 +984,20 @@ pub fn non_iso_date_until(
 
         // OPTIMIZATION: Skip ahead by estimating the month difference from calendar dates to avoid a large number of
         //               iterations in the NonISODateSurpasses loop below.
+        //               The estimate counts the months of each year in between, as a year of a lunisolar calendar has
+        //               twelve or thirteen, and starts two months short, as constraining the day or a leap month can
+        //               make the difference one month shorter than the month numbers say.
         if largest_unit == Unit::Month {
-            let mut estimated_months = (calendar_two.year.wrapping_sub(calendar_one.year))
-                .wrapping_mul(12)
-                .wrapping_add(i32::from(calendar_two.month) - i32::from(calendar_one.month));
-            if estimated_months != 0 {
-                estimated_months -= i32::from(sign);
-            }
-
-            if estimated_months != 0 {
-                candidate_months = f64::from(estimated_months);
+            let first_year = calendar_one.year.min(calendar_two.year);
+            let last_year = calendar_one.year.max(calendar_two.year);
+            let months_in_years: i64 = (first_year..last_year)
+                .map(|year| i64::from(calendar_months_in_year(calendar, year)))
+                .sum();
+            let estimated_months = i64::from(sign) * months_in_years + i64::from(calendar_two.month)
+                - i64::from(calendar_one.month)
+                - 2 * i64::from(sign);
+            if estimated_months.signum() == i64::from(sign) {
+                candidate_months = estimated_months as f64;
             }
         }
 
@@ -2478,6 +2482,9 @@ pub fn calendar_months_in_year(calendar: Utf16View<'_>, arithmetic_year: i32) ->
     unicode_calendar::calendar_months_in_year(&calendar_for_unicode(calendar), arithmetic_year)
 }
 
+/// Further from year 0 than the arithmetic year of any date within the limits of Temporal, in any calendar.
+const BALANCED_YEAR_LIMIT: i64 = 300_000;
+
 // 4.1.16 BalanceNonISODate ( calendar, arithmeticYear, ordinalMonth, day ), https://tc39.es/proposal-intl-era-monthcode/#sec-temporal-balancenonisodate
 pub fn balance_non_iso_date(
     calendar: Utf16View<'_>,
@@ -2493,6 +2500,22 @@ pub fn balance_non_iso_date(
 
     // 2. Let resolvedMonth be ordinalMonth.
     let mut resolved_month = ordinal_month;
+
+    // AD-HOC: A year has at most 13 months and 385 days in every calendar, so once the months or the days alone move the
+    //         year past any year of a date within the limits of Temporal, the result is out of range whatever it
+    //         balances to, and walking there month by month can take very long.
+    let years_moved_by_months = i64::from(resolved_month) / 13;
+    let years_moved_by_days = i64::from(day) / 385;
+    if years_moved_by_months.signum() * years_moved_by_days.signum() >= 0 {
+        let year_at_least = i64::from(resolved_year) + years_moved_by_months + years_moved_by_days;
+        if year_at_least.abs() > BALANCED_YEAR_LIMIT {
+            return BalancedDate {
+                year: ((BALANCED_YEAR_LIMIT + 1) * year_at_least.signum()) as i32,
+                month: 1,
+                day: 1,
+            };
+        }
+    }
 
     // 3. Let monthsInYear be CalendarMonthsInYear(calendar, resolvedYear).
     let mut months_in_year = months_in_year_of(resolved_year);
@@ -2526,6 +2549,24 @@ pub fn balance_non_iso_date(
 
     // 7. Let daysInMonth be CalendarDaysInMonth(calendar, resolvedYear, resolvedMonth).
     let mut days_in_month = days_in_month_of(resolved_year, resolved_month);
+
+    // OPTIMIZATION: Steps 8 and 9 move resolvedDay - 1 days on from the first day of the month one month at a time,
+    //               which takes very long for a count of many years of days. Adding them to the ISO date of the first
+    //               day of the month finds the same date directly.
+    if resolved_day.unsigned_abs() > 400 {
+        let unicode_calendar_name = calendar_for_unicode(calendar);
+        if let Some(first_day_of_month) =
+            unicode_calendar::calendar_date_to_iso_date(&unicode_calendar_name, resolved_year, resolved_month as u8, 1)
+        {
+            let iso_date = add_days_to_iso_date(first_day_of_month, f64::from(resolved_day) - 1.0);
+            let date = unicode_calendar::iso_date_to_calendar_date(&unicode_calendar_name, iso_date);
+            return BalancedDate {
+                year: date.year,
+                month: date.month,
+                day: date.day,
+            };
+        }
+    }
 
     // 8. Repeat, while resolvedDay ≤ 0,
     while resolved_day <= 0 {

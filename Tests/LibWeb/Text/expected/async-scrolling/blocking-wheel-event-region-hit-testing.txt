@@ -8,15 +8,20 @@ AccumulatedVisualContext Tree:
   spatial:
     [s0] transform=[1,0,0,1,0,0] origin=(0,0) (Viewport<#document>)
       [s1] scroll (Viewport<#document>)
-        [s2] transform=[1,0,0,1,100,0] origin=(20,20) (BlockContainer<DIV>#transformed)
+        [s2] transform=[1,0,0,1,100,0] origin=(20,20) bounds=[20,20 100x100] (BlockContainer<DIV>#transformed)
         [s3] scroll (BlockContainer<DIV>#clip)
   clips:
     [c0 in s1] clip=[20,160 100x100] (BlockContainer<DIV>#clip)
   effects:
     [e0 in s0] effects=[]
 
+ScrollNodes:
+ScrollNode scroll_node_index=s3 parent_scroll_node_index=s0 scrollport_rect=[20,160 100x100] min_scroll_offset=[0,0] max_scroll_offset=[100,0] is_viewport=false
+
+Layers (for a window server that shows tiles and filters what is below layers):
+  [L0] base space=viewport
+
 DisplayList:
-CompositorBlockingWheelEventRegion@s2/e0 rect=[20,20 100x100]
-CompositorScrollNode@s1/e0 scroll_node_index=s3 parent_scroll_node_index=s0 scrollport_rect=[20,160 100x100] min_scroll_offset=[0,0] max_scroll_offset=[100,0] is_viewport=false
-CompositorBlockingWheelEventRegion@s3/c0/e0 rect=[20,160 200x100]
+L0 CompositorBlockingWheelEventRegion@s2/e0 rect=[20,20 100x100] owner=BlockContainer<DIV>#transformed phase=scroll-metadata
+L0 CompositorBlockingWheelEventRegion@s3/c0/e0 rect=[20,160 200x100] owner=BlockContainer<DIV>#clipped-target phase=scroll-metadata
 

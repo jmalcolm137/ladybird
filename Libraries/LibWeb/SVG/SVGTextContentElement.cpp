@@ -28,10 +28,9 @@ SVGTextContentElement::SVGTextContentElement(DOM::Document& document, DOM::Quali
 // A character that is addressable by text positioning attributes and SVG DOM text methods.
 // Characters discarded during layout such as collapsed white space characters are not addressable, neither are
 // characters within an element with a value of none for the display property.
-// Layout commits one cell per code unit of each rendered text content element's own character data, after processing
-// its white space. An element that isn't rendered has no committed box, and so no cells at all.
-// AD-HOC: Layout shapes an element's own character data as one run ahead of its text content children, so the cells
-//         come in that order rather than in document order when text and child elements interleave.
+// Layout commits one cell per code unit of the character data in each rendered text content element's subtree, in
+// document order, after processing its white space. An element that isn't rendered has no committed box, and so no
+// cells at all.
 Vector<Layout::RustFFI::FfiSvgTextCharacterCell> SVGTextContentElement::character_cells()
 {
     Layout::ForcedReadScope read { document() };
@@ -40,22 +39,8 @@ Vector<Layout::RustFFI::FfiSvgTextCharacterCell> SVGTextContentElement::characte
     auto const* layout_node = this->layout_node(read);
     if (!layout_node)
         return cells;
-    auto collect = [&cells](auto& self, Layout::Node const& node) -> void {
-        if (!Painting::has_committed_box(node))
-            return;
-        cells.extend(Painting::svg_text_character_cells(node));
-        for (auto const* child = node.first_child_ptr(); child; child = child->next_sibling_ptr()) {
-            switch (child->kind()) {
-            case Layout::RustFFI::NodeKind::SVGTextBox:
-            case Layout::RustFFI::NodeKind::SVGTextPathBox:
-                self(self, *child);
-                break;
-            default:
-                break;
-            }
-        }
-    };
-    collect(collect, *layout_node);
+    if (Painting::has_committed_box(*layout_node))
+        cells = Painting::svg_text_character_cells(*layout_node);
     return cells;
 }
 
@@ -79,8 +64,8 @@ static float sub_string_length(ReadonlySpan<Layout::RustFFI::FfiSvgTextCharacter
         //    1. Add the advance of the typographic character to length, adjusted for any font kerning in effect.
         //    2. If the letter-spacing or word-spacing properties contributed space just after the typographic
         //       character, then add that space to length.
-        // NB: A cell's width is its typographic character's advance.
-        // FIXME: Layout applies neither letter-spacing nor word-spacing to SVG text, so there's no such space to add.
+        // NB: A cell's width is its typographic character's advance, plus any letter-spacing and word-spacing layout
+        //     put just after it.
         length += cells[index].width;
     }
 
@@ -147,10 +132,52 @@ WebIDL::ExceptionOr<float> SVGTextContentElement::get_sub_string_length(WebIDL::
     return sub_string_length(cells, charnum, nchars);
 }
 
-GC::Ref<Geometry::DOMPoint> SVGTextContentElement::get_start_position_of_char(WebIDL::UnsignedLong charnum)
+WebIDL::ExceptionOr<GC::Ref<Geometry::DOMPoint>> SVGTextContentElement::get_start_position_of_char(WebIDL::UnsignedLong charnum)
 {
-    dbgln("(STUBBED) SVGTextContentElement::get_start_position_of_char(charnum={}). Called on: {}", charnum, debug_description());
-    return Geometry::DOMPoint::create();
+    // The getStartPositionOfChar method is used to get the position of a typographic character after text layout has
+    // been performed. When getStartPositionOfChar(charnum) is called, the following steps are run:
+    auto cells = character_cells();
+
+    // 1. Let cluster be the result of finding the typographic character for the character at index charnum within the
+    //    current element.
+    // 2. If cluster is null, then throw an IndexSizeError.
+    // NB: Every addressable character here corresponds to the typographic character whose cell it carries, so only an
+    //     index past the last character finds nothing.
+    if (charnum >= cells.size())
+        return WebIDL::IndexSizeError::create("Character index out of range"_utf16);
+    auto const& cluster = cells[charnum];
+
+    // 3. Let p be the alignment point of the typographic character that correspond to the character at index charnum,
+    //    in the coordinate system of the current element.
+    // FIXME: The glyph cells of text on a path are measured before the glyphs are laid along the path, so the point
+    //        isn't on the path.
+    // 4. Return a newly created, detached SVGPoint object representing the point p.
+    return Geometry::DOMPoint::create(cluster.x, cluster.alignment_point_y);
+}
+
+// https://svgwg.org/svg2-draft/text.html#__svg__SVGTextContentElement__getEndPositionOfChar
+WebIDL::ExceptionOr<GC::Ref<Geometry::DOMPoint>> SVGTextContentElement::get_end_position_of_char(WebIDL::UnsignedLong charnum)
+{
+    // The getEndPositionOfChar method is used to get the trailing position of a typographic character after text
+    // layout has been performed. When getEndPositionOfChar(charnum) is called, the following steps are run:
+    auto cells = character_cells();
+
+    // 1. Let cluster be the result of finding the typographic character for the character at index charnum within the
+    //    current element.
+    // 2. If cluster is null, then throw an IndexSizeError.
+    if (charnum >= cells.size())
+        return WebIDL::IndexSizeError::create("Character index out of range"_utf16);
+    auto const& cluster = cells[charnum];
+
+    // 3. Let p be the alignment point of cluster that correspond to the character at index charnum, in the coordinate
+    //    system of the current element.
+    // 4. Let direction be a unit vector in the direction of the cluster's advance. [...]
+    // FIXME: Every advance is taken to run along the x axis, which holds for the left-to-right horizontal text that
+    //        layout shapes, off a path.
+    // 5. Let advance be cluster's advance.
+    // 6. Set p to p + advance · direction.
+    // 7. Return a newly created, detached SVGPoint object representing the point p.
+    return Geometry::DOMPoint::create(cluster.x + cluster.width, cluster.alignment_point_y);
 }
 
 // https://svgwg.org/svg2-draft/text.html#__svg__SVGTextContentElement__getExtentOfChar
@@ -179,6 +206,41 @@ WebIDL::ExceptionOr<GC::Ref<Geometry::DOMRect>> SVGTextContentElement::get_exten
 
     // 5. Return a newly created DOMRect object representing the rectangle rect.
     return Geometry::DOMRect::create(rect);
+}
+
+void SVGTextContentElement::attribute_changed(Utf16FlyString const& name, Optional<Utf16String> const& old_value, Optional<Utf16String> const& value, Optional<Utf16FlyString> const& namespace_)
+{
+    Base::attribute_changed(name, old_value, value, namespace_);
+
+    // The attributes adjust the advances of the element's characters, so the text has to be laid out with their new
+    // values.
+    if (old_value != value && name.is_one_of(AttributeNames::textLength, AttributeNames::lengthAdjust))
+        set_needs_layout_update(DOM::SetNeedsLayoutReason::StyleChange);
+}
+
+SVGTextContentElement::ParsedTextLength SVGTextContentElement::parsed_text_length() const
+{
+    CSS::Parser::ParsingParams const parsing_params { document() };
+    ParsedTextLength parsed;
+
+    // https://svgwg.org/svg2-draft/text.html#TextElementTextLengthAttribute
+    // A negative value is an error (see Error processing).
+    auto raw_text_length = get_attribute_value(AttributeNames::textLength);
+    if (auto style_value = parse_css_type(parsing_params, raw_text_length, CSS::ValueType::LengthPercentage)) {
+        if (auto value = SVGLengthValue::from_style_value(*style_value); value.has_value() && value->kind() != SVGLengthValue::Kind::Number && value->value() >= 0)
+            parsed.text_length = value;
+    }
+    if (!parsed.text_length.has_value()) {
+        if (auto style_value = parse_css_type(parsing_params, raw_text_length, CSS::ValueType::Number)) {
+            if (auto value = SVGLengthValue::from_style_value(*style_value); value.has_value() && value->kind() == SVGLengthValue::Kind::Number && value->value() >= 0)
+                parsed.text_length = value;
+        }
+    }
+
+    // https://svgwg.org/svg2-draft/text.html#TextElementLengthAdjustAttribute
+    // lengthAdjust = "spacing | spacingAndGlyphs"
+    parsed.adjusts_glyphs = get_attribute_value(AttributeNames::lengthAdjust) == "spacingAndGlyphs"sv;
+    return parsed;
 }
 
 // https://svgwg.org/svg2-draft/text.html#__svg__SVGTextContentElement__lengthAdjust

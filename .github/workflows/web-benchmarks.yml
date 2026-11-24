@@ -10,6 +10,16 @@ env:
 
 jobs:
   web-benchmarks:
+    # A run takes longer on each runner than master usually goes between pushes, and the runners are the ones that the
+    # PR benchmark runs (bench-pr.yml) queue for. So only the newest push waits for each platform's runner: A push
+    # replaces the job still waiting for the previous one, and lets the job in progress finish. Each platform has a
+    # group of its own, so neither waits for the other's runner.
+    concurrency:
+      group: ${{ github.workflow }}-${{ matrix.os_name }}-${{ matrix.arch }}
+      cancel-in-progress: false
+    # A run takes a quarter of an hour, and half an hour at the most. A job that hangs holds its platform's runner, and
+    # each push meanwhile replaces the job waiting behind it, so the history skips every push until the job ends.
+    timeout-minutes: 60
     runs-on: ${{ fromJSON(matrix.runner_labels) }}
     if: ${{ github.repository == 'LadybirdBrowser/ladybird' }}
     name: ${{ matrix.os_name }}, ${{ matrix.arch }}
@@ -21,7 +31,7 @@ jobs:
         os_name: ['Linux']
         arch: ['x86_64']
         runner_labels: ['["ubuntu-24.04-internal", "web-benchmarks", "self-hosted"]']
-        container: ['{"image":"ghcr.io/ladybirdbrowser/ladybird-ci:2026.10.29"}']
+        container: ['{"image":"ghcr.io/ladybirdbrowser/ladybird-ci:2026.11.21"}']
 
         include:
           - os_name: 'macOS'
@@ -96,7 +106,6 @@ jobs:
         working-directory: ${{ github.workspace }}
         run: |
           cmake --preset Distribution -B Build \
-            -DENABLE_CI_BASELINE_CPU=ON \
             -DPython3_EXECUTABLE=${{ env.pythonLocation }}/bin/python \
             -DCMAKE_C_COMPILER=${{ steps.build-parameters.outputs.host_cc }} \
             -DCMAKE_CXX_COMPILER=${{ steps.build-parameters.outputs.host_cxx }}
@@ -104,6 +113,30 @@ jobs:
       - name: 'Build'
         working-directory: ${{ github.workspace }}/Build
         run: cmake --build . --target ladybird
+
+      # vcpkg's install log names a port that failed to build, but the port's own logs hold the error.
+      - name: 'Collect the logs of vcpkg ports that failed to build'
+        if: ${{ failure() }}
+        shell: bash
+        run: |
+          out=vcpkg-failure-logs
+          mkdir -p "$out"
+          find Build -name vcpkg-manifest-install.log | while read -r install_log; do
+            sed -n 's/^error: building \([^:[]*\).*/\1/p' "$install_log" | sort -u | while read -r port; do
+              mkdir -p "$out/$port"
+              find Build -path "*/buildtrees/$port/*.log" -exec cp {} "$out/$port"/ \; || true
+            done
+            cp "$install_log" "$out"/
+          done || true
+
+      - name: 'Save the logs of vcpkg ports that failed to build'
+        if: ${{ failure() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: vcpkg-failure-logs-${{ matrix.os_name }}-${{ matrix.arch }}
+          path: vcpkg-failure-logs/
+          if-no-files-found: ignore
+          retention-days: 30
 
       - name: 'Save Caches'
         uses: ./.github/actions/cache-save
@@ -130,7 +163,7 @@ jobs:
             executable="${GITHUB_WORKSPACE}/Build/bin/Ladybird"
           fi
 
-          ./run.py --iterations=5 --executable="${executable}"
+          ./run.py --iterations=3 --executable="${executable}"
 
       - name: 'Save results as an artifact'
         uses: actions/upload-artifact@v7

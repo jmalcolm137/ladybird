@@ -4,16 +4,17 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+use libipc_rust::wire::{Decode, Encode};
 use std::ops::{Add, Mul, Neg, Sub};
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Encode, Decode)]
 #[repr(C)]
 pub struct IntPoint {
     pub x: i32,
     pub y: i32,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Encode, Decode)]
 #[repr(C)]
 pub struct FloatPoint {
     pub x: f32,
@@ -28,21 +29,33 @@ pub struct FloatVector3 {
     pub z: f32,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Encode, Decode)]
 #[repr(C)]
 pub struct IntSize {
     pub width: i32,
     pub height: i32,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
+impl IntSize {
+    pub fn is_empty(self) -> bool {
+        self.width <= 0 || self.height <= 0
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Encode, Decode)]
 #[repr(C)]
 pub struct FloatSize {
     pub width: f32,
     pub height: f32,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+impl FloatSize {
+    pub fn is_empty(self) -> bool {
+        self.width <= 0.0 || self.height <= 0.0
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Encode, Decode)]
 #[repr(C)]
 pub struct IntRect {
     pub x: i32,
@@ -51,7 +64,7 @@ pub struct IntRect {
     pub height: i32,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Encode, Decode)]
 #[repr(C)]
 pub struct FloatRect {
     pub x: f32,
@@ -66,6 +79,67 @@ pub enum Orientation {
     #[default]
     Horizontal,
     Vertical,
+}
+
+impl FloatPoint {
+    pub fn primary_offset_for_orientation(self, orientation: Orientation) -> f32 {
+        match orientation {
+            Orientation::Horizontal => self.x,
+            Orientation::Vertical => self.y,
+        }
+    }
+
+    pub fn set_primary_offset_for_orientation(&mut self, orientation: Orientation, value: f32) {
+        match orientation {
+            Orientation::Horizontal => self.x = value,
+            Orientation::Vertical => self.y = value,
+        }
+    }
+
+    pub fn is_zero(self) -> bool {
+        self.x == 0.0 && self.y == 0.0
+    }
+
+    pub fn translate_by(&mut self, delta: Self) {
+        self.x += delta.x;
+        self.y += delta.y;
+    }
+
+    pub fn scaled(self, factor: f32) -> Self {
+        Self {
+            x: self.x * factor,
+            y: self.y * factor,
+        }
+    }
+
+    pub fn distance_from(self, other: Self) -> f32 {
+        if self == other {
+            return 0.0;
+        }
+        ak::math::hypot(self.x - other.x, self.y - other.y)
+    }
+}
+
+impl Add for FloatPoint {
+    type Output = Self;
+
+    fn add(self, other: Self) -> Self {
+        Self {
+            x: self.x + other.x,
+            y: self.y + other.y,
+        }
+    }
+}
+
+impl Sub for FloatPoint {
+    type Output = Self;
+
+    fn sub(self, other: Self) -> Self {
+        Self {
+            x: self.x - other.x,
+            y: self.y - other.y,
+        }
+    }
 }
 
 impl FloatVector3 {
@@ -135,6 +209,27 @@ impl Neg for FloatVector3 {
 }
 
 impl IntRect {
+    pub fn primary_offset_for_orientation(self, orientation: Orientation) -> i32 {
+        match orientation {
+            Orientation::Horizontal => self.x,
+            Orientation::Vertical => self.y,
+        }
+    }
+
+    pub fn primary_size_for_orientation(self, orientation: Orientation) -> i32 {
+        match orientation {
+            Orientation::Horizontal => self.width,
+            Orientation::Vertical => self.height,
+        }
+    }
+
+    pub fn translate_primary_offset_for_orientation(&mut self, orientation: Orientation, delta: i32) {
+        match orientation {
+            Orientation::Horizontal => self.x += delta,
+            Orientation::Vertical => self.y += delta,
+        }
+    }
+
     pub const fn new(x: i32, y: i32, width: i32, height: i32) -> Self {
         Self { x, y, width, height }
     }
@@ -163,6 +258,9 @@ impl IntRect {
     }
     pub const fn inflated(self, w: i32, h: i32) -> Self {
         Self::new(self.x - w / 2, self.y - h / 2, self.width + w, self.height + h)
+    }
+    pub const fn translated(self, dx: i32, dy: i32) -> Self {
+        Self::new(self.x + dx, self.y + dy, self.width, self.height)
     }
     pub const fn inflated_edges(self, top: i32, right: i32, bottom: i32, left: i32) -> Self {
         Self::new(
@@ -201,6 +299,14 @@ impl IntRect {
 }
 
 impl FloatRect {
+    pub fn contains_vertically(self, y: f32) -> bool {
+        y >= self.y && y < self.bottom()
+    }
+
+    pub fn contains_horizontally(self, x: f32) -> bool {
+        x >= self.x && x < self.right()
+    }
+
     pub const fn new(x: f32, y: f32, width: f32, height: f32) -> Self {
         Self { x, y, width, height }
     }

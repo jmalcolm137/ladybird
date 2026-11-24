@@ -160,12 +160,12 @@ ModuleMap& EnvironmentSettingsObject::module_map()
 JS::Realm& EnvironmentSettingsObject::realm()
 {
     // An environment settings object's realm execution context's Realm component is the environment settings object's Realm.
-    return *realm_execution_context().realm;
+    return *realm_execution_context().realm();
 }
 
 JS::Realm const& EnvironmentSettingsObject::realm() const
 {
-    return *realm_execution_context().realm;
+    return *realm_execution_context().realm();
 }
 
 // https://html.spec.whatwg.org/multipage/webappapis.html#concept-settings-object-global
@@ -236,7 +236,7 @@ static JS::ExecutionContext* top_most_script_having_execution_context(JS::VM& vm
     // Here, the topmost script-having execution context is the topmost entry of the JavaScript execution context stack that has a non-null ScriptOrModule component,
     // or null if there is no such entry in the JavaScript execution context stack.
     auto execution_context = vm.last_execution_context_matching([&](JS::ExecutionContext* context) {
-        return !context->script_or_module.has<Empty>();
+        return !context->script_or_module().has<Empty>();
     });
 
     if (!execution_context.has_value())
@@ -260,7 +260,7 @@ void prepare_to_run_callback(EnvironmentSettingsObject& settings)
 
     // 3. If context is not null, increment context's skip-when-determining-incumbent counter.
     if (context) {
-        context->skip_when_determining_incumbent_counter++;
+        HTML::current_event_loop().increment_skip_when_determining_incumbent_counter(*context);
     }
 }
 
@@ -318,7 +318,7 @@ void clean_up_after_running_callback(EnvironmentSettingsObject const& settings)
 
     // 2. If context is not null, decrement context's skip-when-determining-incumbent counter.
     if (context) {
-        context->skip_when_determining_incumbent_counter--;
+        HTML::current_event_loop().decrement_skip_when_determining_incumbent_counter(*context);
     }
 
     // 3. Assert: the topmost entry of the backup incumbent realm stack is settings.
@@ -429,7 +429,7 @@ EnvironmentSettingsObject& incumbent_settings_object()
     auto* context = top_most_script_having_execution_context(vm);
 
     // 2. If context is null, or if context's skip-when-determining-incumbent counter is greater than zero, then:
-    if (!context || context->skip_when_determining_incumbent_counter > 0) {
+    if (!context || event_loop.skip_when_determining_incumbent_counter(*context) > 0) {
         // 1. Assert: the backup incumbent settings object stack is not empty.
         // 1. Assert: the backup incumbent realm stack is not empty.
         // NOTE: If this assertion fails, it's because the incumbent realm was used with no involvement of JavaScript.
@@ -440,7 +440,7 @@ EnvironmentSettingsObject& incumbent_settings_object()
     }
 
     // 3. Return context's Realm component's settings object.
-    return principal_realm_settings_object(*context->realm);
+    return principal_realm_settings_object(*context->realm());
 }
 
 // https://html.spec.whatwg.org/multipage/webappapis.html#concept-incumbent-global
@@ -658,13 +658,13 @@ JS::Realm& entry_realm()
     // With this in hand, we define the entry execution context to be the most recently pushed item in the JavaScript execution context stack that is a realm execution context.
     // The entry realm is the entry execution context's Realm component.
     auto entry_execution_context = vm.last_execution_context_matching([](JS::ExecutionContext* context) {
-        if (!context->realm)
+        if (!context->realm())
             return false;
-        return &principal_realm_settings_object(*context->realm).realm_execution_context() == context;
+        return &principal_realm_settings_object(*context->realm()).realm_execution_context() == context;
     });
 
     VERIFY(entry_execution_context.has_value());
-    return *entry_execution_context.value()->realm;
+    return *entry_execution_context.value()->realm();
 }
 
 // https://html.spec.whatwg.org/multipage/webappapis.html#entry-settings-object

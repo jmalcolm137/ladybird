@@ -12,19 +12,23 @@
 #include <LibGfx/Point.h>
 #include <LibGfx/Size.h>
 #include <QAbstractNativeEventFilter>
+#include <QApplication>
 #include <QColor>
 #include <QCoreApplication>
 #include <QDrag>
 #include <QGuiApplication>
 #include <QMargins>
+#include <QMetaObject>
 #include <QMouseEvent>
 #include <QPointer>
 #include <QWheelEvent>
 #include <QWidget>
 #include <QWindow>
 #include <UI/Qt/WebContentView.h>
+#include <qpa/qplatformwindow_p.h>
 
 #import <Cocoa/Cocoa.h>
+#import <IOSurface/IOSurface.h>
 #import <QuartzCore/QuartzCore.h>
 #import <UI/Qt/DictionaryLookup.h>
 #import <dlfcn.h>
@@ -459,7 +463,84 @@ void install_appkit_event_capture()
     }
 }
 
-Optional<u64> appkit_display_id_for_window(QWidget& widget)
+static NSWindow* appkit_window_for(QWidget& widget)
+{
+    if (QGuiApplication::platformName() != "cocoa")
+        return nil;
+    auto* view = reinterpret_cast<NSView*>(widget.internalWinId());
+    return view.window;
+}
+
+// A popup is a window of its own, placed by what it hangs from when it opens. Dragging that window by its title bar
+// never reaches the popup as a press outside it, so the popup would stay open where it was while the window moved away.
+// The popup's window is a child window of the window it hangs from while it is shown, so AppKit moves it along. On
+// other platforms, starting to move a window is a press outside the popup, which closes it.
+class LadybirdAppKitPopupAttachmentFilter final : public QObject {
+public:
+    AK_ALLOC_WITH_KMALLOC;
+
+    virtual bool eventFilter(QObject* watched, QEvent* event) override
+    {
+        if (event->type() != QEvent::Show && event->type() != QEvent::Hide)
+            return false;
+        if (!watched->isWidgetType())
+            return false;
+        auto& popup = static_cast<QWidget&>(*watched);
+        if (popup.windowType() != Qt::Popup || !popup.parentWidget())
+            return false;
+
+        if (event->type() == QEvent::Hide) {
+            auto* popup_window = appkit_window_for(popup);
+            if (auto* parent_window = popup_window.parentWindow)
+                [parent_window removeChildWindow:popup_window];
+            return false;
+        }
+
+        // Qt sends the Show event before applying the popup's geometry to its native window. Attaching it during
+        // that event can expose the window with its initial geometry.
+        // The menus that every window shares have a parent that is never shown. Its window would appear along with a
+        // child window that is pressed, so such a menu hangs from the popup that opened it.
+        // NB: Qt sends the Show event before the popup becomes the active one.
+        QPointer<QWidget> anchor = popup.parentWidget()->window();
+        if (!anchor->isVisible())
+            anchor = QApplication::activePopupWidget();
+
+        auto attach_popup = [&popup, anchor] {
+            if (!popup.isVisible() || !anchor || !anchor->isVisible())
+                return;
+            auto* popup_window = appkit_window_for(popup);
+            if (!popup_window)
+                return;
+
+            // A window can be dragged by its content with a gesture, which would take the popup away from its anchor.
+            popup_window.movable = NO;
+
+            auto* parent_window = appkit_window_for(*anchor);
+            if (!parent_window || parent_window == popup_window || popup_window.parentWindow == parent_window)
+                return;
+
+            if (auto* previous_parent_window = popup_window.parentWindow)
+                [previous_parent_window removeChildWindow:popup_window];
+            [parent_window addChildWindow:popup_window ordered:NSWindowAbove];
+        };
+
+        QMetaObject::invokeMethod(&popup, attach_popup, Qt::QueuedConnection);
+        return false;
+    }
+};
+
+void install_appkit_popup_attachment()
+{
+    static bool installed = false;
+    if (installed)
+        return;
+    if (auto* application = QCoreApplication::instance()) {
+        application->installEventFilter(new LadybirdAppKitPopupAttachmentFilter);
+        installed = true;
+    }
+}
+
+static NSScreen* appkit_screen_of_window(QWidget& widget)
 {
     NSScreen* screen = nil;
     // winId() would create the native window, so only a window that already has one is asked for its screen.
@@ -469,6 +550,18 @@ Optional<u64> appkit_display_id_for_window(QWidget& widget)
     }
     if (screen == nil)
         screen = NSScreen.mainScreen;
+    return screen;
+}
+
+bool appkit_window_screen_shows_high_dynamic_range(QWidget& widget)
+{
+    auto* screen = appkit_screen_of_window(widget);
+    return screen != nil && screen.maximumPotentialExtendedDynamicRangeColorComponentValue > 1.0;
+}
+
+Optional<u64> appkit_display_id_for_window(QWidget& widget)
+{
+    auto* screen = appkit_screen_of_window(widget);
     if (screen == nil)
         return {};
 
@@ -520,12 +613,15 @@ void disable_appkit_window_animations(QWidget& widget)
 void ensure_appkit_window_is_exposed(QWidget& widget)
 {
     auto* window = widget.windowHandle();
-    if (!widget.isVisible() || !window || window->isExposed())
+    if (!widget.isVisible() || !window || !window->isVisible() || window->isExposed())
         return;
 
-    // Qt restores a native view's exposed state from its display callback. A view whose backing layer is already
-    // clean can remain unexposed after being shown or raised, causing Qt to route hover events to the view below it.
-    [reinterpret_cast<NSView*>(widget.winId()) setNeedsDisplay:YES];
+    // Qt restores a native view's exposed state from its content layer's display callback. A view whose backing layer
+    // is already clean can remain unexposed after being shown or raised, causing Qt to route hover events below it.
+    // Display the content layer directly: marking the NSView as needing display can leave that callback uncalled.
+    auto* layer = static_cast<CALayer*>(appkit_content_layer(widget));
+    [layer setNeedsDisplay];
+    [layer displayIfNeeded];
 }
 
 void set_appkit_window_content_aspect_ratio(QWidget& widget, Gfx::IntSize aspect_ratio)
@@ -634,6 +730,134 @@ void show_appkit_dictionary_lookup(QWidget& widget, WebView::DictionaryLookup co
     show_dictionary_lookup(view, lookup, widget_position_to_ns_point(widget, position));
 }
 
+void* appkit_content_layer(QWidget& widget)
+{
+    auto* window_handle = widget.windowHandle();
+    auto* cocoa_window = window_handle ? window_handle->nativeInterface<QNativeInterface::Private::QCocoaWindow>() : nullptr;
+    return cocoa_window ? cocoa_window->contentLayer() : nullptr;
+}
+
+static IOSurfaceRef create_chrome_snapshot_surface(IOSurfaceRef window_surface, size_t height)
+{
+    auto* properties = @{
+        (__bridge NSString*)kIOSurfaceWidth : @(IOSurfaceGetWidth(window_surface)),
+        (__bridge NSString*)kIOSurfaceHeight : @(height),
+        (__bridge NSString*)kIOSurfaceBytesPerRow : @(IOSurfaceGetBytesPerRow(window_surface)),
+        (__bridge NSString*)kIOSurfaceBytesPerElement : @(IOSurfaceGetBytesPerElement(window_surface)),
+        (__bridge NSString*)kIOSurfacePixelFormat : @(IOSurfaceGetPixelFormat(window_surface)),
+    };
+    auto* surface = IOSurfaceCreate((__bridge CFDictionaryRef)properties);
+    if (!surface)
+        return nullptr;
+
+    auto color_space_key = CFSTR("IOSurfaceColorSpace");
+    if (auto color_space = IOSurfaceCopyValue(window_surface, color_space_key)) {
+        IOSurfaceSetValue(surface, color_space_key, color_space);
+        CFRelease(color_space);
+    }
+    return surface;
+}
+
+static bool copy_top_rows_of_surface(IOSurfaceRef from, IOSurfaceRef to, size_t height)
+{
+    if (IOSurfaceLock(from, kIOSurfaceLockReadOnly, nullptr) != kIOReturnSuccess)
+        return false;
+    auto locked_to = IOSurfaceLock(to, 0, nullptr) == kIOReturnSuccess;
+    if (locked_to) {
+        memcpy(IOSurfaceGetBaseAddress(to), IOSurfaceGetBaseAddress(from), min(IOSurfaceGetBytesPerRow(from), IOSurfaceGetBytesPerRow(to)) * height);
+        IOSurfaceUnlock(to, 0, nullptr);
+    }
+    IOSurfaceUnlock(from, kIOSurfaceLockReadOnly, nullptr);
+    return locked_to;
+}
+
+AppKitWindowChromeSnapshots::AppKitWindowChromeSnapshots(QWidget& window, Function<int()> chrome_height)
+    : m_window(window)
+    , m_chrome_height(move(chrome_height))
+{
+    auto* layer = [[CALayer alloc] init];
+    layer.opaque = YES;
+    m_layer = layer;
+
+    // NB: Core Animation commits at order 2000000, so a repaint normally reaches the screen in one commit with its
+    //     snapshot. Core Animation can also ask Qt for a repaint during that commit. Only the second observer then
+    //     sees the repaint before the run loop sleeps.
+    static constexpr Array<CFIndex, 2> orders { 1999999, 2000001 };
+    for (size_t i = 0; i < orders.size(); ++i) {
+        auto* observer = CFRunLoopObserverCreateWithHandler(kCFAllocatorDefault, kCFRunLoopBeforeWaiting | kCFRunLoopExit, true, orders[i], ^(CFRunLoopObserverRef, CFRunLoopActivity) {
+            update();
+        });
+        CFRunLoopAddObserver(CFRunLoopGetMain(), observer, kCFRunLoopCommonModes);
+        m_run_loop_observers[i] = observer;
+    }
+}
+
+AppKitWindowChromeSnapshots::~AppKitWindowChromeSnapshots()
+{
+    for (auto* observer : m_run_loop_observers) {
+        CFRunLoopObserverInvalidate(static_cast<CFRunLoopObserverRef>(observer));
+        CFRelease(observer);
+    }
+    auto* layer = static_cast<CALayer*>(m_layer);
+    [layer removeFromSuperlayer];
+    [layer release];
+    for (auto* surface : { m_shown_surface, m_spare_surface }) {
+        if (surface)
+            CFRelease(surface);
+    }
+}
+
+void AppKitWindowChromeSnapshots::update()
+{
+    auto* window_layer = static_cast<CALayer*>(appkit_content_layer(m_window));
+    id contents = window_layer.contents;
+    if (!contents || CFGetTypeID((__bridge CFTypeRef)contents) != IOSurfaceGetTypeID())
+        return;
+
+    // NB: Qt does not always set the layer's contents after a repaint, as the layer already has the one surface it
+    //     paints into. The surface's seed changes with each repaint.
+    auto* window_surface = (__bridge IOSurfaceRef)contents;
+    auto window_surface_id = IOSurfaceGetID(window_surface);
+    auto window_surface_seed = IOSurfaceGetSeed(window_surface);
+    auto scale = window_layer.contentsScale;
+    auto height = min(static_cast<size_t>(max(m_chrome_height(), 0) * scale), IOSurfaceGetHeight(window_surface));
+    if (window_surface_id == m_window_surface_id && window_surface_seed == m_window_surface_seed && height == m_height)
+        return;
+
+    auto* layer = static_cast<CALayer*>(m_layer);
+    if (height > 0) {
+        // NB: The window server may still be reading the spare surface, and a surface in use is never written to.
+        auto* surface = static_cast<IOSurfaceRef>(m_spare_surface);
+        if (!surface || IOSurfaceGetWidth(surface) != IOSurfaceGetWidth(window_surface) || IOSurfaceGetHeight(surface) != height || IOSurfaceIsInUse(surface)) {
+            if (surface)
+                CFRelease(surface);
+            m_spare_surface = surface = create_chrome_snapshot_surface(window_surface, height);
+        }
+        if (!surface || !copy_top_rows_of_surface(window_surface, surface, height))
+            return;
+        swap(m_shown_surface, m_spare_surface);
+    }
+    m_window_surface_id = window_surface_id;
+    m_window_surface_seed = window_surface_seed;
+    m_height = height;
+
+    [CATransaction begin];
+    [CATransaction setDisableActions:YES];
+    if (layer.superlayer != window_layer)
+        [window_layer addSublayer:layer];
+    layer.hidden = height == 0;
+    layer.frame = CGRectMake(0, 0, IOSurfaceGetWidth(window_surface) / scale, height / scale);
+    layer.contentsScale = scale;
+    layer.contents = height > 0 ? (__bridge id)m_shown_surface : nil;
+
+    // NB: Qt skips its flush for a surface that is on screen, so this tells the window server of the repaint instead.
+    window_layer.contents = nil;
+    window_layer.contents = contents;
+    [CATransaction commit];
+
+    reinterpret_cast<NSView*>(m_window.winId()).window.viewsNeedDisplay = YES;
+}
+
 void round_appkit_view_corners(QWidget& widget, qreal radius, QColor const& border_color)
 {
     auto* view = reinterpret_cast<NSView*>(widget.winId());
@@ -664,28 +888,6 @@ void round_appkit_view_bottom_corners(QWidget& widget, qreal radius)
     // NB: Qt's views are flipped, so the bottom of the view is at its layer's largest y.
     layer.maskedCorners = view.isFlipped ? (kCALayerMinXMaxYCorner | kCALayerMaxXMaxYCorner) : (kCALayerMinXMinYCorner | kCALayerMaxXMinYCorner);
     layer.masksToBounds = YES;
-}
-
-void cast_appkit_view_shadow(QWidget& widget, qreal corner_radius, qreal blur_radius, qreal y_offset, QColor const& color)
-{
-    if (QGuiApplication::platformName() != "cocoa")
-        return;
-    auto* view = reinterpret_cast<NSView*>(widget.winId());
-    if (!view)
-        return;
-    view.wantsLayer = YES;
-    auto* layer = view.layer;
-    layer.masksToBounds = NO;
-    layer.shadowOpacity = 1;
-    layer.shadowRadius = blur_radius;
-    // NB: The layer of a view is flipped with it, and Qt's views are, so a positive offset points down.
-    layer.shadowOffset = CGSizeMake(0, y_offset);
-    auto* shadow_color = CGColorCreateSRGB(color.redF(), color.greenF(), color.blueF(), color.alphaF());
-    layer.shadowColor = shadow_color;
-    CGColorRelease(shadow_color);
-    auto* shadow_path = CGPathCreateWithRoundedRect(view.bounds, corner_radius, corner_radius, nullptr);
-    layer.shadowPath = shadow_path;
-    CGPathRelease(shadow_path);
 }
 
 AppKitViewShadow::AppKitViewShadow()

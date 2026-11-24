@@ -6,15 +6,16 @@
 
 #pragma once
 
+#include <AK/ByteBuffer.h>
 #include <AK/Optional.h>
 #include <AK/RefPtr.h>
+#include <AK/Time.h>
 #include <AK/Vector.h>
-#include <LibCompositing/DisplayList/AccumulatedVisualContext.h>
-#include <LibCompositing/DisplayList/DisplayListResourceStorage.h>
-#include <LibCompositing/Scrolling/ScrollState.h>
+#include <LibCompositing/DisplayList/DisplayListResources.h>
 #include <LibGC/Ptr.h>
 #include <LibWeb/Export.h>
 #include <LibWeb/Forward.h>
+#include <LibWeb/Layout/LayoutRustFFI.h>
 #include <LibWeb/Layout/NodeArena.h>
 
 namespace Web::Painting {
@@ -34,29 +35,29 @@ public:
 
     BlockingWheelEventRegionState collect_root_blocking_wheel_event_regions(DOM::Document&);
 
-    // Called from Document::update_paint_and_hit_testing_properties_if_needed() once the visual
-    // context tree is settled; every other consumer reaches the scroll state through that update.
-    void refresh_scroll_state(Layout::BegunRead const& read, DOM::Document&);
-    void did_update_visual_context_values() { m_visual_context_tree_needs_compositor_update = true; }
+    // The mapping through the document's visual context tree, brought up to date, with the compositor's animations
+    // sampled at the time where one is given. It reads the scroll state, and the tree the host keeps for its mappings,
+    // where it is used.
+    Layout::RustFFI::FfiViewportMapping viewport_mapping(DOM::Document const&, Optional<MonotonicTime> visual_animation_sample_time, double device_pixels_per_css_pixel) const;
+    // Whether the scroll translations of the space the box is painted in, and the origins drawn in it, round to whole
+    // device pixels: no transform but identities lies above it in the visual context tree, brought up to date.
+    bool translations_snap_to_device_pixels(DOM::Document const&, Compositing::RustFFI::NodeSlotId box) const;
+    // Only the scroll logic of the compositor, which is Rust, decodes it.
+    void did_update_visual_context_values();
 
-    void update_accumulated_visual_contexts(Layout::BegunRead const& read, DOM::Document&);
     void update_visual_viewport_accumulated_visual_context(Layout::BegunRead const& read, DOM::Document&);
     // An update pass publishes each effect's compositor animations into a list the tree takes at the end.
-    void begin_compositor_animation_update(DOM::Document&);
+    void begin_compositor_animation_update();
     enum class PublishPendingCompositorAnimations {
         No,
         Yes,
     };
-    void publish_compositor_animations(Layout::BegunRead const& read, DOM::Document&, PublishPendingCompositorAnimations);
-    void republish_visual_animations(Layout::BegunRead const& read, DOM::Document&);
-    bool visual_context_tree_needs_compositor_update() const { return m_visual_context_tree_needs_compositor_update; }
-    void did_update_visual_context_tree_in_compositor() { m_visual_context_tree_needs_compositor_update = false; }
-    // Whether the scroll offsets changed since a frame last took the change.
-    bool take_scroll_state_change() { return exchange(m_scroll_state_changed, false); }
-    void did_change_scroll_state() { m_scroll_state_changed = true; }
+    void publish_compositor_animations(Layout::BegunRead const& read, PublishPendingCompositorAnimations);
+    void republish_visual_animations(Layout::BegunRead const& read);
+    // Whether the visual context tree changed since a frame last took it to the compositor, which the caller's frame now
+    // does.
+    bool take_visual_context_tree_compositor_update(Layout::BegunRead const& read);
     bool has_visual_context_tree(Layout::BegunRead const& read) const;
-    u64 accumulated_visual_context_tree_build_count() const { return m_accumulated_visual_context_tree_build_count; }
-    u64 accumulated_visual_context_tree_incremental_update_count() const { return m_accumulated_visual_context_tree_incremental_update_count; }
     void append_recording_trace(String trace) { m_recording_traces.append(move(trace)); }
     Vector<String> take_recording_traces() { return exchange(m_recording_traces, {}); }
 
@@ -69,43 +70,17 @@ public:
     void recompute_custom_highlight_states(Layout::BegunRead const& read, DOM::Document&, CSS::HighlightRegistry&);
     void reset_custom_highlight_states();
 
-    Compositing::ScrollStateSnapshot const& scroll_state_snapshot() const { return m_scroll_state_snapshot; }
-
     void set_boxes_with_auto_content_visibility(Vector<Compositing::RustFFI::NodeSlotId> boxes) { m_boxes_with_auto_content_visibility = move(boxes); }
     Vector<Compositing::RustFFI::NodeSlotId> const& boxes_with_auto_content_visibility() const { return m_boxes_with_auto_content_visibility; }
 
-    Compositing::AccumulatedVisualContextTree visual_context_tree(DOM::Document const&) const;
-    // Passive access for consumers of an already settled recording.
-    Compositing::AccumulatedVisualContextTree visual_context_tree_without_update(Layout::BegunRead const& read, DOM::Document const&) const;
-    u64 visual_context_tree_structural_epoch_without_update(Layout::BegunRead const& read) const;
-
-    void set_display_list_used_as_paint_command_cache_source(RefPtr<Compositing::DisplayList> display_list, Compositing::DisplayListResourceSet referenced_resources)
-    {
-        m_display_list_used_as_paint_command_cache_source = move(display_list);
-        m_paint_command_cache_source_referenced_resources = move(referenced_resources);
-    }
-    Compositing::DisplayList* display_list_used_as_paint_command_cache_source() const { return m_display_list_used_as_paint_command_cache_source.ptr(); }
-    Compositing::DisplayListResourceSet const& paint_command_cache_source_referenced_resources() const { return m_paint_command_cache_source_referenced_resources; }
-
-    void append_paint_command_cache_source_resources(Compositing::DisplayListResourceSet&) const;
+    u64 visual_context_tree_structural_epoch(Layout::BegunRead const& read) const;
 
 private:
     Vector<String> m_recording_traces;
-    void ensure_visual_context_tree(DOM::Document const&) const;
 
     NonnullRefPtr<Layout::NodeArena> m_layout_node_arena;
 
-    Compositing::ScrollStateSnapshot m_scroll_state_snapshot;
-
     Vector<Compositing::RustFFI::NodeSlotId> m_boxes_with_auto_content_visibility;
-
-    RefPtr<Compositing::DisplayList> m_display_list_used_as_paint_command_cache_source;
-    Compositing::DisplayListResourceSet m_paint_command_cache_source_referenced_resources;
-
-    u64 m_accumulated_visual_context_tree_build_count { 0 };
-    u64 m_accumulated_visual_context_tree_incremental_update_count { 0 };
-    bool m_visual_context_tree_needs_compositor_update { false };
-    bool m_scroll_state_changed { false };
 };
 
 }

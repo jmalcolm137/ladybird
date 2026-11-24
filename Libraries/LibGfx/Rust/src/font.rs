@@ -36,6 +36,8 @@ unsafe extern "C" {
         code_point: u32,
         next_code_point: u32,
         has_next_code_point: bool,
+        code_point_after_next: u32,
+        has_code_point_after_next: bool,
     ) -> u8;
 }
 
@@ -45,7 +47,9 @@ pub struct FfiFontSnapshot {
     pub id: u64,
     pub ascent: f32,
     pub descent: f32,
+    pub line_gap: f32,
     pub x_height: f32,
+    pub cap_height: f32,
     pub zero_advance: f32,
     pub pixel_size: f32,
     pub point_size: f32,
@@ -58,7 +62,9 @@ pub struct FontId(pub u64);
 pub struct FontFacts {
     pub ascent: f32,
     pub descent: f32,
+    pub line_gap: f32,
     pub x_height: f32,
+    pub cap_height: f32,
     pub zero_advance: f32,
     pub pixel_size: f32,
     pub point_size: f32,
@@ -71,6 +77,7 @@ struct FontEntry {
     id: FontId,
     raw: NonNull<c_void>,
     facts: FontFacts,
+    character_advances: std::sync::OnceLock<(f32, f32)>,
     // What the font answers about itself that text chunking asks for every character: whether it is an emoji font,
     // and whether it has a glyph for U+0020 SPACE. Each is unknown until first asked.
     is_emoji_font: LazyVerdict,
@@ -140,11 +147,14 @@ impl FontHandle {
             facts: FontFacts {
                 ascent: snapshot.ascent,
                 descent: snapshot.descent,
+                line_gap: snapshot.line_gap,
                 x_height: snapshot.x_height,
+                cap_height: snapshot.cap_height,
                 zero_advance: snapshot.zero_advance,
                 pixel_size: snapshot.pixel_size,
                 point_size: snapshot.point_size,
             },
+            character_advances: std::sync::OnceLock::new(),
             is_emoji_font: LazyVerdict::default(),
             contains_space_glyph: LazyVerdict::default(),
         }))
@@ -172,6 +182,20 @@ impl FontHandle {
         &self.0.facts
     }
 
+    /// The average and maximum horizontal advances in pixels. A missing metric is zero.
+    pub fn character_advances(&self) -> (f32, f32) {
+        unsafe extern "C" {
+            fn ladybird_gfx_font_character_advances(font: *const c_void, average: *mut f32, maximum: *mut f32);
+        }
+        *self.0.character_advances.get_or_init(|| {
+            let mut average = 0.0;
+            let mut maximum = 0.0;
+            // SAFETY: The entry owns a reference to the font, and both out-pointers address local variables.
+            unsafe { ladybird_gfx_font_character_advances(self.as_raw(), &raw mut average, &raw mut maximum) };
+            (average, maximum)
+        })
+    }
+
     #[inline]
     pub fn as_raw(&self) -> *const c_void {
         self.0.raw.as_ptr()
@@ -195,7 +219,14 @@ impl FontHandle {
         let encoded = char::from_u32(code_point)
             .unwrap_or(char::REPLACEMENT_CHARACTER)
             .encode_utf16(&mut utf16);
-        crate::text_layout::shaped_text_width(self, encoded, crate::text_layout::TextType::Common, 0.0, 0.0)
+        crate::text_layout::shaped_text_width(
+            self,
+            encoded,
+            crate::text_layout::TextType::Common,
+            0.0,
+            0.0,
+            crate::text_layout::JoiningContext::default(),
+        )
     }
 
     pub fn glyph_id_for_code_point(&self, code_point: u32) -> u32 {
@@ -247,13 +278,41 @@ pub struct EmojiPresentation {
     pub forced: bool,
 }
 
-pub fn emoji_presentation_for_code_point(code_point: u32, next_code_point: Option<u32>) -> EmojiPresentation {
+/// Whether `code_point` only ever extends the emoji sequence it follows: a zero width joiner, a variation selector, an
+/// emoji modifier, a tag character, or the combining enclosing keycap. The font that draws what it follows draws it
+/// too, where that font has a glyph for it.
+/// https://www.unicode.org/reports/tr51/#Emoji_Sequences
+pub fn code_point_extends_emoji_sequence(code_point: u32) -> bool {
+    matches!(
+        code_point,
+        0x200d | 0xfe0e | 0xfe0f | 0x20e3 | 0x1f3fb..=0x1f3ff | 0xe0020..=0xe007f
+    )
+}
+
+/// Whether a zero width joiner right after `code_point` joins what follows it to an emoji sequence: `code_point` is an
+/// emoji by default, or it ends the emoji sequence it's in. A joiner after any other character, as in Indic or Arabic
+/// text, joins no emoji.
+/// https://www.unicode.org/reports/tr51/#def_emoji_zwj_element
+pub fn code_point_ends_emoji_zwj_element(code_point: u32) -> bool {
+    matches!(code_point, 0xfe0f | 0x20e3 | 0x1f3fb..=0x1f3ff | 0xe007f)
+        || emoji_presentation_for_code_point(code_point, None, None).is_emoji
+}
+
+/// The presentation `code_point` takes, given the code point after it and the one after that, which can make it the
+/// start of an emoji sequence.
+pub fn emoji_presentation_for_code_point(
+    code_point: u32,
+    next_code_point: Option<u32>,
+    code_point_after_next: Option<u32>,
+) -> EmojiPresentation {
     // SAFETY: The lookup reads only immutable Unicode tables.
     let encoded = unsafe {
         ladybird_gfx_emoji_presentation_for_code_point(
             code_point,
             next_code_point.unwrap_or(0),
             next_code_point.is_some(),
+            code_point_after_next.unwrap_or(0),
+            code_point_after_next.is_some(),
         )
     };
     EmojiPresentation {
@@ -401,6 +460,10 @@ unsafe extern "C" {
         out_entries: *mut FfiCascadeSnapshotEntry,
         out_ranges: *mut FfiCascadeSnapshotRange,
     );
+    fn ladybird_gfx_cascade_snapshot_system_fallback_features(
+        snapshot: *const c_void,
+        out_features: *mut FfiShapeFeature,
+    );
     fn ladybird_gfx_cascade_snapshot_end(snapshot: *const c_void);
     fn ladybird_gfx_system_fallback_font(
         code_point: u32,
@@ -409,6 +472,8 @@ unsafe extern "C" {
         slope: u8,
         prefer_color_emoji: bool,
         point_size: f32,
+        features: *const FfiShapeFeature,
+        feature_count: usize,
     ) -> *const c_void;
     fn ladybird_gfx_font_invisible_variant(font: *const c_void) -> *const c_void;
 
@@ -434,6 +499,16 @@ struct FfiCascadeSnapshotHeader {
     system_fallback_width: u16,
     system_fallback_slope: u8,
     has_system_fallback: bool,
+    system_fallback_feature_count: usize,
+}
+
+/// A `Gfx::ShapeFeature`: an OpenType feature tag, its value, and whether font-feature-settings set it.
+#[repr(C)]
+#[derive(Clone, Copy, Default, Debug, PartialEq)]
+struct FfiShapeFeature {
+    tag: [u8; 4],
+    value: u32,
+    set_by_feature_settings: bool,
 }
 
 #[repr(C)]
@@ -511,12 +586,14 @@ struct EntrySelection<'a> {
 }
 
 /// How this cascade asks for a font no listed family covers.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 struct SystemFallbackStyle {
     point_size: f32,
     weight: u16,
     width: u16,
     slope: u8,
+    /// The features the cascade's request asks of every font, which the system fallback font applies as well.
+    features: Box<[FfiShapeFeature]>,
 }
 
 /// The index of the first entry with a font and the ASCII code points it resolves, where one does.
@@ -941,6 +1018,11 @@ impl FrozenFontList {
                 ffi_fallback_ranges.as_mut_ptr(),
             );
         }
+        let mut system_fallback_features = vec![FfiShapeFeature::default(); header.system_fallback_feature_count];
+        // SAFETY: The buffer is exactly the size the header asked for.
+        unsafe {
+            ladybird_gfx_cascade_snapshot_system_fallback_features(snapshot, system_fallback_features.as_mut_ptr())
+        };
         let last_resort = (!header.last_resort_font.is_null()).then(|| {
             // SAFETY: The list owns its last-resort font for the snapshot's duration.
             unsafe { FontHandle::intern(header.last_resort_font) }
@@ -1018,6 +1100,7 @@ impl FrozenFontList {
                 weight: header.system_fallback_weight,
                 width: header.system_fallback_width,
                 slope: header.system_fallback_slope,
+                features: system_fallback_features.into_boxed_slice(),
             }),
             fonts: fonts.into_boxed_slice(),
             ascii_cache: std::array::from_fn(|_| std::sync::atomic::AtomicU64::new(0)),
@@ -1081,7 +1164,7 @@ impl FrozenFontList {
     }
 
     fn system_fallback_font(&self, code_point: u32, presentation: EmojiPresentation) -> Option<FontHandle> {
-        let style = self.system_fallback?;
+        let style = self.system_fallback.as_ref()?;
         // SAFETY: The service answers with a font it transfers one reference to, or with null.
         let raw = unsafe {
             ladybird_gfx_system_fallback_font(
@@ -1091,6 +1174,8 @@ impl FrozenFontList {
                 style.slope,
                 presentation.is_emoji,
                 style.point_size,
+                style.features.as_ptr(),
+                style.features.len(),
             )
         };
         // SAFETY: A non-null answer carries the reference this handle takes over.
@@ -1339,6 +1424,23 @@ impl FrozenFontList {
             .iter()
             .position(|entry| entry.loaded.get() == Some(font))
             .map(|index| index as u32 | CACHED_FILLED_ENTRY)
+    }
+
+    /// https://drafts.csswg.org/css-values-4/#font-relative-lengths
+    /// Wants the loads of the faces still loading ahead of the first available font, as a length
+    /// relative to a metric of that font (ex, cap, ch, ic, lh) reads the first of them that covers
+    /// U+0020 once it loads. The document requests them once the pass ends, as it does those a
+    /// render pass wants.
+    pub fn want_first_available_font_loads(&self) {
+        const SPACE: u32 = 0x20;
+        for entry in self.entries.iter().filter(|entry| entry.covers(SPACE, &self.ranges)) {
+            if entry.font().is_some() {
+                return;
+            }
+            if let Some((face_id, _)) = entry.pending() {
+                self.note_wanted_pending_face(entry, face_id);
+            }
+        }
     }
 
     fn note_wanted_pending_face(&self, entry: &FrozenEntry, face_id: u64) {

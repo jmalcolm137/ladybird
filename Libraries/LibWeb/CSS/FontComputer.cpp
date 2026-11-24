@@ -25,7 +25,6 @@
 #include <LibWeb/CSS/StyleSheetState.h>
 #include <LibWeb/DOM/Document.h>
 #include <LibWeb/DOM/ShadowRoot.h>
-#include <LibWeb/Fetch/Infrastructure/HTTP/MIME.h>
 #include <LibWeb/Fetch/Response.h>
 #include <LibWeb/HTML/Window.h>
 #include <LibWeb/HTML/WorkerGlobalScope.h>
@@ -36,7 +35,6 @@
 #include <LibWeb/Page/RenderingStats.h>
 #include <LibWeb/Platform/FontPlugin.h>
 #include <LibWeb/SVG/SVGDecodedImageData.h>
-#include <LibWebCommon/MimeSniff/Resource.h>
 
 namespace Web::CSS {
 
@@ -159,7 +157,7 @@ void FontLoader::start_loading_next_source()
         // failure or a byte stream stream:
         m_has_received_font_data = false;
         m_fetch_controller = fetch_a_style_resource(m_sources.take_first().get<URL>(), m_rule_or_declaration, Fetch::Infrastructure::Request::Destination::Font, CorsMode::Cors,
-            GC::create_function(heap(), GC::captures(this), [](FontLoader* loader, GC::Ref<Fetch::Infrastructure::ResponseView> response, Fetch::Infrastructure::FetchAlgorithms::BodyBytes stream) {
+            GC::create_function(heap(), GC::captures(this), [](FontLoader* loader, GC::Ref<Fetch::Infrastructure::ResponseView>, Fetch::Infrastructure::FetchAlgorithms::BodyBytes stream) {
                 // 1. If stream is null, return.
                 // 2. Load a font from stream according to its type.
 
@@ -176,9 +174,8 @@ void FontLoader::start_loading_next_source()
                 loader->m_has_received_font_data = true;
                 auto bytes = immutable_bytes->copy_to_byte_buffer().release_value_but_fixme_should_propagate_errors();
 
-                auto mime_type_essence = loader->try_load_font_mime_type_essence(response, bytes);
-                if (!requires_off_thread_vector_font_preparation(bytes, mime_type_essence)) {
-                    auto maybe_typeface = try_load_vector_font(bytes, mime_type_essence);
+                if (!requires_off_thread_vector_font_preparation(bytes)) {
+                    auto maybe_typeface = try_load_vector_font(bytes);
                     if (maybe_typeface.is_error()) {
                         if (loader->m_sources.is_empty()) {
                             loader->font_did_load_or_fail(nullptr);
@@ -245,18 +242,6 @@ void FontLoader::font_did_load_or_fail(RefPtr<Gfx::Typeface const> typeface)
         callback->function()(m_typeface);
     m_subscribers.clear();
     m_fetch_controller = nullptr;
-}
-
-Optional<ByteString> FontLoader::try_load_font_mime_type_essence(Fetch::Infrastructure::ResponseView const& response, ByteBuffer const& bytes)
-{
-    // FIXME: This could maybe use the format() provided in @font-face as well, since often the mime type is just application/octet-stream and we have to try every format
-    auto mime_type = Fetch::Infrastructure::extract_mime_type(response.header_list());
-    if (!mime_type.has_value() || !is_supported_font_mimetype(mime_type->essence())) {
-        mime_type = MimeSniff::Resource::sniff(bytes, MimeSniff::SniffingConfiguration { .sniffing_context = MimeSniff::SniffingContext::Font });
-    }
-    if (!mime_type.has_value() || !is_supported_font_mimetype(mime_type->essence()))
-        return {};
-    return mime_type->essence().to_byte_string();
 }
 
 void FontComputer::visit_edges(Visitor& visitor)
@@ -396,7 +381,7 @@ FontFeatureValues const& FontComputer::font_feature_values_for_family(Utf16FlySt
     return m_font_feature_values_cache.ensure(move(key), [&] { return move(font_feature_values); });
 }
 
-Gfx::Font const& FontComputer::initial_font() const
+Gfx::Font const& FontComputer::initial_font()
 {
     // FIXME: This is not correct.
     static auto const& font = Platform::FontPlugin::the().default_font(12).release_nonnull().leak_ref();
@@ -453,7 +438,6 @@ void FontComputer::invalidate_changed_font_cascades(Vector<Utf16FlyString> const
         fill_loaded_font_faces(move(loaded_face_fills));
     if (!invalidated_font_lists.is_empty() && m_document)
         record_font_input_changes({}, invalidated_font_lists);
-    request_wanted_web_faces();
 }
 
 // Has the style engine record an input change for every element whose style uses a font that resolves differently
@@ -569,13 +553,16 @@ NonnullRefPtr<FontFaceSnapshot const> FontComputer::font_face_snapshot() const
     for (auto const& [key, faces] : m_font_faces) {
         Vector<FontFaceSnapshot::Face> snapshot_faces;
         snapshot_faces.ensure_capacity(faces.size());
-        for (auto const& face : faces) {
+        // https://drafts.csswg.org/css-fonts-4/#font-style-matching
+        // Try the faces of a composite face in reverse order of definition.
+        for (auto const& face : faces.in_reverse()) {
             snapshot_faces.unchecked_append({
                 .id = face->id(),
                 .typeface = face->typeface(),
                 .rendering_typeface = face->rendering_typeface(),
                 .rendering_state = face->rendering_state_without_requesting(),
                 .unicode_ranges = face->unicode_ranges(),
+                .size_adjust = face->size_adjust(),
                 .has_urls = face->has_urls(),
                 .is_unusable = face->is_unusable_for_rendering(),
                 .has_non_default_unicode_range = face->has_non_default_unicode_range(),
@@ -657,6 +644,10 @@ void FontComputer::register_font_face(NonnullRefPtr<FontFaceState> face)
     if (faces.contains_slow(face))
         return;
     faces.append(face);
+    // Editing a matching descriptor can return an earlier face to a group that already has a later one.
+    // Loading a sheet synchronizes the whole batch once every face has joined the font source.
+    if (faces.size() > 1 && m_document && m_font_face_change_batch_depth == 0)
+        document().fonts()->synchronize_css_connected_font_order();
     did_load_font(key);
 }
 
@@ -676,6 +667,8 @@ void FontComputer::unregister_font_face(NonnullRefPtr<FontFaceState> face)
 void FontComputer::synchronize_font_face_order(Vector<NonnullRefPtr<FontFaceState>> const& font_source_order)
 {
     for (auto& entry : m_font_faces) {
+        if (entry.value.size() < 2)
+            continue;
         Vector<NonnullRefPtr<FontFaceState>> ordered_faces;
         for (auto& font_face : font_source_order) {
             if (entry.value.contains_slow(font_face))

@@ -14,6 +14,7 @@ mod property;
 
 pub(super) use property::CacheRegisters;
 pub(super) use property::DeferredCacheProbe;
+pub(super) use property::DeferredVmCacheProbe;
 pub(super) use property::PUT_BY_ID_RECORD_BYTES;
 
 use super::Codegen;
@@ -23,7 +24,7 @@ use crate::asm::Gpr;
 use crate::asm::Label;
 use crate::asm::PortableMacroAssembler;
 
-impl<M: PortableMacroAssembler> Codegen<'_, M> {
+impl<M: PortableMacroAssembler> Codegen<'_, '_, M> {
     /// Branches to `miss` unless the dictionary generation of the shape in
     /// `shape` is the one a cache recorded at `expected`. Loads the two into
     /// `temps`, the first of which may be `shape`.

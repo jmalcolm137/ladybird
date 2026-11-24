@@ -26,7 +26,6 @@
 #include <AK/Variant.h>
 #include <AK/Vector.h>
 #include <AK/kmalloc.h>
-#include <LibCrypto/Forward.h>
 #include <LibGC/Function.h>
 #include <LibGC/Heap.h>
 #include <LibGC/RootHashMap.h>
@@ -55,6 +54,22 @@
 #include <LibJS/Runtime/Value.h>
 
 namespace JS {
+
+struct AsyncWaitQueue;
+
+// wake() receives an owned native queue reference on any thread. Dispatch it on the VM's thread, and release it even
+// if dispatch is canceled. destroy() runs on any thread after the final wake() returns; the other callbacks run on
+// the VM's thread, while their realm is live.
+struct AsyncWaitHooks {
+    AK_ALLOC_WITH_KMALLOC;
+
+    void* data;
+    void (*wake)(void*, AsyncWaitQueue const*);
+    void (*destroy)(void*);
+    void (*enqueue_resolution)(void*, u64, Realm&);
+    i32 (*schedule_timeout)(void*, u64, Realm&, double);
+    void (*cancel_timeout)(void*, Realm&, i32);
+};
 
 enum class HandledByHost {
     Handled,
@@ -148,7 +163,7 @@ public:
     VM& vm() { return *this; }
     VM const& vm() const { return *this; }
 
-    [[nodiscard]] Realm& realm() { return *running_execution_context().realm; }
+    [[nodiscard]] Realm& realm() { return *current_realm(); }
     [[nodiscard]] Object& global_object() { return realm().global_object(); }
 
     ThrowCompletionOr<Value> run(Script&, GC::Ptr<Environment> lexical_environment_override = nullptr);
@@ -180,6 +195,10 @@ public:
 
     PrimitiveString& empty_string();
 
+    // A realm with no intrinsics, global object, global environment or host-defined data, which nothing can give it. An
+    // object that belongs to no realm lives in it.
+    Realm& empty_realm();
+
     // This represents the list of errors from ErrorTypes.h whose messages are used in contexts which
     // must not fail to allocate when they are used. For example, we cannot allocate when we raise an
     // out-of-memory error, thus we pre-allocate that error string at VM creation time.
@@ -190,8 +209,6 @@ public:
         __Count,
     };
     Utf16String const& error_message(ErrorMessage) const;
-
-    bool did_reach_stack_space_limit() const;
 
     // Pushes onto the runtime's execution context stack in place, as the runtime itself does, unless the stack's
     // storage is full, which only the runtime can grow.
@@ -206,11 +223,14 @@ public:
         execution_context.caller_return_pc = 0;
         execution_context.caller_dst_raw = 0;
         execution_context.caller_is_construct = false;
+        execution_context.caller_is_derived_construct = false;
         auto& entry = execution_context_stack_entries()[length];
         entry.execution_context = &execution_context;
         entry.previous_running_execution_context = running_execution_context_or_null();
+        entry.previous_realm = engine_head_field<Realm*>(JS_LAYOUT_VM_CURRENT_REALM_OFFSET);
         set_engine_head_field<size_t>(JS_LAYOUT_VM_EXECUTION_CONTEXT_STACK_LENGTH_OFFSET, length + 1);
         set_engine_head_field<ExecutionContext*>(JS_LAYOUT_VM_RUNNING_EXECUTION_CONTEXT_OFFSET, &execution_context);
+        set_engine_head_field<Realm*>(JS_LAYOUT_VM_CURRENT_REALM_OFFSET, execution_context.realm().ptr());
     }
 
     ExecutionContext* pop_execution_context()
@@ -220,6 +240,7 @@ public:
         auto const& entry = execution_context_stack_entries()[length - 1];
         set_engine_head_field<size_t>(JS_LAYOUT_VM_EXECUTION_CONTEXT_STACK_LENGTH_OFFSET, length - 1);
         set_engine_head_field<ExecutionContext*>(JS_LAYOUT_VM_RUNNING_EXECUTION_CONTEXT_OFFSET, entry.previous_running_execution_context);
+        set_engine_head_field<Realm*>(JS_LAYOUT_VM_CURRENT_REALM_OFFSET, entry.previous_realm.ptr());
         return entry.execution_context;
     }
 
@@ -323,13 +344,18 @@ public:
     Environment const* lexical_environment() const { return running_execution_context().lexical_environment.ptr(); }
     Environment* lexical_environment() { return running_execution_context().lexical_environment.ptr(); }
 
-    Environment const* variable_environment() const { return running_execution_context().variable_environment.ptr(); }
-    Environment* variable_environment() { return running_execution_context().variable_environment.ptr(); }
-
     // https://tc39.es/ecma262/#current-realm
     // The value of the Realm component of the running execution context is also called the current Realm Record.
-    Realm const* current_realm() const { return running_execution_context().realm.ptr(); }
-    Realm* current_realm() { return running_execution_context().realm.ptr(); }
+    Realm const* current_realm() const
+    {
+        VERIFY(running_execution_context_or_null());
+        return engine_head_field<Realm*>(JS_LAYOUT_VM_CURRENT_REALM_OFFSET);
+    }
+    Realm* current_realm()
+    {
+        VERIFY(running_execution_context_or_null());
+        return engine_head_field<Realm*>(JS_LAYOUT_VM_CURRENT_REALM_OFFSET);
+    }
 
     // https://tc39.es/ecma262/#active-function-object
     // The value of the Function component of the running execution context is also called the active function object.
@@ -387,6 +413,12 @@ public:
     Function<void(Object const&, PropertyKey const&)> on_unimplemented_property_access;
 
     void set_agent(OwnPtr<Agent>);
+    void set_async_wait_hooks(AsyncWaitHooks);
+    static void dispatch_async_wait_queue(AsyncWaitQueue const*);
+    static void release_async_wait_queue(AsyncWaitQueue const*);
+    void resolve_async_wait(u64 id);
+    void timeout_async_wait(u64 id);
+    void async_wait_timer_fired(u64 id);
 
     // How Error.prototype.stack writes its frames and how Function.prototype.toString writes a built-in function: the
     // embedder's choice, since scripts read both to tell engines apart. This goes for all the VMs of the process, on any
@@ -437,6 +469,14 @@ public:
     // Where the given value was thrown, if it is the last exception thrown. Only one report may take the location of a
     // throw.
     [[nodiscard]] Optional<SourceRange> take_throw_site_of(Value);
+
+    // Whether errors keep at least 200 frames, for a debugger that lists them, even when Error.stackTraceLimit is not a
+    // number. What script can observe stays the same: stack strings show as many frames as Error.stackTraceLimit says,
+    // and ErrorData::script_visible_traceback() has the frames that the error would keep without this.
+    void set_keeps_long_stack_traces(bool);
+
+    // The source range of the innermost frame on the stack that has one, as the first such element of stack_trace().
+    [[nodiscard]] Optional<SourceRange> innermost_source_range() const;
 
 private:
     friend class InterpreterStack;
@@ -493,14 +533,16 @@ private:
     }
 
     // An entry of the runtime's execution context stack: a context pushed onto it, and the context that was running
-    // when it was pushed.
+    // when it was pushed, with the current realm of then, which the pop of the entry makes current again.
     struct ExecutionContextStackEntry {
         ExecutionContext* execution_context;
         ExecutionContext* previous_running_execution_context;
+        GC::RawPtr<Realm> previous_realm;
     };
     static_assert(sizeof(ExecutionContextStackEntry) == JS_LAYOUT_EXECUTION_CONTEXT_STACK_ENTRY_SIZE);
     static_assert(__builtin_offsetof(ExecutionContextStackEntry, execution_context) == JS_LAYOUT_EXECUTION_CONTEXT_STACK_ENTRY_EXECUTION_CONTEXT_OFFSET);
     static_assert(__builtin_offsetof(ExecutionContextStackEntry, previous_running_execution_context) == JS_LAYOUT_EXECUTION_CONTEXT_STACK_ENTRY_PREVIOUS_RUNNING_EXECUTION_CONTEXT_OFFSET);
+    static_assert(__builtin_offsetof(ExecutionContextStackEntry, previous_realm) == JS_LAYOUT_EXECUTION_CONTEXT_STACK_ENTRY_PREVIOUS_REALM_OFFSET);
 
     ExecutionContextStackEntry* execution_context_stack_entries() const
     {

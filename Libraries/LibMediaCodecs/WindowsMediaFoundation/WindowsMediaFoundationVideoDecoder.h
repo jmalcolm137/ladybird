@@ -13,6 +13,7 @@
 #include <AK/kmalloc.h>
 #include <LibMediaCodecs/CodecID.h>
 #include <LibMediaCodecs/CodecParameters.h>
+#include <LibMediaCodecs/Codecs/HighDynamicRangeMetadataTracker.h>
 #include <LibMediaCodecs/DecoderCapabilities.h>
 #include <LibMediaCodecs/Export.h>
 #include <LibMediaCodecs/VideoDecoder.h>
@@ -33,11 +34,12 @@ public:
     virtual ~WindowsMediaFoundationVideoDecoder() override;
 
     virtual void set_storage_freed_callback(Function<void()> callback) override { m_frame_pool->set_slot_freed_callback(move(callback)); }
-    virtual void set_output_arrived_callback(Function<void()>) override;
+    virtual void set_decode_completed_callback(Function<void(DecodeCompletion)>) override;
+    virtual bool has_any_decode_in_progress() const override;
 
     virtual DecoderErrorOr<void> receive_coded_data(CodedFrame const&, DecodeIntent) override;
     virtual void signal_end_of_stream() override;
-    virtual DecoderErrorOr<NonnullRefPtr<VideoFrame>> take_next_output(CodingIndependentCodePoints const& container_cicp, Optional<AK::Duration> target = {}) override;
+    virtual DecoderErrorOr<NonnullRefPtr<VideoFrame>> take_next_output(ColorMetadata const& container_color_metadata, Optional<AK::Duration> target = {}) override;
     virtual void flush() override;
 
 private:
@@ -52,9 +54,10 @@ private:
         AK::Duration timestamp;
         AK::Duration duration;
         DecodeIntent intent { DecodeIntent::Output };
+        ColorMetadata high_dynamic_range_metadata {};
     };
 
-    WindowsMediaFoundationVideoDecoder(CodecID, NonnullOwnPtr<Transform>, NonnullRefPtr<ThreadData>, NonnullRefPtr<VideoFramePool>);
+    WindowsMediaFoundationVideoDecoder(CodecID, ReadonlyBytes codec_initialization_data, NonnullOwnPtr<Transform>, NonnullRefPtr<ThreadData>, NonnullRefPtr<VideoFramePool>);
 
     DecoderErrorOr<void> apply_codec_configuration(ReadonlyBytes);
     DecoderErrorOr<ByteBuffer> annex_b_access_unit_for(CodedFrame const&);
@@ -64,7 +67,7 @@ private:
     Optional<size_t> index_of_submitted_frame(i64 sample_time) const;
     void retire_submitted_frames_through(Optional<size_t> index);
 
-    DecoderErrorOr<NonnullRefPtr<VideoFrame>> copy_output_into_frame_pool(DecodedOutput const&, CodingIndependentCodePoints const& container_cicp);
+    DecoderErrorOr<NonnullRefPtr<VideoFrame>> copy_output_into_frame_pool(DecodedOutput const&, ColorMetadata const& container_color_metadata);
 
     CodecID const m_codec_id;
     NonnullOwnPtr<Transform> m_transform;
@@ -74,6 +77,7 @@ private:
     u8 m_nal_unit_length_size { 4 };
     // The transform never sees the configuration record, so its parameter sets are sent ahead of each keyframe.
     ByteBuffer m_annex_b_parameter_sets;
+    Codecs::HighDynamicRangeMetadataTracker m_high_dynamic_range_metadata_tracker;
 
     // Ordered by sample time, which is how the transform hands frames back.
     Vector<SubmittedFrame> m_submitted_frames;

@@ -6,6 +6,12 @@
 
 use super::*;
 use crate::css::style::tree::StyleNodeID;
+use crate::layout::node_data::DomPaintFact;
+use crate::painting::node_painting;
+use crate::painting::paint_read::PaintRead;
+use crate::painting::paintable_rows::PaintableRowReset;
+use crate::painting::record::change_ticks::RowPaintChange;
+use crate::painting::visual_context::dirty::VisualContextBoxDirtyKind;
 
 /// What a commit message tells the document.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -15,15 +21,6 @@ pub enum FfiCommitMessageKind {
     ContentSizeChangedForContainerQueries,
     /// The node is a navigable container whose viewport committed.
     NavigableContainerViewportCommitted,
-    /// The node is the element a box escaped its rebuild root under, so its layout tree has to be
-    /// built again.
-    LayoutTreeRebuildRequested,
-    /// The node is the element whose box keeps a white space text whose box the build could not add or take away
-    /// without building the element's child list again.
-    WhitespaceTextBoxesStale,
-    /// A top layer member was reached with no box and nothing scheduled to rebuild it, so the
-    /// document has to run another top layer zone pass. This one is about the document itself.
-    TopLayerZoneRebuildNeeded,
     /// The node is the element a pseudo-element was generated for, and the pseudo-element's content
     /// or list marker shows the value of the `list-item` counter.
     ListItemCounterValueRendered,
@@ -70,7 +67,7 @@ impl FfiCommitMessage {
 /// Host notifications contain no arena borrows. Dispatch them only after the
 /// mutation phase returns, since C++ can reenter Rust to read or update paint state.
 pub(crate) struct CommitNotifications {
-    row_resets: Vec<crate::painting::paintable_rows::PaintableRowReset>,
+    row_resets: Vec<PaintableRowReset>,
     messages: Vec<FfiCommitMessage>,
 }
 
@@ -114,6 +111,90 @@ impl CommitNotifications {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PreparedRow {
+    None,
+    PopulatedByThisCommit,
+    ExistedBeforeThisCommit,
+}
+
+#[derive(Clone, Copy, Default)]
+struct LineRootChanges {
+    fragment_changed: bool,
+    inline_content_changed: bool,
+    inline_item_order_changed: bool,
+}
+
+impl LineRootChanges {
+    fn all() -> Self {
+        Self {
+            fragment_changed: true,
+            inline_content_changed: true,
+            inline_item_order_changed: true,
+        }
+    }
+
+    fn any(self) -> bool {
+        self.fragment_changed || self.inline_content_changed || self.inline_item_order_changed
+    }
+
+    fn of_link(change: fragment_tree::LinkChange) -> Self {
+        Self {
+            fragment_changed: change.fragment_identity_changed,
+            inline_content_changed: change.inline_content_changed,
+            inline_item_order_changed: change.inline_item_order_changed,
+        }
+    }
+
+    fn union(self, other: Self) -> Self {
+        Self {
+            fragment_changed: self.fragment_changed || other.fragment_changed,
+            inline_content_changed: self.inline_content_changed || other.inline_content_changed,
+            inline_item_order_changed: self.inline_item_order_changed || other.inline_item_order_changed,
+        }
+    }
+}
+
+fn has_descendant_dependent_paint(arena: &LayoutNodeArena, node: NodeSlotId) -> bool {
+    let kind = arena.data(node).kind.get();
+    if node_painting::is_svg(kind)
+        || matches!(
+            kind,
+            NodeKind::FieldSetBox | NodeKind::SVGSVGBox | NodeKind::SVGForeignObjectBox
+        )
+    {
+        return true;
+    }
+    let Some(style) = arena.node_style_if_live(node) else {
+        return true;
+    };
+    let display = style.display();
+    if display.is_table_inside() || display.is_internal_table() || kind == NodeKind::TableWrapper {
+        return true;
+    }
+    // A text-clipped background can collect glyphs from multiple descendant line roots.
+    fn clips_text(value: &crate::css::style_value::StyleValueData) -> bool {
+        use crate::css::{css_enums, style_value::StyleValueData};
+        match value {
+            StyleValueData::Keyword { keyword } => {
+                css_enums::keyword_to_background_box(*keyword) == Some(css_enums::background_box::TEXT)
+            }
+            StyleValueData::ValueList { values, .. } => values.as_slice().iter().any(|value| clips_text(value.data())),
+            _ => false,
+        }
+    }
+    crate::painting::style_queries::handle_value(&style.background().background_clip).is_some_and(clips_text)
+}
+
+fn line_root_changes_repaint_inline_box(
+    arena: &LayoutNodeArena,
+    inline_box: NodeSlotId,
+    line_root_changes: LineRootChanges,
+) -> bool {
+    line_root_changes.inline_content_changed
+        || (line_root_changes.fragment_changed && has_descendant_dependent_paint(arena, inline_box))
+}
+
 /// The fragment holding the links a commit meets: a box's fragment, or the top of the pass.
 #[derive(Clone, Copy)]
 struct Holder {
@@ -123,7 +204,7 @@ struct Holder {
     fragment_index: Option<u32>,
     /// How many lines the box's earlier fragments hold, by which the fragment's line indices count on.
     line_index_offset: usize,
-    line_root_changes: crate::painting::paintable_build::LineRootChanges,
+    line_root_changes: LineRootChanges,
 }
 
 impl Holder {
@@ -141,7 +222,7 @@ impl Holder {
     fn placement_of(&self, link: &FragmentLink) -> (Option<u32>, usize) {
         match self.fragment_index {
             None => (None, 0),
-            Some(index) if link.containing_block == self.node => (Some(index), self.line_index_offset),
+            Some(index) if link.placement.containing_block == self.node => (Some(index), self.line_index_offset),
             Some(_) => (Some(0), 0),
         }
     }
@@ -151,7 +232,7 @@ impl Holder {
 struct BrokenBox<'tree> {
     fragments: fragment_tree::SlotFragments<'tree>,
     line_count: usize,
-    enclosing_line_root_changes: crate::painting::paintable_build::LineRootChanges,
+    enclosing_line_root_changes: LineRootChanges,
 }
 
 /// A box a commit committed anew, with the fragments it committed before, whose links the commit clears unless it met
@@ -166,8 +247,10 @@ struct RecommittedBox {
 /// changed. The fragment of a box whose committed link it meets again unchanged, in geometry still current, holds the
 /// links its subtree committed, so the walk leaves that subtree as it is.
 struct Commit<'arena, 'tree> {
-    paintables: crate::painting::paintable_build::PaintableCommit<'arena>,
+    arena: &'arena mut LayoutNodeArena,
     messages: Vec<FfiCommitMessage>,
+    row_reset_notifications: Vec<PaintableRowReset>,
+    committed_navigable_container_viewports: Vec<Node>,
     /// The number of this commit, which tells the links it met from those it did not.
     number: u32,
     root: Node,
@@ -178,16 +261,21 @@ struct Commit<'arena, 'tree> {
     broken_box_order: Vec<Node>,
     out_of_flow_boxes: Vec<(Node, std::sync::Arc<crate::layout::abspos_inputs::AbsposLayoutInputs>)>,
     pass_level_links: Vec<Node>,
-    line_roots: Vec<(Node, crate::painting::paintable_build::LineRootChanges)>,
+    line_roots: Vec<(Node, LineRootChanges)>,
+    pieces_only_moved_by_inline_box_slot_index: Vec<bool>,
 }
 
 impl<'tree> Commit<'_, 'tree> {
     fn arena(&self) -> &LayoutNodeArena {
-        self.paintables.arena()
+        self.arena
     }
 
     fn arena_mut(&mut self) -> &mut LayoutNodeArena {
-        self.paintables.arena_mut()
+        self.arena
+    }
+
+    fn discard_absolute_rects_memoized_during_commit(&mut self) {
+        self.arena_mut().clear_absolute_rect_memo();
     }
 
     fn was_met(&self, node: Node) -> bool {
@@ -198,6 +286,10 @@ impl<'tree> Commit<'_, 'tree> {
 
     fn meet(&mut self, link: &'tree FragmentLink, holder: &Holder) {
         let node = link.fragment.node;
+        debug_assert!(
+            link.fragment.outer_links != fragment_tree::OuterLinks::AwaitingContainingBlockSize,
+            "{node:?} reaches commit with links that await the size of their containing block"
+        );
         // NB: A partial relayout's root keeps the fragment of its parent as its holder, which the commit does not walk.
         let keeps_its_holder = holder.node.is_invalid() && !self.is_full_commit && node == self.root;
         let recorded_holder = if keeps_its_holder {
@@ -214,7 +306,7 @@ impl<'tree> Commit<'_, 'tree> {
         let number = self.number;
         self.arena_mut()
             .note_committed_link_holder(node, recorded_holder, number);
-        let containing_block = link.containing_block;
+        let containing_block = link.placement.containing_block;
         if !containing_block.is_invalid() {
             let held_by_containing_block = recorded_holder == containing_block
                 || self
@@ -231,11 +323,11 @@ impl<'tree> Commit<'_, 'tree> {
         if holder.node.is_invalid() && !keeps_its_holder && (self.is_full_commit || !was_at_pass_level) {
             self.pass_level_links.push(node);
         }
-        if let Some(inputs) = &link.abspos_layout_inputs {
+        if let Some(inputs) = &link.placement.abspos_layout_inputs {
             self.out_of_flow_boxes.push((node, inputs.clone()));
         }
         let (containing_block_fragment, line_index_offset) = holder.placement_of(link);
-        if link.fragment.continues_from_previous_fragment || link.fragment.continues_in_next_fragment {
+        if link.fragment.breaks.box_is_broken() {
             self.meet_broken_box(link, containing_block_fragment, line_index_offset, holder);
             return;
         }
@@ -273,7 +365,7 @@ impl<'tree> Commit<'_, 'tree> {
         //     its line root.
         node_facts::kind_is_box(kind)
             && kind != NodeKind::NavigableContainerViewport
-            && !link.containing_block.is_invalid()
+            && !link.placement.containing_block.is_invalid()
             && !(holder.line_root_changes.any()
                 && node_facts::node_is_fragmented_inline(data, node_facts::node_style_view(data)))
             && arena.paintable_row_is_populated(node)
@@ -326,7 +418,7 @@ impl<'tree> Commit<'_, 'tree> {
             node,
             fragment_index: Some(fragment_index),
             line_index_offset: lines_before,
-            line_root_changes: crate::painting::paintable_build::LineRootChanges::all(),
+            line_root_changes: LineRootChanges::all(),
         };
         for child in &link.fragment.children {
             self.meet(child, &children_holder);
@@ -366,19 +458,19 @@ impl<'tree> Commit<'_, 'tree> {
         &mut self,
         node: Node,
         fragments: fragment_tree::SlotFragments<'tree>,
-        enclosing_line_root_changes: crate::painting::paintable_build::LineRootChanges,
+        enclosing_line_root_changes: LineRootChanges,
     ) -> Option<Holder> {
         let first = fragments.first().expect("a committed box has a fragment");
         let link_with_merged_line_index;
-        let link = if first.containing_block_line_index_offset != 0 && first.link.containing_line_box_index.is_some() {
-            link_with_merged_line_index = FragmentLink {
-                containing_line_box_index: first.link.containing_line_box_index.map(|index| {
-                    index
-                        + u32::try_from(first.containing_block_line_index_offset)
-                            .expect("a line box index fits in 32 bits")
-                }),
-                ..first.link.clone()
-            };
+        let link = if first.containing_block_line_index_offset != 0
+            && first.link.placement.containing_line_box_index.is_some()
+        {
+            let mut link = first.link.clone();
+            if let Some(index) = link.placement.containing_line_box_index.as_mut() {
+                *index +=
+                    u32::try_from(first.containing_block_line_index_offset).expect("a line box index fits in 32 bits");
+            }
+            link_with_merged_line_index = link;
             &link_with_merged_line_index
         } else {
             first.link
@@ -410,7 +502,7 @@ impl<'tree> Commit<'_, 'tree> {
                 })
             })
             .flatten();
-        if let Some(shift) = link.default_scroll_shift {
+        if let Some(shift) = link.placement.default_scroll_shift {
             self.arena_mut().set_default_scroll_shift(
                 node,
                 shift.anchor,
@@ -421,24 +513,19 @@ impl<'tree> Commit<'_, 'tree> {
         if !keeps_committed_subtree {
             self.arena_mut().forget_committed_out_of_flow_facts(node);
         }
-        let previous_fragmented_content = (has_more_fragments
+        let previous_inline_content = previous
+            .as_ref()
+            .and_then(|previous| previous.previous_inline_content.clone());
+        let is_or_was_fragmented = has_more_fragments
             || previous
                 .as_ref()
-                .is_some_and(|previous| previous.previous_fragments.len() > 1))
-        .then(|| {
-            previous
-                .as_ref()
-                .and_then(|previous| previous.previous_inline_content.clone())
-        })
-        .flatten();
-        let prepared = self
-            .paintables
-            .prepare_node(node, true, keeps_committed_subtree, enclosing_line_root_changes);
+                .is_some_and(|previous| previous.previous_fragments.len() > 1);
+        let prepared_row = self.prepare_node(node, true, keeps_committed_subtree, enclosing_line_root_changes);
         self.committed_anew.push(node);
         if let Some(previous) = previous {
             self.recommitted.push(previous);
         }
-        if !prepared.has_paintable_row {
+        if prepared_row == PreparedRow::None {
             self.arena_mut().gather_layout_style_snapshot_geometry(node);
             return Some(Holder {
                 node,
@@ -449,23 +536,24 @@ impl<'tree> Commit<'_, 'tree> {
         }
         let fragment = &link.fragment;
         debug_assert!(
-            fragment.computed_svg_path.is_some()
+            fragment.svg().is_some_and(|svg| svg.path.is_some())
                 || !crate::painting::node_painting::is_svg_path(self.arena().data(node).kind.get()),
             "committed path-like fragment carries no computed SVG path"
         );
-        let replaced = self.paintables.replace_committed_fragment_link(
+        let row_existed_before_this_commit = prepared_row == PreparedRow::ExistedBeforeThisCommit;
+        let link_change = self.replace_committed_fragment_link(
             node,
             link,
+            row_existed_before_this_commit,
             enclosing_line_root_changes,
-            prepared.previous_offset,
         );
-        self.paintables.set_box_fragments(node, &fragments);
+        self.set_box_fragments(node, &fragments);
         let mut line_root_changes_for_children = enclosing_line_root_changes;
         if fragment.line_data.is_some() {
-            line_root_changes_for_children = replaced.line_root_changes;
+            line_root_changes_for_children = LineRootChanges::of_link(link_change);
         }
-        let content_size_change = if prepared.row_existed_before_this_commit {
-            replaced.content_size_change
+        let content_size_change = if row_existed_before_this_commit {
+            link_change.content_size_change
         } else {
             self.arena().content_size_change_of_rebuilt_box(node)
         };
@@ -495,14 +583,16 @@ impl<'tree> Commit<'_, 'tree> {
             })
             .flatten();
         if let Some(line_data) = merged_line_data.as_ref().or(fragment.line_data.as_ref()) {
-            let change = self
-                .paintables
-                .set_line_data(node, line_data, previous_fragmented_content);
-            line_root_changes_for_children.fragment_changed |= change.content_changed;
-            line_root_changes_for_children.inline_content_changed |= change.content_changed;
-            line_root_changes_for_children.inline_item_order_changed |= change.item_order_changed;
+            let line_data_changes = self.set_line_data(
+                node,
+                line_data,
+                previous_inline_content,
+                is_or_was_fragmented,
+                link.fragment.sides.content_size,
+            );
+            line_root_changes_for_children = line_root_changes_for_children.union(line_data_changes);
         } else {
-            self.paintables.clear_line_data(node);
+            self.clear_line_data(node);
         }
         self.arena_mut().gather_layout_style_snapshot_geometry(node);
         // NB: A link can change what orders the painting of a box that keeps its fragment, such as whether collapsed
@@ -517,7 +607,7 @@ impl<'tree> Commit<'_, 'tree> {
     }
 
     /// Notes a box committed anew whose fragment may hold lines, whose inline boxes commit after the walk.
-    fn finish_box(&mut self, node: Node, line_root_changes: crate::painting::paintable_build::LineRootChanges) {
+    fn finish_box(&mut self, node: Node, line_root_changes: LineRootChanges) {
         if self.arena().paintable_row_is_populated(node)
             && self
                 .arena()
@@ -527,6 +617,482 @@ impl<'tree> Commit<'_, 'tree> {
                 .is_some_and(|content| content.inline_boxes.boxes().next().is_some())
         {
             self.line_roots.push((node, line_root_changes));
+        }
+    }
+
+    /// Clears the committed link and row of a box the commit left without them.
+    fn clear_node(&mut self, node: formatting_context::Node) {
+        self.arena_mut().clear_committed_fragment_link(node);
+        if self.arena().paintable_rows().paintable_row_is_populated(node) {
+            let reset = self
+                .arena()
+                .prepare_paintable_row_cleared_reset(node)
+                .expect("live row for node could not be cleared");
+            self.row_reset_notifications.push(reset);
+            self.arena_mut().paintable_row_cleared(reset);
+        }
+    }
+
+    fn prepare_node(
+        &mut self,
+        node: formatting_context::Node,
+        has_used_values: bool,
+        reuses_committed_subtree: bool,
+        enclosing_line_root_changes: LineRootChanges,
+    ) -> PreparedRow {
+        let (wants_paintable, node_kind) = {
+            let data = self.arena().data(node);
+            let is_fragmented_inline = node_facts::node_is_fragmented_inline(data, node_facts::node_style_view(data));
+            let has_dom_node = !node_facts::has_flag(data, crate::layout::node_data::NodeFlag::Anonymous);
+            (
+                (has_used_values || (is_fragmented_inline && has_dom_node))
+                    && node_painting::has_paintable(data.kind.get()),
+                data.kind.get(),
+            )
+        };
+        let row_existed_before_this_commit = self.arena().paintable_rows().paintable_row_is_populated(node);
+        if !wants_paintable {
+            self.clear_node(node);
+            return PreparedRow::None;
+        }
+        if node_kind == NodeKind::NavigableContainerViewport {
+            self.committed_navigable_container_viewports.push(node);
+        }
+        if reuses_committed_subtree {
+            assert!(
+                row_existed_before_this_commit,
+                "a kept subtree root has no committed row"
+            );
+            return PreparedRow::ExistedBeforeThisCommit;
+        }
+        if !has_used_values {
+            self.arena_mut().clear_committed_fragment_link(node);
+            // Fragmented inlines get their painted pieces from the enclosing line root.
+            if row_existed_before_this_commit
+                && line_root_changes_repaint_inline_box(self.arena(), node, enclosing_line_root_changes)
+            {
+                self.note_paint_change_of_inline_box(node, RowPaintChange::EVERYTHING_IT_PAINTS);
+            }
+            if row_existed_before_this_commit && enclosing_line_root_changes.fragment_changed {
+                self.arena_mut()
+                    .note_visual_context_box_dirty(node, VisualContextBoxDirtyKind::InlineGeometryChanged);
+            }
+        }
+        if row_existed_before_this_commit {
+            let notification = self
+                .arena()
+                .paintable_rows()
+                .prepare_paintable_row_recommit_notification(node);
+            self.row_reset_notifications.push(notification);
+        }
+        let arena = self.arena_mut();
+        if row_existed_before_this_commit {
+            arena.paintable_rows_mut().begin_paintable_row_recommit(node);
+            if node_kind == NodeKind::Viewport {
+                // A recommitted viewport row starts its paint state over: the scroll registry is
+                // dropped here and rebuilt by the next tree update, while the host resets its
+                // snapshot from the row reset notification.
+                arena.paint_state_mut().visual_context.clear_scroll_state();
+            }
+        } else {
+            arena.populate_paintable_row(node);
+            if node_kind == NodeKind::Viewport {
+                arena.paint_state_mut().reset_visual_context_state();
+            }
+            arena.note_visual_context_box_dirty(node, VisualContextBoxDirtyKind::NewRow);
+        }
+        if row_existed_before_this_commit {
+            PreparedRow::ExistedBeforeThisCommit
+        } else {
+            PreparedRow::PopulatedByThisCommit
+        }
+    }
+
+    fn replace_committed_fragment_link(
+        &mut self,
+        node: formatting_context::Node,
+        link: &fragment_tree::FragmentLink,
+        row_existed_before_this_commit: bool,
+        enclosing_line_root_changes: LineRootChanges,
+    ) -> fragment_tree::LinkChange {
+        let fragment = &link.fragment;
+        let change = self
+            .arena()
+            .with_committed_fragment_link(node, |previous_link| link.change_from(previous_link));
+        let offset_changed = !row_existed_before_this_commit || change.offset_changed;
+        // record_lines_hit_test_items() emits an EmptyEditable target only without paint
+        // children. An out-of-flow child can change that eligibility without changing the
+        // editor's box properties or inline content, so descendant dirtiness alone is insufficient.
+        let empty_editable_children_changed = change.child_placements_changed
+            && node_painting::has_lines(self.arena(), node)
+            && self
+                .arena()
+                .node_has_dom_paint_fact(node, DomPaintFact::EditableOrEditingHost)
+            && fragment
+                .line_data
+                .as_ref()
+                .is_none_or(|content| content.fragments.is_empty());
+        let mut paint_change = RowPaintChange::NONE;
+        if change.changes_what_the_box_itself_shows()
+            || (change.fragment_identity_changed && has_descendant_dependent_paint(self.arena(), node))
+            || empty_editable_children_changed
+        {
+            paint_change |= RowPaintChange::EVERYTHING_IT_PAINTS;
+        }
+        // Inserted, removed or reordered children change which scopes this row's plans list,
+        // independently of where the children were placed.
+        if change.child_sequence_changed || change.inline_item_order_changed {
+            paint_change |= RowPaintChange::ORDER;
+        }
+        // Keep fragment identity as the conservative signal for overflow and visual contexts.
+        // The fragment stays the same when only the link's margins or parent-decided facts change, but margin-box clip
+        // paths, line clamp clips and overflow read those.
+        let mut fragment_content_changed = change.fragment_identity_changed || change.shown_as_changed;
+        let painted_geometry_lives_in_enclosing_line_root = {
+            let data = self.arena().data(node);
+            node_facts::node_is_fragmented_inline(data, node_facts::node_style_view(data))
+        };
+        if painted_geometry_lives_in_enclosing_line_root {
+            // A fragmented inline's geometry is read from its line root's pieces. Comparing it with
+            // the fragment's temporary offset would dirty identical inlines on every relayout; their
+            // line content and box properties suffice.
+            if line_root_changes_repaint_inline_box(self.arena(), node, enclosing_line_root_changes) {
+                paint_change |= RowPaintChange::EVERYTHING_IT_PAINTS;
+            }
+            if enclosing_line_root_changes.inline_item_order_changed {
+                paint_change |= RowPaintChange::ORDER;
+            }
+            fragment_content_changed |= enclosing_line_root_changes.fragment_changed;
+            self.note_paint_change_of_inline_box(node, paint_change);
+        } else {
+            if offset_changed {
+                paint_change |= RowPaintChange::PLACE;
+            }
+            self.arena_mut().note_paint_change(node, paint_change);
+        }
+        if offset_changed {
+            self.arena_mut()
+                .note_visual_context_box_dirty(node, VisualContextBoxDirtyKind::MovedWithDescendants);
+        }
+        if fragment_content_changed {
+            self.arena_mut()
+                .note_visual_context_box_dirty(node, VisualContextBoxDirtyKind::RecommittedInPlace);
+        }
+        if change.scrollable_overflow_changed {
+            self.arena_mut().note_scrollable_overflow_change(
+                node,
+                change.had_scrollable_overflow,
+                fragment.scrollable_overflow.has_scrollable_overflow,
+                false,
+            );
+        }
+        self.arena_mut().note_scroll_offset_may_leave_range(node);
+        // A layout pass bumps no epoch, so its geometry is laid out against the epoch the node has now.
+        let epoch_of_laid_out_geometry = self.arena().data(node).fragment_cache_epoch;
+        self.arena_mut()
+            .set_committed_fragment_link(node, link.clone(), Some(epoch_of_laid_out_geometry));
+        change
+    }
+
+    fn set_box_fragments(&mut self, slot: NodeSlotId, fragments: &[fragment_tree::SlotFragment<'_>]) {
+        let later_fragments = fragments.get(1..).unwrap_or_default();
+        let (moved, containing_block_fragment, identical, geometry_unchanged) = {
+            let side = self.arena().committed_side_data(slot);
+            let containing_block_fragment = fragments
+                .first()
+                .and_then(|fragment| fragment.containing_block_fragment)
+                .unwrap_or(side.containing_block_fragment);
+            let first_fragment_moved = side.containing_block_fragment != containing_block_fragment;
+            let same_count = !first_fragment_moved && side.box_fragments().len() == later_fragments.len();
+            let all_pairs = |same: fn(&fragment_tree::FragmentLink, &fragment_tree::FragmentLink) -> bool| {
+                side.box_fragments()
+                    .iter()
+                    .zip(later_fragments)
+                    .all(|(committed, fragment)| {
+                        Some(committed.containing_block_fragment) == fragment.containing_block_fragment
+                            && same(fragment.link, &committed.link)
+                    })
+            };
+            (
+                first_fragment_moved || !all_pairs(|link, committed| link.has_same_placement(committed)),
+                containing_block_fragment,
+                same_count && all_pairs(|link, committed| link.places_same_fragment_identically_to(committed)),
+                same_count
+                    && all_pairs(|link, committed| {
+                        link.has_same_placement(committed)
+                            && link.fragment.has_same_box_properties(&committed.fragment)
+                            && link.fragment.has_same_inline_content(&committed.fragment)
+                    }),
+            )
+        };
+        let flags = [
+            (
+                crate::painting::paintable_data::PaintableFlag::InLaterContainingBlockFragment,
+                containing_block_fragment != 0,
+            ),
+            (
+                crate::painting::paintable_data::PaintableFlag::HasLaterBoxFragments,
+                !later_fragments.is_empty(),
+            ),
+        ];
+        let data = self.arena().live_paintable_data(slot);
+        let ink_depends_on_later_fragment_placements = containing_block_fragment != 0
+            || !later_fragments.is_empty()
+            || data.has_flag(crate::painting::paintable_data::PaintableFlag::HasLaterBoxFragments)
+            || data.has_flag(crate::painting::paintable_data::PaintableFlag::InLaterContainingBlockFragment);
+        if flags.iter().any(|&(flag, value)| data.has_flag(flag) != value) {
+            let arena = self.arena_mut();
+            let mut paintable_rows = arena.paintable_rows_mut();
+            let mut data = paintable_rows.paintable_data_mut(slot);
+            for (flag, value) in flags {
+                data.set_flag(flag, value);
+            }
+        }
+        if ink_depends_on_later_fragment_placements {
+            self.arena_mut().request_ink_overflow_recalculation(slot);
+            self.arena_mut()
+                .request_containing_block_ink_overflow_recalculation(slot);
+        }
+        if identical {
+            return;
+        }
+        let (later_overflow_changed, later_fragments_had_scrollable_overflow) = {
+            let committed = self.arena().committed_side_data(slot).box_fragments();
+            (
+                committed.len() != later_fragments.len()
+                    || committed.iter().zip(later_fragments).any(|(committed, fragment)| {
+                        committed.link.fragment.scrollable_overflow != fragment.link.fragment.scrollable_overflow
+                    }),
+                committed
+                    .iter()
+                    .any(|committed| committed.link.fragment.scrollable_overflow.has_scrollable_overflow),
+            )
+        };
+        if later_overflow_changed {
+            let later_fragments_have_scrollable_overflow = later_fragments
+                .iter()
+                .any(|fragment| fragment.link.fragment.scrollable_overflow.has_scrollable_overflow);
+            self.arena_mut().note_scrollable_overflow_change(
+                slot,
+                later_fragments_had_scrollable_overflow,
+                later_fragments_have_scrollable_overflow,
+                false,
+            );
+        }
+        {
+            let mut side = self.arena_mut().committed_side_data_mut(slot);
+            side.containing_block_fragment = containing_block_fragment;
+            side.box_fragments = (!later_fragments.is_empty()).then(|| {
+                std::sync::Arc::new(
+                    later_fragments
+                        .iter()
+                        .map(|fragment| crate::painting::paintable_data::CommittedBoxFragment {
+                            link: fragment.link.clone(),
+                            containing_block_fragment: fragment.containing_block_fragment.unwrap_or_default(),
+                        })
+                        .collect(),
+                )
+            });
+        }
+        if geometry_unchanged {
+            return;
+        }
+        self.arena_mut()
+            .note_paint_change(slot, RowPaintChange::EVERYTHING_IT_PAINTS | RowPaintChange::PLACE);
+        self.arena_mut().note_visual_context_box_dirty(
+            slot,
+            if moved {
+                VisualContextBoxDirtyKind::MovedWithDescendants
+            } else {
+                VisualContextBoxDirtyKind::RecommittedInPlace
+            },
+        );
+    }
+
+    fn set_line_data(
+        &mut self,
+        slot: NodeSlotId,
+        line_data: &std::sync::Arc<crate::layout::inline_content::InlineContent>,
+        previous_content: Option<std::sync::Arc<crate::layout::inline_content::InlineContent>>,
+        is_or_was_fragmented: bool,
+        content_size: used_values::FfiCssPixelSize,
+    ) -> LineRootChanges {
+        if !node_painting::has_lines(self.arena(), slot) {
+            self.clear_line_data(slot);
+            return LineRootChanges::default();
+        }
+        let writing_mode = line_data.writing_mode;
+        let physical_line_data;
+        let line_data = if writing_mode == crate::css::css_enums::writing_mode::HORIZONTAL_TB {
+            line_data
+        } else {
+            physical_line_data = std::sync::Arc::new(line_data.in_physical_plane(writing_mode, content_size));
+            &physical_line_data
+        };
+        let has_pieces = !line_data.inline_box_pieces.is_empty();
+        if let Some(previous) = previous_content.as_ref()
+            && !is_or_was_fragmented
+            && !std::sync::Arc::ptr_eq(previous, line_data)
+        {
+            for inline_box in line_data.inline_boxes_whose_pieces_only_moved_since(previous) {
+                let index = inline_box.slot_index() as usize;
+                if self.pieces_only_moved_by_inline_box_slot_index.len() <= index {
+                    self.pieces_only_moved_by_inline_box_slot_index.resize(index + 1, false);
+                }
+                self.pieces_only_moved_by_inline_box_slot_index[index] = true;
+            }
+        }
+        // NB: The link of a box in one fragment says how its content changed, but compares the content as layout made
+        //     it. The plan of the foreground reads the content the row holds, which is merged and in the physical
+        //     plane, so that is what says whether the plan changed.
+        let (content_changed, item_order_changed) = previous_content.map_or((false, false), |previous| {
+            if std::sync::Arc::ptr_eq(&previous, line_data) {
+                return (false, false);
+            }
+            (
+                is_or_was_fragmented && *previous != **line_data,
+                !crate::painting::paint_order_plan::content_plans_same_foreground(&previous, line_data),
+            )
+        });
+        let previous_content = self
+            .arena_mut()
+            .committed_side_data_mut(slot)
+            .inline_content
+            .replace(line_data.clone());
+        if !previous_content
+            .as_ref()
+            .is_some_and(|previous| std::sync::Arc::ptr_eq(previous, line_data))
+        {
+            self.refresh_paint_order_inputs_that_disagree_with_the_atomic_inlines_of(
+                previous_content.as_deref(),
+                Some(line_data),
+            );
+        }
+        if item_order_changed {
+            self.arena_mut().note_paint_change(slot, RowPaintChange::ORDER);
+        }
+        if has_pieces {
+            self.arena_mut().note_line_root_needs_fragment_ownership(slot);
+        }
+        LineRootChanges {
+            fragment_changed: content_changed,
+            inline_content_changed: content_changed,
+            inline_item_order_changed: item_order_changed,
+        }
+    }
+
+    fn note_paint_change_of_inline_box(&mut self, inline_box: Node, change: RowPaintChange) {
+        if self
+            .pieces_only_moved_by_inline_box_slot_index
+            .get(inline_box.slot_index() as usize)
+            .copied()
+            .unwrap_or(false)
+            && !crate::painting::fragment_ownership::is_self_painting_inline(&self.arena().paintable_rows(), inline_box)
+        {
+            self.arena_mut()
+                .note_paint_change_keeping_own_ink_overflow(inline_box, change);
+        } else {
+            self.arena_mut().note_paint_change(inline_box, change);
+        }
+    }
+
+    /// Clears the inline content of a row whose new fragment has none.
+    fn clear_line_data(&mut self, slot: NodeSlotId) {
+        if self.arena().committed_side_data(slot).inline_content.is_some() {
+            let previous_content = self.arena_mut().committed_side_data_mut(slot).inline_content.take();
+            self.refresh_paint_order_inputs_that_disagree_with_the_atomic_inlines_of(previous_content.as_deref(), None);
+        }
+    }
+
+    fn refresh_paint_order_inputs_that_disagree_with_the_atomic_inlines_of(
+        &mut self,
+        previous_content: Option<&crate::layout::inline_content::InlineContent>,
+        content: Option<&crate::layout::inline_content::InlineContent>,
+    ) {
+        let atomic_inlines_before_and_after: Vec<NodeSlotId> = [previous_content, content]
+            .into_iter()
+            .flatten()
+            .flat_map(|content| content.fragments.iter())
+            .filter(|fragment| fragment.is_atomic_inline)
+            .map(|fragment| fragment.layout_node)
+            .collect();
+        let is_atomic_inline_of_content = |node: NodeSlotId| {
+            content.is_some_and(|content| {
+                content
+                    .fragment_indices_of(node)
+                    .iter()
+                    .any(|&index| content.fragments[index as usize].is_atomic_inline)
+            })
+        };
+        for node in atomic_inlines_before_and_after {
+            let arena = self.arena();
+            if !arena.slot_is_live(node) || !arena.paintable_row_is_populated(node) {
+                continue;
+            }
+            let inputs_disagree = arena
+                .committed_side_data(node)
+                .prepared_order_inputs()
+                .is_some_and(|inputs| inputs.is_atomic_inline_content() != is_atomic_inline_of_content(node));
+            if inputs_disagree {
+                self.arena_mut().refresh_paint_order_inputs(node);
+            }
+        }
+    }
+
+    fn committed_containing_block(
+        &self,
+        node: formatting_context::Node,
+        link: Option<&fragment_tree::FragmentLink>,
+    ) -> NodeSlotId {
+        match link.map(|link| link.placement.containing_block) {
+            Some(containing_block) if !containing_block.is_invalid() => containing_block,
+            _ => self.arena().containing_block_by_walking_ancestors(node),
+        }
+    }
+
+    fn stamp_containing_block(&mut self, node: formatting_context::Node, link: Option<&fragment_tree::FragmentLink>) {
+        if !self.arena().paintable_row_is_populated(node) {
+            return;
+        }
+        let containing_block = self.committed_containing_block(node, link);
+        let arena = self.arena_mut();
+        let mut paintable_rows = arena.paintable_rows_mut();
+        let containing_block = if paintable_rows.paintable_row_is_populated(containing_block) {
+            containing_block
+        } else {
+            NodeSlotId::INVALID
+        };
+        let old_containing_block = {
+            let mut data = paintable_rows.paintable_data_mut(node);
+            std::mem::replace(&mut data.containing_block, containing_block)
+        };
+        if old_containing_block != containing_block {
+            paintable_rows.request_ink_overflow_recalculation(old_containing_block);
+            paintable_rows.request_ink_overflow_recalculation(containing_block);
+            paintable_rows.note_visual_context_box_dirty(node, VisualContextBoxDirtyKind::ContainingBlockChanged);
+            paintable_rows.note_paint_change(node, RowPaintChange::PLACE);
+        }
+    }
+
+    /// Notes that the inline boxes whose pieces the line root `slot` committed anew have geometry its new inline
+    /// content gives them.
+    fn note_inline_boxes_of_line_root_recommitted(&mut self, slot: NodeSlotId) {
+        let inline_boxes: Vec<NodeSlotId> = self
+            .arena()
+            .committed_side_data(slot)
+            .inline_content
+            .as_ref()
+            .map(|content| content.inline_boxes.boxes().map(|(node, _)| node).collect())
+            .unwrap_or_default();
+        let arena = self.arena_mut();
+        let mut paintable_rows = arena.paintable_rows_mut();
+        for inline_box in inline_boxes {
+            if paintable_rows.paintable_row_is_populated(inline_box)
+                && node_painting::is_fragmented_inline(&paintable_rows, inline_box)
+            {
+                paintable_rows
+                    .note_visual_context_box_dirty(inline_box, VisualContextBoxDirtyKind::InlineGeometryChanged);
+            }
         }
     }
 
@@ -559,13 +1125,11 @@ impl<'tree> Commit<'_, 'tree> {
                 }
                 let number = self.number;
                 self.arena_mut().note_committed_link_holder(inline_box, root, number);
-                let prepared = self
-                    .paintables
-                    .prepare_node(inline_box, false, false, line_root_changes);
+                let prepared_row = self.prepare_node(inline_box, false, false, line_root_changes);
                 self.committed_anew.push(inline_box);
-                if prepared.has_paintable_row {
-                    self.paintables.set_box_fragments(inline_box, &[]);
-                    self.paintables.clear_line_data(inline_box);
+                if prepared_row != PreparedRow::None {
+                    self.set_box_fragments(inline_box, &[]);
+                    self.clear_line_data(inline_box);
                 }
                 self.arena_mut().gather_layout_style_snapshot_geometry(inline_box);
                 self.arena_mut().refresh_paint_order_inputs(inline_box);
@@ -647,7 +1211,7 @@ impl<'tree> Commit<'_, 'tree> {
                 continue;
             }
             self.arena_mut().forget_committed_out_of_flow_facts(node);
-            self.paintables.clear_node(node);
+            self.clear_node(node);
             self.arena_mut().gather_layout_style_snapshot_geometry(node);
         }
     }
@@ -663,7 +1227,7 @@ impl<'tree> Commit<'_, 'tree> {
         self.commit_inline_boxes_without_links();
         for (root, _) in std::mem::take(&mut self.line_roots) {
             if self.arena().slot_is_live(root) && self.arena().paintable_row_is_populated(root) {
-                self.paintables.note_inline_boxes_of_line_root_recommitted(root);
+                self.note_inline_boxes_of_line_root_recommitted(root);
             }
         }
         for node in std::mem::take(&mut self.committed_anew) {
@@ -671,7 +1235,7 @@ impl<'tree> Commit<'_, 'tree> {
                 continue;
             }
             let link = self.arena().with_committed_fragment_link(node, |link| link.cloned());
-            self.paintables.stamp_containing_block(node, link.as_ref());
+            self.stamp_containing_block(node, link.as_ref());
         }
         for (node, inputs) in std::mem::take(&mut self.out_of_flow_boxes) {
             if !self.arena().slot_is_live(node)
@@ -683,24 +1247,19 @@ impl<'tree> Commit<'_, 'tree> {
             self.arena_mut()
                 .set_position_option_in_use(node, inputs.position_option);
         }
-        let Self {
-            mut paintables,
-            mut messages,
-            ..
-        } = self;
-        paintables.discard_absolute_rects_memoized_during_commit();
-        for &viewport in paintables.committed_navigable_container_viewports() {
-            if let Some(style_node) = paintables.arena().commit_message_style_node(viewport) {
-                messages.push(FfiCommitMessage::new(
+        self.discard_absolute_rects_memoized_during_commit();
+        for viewport in std::mem::take(&mut self.committed_navigable_container_viewports) {
+            if let Some(style_node) = self.arena().commit_message_style_node(viewport) {
+                self.messages.push(FfiCommitMessage::new(
                     style_node,
                     FfiCommitMessageKind::NavigableContainerViewportCommitted,
                 ));
             }
         }
-        paintables.arena_mut().publish_layout_style_snapshot_commit();
+        self.arena_mut().publish_layout_style_snapshot_commit();
         CommitNotifications {
-            row_resets: paintables.take_row_reset_notifications(),
-            messages,
+            row_resets: self.row_reset_notifications,
+            messages: self.messages,
         }
     }
 }
@@ -732,11 +1291,13 @@ pub(crate) fn commit_replacing(
     arena.note_layout_commit();
     let number = arena.layout_commit_count() as u32;
     let is_full_commit = arena.data(root).kind.get() == NodeKind::Viewport;
-    let mut paintables = crate::painting::paintable_build::PaintableCommit::new(arena);
-    paintables.begin_commit();
+    arena.clear_absolute_rect_memo();
+    arena.note_hit_test_items_changed();
     Commit {
-        paintables,
+        arena,
         messages: Vec::new(),
+        row_reset_notifications: Vec::new(),
+        committed_navigable_container_viewports: Vec::new(),
         number,
         root,
         is_full_commit,
@@ -747,6 +1308,7 @@ pub(crate) fn commit_replacing(
         out_of_flow_boxes: Vec::new(),
         pass_level_links: Vec::new(),
         line_roots: Vec::new(),
+        pieces_only_moved_by_inline_box_slot_index: Vec::new(),
     }
     .finish(pass_fragments)
 }

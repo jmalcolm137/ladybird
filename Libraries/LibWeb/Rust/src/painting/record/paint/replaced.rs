@@ -11,13 +11,16 @@ use crate::css::css_enums::{image_rendering, object_fit};
 use crate::css::css_pixels::CssPixels;
 use crate::css::css_pixels::{CssPixelRect, CssPixelSize};
 use crate::layout::node_data::NodeSlotId;
+use crate::layout::replaced_sizing::{Fraction, run_default_sizing_algorithm};
 use crate::painting::display_list::builder::PendingInlineClip;
-use crate::painting::display_list::commands::{CanvasId, CompositorContextId, CompositorNestedContextWheelRegion};
+use crate::painting::display_list::commands::{
+    CanvasId, CompositorContextId, CompositorNestedContextWheelRegion, VideoSinkHandle,
+};
 use crate::painting::force_dark::ForceDarkRole;
 use crate::painting::paintable_geometry::absolute_rect;
 use crate::painting::record::PaintRecorder;
 use crate::painting::record::paint::background::{paint_image_content, to_gfx_scaling_mode};
-use crate::painting::replaced_paint_facts::VideoPaintFacts;
+use crate::painting::replaced_paint_facts::{ReplacedPaintFacts, VideoPaintFacts};
 use crate::painting::visual_context::node_values::padding_edge_border_radii;
 use libgfx_rust::{Color, CornerRadii, FloatRect, IntRect, ScalingMode};
 
@@ -37,133 +40,6 @@ fn replaced_content_clip_geometry<O: Observer>(
         })
         .filter(|corner_radii| corner_radii.has_any_radius());
     (content_rect, corner_radii)
-}
-
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub(crate) struct Fraction {
-    pub numerator: CssPixels,
-    pub denominator: CssPixels,
-}
-
-impl Fraction {
-    fn one() -> Self {
-        Self {
-            numerator: CssPixels::from_integer(1),
-            denominator: CssPixels::from_integer(1),
-        }
-    }
-
-    pub(crate) fn of(numerator: CssPixels, denominator: CssPixels) -> Self {
-        Self { numerator, denominator }
-    }
-
-    fn to_css_pixels(self) -> CssPixels {
-        self.numerator.div_as_fraction(self.denominator)
-    }
-
-    fn might_be_saturated(self) -> bool {
-        let raw = self.to_css_pixels().raw_value();
-        raw == i32::MAX || raw == i32::MIN
-    }
-
-    fn to_double(self) -> f64 {
-        self.numerator.to_double() / self.denominator.to_double()
-    }
-
-    fn multiply(self, value: CssPixels) -> CssPixels {
-        let wide = value.raw_value() as i64 * self.numerator.raw_value() as i64;
-        CssPixels::from_raw((wide / self.denominator.raw_value() as i64).clamp(i32::MIN as i64, i32::MAX as i64) as i32)
-    }
-
-    fn divide(self, value: CssPixels) -> CssPixels {
-        let wide = value.raw_value() as i64 * self.denominator.raw_value() as i64;
-        CssPixels::from_raw((wide / self.numerator.raw_value() as i64).clamp(i32::MIN as i64, i32::MAX as i64) as i32)
-    }
-
-    fn ge(self, other: Self) -> bool {
-        let left = self.numerator.raw_value() as i64 * other.denominator.raw_value() as i64;
-        let right = other.numerator.raw_value() as i64 * self.denominator.raw_value() as i64;
-        left >= right
-    }
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
-pub(crate) struct SizeWithAspectRatio {
-    pub width: Option<CssPixels>,
-    pub height: Option<CssPixels>,
-    pub aspect_ratio: Option<Fraction>,
-}
-
-impl SizeWithAspectRatio {
-    pub(crate) fn from_ffi(natural: &crate::painting::host::FfiNaturalSize) -> Self {
-        Self {
-            width: natural.width.has_value.then_some(natural.width.value),
-            height: natural.height.has_value.then_some(natural.height.value),
-            aspect_ratio: natural.has_aspect_ratio.then_some(Fraction::of(
-                natural.aspect_ratio_numerator,
-                natural.aspect_ratio_denominator,
-            )),
-        }
-    }
-}
-
-pub(crate) fn run_default_sizing_algorithm(
-    specified_width: Option<CssPixels>,
-    specified_height: Option<CssPixels>,
-    natural: &SizeWithAspectRatio,
-    default_size: CssPixelSize,
-) -> CssPixelSize {
-    if let (Some(width), Some(height)) = (specified_width, specified_height) {
-        return CssPixelSize::new(width, height);
-    }
-    if specified_width.is_some() || specified_height.is_some() {
-        if let Some(aspect_ratio) = natural.aspect_ratio
-            && !aspect_ratio.might_be_saturated()
-        {
-            if let Some(width) = specified_width {
-                return CssPixelSize::new(width, aspect_ratio.divide(width));
-            }
-            if let Some(height) = specified_height {
-                return CssPixelSize::new(aspect_ratio.multiply(height), height);
-            }
-        }
-        if let (Some(height), Some(natural_width)) = (specified_height, natural.width) {
-            return CssPixelSize::new(natural_width, height);
-        }
-        if let (Some(width), Some(natural_height)) = (specified_width, natural.height) {
-            return CssPixelSize::new(width, natural_height);
-        }
-        if let Some(height) = specified_height {
-            return CssPixelSize::new(default_size.width, height);
-        }
-        if let Some(width) = specified_width {
-            return CssPixelSize::new(width, default_size.height);
-        }
-        unreachable!();
-    }
-    if natural.width.is_some() || natural.height.is_some() {
-        return run_default_sizing_algorithm(natural.width, natural.height, natural, default_size);
-    }
-    if let Some(aspect_ratio) = natural.aspect_ratio
-        && !aspect_ratio.might_be_saturated()
-    {
-        if default_size.is_empty() {
-            return default_size;
-        }
-        let default_width = default_size.width.to_double();
-        let default_height = default_size.height.to_double();
-        if aspect_ratio.to_double() >= default_width / default_height {
-            return CssPixelSize::new(
-                default_size.width,
-                CssPixels::nearest_value_for(default_width / aspect_ratio.to_double()),
-            );
-        }
-        return CssPixelSize::new(
-            CssPixels::nearest_value_for(default_height * aspect_ratio.to_double()),
-            default_size.height,
-        );
-    }
-    default_size
 }
 
 pub(crate) fn get_replaced_box_painting_area<O: Observer>(
@@ -381,33 +257,76 @@ fn paint_custom_highlight_washes<O: Observer>(
 }
 
 pub(crate) fn paint_canvas_foreground<O: Observer>(recorder: &mut PaintRecorder<'_, O>, paintable: NodeSlotId) {
-    let facts = recorder
-        .source
-        .replaced_paint_facts(paintable)
-        .and_then(|facts| facts.canvas())
-        .unwrap_or_default();
-    let (_, image_rendering) = replaced_style(recorder, paintable);
+    let Some(facts) = recorder.source.replaced_paint_facts(paintable) else {
+        return;
+    };
+    let natural_size = match &facts {
+        ReplacedPaintFacts::Image(image) if image.content != crate::painting::image_content::ImageContent::None => {
+            CssPixelSize::new(
+                image.natural.width.unwrap_or_default(),
+                image.natural.height.unwrap_or_default(),
+            )
+        }
+        ReplacedPaintFacts::Canvas(canvas) if canvas.has_content => CssPixelSize::new(
+            CssPixels::from_integer(i64::from(canvas.content_width)),
+            CssPixels::from_integer(i64::from(canvas.content_height)),
+        ),
+        _ => return,
+    };
+    let (object_fit, image_rendering) = replaced_style(recorder, paintable);
     let canvas_rect = recorder
         .converter
         .rounded_device_rect(absolute_rect(recorder.source, paintable));
-    if !facts.has_content {
+    let zoom = recorder
+        .source
+        .node_style_if_live(paintable)
+        .map_or(1.0, |style| style.effective_zoom());
+    let natural_size = CssPixelSize::new(
+        CssPixels::nearest_value_for(natural_size.width.to_double() * f64::from(zoom)),
+        CssPixels::nearest_value_for(natural_size.height.to_double() * f64::from(zoom)),
+    );
+    let draw_rect = if natural_size.is_empty() {
+        canvas_rect
+    } else {
+        get_replaced_box_painting_area(recorder, paintable, object_fit, natural_size)
+    };
+    if draw_rect.is_empty() {
         return;
     }
     let (content_rect, corner_radii) = replaced_content_clip_geometry(recorder, paintable);
-    let corner_clip =
-        corner_radii.map(|corner_radii| PendingInlineClip::intersecting_rounded_rect(content_rect, corner_radii));
-    recorder.record_with_inline_clips(corner_clip.as_slice(), |recorder| {
-        let scaling_mode = to_gfx_scaling_mode(
-            image_rendering,
-            (facts.content_width, facts.content_height),
-            (canvas_rect.width, canvas_rect.height),
-        );
-        recorder.recorder.draw_canvas(
-            canvas_rect,
-            CanvasId(facts.canvas_id),
-            facts.content_generation,
-            scaling_mode,
-        );
+    let mut inline_clips = Vec::new();
+    if let Some(corner_radii) = corner_radii {
+        inline_clips.push(PendingInlineClip::intersecting_rounded_rect(content_rect, corner_radii));
+    }
+    if !canvas_rect.contains_rect(draw_rect) {
+        inline_clips.push(PendingInlineClip::intersecting_float_rect(content_rect));
+    }
+    recorder.record_with_inline_clips(&inline_clips, |recorder| match &facts {
+        // AD-HOC: The spec has the canvas take the natural dimensions of its output bitmap. Instead, the canvas keeps
+        //         the dimensions its width and height attributes give it, and fits the bitmap using those dimensions.
+        //         So, transferring a bitmap never changes the layout of the page.
+        //         https://html.spec.whatwg.org/multipage/canvas.html#the-canvas-element
+        // FIXME: Composite the output bitmap onto opaque black when the alpha flag of the context is false.
+        ReplacedPaintFacts::Image(image) => {
+            paint_replaced_image_content(
+                recorder,
+                paintable,
+                &image.content,
+                draw_rect.to_float(),
+                image_rendering,
+            );
+        }
+        ReplacedPaintFacts::Canvas(canvas) => {
+            let scaling_mode = to_gfx_scaling_mode(
+                image_rendering,
+                (canvas.content_width, canvas.content_height),
+                (draw_rect.width, draw_rect.height),
+            );
+            recorder
+                .recorder
+                .draw_canvas(draw_rect, CanvasId(canvas.canvas_id), scaling_mode);
+        }
+        _ => unreachable!(),
     });
 }
 
@@ -440,8 +359,9 @@ pub(crate) fn paint_video_foreground<O: Observer>(recorder: &mut PaintRecorder<'
             );
             if !dst_rect.is_empty() {
                 let scaling_mode = to_gfx_scaling_mode(image_rendering, src_size, (dst_rect.width, dst_rect.height));
-                let sink_id = recorder.register_video_sink(video_frame.sink_resource_id, video_frame.sink_handle);
-                recorder.recorder.draw_video_frame(dst_rect, sink_id, scaling_mode);
+                recorder
+                    .recorder
+                    .draw_video_frame(dst_rect, VideoSinkHandle(video_frame.sink_handle), scaling_mode);
             }
         }
         VideoPaintFacts::PosterFrame(Some(poster_frame)) => {
@@ -512,7 +432,6 @@ pub(crate) fn paint_navigable_container_foreground<O: Observer>(
     if destination_rect.is_empty()
         || !recorder.visible_for_hit_testing(paintable)
         || recorder.recorder.is_recording_inside_group()
-        || recorder.is_recording_svg_resource_content()
     {
         return;
     }

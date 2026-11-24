@@ -1,4 +1,4 @@
-# Flags shared by Lagom (including Ladybird) and Serenity.
+# Flags shared by Lagom and Ladybird.
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
@@ -57,8 +57,8 @@ function(add_cxx_link_option_if_supported option)
 endfunction()
 
 # RUSTC_TARGET_CPU_FLAGS names the same CPU for rustc, so that Rust code runs on the instruction set C++ code does.
-if (ENABLE_CI_BASELINE_CPU)
-    # In CI, we want to target a common architecture so different runners can share ccache caches effectively.
+if (LADYBIRD_BASELINE_CPU_TARGET)
+    # Binaries that run on other machines, and ccache caches that different runners share, need a common architecture.
     if (APPLE AND CMAKE_SYSTEM_PROCESSOR STREQUAL "arm64")
         add_cxx_compile_options(-mcpu=apple-m1)
         set(RUSTC_TARGET_CPU_FLAGS -Ctarget-cpu=apple-m1)
@@ -100,7 +100,6 @@ if (CMAKE_CXX_COMPILER_ID STREQUAL "AppleClang")
 endif()
 add_cxx_only_compile_options(-Wsuggest-override)
 
-add_cxx_compile_options(-Wno-expansion-to-defined)
 add_cxx_only_compile_options(-Wno-invalid-offsetof)
 add_cxx_compile_options(-Wno-maybe-uninitialized)
 add_cxx_compile_options(-Wno-shorten-64-to-32)
@@ -110,7 +109,7 @@ add_cxx_only_compile_options(-Wno-user-defined-literals)
 
 add_cxx_compile_options(-Werror)
 
-if (CMAKE_CXX_COMPILER_ID STREQUAL "Clang" AND CMAKE_CXX_COMPILER_VERSION VERSION_GREATER_EQUAL "18")
+if (CMAKE_CXX_COMPILER_ID MATCHES "Clang")
     add_cxx_compile_options(-Wpadded-bitfield)
 endif()
 
@@ -130,24 +129,22 @@ if (NOT MSVC)
     endif()
 endif()
 
-if (CMAKE_CXX_COMPILER_ID MATCHES "Clang" AND NOT CMAKE_CXX_SIMULATE_ID  MATCHES "MSVC")
-    # Clang's default constexpr-steps limit is 1048576(2^20), GCC doesn't have one
-    add_cxx_only_compile_options(-fconstexpr-steps=16777216)
-
-    add_cxx_compile_options(-Wmissing-prototypes)
-
+if (CMAKE_CXX_COMPILER_ID MATCHES "Clang")
     add_cxx_compile_options(-Wno-implicit-const-int-float-conversion)
-    add_cxx_only_compile_options(-Wno-user-defined-literals)
     add_cxx_only_compile_options(-Wno-unqualified-std-cast-call)
 
     # Used for the #embed directive.
     # FIXME: Remove this once #embed is no longer an extension.
     add_cxx_compile_options(-Wno-c23-extensions)
+endif()
+
+if (CMAKE_CXX_COMPILER_ID MATCHES "Clang" AND NOT MSVC)
+    # Clang's default constexpr-steps limit is 1048576(2^20), GCC doesn't have one
+    add_cxx_only_compile_options(-fconstexpr-steps=16777216)
+
+    add_cxx_compile_options(-Wmissing-prototypes)
 elseif (CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
-    # Only ignore expansion-to-defined for g++, clang's implementation doesn't complain about function-like macros
-    add_cxx_compile_options(-Wno-expansion-to-defined)
     add_cxx_only_compile_options(-Wno-literal-suffix)
-    add_cxx_only_compile_options(-Wno-unqualified-std-cast-call)
     add_cxx_compile_options(-Wvla)
 
     # FIXME: These warnings trigger on Function and ByteBuffer in GCC (only when LTO is disabled...)
@@ -160,11 +157,7 @@ elseif (CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
 elseif (MSVC)
     # Warning options and defines
     add_cxx_compile_options(/W4)
-    add_cxx_compile_options(-Wno-implicit-const-int-float-conversion)
     add_cxx_compile_options(-Wno-reserved-identifier)
-    add_cxx_compile_options(-Wno-user-defined-literals)
-    add_cxx_compile_options(-Wno-unqualified-std-cast-call)
-    add_cxx_compile_options(-Wno-c23-extensions)
     add_cxx_compile_options(-Wno-microsoft-unqualified-friend) # MSVC doesn't support unqualified friends
     add_cxx_compile_definitions(_CRT_SECURE_NO_WARNINGS) # _s replacements not desired (or implemented on any other platform other than VxWorks)
     add_cxx_compile_definitions(_CRT_NONSTDC_NO_WARNINGS) # POSIX names are just fine, thanks
@@ -209,7 +202,7 @@ elseif (MSVC)
     add_cxx_link_option_if_supported(-prefetch-inputs)
 
     # Use ghash compressed debug info for build time and pdb size reduction
-    if (CMAKE_BUILD_TYPE STREQUAL "RelWithDebInfo" OR "Debug")
+    if (CMAKE_BUILD_TYPE STREQUAL "RelWithDebInfo" OR CMAKE_BUILD_TYPE STREQUAL "Debug")
         add_cxx_compile_options(-gcodeview-ghash)
         add_cxx_link_options(/DEBUG:GHASH)
     endif()
@@ -225,7 +218,8 @@ endif()
 
 include(CheckCXXSourceCompiles)
 if (LINUX)
-    add_cxx_compile_definitions(_FORTIFY_SOURCE=3)
+    # Some distributions' compilers define _FORTIFY_SOURCE themselves, and a different value than ours is an error.
+    add_cxx_compile_options(-U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=3)
     add_cxx_compile_definitions(_FILE_OFFSET_BITS=64)
     add_cxx_compile_options(-fstack-clash-protection)
     add_cxx_link_option_if_supported(LINKER:-z,relro)
@@ -320,15 +314,15 @@ elseif (CMAKE_BUILD_TYPE STREQUAL "Release")
     else()
         add_cxx_compile_options(/O2)
     endif()
+endif()
 
-    if (ENABLE_LTO_FOR_RELEASE)
-        include(CheckIPOSupported)
-        check_ipo_supported(RESULT IPO_AVAILABLE OUTPUT output)
-        if(IPO_AVAILABLE)
-            set(CMAKE_INTERPROCEDURAL_OPTIMIZATION TRUE)
-        else()
-            message(WARNING "Not enabling IPO as it is not supported: ${output}")
-        endif()
+if (LADYBIRD_ENABLE_LTO)
+    include(CheckIPOSupported)
+    check_ipo_supported(RESULT IPO_AVAILABLE OUTPUT output)
+    if(IPO_AVAILABLE)
+        set(CMAKE_INTERPROCEDURAL_OPTIMIZATION TRUE)
+    else()
+        message(WARNING "Not enabling IPO as it is not supported: ${output}")
     endif()
 endif()
 

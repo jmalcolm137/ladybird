@@ -84,6 +84,12 @@ void verify_diagnostics()
     VERIFY(diagnostics.contains("\nZoom level: 110%\n"sv));
     VERIFY(diagnostics.contains("\nGit commit: "sv));
 
+    // The platform features are only in a report whose sender chose to include them.
+    constexpr auto platform_features = "Platform features: [{\"id\":\"gpu_painting\",\"state\":\"Enabled\"}]\nPlatform facts: {}\n"sv;
+    report.set_platform_features(String::from_utf8_without_validation(platform_features.bytes()));
+    VERIFY(report.diagnostics(WebCompatReport::IncludePageDumps::No) == diagnostics);
+    VERIFY(report.diagnostics(WebCompatReport::IncludePageDumps::No, WebCompatReport::IncludePlatformFeatures::Yes) == ByteString::formatted("{}{}", diagnostics, platform_features));
+
     report.set_page_dumps(String::from_utf8_without_validation(page_dumps.bytes()));
     VERIFY(report.has_page_dumps());
     VERIFY(report.diagnostics(WebCompatReport::IncludePageDumps::Yes).ends_with(ByteString::formatted("\n\n{}", page_dumps)));
@@ -159,6 +165,8 @@ TEST_CASE(web_compat_report)
     VERIFY(manifest_field(manifest, "zoom_level"sv)->get_double_with_precision_loss() == 1.1);
     VERIFY(manifest_field(manifest, "platform"sv).has_value());
     VERIFY(manifest_field(manifest, "git_commit"sv).has_value());
+    // The platform features are only sent when chosen.
+    VERIFY(!manifest_field(manifest, "platform_features"sv).has_value());
 
     auto attachments = manifest.get_array("attachments"sv).value();
     VERIFY(attachments.size() == 2);
@@ -218,4 +226,22 @@ TEST_CASE(web_compat_report)
     VERIFY(server.requests.size() == 1);
 
     outln("PASS: Web compatibility reports reach the report server in the format it expects");
+}
+
+TEST_CASE(new_bug_report_url)
+{
+    auto plain_url = WebView::new_bug_report_url({}).serialize();
+    auto plain = plain_url.bytes_as_string_view();
+    EXPECT(plain.starts_with("https://github.com/LadybirdBrowser/ladybird/issues/new?template=bug_report.yml&"sv));
+    EXPECT(plain.contains("&build-flags=Ladybird%20"sv));
+    EXPECT(!plain.contains("sandbox"sv));
+    EXPECT(!plain.contains("painting"sv));
+
+    WebView::BugReportDetails details {
+        .disable_sandbox = WebView::DisableSandbox::Yes,
+        .gpu_painting_enabled = false,
+    };
+    auto detailed_url = WebView::new_bug_report_url(details).serialize();
+    auto detailed = detailed_url.bytes_as_string_view();
+    EXPECT(detailed.ends_with("%2C%20sandbox%3A%20off%2C%20GPU%20painting%3A%20off"sv));
 }

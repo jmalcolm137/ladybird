@@ -8,6 +8,7 @@
 
 #pragma once
 
+#include <AK/Array.h>
 #include <AK/HashMap.h>
 #include <AK/HashTable.h>
 #include <AK/Optional.h>
@@ -17,6 +18,7 @@
 #include <LibWebView/BrowsingSession.h>
 #include <LibWebView/Settings.h>
 #include <UI/Qt/BookmarksBar.h>
+#include <UI/Qt/NotificationBar.h>
 #include <UI/Qt/PlainText.h>
 #include <UI/Qt/Tab.h>
 #include <UI/Qt/WindowToolbar.h>
@@ -41,6 +43,7 @@ class QDropEvent;
 class QEvent;
 class QIcon;
 class QLabel;
+class QMenu;
 class QMouseEvent;
 class QPaintEvent;
 class QResizeEvent;
@@ -53,10 +56,10 @@ class QWheelEvent;
 namespace Ladybird {
 
 class AllTabsPopover;
+class ChromeHeaderButton;
 class LadybirdButton;
 
 class TabMicrophoneIndicator;
-class TabPreviewPopup;
 class TabWidget;
 class WindowControlsReveal;
 
@@ -95,6 +98,7 @@ public:
     void set_pinned_tabs_in_rows(bool);
     void set_vertical_tabs_position(WebView::VerticalTabsPosition);
     void refresh_tab_layout();
+    void did_replace_tab(Tab const& old_tab, Tab& new_tab);
     // After a tab is closed with a click, the tabs keep their width until the pointer leaves the tab bar, so the next
     // close button lands under the pointer.
     void lock_tab_widths();
@@ -167,12 +171,12 @@ private:
     bool is_growing_horizontal_tab(int index, QRect const& tab_rect) const;
     QRectF horizontal_tab_contents_rect(int index, QRect const& tab_rect) const;
     QRect tab_drag_card_rect(int index) const;
+    qreal tab_drag_card_radius() const;
     QPixmap render_tab_drag_pixmap(int index) const;
     void toggle_window_maximized();
     bool start_window_move();
     void start_tab_drag(int index);
     QPoint tab_drag_hot_spot() const;
-    void pointer_left();
     void start_strip_drag(int index);
     void update_strip_drag(QPoint position);
     void end_strip_drag();
@@ -182,10 +186,6 @@ private:
     void update_layout_animation();
     QRect animated_tab_rect(int index, QRect const& target) const;
     HorizontalTabEndRoom horizontal_tab_end_room(int index) const;
-    void schedule_tab_preview(int index);
-    void show_tab_preview();
-    void hide_tab_preview();
-    QPoint tab_preview_position_for(int index, QSize const& popup_size) const;
 
     // Where the pinned tabs sit in vertical tabs: a grid of tiles when expanded, one icon column when collapsed, and a
     // separator below. Its height is 0 when there's no pinned tab.
@@ -224,6 +224,8 @@ private:
     void ensure_tab_visible(int index);
     void update_tab_button_geometry();
     TabMicrophoneIndicator* microphone_indicator(int index) const;
+    int horizontal_tab_min_width(int index) const;
+    int horizontal_tab_share() const;
 
     QPointer<TabWidget> m_tab_widget;
 
@@ -231,6 +233,7 @@ private:
     bool m_pinned_tabs_in_rows { false };
     WebView::VerticalTabsPosition m_vertical_tabs_position { WebView::VerticalTabsPosition::Left };
     int m_available_width { 0 };
+    // NB: While locked, the unpinned tabs keep the share of the strip that they had (see horizontal_tab_share()).
     Optional<int> m_locked_tab_width;
     QTimer* m_tab_width_unlock_timer { nullptr };
     int m_hovered_tab_index { -1 };
@@ -264,6 +267,8 @@ private:
     QRect closing_tab_rect() const;
     HashMap<Tab const*, QRect> m_layout_animation_start_rects;
     HashMap<Tab const*, HorizontalTabEndRoom> m_layout_animation_start_end_rooms;
+    // The tabs that open, and grow in from nothing, while the tabs move.
+    HashTable<Tab const*> m_opening_tabs;
     HashMap<Tab const*, QRect> m_settled_tab_rects;
     HashMap<Tab const*, HorizontalTabEndRoom> m_settled_tab_end_rooms;
     int m_settled_tab_count { 0 };
@@ -287,12 +292,6 @@ private:
     // Where the card a dragged tab is drawn as sits in the tab.
     QPoint m_tab_drag_card_offset;
     QObject* m_strip_drag_cancellation_filter { nullptr };
-    QTimer* m_tab_preview_timer { nullptr };
-    QTimer* m_tab_preview_pointer_timer { nullptr };
-    TabPreviewPopup* m_tab_preview_popup { nullptr };
-    int m_tab_preview_index { -1 };
-    QPointer<Tab> m_previewed_tab;
-    QMetaObject::Connection m_tab_preview_paint_connection;
 };
 
 class TabWidget final : public QWidget {
@@ -309,12 +308,13 @@ public:
 
     // Whether a tab dragged to a position, in the given widget, lands in the tab strip rather than leaving it.
     bool tab_drop_area_contains(QWidget const&, QPoint position) const;
-    QWidget* tab_bar_row() const { return m_tab_bar_row; }
 
     void add_tab(Tab* widget, QString const& label);
     void insert_tab(int index, Tab* widget, QString const& label);
     void remove_tab(int index);
     Tab* take_tab(int index);
+    // Another tab stands in for the one at the index, which keeps its place in the tab bar rather than closing.
+    Tab* replace_tab(int index, Tab* widget);
 
     int count() const { return m_tab_bar->count(); }
 
@@ -335,8 +335,18 @@ public:
     void set_tab_icon(int index, QIcon const& icon);
 
     void set_tab_bar_visible(bool visible);
+
+    enum class NotificationBarSlot : u8 {
+        SandboxOff,
+        CpuPainting,
+    };
+    void show_notification_bar(NotificationBarSlot, QString const& message, Vector<NotificationBar::Button> = {}, Function<void()> on_close = {});
+    void hide_notification_bar(NotificationBarSlot);
+    void update_cpu_painting_bar();
+
     void set_new_tab_action(QAction* action);
     void set_window_controls_visible(bool);
+    void window_control_buttons_changed();
     void update_window_button_icons();
     void set_vertical_tabs_enabled(bool);
     void set_everything_in_sidebar(bool);
@@ -377,9 +387,11 @@ private:
     bool vertical_tabs_effectively_expanded() const;
     bool cursor_is_over_vertical_tabs() const;
     bool vertical_tabs_are_on_right() const;
+    bool window_controls_are_on_left() const;
     int vertical_tabs_layout_width() const;
     bool should_show_window_controls_in_tab_toolbar() const;
     bool vertical_tabs_hold_window_controls() const;
+    int sidebar_ladybird_button_inset(bool after_window_controls) const;
     bool toolbar_is_in_sidebar() const;
     int vertical_tabs_header_spacing() const;
     int minimum_vertical_tabs_expanded_width() const;
@@ -387,9 +399,10 @@ private:
     void rebuild_layout();
     void rebuild_layout_for_horizontal_tabs();
     bool sidebar_toggle_stays_in_corner() const;
+    bool bookmarks_are_in_sidebar() const;
     void place_all_tabs_and_sidebar_toggle();
     void place_sidebar_toggle_in_corner();
-    void place_collapsed_sidebar_buttons();
+    void place_toolbar_sidebar_buttons();
     void float_sidebar_buttons_while_toggling();
     bool slides_page_with_toggling_sidebar() const;
     void slide_page_with_toggling_sidebar();
@@ -398,6 +411,7 @@ private:
     int toolbar_row_height_while_toggling() const;
     void move_toolbar_with_toggling_sidebar();
     QWidget* m_floating_buttons_strip { nullptr };
+    QLabel* m_floating_window_controls { nullptr };
     QLabel* m_floating_ladybird_button { nullptr };
     QLabel* m_floating_all_tabs_button { nullptr };
     QLabel* m_floating_sidebar_toggle { nullptr };
@@ -440,13 +454,15 @@ private:
     QStackedWidget* m_stacked_widget { nullptr };
     QToolButton* m_new_tab_button { nullptr };
     QToolButton* m_all_tabs_button { nullptr };
+    ChromeHeaderButton* m_bookmarks_menu_button { nullptr };
+    QMenu* m_bookmarks_menu { nullptr };
     AllTabsPopover* m_all_tabs_popover { nullptr };
     bool m_all_tabs_entries_update_is_pending { false };
     Vector<SessionWindowId> m_recently_closed_unit_ids;
     LadybirdButton* m_ladybird_button { nullptr };
-    // The Ladybird button and the all-tabs button after it, which move together.
+    // The Ladybird button, with the all-tabs button when both are on the left.
     QWidget* m_ladybird_buttons { nullptr };
-    QToolButton* m_vertical_tabs_toggle_button { nullptr };
+    ChromeHeaderButton* m_vertical_tabs_toggle_button { nullptr };
     QToolButton* m_minimize_window_button { nullptr };
     QToolButton* m_maximize_window_button { nullptr };
     QToolButton* m_close_window_button { nullptr };
@@ -454,6 +470,9 @@ private:
     WindowControlsReveal* m_window_controls_reveal { nullptr };
     WindowToolbar* m_toolbar { nullptr };
     BookmarksBarContainer* m_bookmarks_bar { nullptr };
+    QWidget* m_notification_bar_column { nullptr };
+    QBoxLayout* m_notification_bar_column_layout { nullptr };
+    Array<NotificationBar*, 2> m_notification_bars {};
     QWidget* m_page_column { nullptr };
     QWidget* m_toolbar_placeholder { nullptr };
     bool m_toolbar_follows_page_column { false };
@@ -473,6 +492,7 @@ private:
     QBoxLayout* m_vertical_tab_bar_column_layout { nullptr };
     QBoxLayout* m_vertical_tabs_content_layout { nullptr };
     QSpacerItem* m_vertical_tabs_header_spacer { nullptr };
+    QSpacerItem* m_vertical_tabs_footer_spacer { nullptr };
     bool m_tab_bar_visible { true };
     bool m_window_controls_visible { true };
     bool m_vertical_tabs_enabled { false };
@@ -521,12 +541,18 @@ public:
         RailBadge,
     };
 
+    // How the button shows: by fading in, or at once and fully opaque, cutting short a fade in progress.
+    enum class Reveal : u8 {
+        Fade,
+        AtOnce,
+    };
+
     TabBarButton(QIcon const& icon, Role, QWidget* parent = nullptr);
     void set_placement(Placement);
     // Shows the button by fading it in, or fades it out and hides it.
-    void set_revealed(bool);
-    // A sidebar row's close button is quieter, but on the hovered and the selected rows.
-    void set_row_emphasized(bool);
+    void set_revealed(bool, Reveal = Reveal::Fade);
+    // A close button is dimmed, but on the hovered and the selected tabs.
+    void set_tab_emphasized(bool);
 
 protected:
     virtual bool event(QEvent* event) override;
@@ -538,9 +564,7 @@ private:
     Role m_role { Role::Close };
     Placement m_placement { Placement::Tab };
     bool m_revealed { false };
-    bool m_row_emphasized { false };
-    QIcon m_quiet_close_icon;
-    bool m_quiet_close_icon_is_dark { false };
+    bool m_tab_emphasized { false };
     qreal m_opacity { 1 };
     QVariantAnimation* m_reveal_animation { nullptr };
 };

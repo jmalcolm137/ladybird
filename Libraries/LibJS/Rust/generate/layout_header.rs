@@ -20,9 +20,11 @@ use crate::class_id::{ALL_CLASS_IDS, CLASS_COUNT};
 use crate::layout::cell::*;
 use crate::layout::class::*;
 use crate::layout::execution_context::*;
+use crate::layout::function_object::*;
 use crate::layout::host_class::*;
 use crate::layout::host_object::*;
 use crate::layout::object::*;
+use crate::layout::primitive_string::*;
 use crate::layout::realm::*;
 use crate::layout::shape::*;
 use crate::layout::vm::*;
@@ -32,8 +34,10 @@ const STATIC_ASSERTIONS_PREAMBLE: &str = "\
 use crate::layout::cell::*;
 use crate::layout::class::*;
 use crate::layout::execution_context::*;
+use crate::layout::function_object::*;
 use crate::layout::host_object::*;
 use crate::layout::object::*;
+use crate::layout::primitive_string::*;
 use crate::layout::realm::*;
 use crate::layout::shape::*;
 use crate::layout::vm::*;
@@ -279,7 +283,6 @@ pub fn generate() -> LayoutHeader {
     let mut w = HeaderWriter::new();
 
     w.section("Cell header, at the start of every cell");
-    offset!(w, "CELL_MARK", CellHeader, mark);
     offset!(w, "CELL_STATE", CellHeader, state);
     offset!(w, "CELL_KIND", CellHeader, kind);
     for kind in [CellKind::Other, CellKind::Object, CellKind::PrimitiveString, CellKind::Symbol, CellKind::BigInt, CellKind::Accessor] {
@@ -316,6 +319,17 @@ pub fn generate() -> LayoutHeader {
     offset!(w, "SHAPE_REALM", Shape, realm);
     offset!(w, "SHAPE_PROTOTYPE", Shape, prototype);
 
+    w.section("ECMAScript functions, whose [[ScriptOrModule]] is in their shared data");
+    w.define(
+        "ECMASCRIPT_FUNCTION_OBJECT_SHARED_DATA_OFFSET",
+        ECMASCRIPT_FUNCTION_OBJECT_SHARED_DATA_OFFSET,
+    );
+    w.define(
+        "ECMASCRIPT_FUNCTION_OBJECT_SHARED_DATA_SIZE",
+        size_of_field(|fields: &EcmascriptFunctionFields| &raw const fields.shared_data),
+    );
+    offset!(w, "SHARED_FUNCTION_INSTANCE_DATA_SCRIPT_OR_MODULE", SharedFunctionInstanceData, script_or_module);
+
     w.section("Realm");
     offset!(w, "REALM_GLOBAL_OBJECT", Realm, global_object);
     offset!(w, "REALM_GLOBAL_ENVIRONMENT", Realm, global_environment);
@@ -325,14 +339,13 @@ pub fn generate() -> LayoutHeader {
     w.section("ExecutionContext, whose value slots follow it directly");
     every_field_offset!(w, "EXECUTION_CONTEXT", ExecutionContext {
         function,
-        realm,
-        script_or_module,
+        realm_without_function,
+        script_or_module_without_function,
         lexical_environment,
-        variable_environment,
-        private_environment,
+        variable_environment_in_frame,
+        private_environment_in_frame,
         frame_id,
         program_counter,
-        skip_when_determining_incumbent_counter,
         yield_continuation,
         yield_is_await,
         yield_value_is_iterator_result,
@@ -348,6 +361,8 @@ pub fn generate() -> LayoutHeader {
         argument_count,
         returns_to_native_caller,
         runs_jit_code,
+        caller_is_derived_construct,
+        new_target,
     });
     size!(w, "EXECUTION_CONTEXT", ExecutionContext);
     w.define("EXECUTION_CONTEXT_ALIGN", align_of::<ExecutionContext>());
@@ -367,17 +382,25 @@ pub fn generate() -> LayoutHeader {
     offset!(w, "VM_EXECUTION_CONTEXT_STACK_CAPACITY", VmHead, execution_context_stack_capacity);
     offset!(w, "VM_TYPE_ERROR_REALM_OVERRIDE", VmHead, type_error_realm_override);
     offset!(w, "VM_TYPE_ERROR_REALM_OVERRIDE_DEPTH", VmHead, type_error_realm_override_depth);
+    offset!(w, "VM_CURRENT_REALM", VmHead, current_realm);
 
     w.section("ExecutionContextStackEntry, the entries of the VM's execution context stack");
     every_field_offset!(w, "EXECUTION_CONTEXT_STACK_ENTRY", ExecutionContextStackEntry {
         execution_context,
         previous_running_execution_context,
+        previous_realm,
     });
     size!(w, "EXECUTION_CONTEXT_STACK_ENTRY", ExecutionContextStackEntry);
 
     w.section("Storage to reserve for constructing the VM in place, at least its size and alignment");
     w.define("VM_SIZE", VM_SIZE);
     w.define("VM_ALIGN", VM_ALIGN);
+
+    w.section("PrimitiveString");
+    offset!(w, "PRIMITIVE_STRING_DEFERRED_KIND_AND_FLAGS", PrimitiveString, deferred_kind_and_flags);
+    w.define_hex("PRIMITIVE_STRING_DEFERRED_KIND_MASK", DEFERRED_KIND_MASK.into());
+    w.define("PRIMITIVE_STRING_DEFERRED_KIND_NONE", DeferredKind::None as u8);
+    offset!(w, "PRIMITIVE_STRING_UTF16_STRING", PrimitiveString, utf16_string);
 
     w.section("TypedArrayBase");
     offset!(w, "TYPED_ARRAY_KIND", TypedArrayBase, kind);
@@ -443,15 +466,15 @@ pub fn generate() -> LayoutHeader {
         error_data,
         finalize,
         get_indexed_value,
+        preserve_identity,
     });
     check_host_object_abi_struct!(w, JSHostFunctionHooks { call, construct, finalize });
     check_host_object_abi_struct!(w, JSHostArrayHooks { set, delete_property });
     check_host_object_abi_struct!(w, JSResolvedBinding { module, binding_name, r#type });
     check_host_object_abi_struct!(w, JSHostModuleHooks { get_exported_names, resolve_export, initialize_environment, execute_module });
-    check_host_object_abi_struct!(w, JSHostClass { abi_version, kind, reserved, flags, name, name_length, parent, hooks, user_data });
+    check_host_object_abi_struct!(w, JSHostClass { kind, flags, name, name_length, parent, hooks, user_data });
     check_host_object_abi_constants!(
         w,
-        JS_HOST_ABI_VERSION,
         JS_COMPLETION_NORMAL,
         JS_COMPLETION_THROW,
         JS_PROPERTY_LOOKUP_PHASE_OWN_PROPERTY,

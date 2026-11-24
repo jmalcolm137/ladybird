@@ -6,18 +6,18 @@
 
 //! What the emission core writes instructions with, and what it leaves when it is done.
 
-use crate::bytecode::executable_data::ExceptionHandler;
+use crate::bytecode::executable_data::{ExceptionHandler, StrictRange};
 use crate::bytecode::operand::Operand;
 use crate::bytecode::operand::OperandType;
-use crate::bytecode::source_map::SourceOffsetEntry;
 use crate::layout::buffer::BlockSlice;
 use crate::u32_from_usize;
 
 /// The result of assembling bytecode.
 pub struct AssembledBytecode {
     pub bytecode: BlockSlice<u8>,
-    pub source_map: BlockSlice<SourceOffsetEntry>,
-    pub exception_handlers: BlockSlice<ExceptionHandler>,
+    pub strict_ranges: Box<[StrictRange]>,
+    pub source_map: BlockSlice<u8>,
+    pub exception_handlers: Box<[ExceptionHandler]>,
     pub number_of_registers: u32,
     /// One past the highest `Operand::argument` index referenced by any
     /// instruction, or 0 if the bytecode never reads an argument.
@@ -31,11 +31,23 @@ pub(super) struct BlockPosition {
     pub(super) offset: u32,
 }
 
+/// The first frame slot that an operand cannot name, which is what an operand that is left out holds.
+pub(crate) const FIRST_WIDE_SLOT: u32 = 255;
+
+/// Where an operand that is not a low register sits in a block, and what kind of operand it is.
+#[derive(Clone, Copy)]
+pub(super) struct OperandPosition {
+    pub(super) offset: u32,
+    pub(super) operand_type: OperandType,
+    /// The index among the operands of that type, which only a full operand can hold before the frame is laid out.
+    pub(super) index: u32,
+}
+
 /// What the generated encoder writes an instruction with: the bytes of its block, and the notes for `finish()`.
 pub struct BlockEncoder<'a> {
     pub bytes: &'a mut Vec<u8>,
     block: u32,
-    operand_positions: &'a mut Vec<BlockPosition>,
+    operand_positions: &'a mut Vec<OperandPosition>,
     label_positions: &'a mut Vec<BlockPosition>,
     /// One past the highest argument that an instruction refers to so far.
     number_of_arguments: &'a mut u32,
@@ -48,7 +60,7 @@ impl<'a> BlockEncoder<'a> {
     #[inline(always)]
     pub(super) fn for_stream(
         bytes: &'a mut Vec<u8>,
-        operand_positions: &'a mut Vec<BlockPosition>,
+        operand_positions: &'a mut Vec<OperandPosition>,
         label_positions: &'a mut Vec<BlockPosition>,
         number_of_arguments: &'a mut u32,
         watched: Operand,
@@ -76,21 +88,25 @@ impl BlockEncoder<'_> {
                     self.watched = Operand::invalid();
                     self.watched_position = u32_from_usize(self.bytes.len() + offset);
                 }
+                if operand.index() >= FIRST_WIDE_SLOT {
+                    self.note_operand(offset, operand);
+                }
             }
             OperandType::Argument => {
                 *self.number_of_arguments = (*self.number_of_arguments).max(operand.index() + 1);
-                self.note_operand(offset);
+                self.note_operand(offset, operand);
             }
-            OperandType::Local | OperandType::Constant => self.note_operand(offset),
+            OperandType::Local | OperandType::Constant => self.note_operand(offset, operand),
         }
         operand.raw()
     }
 
     #[inline(always)]
-    fn note_operand(&mut self, offset: usize) {
-        self.operand_positions.push(BlockPosition {
-            block: self.block,
+    fn note_operand(&mut self, offset: usize, operand: Operand) {
+        self.operand_positions.push(OperandPosition {
             offset: u32_from_usize(self.bytes.len() + offset),
+            operand_type: operand.operand_type(),
+            index: operand.index(),
         });
     }
 

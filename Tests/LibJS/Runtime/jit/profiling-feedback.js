@@ -67,11 +67,23 @@ profilingTest("loads and calls record the kinds of the values they produce", () 
     }
     jit.prepare(read);
     read({ value: 1 });
-    expect(feedbackOf(read, "GetById")).toBe("value#0: Int32");
+    expect(feedbackOf(read, "GetById")).toBe("value of cache#0: Int32");
     read({ value: "string" });
-    expect(feedbackOf(read, "GetById")).toBe("value#0: Int32|String");
+    expect(feedbackOf(read, "GetById")).toBe("value of cache#0: Int32|String");
     read({ value: undefined });
-    expect(feedbackOf(read, "GetById")).toBe("value#0: Int32|String|Undefined");
+    expect(feedbackOf(read, "GetById")).toBe("value of cache#0: Int32|String|Undefined");
+
+    // Loads record into the slots of their property lookup caches, which stores and the other loads have too.
+    function readAfterWrites(object) {
+        object.first = 1;
+        object.second = 2;
+        const length = object.length;
+        return [length, object.value];
+    }
+    jit.prepare(readAfterWrites);
+    readAfterWrites({ value: true, length: 1.5 });
+    expect(feedbackOf(readAfterWrites, "GetLength")).toBe("value of cache#2: Double keyed#0: keys=none elements=Other");
+    expect(feedbackOf(readAfterWrites, "GetById")).toBe("value of cache#3: Boolean");
 
     function call(f) {
         return f();
@@ -81,10 +93,10 @@ profilingTest("loads and calls record the kinds of the values they produce", () 
     const returnsNull = () => null;
     const returnsDouble = () => 1.5;
     call(returnsNull);
-    expect(feedbackOf(call, "Call")).toBe("value#0: Null call#0: target=function returnsNull flags=none");
+    expect(feedbackOf(call, "Call")).toBe("call#0: target=function returnsNull flags=none returned: Null");
     call(returnsDouble);
     expect(feedbackOf(call, "Call")).toBe(
-        "value#0: Double|Null call#0: target=function returnsNull flags=Polymorphic|OtherFunctions"
+        "call#0: target=function returnsNull flags=Polymorphic|OtherFunctions returned: Double|Null"
     );
     expect(returnsDouble()).toBe(1.5);
     expect(returnsNull()).toBeNull();
@@ -99,14 +111,14 @@ profilingTest("calls record their first callee and how the others differ", () =>
     jit.prepare(call);
     call(first);
     call(first);
-    expect(feedbackOf(call, "Call")).toBe("value#0: Undefined call#0: target=function first flags=none");
+    expect(feedbackOf(call, "Call")).toBe("call#0: target=function first flags=none returned: Undefined");
     call(second);
     expect(feedbackOf(call, "Call")).toBe(
-        "value#0: Undefined call#0: target=function first flags=Polymorphic|OtherFunctions"
+        "call#0: target=function first flags=Polymorphic|OtherFunctions returned: Undefined"
     );
     call(Math.random);
     expect(feedbackOf(call, "Call")).toBe(
-        "value#0: Double|Undefined call#0: target=function first flags=Polymorphic|SawNative|OtherFunctions"
+        "call#0: target=function first flags=Polymorphic|SawNative|OtherFunctions returned: Double|Undefined"
     );
 
     function callClosure(f) {
@@ -118,7 +130,7 @@ profilingTest("calls record their first callee and how the others differ", () =>
     callClosure(closures[0]);
     callClosure(closures[1]);
     expect(feedbackOf(callClosure, "Call")).toBe(
-        "value#0: Int32 call#0: target=function <anonymous> flags=Polymorphic"
+        "call#0: target=function <anonymous> flags=Polymorphic returned: Int32"
     );
     expect(closures.length).toBe(2);
 
@@ -128,7 +140,7 @@ profilingTest("calls record their first callee and how the others differ", () =>
     jit.prepare(construct);
     construct(Object);
     expect(feedbackOf(construct, "CallConstruct")).toBe(
-        "value#0: Object call#0: target=native function Object flags=SawNative|SawConstruct"
+        "call#0: target=native function Object flags=SawNative|SawConstruct returned: Object"
     );
 });
 
@@ -160,16 +172,16 @@ profilingTest("calls record where their callee forwarded them to", () => {
     viaBound(target.bind(null, 1));
     viaCallback([1, 2]);
     expect(feedbackOf(viaCall, "Call")).toBe(
-        "value#1: Int32 call#0: target=native function call flags=SawNative forwarded by call with 2 arguments to function target"
+        "call#0: target=native function call flags=SawNative forwarded by call with 2 arguments to function target returned: Int32"
     );
     expect(feedbackOf(viaApply, "Call")).toBe(
-        "value#1: Int32 call#0: target=native function apply flags=SawNative forwarded by apply with 3 arguments to function target"
+        "call#0: target=native function apply flags=SawNative forwarded by apply with 3 arguments to function target returned: Int32"
     );
     expect(feedbackOf(viaBound, "Call")).toBe(
-        "value#0: Int32 call#0: target=function target flags=SawNative forwarded by bound with 2 arguments to function target"
+        "call#0: target=function target flags=SawNative forwarded by bound with 2 arguments to function target returned: Int32"
     );
     expect(feedbackOf(viaCallback, "Call")).toBe(
-        "value#2: none call#0: target=native function forEach flags=SawNative forwarded by callback with 0 arguments to function add"
+        "call#0: target=native function forEach flags=SawNative forwarded by callback with 0 arguments to function add returned: none"
     );
 
     function other(a, b) {
@@ -177,7 +189,7 @@ profilingTest("calls record where their callee forwarded them to", () => {
     }
     viaCall(other);
     expect(feedbackOf(viaCall, "Call")).toBe(
-        "value#1: Int32 call#0: target=native function call flags=SawNative|ForwardedPolymorphic forwarded by call with 2 arguments to function target"
+        "call#0: target=native function call flags=SawNative|ForwardedPolymorphic forwarded by call with 2 arguments to function target returned: Int32"
     );
     // NB: The feedback only holds its targets weakly, so `add` stays alive until here.
     expect(add.name).toBe("add");
@@ -189,19 +201,19 @@ profilingTest("keyed accesses record their keys and elements", () => {
     }
     jit.prepare(get);
     get([1, 2, 3], 1);
-    expect(feedbackOf(get, "GetByValue")).toBe("value#0: Int32 keyed#0: keys=Int32Index elements=Packed");
+    expect(feedbackOf(get, "GetByValue")).toBe("value of cache#0: Int32 keyed#0: keys=Int32Index elements=Packed");
     get([1, , 3], 1);
     expect(feedbackOf(get, "GetByValue")).toBe(
-        "value#0: Int32|Undefined keyed#0: keys=Int32Index elements=Packed|Holey out-of-bounds"
+        "value of cache#0: Int32|Undefined keyed#0: keys=Int32Index elements=Packed|Holey out-of-bounds"
     );
     get(new Float64Array(2), 0);
     get({ x: 1 }, "x");
     expect(feedbackOf(get, "GetByValue")).toBe(
-        'value#0: Int32|Undefined keyed#0: keys=Int32Index|String elements=Packed|Holey|Other|Float64Array out-of-bounds last_key="x"'
+        'value of cache#0: Int32|Undefined keyed#0: keys=Int32Index|String elements=Packed|Holey|Other|Float64Array out-of-bounds last_key="x"'
     );
     get({ y: 1 }, "y");
     expect(feedbackOf(get, "GetByValue")).toBe(
-        'value#0: Int32|Undefined keyed#0: keys=Int32Index|String|MultipleKeys elements=Packed|Holey|Other|Float64Array out-of-bounds last_key="y"'
+        'value of cache#0: Int32|Undefined keyed#0: keys=Int32Index|String|MultipleKeys elements=Packed|Holey|Other|Float64Array out-of-bounds last_key="y"'
     );
 
     function fill(count) {
@@ -232,14 +244,14 @@ profilingTest("feedback forgets callees and keys that died", () => {
         call(temporary);
         get({}, symbol);
     })();
-    expect(feedbackOf(call, "Call")).toBe("value#0: Undefined call#0: target=function temporary flags=none");
+    expect(feedbackOf(call, "Call")).toBe("call#0: target=function temporary flags=none returned: Undefined");
     expect(feedbackOf(get, "GetByValue")).toBe(
-        "value#0: Undefined keyed#0: keys=Symbol elements=Other last_key=Symbol(temporary)"
+        "value of cache#0: Undefined keyed#0: keys=Symbol elements=Other last_key=Symbol(temporary)"
     );
     holder.length = 0;
     gc();
-    expect(feedbackOf(call, "Call")).toBe("value#0: Undefined call#0: target=none flags=none");
-    expect(feedbackOf(get, "GetByValue")).toBe("value#0: Undefined keyed#0: keys=Symbol elements=Other");
+    expect(feedbackOf(call, "Call")).toBe("call#0: target=none flags=none returned: Undefined");
+    expect(feedbackOf(get, "GetByValue")).toBe("value of cache#0: Undefined keyed#0: keys=Symbol elements=Other");
 });
 
 profilingTest("functions that never ran have no feedback", () => {

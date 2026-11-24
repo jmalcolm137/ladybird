@@ -1,7 +1,7 @@
 <!doctype html>
 <html id="html">
 <script src="../include.js"></script>
-<script src="recording-test.js"></script>
+<script src="../work-test.js"></script>
 <style>
     body { margin: 0; }
     #a, #b { position: absolute; left: 0; top: 0; width: 100px; height: 100px; }
@@ -19,7 +19,6 @@ displayListTest({
             name: "quiet before reordering",
             check: equal => { equal(document.elementFromPoint(50, 50).id, "b", "hit target"); },
             expect: `
-                damage: rows=0 moved=0 order=0 eligibility=0 all=false
                 @canvas RECORD (empty)
                 @viewport COPY
             `
@@ -29,49 +28,39 @@ displayListTest({
             mutate: () => { b.style.zIndex = "-1"; },
             check: equal => { equal(document.elementFromPoint(50, 50).id, "a", "hit target"); },
             expect: `
-                damage: rows=4 moved=0 order=3 eligibility=0 all=false
                 @canvas RECORD (empty)
                 @viewport ASSEMBLE
                   @viewport/preamble COPY
-                  @viewport/background/hit-test COPY
                   @viewport/scroll-metadata COPY
                   @viewport/background COPY
                   @viewport/border COPY
-                  BlockContainer<HTML>#html/descendants(background-and-borders) ASSEMBLE
-                  @viewport/foreground/hit-test COPY
+                  BlockContainer<HTML>#html/descendants(background-and-borders) REPLAN
                   @viewport/foreground COPY
-                  BlockContainer<HTML>#html/descendants(foreground) ASSEMBLE
+                  BlockContainer<HTML>#html/descendants(foreground) REPLAN
                   BlockContainer<HTML>#html REPLAN
                     BlockContainer<HTML>#html/preamble COPY
-                    BlockContainer<HTML>#html/background/hit-test COPY
                     BlockContainer<HTML>#html/scroll-metadata COPY
                     BlockContainer<HTML>#html/background COPY
                     BlockContainer<HTML>#html/border COPY
                     BlockContainer<DIV>#b REPLAN
                       BlockContainer<DIV>#b/preamble RECORD (empty)
-                      BlockContainer<DIV>#b/background/hit-test RECORD
                       BlockContainer<DIV>#b/scroll-metadata RECORD (empty)
                       BlockContainer<DIV>#b/background RECORD
                       BlockContainer<DIV>#b/border SKIP
-                      BlockContainer<DIV>#b/foreground/hit-test RECORD (empty)
                       BlockContainer<DIV>#b/foreground RECORD (empty)
                       BlockContainer<DIV>#b/outline SKIP
                     BlockContainer<BODY>#body/descendants(background-and-borders) REPLAN
-                      BlockContainer<BODY>#body/background/hit-test COPY
                       BlockContainer<BODY>#body/scroll-metadata COPY
                       BlockContainer<BODY>#body/background COPY
                       BlockContainer<BODY>#body/border COPY
                       BlockContainer<DIV>#a/descendants(background-and-borders) COPY
                       BlockContainer<DIV>#b/descendants(background-and-borders) REPLAN
-                    BlockContainer<HTML>#html/foreground/hit-test COPY
                     BlockContainer<HTML>#html/foreground COPY
                     BlockContainer<BODY>#body/descendants(foreground) REPLAN
-                      BlockContainer<BODY>#body/foreground/hit-test COPY
                       BlockContainer<BODY>#body/foreground COPY
                       BlockContainer<DIV>#a/descendants(foreground) COPY
                       BlockContainer<DIV>#b/descendants(foreground) REPLAN
                       BlockContainer<BODY>#body/outline COPY
-                      BlockContainer<BODY>#body/overlay/hit-test COPY
                       BlockContainer<BODY>#body/overlay COPY
                     BlockContainer<DIV>#a COPY
                     BlockContainer<HTML>#html/outline COPY
@@ -83,49 +72,39 @@ displayListTest({
             mutate: () => { b.style.zIndex = "1"; },
             check: equal => { equal(document.elementFromPoint(50, 50).id, "b", "hit target"); },
             expect: `
-                damage: rows=4 moved=0 order=3 eligibility=0 all=false
                 @canvas RECORD (empty)
                 @viewport ASSEMBLE
                   @viewport/preamble COPY
-                  @viewport/background/hit-test COPY
                   @viewport/scroll-metadata COPY
                   @viewport/background COPY
                   @viewport/border COPY
-                  BlockContainer<HTML>#html/descendants(background-and-borders) ASSEMBLE
-                  @viewport/foreground/hit-test COPY
+                  BlockContainer<HTML>#html/descendants(background-and-borders) REPLAN
                   @viewport/foreground COPY
-                  BlockContainer<HTML>#html/descendants(foreground) ASSEMBLE
+                  BlockContainer<HTML>#html/descendants(foreground) REPLAN
                   BlockContainer<HTML>#html REPLAN
                     BlockContainer<HTML>#html/preamble COPY
-                    BlockContainer<HTML>#html/background/hit-test COPY
                     BlockContainer<HTML>#html/scroll-metadata COPY
                     BlockContainer<HTML>#html/background COPY
                     BlockContainer<HTML>#html/border COPY
                     BlockContainer<BODY>#body/descendants(background-and-borders) REPLAN
-                      BlockContainer<BODY>#body/background/hit-test COPY
                       BlockContainer<BODY>#body/scroll-metadata COPY
                       BlockContainer<BODY>#body/background COPY
                       BlockContainer<BODY>#body/border COPY
                       BlockContainer<DIV>#a/descendants(background-and-borders) COPY
                       BlockContainer<DIV>#b/descendants(background-and-borders) REPLAN
-                    BlockContainer<HTML>#html/foreground/hit-test COPY
                     BlockContainer<HTML>#html/foreground COPY
                     BlockContainer<BODY>#body/descendants(foreground) REPLAN
-                      BlockContainer<BODY>#body/foreground/hit-test COPY
                       BlockContainer<BODY>#body/foreground COPY
                       BlockContainer<DIV>#a/descendants(foreground) COPY
                       BlockContainer<DIV>#b/descendants(foreground) REPLAN
                       BlockContainer<BODY>#body/outline COPY
-                      BlockContainer<BODY>#body/overlay/hit-test COPY
                       BlockContainer<BODY>#body/overlay COPY
                     BlockContainer<DIV>#a COPY
                     BlockContainer<DIV>#b REPLAN
                       BlockContainer<DIV>#b/preamble RECORD (empty)
-                      BlockContainer<DIV>#b/background/hit-test RECORD
                       BlockContainer<DIV>#b/scroll-metadata RECORD (empty)
                       BlockContainer<DIV>#b/background RECORD
                       BlockContainer<DIV>#b/border SKIP
-                      BlockContainer<DIV>#b/foreground/hit-test RECORD (empty)
                       BlockContainer<DIV>#b/foreground RECORD (empty)
                       BlockContainer<DIV>#b/outline SKIP
                     BlockContainer<HTML>#html/outline COPY

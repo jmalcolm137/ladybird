@@ -1,5 +1,5 @@
-$96dbee98 for-in-nullish-completion.js:4:1
-  Registers: 12
+$ab53e99b for-in-nullish-completion.js:4:1
+  Registers: 11
   Blocks:    5
   Constants:
     [0] = Undefined
@@ -9,23 +9,23 @@ $96dbee98 for-in-nullish-completion.js:4:1
 
 block0:
   [   0] Enter
-  [   8] Mov dst:reg5, src:Undefined
-  [  18] Mov dst:reg5, src:Int32(1)
-  [  28] Mov dst:reg6, src:Null
-  [  38] Mov dst:reg5, src:Undefined
-  [  48] JumpNullish condition:reg6, true_target:block4, false_target:block1
+  [   1] Mov dst:reg5, src:Undefined
+  [   4] Mov dst:reg5, src:Int32(1)
+  [   7] Mov dst:reg6, src:Null
+  [   a] Mov dst:reg5, src:Undefined
+  [   d] JumpNullish condition:reg6, true_target:block4, false_target:block1
 
 block1:
-  [  58] GetObjectPropertyIterator dst_keys:reg8, dst_receiver:reg7, object:reg6
-  [  70] Mov dst:reg9, src:Int32(0)
+  [  17] GetObjectPropertyIterator dst_keys:reg8, dst_receiver:reg7, object:reg6
+  [  1f] Mov dst:reg9, src:Int32(0)
 
 block2:
-  [  80] ObjectPropertyIteratorNext dst_value:reg10, dst_done:reg11, receiver:reg7, keys:reg8, cursor:reg9
-  [  98] JumpTrue condition:reg11, target:block4
+  [  22] ObjectPropertyIteratorNext dst_value:reg6, dst_done:reg10, receiver:reg7, keys:reg8, cursor:reg9
+  [  28] JumpTrue condition:reg10, target:block4
 
 block3:
-  [  a8] SetGlobal `a`, src:reg10
-  [  b8] JumpLoop target:block2
+  [  2e] SetGlobal `a`, src:reg6
+  [  34] JumpLoop target:block2
 
 block4:
-  [  c0] End value:reg5
+  [  39] End value:reg5

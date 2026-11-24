@@ -90,7 +90,10 @@ pub fn handling(opcode: OpCode) -> Handling {
     match opcode {
         // Control flow, moves and frame setup.
         O::Enter
+        | O::EnterCoercingThis
         | O::Mov
+        | O::MovWide
+        | O::WideNameIndices
         | O::MovSrcUndefined
         | O::Jump
         | O::JumpIf
@@ -115,6 +118,7 @@ pub fn handling(opcode: OpCode) -> Handling {
         O::GetLexicalEnvironment
         | O::SetLexicalEnvironment
         | O::LeavePrivateEnvironment
+        | O::EnterWithOwnEnvironments
         | O::IsCallable
         | O::GetArgumentCount => Handling::Native,
 
@@ -128,10 +132,14 @@ pub fn handling(opcode: OpCode) -> Handling {
         | O::CallConstruct
         | O::CallWithArgumentArray
         | O::CallConstructWithArgumentArray
-        | O::SuperCallWithArgumentArray => GENERIC_CALL,
-        O::CallDirectEval | O::CallDirectEvalWithArgumentArray => GENERIC_CALL_READS_WHOLE_FRAME,
+        | O::SuperCallWithArgumentArray
+        | O::SuperCall => GENERIC_CALL,
+        O::BindThisFromSuperCall => GENERIC,
+        O::CallDirectEval | O::CallDirectEvalWithArgumentArray | O::SuperCallWithForwardedArguments => {
+            GENERIC_CALL_READS_WHOLE_FRAME
+        }
 
-        O::CreateArguments | O::CreateRestParams | O::Debugger => GENERIC_READS_WHOLE_FRAME,
+        O::CreateArguments | O::CreateRestParams | O::GetArgument | O::Debugger => GENERIC_READS_WHOLE_FRAME,
 
         // Slow paths that only allocate or inspect values.
         O::NewObject
@@ -139,6 +147,7 @@ pub fn handling(opcode: OpCode) -> Handling {
         | O::NewArray
         | O::NewPrimitiveArray
         | O::NewFunction
+        | O::NewFunctionWide
         | O::NewReferenceError
         | O::NewTypeError
         | O::CreateLexicalEnvironment
@@ -322,6 +331,8 @@ pub fn handling(opcode: OpCode) -> Handling {
         | O::GetMethod
         | O::GetObjectPropertyIterator
         | O::IteratorNext
+        | O::IteratorStep
+        | O::SetVariableBindingOfBlockFunction
         | O::IteratorToArray
         | O::CacheObjectShape
         | O::InitObjectLiteralProperty

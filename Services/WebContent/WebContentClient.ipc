@@ -52,6 +52,7 @@
 #include <LibWebCommon/HTML/WindowType.h>
 #include <LibWebCommon/HTML/WorkerAgentForward.h>
 #include <LibWebCommon/HTML/WorkerAgentTypes.h>
+#include <LibWebCommon/MediaSession/MediaSessionState.h>
 #include <LibWebCommon/Page/CompositorContextId.h>
 #include <LibWebCommon/Page/ContextMenuForInputEventsTarget.h>
 #include <LibWebCommon/Page/EventResult.h>
@@ -96,6 +97,7 @@ endpoint WebContentClient routed by Web::PageId page_id
     did_request_navigation_of_navigable(Web::PageId page_id, Web::HTML::CrossProcessId navigable_id, Web::HTML::CrossProcessId source_navigable_id, Web::HTML::CrossProcessId source_document_id, Web::HTML::PreparedNavigationDescriptor navigation) =|
     did_post_message_to_navigable(Web::PageId page_id, Web::HTML::CrossProcessId navigable_id, Web::HTML::PostedMessageDescriptor message) =|
     did_report_navigation_violation(Web::PageId page_id, Web::HTML::CrossProcessId navigable_id, Utf16String navigation_id, u64 policy_index, Web::ContentSecurityPolicy::RemoteViolationDirective directive, bool url_is_https) =|
+    did_report_container_document_navigation_violation(Web::PageId page_id, Web::HTML::CrossProcessId navigable_id, Utf16String navigation_id, u64 policy_index, Web::ContentSecurityPolicy::RemoteViolationDirective directive, bool url_is_https) =|
     did_request_close_of_traversable(Web::PageId page_id, Web::HTML::CrossProcessId navigable_id, Web::HTML::CrossProcessId source_navigable_id, Web::HTML::NavigationSourceSnapshot source_snapshot) =|
     did_request_focusing_steps_for_navigable(Web::PageId page_id, Web::HTML::CrossProcessId navigable_id, Web::HTML::FocusTrigger focus_trigger) =|
     did_request_window_focus_of_navigable(Web::PageId page_id, Web::HTML::CrossProcessId navigable_id) =|
@@ -179,6 +181,7 @@ endpoint WebContentClient routed by Web::PageId page_id
     did_take_screenshot(Web::PageId page_id, Gfx::ShareableBitmap screenshot) =|
 
     did_get_internal_page_info(Web::PageId page_id, WebView::PageInfoType type, Optional<Core::AnonymousBuffer> info) =|
+    did_describe_owners_of_visual_context_nodes(Web::PageId page_id, u64 structural_epoch, Vector<u32> spatial_node_indices, Vector<u32> effect_node_indices, Vector<String> owners) =|
 
     did_get_selected_text(Web::PageId page_id, u64 request_id, ByteString selection) =|
     did_get_selected_text_for_lookup(Web::PageId page_id, u64 request_id, Optional<WebView::DictionaryLookup> lookup) =|
@@ -220,6 +223,9 @@ endpoint WebContentClient routed by Web::PageId page_id
     [NotRouted] did_close_browsing_context(Web::PageId page_id) =|
     did_complete_close_preflight(Web::PageId page_id, u64 request_id, bool approved) =|
     did_change_needs_beforeunload_check(Web::PageId page_id, bool needs_beforeunload_check) =|
+    did_change_had_user_edits(Web::PageId page_id, bool had_user_edits) =|
+    did_save_session_history_entry_state(Web::PageId page_id, Web::HTML::CrossProcessId navigable_id, Web::HTML::SessionHistoryEntryPersistedState persisted_state) =|
+    did_save_session_history_entry_states(Web::PageId page_id) =|
     did_consume_user_activation(Web::PageId page_id, Web::HTML::UserActivationConsumption consumption) =|
     did_notify_about_user_activation(Web::PageId page_id, Web::HTML::CrossProcessId document_id) =|
     webdriver_user_prompt_handling_complete(Web::PageId page_id, u64 request_id, Web::WebDriver::Response response) =|
@@ -238,6 +244,7 @@ endpoint WebContentClient routed by Web::PageId page_id
     did_change_picture_in_picture_video_size(Web::PageId page_id, Gfx::IntSize video_size) =|
     did_change_picture_in_picture_player_controls_visibility(Web::PageId page_id, bool shown) =|
     did_request_file(Web::PageId page_id, ByteString path, i32 request_id) =|
+    did_request_file_for_webdriver(Web::PageId page_id, u64 command_id, ByteString path, i32 request_id) =|
     did_request_color_picker(Web::PageId page_id, Color current_color) =|
     did_request_date_picker(Web::PageId page_id, Utf16String input_type, Utf16String value, Utf16String minimum, Utf16String maximum) =|
     did_request_geolocation_position(Web::PageId page_id, u64 request_id, Web::HTML::CrossProcessId document_id) =|
@@ -254,6 +261,8 @@ endpoint WebContentClient routed by Web::PageId page_id
     did_request_click_notification_for_testing(Web::PageId page_id, u64 notification_id) =|
     did_request_click_notification_by_id_for_testing(Web::PageId page_id, u64 browser_notification_id) =|
     did_request_dismiss_notification_for_testing(Web::PageId page_id, u64 notification_id) =|
+    did_request_hold_next_notification_show_for_testing(Web::PageId page_id) =|
+    did_request_fail_held_notification_show_for_testing(Web::PageId page_id) =|
     did_request_file_picker(Web::PageId page_id, Web::HTML::FileFilter accepted_file_types, Web::HTML::AllowMultipleFiles allow_multiple_files) =|
     did_request_select_dropdown(Web::PageId page_id, Web::HTML::CrossProcessId local_root_id, Gfx::IntPoint content_position, i32 minimum_width, Vector<Web::HTML::SelectItem> items) =|
     did_start_drag(Web::PageId page_id, Web::DragData drag_data) =|
@@ -302,6 +311,8 @@ endpoint WebContentClient routed by Web::PageId page_id
     request_fully_exit_fullscreen(Web::PageId page_id) =|
     changing_navigable_continuation_applied(Web::PageId page_id, Web::HTML::CrossProcessId operation_id, Web::HTML::CrossProcessId navigable_id, Optional<Web::HTML::HostedNavigableState> activated_navigable_state, Optional<Web::HTML::SessionHistoryEntryPersistedState> previous_entry_persisted_state) =|
     nonchanging_navigable_history_state_updated(Web::PageId page_id, Web::HTML::CrossProcessId operation_id, Web::HTML::CrossProcessId navigable_id) =|
+
+    did_change_media_session_state(Web::PageId page_id, Optional<Web::MediaSession::MediaSessionState> state) =|
 
     did_change_screen_wake_lock_state(Web::PageId page_id, Web::ScreenWakeLockState wake_lock_state) =|
 

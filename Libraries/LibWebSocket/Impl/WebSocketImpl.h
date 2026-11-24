@@ -20,18 +20,17 @@ public:
     virtual ~WebSocketImpl();
 
     virtual void connect(ConnectionInfo const&) = 0;
-    virtual bool can_read_line() = 0;
-    virtual ErrorOr<ByteString> read_line(size_t) = 0;
     virtual ErrorOr<ByteBuffer> read(int max_size) = 0;
     virtual bool send(ReadonlyBytes) = 0;
     virtual bool eof() = 0;
     virtual void discard_connection() = 0;
 
-    virtual bool handshake_complete_when_connected() const { return false; }
-
     Function<void()> on_connected;
     Function<void()> on_connection_error;
     Function<void()> on_ready_to_read;
+
+    // Called with how many of the bytes passed to send() have been written to the connection, in order.
+    Function<void(size_t)> on_bytes_written;
 
 protected:
     WebSocketImpl();

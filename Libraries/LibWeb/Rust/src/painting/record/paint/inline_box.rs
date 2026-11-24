@@ -9,7 +9,6 @@ use crate::painting::record::trace::Observer;
 
 use crate::css::css_pixels::{CssPixelRect, CssPixels};
 use crate::layout::node_data::NodeSlotId;
-use crate::painting::force_dark::ForceDarkRole;
 use crate::painting::record::paint::background_resolution::body_background_is_propagated_to_root;
 use crate::painting::record::paint::border::{
     ALL_PIECE_EDGES, paint_box_borders, present_css_border_widths, style_borders_data,
@@ -20,7 +19,7 @@ use crate::painting::style_queries;
 
 pub(crate) fn paint<O: Observer>(recorder: &mut PaintRecorder<'_, O>, paintable: NodeSlotId, phase: PaintPhase) {
     // Inline decorations are interleaved with text by the containing line's plan.
-    if matches!(phase, PaintPhase::Background | PaintPhase::Border) && !recorder.is_recording_svg_resource_content() {
+    if matches!(phase, PaintPhase::Background | PaintPhase::Border) {
         return;
     }
     paint_pieces(recorder, paintable, phase, None);
@@ -231,8 +230,13 @@ fn paint_pieces<O: Observer>(
 
     if phase == PaintPhase::Outline && facts.is_visible {
         let node = paintable;
-        let outline = outline::outline_data_for_paint(recorder, node);
-        let outline_offset = crate::painting::style_queries::outline_offset(recorder.source, node);
+        let (outline, outline_offset) = outline::outline_data_and_offset(
+            recorder.source,
+            node,
+            recorder.inputs.accessibility_focus_target,
+            || recorder.window_is_focused(),
+            recorder.inputs.outline_auto_color.0,
+        );
         for piece_index in piece_indices {
             let piece = &root_pieces[*piece_index as usize];
             if piece.is_geometry_only_placeholder {
@@ -254,9 +258,6 @@ fn paint_pieces<O: Observer>(
         // visible: descendants may set visibility: visible again under a hidden box, so each
         // fragment is filtered by its own node's visibility.
         if crate::painting::fragment_ownership::is_self_painting_inline(layout_arena, paintable) {
-            if recorder.is_recording_svg_resource_content() {
-                text::paint_fragments_foreground(recorder, root, Some(paintable));
-            }
             text::paint_cursor(recorder, root, Some(paintable));
         }
         if facts.is_visible
@@ -267,7 +268,9 @@ fn paint_pieces<O: Observer>(
             let color = caret.color;
             if color.alpha() != 0 {
                 let rect = recorder.converter.rounded_device_rect(caret.rect);
-                recorder.recorder.fill_rect(rect, color, ForceDarkRole::Foreground);
+                recorder
+                    .recorder
+                    .paint_caret(rect, color, caret.blink_cycle_start_time_ns, caret.should_blink);
             }
         }
     }

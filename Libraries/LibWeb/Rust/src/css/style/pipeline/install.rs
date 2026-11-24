@@ -97,6 +97,10 @@ pub(crate) struct StyleInstallation {
     /// The elements taking their first style whose parent, its layout tree parent as well, takes its first style in
     /// this installation too, in the order of their effects, each with the index of those and that parent.
     first_styles_below_first_styles: Vec<(u32, StyleNodeID)>,
+    /// The descendants whose styles the effects of hidden elements clear, in the order of those effects, which name
+    /// theirs. The host clears just these, rather than those its own tree has below each hidden element: a transaction
+    /// that flew decided them from the tree as it was sealed, which the writes made beside it may have moved since.
+    pub(crate) cleared_descendants: Vec<u32>,
 }
 
 impl StyleInstallation {
@@ -121,8 +125,9 @@ impl StyleInstallation {
 
     /// Notes in `state` what the host holds once it took the installation, as it swaps in the styles and clears those
     /// of hidden descendants without telling the render side: in the order the host takes them, each element's swaps,
-    /// then the styles its effects clear, which the swaps of its descendants after them install again.
-    pub(crate) fn note_held_by_the_host(&self, state: &mut RetainedState) {
+    /// then the styles its effects clear, which the swaps of its descendants after them install again. Names the
+    /// descendants each element's effects clear in those effects, for the host to clear.
+    pub(crate) fn note_held_by_the_host(&mut self, state: &mut RetainedState) {
         let note_swaps = |state: &mut RetainedState, swaps: &[StyleSwap]| {
             for swap in swaps {
                 let node = StyleNodeID::from_raw(swap.style_node).expect("a swap names an element");
@@ -141,17 +146,22 @@ impl StyleInstallation {
                 }
             }
         };
+        let index =
+            |cleared: usize| u32::try_from(cleared).expect("an installation's cleared descendants fit their index");
+        self.cleared_descendants.clear();
         let mut next_swap = 0;
-        for effects in &self.effects {
+        for effects in &mut self.effects {
             let swaps_end = effects.swaps_end as usize;
             note_swaps(state, &self.swaps[next_swap..swaps_end.max(next_swap)]);
             next_swap = next_swap.max(swaps_end);
+            effects.cleared_descendants_begin = index(self.cleared_descendants.len());
             if effects
                 .effects
                 .intersects(bridge::MainEffects::CLEAR_HIDDEN_DESCENDANTS)
             {
-                state.clear_hidden_descendants(effects.node());
+                state.clear_hidden_descendants(effects.node(), &mut self.cleared_descendants);
             }
+            effects.cleared_descendants_end = index(self.cleared_descendants.len());
         }
         note_swaps(state, &self.swaps[next_swap..]);
     }
@@ -363,7 +373,7 @@ impl RetainedState {
             let new = new_record.raw();
             // The main thread swaps in the record where it holds another one, or none, as below an element that was
             // display:none.
-            let main_holds_new = self.held_style_record(node) == Some(new);
+            let main_holds_new = self.held_style_record(node) == Some(new) && !self.cleared_by_ancestor(node, scratch);
             if !main_holds_new {
                 installation.swaps.push(StyleSwap::new(
                     self,
@@ -643,6 +653,12 @@ impl RetainedState {
                 };
                 let first_style = facts.element_damage.is_none();
                 let effects = self.main_effects(node, old_view, new_view, facts);
+                if effects
+                    .effects
+                    .intersects(bridge::MainEffects::CLEAR_HIDDEN_DESCENDANTS)
+                {
+                    scratch.note_effects_clear_hidden_descendants(node);
+                }
                 scratch.document_damage.push(effects.damage());
                 installation.note_element_effects(effects, first_swap);
                 if first_style {
@@ -750,6 +766,32 @@ impl RetainedState {
         hidden
     }
 
+    /// Whether an ancestor of `node` that the installation installed already clears the styles of its descendants,
+    /// noting the answer for each element asked in `scratch`.
+    fn cleared_by_ancestor(&self, node: StyleNodeID, scratch: &mut InstallScratch) -> bool {
+        if !scratch.any_effects_clear_hidden_descendants() {
+            return false;
+        }
+        let mut chain = std::mem::take(&mut scratch.chain);
+        chain.clear();
+        let mut ancestor = self.projection.inheritance_parent(node);
+        let mut cleared = false;
+        while let Some(current) = ancestor {
+            if let Some(answer) = scratch.cleared_below(current) {
+                cleared = answer;
+                break;
+            }
+            chain.push(current);
+            ancestor = self.projection.inheritance_parent(current);
+        }
+        for &current in chain.iter().rev() {
+            cleared = cleared || scratch.effects_clear_hidden_descendants(current);
+            scratch.note_cleared_below(current, cleared);
+        }
+        scratch.chain = chain;
+        cleared
+    }
+
     /// Whether the host clears the styles of `node`'s descendants as `node` moves from a record whose display was none
     /// or not, `old_is_none`, to one whose display is none or not, `new_is_none`, the move changing the style groups of
     /// `inherited_groups_changed`, an `FfiStyleInvalidationField` inherited groups mask, and moving the element's
@@ -789,16 +831,19 @@ impl RetainedState {
         found
     }
 
-    /// Notes that the host cleared the styles of `node`'s descendants that hold one, in the flat tree, as it does for
-    /// the descendants of a hidden element.
-    pub(crate) fn clear_hidden_descendants(&mut self, node: StyleNodeID) {
-        let mut cleared = Vec::new();
+    /// Notes that the host clears the styles of `node`'s descendants that hold one, in the flat tree, as it does for
+    /// the descendants of a hidden element, and appends them to `cleared`, the host's list of the elements to clear.
+    pub(crate) fn clear_hidden_descendants(&mut self, node: StyleNodeID, cleared: &mut Vec<u32>) {
+        let first = cleared.len();
         self.for_each_held_flat_tree_descendant(node, |_, element| {
-            cleared.push(element);
+            cleared.push(element.raw());
             true
         });
-        for element in cleared {
-            self.set_held_style_record(element, None);
+        for &element in &cleared[first..] {
+            self.set_held_style_record(
+                StyleNodeID::from_raw(element).expect("a cleared descendant is an element"),
+                None,
+            );
         }
     }
 

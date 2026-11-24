@@ -18,11 +18,16 @@
 #include <LibMediaCodecs/VideoSurface.h>
 
 #include <core/SkCanvas.h>
+#include <core/SkColorFilter.h>
+#include <core/SkData.h>
 #include <core/SkImage.h>
+#include <core/SkSurface.h>
 #include <core/SkYUVAInfo.h>
 #include <core/SkYUVAPixmaps.h>
 #include <gpu/ganesh/GrDirectContext.h>
 #include <gpu/ganesh/SkImageGanesh.h>
+#include <gpu/ganesh/SkSurfaceGanesh.h>
+#include <private/SkHdrMetadata.h>
 
 namespace Compositor {
 
@@ -292,6 +297,111 @@ static sk_sp<SkImage> image_for_video_surface(Media::VideoFrame const& frame, Me
     return cached_image->image;
 }
 
+static bool frame_holds_high_dynamic_range(Media::VideoFrame const& frame)
+{
+    auto transfer_characteristics = frame.cicp().transfer_characteristics();
+    return transfer_characteristics == Media::TransferCharacteristics::SMPTE2084 || transfer_characteristics == Media::TransferCharacteristics::HLG;
+}
+
+// SDR masters of PQ video put SDR white near 100 nits, as AVFoundation does, rather than at BT.2408's 203 nits.
+static constexpr float perceptual_quantizer_standard_dynamic_range_white_luminance = 100;
+
+static sk_sp<SkColorSpace> with_standard_dynamic_range_white_of_perceptual_quantizer(SkColorSpace const& color_space)
+{
+    skcms_TransferFunction transfer_function;
+    color_space.transferFn(&transfer_function);
+    if (skcms_TransferFunction_getType(&transfer_function) != skcms_TFType_PQ)
+        return nullptr;
+    skcms_Matrix3x3 to_xyz_d50;
+    if (!color_space.toXYZD50(&to_xyz_d50))
+        return nullptr;
+    // The PQ transfer function's a is the luminance in nits that it decodes to 1.
+    transfer_function.a = perceptual_quantizer_standard_dynamic_range_white_luminance;
+    return SkColorSpace::MakeRGB(transfer_function, to_xyz_d50);
+}
+
+static skhdr::Metadata high_dynamic_range_metadata_of(Media::ColorMetadata const& color_metadata)
+{
+    auto metadata = skhdr::Metadata::MakeEmpty();
+    if (auto const& volume = color_metadata.mastering_display_color_volume; volume.has_value()) {
+        metadata.setMasteringDisplayColorVolume({
+            .fDisplayPrimaries = {
+                volume->red.x,
+                volume->red.y,
+                volume->green.x,
+                volume->green.y,
+                volume->blue.x,
+                volume->blue.y,
+                volume->white_point.x,
+                volume->white_point.y,
+            },
+            .fMaximumDisplayMasteringLuminance = volume->maximum_luminance,
+            .fMinimumDisplayMasteringLuminance = volume->minimum_luminance,
+        });
+    }
+    // Skia's tone map only reads MaxCLL, as the peak of the content. The peak of the scene replaces that of the video, so
+    // that dark scenes are not compressed to make room for highlights elsewhere in it.
+    if (color_metadata.maximum_scene_luminance.has_value())
+        metadata.setContentLightLevelInformation({ .fMaxCLL = *color_metadata.maximum_scene_luminance, .fMaxFALL = 0 });
+    else if (auto const& information = color_metadata.content_light_level_information; information.has_value() && information->maximum_content_light_level != 0)
+        metadata.setContentLightLevelInformation(skhdr::ContentLightLevelInformation::MakeUint16(information->maximum_content_light_level, information->maximum_frame_average_light_level));
+    return metadata;
+}
+
+// reinterpretColorSpace() copies the pixels of an image in memory, so such an image is given its new colour space by
+// wrapping the same pixels instead. The pixel data holds a reference to the image, so the pixels stay alive and
+// unchanged for as long as the new image uses them.
+static sk_sp<SkImage> reinterpreted_in_color_space(sk_sp<SkImage> image, sk_sp<SkColorSpace> color_space)
+{
+    SkPixmap pixmap;
+    if (!image->peekPixels(&pixmap))
+        return image->reinterpretColorSpace(move(color_space));
+    auto release_image = [](void const*, void* image) { static_cast<SkImage*>(image)->unref(); };
+    auto pixels = SkData::MakeWithProc(pixmap.addr(), pixmap.computeByteSize(), release_image, SkRef(image.get()));
+    if (auto reinterpreted_image = SkImages::RasterFromData(pixmap.info().makeColorSpace(color_space), move(pixels), pixmap.rowBytes()))
+        return reinterpreted_image;
+    return image->reinterpretColorSpace(move(color_space));
+}
+
+// A PQ or HLG frame holds light up to many times as bright as SDR white, which an SDR surface would clip. Such a frame
+// is drawn once through a tone map into an sRGB image instead, on the GPU when there is a context for it.
+static sk_sp<SkImage> tone_mapped_into_standard_dynamic_range(Media::ColorMetadata const& color_metadata, sk_sp<SkImage> image, GrDirectContext* gr_context)
+{
+    auto output_color_space = SkColorSpace::MakeSRGB();
+    // Only the tone map sees the image with SDR white moved, so a frame that cannot be tone mapped keeps its own tag.
+    auto image_to_tone_map = image;
+    if (auto const* color_space = image->colorSpace()) {
+        if (auto perceptual_quantizer_color_space = with_standard_dynamic_range_white_of_perceptual_quantizer(*color_space)) {
+            image_to_tone_map = reinterpreted_in_color_space(image, move(perceptual_quantizer_color_space));
+            // SDR masters are graded for the BT.1886 EOTF, and we show SDR video's pixels as sRGB, so encode the
+            // tone-mapped light the way an SDR master would be encoded.
+            output_color_space = SkColorSpace::MakeRGB(SkNamedTransferFn::kRec709, SkNamedGamut::kSRGB);
+        }
+    }
+
+    // The headroom is in stops above SDR white.
+    static constexpr float standard_dynamic_range_headroom = 0;
+    auto tone_map = high_dynamic_range_metadata_of(color_metadata).makeToneMapColorFilter(standard_dynamic_range_headroom, image_to_tone_map->colorSpace());
+    if (!tone_map)
+        return image;
+    auto image_info = SkImageInfo::Make(image->width(), image->height(), kBGRA_8888_SkColorType, kPremul_SkAlphaType, output_color_space);
+    auto surface = gr_context ? SkSurfaces::RenderTarget(gr_context, skgpu::Budgeted::kYes, image_info) : SkSurfaces::Raster(image_info);
+    if (!surface)
+        return image;
+    SkPaint paint;
+    paint.setColorFilter(move(tone_map));
+    paint.setBlendMode(SkBlendMode::kSrc);
+    surface->getCanvas()->drawImage(image_to_tone_map.get(), 0, 0, SkSamplingOptions {}, &paint);
+    return reinterpreted_in_color_space(surface->makeImageSnapshot(), SkColorSpace::MakeSRGB());
+}
+
+static sk_sp<SkImage> in_standard_dynamic_range(Media::VideoFrame const& frame, sk_sp<SkImage> image, GrDirectContext* gr_context)
+{
+    if (!image || !frame_holds_high_dynamic_range(frame))
+        return image;
+    return tone_mapped_into_standard_dynamic_range(frame.color_metadata(), move(image), gr_context);
+}
+
 static Gfx::ColorSpace color_space_of(Media::VideoFrame const& frame)
 {
     auto color_space_result = Gfx::ColorSpace::from_cicp(frame.cicp());
@@ -338,7 +448,7 @@ sk_sp<SkImage> sk_image_from_video_frame(Media::VideoFrame const& frame, RefPtr<
             image = move(raster_image);
     }
 
-    return image;
+    return in_standard_dynamic_range(frame, move(image), gr_context);
 }
 
 // Draws the frame's surface on the GPU into a fresh surface and reads its pixels back from there, in sRGB.
@@ -360,7 +470,7 @@ sk_sp<SkImage> sk_image_in_memory_from_video_frame(Media::VideoFrame const& fram
 {
     auto bitmap_or_error = frame.to_bitmap();
     if (!bitmap_or_error.is_error())
-        return Gfx::sk_image_adopting_bitmap(bitmap_or_error.release_value(), color_space_of(frame));
+        return in_standard_dynamic_range(frame, Gfx::sk_image_adopting_bitmap(bitmap_or_error.release_value(), color_space_of(frame)), nullptr);
 
     // NB: Only macOS reads a video surface on the CPU. Elsewhere the GPU reads it, into a surface of its own: a readback
     //     of the image of the video surface could be one Skia cached for an earlier frame that the surface showed.
@@ -374,16 +484,26 @@ sk_sp<SkImage> sk_image_in_memory_from_video_frame(Media::VideoFrame const& fram
     return nullptr;
 }
 
-ErrorOr<Gfx::DecodedImageFrame> decoded_image_frame_from_video_frame(Media::VideoFrame const& frame, RefPtr<Gfx::SkiaBackendContext> const& skia_backend_context)
+ErrorOr<BitmapInColorSpace> bitmap_from_video_frame(Media::VideoFrame const& frame, RefPtr<Gfx::SkiaBackendContext> const& skia_backend_context)
 {
     if (frame.surface() != nullptr && skia_backend_context) {
         auto bitmap = TRY(read_back_video_surface_through_gpu(frame, skia_backend_context));
         // The pixels are read back in sRGB.
-        return Gfx::DecodedImageFrame { NonnullRefPtr<Gfx::Bitmap const> { move(bitmap) } };
+        return BitmapInColorSpace { move(bitmap), {} };
     }
 
     auto bitmap = TRY(frame.to_bitmap());
-    return Gfx::DecodedImageFrame { NonnullRefPtr<Gfx::Bitmap const> { move(bitmap) }, color_space_of(frame) };
+    if (!frame_holds_high_dynamic_range(frame))
+        return BitmapInColorSpace { move(bitmap), color_space_of(frame) };
+
+    auto image = tone_mapped_into_standard_dynamic_range(frame.color_metadata(), Gfx::sk_image_adopting_bitmap(bitmap, color_space_of(frame)), nullptr);
+    auto tone_mapped_bitmap = TRY(Gfx::Bitmap::create(Gfx::BitmapFormat::BGRA8888, Gfx::AlphaType::Premultiplied, bitmap->size()));
+    auto surface = Gfx::PaintingSurface::wrap_bitmap(*tone_mapped_bitmap);
+    SkPaint paint;
+    paint.setBlendMode(SkBlendMode::kSrc);
+    surface->canvas().drawImage(image.get(), 0, 0, SkSamplingOptions {}, &paint);
+    // The tone map leaves the pixels in sRGB.
+    return BitmapInColorSpace { move(tone_mapped_bitmap), {} };
 }
 
 }

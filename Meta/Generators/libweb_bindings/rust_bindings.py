@@ -13,6 +13,11 @@
 #
 # A wrapper is a platform object whose host data holds a GC cell of the implementation. Its wrappable slot stays
 # empty, so the C++ bindings see a platform object without a C++ implementation object.
+#
+# A regular attribute or operation of an interface implemented in C++ can be [ImplementedIn=Rust] as well. Its
+# bindings are Rust code that calls a function of the Rust module of the interface's IDL file, which receives the
+# wrapper of the object it runs on, and the C++ bindings call into the Rust bindings to define it on the interface
+# prototype object.
 
 import textwrap
 
@@ -62,13 +67,17 @@ from Generators.libweb_bindings.rust_types import holds_cells
 from Generators.libweb_bindings.rust_types import inheriting_interfaces
 from Generators.libweb_bindings.rust_types import is_implemented_in_rust
 from Generators.libweb_bindings.rust_types import is_promise_type
+from Generators.libweb_bindings.rust_types import rust_implemented_members
 from Generators.libweb_bindings.rust_types import rust_interface_path
+from Generators.libweb_bindings.rust_types import rust_member_definition_entry_point
+from Generators.libweb_bindings.rust_types import rust_module_path
 from Generators.libweb_bindings.rust_types import rust_parameter_type
 from Generators.libweb_bindings.rust_types import rust_type
 from Generators.libweb_bindings.rust_usage import DefinitionUsage
 from Generators.libweb_bindings.wrappers import wrapper_host_class_name
 from Generators.libweb_bindings.wrappers import wrapper_name
 from Utils.utils import title_case_to_snake_case
+from Utils.webidl_parser import Attribute
 from Utils.webidl_parser import Interface
 from Utils.webidl_parser import Module
 from Utils.webidl_parser import OperationParameter
@@ -88,6 +97,7 @@ SUPPORTED_INTERFACE_EXTENDED_ATTRIBUTES = {
     "LegacyNamespace",
     # NB: The C++ bindings only leave the interface object of such an interface off the global object.
     "LegacyNoInterfaceObject",
+    "LegacyOverrideBuiltIns",
     "NavigatorCompatibilityMode",
     "SecureContext",
     # NB: The implementation implements structured_data::Serializable or structured_data::Transferable, whose steps
@@ -240,21 +250,25 @@ def write_cpp_named_properties(
     includes.add("LibWeb/WebIDL/ExceptionOr.h")
     name = wrapper_name(interface)
     legacy_info = f"{name}_legacy_platform_object_info"
+    setter = named_properties.setter
+    deleter = named_properties.deleter
     info_fields = [
         "    .supports_named_properties = true,\n",
     ]
-    if named_properties.setter is not None:
+    if setter is not None:
         info_fields.append("    .has_named_property_setter = true,\n")
-    if named_properties.deleter is not None:
+    if deleter is not None:
         info_fields.append("    .has_named_property_deleter = true,\n")
-    if named_properties.setter is not None:
+    if "LegacyOverrideBuiltIns" in interface.extended_attributes:
+        info_fields.append("    .has_legacy_override_built_ins_interface_extended_attribute = true,\n")
+    if setter is not None and setter.operation.name:
         info_fields.append("    .named_property_setter_has_identifier = true,\n")
-    if named_properties.deleter is not None:
+    if deleter is not None and deleter.operation.name:
         info_fields.append("    .named_property_deleter_has_identifier = true,\n")
     info_fields.append(f"    .named_item_value = {name}_named_item_value,\n")
-    if named_properties.setter is not None:
-        info_fields.append(f"    .set_value_of_named_property = {name}_set_value_of_named_property,\n")
-    if named_properties.deleter is not None:
+    setter_hooks_and_entry_points = named_property_setter_hooks_and_entry_points(interface, setter)
+    info_fields.extend(f"    .{hook} = {name}_{hook},\n" for hook, _ in setter_hooks_and_entry_points)
+    if deleter is not None:
         info_fields.append(f"    .delete_value = {name}_delete_value,\n")
     info_fields.append(f"    .supported_property_names = {name}_supported_property_names,\n")
 
@@ -281,24 +295,26 @@ static Vector<Utf16FlyString> {name}_supported_property_names(JS::HostObject con
 }}
 """
     )
-    if named_properties.setter is not None:
+    for hook, entry_point in setter_hooks_and_entry_points:
         out.write(
             f"""
-static WebIDL::ExceptionOr<void> {name}_set_value_of_named_property(JS::HostObject& wrapper, JS::Realm& realm, Utf16FlyString const& name, JS::Value value)
+static WebIDL::ExceptionOr<void> {name}_{hook}(JS::HostObject& wrapper, JS::Realm& realm, Utf16FlyString const& name, JS::Value value)
 {{
-    TRY(JS::HostABI::completion_from_abi<JS::Value>({set_value_of_named_property_entry_point(interface)}(JS::HostABI::vm_to_abi(realm.vm()), &realm, JS::HostABI::object_to_abi(&wrapper), name.raw_identity(), JS::HostABI::value_to_abi(value))));
+    TRY(JS::HostABI::completion_from_abi<JS::Value>({entry_point}(JS::HostABI::vm_to_abi(realm.vm()), &realm, JS::HostABI::object_to_abi(&wrapper), name.raw_identity(), JS::HostABI::value_to_abi(value))));
     return {{}};
 }}
 """
         )
-    if named_properties.deleter is not None:
+    if deleter is not None:
+        # NB: An anonymous deleter's Rust method reports no failed deletion.
+        deletion_result = "NotRelevant" if deleter.operation.name else "DidNotFail"
         out.write(
             f"""
 static WebIDL::ExceptionOr<NamedPropertyDeletionResult> {name}_delete_value(JS::HostObject& wrapper, Utf16FlyString const& name)
 {{
     auto& realm = wrapper.shape().realm();
     TRY(JS::HostABI::completion_from_abi<JS::Value>({delete_value_entry_point(interface)}(JS::HostABI::vm_to_abi(realm.vm()), &realm, JS::HostABI::object_to_abi(&wrapper), name.raw_identity())));
-    return NamedPropertyDeletionResult::NotRelevant;
+    return NamedPropertyDeletionResult::{deletion_result};
 }}
 """
         )
@@ -397,11 +413,10 @@ void {initialize_constructor}(JSVM*, void* realm, JSObject* constructor);
             f"void {supported_property_names_entry_point(interface)}(JSVM*, void* realm, JSObject* wrapper, "
             "void* names, void (*append)(void* names, FlatPtr name));\n"
         )
-        if named_properties.setter is not None:
-            out.write(
-                f"JSCompletion {set_value_of_named_property_entry_point(interface)}(JSVM*, void* realm, "
-                "JSObject* wrapper, FlatPtr name, JSValue value);\n"
-            )
+        out.writelines(
+            f"JSCompletion {entry_point}(JSVM*, void* realm, JSObject* wrapper, FlatPtr name, JSValue value);\n"
+            for _, entry_point in named_property_setter_hooks_and_entry_points(interface, named_properties.setter)
+        )
         if named_properties.deleter is not None:
             out.write(
                 f"JSCompletion {delete_value_entry_point(interface)}(JSVM*, void* realm, JSObject* wrapper, "
@@ -881,7 +896,36 @@ def implementation_method_signatures(
                 f"fn {method}(&self, cx: &mut CallContext, index: u32, value: {value_type}) -> WebIdlResult<()>"
             )
     if members.named_properties is not None:
+        named_properties = members.named_properties
+        getter = named_properties.getter
+        if not getter.operation.name:
+            what = f"the named property getter of {interface.name}"
+            signatures.append(
+                f"fn {getter.method}(&self, cx: &mut CallContext, name: Utf16String) -> "
+                f"WebIdlResult<{rust_type(getter.operation.return_type, context, what, is_result=True)}>"
+            )
+        setter = named_properties.setter
+        if setter is not None and not setter.operation.name:
+            what = f"the named property setter of {interface.name}"
+            value_type = rust_parameter_type(setter.operation.parameters[1], context, what)
+            signatures.extend(
+                f"fn {hook}(&self, cx: &mut CallContext, name: Utf16String, value: {value_type}) -> WebIdlResult<()>"
+                for hook, _ in named_property_setter_hooks_and_entry_points(interface, setter)
+            )
+        deleter = named_properties.deleter
+        if deleter is not None and not deleter.operation.name:
+            signatures.append(
+                f"fn {deleter.method}(&self, cx: &mut CallContext, name: Utf16String) -> WebIdlResult<()>"
+            )
         signatures.append("fn supported_property_names(&self, cx: &mut CallContext) -> Vec<Utf16String>")
+    for attribute in members.static_attributes:
+        what = f"{interface.name}.{attribute.attribute.name}"
+        result_type = (
+            "Value"
+            if attribute.returns_js_value
+            else rust_type(attribute.attribute.type, context, what, is_result=True)
+        )
+        signatures.append(f"fn {attribute.getter_method}(cx: &mut CallContext) -> WebIdlResult<{result_type}>")
     for operation_set in members.static_operation_sets:
         for overload in operation_set.overloads:
             what = f"{interface.name}.{operation_set.name}()"
@@ -1129,14 +1173,16 @@ RUST_BINDINGS_IMPORTS = """    #![allow(unused_imports)]
     };
 
     use crate::bindings::conversions::{
-        ArrayBufferView, BufferSource, BufferSourceRules, CppInterface, EmptyDictionary, FromJs, ToJs, UsvString,
+        ArrayBufferView, BufferSource, BufferSourceRules, ByteString, CppInterface, EmptyDictionary, FromJs, ToJs, UsvString,
         frozen_array_to_js, implements_cpp_interface, iterator_method, record_from_js, record_to_js, rooted_sequence_to_js,
-        sequence_from_js, sequence_to_js, to_array_buffer_view, to_boolean, to_buffer_source, to_cpp_interface,
+        sequence_from_js, sequence_to_js, to_array_buffer_view, to_boolean, to_buffer_source, to_byte_string, to_cpp_interface,
         to_cpp_interface_in_union, to_dom_string,
         to_dom_string_treating_null_as_empty, to_double, to_float, to_long, to_long_enforcing_range, to_long_long,
-        to_long_long_clamping, to_long_long_enforcing_range, to_object, to_promise, to_typed_array,
-        to_unrestricted_double, to_unrestricted_float, to_unsigned_long, to_unsigned_long_enforcing_range,
-        to_unsigned_long_long, to_unsigned_long_long_enforcing_range, to_usv_string,
+        to_long_long_clamping, to_long_long_enforcing_range, to_object, to_promise, to_shared_array_buffer, to_typed_array,
+        to_unrestricted_double, to_unrestricted_float, to_unsigned_long, to_unsigned_long_clamping, to_unsigned_short,
+        to_unsigned_long_enforcing_range,
+        to_unsigned_long_long, to_unsigned_long_long_enforcing_range, to_usv_string, to_window_proxy,
+        window_proxy_from_object, window_proxy_to_js,
     };
     use crate::bindings::interface::{
         Inherits, Interface, Ref, Wrapped, cell_class, construct_arguments, construct_wrapper, create_dictionary_object,
@@ -1144,7 +1190,7 @@ RUST_BINDINGS_IMPORTS = """    #![allow(unused_imports)]
         define_interface_object_properties, define_operation, define_to_string_tag, define_unimplemented_property,
         define_value_iterator_properties, entry_point_arguments, implementation_if, implementation_of,
         SecurityCheckType, prototype_from_new_target, realm_is_secure_context, realm_is_window, set_dictionary_member,
-        set_interface_prototype_object_prototype, this_object, to_interface,
+        set_interface_prototype_object_prototype, this_cpp_object, this_object, to_interface,
     };
     use crate::bindings::async_iterable::{
         AsyncIterable, DefaultAsyncIterator, DefaultAsyncIteratorClasses, async_iterator_next, async_iterator_return,
@@ -1156,6 +1202,7 @@ RUST_BINDINGS_IMPORTS = """    #![allow(unused_imports)]
     };
     use crate::bindings::callback::{CallbackFunction, CallbackInterface, PromiseCallbackFunction};
     use crate::bindings::event_target::{event_handler_attribute, set_event_handler_attribute};
+    use crate::bindings::global_object::window_or_worker_global_scope_from_global_object;
     use crate::bindings::promise::{WebIdlPromise, create_rejected_promise};
     use crate::bindings::{CallContext, WebIdlResult, with_custom_element_reactions};
 """
@@ -1202,6 +1249,56 @@ def write_rust_operation_set(
     }}
 """
         )
+
+
+def write_rust_attributes(
+    out: TextIO, context: GenerationContext, interface: Interface, attributes: List[RustAttribute]
+) -> None:
+    """The native functions of the getters and the setters of the attributes."""
+    for attribute in attributes:
+        name = attribute.attribute.name
+        if attribute.event_type is not None:
+            write_rust_event_handler_attribute(out, attribute)
+            continue
+        conversion = (
+            "Ok(result)"
+            if attribute.returns_js_value
+            else rust_to_js_value(attribute.attribute.type, "result", "&cx", context, f"{interface.name}.{name}")
+        )
+        call = f"Implementation::{attribute.getter_method}(&implementation, &mut cx)"
+        if attribute.attribute.inherit:
+            call = inherited_attribute_getter_call(context, interface, attribute)
+        this_check = f'this_implementation(vm, "{name}", SecurityCheckType::Getter)?'
+        if is_promise_type(attribute.attribute.type) and not attribute.attribute.type.nullable:
+            # https://webidl.spec.whatwg.org/#dfn-attribute-getter
+            this_check = f"""match this_implementation(vm, "{name}", SecurityCheckType::Getter) {{
+            Ok(this) => this,
+            // If the attribute's type is a promise type, a this value that does not implement the interface rejects
+            // a new promise.
+            Err(throw) => {{
+                let realm = vm.current_realm().expect("a native function runs in a realm");
+                return Ok(Value::from_object(create_rejected_promise(vm, realm, throw.value()).promise()));
+            }}
+        }}"""
+        receiver = "(implementation, mut cx)"
+        caller_realm_context = ""
+        if "NeedsCallerRealm" in attribute.attribute.extended_attributes:
+            receiver = "(implementation, _)"
+            caller_realm_context = CALLER_REALM_CONTEXT
+        out.write(
+            f"""
+    pub(super) fn {attribute.getter_function}(vm: &Vm) -> ThrowCompletionOr<Value> {{
+        let {receiver} = {this_check};
+{caller_realm_context}        let result = {call}
+            .map_err(|exception| exception.throw_in_current_realm(cx.vm()))?;
+        {conversion}
+    }}
+"""
+        )
+        if attribute.setter_method is not None:
+            write_rust_attribute_setter(out, context, interface, attribute)
+        elif attribute.put_forwards is not None:
+            write_rust_put_forwards_setter(out, attribute)
 
 
 def write_rust_interface(
@@ -1273,50 +1370,7 @@ def write_rust_interface(
 """
         )
 
-    for attribute in members.attributes:
-        name = attribute.attribute.name
-        if attribute.event_type is not None:
-            write_rust_event_handler_attribute(out, attribute)
-            continue
-        conversion = (
-            "Ok(result)"
-            if attribute.returns_js_value
-            else rust_to_js_value(attribute.attribute.type, "result", "&cx", context, f"{interface.name}.{name}")
-        )
-        call = f"Implementation::{attribute.getter_method}(&implementation, &mut cx)"
-        if attribute.attribute.inherit:
-            call = inherited_attribute_getter_call(context, interface, attribute)
-        this_check = f'this_implementation(vm, "{name}", SecurityCheckType::Getter)?'
-        if is_promise_type(attribute.attribute.type) and not attribute.attribute.type.nullable:
-            # https://webidl.spec.whatwg.org/#dfn-attribute-getter
-            this_check = f"""match this_implementation(vm, "{name}", SecurityCheckType::Getter) {{
-            Ok(this) => this,
-            // If the attribute's type is a promise type, a this value that does not implement the interface rejects
-            // a new promise.
-            Err(throw) => {{
-                let realm = vm.current_realm().expect("a native function runs in a realm");
-                return Ok(Value::from_object(create_rejected_promise(vm, realm, throw.value()).promise()));
-            }}
-        }}"""
-        receiver = "(implementation, mut cx)"
-        caller_realm_context = ""
-        if "NeedsCallerRealm" in attribute.attribute.extended_attributes:
-            receiver = "(implementation, _)"
-            caller_realm_context = CALLER_REALM_CONTEXT
-        out.write(
-            f"""
-    pub(super) fn {attribute.getter_function}(vm: &Vm) -> ThrowCompletionOr<Value> {{
-        let {receiver} = {this_check};
-{caller_realm_context}        let result = {call}
-            .map_err(|exception| exception.throw_in_current_realm(cx.vm()))?;
-        {conversion}
-    }}
-"""
-        )
-        if attribute.setter_method is not None:
-            write_rust_attribute_setter(out, context, interface, attribute)
-        elif attribute.put_forwards is not None:
-            write_rust_put_forwards_setter(out, attribute)
+    write_rust_attributes(out, context, interface, members.attributes)
 
     if interface.name == "CSSStyleProperties":
         write_css_property_accessors(out)
@@ -1351,6 +1405,9 @@ def write_rust_interface(
     if members.async_iterator is not None:
         write_rust_async_iterator(out, context, interface)
 
+    for attribute in members.static_attributes:
+        write_rust_static_attribute_getter(out, context, interface, attribute)
+
     for operation_set in members.static_operation_sets:
         write_rust_operation_set(out, context, interface, operation_set, write_rust_static_operation)
 
@@ -1384,13 +1441,23 @@ def write_rust_interface(
         is_secure_context_only = "SecureContext" in attribute.attribute.extended_attributes
         if attribute.is_cached:
             definition = f'define_cached_attribute(vm, realm, prototype, "{name}", {getter});'
-            out.write(member_exposure_definition(definition, secure_context_only=is_secure_context_only))
+            out.write(
+                member_exposure_definition(
+                    definition,
+                    secure_context_only=is_secure_context_only,
+                    exposure_condition=attribute.exposure_condition,
+                )
+            )
             defined_property_names.append(name)
             continue
         has_setter = not attribute.attribute.readonly or attribute.put_forwards is not None
         setter = f"raw_native!({attribute.setter_function})" if has_setter else "None"
         definition = f'define_attribute(vm, realm, prototype, "{name}", {getter}, {setter});'
-        out.write(member_exposure_definition(definition, secure_context_only=is_secure_context_only))
+        out.write(
+            member_exposure_definition(
+                definition, secure_context_only=is_secure_context_only, exposure_condition=attribute.exposure_condition
+            )
+        )
         defined_property_names.append(name)
     if interface.name == "CSSStyleProperties":
         out.write(
@@ -1405,7 +1472,7 @@ def write_rust_interface(
             member_exposure_definition(
                 definition,
                 secure_context_only=operation_set.is_secure_context_only,
-                window_only=operation_set.is_window_only,
+                exposure_condition=operation_set.exposure_condition,
             )
         )
         defined_property_names.append(name)
@@ -1415,7 +1482,7 @@ def write_rust_interface(
     if members.stringifier is not None:
         function = members.stringifier.function
         definition = f'define_operation(vm, realm, prototype, "toString", raw_native!({function}), 0);'
-        out.write(member_exposure_definition(definition, window_only=members.stringifier.is_window_only))
+        out.write(member_exposure_definition(definition, exposure_condition=members.stringifier.exposure_condition))
         defined_property_names.append("toString")
     if members.indexed_property_getter is not None:
         getter = members.indexed_property_getter.operation
@@ -1487,6 +1554,18 @@ def write_rust_interface(
     )
     if members.constants:
         out.write("        define_constants(vm, constructor, &CONSTANTS);\n")
+    for attribute in members.static_attributes:
+        definition = (
+            f'define_attribute(vm, realm, constructor, "{attribute.attribute.name}", '
+            f"raw_native!({attribute.getter_function}), None);"
+        )
+        out.write(
+            member_exposure_definition(
+                definition,
+                secure_context_only="SecureContext" in attribute.attribute.extended_attributes,
+                exposure_condition=attribute.exposure_condition,
+            )
+        )
     for operation_set in members.static_operation_sets:
         name = operation_set.name
         definition = (
@@ -1497,7 +1576,7 @@ def write_rust_interface(
             member_exposure_definition(
                 definition,
                 secure_context_only=operation_set.is_secure_context_only,
-                window_only=operation_set.is_window_only,
+                exposure_condition=operation_set.exposure_condition,
             )
         )
     out.write("    }\n")
@@ -1642,7 +1721,7 @@ def write_rust_namespace(out: TextIO, context: GenerationContext, interface: Int
             member_exposure_definition(
                 definition,
                 secure_context_only=operation_set.is_secure_context_only,
-                window_only=operation_set.is_window_only,
+                exposure_condition=operation_set.exposure_condition,
             )
         )
     if "WithInitializer" in interface.extended_attributes:
@@ -1650,13 +1729,15 @@ def write_rust_namespace(out: TextIO, context: GenerationContext, interface: Int
     out.write("    }\n}\n")
 
 
-def member_exposure_definition(definition: str, *, secure_context_only: bool = False, window_only: bool = False) -> str:
+def member_exposure_definition(
+    definition: str, *, secure_context_only: bool = False, exposure_condition: Optional[str] = None
+) -> str:
     """Defines a member on the interface or prototype object when it is exposed in the realm."""
     conditions = []
     if secure_context_only:
         conditions.append("realm_is_secure_context(realm)")
-    if window_only:
-        conditions.append("realm_is_window(realm)")
+    if exposure_condition is not None:
+        conditions.append(exposure_condition)
     if not conditions:
         return f"        {definition}\n"
     return f"""        if {" && ".join(conditions)} {{
@@ -1672,7 +1753,7 @@ def write_default_to_json(out: TextIO, context: GenerationContext, interface: In
     # NB: The inheritance stack of the interface has the interface on top and the one it inherits from at the bottom,
     #     and collecting the attribute values of the stack pops it, https://webidl.spec.whatwg.org/#collect-attribute-values-of-an-inheritance-stack
     #     so the attributes of the interfaces that others inherit from are collected first.
-    for interface_in_chain in context.inheritance_stack(interface):
+    for interface_in_chain in reversed(context.inheritance_stack(interface)):
         if not any(operation_is_default_to_json(operation) for operation in interface_in_chain.regular_operations):
             continue
         if not is_implemented_in_rust(interface_in_chain):
@@ -1684,10 +1765,17 @@ def write_default_to_json(out: TextIO, context: GenerationContext, interface: In
         for attribute in rust_members(interface_in_chain).attributes:
             if not idl_type_is_json_type(attribute.attribute.type, context):
                 continue
+            # NB: Only the attributes that are exposed in the realm are collected.
+            definition = (
+                f"let value = {module}{attribute.getter_function}(vm)?; "
+                f'set_dictionary_member(&cx, result, &PropertyKey::from_utf8("{attribute.attribute.name}"), value)?;'
+            )
             values.write(
-                f"""        let value = {module}{attribute.getter_function}(vm)?;
-        set_dictionary_member(&cx, result, &PropertyKey::from_utf8("{attribute.attribute.name}"), value)?;
-"""
+                member_exposure_definition(
+                    definition,
+                    secure_context_only="SecureContext" in attribute.attribute.extended_attributes,
+                    exposure_condition=attribute.exposure_condition,
+                )
             )
     out.write(
         f"""
@@ -1738,8 +1826,17 @@ def supported_property_names_entry_point(interface: Interface) -> str:
     return rust_entry_point_name(interface, "supported_property_names")
 
 
-def set_value_of_named_property_entry_point(interface: Interface) -> str:
-    return rust_entry_point_name(interface, "set_value_of_named_property")
+def named_property_setter_hooks_and_entry_points(
+    interface: Interface, setter: Optional[RustOperation]
+) -> List[Tuple[str, str]]:
+    """The functions of LegacyPlatformObjectInfo that set a named property, each with the entry point of the Rust
+    bindings that it calls."""
+    if setter is None:
+        return []
+    hooks = ["set_value_of_named_property"]
+    if not setter.operation.name:
+        hooks = ["set_value_of_new_named_property", "set_value_of_existing_named_property"]
+    return [(hook, rust_entry_point_name(interface, hook)) for hook in hooks]
 
 
 def delete_value_entry_point(interface: Interface) -> str:
@@ -1874,7 +1971,13 @@ def write_rust_named_properties(
     https://webidl.spec.whatwg.org/#dfn-legacy-platform-object"""
     getter = named_properties.getter
     what = f"the named property getter of {interface.name}"
-    conversion = rust_to_js_value(getter.operation.return_type.without_nullable(), "value", "&cx", context, what)
+    return_type = getter.operation.return_type
+    getter_result = "Ok(value)"
+    # NB: A getter with an identifier gives None for the names that are not supported property names.
+    if getter.operation.name:
+        return_type = return_type.without_nullable()
+        getter_result = "Ok(Some(value))"
+    conversion = rust_to_js_value(return_type, "value", "&cx", context, what)
     out.write(
         f"""
     /// The value of the named property of the wrapper, which LibWeb's C++ asks for, if the name is a supported
@@ -1898,7 +2001,7 @@ def write_rust_named_properties(
         let name = Utf16String::from(unsafe {{ Utf16FlyString::from_raw_borrowed(name) }});
         let implementation = implementation_of::<Implementation>(wrapper);
         let mut cx = CallContext::new(vm, realm);
-        let Ok(Some(value)) = Implementation::{getter.method}(&implementation, &mut cx, name) else {{
+        let {getter_result} = Implementation::{getter.method}(&implementation, &mut cx, name) else {{
             return false;
         }};
         let value = {conversion}.expect("converting a named property value to a JS value does not throw");
@@ -1944,8 +2047,13 @@ def write_rust_named_properties(
             what,
             keeps_cells_alive=True,
         )
-        out.write(
-            f"""
+        for hook, entry_point in named_property_setter_hooks_and_entry_points(interface, setter):
+            method = setter.method if setter.operation.name else hook
+            call = f"Implementation::{method}(&implementation, &mut cx, name, idl_value)"
+            if "CEReactions" in setter.operation.extended_attributes:
+                call = with_ce_reactions(call)
+            out.write(
+                f"""
     /// Sets the named property of the wrapper, https://webidl.spec.whatwg.org/#invoke-named-setter
     ///
     /// # Safety
@@ -1953,7 +2061,7 @@ def write_rust_named_properties(
     /// The pointers must be the VM, a live realm and a live wrapper of the interface, and the name a live
     /// AK::Utf16FlyString.
     #[unsafe(no_mangle)]
-    pub unsafe extern "C" fn {set_value_of_named_property_entry_point(interface)}(
+    pub unsafe extern "C" fn {entry_point}(
         vm: *mut c_void,
         realm: *mut c_void,
         wrapper: *mut c_void,
@@ -1970,16 +2078,19 @@ def write_rust_named_properties(
         let mut cx = CallContext::new(vm, realm);
         let steps = || -> ThrowCompletionOr<Value> {{
             let idl_value = {value_conversion}?;
-            Implementation::{setter.method}(&implementation, &mut cx, name, idl_value)
+            {call}
                 .map_err(|exception| exception.throw_in_current_realm(cx.vm()))?;
             Ok(Value::UNDEFINED)
         }};
         RawNativeFunctionResult::from_completion(steps())
     }}
 """
-        )
+            )
     if named_properties.deleter is not None:
         deleter = named_properties.deleter
+        call = f"Implementation::{deleter.method}(&implementation, &mut cx, name)"
+        if "CEReactions" in deleter.operation.extended_attributes:
+            call = with_ce_reactions(call)
         out.write(
             f"""
     /// Deletes the named property of the wrapper, https://webidl.spec.whatwg.org/#legacy-platform-object-delete
@@ -2001,7 +2112,7 @@ def write_rust_named_properties(
         let name = Utf16String::from(unsafe {{ Utf16FlyString::from_raw_borrowed(name) }});
         let implementation = implementation_of::<Implementation>(wrapper);
         let mut cx = CallContext::new(vm, realm);
-        let result = Implementation::{deleter.method}(&implementation, &mut cx, name)
+        let result = {call}
             .map(|()| Value::UNDEFINED)
             .map_err(|exception| exception.throw_in_current_realm(cx.vm()));
         RawNativeFunctionResult::from_completion(result)
@@ -2020,6 +2131,29 @@ def write_rust_stringifier(out: TextIO, function: str, method: str) -> None:
         let result = Implementation::{method}(&implementation, &mut cx)
             .map_err(|exception| exception.throw_in_current_realm(cx.vm()))?;
         result.to_js(&cx)
+    }}
+"""
+    )
+
+
+def write_rust_static_attribute_getter(
+    out: TextIO, context: GenerationContext, interface: Interface, attribute: RustAttribute
+) -> None:
+    """The native function of the getter of a static attribute, which runs in the current realm,
+    https://webidl.spec.whatwg.org/#dfn-attribute-getter"""
+    what = f"{interface.name}.{attribute.attribute.name}"
+    conversion = (
+        "Ok(result)"
+        if attribute.returns_js_value
+        else rust_to_js_value(attribute.attribute.type, "result", "&cx", context, what)
+    )
+    out.write(
+        f"""
+    fn {attribute.getter_function}(vm: &Vm) -> ThrowCompletionOr<Value> {{
+        let mut cx = CallContext::new(vm, vm.current_realm().expect("a native function runs in a realm"));
+        let result = Implementation::{attribute.getter_method}(&mut cx)
+            .map_err(|exception| exception.throw_in_current_realm(cx.vm()))?;
+        {conversion}
     }}
 """
     )
@@ -2484,15 +2618,17 @@ pub(crate) mod definitions {
     use crate::bindings::CallContext;
     use crate::bindings::callback::{CallbackFunction, CallbackInterface, PromiseCallbackFunction};
     use crate::bindings::conversions::{
-        ArrayBufferView, BufferSource, BufferSourceRules, CppInterface, EmptyDictionary, FromJs, ToJs, UsvString,
+        ArrayBufferView, BufferSource, BufferSourceRules, BufferSourceTypes, ByteString, CppInterface, EmptyDictionary, FromJs, ToJs, UsvString,
         buffer_source_if, dictionary_member, dictionary_object, enumeration_value_to_js, implements_cpp_interface,
         frozen_array_to_js, iterator_method, record_from_js, record_to_js, rooted_sequence_to_js, sequence_from_iterable, sequence_from_js,
         sequence_to_js, throw_no_union_types_matched, to_array_buffer_view, to_boolean, to_buffer_source,
-        to_cpp_interface,
+        to_byte_string, to_cpp_interface,
         to_dom_string, to_dom_string_treating_null_as_empty, to_double, to_enumeration_value, to_float, to_long,
-        to_long_enforcing_range, to_long_long, to_long_long_enforcing_range, to_object, to_typed_array,
-        to_unrestricted_double, to_unrestricted_float, to_unsigned_long, to_unsigned_long_enforcing_range,
-        to_unsigned_long_long, to_unsigned_long_long_enforcing_range, to_usv_string,
+        to_long_enforcing_range, to_long_long, to_long_long_enforcing_range, to_object, to_shared_array_buffer, to_typed_array,
+        to_unrestricted_double, to_unrestricted_float, to_unsigned_long, to_unsigned_long_clamping, to_unsigned_short,
+        to_unsigned_long_enforcing_range,
+        to_unsigned_long_long, to_unsigned_long_long_enforcing_range, to_usv_string, to_window_proxy,
+        window_proxy_from_object, window_proxy_to_js,
     };
     use crate::bindings::interface::{
         Interface, Ref, create_dictionary_object, implementation_if, implementation_of, set_dictionary_member,
@@ -2503,10 +2639,6 @@ pub(crate) mod definitions {
     )
     for name, directions in usage.rust_dictionaries.items():
         dictionary = context.dictionaries[name]
-        if dictionary.parent_name and directions.to_js:
-            raise UnsupportedByRustBindings(
-                f"The Rust bindings convert the dictionary {name}, which inherits from another dictionary, to a JS value"
-            )
         if directions.from_js:
             write_dictionary_from_js(out, context, dictionary)
         if directions.to_js:
@@ -2542,6 +2674,10 @@ def write_rust_bindings(
     write_rust_definitions(out, context, usage)
     for module in context.modules:
         interface = module.interface
+        if rust_implemented_members(interface) is not None:
+            assert interface is not None
+            write_rust_members_of_cpp_interface(out, context, interface)
+            continue
         if interface is None or not is_implemented_in_rust(interface):
             continue
         if interface.is_namespace:
@@ -2550,6 +2686,92 @@ def write_rust_bindings(
             write_rust_interface(out, context, module, interface, values[interface.name])
     write_rust_serializable_dispatch(out, intrinsics, values)
     write_rust_wrap_for_cpp(out, context, usage)
+
+
+def write_rust_members_of_cpp_interface(out: TextIO, context: GenerationContext, interface: Interface) -> None:
+    """The bindings of the members of an interface implemented in C++ that are [ImplementedIn=Rust]. The functions of
+    the Rust module of the interface's IDL file implement them, and receive the wrapper of the object they run on. The
+    C++ bindings call an entry point for each to define it on the interface prototype object, in the order of the
+    IDL."""
+    rust_members_of_interface = rust_implemented_members(interface)
+    assert rust_members_of_interface is not None
+    members = rust_members(rust_members_of_interface)
+    implementation = rust_module_path(interface.path)
+    method_documentation = "".join(
+        f"/// - `{signature.replace('&self', 'this: &CppInterface')}`\n"
+        for signature in implementation_method_signatures(context, rust_members_of_interface, members)
+    )
+    out.write(
+        f"""
+/// The bindings of the members of {interface.name} that are implemented in Rust, which call these functions of
+/// {implementation}:
+{method_documentation}pub(crate) mod {rust_module_name(interface)} {{
+{RUST_BINDINGS_IMPORTS}
+    use {implementation} as Implementation;
+
+    /// The wrapper of the object that an attribute or an operation runs on, and the context it runs in.
+    fn this_implementation<'vm>(
+        vm: &'vm Vm,
+        identifier: &str,
+        check_type: SecurityCheckType,
+    ) -> ThrowCompletionOr<(CppInterface, CallContext<'vm>)> {{
+        let (object, realm) = this_cpp_object(vm, {cpp_interface_name_constant(interface)}, "{interface.namespaced_name}", identifier, check_type)?;
+        // SAFETY: The object is a wrapper of an object that implements the interface.
+        Ok((unsafe {{ CppInterface::from_wrapper(object) }}, CallContext::new(vm, realm)))
+    }}
+"""
+    )
+    write_rust_attributes(out, context, rust_members_of_interface, members.attributes)
+    for attribute in members.attributes:
+        name = attribute.attribute.name
+        getter = f"raw_native!({attribute.getter_function})"
+        if attribute.is_cached:
+            definition = f'define_cached_attribute(vm, realm, prototype, "{name}", {getter});'
+        else:
+            has_setter = not attribute.attribute.readonly or attribute.put_forwards is not None
+            setter = f"raw_native!({attribute.setter_function})" if has_setter else "None"
+            definition = f'define_attribute(vm, realm, prototype, "{name}", {getter}, {setter});'
+        out.write(
+            f"""
+    /// Defines {interface.name}.{name} on the interface prototype object.
+    ///
+    /// # Safety
+    ///
+    /// The pointers must be the VM, a realm and the interface prototype object of the realm.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn {rust_member_definition_entry_point(interface, attribute.attribute)}(
+        vm: *mut c_void,
+        realm: *mut c_void,
+        prototype: *mut c_void,
+    ) {{
+        // SAFETY: The caller passes live pointers.
+        let (vm, realm, prototype) = unsafe {{ entry_point_arguments(vm, realm, prototype) }};
+        {definition}
+    }}
+"""
+        )
+    for operation_set in members.operation_sets:
+        write_rust_operation_set(out, context, rust_members_of_interface, operation_set, write_rust_operation)
+        out.write(
+            f"""
+    /// Defines {interface.name}.{operation_set.name}() on the interface prototype object.
+    ///
+    /// # Safety
+    ///
+    /// The pointers must be the VM, a realm and the interface prototype object of the realm.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn {rust_member_definition_entry_point(interface, operation_set.overloads[0].operation)}(
+        vm: *mut c_void,
+        realm: *mut c_void,
+        prototype: *mut c_void,
+    ) {{
+        // SAFETY: The caller passes live pointers.
+        let (vm, realm, prototype) = unsafe {{ entry_point_arguments(vm, realm, prototype) }};
+        define_operation(vm, realm, prototype, "{operation_set.name}", raw_native!({operation_set.function}), {operation_set.length});
+    }}
+"""
+        )
+    out.write("}\n")
 
 
 def write_rust_wrap_for_cpp(out: TextIO, context: GenerationContext, usage: DefinitionUsage) -> None:
@@ -2646,4 +2868,40 @@ def check_rust_bindings(context: GenerationContext, usage: DefinitionUsage, intr
             )
         if is_implemented_in_rust(interface):
             check_interface_is_supported(interface, module, context)
+        check_rust_members_of_interface(interface)
     write_rust_bindings(StringIO(), context, usage, intrinsics)
+
+
+def check_rust_members_of_interface(interface: Interface) -> None:
+    """Raises an error for a member marked [ImplementedIn] that the bindings do not handle: so far, only the regular
+    attributes and operations of an interface implemented in C++ that is not a global interface can be."""
+
+    def fail(member: str, message: str) -> None:
+        raise UnsupportedByRustBindings(
+            f"{interface.path}: {interface.name}.{member} is [ImplementedIn=Rust], but {message}"
+        )
+
+    for member in interface.static_attributes + interface.static_operations:
+        if "ImplementedIn" in member.extended_attributes:
+            fail(member.name, "the Rust bindings implement no static member of an interface implemented in C++ yet")
+    has_default_to_json = any(operation_is_default_to_json(operation) for operation in interface.regular_operations)
+    rust_operation_names = set()
+    for member in interface.regular_attributes + interface.regular_operations:
+        implemented_in = member.extended_attributes.get("ImplementedIn")
+        if implemented_in is None:
+            continue
+        if implemented_in != "Rust":
+            fail(member.name, "the only value is Rust")
+        if is_implemented_in_rust(interface):
+            fail(member.name, "the interface is implemented in Rust as a whole")
+        if interface.is_namespace or "Global" in interface.extended_attributes:
+            fail(member.name, "the interface is a namespace or a global interface")
+        if "LegacyUnforgeable" in member.extended_attributes:
+            fail(member.name, "it is [LegacyUnforgeable]")
+        if isinstance(member, Attribute) and has_default_to_json:
+            fail(member.name, "the default toJSON() of the interface reads its attributes through the C++ bindings")
+        if not isinstance(member, Attribute):
+            rust_operation_names.add(member.name)
+    for operation in interface.regular_operations:
+        if operation.name in rust_operation_names and operation.extended_attributes.get("ImplementedIn") != "Rust":
+            fail(operation.name, "not all of its overloads are")

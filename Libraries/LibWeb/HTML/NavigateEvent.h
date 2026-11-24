@@ -76,7 +76,6 @@ class NavigateEvent : public DOM::Event {
 
 public:
     static constexpr size_t destination_offset() { return offsetof(NavigateEvent, m_destination); }
-    static constexpr size_t signal_offset() { return offsetof(NavigateEvent, m_signal); }
     // https://html.spec.whatwg.org/multipage/nav-history-apis.html#concept-navigateevent-interception-state
     enum class InterceptionState {
         None,
@@ -112,6 +111,7 @@ public:
     virtual ~NavigateEvent() override;
 
     Window& relevant_window() const { return *m_relevant_window; }
+    virtual GC::Ptr<Bindings::Wrappable> relevant_global_impl() const override;
 
     GC::Ref<DOM::AbortController> abort_controller() const { return *m_abort_controller; }
     InterceptionState interception_state() const { return m_interception_state; }

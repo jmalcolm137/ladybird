@@ -781,9 +781,11 @@ void run_focusing_steps(GC::Ptr<DOM::Node> new_focus_target, GC::Ptr<DOM::Node> 
             // NB: The active document of a navigable another process hosts is there, and that process runs these steps
             //     for it. The container stands for it in the rest of these steps, as the focused area of its node
             //     document.
-            if (auto* local_navigable = as_if<LocalNavigable>(*content_navigable))
+            if (auto* local_navigable = as_if<LocalNavigable>(*content_navigable)) {
                 new_focus_target = local_navigable->active_document();
-            else
+                if (!new_focus_target)
+                    return;
+            } else
                 remote_content_navigable = as<RemoteNavigable>(*content_navigable);
         }
     }
@@ -871,9 +873,20 @@ void run_focusing_steps(GC::Ptr<DOM::Node> new_focus_target, GC::Ptr<DOM::Node> 
         return;
 
     Bindings::ScrollIntoViewOptions scroll_options;
-    scroll_options.block = Bindings::ScrollLogicalPosition::Nearest;
-    scroll_options.inline_ = Bindings::ScrollLogicalPosition::Nearest;
-    (void)focused_element->scroll_into_view(scroll_options, {});
+    auto scroll_mode = DOM::ScrollIntoViewMode::Always;
+    if (focus_trigger == FocusTrigger::Script || focus_trigger == FocusTrigger::Key) {
+        // https://html.spec.whatwg.org/multipage/interaction.html#dom-focus
+        // 4. If options["preventScroll"] is false, then scroll a target into view given this, "auto",
+        //    "center", and "center".
+        // AD-HOC: Use the same alignment for sequential keyboard focus, for interoperability.
+        scroll_options.block = Bindings::ScrollLogicalPosition::Center;
+        scroll_options.inline_ = Bindings::ScrollLogicalPosition::Center;
+        scroll_mode = DOM::ScrollIntoViewMode::IfNeeded;
+    } else {
+        scroll_options.block = Bindings::ScrollLogicalPosition::Nearest;
+        scroll_options.inline_ = Bindings::ScrollLogicalPosition::Nearest;
+    }
+    (void)focused_element->scroll_into_view(scroll_options, {}, scroll_mode);
 }
 
 // https://html.spec.whatwg.org/multipage/interaction.html#unfocusing-steps

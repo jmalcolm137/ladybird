@@ -27,39 +27,93 @@ use crate::bytecode::constant_fold::try_constant_fold_binary;
 use crate::bytecode::constant_fold::try_constant_fold_unary;
 use crate::bytecode::executable_data::ConstantValue;
 use crate::bytecode::executable_data::ExceptionHandler;
+use crate::bytecode::executable_data::StrictRange;
 use crate::bytecode::instruction::Instruction;
+use crate::bytecode::instruction::OpCode;
+use crate::bytecode::instruction::instruction_length_from_bytes;
 use crate::bytecode::instruction::specialize_instruction;
 use crate::bytecode::instruction::typed as op;
 use crate::bytecode::instruction::typed::TypedInstruction;
+use crate::bytecode::instruction::visit_operands_from_bytes;
 use crate::bytecode::operand::*;
 use crate::bytecode::source_map::SourceOffset;
 use crate::bytecode::source_map::SourceOffsetEntry;
+use crate::bytecode::source_map::encode_source_map;
 use crate::slice_block::SliceBlock;
 use crate::slice_block::SliceBlockBuilder;
 use crate::u32_from_usize;
 
+use libjs_abi::ArgumentsKind;
 use libjs_abi::FunctionNamePrefix;
 
 use super::bindings::*;
 use super::context::Generator;
+use super::context::changes_environment_state;
 use super::emitter::AssembledBytecode;
 use super::emitter::BlockEncoder;
 use super::emitter::BlockPosition;
+use super::emitter::FIRST_WIDE_SLOT;
 use super::emitter::FrameLayout;
+use super::emitter::OperandPosition;
+use super::generators::CompletionRegisters;
 use super::generators::DisposalKind;
 use super::generators::emit_dispose_resources;
 use super::generators::generate_await_of_value;
+use super::generators::generate_await_with_completions;
 use super::generators::generate_yield_of_value;
 use super::members::*;
 use super::names::NameClass;
 use super::nodes::Identifier;
 use super::operators::emit_binary_op;
-use super::registers::ScopedOperand;
 
 const UNBOUND: u32 = u32::MAX;
 
-/// Where the destination of a binary operator is in its instruction, which all have the same layout up to there.
-const DESTINATION_OFFSET_OF_BINARY_OPERATOR: u32 = 4;
+/// Where a binary operator's instruction holds its destination. It is the first operand, behind the
+/// arithmetic feedback index of the operators that have one.
+fn destination_offset_of_binary_operator(operator: BinaryOp) -> u32 {
+    match operator {
+        BinaryOp::In | BinaryOp::InstanceOf => BINARY_OPERATOR_DESTINATION_OFFSET,
+        _ => ARITHMETIC_OPERATOR_DESTINATION_OFFSET,
+    }
+}
+
+const BINARY_OPERATOR_DESTINATION_OFFSET: u32 = 1;
+const ARITHMETIC_OPERATOR_DESTINATION_OFFSET: u32 = 3;
+
+#[cfg(not(test))]
+const _: () = {
+    use crate::bytecode::op as view;
+    use core::mem::offset_of;
+    assert!(offset_of!(view::In, dst) == BINARY_OPERATOR_DESTINATION_OFFSET as usize);
+    assert!(offset_of!(view::InstanceOf, dst) == BINARY_OPERATOR_DESTINATION_OFFSET as usize);
+    macro_rules! assert_arithmetic_destination {
+        ($($name:ident),*) => {
+            $(assert!(offset_of!(view::$name, dst) == ARITHMETIC_OPERATOR_DESTINATION_OFFSET as usize);)*
+        };
+    }
+    assert_arithmetic_destination!(
+        Add,
+        Sub,
+        Mul,
+        Div,
+        Mod,
+        Exp,
+        StrictlyEquals,
+        StrictlyInequals,
+        LooselyEquals,
+        LooselyInequals,
+        GreaterThan,
+        GreaterThanEquals,
+        LessThan,
+        LessThanEquals,
+        BitwiseAnd,
+        BitwiseOr,
+        BitwiseXor,
+        LeftShift,
+        RightShift,
+        UnsignedRightShift
+    );
+};
 
 /// What an evaluated expression is, for whatever consumes it.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -86,6 +140,18 @@ pub enum ValKind {
     InvalidTarget,
     /// The abstract operation `name` of the engine, about to be called.
     BuiltinCallee,
+    /// `arguments`, which the frame answers for, about to be the base of `arguments.length` or `arguments[key]`. `name`
+    /// is the ArgumentsKind of the arguments object that it stands for.
+    FrameArguments,
+}
+
+/// Whether the binding of an identifier that gets written can come into being after the reference to it is made.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum TargetBinding {
+    /// Code that can make one runs in between, as for `x = value`.
+    MightAppear,
+    /// It is read or declared first, as for `x += value` and `var x = value`.
+    Known,
 }
 
 /// An entry of the stack of evaluated expressions.
@@ -132,17 +198,319 @@ struct LastJump {
     label_position_count: u32,
 }
 
+/// A comparison that a conditional jump can make itself.
+#[derive(Clone, Copy)]
+struct Comparison {
+    operator: BinaryOp,
+    arith_feedback: u16,
+    lhs: Operand,
+    rhs: Operand,
+}
+
 /// A comparison that was just emitted, in case it turns out to feed a conditional jump.
 #[derive(Clone, Copy)]
 struct LastComparison {
     start: u32,
     end: u32,
     operand_position_count: u32,
-    operator: BinaryOp,
-    arith_feedback: u16,
     dst: Operand,
-    lhs: Operand,
-    rhs: Operand,
+    comparison: Comparison,
+}
+
+impl Stream {
+    /// Rewrites a function with more frame slots than operands can name: what reads or writes one of the others
+    /// goes through a low temporary and a `MovWide`, and instructions are in their final form afterwards.
+    /// The temporaries come right after the reserved registers, and everything else moves up to make room.
+    fn spill_wide_slots(&mut self, frame: FrameLayout, new_constant_indices: &[u32]) -> FrameLayout {
+        let head_size = u32_from_usize(self.head.bytes.len());
+        let mut bytes = core::mem::take(&mut self.head.bytes);
+        bytes.extend_from_slice(&self.current.bytes);
+        let mut noted: Vec<OperandPosition> = self.head.operand_positions.clone();
+        noted.extend(self.current.operand_positions.iter().map(|position| OperandPosition {
+            offset: position.offset + head_size,
+            ..*position
+        }));
+        noted.sort_unstable_by_key(|position| position.offset);
+        let slot_of = |field: &SpilledField, temporaries: u32| match field.operand_type {
+            OperandType::Register if field.index < Register::RESERVED_COUNT => field.index,
+            OperandType::Register => field.index + temporaries,
+            operand_type => frame.start_of(operand_type) + temporaries + field.index,
+        };
+
+        let (instructions, fields) = spilled_instructions(&bytes, &noted, new_constant_indices);
+        let fields_of = |instruction: &SpilledInstruction| &fields[instruction.fields.clone()];
+
+        // NB: More temporaries push more slots out of reach, which can take more temporaries. This ends, because an
+        //     instruction has a limited number of operands.
+        let mut temporaries = 0;
+        loop {
+            let needed = instructions
+                .iter()
+                .map(|instruction| {
+                    let wide = fields_of(instruction)
+                        .iter()
+                        .filter(|field| slot_of(field, temporaries) >= FIRST_WIDE_SLOT);
+                    u32_from_usize(wide.count())
+                })
+                .max()
+                .unwrap_or(0);
+            if needed <= temporaries {
+                break;
+            }
+            temporaries = needed;
+        }
+
+        let mut result = Vec::with_capacity(bytes.len() + bytes.len() / 4);
+        let mut edits: Vec<SpillEdit> = Vec::new();
+        let mut writes_after = Vec::new();
+        let mut slots = Vec::new();
+        let mut delta = 0;
+        for instruction in &instructions {
+            let (at, length, fields) = (instruction.at, instruction.length, fields_of(instruction));
+            let mut next_temporary = Register::RESERVED_COUNT;
+            slots.clear();
+            for field in fields {
+                let slot = slot_of(field, temporaries);
+                if slot < FIRST_WIDE_SLOT {
+                    slots.push(slot);
+                    continue;
+                }
+                let temporary = next_temporary;
+                next_temporary += 1;
+                if field.reads {
+                    put_wide_move(&mut result, temporary, slot);
+                }
+                if field.writes {
+                    writes_after.push((slot, temporary));
+                }
+                slots.push(temporary);
+            }
+            let copy = u32_from_usize(result.len());
+            result.extend_from_slice(&bytes[at as usize..(at + length) as usize]);
+            for (field, &slot) in fields.iter().zip(&slots) {
+                write_slot(&mut result, field.at - at + copy, slot);
+            }
+            let spilled = next_temporary != Register::RESERVED_COUNT;
+            for (slot, temporary) in writes_after.drain(..) {
+                put_wide_move(&mut result, slot, temporary);
+            }
+            if spilled {
+                let after = u32_from_usize(result.len()) - (at + length);
+                edits.push(SpillEdit {
+                    at,
+                    length,
+                    before: delta,
+                    copy: copy - at,
+                    after,
+                });
+                delta = after;
+            }
+        }
+
+        // NB: Only instructions that got moves around them are in `edits`: the others moved with the one before them.
+        let edit_of = |offset: u32| edits[..edits.partition_point(|edit| edit.at <= offset)].last();
+        let start_of = |offset: u32| match edit_of(offset) {
+            Some(edit) if edit.at == offset => offset + edit.before,
+            Some(edit) => offset + edit.after,
+            None => offset,
+        };
+        for position in &mut self.current.label_positions {
+            let offset = position.offset + head_size;
+            position.offset = match edit_of(offset) {
+                Some(edit) if offset < edit.at + edit.length => offset + edit.copy,
+                Some(edit) => offset + edit.after,
+                None => offset,
+            };
+        }
+        for label in &mut self.labels {
+            if *label != UNBOUND {
+                *label = start_of(*label + head_size);
+            }
+        }
+        for change in &mut self.handler_changes {
+            change.0 = start_of(change.0 + head_size);
+        }
+        // NB: The source entries are in order, so the edit of each one is at or after the edit of the one before.
+        let mut next_edit = 0;
+        let source_entries: Vec<_> = self
+            .head
+            .source_entries
+            .iter()
+            .copied()
+            .chain(
+                self.current
+                    .source_entries
+                    .iter()
+                    .map(|&(offset, source)| (offset + head_size, source)),
+            )
+            .map(|(offset, source)| {
+                while edits.get(next_edit).is_some_and(|edit| edit.at <= offset) {
+                    next_edit += 1;
+                }
+                let start = match next_edit.checked_sub(1).map(|index| &edits[index]) {
+                    Some(edit) if edit.at == offset => offset + edit.before,
+                    Some(edit) => offset + edit.after,
+                    None => offset,
+                };
+                (start, source)
+            })
+            .collect();
+        let strict_ranges: Vec<_> = self
+            .head
+            .strict_ranges
+            .iter()
+            .copied()
+            .chain(self.current.strict_ranges.iter().map(|range| StrictRange {
+                start_offset: range.start_offset + head_size,
+                end_offset: range.end_offset + head_size,
+            }))
+            .map(|range| StrictRange {
+                start_offset: start_of(range.start_offset),
+                end_offset: start_of(range.end_offset),
+            })
+            .collect();
+        self.head.clear();
+        self.current.bytes = result;
+        self.current.operand_positions.clear();
+        self.current.source_entries = source_entries;
+        self.current.strict_ranges = strict_ranges;
+        FrameLayout {
+            register_count: frame.register_count + temporaries,
+            ..frame
+        }
+    }
+}
+
+/// An operand of an instruction that `Stream::spill_wide_slots` is rewriting.
+struct SpilledField {
+    at: u32,
+    reads: bool,
+    writes: bool,
+    operand_type: OperandType,
+    index: u32,
+}
+
+/// An instruction that got moves around it, and how far the code moved.
+struct SpillEdit {
+    at: u32,
+    length: u32,
+    /// How far the instruction before it moved, which is where the moves of this one start.
+    before: u32,
+    /// How far the instruction itself moved.
+    copy: u32,
+    /// How far what comes after it moved.
+    after: u32,
+}
+
+/// An instruction that `Stream::spill_wide_slots` is rewriting, with the range of its operands in the list of them.
+struct SpilledInstruction {
+    at: u32,
+    length: u32,
+    fields: core::ops::Range<usize>,
+}
+
+/// The instructions of `bytes`, and the operands of all of them.
+fn spilled_instructions(
+    bytes: &[u8],
+    noted: &[OperandPosition],
+    new_constant_indices: &[u32],
+) -> (Vec<SpilledInstruction>, Vec<SpilledField>) {
+    let mut instructions = Vec::new();
+    let mut fields = Vec::new();
+    let mut next_noted = 0;
+    let mut at = 0;
+    let mut wide_name_indices_at = None;
+    while at < bytes.len() {
+        let opcode = bytes[at];
+        let length = instruction_length_from_bytes(opcode, bytes, at).expect("a valid instruction");
+        // NB: The moves go around the WideNameIndices of an instruction too, which has to stay right before it.
+        if opcode == OpCode::WideNameIndices as u8 {
+            wide_name_indices_at = Some(at);
+            at += length;
+            continue;
+        }
+        let first_field = fields.len();
+        visit_operands_from_bytes(opcode, bytes, at, &mut |field_at, reads, writes, optional| {
+            let field_at = u32_from_usize(field_at);
+            while noted.get(next_noted).is_some_and(|position| position.offset < field_at) {
+                next_noted += 1;
+            }
+            let (operand_type, index) = match noted.get(next_noted).filter(|position| position.offset == field_at) {
+                Some(position) if position.operand_type == OperandType::Constant => {
+                    (OperandType::Constant, new_constant_indices[position.index as usize])
+                }
+                Some(position) => (position.operand_type, position.index),
+                None => {
+                    let raw = read_slot(bytes, field_at);
+                    if optional && raw == FIRST_WIDE_SLOT {
+                        return;
+                    }
+                    (OperandType::Register, raw)
+                }
+            };
+            fields.push(SpilledField {
+                at: field_at,
+                reads,
+                writes,
+                operand_type,
+                index,
+            });
+        });
+        let start = wide_name_indices_at.take().unwrap_or(at);
+        instructions.push(SpilledInstruction {
+            at: u32_from_usize(start),
+            length: u32_from_usize(at + length - start),
+            fields: first_field..fields.len(),
+        });
+        at += length;
+    }
+    (instructions, fields)
+}
+
+pub(super) fn operand_list_count(length: usize) -> u32 {
+    assert!(
+        length <= MAX_OPERAND_LIST_LENGTH,
+        "operand lists are short enough to count in a byte"
+    );
+    u32_from_usize(length)
+}
+
+fn read_slot(bytes: &[u8], at: u32) -> u32 {
+    u32::from(bytes[at as usize])
+}
+
+fn write_slot(bytes: &mut [u8], at: u32, slot: u32) {
+    bytes[at as usize] = u8::try_from(slot).expect("an operand holds this slot");
+}
+
+fn put_wide_move(bytes: &mut Vec<u8>, dst_slot: u32, src_slot: u32) {
+    bytes.push(OpCode::MovWide as u8);
+    bytes.extend_from_slice(&dst_slot.to_ne_bytes());
+    bytes.extend_from_slice(&src_slot.to_ne_bytes());
+}
+
+#[cfg(not(test))]
+const _: () = {
+    use crate::bytecode::op::MovWide;
+    assert!(core::mem::offset_of!(MovWide, dst_slot) == 1);
+    assert!(core::mem::offset_of!(MovWide, src_slot) == 5);
+    assert!(size_of::<MovWide>() == 9);
+};
+
+impl Segment {
+    /// The end of the segment was cut off, and what comes next must not count as part of a strict range.
+    fn clamp_last_strict_range(&mut self) {
+        let end_offset = u32_from_usize(self.bytes.len());
+        if let Some(range) = self.strict_ranges.last_mut() {
+            range.end_offset = range.end_offset.min(end_offset);
+        }
+    }
+}
+
+/// Where strict code began, and what the code around it is.
+pub(super) struct StrictCode {
+    was_strict: bool,
+    start_offset: u32,
 }
 
 /// The destination of the instruction that was just emitted, in case it can write straight to where the value goes.
@@ -252,6 +620,7 @@ struct BodyStart {
     offset: u32,
     operand_positions: usize,
     label_positions: usize,
+    strict_ranges: usize,
     source_entries: usize,
     labels: usize,
     handler_changes: usize,
@@ -260,8 +629,10 @@ struct BodyStart {
 #[derive(Default)]
 pub(super) struct Segment {
     bytes: Vec<u8>,
-    operand_positions: Vec<BlockPosition>,
+    operand_positions: Vec<OperandPosition>,
     label_positions: Vec<BlockPosition>,
+    /// Where a class body makes the code strict in a function that is not.
+    strict_ranges: Vec<StrictRange>,
     /// (offset of the first instruction from there on, where in the source that came from)
     source_entries: Vec<(u32, SourceOffset)>,
     last_source_offset: Option<SourceOffset>,
@@ -272,6 +643,7 @@ impl Segment {
     fn clear(&mut self) {
         self.bytes.clear();
         self.operand_positions.clear();
+        self.strict_ranges.clear();
         self.label_positions.clear();
         self.source_entries.clear();
         self.last_source_offset = None;
@@ -375,6 +747,8 @@ pub struct Stream {
     has_left_entry: bool,
     /// The operands of a call or an array literal being put together.
     operands: Vec<Operand>,
+    /// The copies that copy_locals_on_stack() made, kept so that it does not allocate each time.
+    spare_local_copies: Vec<(Operand, Operand)>,
     handler: Option<Handler>,
     /// Where the handler changes, in order, as offsets of the main segment.
     handler_changes: Vec<(u32, Option<Handler>)>,
@@ -391,6 +765,10 @@ pub struct Stream {
 }
 
 impl Stream {
+    pub(super) fn bytecode_capacity(&self) -> usize {
+        self.current.bytes.capacity() + self.head.bytes.capacity() + self.body_head.bytes.capacity()
+    }
+
     pub(super) fn clear(&mut self) {
         if !self.is_active {
             return;
@@ -470,6 +848,26 @@ impl Generator<'_> {
         self.end_head();
     }
 
+    /// A class body starts, which is strict code even in a function that is not.
+    pub(super) fn begin_strict_code(&mut self) -> StrictCode {
+        StrictCode {
+            was_strict: std::mem::replace(&mut self.strict, true),
+            start_offset: u32_from_usize(self.context.stream.current.bytes.len()),
+        }
+    }
+
+    pub(super) fn end_strict_code(&mut self, code: StrictCode) {
+        self.strict = code.was_strict;
+        let segment = &mut self.context.stream.current;
+        let end_offset = u32_from_usize(segment.bytes.len());
+        if !code.was_strict && code.start_offset != end_offset {
+            segment.strict_ranges.push(StrictRange {
+                start_offset: code.start_offset,
+                end_offset,
+            });
+        }
+    }
+
     /// The code of the parameters ended here, and from now on `in_head()` is about what comes right after that.
     pub(super) fn begin_body_head(&mut self) {
         let stream = &mut self.context.stream;
@@ -477,6 +875,7 @@ impl Generator<'_> {
             offset: u32_from_usize(stream.current.bytes.len()),
             operand_positions: stream.current.operand_positions.len(),
             label_positions: stream.current.label_positions.len(),
+            strict_ranges: stream.current.strict_ranges.len(),
             source_entries: stream.current.source_entries.len(),
             labels: stream.labels.len(),
             handler_changes: stream.handler_changes.len(),
@@ -508,15 +907,23 @@ impl Generator<'_> {
         for position in &mut current.label_positions[start.label_positions..] {
             position.offset += size;
         }
+        for range in &mut current.strict_ranges[start.strict_ranges..] {
+            *range = range.shifted(size);
+        }
         for entry in &mut current.source_entries[start.source_entries..] {
             entry.0 += size;
         }
         current
             .operand_positions
-            .extend(head.operand_positions.iter().map(|position| BlockPosition {
-                block: 0,
+            .extend(head.operand_positions.iter().map(|position| OperandPosition {
                 offset: position.offset + start.offset,
+                operand_type: position.operand_type,
+                index: position.index,
             }));
+        current.strict_ranges.splice(
+            start.strict_ranges..start.strict_ranges,
+            head.strict_ranges.iter().map(|range| range.shifted(start.offset)),
+        );
         current.source_entries.splice(
             start.source_entries..start.source_entries,
             head.source_entries
@@ -550,8 +957,7 @@ impl Generator<'_> {
     }
 
     #[inline(always)]
-    fn encode_into_stream(&mut self, encode: impl FnOnce(bool, &mut BlockEncoder<'_>), watched: Operand) -> u32 {
-        let strict = self.strict;
+    fn encode_into_stream(&mut self, encode: impl FnOnce(&mut BlockEncoder<'_>), watched: Operand) -> u32 {
         let context = &mut *self.context;
         let stream = &mut context.stream;
         let segment = &mut stream.current;
@@ -568,7 +974,7 @@ impl Generator<'_> {
             &mut stream.number_of_arguments,
             watched,
         );
-        encode(strict, &mut encoder);
+        encode(&mut encoder);
         encoder.watched_position
     }
 
@@ -580,13 +986,16 @@ impl Generator<'_> {
 
     #[inline(always)]
     fn put_watching<I: TypedInstruction>(&mut self, instruction: I, watched: Operand) -> u32 {
+        if changes_environment_state(I::OPCODE) {
+            self.note_environment_change(&instruction.to_instruction());
+        }
         if self.context.stream.current.dead {
             return UNBOUND;
         }
         let position = if instruction.may_specialize() {
             self.put_specialized(&instruction.to_instruction(), watched)
         } else {
-            self.encode_into_stream(|strict, encoder| instruction.encode(strict, encoder), watched)
+            self.encode_into_stream(|encoder| instruction.encode(encoder), watched)
         };
         if I::IS_TERMINATOR {
             self.context.stream.current.dead = true;
@@ -598,10 +1007,7 @@ impl Generator<'_> {
     fn put_specialized(&mut self, instruction: &Instruction, watched: Operand) -> u32 {
         let specialized = specialize_instruction(instruction, &self.context.constants.values);
         let instruction = specialized.as_ref().unwrap_or(instruction);
-        self.encode_into_stream(
-            |strict, encoder| instruction.encode_into_block(strict, encoder),
-            watched,
-        )
+        self.encode_into_stream(|encoder| instruction.encode_into_block(encoder), watched)
     }
 
     /// Emits an instruction with a destination that the next thing to happen may redirect.
@@ -648,7 +1054,8 @@ impl Generator<'_> {
         }
     }
 
-    /// A register that nothing else gets until the registers go back.
+    /// Allocates a register that stays held until its owner's checkpoint is released.
+    /// Rust variable scope does not release it; use temporary() for short-lived expression scratch.
     pub(super) fn held_register(&mut self) -> Operand {
         let register = self.temporary();
         let stream = &mut self.context.stream;
@@ -737,8 +1144,8 @@ impl Generator<'_> {
                 Control::Block {
                     environment: Some(environment),
                 } => {
-                    let parent = self.scoped_operand(environment.parent);
-                    self.restore_lexical_environment(&parent);
+                    let parent = environment.parent;
+                    self.restore_lexical_environment(parent);
                 }
                 Control::Iterator(iterator) => {
                     self.set_handler(iterator.outer_handler);
@@ -790,17 +1197,11 @@ impl Generator<'_> {
         let (completion_type, completion_value, body) =
             (finally.completion_type, finally.completion_value, finally.body);
         if exit == Exit::Return {
-            self.put(op::Mov {
-                dst: completion_value,
-                src: value,
-            });
+            self.emit_mov(completion_value, value);
         }
         let kind =
             self.add_constant_i32(Finally::FIRST_EXIT + i32::try_from(position).expect("a function has few exits"));
-        self.put(op::Mov {
-            dst: completion_type,
-            src: kind.operand(),
-        });
+        self.emit_mov(completion_type, kind);
         self.jump(body);
     }
 
@@ -828,10 +1229,7 @@ impl Generator<'_> {
         let finally = &self.context.stream.finallies[finally as usize];
         let (completion_type, body) = (finally.completion_type, finally.body);
         let normal = self.add_constant_i32(Finally::NORMAL);
-        self.put(op::Mov {
-            dst: completion_type,
-            src: normal.operand(),
-        });
+        self.emit_mov(completion_type, normal);
         self.jump(body);
     }
 
@@ -840,7 +1238,7 @@ impl Generator<'_> {
         &mut self,
         finally: usize,
         handler: Handler,
-        entry_environment: &ScopedOperand,
+        entry_environment: Operand,
     ) -> Label {
         let finally = &self.context.stream.finallies[finally];
         let (completion_type, completion_value, body) =
@@ -853,10 +1251,7 @@ impl Generator<'_> {
         });
         self.restore_lexical_environment(entry_environment);
         let throw = self.add_constant_i32(Finally::THROW);
-        self.put(op::Mov {
-            dst: completion_type,
-            src: throw.operand(),
-        });
+        self.emit_mov(completion_type, throw);
         body
     }
 
@@ -877,7 +1272,7 @@ impl Generator<'_> {
             generator.put(op::JumpStrictlyEquals {
                 arith_feedback,
                 lhs: completion_type,
-                rhs: kind.operand(),
+                rhs: kind,
                 true_target: target,
                 false_target: next,
             });
@@ -914,7 +1309,7 @@ impl Generator<'_> {
             label: self.new_label(),
             catches: false,
         };
-        let entry_environment = self.current_lexical_environment().operand();
+        let entry_environment = self.current_lexical_environment();
         let stream = &mut self.context.stream;
         let index = u32_from_usize(stream.disposals.len());
         stream.disposals.push(Disposal {
@@ -958,13 +1353,15 @@ impl Generator<'_> {
         let finally = disposal.finally;
         self.leave_finally_part(finally);
         self.set_handler(disposal.outer_handler);
-        let entry_environment = self.scoped_operand(disposal.entry_environment);
-        let body = self.bind_finally_handler(finally as usize, disposal.handler, &entry_environment);
+        let entry_environment = disposal.entry_environment;
+        let body = self.bind_finally_handler(finally as usize, disposal.handler, entry_environment);
         self.bind_label(body);
         let (completion_type, completion_value) = {
             let finally = &self.context.stream.finallies[finally as usize];
             (finally.completion_type, finally.completion_value)
         };
+        // NB: What disposing takes is dead by the time the pending exit runs, which can need registers of its own.
+        let disposal_registers = self.hold_registers();
         emit_dispose_resources(
             self,
             if disposal.is_async {
@@ -972,10 +1369,11 @@ impl Generator<'_> {
             } else {
                 DisposalKind::Sync
             },
-            &ScopedOperand::plain(disposal.stack),
-            &ScopedOperand::plain(completion_type),
-            &ScopedOperand::plain(completion_value),
+            disposal.stack,
+            completion_type,
+            completion_value,
         );
+        self.release_held_registers(disposal_registers);
         let end_label = self.new_label();
         self.finally_dispatch(finally as usize, end_label);
         self.bind_label(end_label);
@@ -984,7 +1382,7 @@ impl Generator<'_> {
 
     /// Calls the `return` method of an async iterator and awaits what that gives, if it has one, and returns what it gave.
     pub(super) fn put_async_iterator_return(&mut self, iterator: OpenIterator, after_return: Label) -> Operand {
-        let method = self.allocate_register().operand();
+        let method = self.held_register();
         let key = self.intern_property_key_text(crate::utf16::Utf16View::Ascii(b"return"));
         let cache = self.next_property_lookup_cache();
         self.put(op::GetMethod {
@@ -1002,20 +1400,23 @@ impl Generator<'_> {
             false_target: call,
         });
         self.bind_label(call);
-        let result = self.allocate_register().operand();
-        let value_feedback = self.next_value_feedback();
+        let result = self.held_register();
         let call_feedback = self.next_call_feedback();
         self.put(op::Call {
-            value_feedback,
             call_feedback,
             dst: result,
             callee: method,
             this_value: iterator.object,
             argument_count: 0,
-            expression_string: None,
             arguments: &[],
         });
-        generate_await_of_value(self, &ScopedOperand::plain(result)).operand()
+        // NB: The method is dead after the call, and the result once the await takes it.
+        let received = CompletionRegisters {
+            completion: method,
+            completion_type: result,
+            value: self.held_register(),
+        };
+        generate_await_with_completions(self, result, received)
     }
 
     fn put_iterator_close(&mut self, iterator: OpenIterator) {
@@ -1043,7 +1444,7 @@ impl Generator<'_> {
             iterator_object: iterator.object,
             iterator_next: iterator.next,
             iterator_done: iterator.done,
-            completion_type: libjs_abi::CompletionType::Normal as u32,
+            completion_type: libjs_abi::CompletionType::Normal as u8,
             completion_value: undefined,
             cache,
         });
@@ -1062,6 +1463,11 @@ impl Generator<'_> {
         } else {
             self.put(op::Return { value });
         }
+    }
+
+    /// Makes room for `count` more values, which are about to come.
+    pub(super) fn reserve_values(&mut self, count: usize) {
+        self.context.stream.values.reserve(count);
     }
 
     #[inline(always)]
@@ -1089,8 +1495,47 @@ impl Generator<'_> {
     #[inline(always)]
     pub(super) fn pop_operand(&mut self) -> (Operand, u32) {
         let value = self.pop_value();
+        if value.kind == ValKind::FrameArguments {
+            let kind = if value.name == ArgumentsKind::Mapped as u32 {
+                ArgumentsKind::Mapped
+            } else {
+                ArgumentsKind::Unmapped
+            };
+            return (self.create_arguments_for_frame(kind), value.first_temporary);
+        }
         debug_assert!(matches!(value.kind, ValKind::Value | ValKind::Callee));
         (value.a, value.first_temporary)
+    }
+
+    /// An arguments object of `kind` for a use of `arguments` that the frame does not answer for, which the parser rules
+    /// out.
+    #[cold]
+    fn create_arguments_for_frame(&mut self, kind: ArgumentsKind) -> Operand {
+        debug_assert!(false, "the frame only answers for arguments.length and arguments[key]");
+        // FIXME: A mapped arguments object would alias parameters that are not in the environment here, so one is made
+        //        only without parameters, and an unmapped one, with a throwing `callee`, otherwise.
+        let kind = if kind == ArgumentsKind::Mapped && self.context.scope.has_no_simple_parameters() {
+            ArgumentsKind::Mapped
+        } else {
+            ArgumentsKind::Unmapped
+        };
+        let dst = self.temporary();
+        self.put(op::CreateArguments {
+            dst: Some(dst),
+            kind: kind as u8,
+            is_immutable: false,
+            creates_parameter_bindings: false,
+        });
+        dst
+    }
+
+    /// `arguments`, which the frame answers for as an arguments object of `kind` would.
+    pub(super) fn value_of_arguments_from_frame(&mut self, kind: ArgumentsKind) {
+        let first_temporary = self.next_temporary();
+        self.push_value(Operand::invalid(), first_temporary);
+        let value = self.context.stream.values.last_mut().expect("it was just pushed");
+        value.kind = ValKind::FrameArguments;
+        value.name = kind as u32;
     }
 
     /// Takes a copy of `local` for everything on the stack that holds it, right before something writes it.
@@ -1102,28 +1547,27 @@ impl Generator<'_> {
     }
 
     fn copy_local_on_stack(&mut self, local: Operand) {
+        let mut copy = None;
         for index in 0..self.context.stream.values.len() {
             let value = self.context.stream.values[index];
             if value.kind == ValKind::LocalTarget {
                 continue;
             }
-            if value.a == local {
-                let copy = self.copy_to_kept_temporary(local);
-                self.context.stream.values[index].a = copy;
-            }
-            if value.b == local {
-                let copy = self.copy_to_kept_temporary(local);
-                self.context.stream.values[index].b = copy;
+            if value.a == local || value.b == local {
+                let copy = *copy.get_or_insert_with(|| self.copy_to_kept_temporary(local));
+                if value.a == local {
+                    self.context.stream.values[index].a = copy;
+                }
+                if value.b == local {
+                    self.context.stream.values[index].b = copy;
+                }
             }
         }
     }
 
     fn copy_to_kept_temporary(&mut self, operand: Operand) -> Operand {
         let copy = self.temporary();
-        self.put(op::Mov {
-            dst: copy,
-            src: operand,
-        });
+        self.emit_mov(copy, operand);
         let stream = &mut self.context.stream;
         stream.floor = stream.next_temporary;
         copy
@@ -1131,20 +1575,32 @@ impl Generator<'_> {
 
     /// Whatever is about to happen happens in only some of the ways through the code, so copies have to come first.
     pub(super) fn copy_locals_on_stack(&mut self) {
+        let mut copies = core::mem::take(&mut self.context.stream.spare_local_copies);
+        copies.clear();
         for index in 0..self.context.stream.values.len() {
             let value = self.context.stream.values[index];
             if value.kind == ValKind::LocalTarget {
                 continue;
             }
-            if value.a.is_local() || value.a.is_argument() {
-                let copy = self.copy_to_kept_temporary(value.a);
-                self.context.stream.values[index].a = copy;
-            }
-            if value.b.is_local() || value.b.is_argument() {
-                let copy = self.copy_to_kept_temporary(value.b);
-                self.context.stream.values[index].b = copy;
-            }
+            let a = self.copy_local_before_branch(value.a, &mut copies);
+            let b = self.copy_local_before_branch(value.b, &mut copies);
+            let value = &mut self.context.stream.values[index];
+            value.a = a;
+            value.b = b;
         }
+        self.context.stream.spare_local_copies = copies;
+    }
+
+    fn copy_local_before_branch(&mut self, operand: Operand, copies: &mut Vec<(Operand, Operand)>) -> Operand {
+        if !operand.is_local() && !operand.is_argument() {
+            return operand;
+        }
+        if let Some(&(_, copy)) = copies.iter().find(|&&(local, _)| local == operand) {
+            return copy;
+        }
+        let copy = self.copy_to_kept_temporary(operand);
+        copies.push((operand, copy));
+        copy
     }
 
     /// Makes `dst` hold `value`, which is either in a temporary that the last instruction wrote or takes a move.
@@ -1156,16 +1612,23 @@ impl Generator<'_> {
         // NB: A handler sees a local as it was if the instruction throws, so that it cannot write the local itself.
         if let Some(last) = stream.last_destination
             && last.dst == value
+            && last.dst.is_register()
             && last.end as usize == stream.current.bytes.len()
             && (stream.handler.is_none() || dst.is_register())
         {
             let position = last.position as usize;
-            stream.current.bytes[position..position + 4].copy_from_slice(&dst.raw().to_ne_bytes());
+            stream.current.bytes[position] = dst.raw() as u8;
             stream.last_destination = None;
-            if !dst.is_register() {
-                stream.current.operand_positions.push(BlockPosition {
-                    block: 0,
+            if value.index() >= FIRST_WIDE_SLOT {
+                let positions = &mut stream.current.operand_positions;
+                let noted = positions.iter().rposition(|position| position.offset == last.position);
+                positions.remove(noted.expect("a wide register has a position"));
+            }
+            if !dst.is_register() || dst.index() >= FIRST_WIDE_SLOT {
+                stream.current.operand_positions.push(OperandPosition {
                     offset: last.position,
+                    operand_type: dst.operand_type(),
+                    index: dst.index(),
                 });
             }
             if dst.is_argument() {
@@ -1173,7 +1636,7 @@ impl Generator<'_> {
             }
             return;
         }
-        self.put(op::Mov { dst, src: value });
+        self.emit_mov(dst, value);
     }
 
     // --- Labels and jumps ---
@@ -1205,6 +1668,7 @@ impl Generator<'_> {
         {
             // NB: Nothing else knows about this jump, so that it is as if it never was.
             segment.bytes.truncate(jump.start as usize);
+            segment.clamp_last_strict_range();
             segment.label_positions.truncate(jump.label_position_count as usize);
             segment.dead = false;
         }
@@ -1246,20 +1710,21 @@ impl Generator<'_> {
 
     /// Takes the comparison that made `condition` back, if that is what the code just did.
     #[inline(always)]
-    fn take_last_comparison(&mut self, condition: Operand) -> Option<LastComparison> {
+    fn take_last_comparison(&mut self, condition: Operand) -> Option<Comparison> {
         let stream = &mut self.context.stream;
         let comparison = stream.last_comparison?;
         if comparison.dst != condition || comparison.end as usize != stream.current.bytes.len() {
             return None;
         }
         stream.current.bytes.truncate(comparison.start as usize);
+        stream.current.clamp_last_strict_range();
         stream
             .current
             .operand_positions
             .truncate(comparison.operand_position_count as usize);
         stream.last_comparison = None;
         stream.last_destination = None;
-        Some(comparison)
+        Some(comparison.comparison)
     }
 
     fn constant_truthiness(&self, condition: Operand) -> Option<bool> {
@@ -1334,13 +1799,36 @@ impl Generator<'_> {
         self.context.stream.current.dead = was_dead;
     }
 
-    fn put_fused_jump(&mut self, comparison: LastComparison, true_target: Label, false_target: Label, back_edge: bool) {
-        let LastComparison {
+    /// Branches on a comparison without materializing its boolean result.
+    pub(super) fn emit_comparison_jump(
+        &mut self,
+        operator: BinaryOp,
+        lhs: Operand,
+        rhs: Operand,
+        true_target: Label,
+        false_target: Label,
+    ) {
+        if self.is_stream_dead() {
+            return;
+        }
+        self.reference_label(true_target);
+        self.reference_label(false_target);
+        let arith_feedback = self.next_arith_feedback();
+        let comparison = Comparison {
             operator,
             arith_feedback,
             lhs,
             rhs,
-            ..
+        };
+        self.put_fused_jump(comparison, true_target, false_target, false);
+    }
+
+    fn put_fused_jump(&mut self, comparison: Comparison, true_target: Label, false_target: Label, back_edge: bool) {
+        let Comparison {
+            operator,
+            arith_feedback,
+            lhs,
+            rhs,
         } = comparison;
         macro_rules! fused {
             ($($operator:ident => $jump:ident, $jump_loop:ident;)*) => {
@@ -1382,7 +1870,7 @@ impl Generator<'_> {
     }
 
     pub(super) fn value_of_this(&mut self) {
-        if self.this_value_needs_environment_resolution && !self.context.stream.has_resolved_this {
+        if self.this_value_needs_resolution && !self.context.stream.has_resolved_this {
             self.put(op::ResolveThisBinding {});
             let stream = &mut self.context.stream;
             stream.has_resolved_this = true;
@@ -1404,7 +1892,7 @@ impl Generator<'_> {
         if ident.local_type == Some(LocalType::Argument) {
             if self.checks_parameters() && !self.is_argument_initialized(ident.local_index) {
                 let empty = self.context.constants.add_empty();
-                self.put(op::Mov { dst: local, src: empty });
+                self.emit_mov(local, empty);
                 self.put(op::ThrowIfTDZ { src: local });
             }
         } else if self.local_has_temporal_dead_zone(ident.local_index) && !self.is_local_initialized(ident.local_index)
@@ -1418,7 +1906,7 @@ impl Generator<'_> {
                 .any(|value| value.kind == ValKind::LocalTarget && value.initializes && value.a == local);
             if is_being_initialized {
                 let empty = self.context.constants.add_empty();
-                self.put(op::Mov { dst: local, src: empty });
+                self.emit_mov(local, empty);
             }
             self.put(op::ThrowIfTDZ { src: local });
         }
@@ -1453,7 +1941,7 @@ impl Generator<'_> {
                 }
                 _ => {
                     if let Some(constant) = self.builtin_constant(ident.name) {
-                        self.push_value(constant.operand(), first_temporary);
+                        self.push_value(constant, first_temporary);
                         return;
                     }
                 }
@@ -1511,6 +1999,17 @@ impl Generator<'_> {
     /// `value.name`, for the value on top of the stack.
     #[inline(always)]
     pub(super) fn value_of_member(&mut self, name: Name) {
+        if self.top_value_kind() == ValKind::FrameArguments {
+            let key = self.intern_property_key(name);
+            if self.context.names.is_length_property_key(key) {
+                let first_temporary = self.pop_value().first_temporary;
+                self.release_temporaries_from(first_temporary);
+                let dst = self.temporary();
+                self.put_with_destination(op::GetArgumentCount { dst }, dst);
+                self.push_value(dst, first_temporary);
+                return;
+            }
+        }
         let (base, first_temporary) = self.pop_operand();
         self.release_temporaries_from(first_temporary);
         let dst = self.temporary();
@@ -1524,29 +2023,23 @@ impl Generator<'_> {
         if self.context.names.is_length_property_key(key) {
             self.length_identifier = Some(key);
             let cache = self.next_property_lookup_cache();
-            let value_feedback = self.next_value_feedback();
             let keyed_feedback = self.next_keyed_feedback();
             self.put_with_destination(
                 op::GetLength {
-                    value_feedback,
                     keyed_feedback,
                     dst,
                     base,
-                    base_identifier: None,
                     cache,
                 },
                 dst,
             );
         } else {
             let cache = self.next_property_lookup_cache();
-            let value_feedback = self.next_value_feedback();
             self.put_with_destination(
                 op::GetById {
-                    value_feedback,
                     dst,
                     base,
                     property: key,
-                    base_identifier: None,
                     cache,
                 },
                 dst,
@@ -1556,6 +2049,23 @@ impl Generator<'_> {
 
     /// `base[key]`, for the two values on top of the stack.
     pub(super) fn value_of_index(&mut self) {
+        let values = &self.context.stream.values;
+        if values.len() >= 2 && values[values.len() - 2].kind == ValKind::FrameArguments {
+            let (key, _) = self.pop_operand();
+            let base = self.pop_value();
+            self.release_temporaries_from(base.first_temporary);
+            let dst = self.temporary();
+            self.put_with_destination(
+                op::GetArgument {
+                    dst,
+                    index: key,
+                    kind: base.name as u8,
+                },
+                dst,
+            );
+            self.push_value(dst, base.first_temporary);
+            return;
+        }
         let (key, _) = self.pop_operand();
         let (base, first_temporary) = self.pop_operand();
         self.release_temporaries_from(first_temporary);
@@ -1565,13 +2075,7 @@ impl Generator<'_> {
     }
 
     pub(super) fn put_get_by_value(&mut self, dst: Operand, base: Operand, key: Operand) {
-        emit_get_by_value(
-            self,
-            &ScopedOperand::plain(dst),
-            &ScopedOperand::plain(base),
-            &ScopedOperand::plain(key),
-            None,
-        );
+        emit_get_by_value(self, dst, base, key);
     }
 
     // --- Properties of `super` and private names ---
@@ -1591,14 +2095,11 @@ impl Generator<'_> {
     }
 
     fn put_get_of_super(&mut self, dst: Operand, base: Operand, key: Result<Name, Operand>) {
-        let this_value = ScopedOperand::plain(Operand::register(Register::THIS_VALUE));
-        let dst = ScopedOperand::plain(dst);
-        let base = ScopedOperand::plain(base);
+        let this_value = Operand::register(Register::THIS_VALUE);
         match key {
-            Ok(name) => emit_get_by_id_with_this(self, &dst, &base, name, &this_value),
+            Ok(name) => emit_get_by_id_with_this(self, dst, base, name, this_value),
             Err(key) => {
-                let key = ScopedOperand::plain(key);
-                emit_get_by_value_with_this(self, &dst, &base, &key, &this_value);
+                emit_get_by_value_with_this(self, dst, base, key, this_value);
             }
         }
     }
@@ -1656,19 +2157,43 @@ impl Generator<'_> {
         let (super_constructor, first_temporary) = self.pop_operand();
         self.release_temporaries_from(first_temporary);
         let dst = self.temporary();
-        let value_feedback = self.next_value_feedback();
         let call_feedback = self.next_call_feedback();
         self.put_with_destination(
             op::SuperCallWithArgumentArray {
-                value_feedback,
                 call_feedback,
                 dst,
                 super_constructor,
                 arguments,
-                is_synthetic: false,
             },
             dst,
         );
+        self.push_value(dst, first_temporary);
+    }
+
+    /// `super(...)` without spread arguments, whose arguments are on top of the stack above the super constructor.
+    pub(super) fn super_call_with_operands(&mut self, argument_count: usize) {
+        if argument_count > MAX_OPERAND_LIST_LENGTH {
+            self.array(argument_count);
+            self.super_call();
+            return;
+        }
+        let arguments = self.take_operands(argument_count);
+        let (super_constructor, first_temporary) = self.pop_operand();
+        self.release_temporaries_from(first_temporary);
+        let dst = self.temporary();
+        let call_feedback = self.next_call_feedback();
+        self.put_with_destination(
+            op::SuperCall {
+                call_feedback,
+                dst,
+                super_constructor,
+                argument_count: operand_list_count(arguments.len()),
+                arguments: &arguments,
+            },
+            dst,
+        );
+        self.put(op::BindThisFromSuperCall { result: dst });
+        self.context.stream.operands = arguments;
         self.push_value(dst, first_temporary);
     }
 
@@ -1798,8 +2323,59 @@ impl Generator<'_> {
         operands
     }
 
+    /// Puts an operand list that is too long for an instruction in a new array, which the list then holds in its place.
+    /// Returns whether it did.
+    pub(super) fn fit_operand_list(&mut self, list: &mut Vec<Operand>) -> bool {
+        if list.len() <= MAX_OPERAND_LIST_LENGTH {
+            return false;
+        }
+        let array = self.temporary();
+        self.put_new_array(array, list);
+        *list = vec![array];
+        true
+    }
+
+    /// Puts what `elements` hold in a new array at `dst`, however many there are.
+    pub(super) fn put_new_array(&mut self, dst: Operand, elements: &[Operand]) {
+        let (first, rest) = elements.split_at(elements.len().min(MAX_OPERAND_LIST_LENGTH));
+        self.put(op::NewArray {
+            dst,
+            element_count: operand_list_count(first.len()),
+            elements: first,
+        });
+        for &src in rest {
+            self.put(op::ArrayAppend {
+                dst,
+                src,
+                is_spread: false,
+            });
+        }
+    }
+
+    /// Replaces the `count` values on top of the stack with an array of them, for a list too long for an instruction.
+    fn replace_operands_with_array(&mut self, count: usize) {
+        let values = &self.context.stream.values;
+        let first_temporary = values[values.len() - count].first_temporary;
+        let operands = self.take_operands(count);
+        let array = self.temporary();
+        self.put_new_array(array, &operands);
+        self.context.stream.operands = operands;
+        self.release_temporaries_from(first_temporary);
+        let dst = self.temporary();
+        self.emit_mov(dst, array);
+        self.push_value(dst, first_temporary);
+    }
+
     #[inline(always)]
     pub(super) fn call(&mut self, argument_count: usize) {
+        let values = &self.context.stream.values;
+        if argument_count > MAX_OPERAND_LIST_LENGTH
+            && values[values.len() - argument_count - 1].kind != ValKind::BuiltinCallee
+        {
+            self.replace_operands_with_array(argument_count);
+            self.call_with_array();
+            return;
+        }
         let arguments = self.take_operands(argument_count);
         let callee = self.pop_value();
         if callee.kind == ValKind::BuiltinCallee {
@@ -1817,17 +2393,14 @@ impl Generator<'_> {
         };
         self.release_temporaries_from(callee.first_temporary);
         let dst = self.temporary();
-        let value_feedback = self.next_value_feedback();
         let call_feedback = self.next_call_feedback();
         self.put_with_destination(
             op::Call {
-                value_feedback,
                 call_feedback,
                 dst,
                 callee: callee_operand,
                 this_value,
-                argument_count: u32_from_usize(arguments.len()),
-                expression_string: None,
+                argument_count: operand_list_count(arguments.len()),
                 arguments: &arguments,
             },
             dst,
@@ -1837,20 +2410,22 @@ impl Generator<'_> {
     }
 
     pub(super) fn construct(&mut self, argument_count: usize) {
+        if argument_count > MAX_OPERAND_LIST_LENGTH {
+            self.replace_operands_with_array(argument_count);
+            self.construct_with_array();
+            return;
+        }
         let arguments = self.take_operands(argument_count);
         let (callee, first_temporary) = self.pop_operand();
         self.release_temporaries_from(first_temporary);
         let dst = self.temporary();
-        let value_feedback = self.next_value_feedback();
         let call_feedback = self.next_call_feedback();
         self.put_with_destination(
             op::CallConstruct {
-                value_feedback,
                 call_feedback,
                 dst,
                 callee,
-                argument_count: u32_from_usize(arguments.len()),
-                expression_string: None,
+                argument_count: operand_list_count(arguments.len()),
                 arguments: &arguments,
             },
             dst,
@@ -1862,6 +2437,11 @@ impl Generator<'_> {
     /// A call of what is below the array of arguments on top of the stack.
     /// A call of the name `eval`, which is a direct eval if that is what the name means by then.
     pub(super) fn direct_eval(&mut self, argument_count: usize) {
+        if argument_count > MAX_OPERAND_LIST_LENGTH {
+            self.replace_operands_with_array(argument_count);
+            self.direct_eval_with_array();
+            return;
+        }
         let arguments = self.take_operands(argument_count);
         let callee = self.pop_value();
         let (callee_operand, this_value) = if callee.kind == ValKind::Callee {
@@ -1871,17 +2451,14 @@ impl Generator<'_> {
         };
         self.release_temporaries_from(callee.first_temporary);
         let dst = self.temporary();
-        let value_feedback = self.next_value_feedback();
         let call_feedback = self.next_call_feedback();
         self.put_with_destination(
             op::CallDirectEval {
-                value_feedback,
                 call_feedback,
                 dst,
                 callee: callee_operand,
                 this_value,
-                argument_count: u32_from_usize(arguments.len()),
-                expression_string: None,
+                argument_count: operand_list_count(arguments.len()),
                 arguments: &arguments,
             },
             dst,
@@ -1900,17 +2477,14 @@ impl Generator<'_> {
         };
         self.release_temporaries_from(callee.first_temporary);
         let dst = self.temporary();
-        let value_feedback = self.next_value_feedback();
         let call_feedback = self.next_call_feedback();
         self.put_with_destination(
             op::CallDirectEvalWithArgumentArray {
-                value_feedback,
                 call_feedback,
                 dst,
                 callee: callee_operand,
                 this_value,
                 arguments,
-                expression_string: None,
             },
             dst,
         );
@@ -1927,17 +2501,14 @@ impl Generator<'_> {
         };
         self.release_temporaries_from(callee.first_temporary);
         let dst = self.temporary();
-        let value_feedback = self.next_value_feedback();
         let call_feedback = self.next_call_feedback();
         self.put_with_destination(
             op::CallWithArgumentArray {
-                value_feedback,
                 call_feedback,
                 dst,
                 callee: callee_operand,
                 this_value,
                 arguments,
-                expression_string: None,
             },
             dst,
         );
@@ -1950,26 +2521,23 @@ impl Generator<'_> {
         self.release_temporaries_from(first_temporary);
         let dst = self.temporary();
         let this_value = self.context.constants.add_undefined();
-        let value_feedback = self.next_value_feedback();
         let call_feedback = self.next_call_feedback();
         self.put_with_destination(
             op::CallConstructWithArgumentArray {
-                value_feedback,
                 call_feedback,
                 dst,
                 callee,
                 this_value,
                 arguments,
-                expression_string: None,
             },
             dst,
         );
         self.push_value(dst, first_temporary);
     }
 
-    /// A spread element comes up in a list, so that the `count` elements before it go into an array, and the ones after
-    /// it get appended to that as they come.
-    pub(super) fn spread_begin(&mut self, count: usize) {
+    /// A list starts to be built as an array, so that the `count` elements before this go into an array, and the ones
+    /// after it get appended to that as they come.
+    pub(super) fn array_begin(&mut self, count: usize) {
         let first_temporary = if count == 0 {
             self.next_temporary()
         } else {
@@ -1978,11 +2546,7 @@ impl Generator<'_> {
         };
         let elements = self.take_operands(count);
         let dst = self.temporary();
-        self.put(op::NewArray {
-            dst,
-            element_count: u32_from_usize(elements.len()),
-            elements: &elements,
-        });
+        self.put_new_array(dst, &elements);
         self.context.stream.operands = elements;
         self.release_temporaries_from(dst.index() + 1);
         self.push_value(dst, first_temporary);
@@ -2065,20 +2629,14 @@ impl Generator<'_> {
         };
         let callee = self.pop_value();
         let this_value = self.temporary();
-        self.put(op::Mov {
-            dst: this_value,
-            src: callee.b,
-        });
-        self.put(op::Mov { dst, src: callee.a });
+        self.emit_mov(this_value, callee.b);
+        self.emit_mov(dst, callee.a);
         let end = self.new_label();
         self.jump(end);
         self.bind_label(short_circuit);
         let undefined = self.context.constants.add_undefined();
-        self.put(op::Mov { dst, src: undefined });
-        self.put(op::Mov {
-            dst: this_value,
-            src: undefined,
-        });
+        self.emit_mov(dst, undefined);
+        self.emit_mov(this_value, undefined);
         self.bind_label(end);
         self.push_callee(dst, this_value, first_temporary);
     }
@@ -2104,7 +2662,7 @@ impl Generator<'_> {
         } else {
             self.context.constants.add_undefined()
         };
-        self.put(op::Mov { dst, src });
+        self.emit_mov(dst, src);
         self.bind_label(end);
         self.release_temporaries_from(dst.index() + 1);
         self.push_value(dst, first_temporary);
@@ -2117,11 +2675,10 @@ impl Generator<'_> {
         let (rhs, _) = self.pop_operand();
         let (lhs, first_temporary) = self.pop_operand();
         if lhs.is_constant() && rhs.is_constant() {
-            let folded =
-                try_constant_fold_binary(self, operator, &ScopedOperand::plain(lhs), &ScopedOperand::plain(rhs));
+            let folded = try_constant_fold_binary(self, operator, lhs, rhs);
             if let Some(folded) = folded {
                 self.release_temporaries_from(first_temporary);
-                self.push_value(folded.operand(), first_temporary);
+                self.push_value(folded, first_temporary);
                 return;
             }
         }
@@ -2144,20 +2701,14 @@ impl Generator<'_> {
         let start = u32_from_usize(stream.current.bytes.len());
         let operand_position_count = u32_from_usize(stream.current.operand_positions.len());
         let arith_feedback_before = self.next_arith_feedback;
-        emit_binary_op(
-            self,
-            operator,
-            &ScopedOperand::plain(dst),
-            &ScopedOperand::plain(lhs),
-            &ScopedOperand::plain(rhs),
-        );
+        emit_binary_op(self, operator, dst, lhs, rhs);
         let stream = &mut self.context.stream;
         let end = u32_from_usize(stream.current.bytes.len());
         if !stream.current.dead {
             // NB: Every operator writes its destination, and that is the first operand.
             stream.last_destination = Some(LastDestination {
                 end,
-                position: start + DESTINATION_OFFSET_OF_BINARY_OPERATOR,
+                position: start + destination_offset_of_binary_operator(operator),
                 dst,
             });
         }
@@ -2166,11 +2717,13 @@ impl Generator<'_> {
                 start,
                 end,
                 operand_position_count,
-                operator,
-                arith_feedback: u16::try_from(arith_feedback_before).unwrap_or(u16::MAX),
                 dst,
-                lhs,
-                rhs,
+                comparison: Comparison {
+                    operator,
+                    arith_feedback: u16::try_from(arith_feedback_before).unwrap_or(u16::MAX),
+                    lhs,
+                    rhs,
+                },
             });
         }
         self.push_value(dst, first_temporary);
@@ -2200,10 +2753,10 @@ impl Generator<'_> {
     pub(super) fn unary(&mut self, operator: UnaryOp) {
         let (value, first_temporary) = self.pop_operand();
         if value.is_constant()
-            && let Some(folded) = try_constant_fold_unary(self, operator, &ScopedOperand::plain(value))
+            && let Some(folded) = try_constant_fold_unary(self, operator, value)
         {
             self.release_temporaries_from(first_temporary);
-            self.push_value(folded.operand(), first_temporary);
+            self.push_value(folded, first_temporary);
             return;
         }
         if operator == UnaryOp::Void {
@@ -2265,7 +2818,7 @@ impl Generator<'_> {
         }
         let dst = self.temporary();
         let identifier = self.intern_identifier(ident.name);
-        self.emit(op::DeleteVariable { dst, identifier });
+        self.put(op::DeleteVariable { dst, identifier });
         self.push_value(dst, first_temporary);
     }
 
@@ -2278,7 +2831,7 @@ impl Generator<'_> {
     }
 
     pub(super) fn value_of_bigint(&mut self, digits: String) {
-        let operand = self.add_constant_bigint(digits).operand();
+        let operand = self.add_constant_bigint(digits);
         self.value_of_constant(operand);
     }
 
@@ -2380,8 +2933,8 @@ impl Generator<'_> {
     pub(super) fn await_value(&mut self) {
         let (value, first_temporary) = self.pop_operand();
         let held = self.hold_registers();
-        let result = generate_await_of_value(self, &ScopedOperand::plain(value));
-        self.take_result_of_held_registers(result.operand(), held, first_temporary);
+        let result = generate_await_of_value(self, value);
+        self.take_result_of_held_registers(result, held, first_temporary);
     }
 
     /// Yields the value on top of the stack if there is one, or what it iterates over if `is_yield_from`.
@@ -2392,18 +2945,9 @@ impl Generator<'_> {
             (self.context.constants.add_undefined(), self.next_temporary())
         };
         let held = self.hold_registers();
-        let received_completion = self.allocate_register();
-        let received_completion_type = self.allocate_register();
-        let received_completion_value = self.allocate_register();
-        let result = generate_yield_of_value(
-            self,
-            ScopedOperand::plain(value),
-            is_yield_from,
-            &received_completion,
-            &received_completion_type,
-            &received_completion_value,
-        );
-        self.take_result_of_held_registers(result.operand(), held, first_temporary);
+        let received = CompletionRegisters::allocate(self);
+        let result = generate_yield_of_value(self, value, is_yield_from, received);
+        self.take_result_of_held_registers(result, held, first_temporary);
     }
 
     /// Makes `result` the value of an expression whose code took the registers since `held`.
@@ -2411,7 +2955,7 @@ impl Generator<'_> {
         self.release_held_registers(held);
         self.release_temporaries_from(first_temporary);
         let dst = self.temporary();
-        self.put(op::Mov { dst, src: result });
+        self.emit_mov(dst, result);
         self.push_value(dst, first_temporary);
     }
 
@@ -2538,7 +3082,8 @@ impl Generator<'_> {
 
     // --- Targets ---
 
-    pub(super) fn target_of_identifier(&mut self, ident: Identifier) {
+    /// `ident` as a reference that gets written.
+    pub(super) fn target_of_identifier(&mut self, ident: Identifier, binding: TargetBinding) {
         let first_temporary = self.next_temporary();
         let is_const = ident.declaration_kind == Some(DeclarationKind::Const);
         if ident.is_local() {
@@ -2560,7 +3105,7 @@ impl Generator<'_> {
         // NB: Unless it is known where the binding is, the reference is what it is before the value gets evaluated.
         let mut resolved = Operand::invalid();
         let mut cache = u32::MAX;
-        if !ident.is_global || self.strict {
+        if !ident.is_global || self.strict || binding == TargetBinding::MightAppear {
             let identifier = self.intern_identifier(ident.name);
             if self.environment_coordinate_for_identifier(identifier).is_none() {
                 resolved = self.temporary();
@@ -2617,17 +3162,17 @@ impl Generator<'_> {
                 if target.a != Operand::invalid() {
                     let resolved_binding = if target.is_global {
                         ResolvedBinding::Global {
-                            is_resolvable: ScopedOperand::plain(target.a),
+                            is_resolvable: target.a,
                             identifier,
                             cache: target.cache,
                         }
                     } else {
                         ResolvedBinding::Environment {
-                            environment: ScopedOperand::plain(target.a),
+                            environment: target.a,
                             identifier,
                         }
                     };
-                    emit_set_resolved_binding(self, &resolved_binding, &ScopedOperand::plain(value));
+                    emit_set_resolved_binding(self, &resolved_binding, value);
                 } else if target.is_global {
                     let cache = self.next_global_variable_cache();
                     self.put(op::SetGlobal {
@@ -2649,36 +3194,28 @@ impl Generator<'_> {
                     property: key,
                     src: value,
                     cache,
-                    base_identifier: None,
-                    kind: libjs_abi::PutKind::Normal as u32,
+                    kind: libjs_abi::PutKind::Normal as u8,
                 });
             }
             ValKind::IndexTarget => {
-                emit_put_normal_by_value(
-                    self,
-                    &ScopedOperand::plain(target.a),
-                    &ScopedOperand::plain(target.b),
-                    &ScopedOperand::plain(value),
-                    None,
-                );
+                emit_put_by_value(self, target.a, target.b, value, libjs_abi::PutKind::Normal);
             }
             ValKind::SuperTarget => {
-                let this_value = ScopedOperand::plain(Operand::register(Register::THIS_VALUE));
-                let base = ScopedOperand::plain(target.a);
-                let value = ScopedOperand::plain(value);
+                let this_value = Operand::register(Register::THIS_VALUE);
+                let base = target.a;
                 if target.b != Operand::invalid() {
-                    let key = ScopedOperand::plain(target.b);
-                    emit_put_normal_by_value_with_this(self, &base, &key, &this_value, &value);
+                    let key = target.b;
+                    emit_put_normal_by_value_with_this(self, base, key, this_value, value);
                 } else {
                     let key = self.intern_property_key(Name(target.name));
                     let cache = self.next_property_lookup_cache();
                     self.put(op::PutByIdWithThis {
-                        base: base.operand(),
-                        this_value: this_value.operand(),
+                        base,
+                        this_value,
                         property: key,
-                        src: value.operand(),
+                        src: value,
                         cache,
-                        kind: libjs_abi::PutKind::Normal as u32,
+                        kind: libjs_abi::PutKind::Normal as u8,
                     });
                 }
             }
@@ -2691,7 +3228,11 @@ impl Generator<'_> {
                 });
             }
             ValKind::InvalidTarget => {}
-            ValKind::Value | ValKind::Callee | ValKind::SuperThis | ValKind::BuiltinCallee => {
+            ValKind::Value
+            | ValKind::Callee
+            | ValKind::SuperThis
+            | ValKind::BuiltinCallee
+            | ValKind::FrameArguments => {
                 unreachable!("this is no target")
             }
         }
@@ -2797,15 +3338,14 @@ impl Generator<'_> {
             }
             ValKind::SuperTarget => {
                 let dst = self.temporary();
-                let this_value = ScopedOperand::plain(Operand::register(Register::THIS_VALUE));
-                let base = ScopedOperand::plain(target.a);
+                let this_value = Operand::register(Register::THIS_VALUE);
+                let base = target.a;
                 if target.b != Operand::invalid() {
                     let key = self.read_modify_write_key(target.a, target.b);
                     self.context.stream.values.last_mut().expect("a target was evaluated").b = key;
-                    let key = ScopedOperand::plain(key);
-                    emit_get_by_value_with_this(self, &ScopedOperand::plain(dst), &base, &key, &this_value);
+                    emit_get_by_value_with_this(self, dst, base, key, this_value);
                 } else {
-                    emit_get_by_id_with_this(self, &ScopedOperand::plain(dst), &base, Name(target.name), &this_value);
+                    emit_get_by_id_with_this(self, dst, base, Name(target.name), this_value);
                 }
                 self.push_value(dst, first_temporary);
             }
@@ -2819,7 +3359,12 @@ impl Generator<'_> {
                 });
                 self.push_value(dst, first_temporary);
             }
-            ValKind::InvalidTarget | ValKind::Value | ValKind::Callee | ValKind::SuperThis | ValKind::BuiltinCallee => {
+            ValKind::InvalidTarget
+            | ValKind::Value
+            | ValKind::Callee
+            | ValKind::SuperThis
+            | ValKind::BuiltinCallee
+            | ValKind::FrameArguments => {
                 unreachable!("this is no target")
             }
         }
@@ -2847,7 +3392,7 @@ impl Generator<'_> {
         let dst = self.temporary();
         let stream = &mut self.context.stream;
         stream.floor = stream.next_temporary;
-        self.put(op::Mov { dst, src: old_value });
+        self.emit_mov(dst, old_value);
         let end_label = self.new_label();
         match operator {
             LogicalOp::And => self.jump_unless(dst, end_label),
@@ -2896,13 +3441,7 @@ impl Generator<'_> {
         } else {
             self.temporary()
         };
-        emit_binary_op(
-            self,
-            operator,
-            &ScopedOperand::plain(dst),
-            &ScopedOperand::plain(lhs),
-            &ScopedOperand::plain(rhs),
-        );
+        emit_binary_op(self, operator, dst, lhs, rhs);
         let target = self.pop_value();
         if target.kind != ValKind::LocalTarget || target.is_const {
             self.store_to_target(target, dst, false);
@@ -2925,7 +3464,7 @@ impl Generator<'_> {
             if target.is_const {
                 // NB: The value gets converted to a number before the write fails, and stays what it is.
                 let copy = self.temporary();
-                self.put(op::Mov { dst: copy, src: local });
+                self.emit_mov(copy, local);
                 let old_value = self.temporary();
                 self.put_postfix_update(operator, old_value, copy);
                 self.put(op::ThrowConstAssignment {});
@@ -2956,7 +3495,7 @@ impl Generator<'_> {
         }
         // NB: The old value is in a temporary of its own by now.
         let value = old_value;
-        let result = if prefixed {
+        let result = if prefixed || !value_is_used {
             let arith_feedback = self.next_arith_feedback();
             match operator {
                 UpdateOp::Increment => self.put(op::Increment {
@@ -3014,14 +3553,18 @@ impl Generator<'_> {
             self.push_value(dst, first_temporary);
             return;
         }
-        self.put_with_destination(
-            op::NewArray {
+        if elements.len() > MAX_OPERAND_LIST_LENGTH {
+            self.put_new_array(dst, &elements);
+        } else {
+            self.put_with_destination(
+                op::NewArray {
+                    dst,
+                    element_count: operand_list_count(elements.len()),
+                    elements: &elements,
+                },
                 dst,
-                element_count: u32_from_usize(elements.len()),
-                elements: &elements,
-            },
-            dst,
-        );
+            );
+        }
         self.context.stream.operands = elements;
         self.release_temporaries_from(dst.index() + 1);
         self.push_value(dst, first_temporary);
@@ -3032,6 +3575,7 @@ impl Generator<'_> {
         use crate::bytecode::constant_fold::*;
         let mut values = std::mem::take(&mut self.context.primitive_values);
         values.clear();
+        values.reserve(elements.len());
         for &element in elements {
             let value = match self.context.constants.get(element) {
                 Some(ConstantValue::Number(number)) => nanboxed_number(*number),
@@ -3082,7 +3626,10 @@ impl Generator<'_> {
         let object = self.context.stream.values.last_mut().expect("an object is being built");
         let (dst, cache, slot) = (object.a, object.cache, object.name);
         object.name += 1;
-        if cache != u32::MAX {
+        // NB: The properties of a literal past the first 65536 are put like those of a literal that is not simple.
+        if let Ok(slot) = u16::try_from(slot)
+            && cache != u32::MAX
+        {
             self.put(op::InitObjectLiteralProperty {
                 object: dst,
                 property: key,
@@ -3097,8 +3644,7 @@ impl Generator<'_> {
                 property: key,
                 src: value,
                 cache,
-                base_identifier: None,
-                kind: libjs_abi::PutKind::Own as u32,
+                kind: libjs_abi::PutKind::Own as u8,
             });
         }
         self.release_temporaries_from(dst.index() + 1);
@@ -3120,8 +3666,7 @@ impl Generator<'_> {
             property: key,
             src: value,
             cache,
-            base_identifier: None,
-            kind: kind as u32,
+            kind: kind as u8,
         });
         self.release_temporaries_from(object.index() + 1);
     }
@@ -3131,13 +3676,7 @@ impl Generator<'_> {
         let (value, _) = self.pop_operand();
         let key = self.context.constants.add_number(key);
         let object = self.context.stream.values.last().expect("an object is being built").a;
-        emit_put_by_value(
-            self,
-            &ScopedOperand::plain(object),
-            &ScopedOperand::plain(key),
-            &ScopedOperand::plain(value),
-            kind,
-        );
+        emit_put_by_value(self, object, key, value, kind);
         self.release_temporaries_from(object.index() + 1);
     }
 
@@ -3157,15 +3696,9 @@ impl Generator<'_> {
         self.put(op::SetFunctionName {
             function: value,
             name: key,
-            prefix: prefix as u32,
+            prefix: prefix as u8,
         });
-        emit_put_by_value(
-            self,
-            &ScopedOperand::plain(object),
-            &ScopedOperand::plain(key),
-            &ScopedOperand::plain(value),
-            kind,
-        );
+        emit_put_by_value(self, object, key, value, kind);
         self.release_temporaries_from(object.index() + 1);
     }
 
@@ -3184,17 +3717,11 @@ impl Generator<'_> {
             self.put(op::SetFunctionName {
                 function: value,
                 name: key,
-                prefix: FunctionNamePrefix::None as u32,
+                prefix: FunctionNamePrefix::None as u8,
             });
         }
         let object = *self.context.stream.values.last().expect("an object is being built");
-        emit_put_by_value(
-            self,
-            &ScopedOperand::plain(object.a),
-            &ScopedOperand::plain(key),
-            &ScopedOperand::plain(value),
-            libjs_abi::PutKind::Own,
-        );
+        emit_put_by_value(self, object.a, key, value, libjs_abi::PutKind::Own);
         self.release_temporaries_from(object.a.index() + 1);
     }
 
@@ -3250,19 +3777,56 @@ impl Generator<'_> {
     ) {
         let first_temporary = self.next_temporary();
         let dst = self.temporary();
-        self.put_with_destination(
-            op::NewFunction {
+        if let Ok(index) = u16::try_from(shared_function_data_index) {
+            self.put_with_destination(
+                op::NewFunction {
+                    dst,
+                    shared_function_data_index: index,
+                    lhs_name,
+                    home_object,
+                },
                 dst,
-                shared_function_data_index,
-                lhs_name,
-                home_object,
-            },
-            dst,
-        );
+            );
+        } else {
+            self.put_with_destination(
+                op::NewFunctionWide {
+                    dst,
+                    shared_function_data_index,
+                    lhs_name,
+                    home_object,
+                },
+                dst,
+            );
+        }
         self.push_value(dst, first_temporary);
     }
 
+    /// A function object for the function at index `shared_function_data_index`, in `dst`.
+    pub(super) fn put_new_function(&mut self, dst: Operand, shared_function_data_index: u32) {
+        if let Ok(index) = u16::try_from(shared_function_data_index) {
+            self.put(op::NewFunction {
+                dst,
+                shared_function_data_index: index,
+                lhs_name: None,
+                home_object: None,
+            });
+        } else {
+            self.put(op::NewFunctionWide {
+                dst,
+                shared_function_data_index,
+                lhs_name: None,
+                home_object: None,
+            });
+        }
+    }
+
     // --- Statements ---
+
+    /// Whether the value of an expression statement is what the code completes with, should it be the last one.
+    #[inline(always)]
+    pub(super) fn tracks_completion(&self) -> bool {
+        self.context.stream.completion.is_some()
+    }
 
     /// What the statement evaluated is of no use.
     #[inline(always)]
@@ -3285,10 +3849,7 @@ impl Generator<'_> {
     pub(super) fn reset_completion(&mut self) {
         if let Some(completion) = self.context.stream.completion {
             let undefined = self.context.constants.add_undefined();
-            self.put(op::Mov {
-                dst: completion,
-                src: undefined,
-            });
+            self.emit_mov(completion, undefined);
         }
     }
 
@@ -3296,20 +3857,14 @@ impl Generator<'_> {
     pub(super) fn save_completion(&mut self) -> Option<Operand> {
         let completion = self.context.stream.completion?;
         let saved = self.held_register();
-        self.put(op::Mov {
-            dst: saved,
-            src: completion,
-        });
+        self.emit_mov(saved, completion);
         self.reset_completion();
         Some(saved)
     }
 
     pub(super) fn restore_completion(&mut self, saved: Option<Operand>) {
         if let (Some(completion), Some(saved)) = (self.context.stream.completion, saved) {
-            self.put(op::Mov {
-                dst: completion,
-                src: saved,
-            });
+            self.emit_mov(completion, saved);
         }
     }
 
@@ -3334,12 +3889,10 @@ impl Generator<'_> {
             }
             let target = self.pop_value();
             self.store_to_target(target, value, kind != DeclarationKind::Var);
-        } else {
+        } else if kind != DeclarationKind::Var {
             let target = self.pop_value();
-            if kind != DeclarationKind::Var {
-                let undefined = self.context.constants.add_undefined();
-                self.store_to_target(target, undefined, true);
-            }
+            let undefined = self.context.constants.add_undefined();
+            self.store_to_target(target, undefined, true);
         }
         if target_ident.local_type == Some(LocalType::Variable) {
             self.mark_local_initialized(target_ident.local_index);
@@ -3583,16 +4136,19 @@ impl Generator<'_> {
     pub(super) fn target_of_declaration(&mut self, ident: Identifier) {
         // NB: The object of a `with` can have a property of the name of a `var`, which is what gets written then.
         if self.context.scope.is_in_with() && ident.declaration_kind == Some(DeclarationKind::Var) {
-            self.target_of_identifier(Identifier {
-                is_global: false,
-                ..ident
-            });
+            self.target_of_identifier(
+                Identifier {
+                    is_global: false,
+                    ..ident
+                },
+                TargetBinding::Known,
+            );
             return;
         }
         // NB: What a `var` of a program is, is as open as for any other reference.
         if self.context.scope.is_program() && ident.declaration_kind == Some(DeclarationKind::Var) && !ident.is_local()
         {
-            self.target_of_identifier(ident);
+            self.target_of_identifier(ident, TargetBinding::Known);
             return;
         }
         let first_temporary = self.next_temporary();
@@ -3640,14 +4196,87 @@ impl Generator<'_> {
         self.insert_body_head();
     }
 
+    /// Gives the constants that are used the most the slots that instructions can name.
+    fn order_constants_by_use(&mut self, constant_uses: &[u32], new_constant_indices: &mut [u32]) {
+        let mut used: Vec<usize> = (0..constant_uses.len())
+            .filter(|&index| constant_uses[index] != 0)
+            .collect();
+        used.sort_by_key(|&index| core::cmp::Reverse(constant_uses[index]));
+        let mut values: Vec<Option<ConstantValue>> = core::mem::take(&mut self.context.constants.values)
+            .into_iter()
+            .map(Some)
+            .collect();
+        self.context.constants.values = used
+            .iter()
+            .map(|&index| {
+                values[new_constant_indices[index] as usize]
+                    .take()
+                    .expect("each constant once")
+            })
+            .collect();
+        for (new_index, &index) in used.iter().enumerate() {
+            new_constant_indices[index] = u32_from_usize(new_index);
+        }
+    }
+
     /// Assembles what was emitted into a new block, which has `other_tables_size` bytes left: the operands that come
     /// after the registers get their place in the frame, and labels their offsets.
     pub(super) fn finish_stream(&mut self, other_tables_size: usize) -> (AssembledBytecode, SliceBlockBuilder) {
-        let frame = FrameLayout {
+        // NB: Only code that runs in frames without a function starts without Enter, and those frames keep their
+        //     private environment anyway.
+        // NB: EnterWithOwnEnvironments binds the this value of sloppy functions too.
+        debug_assert!(
+            !self.coerces_this || self.context.stream.head.bytes.first() == Some(&(OpCode::Enter as u8)),
+            "code that binds its this value runs in frames of a function"
+        );
+        if let Some(enter) = self.context.stream.head.bytes.first_mut()
+            && *enter == OpCode::Enter as u8
+        {
+            if self.keeps_own_environments {
+                *enter = OpCode::EnterWithOwnEnvironments as u8;
+            } else if self.coerces_this {
+                *enter = OpCode::EnterCoercingThis as u8;
+            }
+        }
+        // NB: Folding leaves constants that nothing uses, and they would take up slots in every frame.
+        let mut constant_uses = vec![0u32; self.context.constants.values.len()];
+        let stream = &self.context.stream;
+        for position in stream
+            .head
+            .operand_positions
+            .iter()
+            .chain(&stream.current.operand_positions)
+        {
+            if position.operand_type == OperandType::Constant {
+                constant_uses[position.index as usize] += 1;
+            }
+        }
+        let mut used_constant_count = 0;
+        let mut new_constant_indices: Vec<u32> = constant_uses
+            .iter()
+            .map(|&uses| {
+                let new_index = used_constant_count;
+                used_constant_count += u32::from(uses != 0);
+                new_index
+            })
+            .collect();
+        let mut uses = constant_uses.iter();
+        self.context
+            .constants
+            .values
+            .retain(|_| *uses.next().expect("a count per constant") != 0);
+        let mut frame = FrameLayout {
             register_count: self.context.stream.temporary_count.max(Register::RESERVED_COUNT),
             local_count: self.context.scope.local_count(),
-            constant_count: u32_from_usize(self.context.constants.values.len()),
+            constant_count: used_constant_count,
         };
+        if frame.start_of(OperandType::Argument) + self.context.stream.number_of_arguments > FIRST_WIDE_SLOT {
+            // NB: Constants that come after the slots that operands can name are wide whatever their order.
+            if frame.start_of(OperandType::Constant) < FIRST_WIDE_SLOT {
+                self.order_constants_by_use(&constant_uses, &mut new_constant_indices);
+            }
+            frame = self.context.stream.spill_wide_slots(frame, &new_constant_indices);
+        }
         let stream = &mut self.context.stream;
         let head = &stream.head;
         let segment = &mut stream.current;
@@ -3669,29 +4298,49 @@ impl Generator<'_> {
                 });
             }
         }
-        let source_entry_count = head.source_entries.len() + segment.source_entries.len();
+        let segment_start = u32_from_usize(head.bytes.len());
+        let mut source_map_bytes = Vec::with_capacity((head.source_entries.len() + segment.source_entries.len()) * 3);
+        encode_source_map(
+            head.source_entries.len() + segment.source_entries.len(),
+            head.source_entries
+                .iter()
+                .copied()
+                .chain(
+                    segment
+                        .source_entries
+                        .iter()
+                        .map(|&(bytecode_offset, source_offset)| (bytecode_offset + segment_start, source_offset)),
+                )
+                .map(|(bytecode_offset, source_offset)| SourceOffsetEntry {
+                    bytecode_offset,
+                    source_offset,
+                }),
+            &mut source_map_bytes,
+        );
         // SAFETY: The slices and the block end up in an ExecutableData, which drops the slices first.
         let mut block = unsafe {
             SliceBlock::builder(
                 SliceBlock::room_for::<u8>(head.bytes.len() + segment.bytes.len())
-                    + SliceBlock::room_for::<SourceOffsetEntry>(source_entry_count)
-                    + SliceBlock::room_for::<ExceptionHandler>(exception_handlers.len())
+                    + SliceBlock::room_for::<u8>(source_map_bytes.len())
                     + other_tables_size,
             )
         };
         let mut bytecode = block.slice_from_parts(&head.bytes, &segment.bytes);
-        let head_positions = head.operand_positions.iter().map(|position| position.offset);
+        let head_positions = head
+            .operand_positions
+            .iter()
+            .map(|position| (position.offset, *position));
         let positions = segment
             .operand_positions
             .iter()
-            .map(|position| position.offset + head_size);
-        for offset in head_positions.chain(positions) {
-            let at = offset as usize;
-            let bytes = &mut bytecode[at..at + 4];
-            let raw = u32::from_ne_bytes((&*bytes).try_into().expect("an operand is four bytes"));
-            let mut operand = Operand::from_raw(raw);
-            operand.offset_index_by(frame.start_of(operand.operand_type()));
-            bytes.copy_from_slice(&operand.raw().to_ne_bytes());
+            .map(|position| (position.offset + head_size, *position));
+        for (offset, position) in head_positions.chain(positions) {
+            let index = match position.operand_type {
+                OperandType::Constant => new_constant_indices[position.index as usize],
+                _ => position.index,
+            };
+            let slot = index + frame.start_of(position.operand_type);
+            bytecode[offset as usize] = u8::try_from(slot).expect("frame slots that instructions name fit in 8 bits");
         }
         for position in &segment.label_positions {
             let at = (position.offset + head_size) as usize;
@@ -3699,24 +4348,18 @@ impl Generator<'_> {
             let label = u32::from_ne_bytes((&*bytes).try_into().expect("a label is four bytes"));
             bytes.copy_from_slice(&(stream.labels[label as usize] + head_size).to_ne_bytes());
         }
-        let head_entries = head.source_entries.iter().copied();
-        let entries = segment
-            .source_entries
+        let source_map = block.slice_of_length(source_map_bytes.len(), source_map_bytes.iter().copied());
+        let strict_ranges = head
+            .strict_ranges
             .iter()
-            .map(|&(bytecode_offset, source_offset)| (bytecode_offset + head_size, source_offset));
-        let source_map = block.slice_of_length(
-            source_entry_count,
-            head_entries
-                .chain(entries)
-                .map(|(bytecode_offset, source_offset)| SourceOffsetEntry {
-                    bytecode_offset,
-                    source_offset,
-                }),
-        );
+            .copied()
+            .chain(segment.strict_ranges.iter().map(|range| range.shifted(head_size)))
+            .collect();
         let assembled = AssembledBytecode {
             bytecode,
+            strict_ranges,
             source_map,
-            exception_handlers: block.slice(exception_handlers.into_iter()),
+            exception_handlers: exception_handlers.into_boxed_slice(),
             number_of_registers: frame.register_count,
             number_of_arguments: stream.number_of_arguments,
         };

@@ -7,6 +7,7 @@
 
 #pragma once
 
+#include <AK/Array.h>
 #include <AK/Optional.h>
 #include <AK/kmalloc.h>
 #include <LibURL/URL.h>
@@ -16,6 +17,8 @@
 #include <LibWebView/Forward.h>
 #include <LibWebView/Settings.h>
 #include <UI/Qt/FullscreenDebounce.h>
+#include <UI/Qt/MacWindow.h>
+#include <UI/Qt/PageCard.h>
 #include <UI/Qt/SessionStore.h>
 #include <UI/Qt/Tab.h>
 #include <UI/Qt/TabBar.h>
@@ -33,6 +36,8 @@ class QWidget;
 class QWindow;
 
 namespace Ladybird {
+
+class MenuZoomRow;
 
 class Tab;
 class TabBarButton;
@@ -166,6 +171,7 @@ public:
     BookmarksBar& bookmarks_bar() const { return m_tabs_container->bookmarks_bar(); }
     // Closes a tab that isn't worth reopening, such as an empty tab that other tabs took the place of.
     void close_tab_without_keeping_it(int index);
+    void discard_tab(Tab&);
 
     // Pinned tabs always fill the start of the strip: indices [0, pinned_tab_count()).
     int pinned_tab_count() const;
@@ -182,6 +188,14 @@ public:
     // Opens a window's restored tabs, keeping the session rows the store re-adopted for them.
     void restore_tabs(Vector<RestoredSessionTab> const&, i64 active_tab_index);
     Tab* current_tab() const { return m_current_tab; }
+
+    enum class PageCardSlot : u8 {
+        RestoreSession,
+        Update,
+    };
+    void show_page_card(PageCardSlot, QString const& title, QString const& text, Vector<PageCard::Button>);
+    void reposition_page_cards();
+
     Tab* activate_tab_with_url(URL::URL const&, URL::ExcludeFragment);
     // Asks every tab's page if the window may close, without closing it, and reports the answer. Once the pages agree,
     // a close() goes straight through.
@@ -202,6 +216,7 @@ public:
 
     LadybirdButton& ladybird_button() const { return m_tabs_container->ladybird_button(); }
     static bool has_chrome_in_titlebar();
+    void window_control_buttons_changed();
 
     void show_window_context_menu(QPoint global_position);
 
@@ -234,23 +249,26 @@ public:
 
     double refresh_rate() const { return m_screen_observer->refresh_rate(); }
     Optional<u64> display_id() const { return m_screen_observer->display_id(); }
+    bool screen_shows_high_dynamic_range() const { return m_screen_observer->screen_shows_high_dynamic_range(); }
 
     void on_devtools_enabled();
     void on_devtools_disabled();
 
     void set_window_rect(Optional<Web::DevicePixels> x, Optional<Web::DevicePixels> y, Optional<Web::DevicePixels> width, Optional<Web::DevicePixels> height);
+    // Returns the rect made no larger than the bounds, and moved to be inside them.
+    static QRect rect_fitted_into(QRect, QRect const& bounds);
+    void place_popup_window(Web::HTML::WebViewHints const&, QScreen const& opener_screen);
 
 public slots:
     void tab_title_changed(int index, QString const&);
     void tab_favicon_changed(int index, QIcon const& icon);
-    void tab_playing_audio_indicator_changed(int index);
+    void tab_audio_state_changed(int index);
     Tab& new_tab_from_url(URL::URL const&, Web::HTML::ActivateTab, TabLocation);
     void open_new_tab();
     void activate_tab(int index);
     bool definitely_close_tab(int index);
     void move_tab(int old_index, int new_index);
     void request_to_close_tab(int index);
-    void request_to_close_current_tab();
     void open_next_tab();
     void open_previous_tab();
     void show_all_tabs();
@@ -296,9 +314,6 @@ private:
     void initialize_application_actions();
     void initialize_application_menu();
     void initialize_ladybird_menu();
-    QAction* create_ladybird_menu_zoom_row();
-    void update_ladybird_menu_zoom_icons();
-    void update_ladybird_menu_zoom_level();
     void initialize_window_context_menu();
 
     void update_chrome_style();
@@ -328,6 +343,8 @@ private:
 
     TabWidget* m_tabs_container { nullptr };
     Tab* m_current_tab { nullptr };
+    Array<QPointer<PageCard>, 2> m_page_cards;
+    QPointer<WebContentView> m_page_cards_view;
     Vector<QPointer<Tab>> m_background_tabs_from_current_tab;
     DevToolsBanner* m_devtools_banner { nullptr };
 
@@ -337,10 +354,7 @@ private:
     QToolButton* m_menu_bar_close_window_button { nullptr };
 
     QMenu* m_ladybird_menu { nullptr };
-    QWidget* m_ladybird_menu_zoom_row { nullptr };
-    QPushButton* m_ladybird_menu_zoom_out { nullptr };
-    QPushButton* m_ladybird_menu_zoom_level { nullptr };
-    QPushButton* m_ladybird_menu_zoom_in { nullptr };
+    MenuZoomRow* m_ladybird_menu_zoom_row { nullptr };
 
     QMenu* m_window_context_menu { nullptr };
     QAction* m_reopen_closed_tab_action { nullptr };
@@ -354,6 +368,7 @@ private:
     size_t m_acknowledged_failed_download_count { 0 };
     Optional<i64> m_window_close_active_tab_index;
     bool m_window_was_fullscreen_before_page { false };
+    bool m_window_was_maximized_before_page { false };
     QPointer<Tab> m_window_close_original_active_tab;
     QPointer<Tab> m_window_close_current_preflight_tab;
     Vector<QPointer<Tab>> m_window_close_approved_tabs;
@@ -371,6 +386,9 @@ private:
     u64 m_last_left_press_timestamp { 0 };
     u64 m_last_double_click_timestamp { 0 };
     bool m_double_click_started_elsewhere { false };
+#if defined(AK_OS_MACOS)
+    Optional<AppKitWindowChromeSnapshots> m_window_chrome_snapshots;
+#endif
 };
 
 }

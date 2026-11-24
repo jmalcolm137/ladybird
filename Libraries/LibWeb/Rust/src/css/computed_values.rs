@@ -247,8 +247,11 @@ impl_computed_payload_clone_and_eq!(InheritedTextValues {
     font_smoothing,
     webkit_text_fill_color => paint_only,
     webkit_text_fill_color_is_current_color => paint_only,
+    webkit_text_stroke_color => paint_only,
+    webkit_text_stroke_width => paint_only,
     text_shadow,
     text_transform,
+    text_security,
     text_wrap_style,
     text_decoration_skip_ink,
     text_underline_position,
@@ -302,6 +305,7 @@ impl_computed_payload_clone_and_eq!(MiscLayoutValues {
     appearance,
     computed_appearance,
     native_appearance_disabled,
+    user_agent_margin_sides,
     outline_style,
     object_fit,
     column_height,
@@ -344,6 +348,7 @@ impl Clone for FontValues {
             resolved_font_ascent: self.resolved_font_ascent,
             resolved_font_descent: self.resolved_font_descent,
             resolved_font_x_height: self.resolved_font_x_height,
+            resolved_font_cap_height: self.resolved_font_cap_height,
             resolved_font_zero_advance: self.resolved_font_zero_advance,
             resolved_first_available_font: self.resolved_first_available_font,
             font_cascade_list: self.font_cascade_list.clone(),
@@ -386,6 +391,7 @@ impl PartialEq for FontValues {
             || (self.resolved_font_ascent == other.resolved_font_ascent
                 && self.resolved_font_descent == other.resolved_font_descent
                 && self.resolved_font_x_height == other.resolved_font_x_height
+                && self.resolved_font_cap_height == other.resolved_font_cap_height
                 && self.resolved_font_zero_advance == other.resolved_font_zero_advance
                 && self.resolved_first_available_font == other.resolved_first_available_font);
         first_available_fonts_equal
@@ -1583,6 +1589,13 @@ impl Drop for ComputedGroups {
 }
 
 impl StyleGroups {
+    /// Asks the processor to fetch the sets of groups the groups are in, without waiting for them.
+    pub(crate) fn prefetch_sets(&self) {
+        crate::css::declaration_block::prefetch(self.inherited.0.as_ptr().cast_const());
+        crate::css::declaration_block::prefetch(self.rare.0.as_ptr().cast_const());
+        crate::css::declaration_block::prefetch(self.visual.0.as_ptr().cast_const());
+    }
+
     /// Takes over one reference to each of `pointers` but the `borrowed` ones, with `bits` beside
     /// them, sharing the sets of `shares` that hold the same.
     ///
@@ -2520,6 +2533,12 @@ pub extern "C" fn rust_sizing_values_clamp_size(
     *height = clamp(*height, basis_height, &values.min_height, &values.max_height);
 }
 
+/// The computed font size of a font group, unrounded, as [`FontValues::font_size_for_lengths`] reads it.
+#[unsafe(no_mangle)]
+pub extern "C" fn rust_font_values_font_size_for_lengths(values: &FontValues) -> f64 {
+    values.font_size_for_lengths()
+}
+
 /// The used line height of a font group, as [`FontValues::line_height_used`] reads it.
 #[unsafe(no_mangle)]
 pub extern "C" fn rust_font_values_line_height_used_raw(values: &FontValues) -> i32 {
@@ -2560,6 +2579,8 @@ pub(crate) enum GroupFieldKind {
     EnumKeyword(fn(u16) -> Option<u8>),
     /// A number stored as f64.
     F64,
+    /// A nonnegative pixel length stored without fixed-point rounding.
+    PixelLengthF64,
     /// A pixel length stored as raw CSSPixels (i32).
     CssPixels,
     /// A pixel length stored as raw CSSPixels, clamped at zero.
@@ -2698,8 +2719,11 @@ pub(crate) fn group_field_descriptors(group: usize) -> &'static [GroupFieldDescr
             COLOR @ color_style_value => RetainedData,
             _WEBKIT_TEXT_FILL_COLOR @ webkit_text_fill_color => Color,
             _WEBKIT_TEXT_FILL_COLOR @ webkit_text_fill_color_is_current_color => KeywordEqualsBool(k::CURRENTCOLOR),
+            _WEBKIT_TEXT_STROKE_COLOR @ webkit_text_stroke_color => HeldColor,
+            _WEBKIT_TEXT_STROKE_WIDTH @ webkit_text_stroke_width => PixelLengthF64,
             TEXT_SHADOW => RequireKeyword(k::NONE),
             TEXT_JUSTIFY @ text_justify => EnumKeyword(enums::keyword_to_text_justify),
+            _WEBKIT_TEXT_SECURITY @ text_security => EnumKeyword(enums::keyword_to_text_security),
             TEXT_TRANSFORM @ text_transform => EnumKeyword(enums::keyword_to_text_transform),
             TEXT_WRAP_STYLE @ text_wrap_style => EnumKeyword(enums::keyword_to_text_wrap_style),
             TEXT_DECORATION_SKIP_INK @ text_decoration_skip_ink => EnumKeyword(enums::keyword_to_text_decoration_skip_ink),
@@ -3035,7 +3059,7 @@ impl StyleGroupMasks {
 
     const fn compute() -> Self {
         use crate::css::property_metadata::property_id::{
-            CONTENT_VISIBILITY, DIRECTION, POSITION_ANCHOR, WRITING_MODE,
+            APPEARANCE, CONTENT_VISIBILITY, DIRECTION, POSITION_ANCHOR, WRITING_MODE,
         };
         use crate::css::property_metadata::{
             FIRST_INHERITED_PROPERTY_ID, FIRST_LONGHAND_PROPERTY_ID, LAST_INHERITED_PROPERTY_ID,
@@ -3092,6 +3116,8 @@ impl StyleGroupMasks {
         }
         masks[index(DIRECTION)] |= logical_mapping_mask;
         masks[index(WRITING_MODE)] |= logical_mapping_mask;
+        // Appearance controls the line-height adjustment of select elements.
+        masks[index(APPEARANCE)] |= 1 << crate::css::table_group_builder::group_index::FONT;
         // NB: The box group holds the used containment flags implied by hidden content visibility.
         masks[index(CONTENT_VISIBILITY)] |= 1 << crate::css::table_group_builder::group_index::BOX;
         // NB: The surround group holds whether the element names a default anchor, which layout reads beside the
@@ -3285,6 +3311,10 @@ style_bit_fields! {
         INHERITED_BITS_TEXT_WRAP_MODE_SHIFT, INHERITED_BITS_TEXT_WRAP_MODE_WIDTH;
     Inherited WordBreak: WORD_BREAK, word_break::NORMAL, keyword_to_word_break,
         INHERITED_BITS_WORD_BREAK_SHIFT, INHERITED_BITS_WORD_BREAK_WIDTH;
+    Inherited TextAlignLast: TEXT_ALIGN_LAST, text_align_last::AUTO, keyword_to_text_align_last,
+        INHERITED_BITS_TEXT_ALIGN_LAST_SHIFT, INHERITED_BITS_TEXT_ALIGN_LAST_WIDTH;
+    Inherited Hyphens: HYPHENS, hyphens::MANUAL, keyword_to_hyphens,
+        INHERITED_BITS_HYPHENS_SHIFT, INHERITED_BITS_HYPHENS_WIDTH;
     Reset Position: POSITION, positioning::STATIC, keyword_to_positioning,
         RESET_BITS_POSITION_SHIFT, RESET_BITS_POSITION_WIDTH;
     Reset Float: FLOAT, float::NONE, keyword_to_float,
@@ -3625,7 +3655,7 @@ const PAYLOAD_TYPED_LONGHANDS: [(u16, usize, usize, u8); 18] = {
 
 /// The longhands whose computed value a handle of their group's payload holds as it is, by the
 /// handle's offset: the group's values keep no second copy of them.
-const PAYLOAD_HANDLE_LONGHANDS: [(u16, usize, usize); 53] = {
+const PAYLOAD_HANDLE_LONGHANDS: [(u16, usize, usize); 54] = {
     use crate::css::computed_value_types::{BackgroundValues, EffectsValues, FontValues, MaskValues, SVGResetValues};
     use crate::css::property_metadata::property_id as p;
     use std::mem::offset_of;
@@ -3635,6 +3665,11 @@ const PAYLOAD_HANDLE_LONGHANDS: [(u16, usize, usize); 53] = {
     let effects = group_index::EFFECTS;
     let svg_reset = group_index::SVG_RESET;
     [
+        (
+            p::BLOCK_ELLIPSIS,
+            group_index::INHERITED_TEXT,
+            offset_of!(InheritedTextValues, block_ellipsis),
+        ),
         (
             p::BACKGROUND_IMAGE,
             background,
@@ -4124,12 +4159,16 @@ impl crate::heap_size::HeapSize for InheritanceDependentValue {
 #[derive(Clone)]
 pub(crate) struct GroupValueFacts {
     inheritance_dependent_values: Option<std::sync::Arc<[InheritanceDependentValue]>>,
+    /// Computed background lists with entries beyond the image layers, for keyframe reflection.
+    uncoordinated_background_values: Option<std::sync::Arc<Vec<(u16, RetainedStyleValueData)>>>,
     effective_zoom: f32,
     display_before_box_type_transformation: u32,
     effective_color_scheme: i8,
+    /// What the origins of the element's winning declarations decide for its box: whether an author declaration
+    /// disables its native appearance (`NATIVE_APPEARANCE_DISABLED_FACT`), and the physical sides whose margins the
+    /// user agent's style sheet sets in a quirks-mode document (`user_agent_margin_side` bits).
     /// https://drafts.csswg.org/css-ui/#appearance-disabling-properties
-    /// Whether an author declaration disables the element's native appearance.
-    native_appearance_disabled: bool,
+    origin_facts: u8,
     /// What of the recorded specified values a group build reads in place of computed values, by
     /// [`read_in_place_bits_of`], so that a build of another group mostly need not look through them.
     read_in_place_bits: u16,
@@ -4137,6 +4176,11 @@ pub(crate) struct GroupValueFacts {
     /// values or the inherited values that read it.
     current_color_groups: u32,
 }
+
+/// The bit of [`GroupValueFacts::origin_facts`] that says an author declaration disables the element's native
+/// appearance. The bits below it are `user_agent_margin_side` bits.
+const NATIVE_APPEARANCE_DISABLED_FACT: u8 = 1 << 7;
+const USER_AGENT_MARGIN_SIDES_FACTS: u8 = 0x0f;
 
 /// The bits standing for `groups` among the recorded values a group build reads in place: those of
 /// their indices, each group sharing its bit with any other sixteen indices away.
@@ -4156,7 +4200,7 @@ fn read_in_place_bit(property: u16) -> u16 {
 
 impl crate::heap_size::HeapSize for GroupValueFacts {
     fn heap_size(&self, sizer: &mut crate::heap_size::HeapSizer) -> usize {
-        self.inheritance_dependent_values.heap_size(sizer)
+        self.inheritance_dependent_values.heap_size(sizer) + self.uncoordinated_background_values.heap_size(sizer)
     }
 }
 
@@ -4166,13 +4210,26 @@ impl GroupValueFacts {
     pub(crate) fn empty() -> Self {
         Self {
             inheritance_dependent_values: None,
+            uncoordinated_background_values: None,
             effective_zoom: 1.0,
             display_before_box_type_transformation: 0,
             effective_color_scheme: -1,
-            native_appearance_disabled: false,
+            origin_facts: 0,
             read_in_place_bits: 0,
             current_color_groups: 0,
         }
+    }
+
+    pub(crate) fn uncoordinated_background_value(&self, property: u16) -> Option<&RetainedStyleValueData> {
+        self.uncoordinated_background_values
+            .as_ref()?
+            .iter()
+            .find(|(held, _)| *held == property)
+            .map(|(_, value)| value)
+    }
+
+    fn same_uncoordinated_background_values(&self, other: &Self) -> bool {
+        self.uncoordinated_background_values == other.uncoordinated_background_values
     }
 
     /// The groups holding colors resolved against `currentcolor`.
@@ -4232,7 +4289,11 @@ impl GroupValueFacts {
     }
 
     pub(crate) fn native_appearance_disabled(&self) -> bool {
-        self.native_appearance_disabled
+        self.origin_facts & NATIVE_APPEARANCE_DISABLED_FACT != 0
+    }
+
+    pub(crate) fn user_agent_margin_sides(&self) -> u8 {
+        self.origin_facts & USER_AGENT_MARGIN_SIDES_FACTS
     }
 
     /// Whether these and `other` publish the same recorded specified values, zoom, box display
@@ -4244,10 +4305,11 @@ impl GroupValueFacts {
             other.inheritance_dependent_values.as_deref().unwrap_or_default(),
         );
         let same_recorded_values = std::ptr::eq(mine, theirs);
-        self.effective_zoom.to_bits() == other.effective_zoom.to_bits()
+        self.same_uncoordinated_background_values(other)
+            && self.effective_zoom.to_bits() == other.effective_zoom.to_bits()
             && self.display_before_box_type_transformation == other.display_before_box_type_transformation
             && self.effective_color_scheme == other.effective_color_scheme
-            && self.native_appearance_disabled == other.native_appearance_disabled
+            && self.origin_facts == other.origin_facts
             && (same_recorded_values
                 || (mine.len() == theirs.len()
                     && mine.iter().all(|held| {
@@ -4270,15 +4332,18 @@ impl GroupValueFacts {
             values.sort_unstable();
             values
         };
+        if !self.same_uncoordinated_background_values(other) {
+            return Some("the uncoordinated background values".into());
+        }
         if recorded(self) != recorded(other) {
             return Some("the recorded specified values".into());
         }
         if self.effective_zoom.to_bits() != other.effective_zoom.to_bits()
             || self.display_before_box_type_transformation != other.display_before_box_type_transformation
             || self.effective_color_scheme != other.effective_color_scheme
-            || self.native_appearance_disabled != other.native_appearance_disabled
+            || self.origin_facts != other.origin_facts
         {
-            return Some("the zoom, box display, color scheme or native appearance".into());
+            return Some("the zoom, box display, color scheme, native appearance or user-agent margins".into());
         }
         None
     }
@@ -4777,6 +4842,7 @@ pub(crate) struct GroupValuesWriter<'a> {
     /// The recorded specified values of the longhands whose computed values depend on what the
     /// element inherits, once the computation records others than the seeded ones.
     inheritance_dependent_values: Option<Vec<(u16, RetainedStyleValueData)>>,
+    uncoordinated_background_values: Option<std::sync::Arc<Vec<(u16, RetainedStyleValueData)>>>,
     effective_zoom: f32,
     display_before_box_type_transformation: u32,
     effective_color_scheme: i16,
@@ -4785,6 +4851,8 @@ pub(crate) struct GroupValuesWriter<'a> {
     flags: crate::css::computed_longhand_table::LonghandTableFlags,
     /// What the computed values depend on, as `DEPENDS_ON_VIEWPORT_METRICS` and the like.
     dependency_flags: u8,
+    /// The physical sides whose margins the user agent's style sheet sets, where the computation records them.
+    user_agent_margin_sides: u8,
 }
 
 /// A value written over an element's seeded values, at its place among them.
@@ -4848,11 +4916,13 @@ impl<'a> GroupValuesWriter<'a> {
             },
             seeded_inheritance_dependent_values: initial.facts.inheritance_dependent_values.clone(),
             inheritance_dependent_values: None,
+            uncoordinated_background_values: initial.facts.uncoordinated_background_values.clone(),
             effective_zoom: parent.facts.effective_zoom,
             display_before_box_type_transformation: initial.facts.display_before_box_type_transformation,
             effective_color_scheme: parent.facts.effective_color_scheme(),
             flags,
             dependency_flags,
+            user_agent_margin_sides: 0,
         }
     }
 
@@ -5022,6 +5092,24 @@ impl<'a> GroupValuesWriter<'a> {
         });
     }
 
+    pub(crate) fn set_uncoordinated_background_value(&mut self, property: u16, value: Option<RetainedStyleValueData>) {
+        if self.uncoordinated_background_values.is_none() && value.is_none() {
+            return;
+        }
+        let values = self
+            .uncoordinated_background_values
+            .get_or_insert_with(Default::default);
+        let values = std::sync::Arc::make_mut(values);
+        values.retain(|(held, _)| *held != property);
+        if let Some(value) = value {
+            values.push((property, value));
+            values.sort_by_key(|(property, _)| *property);
+        }
+        if values.is_empty() {
+            self.uncoordinated_background_values = None;
+        }
+    }
+
     /// Records `value` as the specified value of `property` where its computed value depends on
     /// what the element inherits, or that it does not depend on it for none.
     pub(crate) fn set_inheritance_dependent_value(&mut self, property: u16, value: Option<RetainedStyleValueData>) {
@@ -5137,6 +5225,11 @@ impl<'a> GroupValuesWriter<'a> {
     /// Adds `flags` to what the computed values depend on.
     pub(crate) fn merge_dependency_flags(&mut self, flags: u8) {
         self.dependency_flags |= flags;
+    }
+
+    /// Records the physical sides whose margins the user agent's style sheet sets, as `user_agent_margin_side` bits.
+    pub(crate) fn set_user_agent_margin_sides(&mut self, sides: u8) {
+        self.user_agent_margin_sides = sides;
     }
 
     /// Records whether an author declaration disables the element's native appearance.
@@ -5265,11 +5358,17 @@ impl<'a> GroupValuesWriter<'a> {
                 bits: self.bits,
                 facts: GroupValueFacts {
                     inheritance_dependent_values,
+                    uncoordinated_background_values: self.uncoordinated_background_values,
                     effective_zoom: self.effective_zoom,
                     display_before_box_type_transformation: self.display_before_box_type_transformation,
                     effective_color_scheme: i8::try_from(self.effective_color_scheme)
                         .expect("a color scheme is a small code"),
-                    native_appearance_disabled,
+                    origin_facts: self.user_agent_margin_sides
+                        | if native_appearance_disabled {
+                            NATIVE_APPEARANCE_DISABLED_FACT
+                        } else {
+                            0
+                        },
                     read_in_place_bits,
                     current_color_groups: 0,
                 },
@@ -5347,6 +5446,16 @@ fn decode_group_field_pokes<'a>(
                     return None;
                 };
                 pokes.push(Poke::F64(offset, *value));
+            }
+            Kind::PixelLengthF64 => {
+                let length = match data {
+                    StyleValueData::Length { value, unit } if *unit == px_length_unit() => *value,
+                    StyleValueData::Calculated { .. } => {
+                        crate::css::calc::resolve_calculated_length_without_context(data, 0.0)?
+                    }
+                    _ => return None,
+                };
+                pokes.push(Poke::F64(offset, length.max(0.0)));
             }
             Kind::CssPixels => match data {
                 StyleValueData::Length { value, unit } if *unit == px_length_unit() => pokes.push(Poke::I32(
@@ -5707,6 +5816,8 @@ impl AlignmentValues {
 
         Self {
             webkit_box_orient: crate::css::css_enums::webkit_box_orient::HORIZONTAL,
+            webkit_box_align: crate::css::css_enums::webkit_box_align::STRETCH,
+            webkit_box_pack: crate::css::css_enums::webkit_box_pack::START,
             flex_direction: flex_direction::ROW,
             flex_wrap: flex_wrap::NOWRAP,
             flex_basis: ComputedFlexBasis {
@@ -5715,7 +5826,9 @@ impl AlignmentValues {
             },
             flex_grow: 0.0,
             flex_shrink: 1.0,
+            webkit_box_flex: 0.0,
             order: 0,
+            webkit_box_ordinal_group: 1,
             align_content: align_content::NORMAL,
             align_items: align_items::STRETCH,
             align_self: align_self::AUTO,
@@ -5730,6 +5843,7 @@ impl AlignmentValues {
             align_self_overflow: crate::css::computed_value_types::OVERFLOW_ALIGNMENT_DEFAULT,
             justify_self_overflow: crate::css::computed_value_types::OVERFLOW_ALIGNMENT_DEFAULT,
             align_content_overflow: crate::css::computed_value_types::OVERFLOW_ALIGNMENT_DEFAULT,
+            justify_content_overflow: crate::css::computed_value_types::OVERFLOW_ALIGNMENT_DEFAULT,
             column_gap: ComputedGap {
                 is_normal: true,
                 value: ComputedStyleValueHandle::empty(),
@@ -5952,6 +6066,8 @@ impl SVGResetValues {
             flood_color: crate::css::computed_value_types::StyleColor::rgba(OPAQUE_BLACK_BGRA),
             flood_opacity: 1.0,
             vector_effect: vector_effect::NONE,
+            has_alignment_baseline: false,
+            alignment_baseline: 0,
         }
     }
 }
@@ -6173,7 +6289,10 @@ impl InheritedTextValues {
             font_smoothing: css_enums::font_smoothing::AUTO,
             webkit_text_fill_color: 0xff00_0000,
             webkit_text_fill_color_is_current_color: true,
+            webkit_text_stroke_color: crate::css::computed_value_types::StyleColor::CURRENT_COLOR,
+            webkit_text_stroke_width: 0.0,
             text_shadow: RetainedComputedShadowList::from_vec(Vec::new()),
+            text_security: css_enums::text_security::NONE,
             text_transform: enum_value(css_enums::keyword_to_text_transform(css_enums::keyword::NONE)),
             text_wrap_style: enum_value(css_enums::keyword_to_text_wrap_style(css_enums::keyword::AUTO)),
             text_decoration_skip_ink: enum_value(css_enums::keyword_to_text_decoration_skip_ink(
@@ -6343,7 +6462,6 @@ impl ContentValues {
     }
 
     fn generated_content_facts(&self) -> u8 {
-        use crate::css::css_enums::keyword;
         use crate::layout::counters::LIST_ITEM_COUNTER_NAME;
 
         let mut facts = 0;
@@ -6352,11 +6470,8 @@ impl ContentValues {
                 continue;
             };
             let CounterDefinitionsPayload { counter_definitions } = &**counter_definitions_payload;
-            let definitions = counter_definitions.as_slice();
-            if !definitions.is_empty() {
-                facts |= GENERATED_CONTENT_DEFINES_COUNTERS;
-            }
-            if definitions
+            if counter_definitions
+                .as_slice()
                 .iter()
                 .any(|definition| definition.name().units() == LIST_ITEM_COUNTER_NAME)
             {
@@ -6375,16 +6490,6 @@ impl ContentValues {
                 _ => &[],
             }
         }
-        for item in items(content) {
-            if let StyleValueData::Keyword { keyword } = item.data()
-                && matches!(
-                    *keyword,
-                    keyword::OPEN_QUOTE | keyword::CLOSE_QUOTE | keyword::NO_OPEN_QUOTE | keyword::NO_CLOSE_QUOTE
-                )
-            {
-                facts |= GENERATED_CONTENT_HAS_QUOTES;
-            }
-        }
         if items(content).iter().chain(items(alt_text)).any(|item| {
             matches!(item.data(), StyleValueData::Counter(counter) if counter.counter_name.units() == LIST_ITEM_COUNTER_NAME)
         }) {
@@ -6395,13 +6500,10 @@ impl ContentValues {
 }
 
 /// What a content group's generated content involves, which the DOM asks to know which changes
-/// can renumber or requote it: counter-increment, counter-reset or counter-set define a counter,
-/// one of them defines list-item, the content or its alternative text shows list-item, and the
-/// content has a quote.
-pub const GENERATED_CONTENT_DEFINES_COUNTERS: u8 = 1 << 0;
-pub const GENERATED_CONTENT_DEFINES_LIST_ITEM_COUNTER: u8 = 1 << 1;
-pub const GENERATED_CONTENT_SHOWS_LIST_ITEM_COUNTER: u8 = 1 << 2;
-pub const GENERATED_CONTENT_HAS_QUOTES: u8 = 1 << 3;
+/// can renumber it: counter-increment, counter-reset or counter-set defines list-item, and the
+/// content or its alternative text shows list-item.
+pub const GENERATED_CONTENT_DEFINES_LIST_ITEM_COUNTER: u8 = 1 << 0;
+pub const GENERATED_CONTENT_SHOWS_LIST_ITEM_COUNTER: u8 = 1 << 1;
 
 #[unsafe(no_mangle)]
 pub extern "C" fn rust_content_group_generated_content_facts(content: &ContentValues) -> u8 {
@@ -6467,6 +6569,7 @@ impl MiscLayoutValues {
             appearance: 0,
             computed_appearance: 7,
             native_appearance_disabled: false,
+            user_agent_margin_sides: 0,
             outline_style: 1,
             object_fit: 0,
             column_height: ComputedSize::keyword(ComputedSizeKind::Auto),
@@ -6528,6 +6631,7 @@ impl FontValues {
             resolved_font_ascent: 0.0,
             resolved_font_descent: 0.0,
             resolved_font_x_height: 0.0,
+            resolved_font_cap_height: 0.0,
             resolved_font_zero_advance: 0.0,
             resolved_first_available_font: std::ptr::null(),
             font_cascade_list: libgfx_rust::font::FontCascadeListHandle::null(),
@@ -6598,7 +6702,7 @@ fn alignment_is_last_baseline(data: &RetainedStyleValueData) -> bool {
             Some(StyleValueData::Keyword { keyword: crate::css::css_enums::keyword::LAST })))
 }
 
-/// The explicit overflow alignment of a computed self-alignment value.
+/// The explicit overflow alignment of a computed alignment value.
 fn alignment_overflow(data: &RetainedStyleValueData) -> u8 {
     use crate::css::css_enums::keyword as k;
     use crate::css::style_value::StyleValueData;
@@ -6625,12 +6729,16 @@ fn alignment_overflow(data: &RetainedStyleValueData) -> u8 {
 pub(crate) fn rust_build_alignment_group(
     group_index: usize,
     webkit_box_orient: &RetainedStyleValueData,
+    webkit_box_align: &RetainedStyleValueData,
+    webkit_box_pack: &RetainedStyleValueData,
     flex_direction: &RetainedStyleValueData,
     flex_wrap: &RetainedStyleValueData,
     flex_basis: &RetainedStyleValueData,
     flex_grow: f64,
     flex_shrink: f64,
+    webkit_box_flex: f64,
     order: i32,
+    webkit_box_ordinal_group: i32,
     align_content: &RetainedStyleValueData,
     align_items: &RetainedStyleValueData,
     align_self: &RetainedStyleValueData,
@@ -6656,12 +6764,16 @@ pub(crate) fn rust_build_alignment_group(
         };
         let built = AlignmentValues {
             webkit_box_orient: keyword_code(webkit_box_orient, crate::css::css_enums::keyword_to_webkit_box_orient)?,
+            webkit_box_align: keyword_code(webkit_box_align, crate::css::css_enums::keyword_to_webkit_box_align)?,
+            webkit_box_pack: keyword_code(webkit_box_pack, crate::css::css_enums::keyword_to_webkit_box_pack)?,
             flex_direction: keyword_code(flex_direction, crate::css::css_enums::keyword_to_flex_direction)?,
             flex_wrap: keyword_code(flex_wrap, crate::css::css_enums::keyword_to_flex_wrap)?,
             flex_basis: ComputedFlexBasis::from_data(flex_basis),
             flex_grow,
             flex_shrink,
+            webkit_box_flex,
             order,
+            webkit_box_ordinal_group,
             align_content: alignment_code(align_content, css_enums::keyword_to_align_content, true)?,
             align_items: alignment_code(align_items, css_enums::keyword_to_align_items, false)?,
             align_self: alignment_code(align_self, css_enums::keyword_to_align_self, false)?,
@@ -6676,6 +6788,7 @@ pub(crate) fn rust_build_alignment_group(
             align_self_overflow: alignment_overflow(align_self),
             justify_self_overflow: alignment_overflow(justify_self),
             align_content_overflow: alignment_overflow(align_content),
+            justify_content_overflow: alignment_overflow(justify_content),
             column_gap: ComputedGap::from_data(column_gap),
             row_gap: ComputedGap::from_data(row_gap),
         };
@@ -7114,6 +7227,26 @@ mod tests {
     }
 }
 
+/// Copies the grid template, implicit track sizes, and fit tolerance, which the anonymous content box of a grid
+/// fieldset inherits from the fieldset. The fieldset's own placement in its parent's grid stays with the fieldset.
+// https://html.spec.whatwg.org/multipage/rendering.html#anonymous-fieldset-content-box
+pub(crate) fn copy_fieldset_content_grid_template(source: &GridValues, target: &mut GridValues) {
+    target.names = source.names.clone();
+    target.name_indices = source.name_indices.clone();
+    target.entries = source.entries.clone();
+    target.areas = source.areas.clone();
+    target.template_columns = source.template_columns;
+    target.template_rows = source.template_rows;
+    target.auto_columns = source.auto_columns;
+    target.auto_rows = source.auto_rows;
+    target.grid_template_columns_style_value = source.grid_template_columns_style_value.clone();
+    target.grid_template_rows_style_value = source.grid_template_rows_style_value.clone();
+    target.grid_auto_columns_style_value = source.grid_auto_columns_style_value.clone();
+    target.grid_auto_rows_style_value = source.grid_auto_rows_style_value.clone();
+    target.grid_template_areas_style_value = source.grid_template_areas_style_value.clone();
+    target.fit_tolerance_style_value = source.fit_tolerance_style_value.clone();
+}
+
 pub(crate) fn copy_fieldset_content_alignment(source: &AlignmentValues, target: &mut AlignmentValues) {
     target.flex_direction = source.flex_direction;
     target.flex_wrap = source.flex_wrap;
@@ -7124,6 +7257,7 @@ pub(crate) fn copy_fieldset_content_alignment(source: &AlignmentValues, target: 
     target.align_items_is_last_baseline = source.align_items_is_last_baseline;
     target.align_items_overflow = source.align_items_overflow;
     target.justify_content = source.justify_content;
+    target.justify_content_overflow = source.justify_content_overflow;
     target.justify_items = source.justify_items;
     target.justify_items_overflow = source.justify_items_overflow;
     target.row_gap = source.row_gap.clone();

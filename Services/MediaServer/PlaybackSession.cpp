@@ -26,11 +26,19 @@ PlaybackSession::PlaybackSession(ConnectionFromClient& connection, u64 id, Audio
     m_manager->on_playback_state_change = [this] {
         report_playback_state();
     };
+    m_manager->on_playback_state_settled_change = [this] {
+        // A state change in the same pipeline update may already have reported it.
+        if (m_manager->playback_state_is_settled() != m_reported_playback_state_is_settled)
+            report_playback_state();
+    };
     m_manager->on_duration_change = [this](AK::Duration duration) {
         m_connection.async_playback_session_duration_changed(m_id, duration);
     };
     m_manager->on_buffered_ranges_change = [this] {
         report_media_stream_scan_states();
+    };
+    m_manager->on_seek_decided = [this](Media::SeekDecision decision) {
+        m_connection.async_playback_session_seek_decided(m_id, m_applied_seek_request_id, decision);
     };
     m_manager->on_error = [this](Media::DecoderError&& error) {
         m_connection.async_playback_session_error(m_id, move(error));
@@ -46,8 +54,9 @@ PlaybackSession::~PlaybackSession() = default;
 
 void PlaybackSession::report_playback_state()
 {
-    dbgln_if(PLAYBACK_MANAGER_DEBUG, "PlaybackSession({}): Reporting {} playing={} available={} time={} after seek {}", m_id, m_manager->state(), m_manager->is_playing(), to_underlying(m_manager->available_data()), m_manager->current_time(), m_applied_seek_request_id);
-    m_connection.async_playback_session_state_changed(m_id, m_applied_seek_request_id, m_manager->state(), m_manager->is_playing(), m_manager->available_data(), m_manager->current_time());
+    dbgln_if(PLAYBACK_MANAGER_DEBUG, "PlaybackSession({}): Reporting {} playing={} available={} settled={} time={} after seek {}", m_id, m_manager->state(), m_manager->is_playing(), to_underlying(m_manager->available_data()), m_manager->playback_state_is_settled(), m_manager->current_time(), m_applied_seek_request_id);
+    m_reported_playback_state_is_settled = m_manager->playback_state_is_settled();
+    m_connection.async_playback_session_state_changed(m_id, m_applied_seek_request_id, m_manager->state(), m_manager->is_playing(), m_manager->available_data(), m_reported_playback_state_is_settled, m_manager->current_time());
 }
 
 void PlaybackSession::report_media_stream_scan_states()
@@ -67,11 +76,18 @@ void PlaybackSession::add_media_stream_source(u64 stream_id, NonnullRefPtr<Media
         ->when_resolved([this, stream_id](Media::PlaybackManager::AddedTracks& added_tracks) {
             auto scan_state = added_tracks.demuxer->scan_state();
             m_media_stream_sources.set(stream_id, { added_tracks.demuxer, scan_state });
-            m_connection.async_playback_session_media_source_added(m_id, stream_id, move(added_tracks.audio_tracks), move(added_tracks.video_tracks), m_manager->preferred_audio_track(), m_manager->preferred_video_track(), m_manager->start_time_realtime(), move(scan_state));
+            m_connection.async_playback_session_media_source_added(m_id, stream_id, move(added_tracks.audio_tracks), move(added_tracks.video_tracks), m_manager->preferred_audio_track(), m_manager->preferred_video_track(), m_manager->start_time_realtime(), m_manager->earliest_possible_position(), move(scan_state));
         })
         .when_rejected([this, stream_id](Media::DecoderError& error) {
             m_connection.async_playback_session_media_stream_source_failed(m_id, stream_id, move(error));
         });
+}
+
+void PlaybackSession::start(u64 seek_request_id)
+{
+    m_applied_seek_request_id = seek_request_id;
+    m_manager->start();
+    report_playback_state();
 }
 
 void PlaybackSession::seek(u64 seek_request_id, AK::Duration timestamp, Media::SeekMode mode)
@@ -120,7 +136,7 @@ void PlaybackSession::add_source_buffer_demuxer(u64 source_buffer_id, NonnullRef
     m_manager->add_media_source(demuxer)
         ->when_resolved([this, source_buffer_id](Media::PlaybackManager::AddedTracks& added_tracks) {
             // A source buffer's ranges reach the renderer with each append or removal that it completes.
-            m_connection.async_playback_session_media_source_added(m_id, {}, move(added_tracks.audio_tracks), move(added_tracks.video_tracks), m_manager->preferred_audio_track(), m_manager->preferred_video_track(), m_manager->start_time_realtime(), {});
+            m_connection.async_playback_session_media_source_added(m_id, {}, move(added_tracks.audio_tracks), move(added_tracks.video_tracks), m_manager->preferred_audio_track(), m_manager->preferred_video_track(), m_manager->start_time_realtime(), m_manager->earliest_possible_position(), {});
             finish_source_buffer_track_addition(source_buffer_id, TrackAdditionOutcome::Added);
         })
         .when_rejected([this, source_buffer_id](Media::DecoderError& error) {
@@ -255,6 +271,9 @@ void PlaybackSession::run_source_buffer_append(u64 source_buffer_id, u64 append_
     source_buffer->append_outcome = AppendOutcome::Pending;
     source_buffer->append_generation = append_generation;
     source_buffer->processor->run(Commands::BufferAppend { move(data) });
+    // The renderer may stop holding the media element once the append is done, so it must first learn whether the
+    // data that the append delivered can still change the playback state.
+    m_manager->update_whether_playback_state_is_settled();
 
     // The callbacks run within the append and may have destroyed this source buffer's entry.
     source_buffer = find_source_buffer(source_buffer_id);

@@ -11,9 +11,11 @@
 #include <AK/QuickSort.h>
 #include <AK/StringBuilder.h>
 #include <AK/Utf16StringBuilder.h>
+#include <LibJS/HostClassBuilder.h>
 #include <LibTextCodec/Decoder.h>
 #include <LibWeb/Bindings/CSS.h>
 #include <LibWeb/Bindings/HTMLFormElement.h>
+#include <LibWeb/Bindings/Wrappable.h>
 #include <LibWeb/CSS/Invalidation/ElementStateInvalidator.h>
 #include <LibWeb/DOM/DOMTokenList.h>
 #include <LibWeb/DOM/Document.h>
@@ -47,6 +49,12 @@
 #include <LibWebCommon/Infra/Strings.h>
 
 namespace Web::HTML {
+
+extern "C" {
+
+// Called by Bindings/Rust/src/html/html_form_element.rs.
+void web_html_form_element_submittable_elements(JSObject* form, void* elements, void (*on_element)(void*, DOM::Element*));
+}
 
 GC_DEFINE_ALLOCATOR(HTMLFormElement);
 
@@ -783,9 +791,9 @@ void HTMLFormElement::attribute_changed(Utf16FlyString const& name, Optional<Utf
 {
     Base::attribute_changed(name, old_value, value, namespace_);
 
-    if (name == HTML::AttributeNames::rel) {
+    if (!namespace_.has_value() && name == HTML::AttributeNames::rel) {
         if (m_rel_list)
-            m_rel_list->associated_attribute_changed(value.has_value() ? value->utf16_view() : u""sv);
+            m_rel_list->associated_attribute_changed(value);
     }
 }
 
@@ -1384,6 +1392,13 @@ size_t HTMLFormElement::number_of_fields_blocking_implicit_submission() const
     };
 
     return count;
+}
+
+void web_html_form_element_submittable_elements(JSObject* form, void* elements, void (*on_element)(void*, DOM::Element*))
+{
+    auto& form_element = as<HTMLFormElement>(*Bindings::wrappable_impl_from(JS::HostABI::object_from_abi(form)));
+    for (auto& element : form_element.get_submittable_elements())
+        on_element(elements, element.ptr());
 }
 
 }

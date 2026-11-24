@@ -70,12 +70,13 @@ public:
     GC::Ref<WebIDL::Promise> get_battery();
     void start_get_battery_steps(GC::Ref<WebIDL::Promise>);
     [[nodiscard]] GC::Ref<PermissionsAPI::Permissions> permissions();
-    void request_media_key_system_access(Utf16String key_system, Vector<EncryptedMediaExtensions::MediaKeySystemConfiguration> supported_configurations, GC::Ref<WebIDL::Promise>);
 
     GC::Ref<ServiceWorker::ServiceWorkerContainer> service_worker();
 
     GC::Ref<MediaCapabilitiesAPI::MediaCapabilities> media_capabilities();
+    GC::Ref<MediaSession::MediaSession> media_session();
     GC::Ref<MediaCapture::MediaDevices> media_devices();
+    void webkit_get_user_media(MediaCapture::MediaStreamConstraints const&, GC::Ref<WebIDL::CallbackType> success_callback, GC::Ref<WebIDL::CallbackType> error_callback);
     GC::Ptr<MediaCapture::MediaDevices> media_devices_if_created() const { return m_media_devices; }
 
     static WebIDL::Long max_touch_points();
@@ -88,7 +89,7 @@ protected:
 private:
     explicit Navigator(Window&);
 
-    virtual URL::URL navigator_id_url() const override;
+    virtual EnvironmentSettingsObject const& navigator_id_settings_object() const override { return navigator_storage_settings_object(); }
 
     // ^StorageAPI::NavigatorStorage
     virtual EnvironmentSettingsObject& navigator_storage_settings_object() const override;
@@ -116,6 +117,9 @@ private:
 
     // https://w3c.github.io/media-capabilities/#dom-navigator-mediacapabilities
     GC::Ptr<MediaCapabilitiesAPI::MediaCapabilities> m_media_capabilities;
+
+    // https://w3c.github.io/mediasession/#dom-navigator-mediasession
+    GC::Ptr<MediaSession::MediaSession> m_media_session;
 
     // https://w3c.github.io/mediacapture-main/#dom-navigator-mediadevices
     GC::Ptr<MediaCapture::MediaDevices> m_media_devices;

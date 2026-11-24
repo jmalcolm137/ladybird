@@ -9,17 +9,15 @@
 use core::cell::{Cell, RefCell};
 use core::ffi::c_void;
 
-use ak::{Span, Utf16String};
-use libcrypto_rust::{KeyDecodeError, KeyHandle};
+use ak::Utf16String;
+use libcrypto_rust::{HandleTag, KeyHandle, OkpCurve};
 use libjs_rust::api::{
     Array, CellRoot, ErrorKind, ErrorType, Gc, GcRefCell, GcWeak, IntegrityLevel, MarkedVec, Must, Object,
     PrimitiveString, PropertyKey, Trace, Value, Vm,
 };
 
 use crate::bindings::conversions::create_uint8_array;
-use crate::bindings::interface::{
-    Ref, Wrappable, allocate, cell_from_abi, cell_into_abi, create_dictionary_object, realm_arguments, wrap,
-};
+use crate::bindings::interface::{Ref, Wrappable, allocate, cell_from_abi, create_dictionary_object};
 use crate::bindings::setlike::WorldEntries;
 use crate::bindings::structured_data::{Serializable, SerializationReader, SerializationWriter};
 use crate::bindings::{CallContext, Exception, WebIdlResult};
@@ -136,8 +134,6 @@ pub(crate) struct CryptoKey {
     key_usages: RefCell<Vec<KeyUsage>>,
     #[gc(untraced)]
     handle: KeyHandle,
-    #[gc(untraced)]
-    algorithm_name: RefCell<Utf16String>,
     cached_algorithm_objects: GcRefCell<Vec<CachedAlgorithmObject>>,
     cached_usages_objects: WorldEntries<Object>,
 }
@@ -258,7 +254,6 @@ impl CryptoKey {
             }),
             key_usages: RefCell::default(),
             handle,
-            algorithm_name: RefCell::default(),
             cached_algorithm_objects: GcRefCell::default(),
             cached_usages_objects: WorldEntries::default(),
         })
@@ -270,14 +265,6 @@ impl CryptoKey {
 
     pub(crate) fn byte_handle_bytes(&self) -> &[u8] {
         self.handle.secret_bytes()
-    }
-
-    pub(crate) fn from_okp_handle(vm: &Vm, is_private: bool, bytes: &[u8]) -> Ref<Self> {
-        Self::create(vm, KeyHandle::from_okp_bytes(is_private, bytes))
-    }
-
-    pub(crate) fn okp_handle_bytes(&self) -> &[u8] {
-        self.handle.okp_bytes()
     }
 
     pub(crate) fn handle(&self) -> &KeyHandle {
@@ -306,7 +293,6 @@ impl CryptoKey {
 
     pub(crate) fn set_algorithm(&self, algorithm: InternalAlgorithmData) {
         self.algorithm.replace(algorithm);
-        self.algorithm_name.replace(Utf16String::default());
         self.cached_algorithm_objects.replace(Vec::new());
     }
 
@@ -371,24 +357,8 @@ impl CryptoKey {
     }
 
     pub(crate) fn algorithm_name(&self) -> Utf16String {
-        let mut algorithm_name = self.algorithm_name.borrow_mut();
-        if algorithm_name.is_empty() {
-            *algorithm_name = self.algorithm.borrow().name().clone();
-        }
-        algorithm_name.clone()
+        self.algorithm.borrow().name().clone()
     }
-}
-
-#[derive(Default)]
-#[repr(C)]
-struct RawAlgorithm<'a> {
-    r#type: u8,
-    name: usize,
-    modulus_length: u32,
-    public_exponent: Span<'a, u8>,
-    hash: usize,
-    named_curve: usize,
-    length: u32,
 }
 
 /// The identifiers by which a storage record holds a key type.
@@ -418,13 +388,6 @@ const ALGORITHM_EC: u8 = 3;
 const ALGORITHM_AES: u8 = 4;
 const ALGORITHM_HMAC: u8 = 5;
 const ALGORITHM_KMAC: u8 = 6;
-
-/// The tags of a serialized handle, Crypto::HandleTag, which are part of the stable storage serialization format.
-const HANDLE_EC_PRIVATE_KEY: u8 = 4;
-
-/// The number of buffers of the handle of each tag, Crypto::HandleTag. An EC private key has one, then optionally its
-/// parameters and its public key, whose two buffers follow.
-const HANDLE_BUFFER_COUNTS: [usize; 11] = [1, 2, 8, 2, 1, 1, 3, 1, 3, 1, 1];
 
 fn data_clone_error(message: &[u8]) -> Exception {
     Exception::Dom("DataCloneError", Utf16String::from_ascii(message))
@@ -468,8 +431,7 @@ impl Serializable for CryptoKey {
 
         // 3. Set serialized.[[Algorithm]] to the sub-serialization of the [[algorithm]] internal slot of value.
         let algorithm = self.algorithm.borrow();
-        let fields = algorithm.fields();
-        serialized.write_u8(fields.r#type);
+        serialized.write_u8(algorithm.serialized_type());
         serialized.write_utf16_string(algorithm.name());
         match &*algorithm {
             InternalAlgorithmData::Key { .. } => {}
@@ -512,30 +474,17 @@ impl Serializable for CryptoKey {
         }
 
         // 5. Set serialized.[[Handle]] to the [[handle]] internal slot of value.
-        self.handle().with_components(|fields| {
-            serialized.write_u8(fields.tag);
-            let buffers = fields.buffers();
-            if fields.tag != HANDLE_EC_PRIVATE_KEY {
-                for buffer in buffers {
-                    serialized.write_bytes(buffer);
-                }
-                return;
+        // NB: An EC private key's first buffer is followed by a has-parameters flag, which is false, and a
+        //     has-public-key flag, which is true, before its public key's buffers.
+        let stored = self.handle().to_stored();
+        serialized.write_u8(stored.tag as u8);
+        for (index, buffer) in stored.buffers().iter().enumerate() {
+            serialized.write_bytes(buffer);
+            if index == 0 && stored.tag == HandleTag::EcPrivate {
+                serialized.write_bool(false);
+                serialized.write_bool(true);
             }
-
-            serialized.write_bytes(buffers[0]);
-            serialized.write_bool(fields.ec_parameters.is_some());
-            if let Some(parameters) = fields.ec_parameters {
-                serialized.write_u64(parameters.len() as u64);
-                for &parameter in parameters {
-                    serialized.write_u32(parameter);
-                }
-            }
-            serialized.write_bool(fields.has_ec_public_key);
-            if fields.has_ec_public_key {
-                serialized.write_bytes(buffers[1]);
-                serialized.write_bytes(buffers[2]);
-            }
-        });
+        }
         Ok(())
     }
 
@@ -597,13 +546,12 @@ impl Serializable for CryptoKey {
         }
 
         // 5. Initialize the [[handle]] internal slot of value to serialized.[[Handle]].
-        let handle_tag = serialized.read_u8()?;
-        let Some(&buffer_count) = HANDLE_BUFFER_COUNTS.get(usize::from(handle_tag)) else {
+        let Ok(handle_tag) = HandleTag::try_from(serialized.read_u8()?) else {
             return Err(data_clone_error(b"Invalid CryptoKey handle tag"));
         };
         let mut buffers: Vec<&[u8]> = Vec::new();
         let (mut has_ec_parameters, mut ec_parameters, mut has_ec_public_key) = (false, Vec::new(), false);
-        if handle_tag == HANDLE_EC_PRIVATE_KEY {
+        if handle_tag == HandleTag::EcPrivate {
             buffers.push(serialized.read_borrowed_bytes()?);
             has_ec_parameters = serialized.read_bool()?;
             if has_ec_parameters {
@@ -618,28 +566,27 @@ impl Serializable for CryptoKey {
                 buffers.push(serialized.read_borrowed_bytes()?);
             }
         } else {
-            for _ in 0..buffer_count {
+            for _ in 0..handle_tag.buffer_count() {
                 buffers.push(serialized.read_borrowed_bytes()?);
             }
         }
 
-        let handle = KeyHandle::from_components(
+        let okp_curve = [
+            ("Ed25519", OkpCurve::Ed25519),
+            ("Ed448", OkpCurve::Ed448),
+            ("X25519", OkpCurve::X25519),
+            ("X448", OkpCurve::X448),
+        ]
+        .into_iter()
+        .find_map(|(curve_name, curve)| (name == curve_name).then_some(curve));
+        let Ok(handle) = KeyHandle::from_stored(
             handle_tag,
             &buffers,
             has_ec_parameters.then_some(ec_parameters.as_slice()),
             has_ec_public_key,
-        );
-        let handle = match handle {
-            Ok(handle) => handle,
-            Err(KeyDecodeError::OutOfMemory) => {
-                return cx
-                    .vm()
-                    .throw_completion(ErrorKind::InternalError, ErrorType::OutOfMemory, &[])
-                    .map_err(Into::into);
-            }
-            Err(KeyDecodeError::InvalidComponents) => {
-                return Err(data_clone_error(b"Invalid CryptoKey handle components"));
-            }
+            okp_curve,
+        ) else {
+            return Err(data_clone_error(b"Invalid CryptoKey handle components"));
         };
         let key = Self::create(cx.vm(), handle);
 
@@ -653,243 +600,69 @@ impl Serializable for CryptoKey {
         public_exponent_bytes.extend_from_slice(public_exponent);
         key.r#type.set(Some(KEY_TYPE_VALUES[usize::from(r#type)]));
         key.extractable.set(extractable);
-        key.set_algorithm(InternalAlgorithmData::from_fields(
-            &RawAlgorithm {
-                r#type: algorithm_type,
+        key.set_algorithm(match algorithm_type {
+            ALGORITHM_KEY => InternalAlgorithmData::Key { name },
+            ALGORITHM_RSA => InternalAlgorithmData::Rsa {
+                name,
                 modulus_length,
-                length,
-                ..RawAlgorithm::default()
+                public_exponent: public_exponent_bytes,
             },
-            name,
-            hash,
-            named_curve,
-            public_exponent_bytes,
-        ));
+            ALGORITHM_RSA_HASHED => InternalAlgorithmData::RsaHashed {
+                name,
+                modulus_length,
+                public_exponent: public_exponent_bytes,
+                hash,
+            },
+            ALGORITHM_EC => InternalAlgorithmData::Ec { name, named_curve },
+            ALGORITHM_AES => InternalAlgorithmData::Aes {
+                name,
+                length: u16::try_from(length).expect("an AES key has a 16-bit length"),
+            },
+            ALGORITHM_HMAC => InternalAlgorithmData::Hmac { name, hash, length },
+            ALGORITHM_KMAC => InternalAlgorithmData::Kmac { name, length },
+            _ => unreachable!("the type is that of an algorithm, as checked above"),
+        });
         key.set_usages(usages);
         Ok(key)
     }
 }
 
 impl InternalAlgorithmData {
-    fn fields(&self) -> RawAlgorithm<'_> {
-        let mut fields = RawAlgorithm {
-            name: self.name().raw_identity(),
-            ..RawAlgorithm::default()
-        };
-        fields.r#type = match self {
+    fn serialized_type(&self) -> u8 {
+        match self {
             Self::Key { .. } => ALGORITHM_KEY,
-            Self::Rsa {
-                modulus_length,
-                public_exponent,
-                ..
-            } => {
-                fields.modulus_length = *modulus_length;
-                fields.public_exponent = Span::new(public_exponent);
-                ALGORITHM_RSA
-            }
-            Self::RsaHashed {
-                modulus_length,
-                public_exponent,
-                hash,
-                ..
-            } => {
-                fields.modulus_length = *modulus_length;
-                fields.public_exponent = Span::new(public_exponent);
-                fields.hash = hash.raw_identity();
-                ALGORITHM_RSA_HASHED
-            }
-            Self::Ec { named_curve, .. } => {
-                fields.named_curve = named_curve.raw_identity();
-                ALGORITHM_EC
-            }
-            Self::Aes { length, .. } => {
-                fields.length = u32::from(*length);
-                ALGORITHM_AES
-            }
-            Self::Hmac { hash, length, .. } => {
-                fields.hash = hash.raw_identity();
-                fields.length = *length;
-                ALGORITHM_HMAC
-            }
-            Self::Kmac { length, .. } => {
-                fields.length = *length;
-                ALGORITHM_KMAC
-            }
-        };
-        fields
-    }
-
-    fn from_fields(
-        fields: &RawAlgorithm<'_>,
-        name: Utf16String,
-        hash: Utf16String,
-        named_curve: Utf16String,
-        public_exponent: Vec<u8>,
-    ) -> Self {
-        let RawAlgorithm {
-            r#type,
-            modulus_length,
-            length,
-            ..
-        } = *fields;
-        match r#type {
-            ALGORITHM_KEY => Self::Key { name },
-            ALGORITHM_RSA => Self::Rsa {
-                name,
-                modulus_length,
-                public_exponent,
-            },
-            ALGORITHM_RSA_HASHED => Self::RsaHashed {
-                name,
-                modulus_length,
-                public_exponent,
-                hash,
-            },
-            ALGORITHM_EC => Self::Ec { name, named_curve },
-            ALGORITHM_AES => Self::Aes {
-                name,
-                length: u16::try_from(length).expect("an AES key has a 16-bit length"),
-            },
-            ALGORITHM_HMAC => Self::Hmac { name, hash, length },
-            ALGORITHM_KMAC => Self::Kmac { name, length },
-            _ => unreachable!("the type is that of a key algorithm"),
+            Self::Rsa { .. } => ALGORITHM_RSA,
+            Self::RsaHashed { .. } => ALGORITHM_RSA_HASHED,
+            Self::Ec { .. } => ALGORITHM_EC,
+            Self::Aes { .. } => ALGORITHM_AES,
+            Self::Hmac { .. } => ALGORITHM_HMAC,
+            Self::Kmac { .. } => ALGORITHM_KMAC,
         }
     }
 }
 
-/// # Safety
+/// Gives a key with an RsaHashedKeyAlgorithm the RsaKeyAlgorithm without its hash, which no operation creates, so
+/// that tests can serialize one.
 ///
-/// The VM is live and the caller transfers ownership of the handle.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn web_rust_crypto_key_create(vm: *const c_void, handle: KeyHandle) -> *mut c_void {
-    // SAFETY: The VM is live and the handle is owned.
-    let vm = unsafe { &*vm.cast::<Vm>() };
-    cell_into_abi(CryptoKey::create(vm, handle))
-}
-
-/// # Safety
-///
-/// The VM, realm, and CryptoKey cell must be live.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn web_rust_crypto_key_wrap(
-    vm: *mut c_void,
-    realm: *mut c_void,
-    key: *mut c_void,
-) -> *mut c_void {
-    // SAFETY: The caller supplies the live VM, realm, and CryptoKey cell.
-    let ((vm, realm), key) = unsafe { (realm_arguments(vm, realm), cell_from_abi::<CryptoKey>(key)) };
-    wrap(&CallContext::new(vm, realm), key).as_ptr().cast()
-}
-
 /// # Safety
 ///
 /// The key must be a live CryptoKey cell.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn web_rust_crypto_key_handle(key: *mut c_void) -> *mut c_void {
-    // SAFETY: LibWeb supplies a live CryptoKey cell.
-    unsafe { cell_from_abi::<CryptoKey>(key) }.handle().as_raw()
-}
-
-/// # Safety
-///
-/// The key must be a live CryptoKey cell.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn web_rust_crypto_key_extractable(key: *mut c_void) -> bool {
-    // SAFETY: LibWeb supplies a live CryptoKey cell.
-    unsafe { cell_from_abi::<CryptoKey>(key) }.extractable.get()
-}
-
-/// # Safety
-///
-/// The key must be a live CryptoKey cell.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn web_rust_crypto_key_set_extractable(key: *mut c_void, extractable: bool) {
-    // SAFETY: LibWeb supplies a live CryptoKey cell.
-    unsafe { cell_from_abi::<CryptoKey>(key) }.extractable.set(extractable);
-}
-
-/// # Safety
-///
-/// The key must be a live CryptoKey cell.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn web_rust_crypto_key_type(key: *mut c_void) -> u8 {
-    // SAFETY: LibWeb supplies a live CryptoKey cell.
-    unsafe { cell_from_abi::<CryptoKey>(key) }.key_type() as u8
-}
-
-/// # Safety
-///
-/// The key must be a live CryptoKey cell and the type must be a valid KeyType.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn web_rust_crypto_key_set_type(key: *mut c_void, r#type: u8) {
+pub unsafe extern "C" fn web_rust_crypto_key_remove_algorithm_hash_for_testing(key: *mut c_void) {
     // SAFETY: LibWeb supplies a live CryptoKey cell.
     let key = unsafe { cell_from_abi::<CryptoKey>(key) };
-    key.r#type.set(Some(KEY_TYPE_VALUES[usize::from(r#type)]));
-}
-
-/// # Safety
-///
-/// The key must be a live CryptoKey cell and fields must point to writable storage.
-#[unsafe(no_mangle)]
-unsafe extern "C" fn web_rust_crypto_key_get_algorithm(key: *mut c_void, fields: *mut c_void) {
-    // SAFETY: LibWeb supplies a live CryptoKey cell.
-    let key = unsafe { cell_from_abi::<CryptoKey>(key) };
-    let algorithm = key.algorithm.borrow();
-    // SAFETY: LibWeb reads the fields before mutating the key or letting it die.
-    unsafe { fields.cast::<RawAlgorithm<'_>>().write(algorithm.fields()) };
-}
-
-/// # Safety
-///
-/// The key must be a live CryptoKey cell and fields must own their strings.
-#[unsafe(no_mangle)]
-unsafe extern "C" fn web_rust_crypto_key_set_algorithm(key: *mut c_void, fields: &RawAlgorithm<'_>) {
-    // SAFETY: LibWeb supplies a live CryptoKey cell and transfers the strings.
-    let (key, name, hash, named_curve) = unsafe {
-        (
-            cell_from_abi::<CryptoKey>(key),
-            Utf16String::from_raw_owned(fields.name),
-            Utf16String::from_raw_owned(fields.hash),
-            Utf16String::from_raw_owned(fields.named_curve),
-        )
+    let algorithm = match &*key.internal_algorithm() {
+        InternalAlgorithmData::RsaHashed {
+            name,
+            modulus_length,
+            public_exponent,
+            ..
+        } => InternalAlgorithmData::Rsa {
+            name: name.clone(),
+            modulus_length: *modulus_length,
+            public_exponent: public_exponent.clone(),
+        },
+        _ => panic!("the key has an RsaHashedKeyAlgorithm"),
     };
-    key.set_algorithm(InternalAlgorithmData::from_fields(
-        fields,
-        name,
-        hash,
-        named_curve,
-        fields.public_exponent.as_slice().to_vec(),
-    ));
-}
-
-/// # Safety
-///
-/// The key must be a live CryptoKey cell. The caller takes ownership of the returned string.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn web_rust_crypto_key_algorithm_name(key: *mut c_void) -> usize {
-    // SAFETY: LibWeb supplies a live CryptoKey cell.
-    unsafe { cell_from_abi::<CryptoKey>(key) }.algorithm_name().into_raw()
-}
-
-/// # Safety
-///
-/// The key must be a live CryptoKey cell and steps must not mutate it.
-#[unsafe(no_mangle)]
-unsafe extern "C" fn web_rust_crypto_key_with_usages(
-    key: *mut c_void,
-    state: *mut c_void,
-    steps: unsafe extern "C" fn(*mut c_void, Span<'_, KeyUsage>),
-) {
-    // SAFETY: LibWeb supplies a live CryptoKey cell and the usages are lent for the callback.
-    let key = unsafe { cell_from_abi::<CryptoKey>(key) };
-    unsafe { steps(state, Span::new(&key.key_usages.borrow())) };
-}
-
-/// # Safety
-///
-/// The key must be a live CryptoKey cell and usages must contain valid KeyUsage values.
-#[unsafe(no_mangle)]
-unsafe extern "C" fn web_rust_crypto_key_set_usages(key: *mut c_void, usages: Span<'_, KeyUsage>) {
-    // SAFETY: LibWeb supplies a live CryptoKey cell and lends the usages for the call.
-    unsafe { cell_from_abi::<CryptoKey>(key) }.set_usages(usages.as_slice().to_vec());
+    key.set_algorithm(algorithm);
 }

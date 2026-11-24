@@ -48,6 +48,10 @@ public:
     // The frames are copied out of the runtime, so this returns them by value.
     [[nodiscard]] Vector<TracebackFrame, 32> traceback() const;
 
+    // NB: The innermost frames that the error would keep if the VM kept no long stack traces. What script can observe
+    //     reads only these, so it does not change while a debugger is attached; traceback() is for the debugger.
+    [[nodiscard]] Vector<TracebackFrame, 32> script_visible_traceback() const;
+
 protected:
     ErrorData() = delete;
     ~ErrorData() = delete;
@@ -59,6 +63,10 @@ protected:
 class JS_API ErrorDataCell final : public EngineCell {
 public:
     static GC::Ref<ErrorDataCell> capture(VM&);
+
+    // Every frame of the call stack, whatever Error.stackTraceLimit is, for a trace of the running code that is not the
+    // stack of an error.
+    static GC::Ref<ErrorDataCell> capture_whole_stack(VM&);
 
     ErrorData& error_data() { return *reinterpret_cast<ErrorData*>(this); }
     ErrorData const& error_data() const { return *reinterpret_cast<ErrorData const*>(this); }

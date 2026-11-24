@@ -11,15 +11,16 @@
 
 use super::FfiCssPixelRect;
 use super::node_data::NodeSlotId;
-use super::used_values::FfiCssPixelSize;
+use super::query::inline_cursor::{self, CaretPosition, InlineCursor};
+use super::used_values::{FfiCssPixelPoint, FfiCssPixelSize};
 use crate::css::css_pixels::{CssPixelRect, CssPixels};
 use crate::css::ffi_support::FfiUtf16View;
 use crate::css::style::tree::StyleNodeID;
 use crate::layout::text_queries::FfiDomTextRange;
-use crate::painting::ffi::{
-    FfiBoxModelMetrics, FfiCaretRectResult, FfiEmptyLineCaretRect, FfiOptionalCssPixelRect, FfiRectToViewportTransform,
-};
+use crate::painting::ffi::FfiBoxModelMetrics;
+use crate::painting::host::FfiCaretPaintKind;
 use crate::painting::paint_read::{GeometryRead, PaintRead, PaintRow, PaintSource};
+use crate::painting::viewport_mapping::{FfiViewportMapping, ViewportSpace};
 use crate::render_state::{DocumentHost, ScriptForcedRead};
 use std::ffi::c_void;
 
@@ -43,21 +44,16 @@ fn read_rows<R>(host: &DocumentHost, read: impl FnOnce(&PaintSource<'_>) -> R) -
 pub unsafe extern "C" fn layout_script_client_rects(
     host: &DocumentHost,
     layout_node: NodeSlotId,
-    rect_to_viewport_transform: FfiRectToViewportTransform<'_>,
+    viewport_mapping: FfiViewportMapping<'_>,
     context: *mut c_void,
     push_rect: unsafe extern "C" fn(*mut c_void, FfiCssPixelRect),
 ) {
+    let viewport_mapping = viewport_mapping.resolve();
     read_rows(host, |arena| {
-        let rect_to_viewport_transform = rect_to_viewport_transform.transform();
-        crate::painting::client_rects::for_each_client_rect(
-            arena,
-            layout_node,
-            rect_to_viewport_transform.as_ref(),
-            |rect| {
-                // SAFETY: The consumer copies the plain-data rect synchronously.
-                unsafe { push_rect(context, rect.into()) };
-            },
-        );
+        crate::painting::client_rects::for_each_client_rect(arena, layout_node, &viewport_mapping.mapping(), |rect| {
+            // SAFETY: The consumer copies the plain-data rect synchronously.
+            unsafe { push_rect(context, rect.into()) };
+        });
     });
 }
 
@@ -65,30 +61,42 @@ pub unsafe extern "C" fn layout_script_client_rects(
 pub extern "C" fn layout_script_bounding_client_rect(
     host: &DocumentHost,
     layout_node: NodeSlotId,
-    rect_to_viewport_transform: FfiRectToViewportTransform<'_>,
+    viewport_mapping: FfiViewportMapping<'_>,
     out: &mut FfiCssPixelRect,
 ) {
+    let viewport_mapping = viewport_mapping.resolve();
     *out = read_rows(host, |arena| {
-        let rect_to_viewport_transform = rect_to_viewport_transform.transform();
-        crate::painting::client_rects::bounding_client_rect(arena, layout_node, rect_to_viewport_transform.as_ref())
-            .into()
+        crate::painting::client_rects::bounding_client_rect(arena, layout_node, &viewport_mapping.mapping()).into()
     });
 }
 
+/// # Safety
+///
+/// A supplied callback must be sound to call with `context`.
 #[unsafe(no_mangle)]
-pub extern "C" fn layout_script_transform_subtree_is_clipped_outside(
+pub unsafe extern "C" fn layout_script_transform_subtree_is_clipped_outside(
     host: &DocumentHost,
     target: NodeSlotId,
+    intersection_root: NodeSlotId,
     root_bounds: FfiCssPixelRect,
-    rect_to_viewport_transform: FfiRectToViewportTransform<'_>,
+    viewport_mapping: FfiViewportMapping<'_>,
+    context: *const c_void,
+    inflate_scroll_clip: Option<unsafe extern "C" fn(*const c_void, FfiCssPixelRect) -> FfiCssPixelRect>,
 ) -> bool {
+    let viewport_mapping = viewport_mapping.resolve();
     read_rows(host, |arena| {
-        let rect_to_viewport_transform = rect_to_viewport_transform.transform();
         crate::painting::intersection_observer::transform_subtree_is_clipped_outside(
             arena,
             target,
+            intersection_root,
             root_bounds.into(),
-            rect_to_viewport_transform.as_ref(),
+            &viewport_mapping.mapping(),
+            inflate_scroll_clip.map(|inflate| {
+                move |rect: CssPixelRect| {
+                    // SAFETY: The callback copies the plain-data rect synchronously.
+                    unsafe { inflate(context, rect.into()) }.into()
+                }
+            }),
         )
     })
 }
@@ -103,30 +111,31 @@ pub unsafe extern "C" fn layout_script_intersection_observer_intersection_rect(
     target_rect: FfiCssPixelRect,
     intersection_root: NodeSlotId,
     root_bounds: FfiCssPixelRect,
-    rect_to_viewport_transform: FfiRectToViewportTransform<'_>,
-    context: *mut c_void,
+    viewport_mapping: FfiViewportMapping<'_>,
+    context: *const c_void,
     inflate_scroll_container_clip_rect_by_scroll_margin: unsafe extern "C" fn(
-        *mut c_void,
+        *const c_void,
         FfiCssPixelRect,
     ) -> FfiCssPixelRect,
     out: &mut FfiCssPixelRect,
-) {
-    *out = read_rows(host, |arena| {
-        let rect_to_viewport_transform = rect_to_viewport_transform.transform();
+) -> bool {
+    let viewport_mapping = viewport_mapping.resolve();
+    let intersection_rect = read_rows(host, |arena| {
         crate::painting::intersection_observer::intersection_rect(
             arena,
             target,
             target_rect.into(),
             intersection_root,
             root_bounds.into(),
-            rect_to_viewport_transform.as_ref(),
+            &viewport_mapping.mapping(),
             |clip_rect: CssPixelRect| -> CssPixelRect {
                 // SAFETY: The callback copies the plain-data rect synchronously.
                 unsafe { inflate_scroll_container_clip_rect_by_scroll_margin(context, clip_rect.into()) }.into()
             },
         )
-        .into()
     });
+    *out = intersection_rect.unwrap_or_default().into();
+    intersection_rect.is_some()
 }
 
 #[unsafe(no_mangle)]
@@ -156,13 +165,46 @@ pub unsafe extern "C" fn layout_script_text_range_rects(
     range_end_offset: usize,
     filter_dom_start: usize,
     filter_dom_end: usize,
-    rect_to_viewport_transform: FfiRectToViewportTransform<'_>,
+    viewport_mapping: FfiViewportMapping<'_>,
     context: *mut c_void,
     push_rect: unsafe extern "C" fn(*mut c_void, FfiCssPixelRect),
 ) {
+    let viewport_mapping = viewport_mapping.resolve();
     read_rows(host, |arena| {
         let paintable_rows = arena;
-        let rect_to_viewport_transform = rect_to_viewport_transform.transform();
+        let viewport_mapping = viewport_mapping.mapping();
+
+        // A collapsed range has the rect of the caret it is in text, with no width.
+        if selection_state == crate::painting::paintable_data::SELECTION_STATE_START_AND_END
+            && range_start_offset == range_end_offset
+        {
+            let cursor = InlineCursor::new(arena);
+            if let Some(position) = cursor.line_of(primary, range_start_offset, true)
+                && let Some(index) = position.fragment
+            {
+                let root = position.line.root;
+                let side = arena.committed_side_data(root);
+                let fragment = &side.fragments()[index as usize];
+                let mut rect = cursor
+                    .caret_rect_in_fragment(root, fragment, range_start_offset, true)
+                    .rect;
+                if crate::painting::text_fragment::is_horizontal(fragment) {
+                    rect.width = CssPixels::default();
+                } else {
+                    rect.height = CssPixels::default();
+                }
+                let rect = viewport_mapping.line_content_rect_to_viewport(
+                    arena,
+                    root,
+                    fragment.layout_node,
+                    rect,
+                    ViewportSpace::LayoutViewport,
+                );
+                // SAFETY: The consumer copies the plain-data rect synchronously.
+                unsafe { push_rect(context, rect.into()) };
+            }
+            return;
+        }
 
         let fragments = arena.text_fragments(primary);
         let node_slots = fragments.as_slice();
@@ -182,11 +224,12 @@ pub unsafe extern "C" fn layout_script_text_range_rects(
             );
 
             let rect_in_viewport_space = if arena.slot_is_live(block) {
-                crate::painting::rect_to_viewport_transform::transform_rect_to_viewport_or_identity(
-                    rect_to_viewport_transform.as_ref(),
+                viewport_mapping.line_content_rect_to_viewport(
                     paintable_rows,
                     block,
+                    fragment.layout_node,
                     rect,
+                    ViewportSpace::LayoutViewport,
                 )
             } else {
                 rect
@@ -196,30 +239,6 @@ pub unsafe extern "C" fn layout_script_text_range_rects(
             unsafe { push_rect(context, rect_in_viewport_space.into()) };
             true
         });
-    });
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn layout_script_text_caret_rect_in_dom_range(
-    host: &DocumentHost,
-    primary: NodeSlotId,
-    offset: usize,
-    out: &mut FfiOptionalCssPixelRect,
-) {
-    *out = read_rows(host, |arena| {
-        let paintable_rows = arena;
-        let fragments = arena.text_fragments(primary);
-        let node_slots = fragments.as_slice();
-        match crate::painting::caret::caret_rect_in_dom_range(paintable_rows, node_slots, offset) {
-            Some(rect) => FfiOptionalCssPixelRect {
-                has_value: true,
-                rect: rect.into(),
-            },
-            None => FfiOptionalCssPixelRect {
-                has_value: false,
-                rect: FfiCssPixelRect::default(),
-            },
-        }
     });
 }
 
@@ -308,94 +327,109 @@ pub unsafe extern "C" fn layout_script_text_character_x_positions(
     });
 }
 
+/// A caret position as the host names it: `offset` in the DOM text whose layout node is `node`, or, where `node` is the
+/// box of an element, the position between the children of the element whose boxes are `child_before` and
+/// `child_after` (`NodeSlotId::INVALID` for none), where the DOM text of `child_before` is `child_before_length` long.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct FfiCaretPosition {
+    pub node: NodeSlotId,
+    pub offset: usize,
+    pub downstream: bool,
+    pub child_before: NodeSlotId,
+    pub child_before_length: usize,
+    pub child_after: NodeSlotId,
+}
+
+impl FfiCaretPosition {
+    /// The caret positions the position can take, in the order to try them.
+    pub(crate) fn candidates(&self, arena: &impl PaintRead) -> impl Iterator<Item = CaretPosition> {
+        let is_text = arena
+            .node_kind_if_live(self.node)
+            .is_some_and(super::node_facts::kind_is_text);
+        let text = is_text.then_some(CaretPosition::Text {
+            text: self.node,
+            offset: self.offset,
+            downstream: self.downstream,
+        });
+        let between_children = (!is_text)
+            .then(|| {
+                inline_cursor::caret_positions_between_children(
+                    arena,
+                    self.node,
+                    self.child_before,
+                    self.child_before_length,
+                    self.child_after,
+                )
+            })
+            .into_iter()
+            .flatten();
+        text.into_iter().chain(between_children)
+    }
+}
+
+/// The caret layout gives a position, as the recorder paints it and in the layout viewport.
+#[repr(C)]
+pub struct FfiCaret {
+    pub found: bool,
+    pub paint: FfiCaretPaintKind,
+    pub block: NodeSlotId,
+    pub owner: NodeSlotId,
+    pub rect: FfiCssPixelRect,
+    pub viewport_rect: FfiCssPixelRect,
+    pub style_source: NodeSlotId,
+}
+
 #[unsafe(no_mangle)]
-pub extern "C" fn layout_script_text_caret_rect_for_position(
+pub extern "C" fn layout_script_caret(
     host: &DocumentHost,
-    primary: NodeSlotId,
-    offset: usize,
-    affinity_is_downstream: bool,
-    out: &mut FfiCaretRectResult,
+    position: FfiCaretPosition,
+    viewport_mapping: FfiViewportMapping<'_>,
+    out: &mut FfiCaret,
 ) {
-    let mut result = FfiCaretRectResult {
-        found: false,
-        rect: FfiCssPixelRect::default(),
-        style_source: NodeSlotId::INVALID,
-        owner_paintable: NodeSlotId::INVALID,
-        nearest_self_painting_inline: NodeSlotId::INVALID,
-    };
+    let viewport_mapping = viewport_mapping.resolve();
     *out = read_rows(host, |arena| {
-        let paintable_rows = arena;
-        let fragments = arena.text_fragments(primary);
-        let node_slots = fragments.as_slice();
-        let Some(answer) =
-            crate::painting::caret::caret_rect_for_position(paintable_rows, node_slots, offset, affinity_is_downstream)
+        let cursor = InlineCursor::new(arena);
+        let Some(caret) = position
+            .candidates(arena)
+            .find_map(|candidate| cursor.caret_rect(candidate))
         else {
-            return result;
+            return FfiCaret {
+                found: false,
+                paint: FfiCaretPaintKind::None,
+                block: NodeSlotId::INVALID,
+                owner: NodeSlotId::INVALID,
+                rect: FfiCssPixelRect::default(),
+                viewport_rect: FfiCssPixelRect::default(),
+                style_source: NodeSlotId::INVALID,
+            };
         };
-        result.found = true;
-        result.rect = answer.rect.into();
-        result.style_source = answer.style_source;
-        result.owner_paintable = answer.owner;
-        result.nearest_self_painting_inline =
-            crate::painting::fragment_ownership::nearest_self_painting_inline_box(paintable_rows, answer.node)
-                .unwrap_or(NodeSlotId::INVALID);
-        result
-    });
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn layout_script_atomic_inline_caret_rect_for_position(
-    host: &DocumentHost,
-    primary: NodeSlotId,
-    after: bool,
-    out: &mut FfiCaretRectResult,
-) {
-    let mut result = FfiCaretRectResult {
-        found: false,
-        rect: FfiCssPixelRect::default(),
-        style_source: NodeSlotId::INVALID,
-        owner_paintable: NodeSlotId::INVALID,
-        nearest_self_painting_inline: NodeSlotId::INVALID,
-    };
-    *out = read_rows(host, |arena| {
-        let paintable_rows = arena;
-        let Some(answer) = crate::painting::caret::caret_rect_for_atomic_inline(paintable_rows, primary, after) else {
-            return result;
-        };
-        result.found = true;
-        result.rect = answer.rect.into();
-        result.style_source = answer.style_source;
-        result.owner_paintable = answer.owner;
-        result.nearest_self_painting_inline =
-            crate::painting::fragment_ownership::nearest_self_painting_inline_box(paintable_rows, answer.node)
-                .unwrap_or(NodeSlotId::INVALID);
-        result
-    });
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn layout_script_paintable_empty_line_caret_rect(
-    host: &DocumentHost,
-    block: NodeSlotId,
-    primary: NodeSlotId,
-    offset: usize,
-    out: &mut FfiEmptyLineCaretRect,
-) {
-    let mut result = FfiEmptyLineCaretRect {
-        has_value: false,
-        rect: FfiCssPixelRect::default(),
-        style_source: NodeSlotId::INVALID,
-    };
-    *out = read_rows(host, |arena| {
-        let fragments = arena.text_fragments(primary);
-        if let Some(caret) =
-            crate::painting::caret::caret_rect_on_empty_line(arena, block, fragments.as_slice(), offset)
-        {
-            result.has_value = true;
-            result.rect = caret.rect.into();
-            result.style_source = caret.style_source;
+        // A box with no line content around the caret paints the caret itself.
+        let at_start_of_box = caret.owner == caret.node;
+        FfiCaret {
+            found: true,
+            paint: if at_start_of_box && crate::painting::node_painting::is_fragmented_inline(arena, caret.owner) {
+                FfiCaretPaintKind::EmptyInline
+            } else {
+                FfiCaretPaintKind::InBlock
+            },
+            block: caret.owner,
+            owner: crate::painting::fragment_ownership::nearest_self_painting_inline_box(arena, caret.node)
+                .filter(|_| !at_start_of_box)
+                .unwrap_or(NodeSlotId::INVALID),
+            rect: caret.rect.into(),
+            viewport_rect: viewport_mapping
+                .mapping()
+                .line_content_rect_to_viewport(
+                    arena,
+                    caret.owner,
+                    caret.node,
+                    caret.rect,
+                    ViewportSpace::LayoutViewport,
+                )
+                .into(),
+            style_source: caret.style_source,
         }
-        result
     });
 }
 
@@ -446,53 +480,17 @@ pub extern "C" fn layout_script_has_sticky_positioned_inclusive_ancestor(
     })
 }
 
-fn spatial_chain_offset_in_css_pixels(
-    host: &DocumentHost,
-    slot: NodeSlotId,
-    rect_to_viewport_transform: FfiRectToViewportTransform<'_>,
-    device_offset_of_spatial_chain: impl Fn(
-        &crate::painting::visual_context::VisualContextTree,
-        crate::painting::visual_context::SpatialNodeIndex,
-        &[libgfx_rust::FloatPoint],
-    ) -> libgfx_rust::FloatPoint,
-) -> crate::painting::ffi::FfiOptionalCssPixelPoint {
-    read_rows(host, |arena| {
-        let mut result = crate::painting::ffi::FfiOptionalCssPixelPoint {
-            has_value: false,
-            x: CssPixels::from_raw(0),
-            y: CssPixels::from_raw(0),
-        };
-        let Some(transform) = rect_to_viewport_transform.transform() else {
-            return result;
-        };
-        if !arena.paintable_row_is_populated(slot) {
-            return result;
-        }
-        let spatial = arena.paintable_data(slot).accumulated_visual_context.spatial;
-        let offset = device_offset_of_spatial_chain(transform.visual_context_tree, spatial, transform.scroll_offsets);
-        let inverse_pixel_ratio = 1.0 / transform.device_pixels_per_css_pixel;
-        result.has_value = true;
-        result.x = CssPixels::nearest_value_for_f32(offset.x * inverse_pixel_ratio);
-        result.y = CssPixels::nearest_value_for_f32(offset.y * inverse_pixel_ratio);
-        result
-    })
-}
-
 /// The offset by which sticky positioning moves the box, as the sum of the offsets of the sticky positioned box and
 /// its sticky positioned ancestors.
 #[unsafe(no_mangle)]
 pub extern "C" fn layout_script_accumulated_sticky_offset(
     host: &DocumentHost,
     slot: NodeSlotId,
-    rect_to_viewport_transform: FfiRectToViewportTransform<'_>,
-    out: &mut crate::painting::ffi::FfiOptionalCssPixelPoint,
+    viewport_mapping: FfiViewportMapping<'_>,
+    out: &mut FfiCssPixelPoint,
 ) {
-    *out = spatial_chain_offset_in_css_pixels(
-        host,
-        slot,
-        rect_to_viewport_transform,
-        crate::painting::visual_context::VisualContextTree::accumulated_sticky_offset,
-    );
+    let viewport_mapping = viewport_mapping.resolve();
+    *out = read_rows(host, |arena| viewport_mapping.mapping().sticky_offset(arena, slot)).into();
 }
 
 /// The offset by which scrolling, sticky positioning and anchor scroll shifts move the box, without its transforms.
@@ -500,15 +498,16 @@ pub extern "C" fn layout_script_accumulated_sticky_offset(
 pub extern "C" fn layout_script_offset_to_viewport_ignoring_transforms(
     host: &DocumentHost,
     slot: NodeSlotId,
-    rect_to_viewport_transform: FfiRectToViewportTransform<'_>,
-    out: &mut crate::painting::ffi::FfiOptionalCssPixelPoint,
+    viewport_mapping: FfiViewportMapping<'_>,
+    out: &mut FfiCssPixelPoint,
 ) {
-    *out = spatial_chain_offset_in_css_pixels(
-        host,
-        slot,
-        rect_to_viewport_transform,
-        crate::painting::visual_context::VisualContextTree::offset_to_viewport_ignoring_transforms,
-    );
+    let viewport_mapping = viewport_mapping.resolve();
+    *out = read_rows(host, |arena| {
+        viewport_mapping
+            .mapping()
+            .offset_to_viewport_ignoring_transforms(arena, slot)
+    })
+    .into();
 }
 
 #[unsafe(no_mangle)]
@@ -536,7 +535,7 @@ pub extern "C" fn layout_script_paintable_border_box_rect_of_fragments(
         if !arena.paintable_row_is_populated(slot) {
             return FfiCssPixelRect::default();
         }
-        crate::painting::paintable_geometry::absolute_border_box_rect(arena, slot).into()
+        crate::painting::client_rects::border_box_rect_of_fragments(arena, slot).into()
     });
 }
 
@@ -564,31 +563,19 @@ pub extern "C" fn layout_script_paintable_unbroken_border_box_size(
     });
 }
 
+/// Whether the forced break `forced_break` ends an empty line of `block`.
 #[unsafe(no_mangle)]
-pub extern "C" fn layout_script_empty_line_ended_by_forced_break_position(
+pub extern "C" fn layout_script_forced_break_ends_empty_line(
     host: &DocumentHost,
     block: NodeSlotId,
     forced_break: NodeSlotId,
-    out: &mut super::used_values::FfiCssPixelPoint,
 ) -> bool {
-    let position = read_rows(host, |arena| {
-        if !arena.paintable_row_is_populated(block) {
-            return None;
-        }
-        let side = arena.committed_side_data(block);
-        let line = side
-            .lines()
-            .iter()
-            .find(|line| line.forced_break_node == forced_break && line.fragment_count == 0)?;
-        let root_position =
-            crate::painting::paintable_geometry::LineRootPositions::new(arena, block).of_fragment(line.box_fragment);
-        Some(CssPixelRect::from(line.rect).translated_by(root_position).location())
-    });
-    let Some(position) = position else {
-        return false;
-    };
-    *out = position.into();
-    true
+    read_rows(host, |arena| {
+        arena.paintable_row_is_populated(block)
+            && arena.committed_side_data(block).lines().iter().any(|line| {
+                line.fragment_count == 0 && line.forced_break.is_some_and(|position| position.node == forced_break)
+            })
+    })
 }
 
 #[unsafe(no_mangle)]
@@ -787,8 +774,7 @@ pub enum FfiAnchorSizedProperty {
 
 /// Writes the size `property` of the absolutely positioned box `slot` resolved to in the committed layout to `out`,
 /// when its anchor-size() functions resolved against an anchor box.
-#[unsafe(no_mangle)]
-pub extern "C" fn layout_script_anchor_resolved_size(
+pub fn layout_script_anchor_resolved_size(
     host: &DocumentHost,
     slot: NodeSlotId,
     property: FfiAnchorSizedProperty,
@@ -801,9 +787,10 @@ pub extern "C" fn layout_script_anchor_resolved_size(
         }
         arena.with_committed_fragment_link(slot, |link| {
             let link = link?;
-            let sizes = link.abspos_layout_inputs.as_ref()?.resolved_anchor_sizes;
+            let inputs = link.placement.abspos_layout_inputs.as_ref()?;
+            let sizes = inputs.resolved_anchor_sizes;
             // NB: The sizes lie in the frame the box was laid out in, whose axes a vertical writing mode transposes.
-            let (physical_width, physical_height) = if link.frame.is_transposed() {
+            let (physical_width, physical_height) = if inputs.frame.is_transposed() {
                 ((sizes.min_height, sizes.max_height), (sizes.min_width, sizes.max_width))
             } else {
                 ((sizes.min_width, sizes.max_width), (sizes.min_height, sizes.max_height))

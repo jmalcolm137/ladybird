@@ -16,9 +16,7 @@
 #include <AK/Tuple.h>
 #include <AK/Utf16String.h>
 #include <AK/Utf16View.h>
-#include <LibCompositing/DisplayList/AccumulatedVisualContext.h>
-#include <LibCompositing/DisplayList/DisplayListResourceStorage.h>
-#include <LibCompositing/Scrolling/ScrollState.h>
+#include <LibCompositing/DisplayList/DisplayListResources.h>
 #include <LibCompositing/Scrolling/SmoothScrollAnimation.h>
 #include <LibCore/Forward.h>
 #include <LibCore/StatsLog.h>
@@ -73,6 +71,7 @@ namespace Web::HTML {
 
 enum class ClockAnimations : u8;
 struct PopulateSessionHistoryEntryDocumentOutput;
+class DocumentToCreate;
 
 // https://html.spec.whatwg.org/multipage/document-sequences.html#navigable
 class WEB_API LocalNavigable : public Navigable {
@@ -105,6 +104,7 @@ public:
     GC::Ptr<RemoteNavigable> provisional_for() const { return m_provisional_for; }
     void clear_provisional_for() { m_provisional_for = nullptr; }
     static GC::Ref<LocalNavigable> create_stand_in(Badge<Page>, RemoteNavigable&, SessionHistoryEntryDescriptor const& current_history_entry);
+    bool container_suppresses_viewport_scrolling() const;
     void set_root_container_state(ReplicatedContainerState);
     void set_parent_compositor_context(Optional<Web::CompositorContextId>);
 
@@ -221,7 +221,7 @@ public:
 
     void create_navigation_params_for_navigation(NavigationPopulationRequest, GC::Ref<SourceSnapshotParams>, NavigationParamsVariant, Bindings::NavigationTimingType);
 
-    GC::Ptr<DOM::Document> evaluate_javascript_url(URL::URL const&, URL::Origin const& new_document_origin, UserNavigationInvolvement, Utf16String navigation_id);
+    GC::Ptr<DocumentToCreate> evaluate_javascript_url(URL::URL const&, URL::Origin const& new_document_origin, UserNavigationInvolvement, Utf16String navigation_id);
 
     void reload(Optional<StorageSerializationRecord> navigation_api_state = {}, UserNavigationInvolvement = UserNavigationInvolvement::None, GC::Ptr<NavigationAPIMethodTracker> api_method_tracker = {});
 
@@ -248,6 +248,13 @@ public:
     CSSPixelRect viewport_rect() const { return { m_viewport_scroll_offset, m_viewport_size }; }
     CSSPixelSize viewport_size() const { return m_viewport_size; }
     void set_viewport_size(CSSPixelSize, InvalidateDisplayList = InvalidateDisplayList::No);
+    Gfx::IntSize viewport_size_in_device_pixels() const;
+    Gfx::IntRect present_viewport_rect() const;
+
+    // A size the window takes as a rendering update is in flight waits for that update to end: the update flies for
+    // the size it began with, and a new size would make the main thread wait for the flight and lay out again.
+    void set_viewport_size_after_rendering_update_in_flight(CSSPixelSize);
+    void take_viewport_size_held_for_rendering_update_in_flight();
 
     // The part of the viewport of a local root another process embeds that the top-level viewport shows, in this
     // viewport's coordinates, as its embedder last reported. None of it until then.
@@ -331,7 +338,6 @@ public:
 
     // Paints into the target, which must be a shareable bitmap, then calls the callback.
     void render_screenshot(NonnullRefPtr<Gfx::Bitmap> target, PaintConfig, Function<void(Compositor::ScreenshotResult)>&& callback);
-    Compositing::DisplayListResourceStorage& display_list_resource_storage() { return presenter().display_list_resource_storage(); }
 
     // Tells the clock lanes of the active document whether a task begins or the event loop goes idle: a task that begins
     // lets them sample the animations they held, at once. Answers whether the navigable still has lanes to tell.
@@ -415,7 +421,6 @@ public:
     GC::Ref<WebIDL::Promise> perform_a_scroll_of_an_element(DOM::Element&, CSSPixelPoint position, Bindings::ScrollBehavior, Optional<CSSPixelPoint> relative_displacement = {});
     bool perform_a_snapped_relative_user_scroll(Layout::Node&, CSSPixelPoint delta, Compositing::SnapSelectionStrategy::Type, Painting::ScrollKind = Painting::ScrollKind::Relative);
     bool perform_a_scroll_step_for_key_input(Layout::Node&, CSSPixelPoint delta, Compositing::SnapSelectionStrategy::Type);
-    Layout::Node* layout_node_for_async_scroll_node_stable_id(Web::AsyncScrollNodeStableID);
     void re_snap_scroll_containers_after_layout_change(Layout::BegunRead const& read);
     void abort_in_flight_smooth_scrolls(Web::AsyncScrollNodeStableID);
     void abort_in_flight_smooth_scrolls_taken_over_by_user_input(Web::AsyncScrollNodeStableID, CSSPixelPoint scroll_offset_at_gesture_start);
@@ -459,6 +464,7 @@ protected:
     Variant<Empty, Traversal, Utf16String> m_ongoing_navigation;
 
 private:
+    void render_screenshot_of_painted_subtree(NonnullRefPtr<Gfx::Bitmap> target, PaintConfig, Function<void(Compositor::ScreenshotResult)>&& callback);
     void record_rendering_invalidation();
 
     // A rendering update's recording that flies beside the event loop, with what its frame is finished with.
@@ -466,10 +472,8 @@ private:
 
     Compositor::FlightPresentation take_presentation(Compositor::SealedPresentation);
     void commit_unrecorded_frame(Layout::BegunRead const&, DOM::Document&, Compositor::SealedPresentation);
-    Compositor::SealedPresentation seal_presentation(DOM::Document&, PaintConfig const&, bool records_display_list);
-    void unseal_presentation(DOM::Document&, Compositor::SealedPresentation&);
-    void finish_recording_in_flight(RecordingInFlight&, Layout::RustFFI::FfiRecordingLanding, Layout::RustFFI::FfiPresentation);
-    Gfx::IntRect present_viewport_rect() const;
+    Compositor::SealedPresentation seal_presentation(Layout::BegunRead const&, DOM::Document&, PaintConfig const&, bool records_display_list);
+    void finish_recording_in_flight(RecordingInFlight&, Layout::RustFFI::FfiRecordingLanding, bool presented_other_scroll_offsets);
 
     Optional<CSSPixelPoint> to_local_root_viewport_position(CSSPixelPoint);
 
@@ -644,6 +648,7 @@ private:
     ReplicatedContainerState m_root_container_state;
 
     CSSPixelSize m_viewport_size;
+    Optional<CSSPixelSize> m_viewport_size_held_for_rendering_update_in_flight;
     Optional<CSSPixelRect> m_viewport_intersection;
     CSSPixelPoint m_viewport_scroll_offset;
     struct PendingPersistedStateRestoration {
@@ -678,7 +683,7 @@ private:
     bool m_should_show_caret_hit_test_debug_overlay { false };
     // The navigable's presenter, which what presents a frame of it beside the event loop shares, and how many frames a
     // rendering update committed with it.
-    NonnullRefPtr<Compositor::NavigablePresenter> m_presenter { Compositor::NavigablePresenter::create() };
+    NonnullOwnPtr<Compositor::NavigablePresenter> m_presenter { make<Compositor::NavigablePresenter>() };
     u64 m_committed_generation { 0 };
     OwnPtr<Compositor::CompositorContextHandle> m_compositor_context;
     RefPtr<Core::Timer> m_async_scroll_hover_update_timer;
@@ -792,12 +797,47 @@ private:
     Vector<Web::AsyncScrollNodeStableID, 1> m_held_boxes;
 };
 
+// AD-HOC: The Document a navigation creates once the document it replaces is unloaded, as what it is created from.
+//         What the steps before then read of the Document is read from there.
+class DocumentToCreate final : public GC::Cell {
+    GC_CELL(DocumentToCreate, GC::Cell);
+    GC_DECLARE_ALLOCATOR(DocumentToCreate);
+
+public:
+    using LoadSteps = GC::Function<GC::Ref<DOM::Document>(NavigationParams const&)>;
+
+    static GC::Ref<DocumentToCreate> create(GC::Ref<NavigationParams>, GC::Ref<LoadSteps>, Optional<URL::Origin> origin = {});
+
+    URL::Origin origin() const;
+    bool replaces_response_origin() const { return m_replaces_response_origin; }
+    URL::URL url() const;
+    CrossProcessId id() const;
+    EnvironmentId const& environment_id() const;
+
+    bool takes_over_window_of(DOM::Document const&) const;
+
+    GC::Ref<DOM::Document> create_document();
+    void discard();
+
+private:
+    DocumentToCreate(GC::Ref<NavigationParams>, GC::Ref<LoadSteps>, Optional<URL::Origin>);
+
+    virtual void visit_edges(Cell::Visitor&) override;
+
+    // Null once the document is created or discarded, so that what it was created from is released.
+    GC::Ptr<NavigationParams> m_navigation_params;
+    GC::Ptr<LoadSteps> m_load_steps;
+    bool m_replaces_response_origin { false };
+    // Creating the document moves the id out of the reserved environment.
+    EnvironmentId m_environment_id;
+};
+
 struct PopulateSessionHistoryEntryDocumentOutput final : public JS::Cell {
     GC_CELL(PopulateSessionHistoryEntryDocumentOutput, JS::Cell);
     GC_DECLARE_ALLOCATOR(PopulateSessionHistoryEntryDocumentOutput);
 
 public:
-    GC::Ptr<DOM::Document> document;
+    GC::Ptr<DocumentToCreate> document_to_create;
 
     LocalNavigable::NavigationParamsVariant navigation_params { LocalNavigable::NullOrError {} };
     bool save_extra_document_state = true;
@@ -822,7 +862,7 @@ WEB_API HashTable<GC::RawRef<LocalNavigable>>& all_local_navigables();
 WEB_API GC::Ptr<LocalNavigable> local_navigable_with_id(CrossProcessId);
 
 bool navigation_must_be_a_replace(URL::URL const& url, DOM::Document const& document);
-void finalize_a_cross_document_navigation(GC::Ref<LocalNavigable>, HistoryHandlingBehavior, UserNavigationInvolvement, NonnullRefPtr<SessionHistoryEntry>, GC::Ptr<DOM::Document> pending_document, Utf16String navigation_id);
+void finalize_a_cross_document_navigation(GC::Ref<LocalNavigable>, HistoryHandlingBehavior, UserNavigationInvolvement, NonnullRefPtr<SessionHistoryEntry>, GC::Ptr<DocumentToCreate> pending_document, Utf16String navigation_id);
 
 WEB_API void check_if_unloading_is_canceled(Page&, Vector<GC::Root<LocalNavigable>> navigables_that_need_before_unload, GC::Ptr<LocalTraversableNavigable> owner, GC::Ptr<LocalTraversableNavigable> traversable, RefPtr<SessionHistoryEntry> target_entry, Optional<UserNavigationInvolvement> user_involvement_for_navigate_events, UnloadPromptShown, GC::Ref<GC::Function<void(CheckIfUnloadingIsCanceledResult, UnloadPromptShown)>> callback);
 void perform_url_and_history_update_steps(DOM::Document& document, URL::URL new_url, Optional<StorageSerializationRecord> = {}, HistoryHandlingBehavior history_handling = HistoryHandlingBehavior::Replace);

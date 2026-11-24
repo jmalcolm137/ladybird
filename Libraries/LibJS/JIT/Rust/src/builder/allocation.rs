@@ -26,17 +26,16 @@ use crate::code::Repr;
 use crate::ir::FrameField;
 use crate::ir::NodeId;
 use crate::ir::Op;
+use crate::snapshot::ClosureTemplateSnapshot;
 use crate::snapshot::ObjectShapeCacheSnapshot;
 use crate::snapshot::ShapeSnapshot;
 
 /// `NewObject` without an object shape cache.
 const NO_OBJECT_SHAPE_CACHE: u32 = u32::MAX;
 
-impl GraphBuilder<'_> {
+impl GraphBuilder<'_, '_> {
     fn object_shape_cache(&self, cache: u32) -> Option<&ObjectShapeCacheSnapshot> {
-        self.function
-            .executable
-            .object_shape_caches
+        self.snapshot[self.function.executable.object_shape_caches]
             .get(cache as usize)
             .and_then(Option::as_ref)
     }
@@ -67,7 +66,7 @@ impl GraphBuilder<'_> {
                 property_count,
                 reserve: property_count,
             },
-            Vec::new(),
+            &[],
             Some(Repr::Tagged),
         );
         self.write(dst, object)?;
@@ -87,12 +86,16 @@ impl GraphBuilder<'_> {
         let object = self.read(object)?;
         let Some(offset) = self
             .literal_allocated_with_cache_shape(object, shape_cache_index)
-            .and_then(|cached| cached.property_offsets.get(property_slot as usize).copied())
+            .and_then(|cached| {
+                self.snapshot[cached.property_offsets]
+                    .get(property_slot as usize)
+                    .copied()
+            })
         else {
             return Ok(false);
         };
         let value = self.read(src)?;
-        self.emit(Op::InitializeNamed { offset }, vec![object, value], None);
+        self.emit(Op::InitializeNamed { offset }, &[object, value], None);
         Ok(true)
     }
 
@@ -115,7 +118,7 @@ pub(super) enum ArrayElement {
     Constant(u64),
 }
 
-impl GraphBuilder<'_> {
+impl GraphBuilder<'_, '_> {
     /// Whether compiled code allocates arrays of `count` elements.
     pub(super) fn can_allocate_array(&self, count: usize) -> bool {
         // NB: The runtime always allocates arrays; the codegen tests of slow
@@ -134,18 +137,19 @@ impl GraphBuilder<'_> {
         if !self.can_allocate_array(elements.len()) {
             return Ok(false);
         }
-        let values = elements
-            .iter()
-            .map(|element| match element {
-                ArrayElement::Operand(operand) => self.read(*operand),
-                ArrayElement::Constant(bits) => Ok(self.constant(*bits)),
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+        let mut values = self.node_list();
+        for element in elements {
+            values.push(match element {
+                ArrayElement::Operand(operand) => self.read(*operand)?,
+                ArrayElement::Constant(bits) => self.constant(*bits),
+            });
+        }
         // NB: Holes (the empty value) make the elements holey, not packed.
         if values
             .iter()
             .any(|value| self.graph.constant_value(*value) == Some(crate::ir::value::EMPTY))
         {
+            self.release_node_list(values);
             return Ok(false);
         }
         let shape = self.runtime.array_allocation.shape;
@@ -153,17 +157,18 @@ impl GraphBuilder<'_> {
             self.embed(shape);
         }
         let count = u32::try_from(values.len()).expect("array literals have fewer than 2^32 elements");
-        let array = self.emit(Op::AllocateArray { count }, Vec::new(), Some(Repr::Tagged));
-        for (index, value) in (0u32..).zip(values) {
-            self.emit(Op::InitializeElement { index }, vec![array, value], None);
+        let array = self.emit(Op::AllocateArray { count }, &[], Some(Repr::Tagged));
+        for (index, value) in (0u32..).zip(values.iter().copied()) {
+            self.emit(Op::InitializeElement { index }, &[array, value], None);
         }
+        self.release_node_list(values);
         self.write(dst, array)?;
         Ok(true)
     }
 }
 
-impl GraphBuilder<'_> {
-    /// Builds `NewFunction` of the compiled function as an
+impl GraphBuilder<'_, '_> {
+    /// Builds `NewFunction` of the compiled function or an inlined one as an
     /// `AllocateFunction`, if it has a closure template and creates no
     /// method. Returns false, having built nothing, otherwise.
     pub(super) fn try_build_new_function(
@@ -172,27 +177,45 @@ impl GraphBuilder<'_> {
         shared_function_data_index: u32,
         has_home_object: bool,
     ) -> Result<bool, CompileFailure> {
-        if self.function.is_virtual() || has_home_object {
+        if has_home_object {
             return Ok(false);
         }
-        let Some(sample) = self
-            .function
-            .executable
-            .closure_templates
+        let Some(&ClosureTemplateSnapshot {
+            sample_slot,
+            shape,
+            shared_data,
+            inline_executable,
+            ..
+        }) = self.snapshot[self.function.executable.closure_templates]
             .get(shared_function_data_index as usize)
             .and_then(Option::as_ref)
-            .map(|closure| closure.sample)
         else {
             return Ok(false);
         };
-        self.embed(sample);
+        // NB: Only frames of inlined calls of the closure show it, so the closure of a function that is never inlined
+        //     is no frame's legacy caller. Closure templates are of normal functions, which are legacy callers when
+        //     they are not strict, arrow functions and methods included.
+        let legacy_caller =
+            inline_executable.is_some_and(|index| self.snapshot.executables[index as usize].is_non_strict_function());
+        self.embed(shape);
+        self.embed(shared_data);
         let environment = self.frame_field(FrameField::LexicalEnvironment)?;
-        let private_environment = self.frame_field(FrameField::PrivateEnvironment)?;
+        // NB: Only inlined functions without a private environment have closure templates, but the frames of inlined
+        //     closures have the environments of the closure.
+        let inlined_closure = self.function.inline.as_ref().is_some_and(|call| call.closure.is_some());
+        let private_environment = if self.function.is_virtual() && !inlined_closure {
+            self.typed_constant(0, Repr::Pointer)
+        } else {
+            self.frame_field(FrameField::PrivateEnvironment)?
+        };
         let function = self.emit(
             Op::AllocateFunction {
+                executable: self.function.index,
                 shared_function_data_index,
+                sample_slot,
+                legacy_caller,
             },
-            vec![environment, private_environment],
+            &[environment, private_environment],
             Some(Repr::Tagged),
         );
         self.write(dst, function)?;
@@ -200,7 +223,7 @@ impl GraphBuilder<'_> {
     }
 }
 
-impl GraphBuilder<'_> {
+impl GraphBuilder<'_, '_> {
     /// Builds `CreateLexicalEnvironment` of the compiled function as an
     /// `AllocateEnvironment` that becomes the frame's lexical environment, if
     /// its shape cache has a template for environments with `capacity`
@@ -215,10 +238,7 @@ impl GraphBuilder<'_> {
         if self.function.is_virtual() {
             return Ok(false);
         }
-        let Some(template) = self
-            .function
-            .executable
-            .lexical_environment_templates
+        let Some(template) = self.snapshot[self.function.executable.lexical_environment_templates]
             .get(shape_cache as usize)
             .and_then(Option::as_ref)
         else {
@@ -233,10 +253,10 @@ impl GraphBuilder<'_> {
         let parent = self.read(parent)?;
         let environment = self.emit(
             Op::AllocateEnvironment { shape_cache, capacity },
-            vec![parent],
+            &[parent],
             Some(Repr::Tagged),
         );
-        let address = self.emit(Op::SetLexicalEnvironment, vec![environment], Some(Repr::Pointer));
+        let address = self.emit(Op::SetLexicalEnvironment, &[environment], Some(Repr::Pointer));
         self.frame.set_field(FrameField::LexicalEnvironment, address);
         self.write(dst, environment)?;
         Ok(true)
@@ -286,7 +306,7 @@ mod tests {
         })
     }
 
-    fn ops(graph: &crate::ir::Graph) -> Vec<Op> {
+    fn ops<'z>(graph: &crate::ir::Graph<'z>) -> Vec<Op<'z>> {
         graph
             .blocks
             .iter()
@@ -306,18 +326,19 @@ mod tests {
         let program = literal_program();
         let mut snapshot = snapshot_for(&program, test_layout());
         snapshot.runtime.object_allocation.slow_path = 1;
-        snapshot.executables[0].object_shape_caches = vec![Some(ObjectShapeCacheSnapshot {
+        let property_offsets = snapshot.add(&[1, 0]);
+        snapshot.executables[0].object_shape_caches = snapshot.add(&[Some(ObjectShapeCacheSnapshot {
             shape: ShapeSnapshot {
                 shape: LITERAL_SHAPE,
                 property_count: 2,
             },
-            property_offsets: vec![1, 0],
-        })];
+            property_offsets,
+        })]);
         snapshot.executables[0].new_object_shape = Some(ShapeSnapshot {
             shape: EMPTY_SHAPE,
             property_count: 0,
         });
-        let graph = crate::builder::build_graph(&snapshot).unwrap();
+        let graph = crate::builder::build_graph(&snapshot, crate::test_zone()).unwrap();
         assert_eq!(
             ops(&graph),
             vec![
@@ -368,7 +389,7 @@ mod tests {
         let template = crate::snapshot::LexicalEnvironmentTemplateSnapshot {
             allocator: 0x5000,
             cell_size: 88,
-            words: vec![0; 9],
+            words: snapshot.add(&[0; 9]),
             binding_count: 2,
             inline_binding_values: true,
             binding_values_offset: 48,
@@ -376,8 +397,8 @@ mod tests {
             shape: Some(SHAPE),
         };
         // NB: Cache 1 has no template.
-        snapshot.executables[0].lexical_environment_templates = vec![Some(template), None];
-        let graph = crate::builder::build_graph(&snapshot).unwrap();
+        snapshot.executables[0].lexical_environment_templates = snapshot.add(&[Some(template), None]);
+        let graph = crate::builder::build_graph(&snapshot, crate::test_zone()).unwrap();
         let ops = graph
             .blocks
             .iter()
@@ -414,12 +435,12 @@ mod tests {
         let program = literal_program();
         let mut snapshot = snapshot_for(&program, test_layout());
         snapshot.runtime.object_allocation.slow_path = 1;
-        snapshot.executables[0].object_shape_caches = vec![None];
+        snapshot.executables[0].object_shape_caches = snapshot.add(&[None]);
         snapshot.executables[0].new_object_shape = Some(ShapeSnapshot {
             shape: EMPTY_SHAPE,
             property_count: 0,
         });
-        let graph = crate::builder::build_graph(&snapshot).unwrap();
+        let graph = crate::builder::build_graph(&snapshot, crate::test_zone()).unwrap();
         let ops = ops(&graph);
         assert_eq!(
             ops.iter()

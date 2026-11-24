@@ -20,6 +20,8 @@
 #include <LibGfx/Forward.h>
 #include <LibGfx/Rect.h>
 #include <LibGfx/Size.h>
+#include <LibMedia/VideoSinkHandle.h>
+#include <LibMediaCodecs/Forward.h>
 
 class SkImage;
 class SkImageFilter;
@@ -41,6 +43,7 @@ struct TextBlobCacheKey {
     u64 font_id { 0 };
     u32 scale_bits { 0 };
     u8 font_smoothing { 0 };
+    bool uses_lcd_text { false };
     u64 glyph_hash { 0 };
 
     bool operator==(TextBlobCacheKey const&) const = default;
@@ -54,7 +57,8 @@ template<>
 struct Traits<Compositor::TextBlobCacheKey> : public DefaultTraits<Compositor::TextBlobCacheKey> {
     static unsigned hash(Compositor::TextBlobCacheKey const& key)
     {
-        return pair_int_hash(pair_int_hash(u64_hash(key.font_id ^ key.glyph_hash), key.scale_bits), key.font_smoothing);
+        auto font_options = (static_cast<unsigned>(key.font_smoothing) << 1) | key.uses_lcd_text;
+        return pair_int_hash(pair_int_hash(u64_hash(key.font_id ^ key.glyph_hash), key.scale_bits), font_options);
     }
 };
 
@@ -62,8 +66,8 @@ struct Traits<Compositor::TextBlobCacheKey> : public DefaultTraits<Compositor::T
 
 namespace Compositor {
 
-// The Skia images and text blobs that the player makes from the resources of one storage. They are kept until the
-// storage removes the resource they were made from.
+// The Skia images and text blobs that the player makes from the fonts and the image frames that one display list, or
+// what else is painted, draws. They are kept until it stops drawing what they were made from.
 class DisplayListRasterCache {
     AK_MAKE_NONCOPYABLE(DisplayListRasterCache);
     AK_MAKE_NONMOVABLE(DisplayListRasterCache);
@@ -72,37 +76,48 @@ public:
     DisplayListRasterCache();
     ~DisplayListRasterCache();
 
-    // Drops everything made from these resources, which the storage removed or replaced.
-    void evict(Compositing::DisplayListResourceSet const& removed_resources);
+    // Drops everything made from these fonts, which are no longer drawn.
+    void forget_fonts(ReadonlySpan<u64> font_ids);
+    // Drops everything made from these image frames, which are no longer drawn.
+    void forget_image_frames(ReadonlySpan<u64> image_frame_ids);
+    // Drops the image made from the frame of a video sink that is no longer drawn.
+    void forget_video_sink(Media::VideoSinkHandle);
+    // Drops the rasters of every SVG image but these, which are the ones that the display list of the context draws.
+    void forget_vector_images_other_than(ReadonlySpan<u64> drawn_vector_image_ids);
 
-    sk_sp<SkImage> image_for_image_frame(Compositing::DisplayListResourceStorage const&, Compositing::ImageFrameResourceId, RefPtr<Gfx::SkiaBackendContext> const&);
-    // The image can be larger than the frame, whose visible size is the part of it to draw.
-    sk_sp<SkImage> image_for_video_sink(Compositing::DisplayListResourceStorage const&, Compositing::VideoSinkResourceId, RefPtr<Gfx::SkiaBackendContext> const&, Gfx::IntSize& visible_size);
+    sk_sp<SkImage> image_for_image_frame(Gfx::DecodedImageFrame const&, Compositing::ImageFrameResourceId, RefPtr<Gfx::SkiaBackendContext> const&);
+    // The image of the frame that the video sink shows. The image can be larger than the frame, whose visible size is
+    // the part of it to draw.
+    sk_sp<SkImage> image_for_video_sink(Media::VideoSinkHandle, Media::VideoFrame const&, RefPtr<Gfx::SkiaBackendContext> const&, Gfx::IntSize& visible_size);
     sk_sp<SkImage> repeated_tile_raster(u64 tile_key, Gfx::IntSize, RefPtr<Gfx::SkiaBackendContext> const&) const;
     void add_repeated_tile_raster(u64 tile_key, Gfx::IntSize, RefPtr<Gfx::SkiaBackendContext> const&, sk_sp<SkImage>);
-    sk_sp<SkImage> nested_display_list_raster(Compositing::DisplayListResourceId, RefPtr<Gfx::SkiaBackendContext> const&, Gfx::IntRect visible_rect_in_list_space, Gfx::IntRect& raster_rect_in_list_space);
-    bool has_rasterized_nested_display_list(Compositing::DisplayListResourceId) const;
-    sk_sp<SkImage> create_nested_display_list_raster(Compositing::DisplayListResourceId, RefPtr<Gfx::SkiaBackendContext> const&, Gfx::IntRect rect_in_list_space, Function<sk_sp<SkImage>()> const& rasterize);
-    sk_sp<SkTextBlob> text_blob(Compositing::DisplayListResourceStorage const&, Compositing::FontResourceId, float scale, ReadonlySpan<Compositing::DisplayListGlyph>, u8 font_smoothing);
+    sk_sp<SkImage> vector_image_raster(Compositing::DisplayListResourceId, RefPtr<Gfx::SkiaBackendContext> const&, Gfx::IntRect visible_rect_in_recorded_space, Gfx::IntRect& raster_rect_in_recorded_space);
+    bool has_rasterized_vector_image(Compositing::DisplayListResourceId) const;
+    // Makes room for a raster of the image, which then counts against the budget until it is finished, and answers false
+    // where the rasters in use leave no room for it.
+    bool reserve_vector_image_raster(Compositing::DisplayListResourceId, RefPtr<Gfx::SkiaBackendContext> const&, Gfx::IntRect rect_in_recorded_space);
+    // Keeps the raster that was reserved, unless it could not be made.
+    sk_sp<SkImage> finish_vector_image_raster(Compositing::DisplayListResourceId, RefPtr<Gfx::SkiaBackendContext> const&, Gfx::IntRect rect_in_recorded_space, sk_sp<SkImage>);
+    sk_sp<SkTextBlob> text_blob(Gfx::Font const&, Compositing::FontResourceId, float scale, ReadonlySpan<Compositing::DisplayListGlyph>, u8 font_smoothing, bool uses_lcd_text = false);
 
-    sk_sp<SkImageFilter> layer_image_filter(u64 tree_structural_epoch, Compositing::ReplayLayer const&, Function<sk_sp<SkImageFilter>()> const& create);
-    sk_sp<SkImageFilter> backdrop_image_filter(u64 tree_structural_epoch, Compositing::ReplayLayer const&, Optional<Gfx::FloatRect> blur_edge, bool limited_to_region, Function<sk_sp<SkImageFilter>()> const& create);
+    sk_sp<SkImageFilter> layer_image_filter(Compositing::ReplayLayer const&, Function<sk_sp<SkImageFilter>()> const& create);
+    sk_sp<SkImageFilter> backdrop_image_filter(Compositing::ReplayLayer const&, Optional<Gfx::FloatRect> blur_edge, bool limited_to_region, Function<sk_sp<SkImageFilter>()> const& create);
 
     // The Skia path for a path that stays the same for as long as it has this identity. Keeping one Skia path lets
     // the caches that are keyed on it work.
     SkPath clip_path(u64 path_identity, Gfx::PathData const&);
-    // Drops the clip paths that were not used since the last call.
-    void drop_clip_paths_not_used_since_last_frame();
+    // Drops the clip paths and layer filters that were not used since the last call.
+    void drop_what_was_not_used_since_last_frame();
 
 private:
     struct ImageFrameImage;
     struct VideoSinkImage;
     struct RepeatedTileRaster;
-    struct NestedDisplayListRasters;
+    struct VectorImageRasters;
     struct TextBlob;
     struct ClipPath;
     struct LayerImageFilterCache;
-    LayerImageFilterCache& ensure_layer_image_filter_cache(u64 tree_structural_epoch);
+    LayerImageFilterCache& ensure_layer_image_filter_cache();
 
     OwnPtr<LayerImageFilterCache> m_layer_image_filter_cache;
 
@@ -110,8 +125,8 @@ private:
     HashMap<u64, NonnullOwnPtr<VideoSinkImage>> m_video_sink_images;
     HashMap<u64, NonnullOwnPtr<RepeatedTileRaster>> m_repeated_tile_rasters;
     size_t m_repeated_tile_raster_bytes { 0 };
-    HashMap<u64, NonnullOwnPtr<NestedDisplayListRasters>> m_nested_display_list_rasters;
-    size_t m_nested_raster_cache_reserved_bytes { 0 };
+    HashMap<u64, NonnullOwnPtr<VectorImageRasters>> m_vector_image_rasters;
+    size_t m_vector_image_raster_cache_reserved_bytes { 0 };
     HashMap<TextBlobCacheKey, NonnullOwnPtr<TextBlob>> m_text_blobs;
     size_t m_text_blob_cache_bytes { 0 };
     MonotonicTime m_text_blob_cache_sweep_time { MonotonicTime::now() };

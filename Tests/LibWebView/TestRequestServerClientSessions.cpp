@@ -12,12 +12,17 @@
 #include <LibRequests/RequestClient.h>
 #include <LibRequests/RequestControlClient.h>
 #include <LibTest/TestCase.h>
+#include <LibURL/Parser.h>
 #include <LibWebView/Application.h>
 #include <LibWebView/BrowsingSession.h>
 #include <LibWebView/HeadlessWebView.h>
 #include <LibWebView/HelperProcess.h>
 #include <LibWebView/ProcessManager.h>
+#include <LibWebView/ProcessSnapshot.h>
+#include <LibWebView/RequestServerManager.h>
+#include <LibWebView/RequestServerSiteBindings.h>
 #include <LibWebView/Utilities.h>
+#include <LibWebView/WorkerAgentManager.h>
 
 namespace {
 
@@ -56,6 +61,33 @@ int connect_request_server_client(WebView::BrowsingSession& session)
     return client_id;
 }
 
+}
+
+TEST_CASE(request_server_snapshots_report_session_privacy)
+{
+    Test::HeadlessTestEnvironment environment { "TestRequestServerSnapshots"sv };
+    auto app = TRY_OR_FAIL(environment.create_application<TestApplication>());
+
+    auto& manager = WebView::Application::request_server_manager();
+    auto& regular_session = WebView::Application::default_session();
+    auto private_session = WebView::Application::session_for_new_view(WebView::IsPrivate::Yes);
+    auto site = "https://example.com"_utf16;
+    (void)TRY_OR_FAIL(manager.instance_for_site(regular_session, site));
+    (void)TRY_OR_FAIL(manager.instance_for_site(*private_session, site));
+    (void)TRY_OR_FAIL(manager.browser_instance(*private_session));
+
+    auto snapshots = WebView::process_snapshots(WebView::Application::process_manager());
+    auto site_url = URL::Parser::basic_parse(site);
+    auto has_request_server = [&](Optional<URL::URL> const& url, WebView::IsPrivate is_private) {
+        auto match = snapshots.first_matching([&](auto const& snapshot) {
+            return snapshot.type == WebView::ProcessType::RequestServer && snapshot.site_url == url && snapshot.is_private == is_private;
+        });
+        return match.has_value();
+    };
+    for (auto is_private : { WebView::IsPrivate::No, WebView::IsPrivate::Yes }) {
+        EXPECT(has_request_server(site_url, is_private));
+        EXPECT(has_request_server({}, is_private));
+    }
 }
 
 // RequestServer asks the UI process for the cookies of a request by the ID of the client that made it. The UI process
@@ -133,5 +165,46 @@ TEST_CASE(request_server_client_sessions)
     VERIFY(app->session_for_request_server_client(disconnecting_client));
     s_clients.clear();
     Core::EventLoop::current().spin_until([&] { return !app->session_for_request_server_client(disconnecting_client); });
+
+    // A worker uses the cookies of the browsing session of the process it runs in, also one that a page's worker
+    // starts after the page's private session was restarted, whether or not the next private session has begun.
+    auto worker_owner_view = WebView::HeadlessWebView::create(theme, { 800, 600 }, WebView::IsPrivate::Yes);
+    worker_owner_view->load_from_browser_ui(URL::Parser::basic_parse("data:text/html,<title>workers</title>"sv).release_value());
+    Core::EventLoop::current().spin_until([&] { return worker_owner_view->title() == "workers"sv; });
+    auto& worker_owner_session = worker_owner_view->page().client().session();
+    worker_owner_view->run_javascript(R"js(
+        const script = `
+            const nestedWorkers = [];
+            onmessage = () => {
+                const nestedWorker = new Worker("data:text/javascript,postMessage(0)");
+                nestedWorker.onmessage = () => postMessage(nestedWorkers.length);
+                nestedWorkers.push(nestedWorker);
+            };
+            postMessage(0);
+        `;
+        window.worker = new Worker(`data:text/javascript,${encodeURIComponent(script)}`);
+        worker.onmessage = event => document.title = `nested workers: ${event.data}`;
+    )js"_string);
+    auto wait_for_nested_workers = [&](size_t count) {
+        auto title = ByteString::formatted("nested workers: {}", count);
+        Core::EventLoop::current().spin_until([&] { return worker_owner_view->title() == title.view(); });
+    };
+    wait_for_nested_workers(0);
+
+    app->reset_private_browsing_session();
+    worker_owner_view->run_javascript("worker.postMessage(null);"_string);
+    wait_for_nested_workers(1);
+    auto next_private_view = WebView::HeadlessWebView::create(theme, { 800, 600 }, WebView::IsPrivate::Yes);
+    VERIFY(&next_private_view->page().client().session() != &worker_owner_session);
+    worker_owner_view->run_javascript("worker.postMessage(null);"_string);
+    wait_for_nested_workers(2);
+
+    size_t worker_count = 0;
+    WebView::WorkerAgentManager::the().for_each_request_server_site_bindings([&](WebView::RequestServerSiteBindings& bindings) {
+        VERIFY(app->session_for_request_server_client(*bindings.client_id()).ptr() == &worker_owner_session);
+        ++worker_count;
+        return IterationDecision::Continue;
+    });
+    VERIFY(worker_count == 3);
     outln("PASS: RequestServer clients use the cookies of the browsing session they were created for");
 }

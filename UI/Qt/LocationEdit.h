@@ -40,7 +40,7 @@ class LocationEdit final
 public:
     AK_ALLOC_WITH_KMALLOC;
 
-    LocationEdit(QWidget*, WebView::IsPrivate);
+    LocationEdit(QWidget*, WebView::Settings&, NonnullOwnPtr<WebView::OmniboxSuggestionProvider>);
 
     void set_trailing_action(QAction*);
     // The content blocker's button stands in the field, before the bookmark star.
@@ -54,6 +54,9 @@ public:
     void animate_trailing_action_change(TrailingActionMotion, Function<void()> const& change);
     // The knobs of the site settings icon slide past each other while the given popover is open.
     void follow_site_settings_popover(QWidget&);
+    // The bookmark star and the translate button look pressed while the given popover or menu is open.
+    void follow_bookmark_popover(QWidget&);
+    void follow_translation_menu(QWidget&);
     void set_zoom_action(QAction*);
     // The translate button stands in the field, before the bookmark star, while the page can be translated.
     void set_translate_action(QAction*);
@@ -117,6 +120,7 @@ private:
     void update_trailing_item_positions();
     void update_chrome_style();
     void update_location_icon();
+    void update_editing_icon();
     void update_zoom_indicator();
     void update_translate_button();
     void update_in_use_chip_icons();
@@ -131,16 +135,16 @@ private:
     void slide_site_settings_knobs(qreal travel);
     void update_completion_title();
     void highlight_location();
-    bool text_matches_current_url() const;
     QString serialized_url() const;
     QString display_url() const;
-    QString current_query() const;
     void set_text_and_restart_editing(QString const& text);
 
+    WebView::Settings const& m_settings;
     WebView::Omnibox m_omnibox;
     Autocomplete* m_autocomplete { nullptr };
     QToolButton* m_leading_icon_button { nullptr };
     bool m_shows_site_settings_button { false };
+    bool m_shows_editing_icon { false };
     QPointer<QWidget> m_site_settings_popover;
     QVariantAnimation* m_site_settings_knob_animation { nullptr };
     qreal m_site_settings_knob_travel { 0 };
@@ -155,6 +159,9 @@ private:
     InUseChip* m_location_in_use_chip { nullptr };
     InUseChip* m_microphone_in_use_chip { nullptr };
     QLabel* m_completion_title { nullptr };
+    // The editing icon on the button, unless it has to be set afresh.
+    Optional<WebView::Omnibox::EditingIcon::Kind> m_editing_icon_kind;
+    ByteBuffer m_editing_favicon_png;
     QVariantAnimation* m_focus_ring_animation { nullptr };
     QGraphicsEffect* m_focus_ring_effect { nullptr };
     QAction* m_zoom_action { nullptr };

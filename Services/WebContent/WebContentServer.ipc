@@ -5,6 +5,7 @@
 #include <LibIPC/File.h>
 #include <LibIPC/TransportHandle.h>
 #include <LibURL/URL.h>
+#include <LibWebCommon/Bindings/MediaSession.h>
 #include <LibWebCommon/Bindings/Navigation.h>
 #include <LibWebCommon/Bindings/NavigationType.h>
 #include <LibWebCommon/CSS/PreferredColorScheme.h>
@@ -72,6 +73,7 @@
 endpoint WebContentServer routed by Web::PageId page_id
 {
     set_font_service(IPC::TransportHandle handle, IPC::File catalog, u64 catalog_size, u64 generation) =|
+    release_memory() =|
     [NotRouted] initialize(Web::PageId initial_page_id, Vector<Web::HTML::RemoteNavigableDescriptor> remote_navigables, Web::HTML::CrossProcessId root_navigable_id, Web::HTML::CrossProcessIdAllocator cross_process_id_allocator, Web::HTML::SessionHistoryEntryDescriptor initial_history_entry, Web::HTML::CrossProcessId initial_document_id, Web::HTML::VisibilityState system_visibility_state) =|
     [NotRouted] create_representing_page(Web::PageId page_id, Vector<Web::HTML::RemoteNavigableDescriptor> remote_navigables) =|
     create_embedded_page(Web::PageId page_id, Vector<Web::HTML::RemoteNavigableDescriptor> remote_navigables, Web::HTML::CrossProcessId root_navigable_id, Web::HTML::SessionHistoryEntryDescriptor initial_history_entry, Web::HTML::VisibilityState system_visibility_state) =|
@@ -219,6 +221,7 @@ endpoint WebContentServer routed by Web::PageId page_id
 
     set_listen_for_dom_mutations(Web::PageId page_id, bool listen_for_dom_mutations) =|
     set_has_devtools_client(Web::PageId page_id, bool has_devtools_client) =|
+    save_session_history_entry_states(Web::PageId page_id) =|
     start_sending_console_output(Web::PageId page_id, bool messages, bool errors) =|
     get_dom_node_inner_html(Web::PageId page_id, Web::UniqueNodeID node_id) =|
     get_dom_node_outer_html(Web::PageId page_id, Web::UniqueNodeID node_id) =|
@@ -237,6 +240,7 @@ endpoint WebContentServer routed by Web::PageId page_id
     take_dom_node_screenshot(Web::PageId page_id, Web::UniqueNodeID node_id) =|
 
     request_internal_page_info(Web::PageId page_id, WebView::PageInfoType type) =|
+    describe_owners_of_visual_context_nodes(Web::PageId page_id, Vector<u32> spatial_node_indices, Vector<u32> effect_node_indices) =|
 
     get_selected_text(Web::PageId page_id, u64 request_id) =|
     generate_text_fragment_url(Web::PageId page_id, u64 request_id, u64 generation_id) =|
@@ -261,7 +265,8 @@ endpoint WebContentServer routed by Web::PageId page_id
     set_content_blockers(Core::AnonymousBuffer patterns) =|
 
     set_force_dark_settings(Web::PageId page_id, bool enabled, HashMap<String, bool> per_host) =|
-    set_autoplay_settings(Web::PageId page_id, Web::HTML::AutoplayPolicy policy, Vector<Utf16String> allowlist) =|
+    set_force_dark_for_local_roots(Web::PageId page_id, bool enabled) =|
+    set_autoplay_settings(Web::PageId page_id, Web::HTML::AutoplayPolicy policy, OrderedHashMap<String, Web::HTML::AutoplayPolicy> site_policies) =|
     set_preferred_color_scheme(Web::PageId page_id, Web::CSS::PreferredColorScheme color_scheme) =|
     set_preferred_contrast(Web::PageId page_id, Web::CSS::PreferredContrast contrast) =|
     set_preferred_motion(Web::PageId page_id, Web::CSS::PreferredMotion motion) =|
@@ -284,6 +289,7 @@ endpoint WebContentServer routed by Web::PageId page_id
     set_is_scripting_enabled(Web::PageId page_id, bool is_scripting_enabled) =|
     set_zoom_level(Web::PageId page_id, double zoom_level) =|
     set_maximum_frames_per_second(Web::PageId page_id, double maximum_frames_per_second) =|
+    set_screen_shows_high_dynamic_range(Web::PageId page_id, bool screen_shows_high_dynamic_range) =|
     set_frame_rate_capped(Web::PageId page_id, bool capped) =|
 
     set_window_position(Web::PageId page_id, Web::DevicePixelPoint position) =|
@@ -353,4 +359,6 @@ endpoint WebContentServer routed by Web::PageId page_id
     picture_in_picture_window_did_resize(Web::PageId page_id, Gfx::IntSize window_size) =|
     picture_in_picture_window_did_close(Web::PageId page_id, bool pause_video) =|
     set_picture_in_picture_window_controls_in_use(Web::PageId page_id, bool in_use) =|
+
+    media_session_action(Web::PageId page_id, Web::Bindings::MediaSessionAction action, Optional<double> seek_offset, Optional<double> seek_time, Optional<bool> fast_seek) =|
 }

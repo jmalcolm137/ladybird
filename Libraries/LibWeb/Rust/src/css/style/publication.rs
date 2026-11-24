@@ -13,7 +13,7 @@ use crate::css::cascaded_properties::NO_PSEUDO_ELEMENT;
 use crate::css::computed_longhand_table::IN_DISPLAY_NONE_SUBTREE;
 use crate::css::computed_value_views::QuoteTransfer;
 use animations::DeclarationScope;
-pub(crate) use demand::{RecordDemand, RecordDemandAnswer};
+pub(crate) use demand::{PendingDemandInput, RecordDemand, RecordDemandAnswer};
 
 /// What a subtree does to the generated-content state that the boxes after it read.
 #[derive(Clone, Copy, Default)]
@@ -149,19 +149,20 @@ impl RetainedState {
 
     /// The animation plan `record` decides for an element, or for its pseudo-element `pseudo_kind`,
     /// where applying it would change the animations they run: none where it would not, or where
-    /// the record installs no `animation-name`. The definitions borrow the record's values.
+    /// the record installs no `animation-name`. The definitions borrow the record's values, and the
+    /// keyframe sets the plan holds.
     pub(crate) fn animation_plan_of_record(
         &self,
         node: StyleNodeID,
         pseudo_kind: u8,
         record: &std::sync::Arc<super::pipeline::Record>,
-    ) -> Option<smallvec::SmallVec<[crate::css::style_compute::FfiComputedAnimation; 1]>> {
+    ) -> Option<crate::css::style_compute::AnimationPlan> {
         let longhands = StyleRecordView::of_host_record(record).longhands();
         let declaration_scope = self.animation_name_declaration_scope_of(node, pseudo_kind, record)?;
         let existing_animations =
             self.element_css_defined_animations(node, crate::css::style_compute::animation_slot(pseudo_kind));
         let element_tree_scope = self.element_tree_scope(node);
-        let mut definitions = smallvec::SmallVec::new();
+        let mut plan = crate::css::style_compute::AnimationPlan::default();
         crate::css::style_compute::build_computed_animation_list(
             longhands,
             existing_animations,
@@ -169,9 +170,9 @@ impl RetainedState {
                 self.animation_keyframes()
                     .resolve(declaration_scope, element_tree_scope, name)
             },
-            &mut definitions,
+            &mut plan,
         );
-        (!animations::plan_changes_nothing(&definitions, existing_animations)).then_some(definitions)
+        (!animations::plan_changes_nothing(&plan.definitions, existing_animations)).then_some(plan)
     }
 
     /// Whether installing the `new` record the engine derived for an element, in place of the
@@ -349,20 +350,37 @@ impl RetainedState {
         root_inputs.apply_to(&mut self.document_style_computation_inputs);
     }
 
+    /// Whether no record the style engine holds may change a counter or the quote depth, which no element then does.
+    #[must_use]
+    pub(crate) fn holds_no_records_affecting_generated_content(&self) -> bool {
+        self.computed_group_sets.holds_no_records_affecting_generated_content()
+    }
+
     /// What the node and its DOM descendants do to the two pieces of generated-content state that run
     /// along the whole tree rather than staying inside one box, themselves or through a `::before`,
     /// `::after` or `::marker`. Inserting such a subtree can change what the boxes after it show.
     #[must_use]
     pub(crate) fn subtree_generated_content_effects(&self, root: StyleNodeID) -> SubtreeGeneratedContentEffects {
         let mut effects = SubtreeGeneratedContentEffects::default();
+        // OPTIMIZATION: A subtree has none of these effects where no record has any.
+        if self.computed_group_sets.holds_no_records_affecting_generated_content() {
+            return effects;
+        }
         let mut pending = vec![root];
         while let Some(node) = pending.pop() {
             if node.element_index().is_some() {
+                // OPTIMIZATION: Most elements hold no pseudo-element record at all.
+                let has_pseudo_records = !self.computed_group_sets.has_no_pseudo_rows(node);
+                let pseudo_record = |kind| {
+                    has_pseudo_records
+                        .then(|| self.computed_group_sets.pseudo_style_record(node, kind))
+                        .flatten()
+                };
                 let records = [
                     self.computed_group_sets.assigned_style_record(node),
-                    self.computed_group_sets.pseudo_style_record(node, pseudo_kind::BEFORE),
-                    self.computed_group_sets.pseudo_style_record(node, pseudo_kind::AFTER),
-                    self.computed_group_sets.pseudo_style_record(node, pseudo_kind::MARKER),
+                    pseudo_record(pseudo_kind::BEFORE),
+                    pseudo_record(pseudo_kind::AFTER),
+                    pseudo_record(pseudo_kind::MARKER),
                 ];
                 for (index, record) in records.into_iter().enumerate() {
                     let Some(view) = self.published_style_record_view(record) else {
@@ -433,10 +451,8 @@ impl RetainedState {
             .iter()
             .any(|effect| {
                 effect.keyframes().iter().any(|keyframe| {
-                    keyframe
-                        .easing_value
-                        .as_ref()
-                        .is_some_and(|value| matches!(value.data(), StyleValueData::Unresolved { .. }))
+                    matches!(&keyframe.easing, crate::animations::keyframes::KeyframeEasing::Value(value)
+                        if matches!(value.data(), StyleValueData::Unresolved { .. }))
                 })
             });
 
@@ -610,6 +626,10 @@ impl RetainedState {
 
     pub(crate) fn pin_style_record(&mut self, style_record: u64) {
         self.computed_group_sets.pin_style_record(style_record);
+    }
+
+    pub(crate) fn pin_style_record_times(&mut self, style_record: u64, times: u32) {
+        self.computed_group_sets.pin_style_record_times(style_record, times);
     }
 
     pub(crate) fn has_animation_overlay_records(&self) -> bool {

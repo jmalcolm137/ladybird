@@ -74,6 +74,7 @@
 #include <LibWebView/CanonicalTraversable.h>
 #include <LibWebView/ContentBlocking.h>
 #include <LibWebView/ContextMenuRequest.h>
+#include <LibWebView/DiscardBlockers.h>
 #include <LibWebView/ExternalURLHandler.h>
 #include <LibWebView/Forward.h>
 #include <LibWebView/HistoryVisitTransition.h>
@@ -181,8 +182,6 @@ public:
     u64 system_microphone_requests_for_testing() const;
     u64 microphone_denied_notices_shown_for_testing() const { return m_microphone_denied_notices_shown; }
 
-    bool location_in_use() const { return m_tab_indicators.is_active(TabIndicator::UsingLocation); }
-
     // Ends every location request and watch whose document the user has since taken the permission away from.
     void revoke_geolocation_without_permission();
 
@@ -232,19 +231,71 @@ public:
     // Damage reported by the WebContent compositor for the most recently presented frame. This is in frame pixels.
     Gfx::IntRect last_presented_damage_rect() const { return m_last_presented_damage_rect; }
 
+    // The Compositor showed the frame itself, in the remote layer of this view.
+    void server_did_present_frame_in_remote_layer(Badge<WebContentPage>, Gfx::IntSize size, Gfx::IntRect damage_rect, double device_pixel_ratio);
+
     void set_window_position(Gfx::IntPoint);
     void set_window_size(Gfx::IntSize);
     void set_system_visibility_state(Web::HTML::VisibilityState);
+
+    // A tab that the user doesn't see may be discarded: its pages close, so that the processes hosting them can let go
+    // of their memory, and the tab stays in the tab strip to restore its current session history entry once the user
+    // comes back to it.
+    enum class DiscardReason : u8 {
+        // The system is about to run out of memory.
+        MemoryPressure,
+        // The tab was hidden for long, without doing anything the user could notice.
+        Inactivity,
+    };
+    bool may_be_discarded(DiscardReason, AK::Duration minimum_time_hidden, MonotonicTime now) const;
+    DiscardBlockers discard_blockers(DiscardReason, MonotonicTime now) const;
+    // Whether discarding the view would let a process exit, which is how its memory comes back.
+    bool discarding_ends_a_process() const;
+    void set_pinned(bool pinned);
+    void set_current_tab_of_window(bool current_tab_of_window);
+    // When the user last stopped seeing the view, if they don't see it now.
+    Optional<MonotonicTime> hidden_since() const { return m_hidden_since; }
+    bool discard_requested() const { return m_discard_requested; }
+    void request_discard(DiscardReason);
+    // The UI may keep a tab that the Hub asked it to discard, such as one with an unfinished edit of its address.
+    void did_decline_discard();
+    void did_save_session_history_entry_states(Badge<WebContentPage>, WebContentPage&);
+
     // Whether the view shows its frames from CPU memory for now, so that the Compositor shares them there rather than
     // in GPU memory that the view would have to read back for every frame.
     void set_presents_from_cpu_memory(bool);
     bool presents_from_cpu_memory() const { return m_presents_from_cpu_memory; }
+    // Whether the UI shows the view's frames in a remote layer, which the Compositor commits them into itself, rather
+    // than in backing stores the view receives.
+    void set_hosts_remote_layer(bool);
+    // What the view shows, from the Compositor, scaled down to fit within the size given.
+    void take_frame_snapshot(Function<void(Optional<Gfx::ShareableBitmap>)>);
+    void update_ui_overlays();
+    void set_compositor_layer_hidden(u64 layer_id, bool hidden);
+    void set_selected_compositor_layers(Vector<u64> layer_ids);
+    void set_hovered_compositor_layer(Optional<u64> layer_id);
+    // Hides every layer the compositor tells of but these.
+    void show_only_compositor_layers(Vector<u64> const& layer_ids);
+    void show_all_compositor_layers();
+    void reset_compositor_layer_raster_counts();
+    // The Compositor's remote layers went with its process, so the view asks the new one for another.
+    void recreate_remote_layer_after_compositor_reconnect(Badge<WebContentClient>);
+    static ViewImplementation* find_view_showing_remote_layer(u64 remote_layer_id);
+
+    // The UI shows a resize of the view along with the page's frame of the new size. A view without a remote layer
+    // has nothing to wait for, so it answers at once.
+    void begin_synchronized_resize(u64 token);
+    void await_synchronized_resize_frame(u64 token, Gfx::IntSize);
+    void commit_synchronized_resize(u64 token);
+    void synchronized_resize_frame_held(Badge<CompositorPresentationClient>, u64 token) { did_hold_synchronized_resize_frame(token); }
+    void synchronized_resize_committed(Badge<CompositorPresentationClient>, u64 token) { did_commit_synchronized_resize(token); }
     void set_has_system_focus(bool);
 
-    void load(URL::URL const&, Web::Bindings::NavigationHistoryBehavior = Web::Bindings::NavigationHistoryBehavior::Auto);
+    // A URL the user chose in the browser's UI. Loading a file: URL this way grants a root for that file.
+    void load_from_browser_ui(URL::URL const&, Web::Bindings::NavigationHistoryBehavior = Web::Bindings::NavigationHistoryBehavior::Auto);
     void open_url_in_new_tab(URL::URL const&, Web::HTML::ActivateTab);
     void open_url_in_new_window(URL::URL const&, IsPrivate);
-    void load(Web::HTML::PreparedNavigationDescriptor);
+    void load(Web::HTML::PreparedNavigationDescriptor, LocalFileAccess = {});
     void open_navigation_in_new_tab(Web::HTML::PreparedNavigationDescriptor, Web::HTML::ActivateTab);
     void open_navigation_in_new_window(Web::HTML::PreparedNavigationDescriptor, IsPrivate);
     void set_next_history_visit_transition(HistoryVisitTransition transition) { m_history_visit_transition_for_next_load = transition; }
@@ -257,6 +308,7 @@ public:
 
     bool crash_overlay_active() const { return m_crash_state.has_value(); }
     String crash_overlay_failed_url() const;
+    bool crash_overlay_is_for_memory_limit() const { return m_crash_state.has_value() && m_crash_state->exceeded_memory_limit; }
     Optional<ByteString> crash_report_name() const;
     Optional<String> crash_report_website() const;
 
@@ -278,20 +330,29 @@ public:
     [[nodiscard]] SessionHistorySnapshot session_history_snapshot() const;
     [[nodiscard]] ErrorOr<void> restore_session_history_from_snapshot(SessionHistorySnapshot);
 
+    // The UI keeps the session history of a discarded tab. The Hub keeps what else the tab should have once it is
+    // loaded again, until the UI restores or forgets it. The UI asks the Hub to keep it as it discards the tab.
+    Optional<u64> keep_state_for_discarding();
+    void restore_state_of_discarded_tab(u64 discarded_tab_state_id);
+    static void forget_state_of_discarded_tab(u64 discarded_tab_state_id);
+    void update_state_of_discarded_tab();
+
     // A view whose windows and tabs the application keeps tells it of each change to its session history.
     void set_reports_session_history(bool);
 
     void zoom_in();
     void zoom_out();
     void set_zoom(double zoom_level);
-    void set_device_pixel_ratio_for_testing(WebContentPage&, double device_pixel_ratio);
     void reset_zoom();
     double zoom_level() const { return m_zoom_level; }
+
+    void set_device_pixel_ratio_for_testing(WebContentPage&, double device_pixel_ratio);
     double device_pixel_ratio() const { return m_device_pixel_ratio; }
+
     Optional<u64> display_id() const { return m_display_id; }
     double maximum_frames_per_second() const { return m_maximum_frames_per_second; }
     // Sends the display metadata to every page hosting documents of the tab.
-    void set_display_metadata(Optional<u64> display_id, double maximum_frames_per_second);
+    void set_display_metadata(Optional<u64> display_id, double maximum_frames_per_second, bool screen_shows_high_dynamic_range);
     void set_frame_rate_capped(bool);
 
     struct ScreenRects {
@@ -302,7 +363,8 @@ public:
     };
     // Sends the screens that screen_rects() reports to every page hosting documents of the tab.
     void update_screen_rects();
-    void set_scales_frames_to_fit(bool scales_frames_to_fit) { m_scales_frames_to_fit = scales_frames_to_fit; }
+    void set_scales_frames_to_fit(bool);
+    bool scales_frames_to_fit() const { return m_scales_frames_to_fit; }
     void enable_picture_in_picture_controls();
     void enqueue_input_event(Web::InputEvent);
     // The page reporting on an event must be the one handling it.
@@ -322,9 +384,11 @@ public:
     // Consumes the activation of the input the page is handling, if that input gives activation.
     void consume_user_activation_of_input_handled_by(Badge<WebContentPage>, WebContentPage const&);
     // Opening a link in a new tab takes one key or mouse press the view delivered.
-    bool take_input_to_open_link_in_new_tab(Badge<WebContentPage>);
+    bool take_input_to_open_link_in_new_tab(Badge<WebContentPage>, WebContentPage const&);
     void did_lose_input_event_endpoint(Badge<WebContentPage>, WebContentPage&);
     void did_consume_input_event_in_compositor(Badge<WebContentPage>, u64 event_id);
+    void did_update_compositor_layers(Badge<WebContentPage>, Compositing::CompositorLayersDescription const&);
+    void did_describe_owners_of_visual_context_nodes(Badge<WebContentPage>, u64 structural_epoch, Vector<u32> const& spatial_node_indices, Vector<u32> const& effect_node_indices, Vector<String> const& owners);
     void did_not_dispatch_input_event_through_compositor(Badge<WebContentPage>, u64 event_id);
     void did_dispatch_input_event_through_compositor(Badge<WebContentPage>, u64 event_id, bool performed_default_action);
     void discard_input_events_routed_through_lost_compositor(Badge<Application>);
@@ -342,7 +406,8 @@ public:
         return m_backing_stores->displayed_frame().map([](auto const& frame) { return frame.device_pixel_ratio; });
     }
 
-    String force_dark_host() const;
+    String current_host_for_settings() const;
+
     bool force_dark_enabled() const;
     bool can_set_force_dark() const;
     void set_force_dark_enabled(bool);
@@ -517,6 +582,7 @@ public:
 
     Web::HTML::MuteState page_mute_state() const { return m_mute_state; }
     void toggle_page_mute_state();
+    void set_page_mute_state(Web::HTML::MuteState);
 
     // The tab plays audio while the AudioServer has recently heard any page of it.
     void update_audibility(Badge<WebContentPage>) { update_audibility(); }
@@ -528,7 +594,7 @@ public:
     bool is_capturing_audio() const { return m_tab_indicators.is_active(TabIndicator::UsingMicrophone); }
 
     bool tab_indicator_visible(TabIndicator indicator) const { return m_tab_indicators.is_visible(indicator); }
-    u64 playing_audio_indicator_change_count() const { return m_playing_audio_indicator_change_count; }
+    Vector<bool> const& playing_audio_indicator_transitions() const { return m_playing_audio_indicator_transitions; }
     void did_change_screen_wake_lock_state(Badge<WebContentPage>, Web::ScreenWakeLockState);
 
     void did_reset_state_for_testing(Badge<WebContentPage>, Web::HTML::SessionHistoryEntryDescriptor);
@@ -558,6 +624,12 @@ public:
     void run_webdriver_user_prompt_handling(Function<void(Web::WebDriver::Response)> on_complete);
     void did_complete_webdriver_user_prompt_handling(Badge<WebContentPage>, u64 request_id, Web::WebDriver::Response);
     void did_open_user_prompt(Badge<WebContentPage>);
+
+    // NB: Under WebDriver, a renderer has some of the browser's powers only while it runs a command that needs them.
+    bool is_running_webdriver_command_to_select_file(WebContentPage const&, u64 command_id, StringView path) const;
+    Optional<URL::URL> url_of_webdriver_cookie_command_running_in(WebContentClient const&) const;
+    bool is_running_webdriver_input_command_in(WebContentPage const&) const;
+    bool is_running_webdriver_window_command_in(WebContentPage const&) const;
     static Optional<ViewImplementation&> find_view_by_handle(StringView);
     void did_change_background_color(Badge<WebContentPage>, Gfx::Color);
     Gfx::Color page_background_color() const { return m_page_background_color; }
@@ -591,6 +663,7 @@ public:
     void prepare_for_immediate_close();
     void close_tab_for_testing();
     bool needs_beforeunload_check() const;
+    bool had_user_edits() const;
 
     struct NavigationListener {
         Function<void(URL::URL const&)> on_load_start;
@@ -601,6 +674,7 @@ public:
 
     Function<void()> on_ready_to_paint;
     Function<void(TabPerformanceStats const&)> on_performance_stats;
+    Function<void(Compositing::CompositorLayersDescription const&)> on_compositor_layers_change;
     Function<String(Web::HTML::ActivateTab, Web::HTML::WebViewHints, CanonicalTraversable&)> on_new_web_view;
     Function<void()> on_activate_tab;
     Function<void()> on_close;
@@ -695,6 +769,7 @@ public:
     enum class WebContentCrashReason {
         ProcessCrash,
         RejectedIPC,
+        ExceededMemoryLimit,
     };
     Function<void(WebContentCrashReason)> on_web_content_crashed;
     Function<void(bool)> on_crash_overlay_state_change;
@@ -719,6 +794,10 @@ public:
 
     // Something the UI shows about this view may have changed, like whether it can undo or show its source.
     virtual void did_change_state() { }
+
+    // Whether the UI can discard the view, and how it is asked to.
+    virtual bool supports_discarding() const { return false; }
+    virtual void did_request_discard() { }
 
     virtual void did_change_session_history(SessionHistorySnapshot const&, URL::URL const&) { }
 
@@ -763,6 +842,12 @@ protected:
     virtual void insert_clipboard_item(Web::Clipboard::SystemClipboardItem);
 
     virtual void did_accept_presented_backing_store(i32, Gfx::IntRect) { }
+    // The view's remote layer was made, or made again. The ID is 0 when there is none, and frames arrive in backing
+    // stores instead.
+    virtual void did_create_remote_layer(Compositing::RemoteLayerHostHandle) { }
+    virtual void did_present_frame_in_remote_layer(Gfx::IntSize, double device_pixel_ratio) { (void)device_pixel_ratio; }
+    virtual void did_hold_synchronized_resize_frame(u64 token) { (void)token; }
+    virtual void did_commit_synchronized_resize(u64 token) { (void)token; }
     // Lets the Compositor paint into a backing store again. A view whose frames something else still reads may wait
     // for that to finish first.
     virtual void release_backing_store(i32 bitmap_id);
@@ -776,7 +861,7 @@ protected:
 
     explicit ViewImplementation(IsPrivate = IsPrivate::No);
 
-    void set_owner_view(ViewImplementation const& owner_view) { m_owner_view_id = owner_view.view_id(); }
+    void set_owner_view(ViewImplementation& owner_view);
 
     void did_update_url();
     void settle_permission_prompt(PermissionPromptRequest const&, Web::Permissions::PromptOutcome);
@@ -785,6 +870,11 @@ protected:
     void ignore_pending_permission_prompts();
     void set_title(Utf16String);
     void set_favicon(Optional<Gfx::Bitmap const&>);
+    bool shows_background_activity() const;
+    void finish_discard_request();
+    void stop_counting_as_owned_view();
+    void start_being_hidden();
+    void for_each_process_that_discarding_ends(Function<void(WebContentClient&)> const&) const;
     Optional<URL::URL const&> browser_ui_load_url() const;
     void update_displayed_url();
     void did_start_navigation();
@@ -820,6 +910,8 @@ protected:
     // The view to show a tab or window opened from this view in, or null for the application to open one of its own.
     virtual ViewImplementation* create_view_for_new_tab_or_window(IsPrivate) { return nullptr; }
     void apply_zoom_for_current_host();
+    void send_force_dark_to_embedded_page(WebContentPage&) const;
+    void send_force_dark_to_embedded_pages() const;
 
     void handle_resize();
     void fail_pending_debugger_requests();
@@ -838,7 +930,7 @@ protected:
     bool is_ui_overlay_hovered() const { return m_debugger_overlay_pointer_state.hovered_action().has_value() || m_picture_in_picture_controls_pointer_state.hovered_action().has_value(); }
     void apply_cursor();
     void apply_tooltip();
-    void update_ui_overlays();
+    void tell_of_compositor_layers_with_owners_of_nodes();
     void set_page_background_color_to_system_canvas(bool dark);
     void set_page_background_color(Gfx::Color);
     Gfx::Color preferred_canvas_background_color() const;
@@ -848,6 +940,7 @@ protected:
     void display_traversable(CanonicalTraversable&, Web::HTML::VisibilityState);
     void display_page_changed(RefPtr<WebContentPage> previous_page);
     void cancel_all_native_geolocation_requests();
+    void geolocation_settings_changed();
     void send_geolocation_emulated_position(WebContentPage&);
     WebContentPage& focused_navigable_host() const;
     void reset_page_media_state();
@@ -859,24 +952,23 @@ protected:
     struct NavigationToRetry {
         URL::URL url;
         Optional<Web::HTML::PreparedNavigationDescriptor> navigation;
+        LocalFileAccess local_file_access {};
     };
     Optional<NavigationToRetry> navigation_to_retry_for_ongoing_navigation() const;
     void retry_navigation(NavigationToRetry, Web::Bindings::NavigationHistoryBehavior);
 
     struct CrashState;
-    void handle_web_content_process_crash();
+    void handle_web_content_process_crash(WebContentCrashReason);
     void did_save_crash_report(ByteString report_name);
     void respawn_web_content_process_after_crash();
     void prepare_for_navigation_after_crash(Optional<NavigationToRetry> navigation_to_retry = {});
     void set_crash_state(Optional<CrashState>);
 
-    String current_host_for_settings() const;
-
     virtual void languages_changed() override;
     virtual void content_settings_changed() override;
     virtual void browsing_behavior_changed() override;
     virtual void autoplay_settings_changed() override;
-    virtual void geolocation_settings_changed() override;
+    virtual void permission_settings_changed(Web::Permissions::PermissionName name) override;
     virtual void global_privacy_control_changed() override;
 
     void send_context_menu_request(ContextMenuRequest, Gfx::IntPoint content_position);
@@ -894,6 +986,9 @@ protected:
     bool m_pinch_gesture_was_canceled { false };
     Gfx::IntRect m_last_presented_damage_rect;
     bool m_presents_from_cpu_memory { false };
+    bool m_hosts_remote_layer { false };
+    Optional<u64> m_remote_layer_id;
+    void update_remote_layer_fit();
 
     // Set once an assistive technology asked for the page tree; every display page the view shows from then on gets
     // asked for its tree too.
@@ -917,6 +1012,7 @@ protected:
         Optional<NavigationToRetry> navigation_to_retry;
         bool recovery_started { false };
         ByteString report_name {};
+        bool exceeded_memory_limit { false };
     };
     Optional<CrashState> m_crash_state;
 
@@ -924,6 +1020,7 @@ protected:
     double m_device_pixel_ratio { 1.0 };
     Optional<u64> m_display_id;
     double m_maximum_frames_per_second { 60.0 };
+    bool m_screen_shows_high_dynamic_range { false };
     bool m_frame_rate_capped { false };
     bool m_scales_frames_to_fit { false };
 
@@ -1005,6 +1102,19 @@ protected:
     bool m_debugger_paused { false };
     Compositing::OverlayPointerState<Compositing::PausedDebuggerOverlayAction> m_debugger_overlay_pointer_state;
     bool m_has_picture_in_picture_controls { false };
+    Vector<u64> m_ids_of_hidden_compositor_layers;
+    Vector<u64> m_ids_of_selected_compositor_layers;
+    Optional<u64> m_id_of_hovered_compositor_layer;
+    u64 m_compositor_layer_raster_count_reset_generation { 0 };
+    Optional<Compositing::CompositorLayersDescription> m_latest_compositor_layers;
+    // The elements whose boxes own the nodes of the visual context tree that the compositor layers name, as the page
+    // described them for the tree of one structural epoch, by node, and the nodes asked of the page and not described.
+    struct OwnersOfVisualContextNodes {
+        u64 structural_epoch { 0 };
+        HashMap<u64, String> owner_by_node;
+        HashTable<u64> nodes_asked;
+    };
+    OwnersOfVisualContextNodes m_owners_of_visual_context_nodes;
     bool m_picture_in_picture_controls_shown { false };
     bool m_picture_in_picture_player_controls_shown { false };
     Compositing::OverlayPointerState<Compositing::PictureInPictureControl> m_picture_in_picture_controls_pointer_state;
@@ -1080,6 +1190,12 @@ protected:
         Optional<Web::HTML::CrossProcessId> navigable_id;
         WebDriverProtocol protocol { WebDriverProtocol::Classic };
         bool stays_on_page { false };
+        // The paths an Element Send Keys command names, which the renderer may open to select them as files.
+        Vector<ByteString> files_to_select {};
+        // A command whose page went away while it waited for a navigation, which its new page only waits for.
+        bool only_waits_for_navigation { false };
+        // The URL of the document a cookie command is for, whose cookies alone the renderer may reach.
+        Optional<URL::URL> cookie_document_url {};
     };
     HashMap<u64, PendingWebDriverCommand> m_pending_webdriver_commands;
     HashMap<u64, PendingWebDriverCommand> m_pending_webdriver_crash_commands;
@@ -1115,7 +1231,7 @@ protected:
     Optional<Web::HTML::CrossProcessId> m_webdriver_current_parent_navigable_id;
 
     TabIndicators m_tab_indicators;
-    u64 m_playing_audio_indicator_change_count { 0 };
+    Vector<bool> m_playing_audio_indicator_transitions;
     Web::ScreenWakeLockState m_screen_wake_lock_state { Web::ScreenWakeLockState::Released };
 
     Web::HTML::MuteState m_mute_state { Web::HTML::MuteState::Unmuted };
@@ -1221,6 +1337,9 @@ protected:
     //        is required to be globally unique for Firefox DevTools.
     u64 m_view_id { 0 };
     Optional<u64> m_owner_view_id;
+    // NB: Counted so that whether this view owns another is known without looking at every view.
+    size_t m_owned_view_count { 0 };
+    bool m_counts_as_owned_view { false };
     WeakPtr<CanonicalDocument const> m_owner_document;
 
     HashMap<u64, NavigationListener> m_navigation_listeners;
@@ -1247,6 +1366,25 @@ protected:
     bool m_devtools_connected { false };
     bool m_devtools_takes_console_messages { false };
     bool m_devtools_takes_console_errors { false };
+
+    // NB: A view starts out hidden, until the UI shows it.
+    Optional<MonotonicTime> m_hidden_since { MonotonicTime::now() };
+    Optional<MonotonicTime> m_stopped_playing_audio_time;
+    Optional<MonotonicTime> m_finished_loading_time;
+    bool m_changed_title_while_hidden { false };
+    bool m_changed_favicon_while_hidden { false };
+    RefPtr<Gfx::Bitmap const> m_favicon;
+    bool m_pinned { false };
+    // NB: The current tab of a minimized window is hidden, but the user sees it again as soon as they bring the window
+    //     back.
+    bool m_current_tab_of_window { false };
+    // The UI was asked to discard the view, so it isn't asked again until the user has seen it.
+    bool m_discard_requested { false };
+    DiscardReason m_discard_reason { DiscardReason::Inactivity };
+    Optional<u64> m_discarded_tab_state_id;
+    // NB: These are kept alive, so that no other page can take the place of one that closes before it answers.
+    Vector<NonnullRefPtr<WebContentPage>> m_pages_saving_session_history_entry_states;
+    RefPtr<Core::Timer> m_save_session_history_entry_states_timer;
 };
 
 }

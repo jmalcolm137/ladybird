@@ -112,6 +112,8 @@ public:
     GC::Ptr<DOM::Node> target_node_for_mouse_position(CSSPixelPoint);
 
     EventResult handle_keydown(UIEvents::KeyCode, unsigned modifiers, u32 code_point, bool repeat, bool should_insert_text, bool async_scroll_performed_default_action = false, ReadonlySpan<TextEditingCommand> editing_commands = {}, bool native_editing_binding_resolved = false);
+    // Whether a key the user pressed or a paste is being handled, along with what the page does in response to it.
+    static bool is_handling_user_key_press_or_paste();
     EventResult handle_text_editing_command(TextEditingCommand const&);
     struct KeyboardScrollSnapshot {
         Compositing::KeyboardScrollState state;
@@ -140,7 +142,7 @@ public:
     void handle_gamepad_updated(Gamepad::GamepadState const&);
     void handle_gamepad_disconnected(Gamepad::GamepadHandle);
 
-    void process_auto_scroll();
+    void process_auto_scroll(double frame_timestamp);
 
     enum class SelectionMode : u8 {
         None,
@@ -174,7 +176,8 @@ public:
     // For a held key whose release will not reach the page, as when the window loses focus.
     void release_held_scroll_key();
 
-    void clear_per_test_input_state(Badge<Internals::Internals>);
+    void clear_per_test_input_state();
+    void clear_hover_for_next_test();
 
 private:
     bool should_ignore_device_input_event() const;
@@ -268,7 +271,7 @@ private:
     GC::Ptr<DOM::Node> focus_candidate_for_position(Layout::BegunRead const& read, CSSPixelPoint) const;
 
     void run_mousedown_default_actions(Layout::BegunRead const& read, DOM::Document&, CSSPixelPoint visual_viewport_position, unsigned button, unsigned modifiers, int click_count);
-    void run_activation_behavior(GC::Ref<DOM::Node>, unsigned button, unsigned modifiers);
+    void run_activation_behavior(DOM::Node const&, unsigned button, unsigned modifiers);
 
     void maybe_show_context_menu(GC::Ref<DOM::Node>, MouseEventCoordinates const&, CSSPixelPoint screen_position, CSSPixelPoint viewport_position, unsigned buttons, unsigned modifiers);
     bool maybe_request_paste_for_middle_click(Layout::BegunRead const& read, DOM::Document&, CSSPixelPoint visual_viewport_position);
@@ -294,6 +297,7 @@ private:
 
     void clear_mousedown_tracking();
     void stop_updating_selection();
+    void stop_middle_button_scroll();
 
     enum class HoverUpdateCause : u8 {
         PointerMoved,

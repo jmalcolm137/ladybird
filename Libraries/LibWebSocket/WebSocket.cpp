@@ -10,7 +10,7 @@
 #include <AK/Random.h>
 #include <AK/Utf8View.h>
 #include <LibCore/Timer.h>
-#include <LibCrypto/Hash/HashManager.h>
+#include <LibCrypto/Hash/Hash.h>
 #include <LibWebSocket/Impl/AcceptedSocket.h>
 #include <LibWebSocket/WebSocket.h>
 
@@ -59,6 +59,7 @@ WebSocket::~WebSocket()
         m_impl->on_connection_error = nullptr;
         m_impl->on_connected = nullptr;
         m_impl->on_ready_to_read = nullptr;
+        m_impl->on_bytes_written = nullptr;
         m_impl->discard_connection();
     }
 }
@@ -96,18 +97,17 @@ void WebSocket::start()
                     fail_connection(to_underlying(CloseStatusCode::AbnormalClosure), Error::ConnectionUpgradeFailed, "Timed out waiting for the client's handshake");
             });
             m_opening_handshake_timer->start();
-        } else if (m_impl->handshake_complete_when_connected()) {
+        } else {
             set_state(WebSocket::InternalState::Open);
             notify_open();
-        } else {
-            set_state(WebSocket::InternalState::SendingClientHandshake);
-            send_client_handshake();
-            drain_read();
         }
     };
     m_impl->on_ready_to_read = [this] {
         auto protector = NonnullRefPtr { *this };
         drain_read();
+    };
+    m_impl->on_bytes_written = [this](size_t byte_count) {
+        did_write_bytes(byte_count);
     };
     set_state(WebSocket::InternalState::EstablishingProtocolConnection);
     m_impl->connect(m_connection);
@@ -118,8 +118,6 @@ ReadyState WebSocket::ready_state()
     switch (m_state) {
     case WebSocket::InternalState::NotStarted:
     case WebSocket::InternalState::EstablishingProtocolConnection:
-    case WebSocket::InternalState::SendingClientHandshake:
-    case WebSocket::InternalState::WaitingForServerHandshake:
     case WebSocket::InternalState::WaitingForClientHandshake:
         return ReadyState::Connecting;
     case WebSocket::InternalState::Open:
@@ -168,8 +166,6 @@ void WebSocket::close(u16 code, ByteString const& message)
         break;
     case InternalState::NotStarted:
     case InternalState::EstablishingProtocolConnection:
-    case InternalState::SendingClientHandshake:
-    case InternalState::WaitingForServerHandshake:
     case InternalState::WaitingForClientHandshake:
         // "If the WebSocket connection is not yet established [WSP]
         // Fail the WebSocket connection and set this’s ready state to CLOSING (2)."
@@ -226,17 +222,13 @@ void WebSocket::drain_read()
 
     switch (m_state) {
     case InternalState::NotStarted:
-    case InternalState::EstablishingProtocolConnection:
-    case InternalState::SendingClientHandshake: {
+    case InternalState::EstablishingProtocolConnection: {
         auto initializing_bytes = m_impl->read(1024);
         if (!initializing_bytes.is_error())
             dbgln("drain_read() was called on a websocket that isn't opened yet. Read {} bytes from the socket.", initializing_bytes.value().size());
     } break;
     case InternalState::WaitingForClientHandshake:
         VERIFY_NOT_REACHED();
-    case InternalState::WaitingForServerHandshake: {
-        read_server_handshake();
-    } break;
     case InternalState::Open:
     case InternalState::Closing: {
         // NB: The socket tells us just once that it has data to read, however much it has — so keep reading until
@@ -285,70 +277,6 @@ void WebSocket::drain_read()
     }
 }
 
-// The client handshake message is defined in the second list of section 4.1
-void WebSocket::send_client_handshake()
-{
-    VERIFY(m_impl);
-    VERIFY(m_state == WebSocket::InternalState::SendingClientHandshake);
-    StringBuilder builder;
-
-    // 2. and 3. GET /resource name/ HTTP 1.1
-    builder.appendff("GET {} HTTP/1.1\r\n", m_connection.resource_name());
-
-    // 4. Host
-    auto url = m_connection.url();
-    builder.appendff("Host: {}", url.serialized_host());
-    if (!m_connection.is_secure() && url.port_or_default() != 80)
-        builder.appendff(":{}", url.port_or_default());
-    else if (m_connection.is_secure() && url.port_or_default() != 443)
-        builder.appendff(":{}", url.port_or_default());
-    builder.append("\r\n"sv);
-
-    // 5. and 6. Connection Upgrade
-    builder.append("Upgrade: websocket\r\n"sv);
-    builder.append("Connection: Upgrade\r\n"sv);
-
-    // 7. 16-byte nonce encoded as Base64
-    u8 nonce_data[16];
-    fill_with_random(nonce_data);
-    // FIXME: change to TRY() and make method fallible
-    m_websocket_key = MUST(encode_base64({ nonce_data, 16 })).to_byte_string();
-    builder.appendff("Sec-WebSocket-Key: {}\r\n", m_websocket_key);
-
-    // 8. Origin (optional field)
-    if (!m_connection.origin().is_empty()) {
-        builder.appendff("Origin: {}\r\n", m_connection.origin());
-    }
-
-    // 9. Websocket version
-    builder.append("Sec-WebSocket-Version: 13\r\n"sv);
-
-    // 10. Websocket protocol (optional field)
-    if (!m_connection.protocols().is_empty()) {
-        builder.append("Sec-WebSocket-Protocol: "sv);
-        builder.join(',', m_connection.protocols());
-        builder.append("\r\n"sv);
-    }
-
-    // 11. Websocket extensions (optional field)
-    if (!m_connection.extensions().is_empty()) {
-        builder.append("Sec-WebSocket-Extensions: "sv);
-        builder.join(',', m_connection.extensions());
-        builder.append("\r\n"sv);
-    }
-
-    // 12. Additional headers
-    for (auto const& header : m_connection.headers()) {
-        builder.appendff("{}: {}\r\n", header.name, header.value);
-    }
-
-    builder.append("\r\n"sv);
-
-    set_state(WebSocket::InternalState::WaitingForServerHandshake);
-    auto success = m_impl->send(builder.string_view().bytes());
-    VERIFY(success);
-}
-
 void WebSocket::fail_connection(u16 close_status_code, WebSocket::Error error_code, ByteString const& reason)
 {
     auto protector = NonnullRefPtr { *this };
@@ -368,158 +296,6 @@ void WebSocket::fail_connection(u16 close_status_code, WebSocket::Error error_co
     discard_connection();
 }
 
-// The server handshake message is defined in the third list of section 4.1
-void WebSocket::read_server_handshake()
-{
-    VERIFY(m_impl);
-    VERIFY(m_state == WebSocket::InternalState::WaitingForServerHandshake);
-
-    auto fail_opening_handshake = [&](ByteString const& reason, CloseStatusCode close_status_code = CloseStatusCode::AbnormalClosure) {
-        fail_connection(to_underlying(close_status_code), WebSocket::Error::ConnectionUpgradeFailed, reason);
-    };
-
-    // Read the server handshake
-    if (!m_impl->can_read_line())
-        return;
-
-    if (!m_has_read_server_handshake_first_line) {
-        auto header = m_impl->read_line(PAGE_SIZE).release_value_but_fixme_should_propagate_errors();
-        auto parts = header.split(' ');
-        if (parts.size() < 2) {
-            fail_opening_handshake("Server HTTP Handshake contained HTTP header was malformed");
-            return;
-        }
-        if (parts[0] != "HTTP/1.1") {
-            fail_opening_handshake(ByteString::formatted("Server HTTP Handshake contained HTTP header {} which isn't supported", parts[0]));
-            return;
-        }
-        if (parts[1] != "101") {
-            // 1. If the status code is not 101, handle as per HTTP procedures.
-            // FIXME: This could be a redirect or a 401 authentication request, which we do not handle.
-            fail_opening_handshake(ByteString::formatted("Server HTTP Handshake return status {} which isn't supported", parts[1]));
-            return;
-        }
-        m_has_read_server_handshake_first_line = true;
-    }
-
-    // Read the rest of the reply until we find an empty line
-    while (m_impl->can_read_line()) {
-        auto line = m_impl->read_line(PAGE_SIZE).release_value_but_fixme_should_propagate_errors();
-        if (line.is_whitespace()) {
-            // We're done with the HTTP headers.
-            // Fail the connection if we're missing any of the following:
-            if (!m_has_read_server_handshake_upgrade) {
-                // 2. |Upgrade| should be present
-                fail_opening_handshake("Server HTTP Handshake didn't contain an |Upgrade| header");
-                return;
-            }
-            if (!m_has_read_server_handshake_connection) {
-                // 2. |Connection| should be present
-                fail_opening_handshake("Server HTTP Handshake didn't contain a |Connection| header");
-                return;
-            }
-            if (!m_has_read_server_handshake_accept) {
-                // 2. |Sec-WebSocket-Accept| should be present
-                fail_opening_handshake("Server HTTP Handshake didn't contain a |Sec-WebSocket-Accept| header");
-                return;
-            }
-
-            set_state(WebSocket::InternalState::Open);
-            notify_open();
-            return;
-        }
-
-        auto parts = line.split(':');
-        if (parts.size() < 2) {
-            // The header field is not valid
-            fail_opening_handshake(ByteString::formatted("Got invalid header line {} in the Server HTTP handshake", line));
-            return;
-        }
-
-        auto header_name = parts[0];
-
-        if (header_name.equals_ignoring_ascii_case("Upgrade"sv)) {
-            // 2. |Upgrade| should be case-insensitive "websocket"
-            if (!parts[1].trim_whitespace().equals_ignoring_ascii_case("websocket"sv)) {
-                fail_opening_handshake(ByteString::formatted("Server HTTP Handshake Header |Upgrade| should be 'websocket', got '{}'. Failing connection.", parts[1]));
-                return;
-            }
-
-            m_has_read_server_handshake_upgrade = true;
-            continue;
-        }
-
-        if (header_name.equals_ignoring_ascii_case("Connection"sv)) {
-            // 3. |Connection| should be case-insensitive "Upgrade"
-            if (!parts[1].trim_whitespace().equals_ignoring_ascii_case("Upgrade"sv)) {
-                fail_opening_handshake(ByteString::formatted("Server HTTP Handshake Header |Connection| should be 'Upgrade', got '{}'. Failing connection.", parts[1]));
-                return;
-            }
-
-            m_has_read_server_handshake_connection = true;
-            continue;
-        }
-
-        if (header_name.equals_ignoring_ascii_case("Sec-WebSocket-Accept"sv)) {
-            // 4. |Sec-WebSocket-Accept| should be base64(SHA1(|Sec-WebSocket-Key| + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"))
-            auto expected_content = ByteString::formatted("{}258EAFA5-E914-47DA-95CA-C5AB0DC85B11", m_websocket_key);
-
-            Crypto::Hash::Manager hash;
-            hash.initialize(Crypto::Hash::HashKind::SHA1);
-            hash.update(expected_content);
-            auto expected_sha1 = hash.digest();
-            // FIXME: change to TRY() and make method fallible
-            auto expected_sha1_string = MUST(encode_base64({ expected_sha1.immutable_data(), expected_sha1.data_length() }));
-            if (!parts[1].trim_whitespace().equals_ignoring_ascii_case(expected_sha1_string)) {
-                fail_opening_handshake(ByteString::formatted("Server HTTP Handshake Header |Sec-Websocket-Accept| should be '{}', got '{}'. Failing connection.", expected_sha1_string, parts[1]));
-                return;
-            }
-
-            m_has_read_server_handshake_accept = true;
-            continue;
-        }
-
-        if (header_name.equals_ignoring_ascii_case("Sec-WebSocket-Extensions"sv)) {
-            // 5. |Sec-WebSocket-Extensions| should not contain an extension that doesn't appear in m_connection->extensions()
-            auto server_extensions = parts[1].split(',');
-            for (auto const& extension : server_extensions) {
-                auto trimmed_extension = extension.trim_whitespace();
-                bool found_extension = false;
-                for (auto const& supported_extension : m_connection.extensions()) {
-                    if (trimmed_extension.equals_ignoring_ascii_case(supported_extension)) {
-                        found_extension = true;
-                    }
-                }
-                if (!found_extension) {
-                    fail_opening_handshake(ByteString::formatted("Server HTTP Handshake Header |Sec-WebSocket-Extensions| contains '{}', which is not supported by the client. Failing connection.", trimmed_extension));
-                    return;
-                }
-            }
-            continue;
-        }
-
-        if (header_name.equals_ignoring_ascii_case("Sec-WebSocket-Protocol"sv)) {
-            // 6. If the response includes a |Sec-WebSocket-Protocol| header field and this header field indicates the use of a subprotocol that was not present in the client's handshake (the server has indicated a subprotocol not requested by the client), the client MUST _Fail the WebSocket Connection_.
-            // Additionally, Section 4.2.2 says this is "Either a single value representing the subprotocol the server is ready to use or null."
-            auto server_protocol = parts[1].trim_whitespace();
-            bool found_protocol = false;
-            for (auto const& supported_protocol : m_connection.protocols()) {
-                if (server_protocol.equals_ignoring_ascii_case(supported_protocol)) {
-                    found_protocol = true;
-                }
-            }
-            if (!found_protocol) {
-                fail_opening_handshake(ByteString::formatted("Server HTTP Handshake Header |Sec-WebSocket-Protocol| contains '{}', which is not supported by the client. Failing connection.", server_protocol));
-                return;
-            }
-            m_subprotocol_in_use = server_protocol;
-            continue;
-        }
-    }
-
-    // If needed, we will keep reading the header on the next drain_read call
-}
-
 static bool contains_header_token(ByteString const& value, StringView token)
 {
     for (auto part : value.view().split_view(',')) {
@@ -532,7 +308,7 @@ static bool contains_header_token(ByteString const& value, StringView token)
 void WebSocket::reject_client_handshake(StringView status)
 {
     auto response = ByteString::formatted("HTTP/1.1 {}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", status);
-    m_impl->send(response.bytes());
+    send_bytes(response.bytes());
     fail_connection(to_underlying(CloseStatusCode::AbnormalClosure), Error::ConnectionUpgradeFailed, {});
 }
 
@@ -594,7 +370,7 @@ void WebSocket::read_client_handshake()
                 return;
             }
             if (!version.has_value() || *version != "13"sv) {
-                m_impl->send("HTTP/1.1 426 Upgrade Required\r\nSec-WebSocket-Version: 13\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"sv.bytes());
+                send_bytes("HTTP/1.1 426 Upgrade Required\r\nSec-WebSocket-Version: 13\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"sv.bytes());
                 fail_connection(to_underlying(CloseStatusCode::AbnormalClosure), Error::ConnectionUpgradeFailed, {});
                 return;
             }
@@ -606,13 +382,11 @@ void WebSocket::read_client_handshake()
             }
             if (m_state != InternalState::WaitingForClientHandshake)
                 return;
-            Crypto::Hash::Manager hash;
-            hash.initialize(Crypto::Hash::HashKind::SHA1);
-            hash.update(ByteString::formatted("{}258EAFA5-E914-47DA-95CA-C5AB0DC85B11", *key));
-            auto digest = hash.digest();
-            auto accept = MUST(encode_base64({ digest.immutable_data(), digest.data_length() }));
+            auto accept_input = ByteString::formatted("{}258EAFA5-E914-47DA-95CA-C5AB0DC85B11", *key);
+            auto digest = Crypto::Hash::digest(Crypto::Hash::HashKind::SHA1, accept_input.bytes());
+            auto accept = MUST(encode_base64(digest.bytes()));
             auto response = ByteString::formatted("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {}\r\n\r\n", accept);
-            if (!m_impl->send(response.bytes())) {
+            if (!send_bytes(response.bytes())) {
                 fail_connection(to_underlying(CloseStatusCode::AbnormalClosure), Error::ConnectionUpgradeFailed, {});
                 return;
             }
@@ -942,8 +716,40 @@ void WebSocket::send_frame(WebSocket::OpCode op_code, ReadonlyBytes payload, boo
         buf.overwrite(offset, payload.data(), payload.size());
         offset += payload.size();
     }
-    if (!m_impl->send(buf.span().slice(0, offset)) && m_role == Role::Server)
+    auto is_message_frame = op_code == OpCode::Text || op_code == OpCode::Binary || op_code == OpCode::Continuation;
+    if (!send_bytes(buf.span().slice(0, offset), is_message_frame ? payload.size() : 0) && m_role == Role::Server)
         fail_connection(to_underlying(CloseStatusCode::AbnormalClosure), Error::ServerClosedSocket, "Unable to send a frame");
+}
+
+bool WebSocket::send_bytes(ReadonlyBytes bytes, u64 message_byte_count)
+{
+    // A frame's message bytes come last. Record them first, as the connection may write them before send() returns.
+    auto end = m_bytes_passed_to_connection + bytes.size();
+    if (message_byte_count > 0)
+        m_unwritten_message_bytes.enqueue({ end - message_byte_count, end });
+    m_bytes_passed_to_connection = end;
+    return m_impl->send(bytes);
+}
+
+void WebSocket::did_write_bytes(size_t byte_count)
+{
+    auto written_before = m_bytes_written;
+    m_bytes_written += byte_count;
+
+    u64 message_byte_count = 0;
+    while (!m_unwritten_message_bytes.is_empty()) {
+        auto const& message_bytes = m_unwritten_message_bytes.head();
+        auto start = max(message_bytes.start, written_before);
+        auto end = min(message_bytes.end, m_bytes_written);
+        if (end > start)
+            message_byte_count += end - start;
+        if (message_bytes.end > m_bytes_written)
+            break;
+        (void)m_unwritten_message_bytes.dequeue();
+    }
+
+    if (message_byte_count > 0 && on_message_bytes_transmitted)
+        on_message_bytes_transmitted(message_byte_count);
 }
 
 void WebSocket::discard_connection()
@@ -960,6 +766,7 @@ void WebSocket::discard_connection()
         m_impl->on_connection_error = nullptr;
         m_impl->on_connected = nullptr;
         m_impl->on_ready_to_read = nullptr;
+        m_impl->on_bytes_written = nullptr;
         m_impl = nullptr;
     });
 }

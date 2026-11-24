@@ -720,6 +720,11 @@
     "increasing",
     "decreasing"
   ],
+  "hyphens": [
+    "none",
+    "manual",
+    "auto"
+  ],
   "image-rendering": [
     "auto",
     "crisp-edges",
@@ -787,6 +792,7 @@
     "anchor-center"
   ],
   "line-break": [
+    "anywhere",
     "auto",
     "loose",
     "normal",
@@ -1145,10 +1151,19 @@
     "left",
     "right",
     "match-parent",
-    "-libweb-center",
+    "-webkit-center",
     "-libweb-inherit-or-center",
-    "-libweb-left",
-    "-libweb-right"
+    "-webkit-left",
+    "-webkit-right"
+  ],
+  "text-align-last": [
+    "auto",
+    "start",
+    "end",
+    "left",
+    "right",
+    "center",
+    "justify"
   ],
   "text-anchor": [
     "start",
@@ -1196,6 +1211,12 @@
     "optimizespeed",
     "optimizelegibility",
     "geometricprecision"
+  ],
+  "text-security": [
+    "none",
+    "disc",
+    "circle",
+    "square"
   ],
   "text-transform": [
     "capitalize",
@@ -1301,9 +1322,22 @@
     "hidden",
     "visible"
   ],
+  "webkit-box-align": [
+    "stretch",
+    "start",
+    "end",
+    "center",
+    "baseline"
+  ],
   "webkit-box-orient": [
     "horizontal",
     "vertical"
+  ],
+  "webkit-box-pack": [
+    "start",
+    "end",
+    "center",
+    "justify"
   ],
   "white-space": [
     "normal",

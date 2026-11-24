@@ -123,6 +123,13 @@ impl TextSink {
         }
     }
 
+    /// Empties the sink and keeps its memory.
+    fn clear(&mut self) {
+        self.ascii.clear();
+        self.utf16.clear();
+        self.is_ascii = true;
+    }
+
     /// The current length in code units.
     fn len(&self) -> usize {
         if self.is_ascii {
@@ -322,7 +329,9 @@ pub(crate) fn serialize_component_values_to_utf16(
     values: &[crate::css::parser::component_value::ComponentValue],
     mode: ComponentSerializationMode,
 ) -> Vec<u16> {
+    // NB: Most values are short, and the sink then grows once at most.
     let mut sink = TextSink::new();
+    sink.ascii.reserve(64);
     if !serialize_component_values_into(&mut sink, values, mode) {
         sink = TextSink::new();
         assert!(serialize_component_values_into(
@@ -332,6 +341,39 @@ pub(crate) fn serialize_component_values_to_utf16(
         ));
     }
     sink.into_utf16()
+}
+
+thread_local! {
+    static SERIALIZATION_SINK: std::cell::Cell<Option<TextSink>> = const { std::cell::Cell::new(None) };
+}
+
+/// Serializes `values` into `out` in place of what it holds, with the memory of the last serialization of the thread
+/// for the work in between.
+pub(crate) fn serialize_component_values_into_utf16(
+    values: &[crate::css::parser::component_value::ComponentValue],
+    mode: ComponentSerializationMode,
+    out: &mut Vec<u16>,
+) {
+    let mut sink = SERIALIZATION_SINK.take().unwrap_or_default();
+    sink.clear();
+    if !serialize_component_values_into(&mut sink, values, mode) {
+        sink.clear();
+        assert!(serialize_component_values_into(
+            &mut sink,
+            values,
+            ComponentSerializationMode::Normalized,
+        ));
+    }
+    out.clear();
+    if sink.is_ascii {
+        out.extend(sink.ascii.iter().map(|&byte| u16::from(byte)));
+    } else {
+        out.extend_from_slice(&sink.utf16);
+    }
+    // NB: The thread keeps the memory for the next serialization, but not the memory of one very large one.
+    if sink.ascii.capacity() <= 4096 && sink.utf16.capacity() <= 4096 {
+        SERIALIZATION_SINK.set(Some(sink));
+    }
 }
 
 pub(crate) fn normalized_component_values_equal(
@@ -406,7 +448,7 @@ fn escape_a_character_as_code_point(sink: &mut TextSink, code_point: u32) {
 
 /// https://www.w3.org/TR/cssom-1/#serialize-an-identifier
 pub(crate) fn serialize_an_identifier(sink: &mut TextSink, ident: &StringUnits) {
-    let mut code_points = Vec::new();
+    let mut code_points = smallvec::SmallVec::<[u32; 48]>::new();
     match ident {
         StringUnits::Ascii(bytes) => code_points.extend(bytes.iter().map(|&byte| u32::from(byte))),
         StringUnits::Utf16(units) => for_each_code_point_utf16(units, |code_point| code_points.push(code_point)),
@@ -1704,7 +1746,10 @@ pub(crate) fn serialize_style_value(sink: &mut TextSink, value: &StyleValueData,
         }
         StyleValueData::RadialGradient(radial_gradient_payload) => {
             let RadialGradientPayload {
-                ending_shape: _,
+                ending_shape,
+                webkit,
+                has_explicit_position,
+                webkit_size_keyword,
                 size,
                 position,
                 color_stop_list,
@@ -1712,6 +1757,32 @@ pub(crate) fn serialize_style_value(sink: &mut TextSink, value: &StyleValueData,
                 color_interpolation_method,
                 color_syntax,
             } = &**radial_gradient_payload;
+            if *webkit {
+                sink.push_ascii(if *repeating {
+                    "-webkit-repeating-radial-gradient("
+                } else {
+                    "-webkit-radial-gradient("
+                });
+                if *has_explicit_position {
+                    serialize_style_value(sink, position.data(), mode);
+                } else {
+                    sink.push_ascii("center");
+                }
+                if *webkit_size_keyword != 0 {
+                    sink.push_ascii(if *ending_shape == 0 { ", circle " } else { ", ellipse " });
+                    sink.push_ascii(keyword::NAMES[*webkit_size_keyword as usize]);
+                } else if let StyleValueData::RadialSize(size_payload) = size.data()
+                    && size_payload.component_count == 2
+                {
+                    sink.push_ascii(", ");
+                    serialize_style_value(sink, size.data(), mode);
+                }
+                sink.push_ascii(", ");
+                serialize_color_stop_list(sink, color_stop_list, mode);
+                sink.push_ascii(")");
+                return;
+            }
+
             if *repeating {
                 sink.push_ascii("repeating-");
             }

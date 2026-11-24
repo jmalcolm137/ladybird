@@ -30,6 +30,7 @@
 #include <LibWeb/HTML/BarProp.h>
 #include <LibWeb/HTML/CrossOrigin/AbstractOperations.h>
 #include <LibWeb/HTML/LocalTraversableNavigable.h>
+#include <LibWeb/HTML/Scripting/Environments.h>
 #include <LibWeb/HTML/Scripting/SimilarOriginWindowAgent.h>
 #include <LibWeb/HTML/Scripting/TemporaryExecutionContext.h>
 #include <LibWeb/HTML/Scripting/WindowEnvironmentSettingsObject.h>
@@ -40,8 +41,6 @@
 #include <LibWeb/WebIDL/ExceptionOr.h>
 
 namespace {
-
-bool s_main_thread_vm_was_initialized_by_an_earlier_wrapper_test = false;
 
 void ensure_font_plugin_installed()
 {
@@ -277,7 +276,7 @@ GC::Ref<JS::Realm> create_test_principal_realm(JS::VM& vm)
             return global_this.as_nonnull();
         });
 
-    auto realm = execution_context->realm;
+    auto realm = execution_context->realm();
     URL::Origin::OpaqueData::Nonce nonce {};
     auto origin = URL::Origin { URL::Origin::OpaqueData { nonce, URL::Origin::OpaqueData::Type::Standard } };
     Web::HTML::WindowEnvironmentSettingsObject::setup(
@@ -327,7 +326,7 @@ struct TestRealm {
         realm().vm().pop_execution_context();
     }
 
-    JS::Realm& realm() { return *execution_context->realm; }
+    JS::Realm& realm() { return *execution_context->realm(); }
 
     GC::Root<JS::Realm> principal_realm;
     NonnullOwnPtr<JS::ExecutionContext> execution_context;
@@ -474,7 +473,7 @@ TEST_CASE(global_wrapper_uses_requested_realm)
     TestRealm allocation_realm { *vm };
     auto wrappable = allocation_realm.realm().create<TestWrappable>(allocation_realm.realm());
     auto extension_execution_context = MUST(JS::Realm::initialize_host_defined_realm(*vm, nullptr, nullptr));
-    auto& extension_realm = *extension_execution_context->realm;
+    auto& extension_realm = *extension_execution_context->realm();
 
     auto wrapper = Web::Bindings::create_global_object_wrapper(extension_realm, wrappable);
 
@@ -540,7 +539,7 @@ TEST_CASE(global_wrapper_cache_uses_realm_wrapper_world)
             return Web::Bindings::create_global_object_wrapper(realm, wrappable);
         },
         nullptr));
-    auto& extension_realm = *extension_execution_context->realm;
+    auto& extension_realm = *extension_execution_context->realm();
     install_test_host_defined(extension_realm, Web::Bindings::WrapperWorld::Type::Extension, *main_world.principal_realm);
     Web::Bindings::cache_global_object_wrapper(extension_realm);
 
@@ -807,7 +806,7 @@ TEST_CASE(custom_element_prototype_helper_denies_realm_without_host_defined)
     auto original_prototype = main_wrapper->shape().prototype();
 
     auto bare_execution_context = MUST(JS::Realm::initialize_host_defined_realm(*vm, nullptr, nullptr));
-    auto& bare_realm = *bare_execution_context->realm;
+    auto& bare_realm = *bare_execution_context->realm();
     auto bare_prototype = JS::Object::create(bare_realm, nullptr);
 
     auto result = Web::Bindings::set_prototype_of_cached_main_world_wrapper(*wrappable, *bare_prototype);
@@ -826,7 +825,7 @@ TEST_CASE(window_cross_origin_descriptor_cache_lives_on_wrapper)
     auto window = Web::HTML::Window::create();
     auto wrapper = Web::Bindings::wrap(wrapper_world, extension_realm.realm(), window);
     auto key = Web::HTML::CrossOriginKey {
-        .current_settings_object = 1,
+        .current_settings_object = Web::HTML::principal_realm_settings_object(extension_realm.realm()),
         .relevant_settings_object = 2,
         .property_key = JS::PropertyKey { "closed"_utf16_fly_string },
     };
@@ -834,10 +833,10 @@ TEST_CASE(window_cross_origin_descriptor_cache_lives_on_wrapper)
     EXPECT(!wrapper->host_data());
     JS::PropertyDescriptor descriptor;
     descriptor.value = JS::Value(false);
-    Web::HTML::cross_origin_property_descriptor_map(*wrapper).set(key, Web::HTML::CrossOriginCachedPropertyDescriptor { descriptor });
+    Web::HTML::cross_origin_property_descriptor_map(*wrapper).set(key, descriptor);
 
     EXPECT(wrapper->host_data());
-    EXPECT(Web::HTML::cross_origin_property_descriptor_map(*wrapper).contains(key));
+    EXPECT(Web::HTML::cross_origin_property_descriptor_map(*wrapper).get(key).has_value());
     EXPECT(wrapper_world.wrapper_for(*window, extension_realm.realm()) == wrapper);
     wrapper_world.detach();
     EXPECT(!wrapper_world.wrapper_for(*window, extension_realm.realm()));
@@ -855,14 +854,14 @@ TEST_CASE(cross_origin_descriptor_cache_does_not_root_realm_after_wrapper_dies)
         auto wrapper = Web::Bindings::wrap(wrapper_world, realm.realm(), window);
         auto accessor = JS::NativeFunction::create(realm.realm(), [](JS::VM&) -> JS::ThrowCompletionOr<JS::Value> { return JS::js_undefined(); }, 0);
         auto key = Web::HTML::CrossOriginKey {
-            .current_settings_object = 1,
+            .current_settings_object = Web::HTML::principal_realm_settings_object(realm.realm()),
             .relevant_settings_object = 2,
             .property_key = JS::PropertyKey { "closed"_utf16_fly_string },
         };
 
         JS::PropertyDescriptor descriptor;
         descriptor.get = accessor;
-        Web::HTML::cross_origin_property_descriptor_map(*wrapper).set(key, Web::HTML::CrossOriginCachedPropertyDescriptor { descriptor });
+        Web::HTML::cross_origin_property_descriptor_map(*wrapper).set(key, descriptor);
         weak_realm = GC::Weak<JS::Realm> { realm.realm() };
     }
 
@@ -1047,7 +1046,7 @@ TEST_CASE(relevant_global_main_world_wrapper_ignores_preferred_realm)
     auto window = GC::Ref { *traversable->active_document()->window() };
 
     auto preferred_execution_context = MUST(JS::Realm::initialize_host_defined_realm(vm, nullptr, nullptr));
-    auto& preferred_realm = *preferred_execution_context->realm;
+    auto& preferred_realm = *preferred_execution_context->realm();
     install_test_host_defined(preferred_realm, static_cast<Web::HTML::Agent&>(*vm.agent()).main_world(), window->principal_realm());
 
     auto bar_prop = GC::Ref { const_cast<Web::HTML::BarProp&>(*window->locationbar()) };
@@ -1059,7 +1058,6 @@ TEST_CASE(relevant_global_main_world_wrapper_ignores_preferred_realm)
 
     vm.pop_execution_context();
     vm.pop_execution_context();
-    s_main_thread_vm_was_initialized_by_an_earlier_wrapper_test = true;
 }
 
 TEST_CASE(wasm_instance_exports_belong_to_the_realm_of_the_instance)
@@ -1079,7 +1077,7 @@ TEST_CASE(wasm_instance_exports_belong_to_the_realm_of_the_instance)
     auto& window_realm = traversable->active_document()->window()->principal_realm();
 
     auto extension_execution_context = MUST(JS::Realm::initialize_host_defined_realm(vm, nullptr, nullptr));
-    auto& extension_realm = *extension_execution_context->realm;
+    auto& extension_realm = *extension_execution_context->realm();
     install_test_host_defined(extension_realm, Web::Bindings::WrapperWorld::Type::Extension, window_realm);
 
     // An Instance made in the window realm, whose exports object belongs to that realm.
@@ -1100,5 +1098,4 @@ TEST_CASE(wasm_instance_exports_belong_to_the_realm_of_the_instance)
 
     vm.pop_execution_context();
     vm.pop_execution_context();
-    s_main_thread_vm_was_initialized_by_an_earlier_wrapper_test = true;
 }

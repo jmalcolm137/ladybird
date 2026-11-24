@@ -26,15 +26,16 @@ public:
     static Optional<DecoderCapabilities> capabilities(ParsedCodec const&);
     static DecoderErrorOr<NonnullOwnPtr<FFmpegVideoDecoder>> try_create(FFmpegFunctions const&, CodecID, ReadonlyBytes codec_initialization_data);
     static DecoderErrorOr<NonnullOwnPtr<FFmpegVideoDecoder>> try_create(CodecID, ReadonlyBytes codec_initialization_data);
-    FFmpegVideoDecoder(FFmpegFunctions const&, AVCodecContext* codec_context, AVPacket* packet, AVFrame* frame, NonnullRefPtr<VideoFramePool> frame_pool);
+    FFmpegVideoDecoder(FFmpegFunctions const&, CodecID, ReadonlyBytes codec_initialization_data, AVCodecContext* codec_context, AVPacket* packet, AVFrame* frame, NonnullRefPtr<VideoFramePool> frame_pool);
     virtual ~FFmpegVideoDecoder() override;
 
     virtual void set_storage_freed_callback(Function<void()> callback) override { m_frame_pool->set_slot_freed_callback(move(callback)); }
-    virtual void set_output_arrived_callback(Function<void()>) override { }
+    virtual void set_decode_completed_callback(Function<void(DecodeCompletion)>) override { }
+    virtual bool has_any_decode_in_progress() const override { return false; }
 
     virtual DecoderErrorOr<void> receive_coded_data(CodedFrame const&, DecodeIntent) override;
     virtual void signal_end_of_stream() override;
-    virtual DecoderErrorOr<NonnullRefPtr<VideoFrame>> take_next_output(CodingIndependentCodePoints const& container_cicp, Optional<AK::Duration> target = {}) override;
+    virtual DecoderErrorOr<NonnullRefPtr<VideoFrame>> take_next_output(ColorMetadata const& container_color_metadata, Optional<AK::Duration> target = {}) override;
 
     virtual void flush() override;
 

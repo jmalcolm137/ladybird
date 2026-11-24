@@ -13,10 +13,11 @@ pub(crate) use crate::css::display::*;
 pub(crate) mod abspos_engine;
 pub(crate) mod abspos_inputs;
 pub(crate) mod block_formatting_context;
-pub(crate) mod box_removal;
+pub(crate) mod box_alignment;
 pub mod commit;
 pub(crate) mod counters;
 pub(crate) mod fc_run_cache;
+pub(crate) mod first_paint_text;
 pub(crate) mod flex_formatting_context;
 pub mod formatting_context;
 pub(crate) mod fragment_overflow;
@@ -49,8 +50,10 @@ pub use libcompositing_rust::node_slot_id;
 pub(crate) mod frameset_formatting_context;
 mod partial_relayout;
 pub(crate) mod prepared_inline_content;
+pub(crate) mod query;
 pub(crate) mod quote_depth;
 pub(crate) mod rendered_text;
+pub(crate) mod replaced_sizing;
 mod replaced_with_children_formatting_context;
 pub(crate) mod row_reads;
 pub(crate) mod run_repeatability;
@@ -68,8 +71,10 @@ mod text_transform;
 mod trace;
 mod tree_builder;
 pub(crate) mod tree_mutation;
+pub(crate) mod tree_plan;
 pub(crate) mod tree_update_marks;
 mod update_layout;
+pub(crate) mod used_transform;
 pub mod used_values;
 pub(crate) mod viewport_propagation;
 
@@ -90,10 +95,10 @@ use crate::layout::node_data::NodeData;
 use crate::layout::node_data::NodeFlag;
 use crate::layout::node_data::NodeKind;
 use crate::layout::node_data::NodeSlotId;
-pub(crate) use abspos_inputs::{AbsposAlignment, StaticPositionAlignment};
+pub(crate) use abspos_inputs::AbsposAxisAlignment;
+pub(crate) use box_alignment::AxisEdge;
 pub(crate) use formatting_context::{
-    ChildLayoutOutcome, DerivedBaselines, FfiLayoutHostCallbacks, FormattingContextRun, Node, SizingAxis,
-    SizingProperty,
+    DerivedBaselines, FfiLayoutHostCallbacks, FormattingContextRun, Node, SizingAxis, SizingProperty,
 };
 pub(crate) use fragment_tree::FragmentLink;
 pub(crate) use geometry::{
@@ -114,7 +119,6 @@ use std::cell::RefCell;
 use std::cell::RefMut;
 use std::ffi::c_void;
 pub(crate) use style_values::StyleValues;
-pub(crate) use tree_builder::build_keeps_box;
 pub(crate) use update_layout::MainThreadFfiEntry as UpdateMainThreadFfiEntry;
 pub(crate) use update_layout::{ClockRound, ClockRoundDeclined, FlownRound, SealedRound};
 pub(crate) use used_values::{BoxMetricCells, BoxMetricCellsMut, FfiCssPixelPoint, FfiCssPixelRect, FfiCssPixelSize};

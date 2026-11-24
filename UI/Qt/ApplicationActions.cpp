@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <LibCore/Environment.h>
 #include <LibURL/InternalURLs.h>
 #include <LibWebCommon/CSS/PreferredContrast.h>
 #include <LibWebCommon/CSS/PreferredMotion.h>
@@ -18,6 +19,7 @@
 #include <QClipboard>
 #include <QLineEdit>
 #include <QPlainTextEdit>
+#include <QTimer>
 
 namespace Ladybird {
 
@@ -161,10 +163,10 @@ ApplicationActions::ApplicationActions(PageOptions const& options)
     m_zoom_menu->add_action(*m_reset_zoom_action);
 
     m_force_dark_action = Action::create_checkable("Force Dark Mode"sv, ActionID::ForceDark, on_active_view([](RemoteView& view) {
-        if (view.is_private() == WebView::IsPrivate::Yes || view.force_dark_host().is_empty())
+        if (view.is_private() == WebView::IsPrivate::Yes || view.current_host_for_settings().is_empty())
             return;
         auto& settings = Application::settings();
-        settings.set_force_dark_for_host(view.force_dark_host(), !settings.force_dark_for_host(view.force_dark_host()));
+        settings.set_force_dark_for_host(view.current_host_for_settings(), !settings.force_dark_for_host(view.current_host_for_settings()));
     }));
 
     auto set_website_color_scheme = [](WebView::ThemePreference color_scheme) {
@@ -264,23 +266,25 @@ void ApplicationActions::create_debug_menu(PageOptions const& options)
 
     m_debug_menu = Menu::create("Debug"sv);
     m_debug_menu->set_visible(settings.config_variable_as_bool(WebView::ConfigVariableID::ShowAdvancedDebugMenu));
-    m_debug_menu->add_action(Action::create("Dump Session History Tree"sv, ActionID::DumpSessionHistoryTree, debug_request("dump-session-history"sv)));
-    m_debug_menu->add_action(Action::create("Dump DOM Tree"sv, ActionID::DumpDOMTree, debug_request("dump-dom-tree"sv)));
-    m_debug_menu->add_action(Action::create("Dump Layout Tree"sv, ActionID::DumpLayoutTree, debug_request("dump-layout-tree"sv)));
-    m_debug_menu->add_action(Action::create("Dump Stacking Context Tree"sv, ActionID::DumpStackingContextTree, debug_request("dump-stacking-context-tree"sv)));
-    m_debug_menu->add_action(Action::create("Dump Site Isolation Process Tree"sv, ActionID::DumpSiteIsolationProcessTree, debug_request("dump-site-isolation-process-tree"sv)));
-    m_debug_menu->add_action(Action::create("Dump Display List"sv, ActionID::DumpDisplayList, debug_request("dump-display-list"sv)));
-    m_debug_menu->add_action(Action::create("Dump Style Sheets"sv, ActionID::DumpStyleSheets, debug_request("dump-style-sheets"sv)));
-    m_debug_menu->add_action(Action::create("Dump All Resolved Styles"sv, ActionID::DumpStyles, debug_request("dump-all-resolved-styles"sv)));
-    m_debug_menu->add_action(Action::create("Dump CSS Errors"sv, ActionID::DumpCSSErrors, debug_request("dump-all-css-errors"sv)));
-    m_debug_menu->add_action(Action::create("Dump Cookies"sv, ActionID::DumpCookies, [] {
+    auto dump_menu = Menu::create("Dump"sv);
+    dump_menu->add_action(Action::create("Session History Tree"sv, ActionID::DumpSessionHistoryTree, debug_request("dump-session-history"sv)));
+    dump_menu->add_action(Action::create("DOM Tree"sv, ActionID::DumpDOMTree, debug_request("dump-dom-tree"sv)));
+    dump_menu->add_action(Action::create("Layout Tree"sv, ActionID::DumpLayoutTree, debug_request("dump-layout-tree"sv)));
+    dump_menu->add_action(Action::create("Stacking Context Tree"sv, ActionID::DumpStackingContextTree, debug_request("dump-stacking-context-tree"sv)));
+    dump_menu->add_action(Action::create("Site Isolation Process Tree"sv, ActionID::DumpSiteIsolationProcessTree, debug_request("dump-site-isolation-process-tree"sv)));
+    dump_menu->add_action(Action::create("Display List"sv, ActionID::DumpDisplayList, debug_request("dump-display-list"sv)));
+    dump_menu->add_action(Action::create("Style Sheets"sv, ActionID::DumpStyleSheets, debug_request("dump-style-sheets"sv)));
+    dump_menu->add_action(Action::create("All Resolved Styles"sv, ActionID::DumpStyles, debug_request("dump-all-resolved-styles"sv)));
+    dump_menu->add_action(Action::create("CSS Errors"sv, ActionID::DumpCSSErrors, debug_request("dump-all-css-errors"sv)));
+    dump_menu->add_action(Action::create("Cookies"sv, ActionID::DumpCookies, [] {
         HubConnection::the().async_dump_cookies();
     }));
-    m_debug_menu->add_action(Action::create("Dump Local Storage"sv, ActionID::DumpLocalStorage, debug_request("dump-local-storage"sv)));
-    m_debug_menu->add_action(Action::create("Dump Session Storage"sv, ActionID::DumpSessionStorage, debug_request("dump-session-storage"sv)));
-    m_debug_menu->add_action(Action::create("Dump GC Graph"sv, ActionID::DumpGCGraph, on_active_view([](RemoteView& view) {
+    dump_menu->add_action(Action::create("Local Storage"sv, ActionID::DumpLocalStorage, debug_request("dump-local-storage"sv)));
+    dump_menu->add_action(Action::create("Session Storage"sv, ActionID::DumpSessionStorage, debug_request("dump-session-storage"sv)));
+    dump_menu->add_action(Action::create("GC Graph"sv, ActionID::DumpGCGraph, on_active_view([](RemoteView& view) {
         HubConnection::the().async_view_dump_gc_graph(view.view_id());
     })));
+    m_debug_menu->add_submenu(move(dump_menu));
     m_debug_menu->add_separator();
 
     auto add_switch = [&](RefPtr<Action>& action, StringView name, ActionID id, bool checked, void (*set)(bool)) {
@@ -295,6 +299,14 @@ void ApplicationActions::create_debug_menu(PageOptions const& options)
     add_switch(m_show_caret_hit_test_debug_overlay_action, "Show Caret Hit Test Debug Overlay"sv, ActionID::ShowCaretHitTestDebugOverlay, false, [](bool shows) {
         HubConnection::the().async_set_shows_caret_hit_test_debug_overlay(shows);
     });
+    auto shows_compositor_layers = Core::Environment::has("LADYBIRD_SHOW_COMPOSITOR_LAYERS"sv);
+    add_switch(m_show_compositor_layers_action, "Show Compositor Layers and Tiles"sv, ActionID::ShowCompositorLayers, shows_compositor_layers, [](bool shows) {
+        Application::the().set_shows_compositor_layers(shows);
+    });
+    if (shows_compositor_layers) {
+        // The window that lists the layers opens once the application runs.
+        QTimer::singleShot(0, [] { Application::the().set_shows_compositor_layers(true); });
+    }
 
     m_show_tab_performance_monitor_action = Action::create_checkable("Show Tab Performance Monitor"sv, ActionID::ShowTabPerformanceMonitor, [this] {
         Application::settings().set_config_variable(WebView::ConfigVariableID::ShowTabPerformanceMonitor, m_show_tab_performance_monitor_action->checked());
@@ -363,8 +375,8 @@ void ApplicationActions::update_force_dark_action()
 {
     auto& settings = Application::settings();
     auto* view = active_view();
-    m_force_dark_action->set_enabled(view && view->is_private() == WebView::IsPrivate::No && !view->force_dark_host().is_empty());
-    m_force_dark_action->set_checked(view ? settings.force_dark_for_host(view->force_dark_host()) : settings.content_settings().enable_force_dark);
+    m_force_dark_action->set_enabled(view && view->is_private() == WebView::IsPrivate::No && !view->current_host_for_settings().is_empty());
+    m_force_dark_action->set_checked(view ? settings.force_dark_for_host(view->current_host_for_settings()) : settings.content_settings().enable_force_dark);
 }
 
 void ApplicationActions::devtools_enabled_changed(bool enabled)

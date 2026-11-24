@@ -22,7 +22,6 @@
 #include <LibWeb/HTML/Scripting/TemporaryExecutionContext.h>
 #include <LibWeb/HTML/Window.h>
 #include <LibWeb/HTML/WorkerGlobalScope.h>
-#include <LibWeb/HighResolutionTime/TimeOrigin.h>
 #include <LibWeb/Infra/JSON.h>
 #include <LibWebCommon/Fetch/Infrastructure/URL.h>
 
@@ -62,18 +61,12 @@ GC::Ref<Violation> Violation::create_a_violation_object_for_global_policy_and_di
     // NOTE: User agents need to ensure that the source file is the URL requested by the page, pre-redirects. If that’s
     //       not possible, user agents need to strip the URL down to an origin to avoid unintentional leakage.
     // NB: We use the innermost stack frame that has a source location.
-    for (auto const& frame : JS::VM::the().stack_trace()) {
-        if (!frame.source_range.has_value())
-            continue;
-        auto const& source_range = *frame.source_range;
-        auto source_file = URL::Parser::basic_parse(source_range.filename().utf16_view());
-        if (!source_file.has_value())
-            break;
-
-        violation->m_source_file = source_file.release_value();
-        violation->m_line_number = source_range.start.line;
-        violation->m_column_number = source_range.start.column;
-        break;
+    if (auto source_range = JS::VM::the().innermost_source_range(); source_range.has_value()) {
+        if (auto source_file = URL::Parser::basic_parse(source_range->filename().utf16_view()); source_file.has_value()) {
+            violation->m_source_file = source_file.release_value();
+            violation->m_line_number = source_range->start.line;
+            violation->m_column_number = source_range->start.column;
+        }
     }
 
     // 3. If global is a Window object, set violation’s referrer to global’s document's referrer.
@@ -396,7 +389,7 @@ void Violation::report_a_violation(JS::Realm& realm)
             //    violation's sample
             event_init.sample = self.m_sample;
 
-            auto event = SecurityPolicyViolationEvent::create(HTML::EventNames::securitypolicyviolation, event_init, HighResolutionTime::current_high_resolution_time(realm.global_object()));
+            auto event = create_security_policy_violation_event(realm, HTML::EventNames::securitypolicyviolation, event_init);
             event->set_is_trusted(true);
             event_target->dispatch_event(event);
         }

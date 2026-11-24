@@ -29,8 +29,10 @@ from Generators.libweb_bindings.rust_types import inheriting_interfaces
 from Generators.libweb_bindings.rust_types import is_callback_interface
 from Generators.libweb_bindings.rust_types import is_named_union
 from Generators.libweb_bindings.rust_types import is_promise_type
+from Generators.libweb_bindings.rust_types import is_record_of_cells
 from Generators.libweb_bindings.rust_types import is_sequence_of_cells
 from Generators.libweb_bindings.rust_types import is_unnamed_union_of_cpp_interfaces
+from Generators.libweb_bindings.rust_types import is_window_proxy
 from Generators.libweb_bindings.rust_types import member_other_than_undefined
 from Generators.libweb_bindings.rust_types import resolved_dictionary
 from Generators.libweb_bindings.rust_types import runtime_union_type
@@ -44,6 +46,7 @@ from Generators.libweb_bindings.rust_types import rust_interface_path
 from Generators.libweb_bindings.rust_types import rust_type
 from Generators.libweb_bindings.rust_types import rust_union_path
 from Generators.libweb_bindings.rust_types import rust_union_variant
+from Generators.libweb_bindings.rust_types import union_holds_sequence_of_cells
 from Generators.libweb_bindings.rust_types import union_member_types
 from Utils.webidl_parser import Dictionary
 from Utils.webidl_parser import DictionaryMember
@@ -57,7 +60,7 @@ from Utils.webidl_parser import OperationParameter
 # NB: CSSOMString is a string type that an implementation chooses, https://drafts.csswg.org/cssom/#cssomstring-type,
 #     and it is a DOMString here, as it is in the C++ bindings.
 DOM_STRING_TYPES = ("CSSOMString", "DOMString")
-STRING_TYPES = (*DOM_STRING_TYPES, "USVString")
+STRING_TYPES = ("ByteString", *DOM_STRING_TYPES, "USVString")
 
 
 def buffer_source_rules(idl_type: IDLType, parameter_attributes: dict[str, str]) -> str:
@@ -65,6 +68,10 @@ def buffer_source_rules(idl_type: IDLType, parameter_attributes: dict[str, str])
     allow_shared = "true" if "AllowShared" in attributes else "false"
     allow_resizable = "true" if "AllowResizable" in attributes else "false"
     return f"&BufferSourceRules {{ allow_shared: {allow_shared}, allow_resizable: {allow_resizable} }}"
+
+
+def optional_buffer_source_rules(idl_type: Optional[IDLType]) -> str:
+    return f"Some({buffer_source_rules(idl_type, {})})" if idl_type is not None else "None"
 
 
 def rust_to_idl_value(
@@ -111,6 +118,10 @@ def rust_to_idl_value(
         element = rust_sequence_element_to_idl_value(idl_type, identifier, context, what)
         return f"sequence_from_js(vm, {value}, Vec::new(), |value| {element})"
     if isinstance(idl_type, IDLParameterizedType) and idl_type.name == "record":
+        if keeps_cells_alive and is_record_of_cells(idl_type, context):
+            key = rust_to_idl_value(idl_type.parameters[0], {}, "key", identifier, context, what)
+            record_value = rust_to_idl_value(idl_type.parameters[1], {}, "value", identifier, context, what)
+            return f"record_from_js(vm, {value}, MarkedVec::new(vm), |key| {key}, |value| {record_value})"
         return rust_record_to_idl_value(idl_type, value, identifier, context, what)
     if isinstance(idl_type, IDLParameterizedType) and idl_type.name == "Promise":
         return f"to_promise(vm, {value})"
@@ -124,6 +135,8 @@ def rust_to_idl_value(
         return f"to_dom_string(vm, {value})"
     if name == "USVString":
         return f"to_usv_string(vm, {value})"
+    if name == "ByteString":
+        return f"to_byte_string(vm, {value})"
     if name == "boolean":
         return f"to_boolean({value})"
     if name == "any":
@@ -148,6 +161,8 @@ def rust_to_idl_value(
         if "AllowShared" in attributes:
             raise UnsupportedByRustBindings(f"{what} has [AllowShared] ArrayBuffer, which Rust does not convert yet")
         return f"crate::bindings::conversions::to_array_buffer(vm, {value}, {buffer_source_rules(idl_type, parameter_attributes)})"
+    if name == "SharedArrayBuffer":
+        return f"to_shared_array_buffer(vm, {value}, {buffer_source_rules(idl_type, parameter_attributes)})"
     if name in TYPED_ARRAY_NAMES:
         rules = buffer_source_rules(idl_type, parameter_attributes)
         return f'to_typed_array(vm, {value}, TypedArrayKind::{name}, "{name}", {rules})'
@@ -170,6 +185,8 @@ def rust_to_idl_value(
         if inheriting_interfaces(interface, context):
             return f"<{rust_any_interface_path(interface)}>::from_js(vm, {value})"
         return f"to_interface::<{rust_interface_path(interface)}>(vm, {value})"
+    if is_window_proxy(idl_type):
+        return f"to_window_proxy(vm, {value})"
     interface = cpp_interface(idl_type, context)
     if interface is not None:
         return f'to_cpp_interface(vm, {value}, {cpp_interface_name_constant(interface)}, "{interface.name}")'
@@ -230,7 +247,7 @@ def rust_record_to_idl_value(
         )
     key = rust_to_idl_value(key_type, {}, "key", identifier, context, what)
     record_value = rust_to_idl_value(value_type, {}, "value", identifier, context, what)
-    return f"record_from_js(vm, {value}, |key| {key}, |value| {record_value})"
+    return f"record_from_js(vm, {value}, Vec::new(), |key| {key}, |value| {record_value})"
 
 
 @dataclass
@@ -245,6 +262,9 @@ class UnionMembers:
     sequence_type: Optional[IDLParameterizedType] = None
     record_type: Optional[IDLParameterizedType] = None
     buffer_source_type: Optional[IDLType] = None
+    array_buffer_type: Optional[IDLType] = None
+    shared_array_buffer_type: Optional[IDLType] = None
+    array_buffer_view_type: Optional[IDLType] = None
     typed_array_types: List[IDLType] = field(default_factory=list)
     enumeration_types: List[IDLType] = field(default_factory=list)
     # The interfaces, implemented in either language, in the order of the union.
@@ -268,6 +288,12 @@ def union_members_by_kind(union_type: IDLUnionType, context: GenerationContext, 
     for member_type in union_member_types(union_type, context):
         if runtime_union_type(member_type, context) == "BufferSource" and members.buffer_source_type is None:
             members.buffer_source_type = member_type
+        elif runtime_union_type(member_type, context) == "ArrayBufferView":
+            members.array_buffer_view_type = member_type
+        elif member_type.name == "ArrayBuffer":
+            members.array_buffer_type = member_type
+        elif member_type.name == "SharedArrayBuffer":
+            members.shared_array_buffer_type = member_type
         elif member_type.name == "object" and members.object_type is None:
             members.object_type = member_type
         elif resolved_dictionary(member_type, context) is not None and members.dictionary_type is None:
@@ -282,7 +308,11 @@ def union_members_by_kind(union_type: IDLUnionType, context: GenerationContext, 
             members.enumeration_types.append(member_type)
         elif member_type.name in TYPED_ARRAY_NAMES:
             members.typed_array_types.append(member_type)
-        elif cpp_interface(member_type, context) is not None or rust_interface(member_type, context) is not None:
+        elif (
+            is_window_proxy(member_type)
+            or cpp_interface(member_type, context) is not None
+            or rust_interface(member_type, context) is not None
+        ):
             members.interface_types.append(member_type)
         elif (
             isinstance(member_type, IDLParameterizedType)
@@ -315,7 +345,9 @@ def rust_numeric_literal(literal: Optional[str], idl_type_name: str) -> Optional
 
 def rust_string_literal(default_value: Optional[str], idl_type_name: str, what: str) -> Optional[str]:
     """The Rust expression of a string of the IDL, if the default value is one, as a value of the string type."""
-    if idl_type_name not in STRING_TYPES or default_value is None or not default_value.startswith('"'):
+    if idl_type_name not in STRING_TYPES or idl_type_name == "ByteString":
+        return None
+    if default_value is None or not default_value.startswith('"'):
         return None
     string = default_value[1:-1]
     if not string.isascii() or "\\" in string:
@@ -333,14 +365,19 @@ def rust_default_value(
     default_value = member.default_value
     if member.type.nullable and default_value == "null":
         return "None"
+
+    # NB: A nullable type with another default value has that value, not null.
+    def value(literal: str) -> str:
+        return f"Some({literal})" if member.type.nullable else literal
+
     string_literal = rust_string_literal(default_value, name, what)
     if string_literal is not None:
-        return string_literal
+        return value(string_literal)
     if name == "boolean" and default_value in ("true", "false"):
-        return default_value
+        return value(default_value)
     numeric_literal = rust_numeric_literal(default_value, name)
     if numeric_literal is not None:
-        return numeric_literal
+        return value(numeric_literal)
     if member.type.nullable and default_value == "null":
         return "None"
     if name == "any" and default_value in ("null", "undefined"):
@@ -578,8 +615,12 @@ def write_union_from_js(out: TextIO, context: GenerationContext, union_type: IDL
     what = f"the union {union_type}"
     path = rust_union_path(union_type, context, what)
     members = union_members_by_kind(union_type, context, what)
+    holds_sequence_of_cells = union_holds_sequence_of_cells(union_type, context)
     dictionary_type = members.dictionary_type
     string_type = members.string_type
+    array_buffer_type = members.array_buffer_type
+    shared_array_buffer_type = members.shared_array_buffer_type
+    array_buffer_view_type = members.array_buffer_view_type
     steps = []
     dictionary_conversion = None
     if dictionary_type is not None:
@@ -593,6 +634,9 @@ def write_union_from_js(out: TextIO, context: GenerationContext, union_type: IDL
         or members.record_type is not None
         or members.interface_types
         or members.buffer_source_type is not None
+        or array_buffer_type is not None
+        or shared_array_buffer_type is not None
+        or array_buffer_view_type is not None
     ):
         if dictionary_conversion is not None:
             steps.append(
@@ -606,13 +650,21 @@ def write_union_from_js(out: TextIO, context: GenerationContext, union_type: IDL
             )
         steps.append("            if value.is_object() {\n")
         for interface_type in members.interface_types:
-            interface = context.interfaces[interface_type.name]
             steps.append(
                 """                // 5. If V is a platform object, then:
                 //     1. If types includes an interface type that V implements, then return the IDL value that is a
                 //        reference to the object V.
 """
             )
+            if is_window_proxy(interface_type):
+                steps.append(
+                    f"""                if let Some(window_proxy) = window_proxy_from_object(value.as_object()) {{
+                    return Ok(Self::{rust_union_variant(interface_type)}(window_proxy));
+                }}
+"""
+                )
+                continue
+            interface = context.interfaces[interface_type.name]
             if rust_interface(interface_type, context) is not None and inheriting_interfaces(interface, context):
                 # NB: A wrapper of the interface wraps an object of the interface or of one that inherits from it,
                 #     which the variant holds as such.
@@ -663,11 +715,71 @@ def write_union_from_js(out: TextIO, context: GenerationContext, union_type: IDL
                 // 9. If V is an Object and V has a [[TypedArrayName]] internal slot, then:
                 //     1. If types includes a typed array type whose name is the value of V's [[TypedArrayName]]
                 //        internal slot, then return the result of converting V to that type.
-                if let Some(buffer_source) = buffer_source_if(vm, value.as_object(), {rules})? {{
+                if let Some(buffer_source) = buffer_source_if(vm, value.as_object(), BufferSourceTypes {{
+                    array_buffer_type: Some({rules}),
+                    shared_array_buffer_type: None,
+                    array_buffer_view_type: Some({rules}),
+                }})? {{
                     return Ok(Self::BufferSource(buffer_source));
                 }}
 """
             )
+        if array_buffer_type is not None or shared_array_buffer_type is not None or array_buffer_view_type is not None:
+            if array_buffer_type is not None and "AllowShared" in array_buffer_type.extended_attributes:
+                raise UnsupportedByRustBindings(
+                    f"{what} has [AllowShared] ArrayBuffer, which Rust does not convert yet"
+                )
+            steps.append(
+                f"""                // 6. If V is an Object, V has an [[ArrayBufferData]] internal slot, and IsSharedArrayBuffer(V) is
+                //    false, then:
+                //     1. If types includes ArrayBuffer, then return the result of converting V to ArrayBuffer.
+                // 7. If V is an Object, V, has an [[ArrayBufferData]] internal slot, and IsSharedArrayBuffer(V) is
+                //    true, then:
+                //     1. If types includes SharedArrayBuffer, then return the result of converting V to
+                //        SharedArrayBuffer.
+                // 8. If V is an Object and V has a [[DataView]] internal slot, then:
+                //     1. If types includes DataView, then return the result of converting V to DataView.
+                // 9. If V is an Object and V has a [[TypedArrayName]] internal slot, then:
+                //     1. If types includes a typed array type whose name is the value of V's [[TypedArrayName]]
+                //        internal slot, then return the result of converting V to that type.
+                if let Some(buffer_source) = buffer_source_if(vm, value.as_object(), BufferSourceTypes {{
+                    array_buffer_type: {optional_buffer_source_rules(array_buffer_type)},
+                    shared_array_buffer_type: {optional_buffer_source_rules(shared_array_buffer_type)},
+                    array_buffer_view_type: {optional_buffer_source_rules(array_buffer_view_type)},
+                }})? {{
+                    // NB: The match wraps the converted value in the union's Rust enum.
+                    return Ok(match buffer_source {{
+"""
+            )
+            if array_buffer_type is not None:
+                guard = " if !buffer.is_shared_array_buffer()" if shared_array_buffer_type is not None else ""
+                buffer = "Some(buffer)" if array_buffer_type.nullable else "buffer"
+                variant = rust_union_variant(array_buffer_type)
+                steps.append(
+                    f"                        BufferSource::ArrayBuffer(buffer){guard} => Self::{variant}({buffer}),\n"
+                )
+            if shared_array_buffer_type is not None:
+                buffer = "Some(buffer)" if shared_array_buffer_type.nullable else "buffer"
+                variant = rust_union_variant(shared_array_buffer_type)
+                steps.append(
+                    f"                        BufferSource::ArrayBuffer(buffer) => Self::{variant}({buffer}),\n"
+                )
+            if array_buffer_view_type is not None:
+                data_view = "ArrayBufferView::DataView(view)"
+                typed_array = "ArrayBufferView::TypedArray(view)"
+                if array_buffer_view_type.nullable:
+                    data_view = f"Some({data_view})"
+                    typed_array = f"Some({typed_array})"
+                steps.append(
+                    f"""                        BufferSource::DataView(view) => Self::ArrayBufferView({data_view}),
+                        BufferSource::TypedArray(view) => Self::ArrayBufferView({typed_array}),
+"""
+                )
+            if array_buffer_view_type is None or (array_buffer_type is None and shared_array_buffer_type is None):
+                steps.append(
+                    '                        _ => unreachable!("buffer_source_if only returns included buffer types"),\n'
+                )
+            steps.append("                    });\n                }\n")
         for typed_array_type in members.typed_array_types:
             name = typed_array_type.name
             conversion = rust_to_idl_value(typed_array_type, {}, "value", "value", context, what)
@@ -681,7 +793,20 @@ def write_union_from_js(out: TextIO, context: GenerationContext, union_type: IDL
                 }}
 """
             )
-        if members.sequence_type is not None:
+        if members.sequence_type is not None and holds_sequence_of_cells:
+            element = rust_to_idl_value(members.sequence_type.parameters[0], {}, "value", "value", context, what)
+            steps.append(
+                f"""                // 11. If V is an Object, then:
+                //     2. If types includes a sequence type, then:
+                //         1. Let method be ? GetMethod(V, %Symbol.iterator%).
+                //         2. If method is not undefined, return the result of creating a sequence of that type from
+                //            V and method.
+                if let Some(method) = iterator_method(vm, value)? {{
+                    return Ok(Self::Sequence(sequence_from_iterable(vm, value, method, MarkedVec::new(vm), |value| {element})?));
+                }}
+"""
+            )
+        elif members.sequence_type is not None:
             element = rust_sequence_element_to_idl_value(members.sequence_type, "value", context, what)
             steps.append(
                 f"""                // 11. If V is an Object, then:
@@ -788,6 +913,13 @@ def write_union_from_js(out: TextIO, context: GenerationContext, union_type: IDL
     if members.names_numeric_argument:
         implementation = f"impl {path}"
         conversion = "pub(crate) fn from_js_with_identifier(vm: &Vm, value: Value, identifier: &str)"
+    if holds_sequence_of_cells:
+        # NB: The enum keeps the sequence alive in a MarkedVec for as long as the reference to the VM lives, a lifetime
+        #     that the result of FromJs::from_js() cannot have, so the conversion is its method.
+        implementation = f"impl<'vm> {path}<'vm>"
+        conversion = "pub(crate) fn from_js(vm: &'vm Vm, value: Value)"
+        if members.names_numeric_argument:
+            conversion = "pub(crate) fn from_js_with_identifier(vm: &'vm Vm, value: Value, identifier: &str)"
     out.write(
         f"""
     /// The conversion of a JS value to the union {union_type}, https://webidl.spec.whatwg.org/#js-union

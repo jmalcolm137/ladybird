@@ -637,7 +637,7 @@ fn operand_store(
 
     load(
         emit,
-        MemoryWidth::Word,
+        MemoryWidth::Byte,
         false,
         index,
         MachineMemoryAddress::offset(X21, offset),
@@ -905,7 +905,7 @@ fn call_with_scalar_values(
     function: crate::low_ir::Relocation,
     layout: &crate::metadata::SlowPathLayout,
 ) -> Result<(), CompileError> {
-    use crate::metadata::ParameterMode;
+    use crate::metadata::{NO_OPERAND, ParameterMode};
     use crate::target::registers::aarch64::{SP, X0, X1, X3, X4, X5, X6, X7, X9, X10, X11, X21, X27};
     let registers = [X3, X4, X5, X6, X7];
     let inputs: Vec<_> = layout
@@ -923,14 +923,14 @@ fn call_with_scalar_values(
         let ready = emit.unique_label("scalar_value_ready");
         call_values_load(
             emit,
-            MemoryWidth::Word,
+            MemoryWidth::Byte,
             X9,
             MachineMemoryAddress::offset(X21, field.instruction_offset as i64),
         )?;
         if field.optional {
             let empty = emit.constant(KnownLayoutConstant::EmptyValue)?;
             move_immediate(emit, X10, empty, IntegerWidth::U64);
-            move_immediate(emit, X11, -1, IntegerWidth::U32);
+            move_immediate(emit, X11, NO_OPERAND, IntegerWidth::U32);
             emit!(emit.output, Aarch64;
                 Opcode::CompareRegister(IntegerWidth::U32) => [register X9, register X11];
                 Opcode::BranchCondition(super::Condition::Equal) => [label ready.clone()];
@@ -971,7 +971,7 @@ fn call_with_scalar_values(
     if let Some(output) = layout.fields.iter().find(|field| field.mode == ParameterMode::Out) {
         call_values_load(
             emit,
-            MemoryWidth::Word,
+            MemoryWidth::Byte,
             X9,
             MachineMemoryAddress::offset(X21, output.instruction_offset as i64),
         )?;
@@ -998,7 +998,7 @@ fn call_with_values(
     kind: crate::target::backend::HelperCallKind,
 ) -> Result<(), CompileError> {
     use super::Condition;
-    use crate::metadata::{ParameterMode, SlowPathAbi, SlowPathArray};
+    use crate::metadata::{NO_OPERAND, ParameterMode, SlowPathAbi, SlowPathArray};
     use crate::target::description::ShiftOperation;
     use crate::target::registers::aarch64::{
         SP, X0, X3, X4, X5, X6, X7, X9, X10, X11, X12, X13, X14, X20, X21, X27, X28,
@@ -1041,7 +1041,7 @@ fn call_with_values(
         let stack_space_limit = emit.constant(KnownLayoutConstant::VmStackSpaceLimit)?;
         call_values_load(
             emit,
-            MemoryWidth::Word,
+            MemoryWidth::Byte,
             X10,
             MachineMemoryAddress::offset(X21, count_offset as i64),
         )?;
@@ -1110,12 +1110,12 @@ fn call_with_values(
         }
         call_values_load(
             emit,
-            MemoryWidth::Word,
+            MemoryWidth::Byte,
             X12,
             MachineMemoryAddress::offset(X21, field.instruction_offset as i64),
         )?;
         if field.optional {
-            move_immediate(emit, X13, -1, IntegerWidth::U32);
+            move_immediate(emit, X13, NO_OPERAND, IntegerWidth::U32);
             emit!(emit.output, Aarch64;
                 Opcode::CompareRegister(IntegerWidth::U32) => [register X12, register X13];
                 Opcode::BranchCondition(Condition::Equal) => [label ready.clone()];
@@ -1165,7 +1165,7 @@ fn call_with_values(
         move_immediate(emit, X9, 0, IntegerWidth::U64);
         call_values_load(
             emit,
-            MemoryWidth::Word,
+            MemoryWidth::Byte,
             X10,
             MachineMemoryAddress::offset(X21, count_offset as i64),
         )?;
@@ -1176,18 +1176,10 @@ fn call_with_values(
             Opcode::CompareRegister(IntegerWidth::U64) => [register X9, register X10];
             Opcode::BranchCondition(Condition::UnsignedGreaterOrEqual) => [label end.clone()];
         );
-        call_values_load(
-            emit,
-            MemoryWidth::Word,
-            X12,
-            MachineMemoryAddress {
-                scale: Some(4),
-                ..MachineMemoryAddress::indexed(X3, X9)
-            },
-        )?;
+        call_values_load(emit, MemoryWidth::Byte, X12, MachineMemoryAddress::indexed(X3, X9))?;
         if optional {
             move_immediate(emit, X11, empty, IntegerWidth::U64);
-            move_immediate(emit, X13, -1, IntegerWidth::U32);
+            move_immediate(emit, X13, NO_OPERAND, IntegerWidth::U32);
             emit!(emit.output, Aarch64;
                 Opcode::CompareRegister(IntegerWidth::U32) => [register X12, register X13];
                 Opcode::BranchCondition(Condition::Equal) => [label ready.clone()];
@@ -1255,12 +1247,12 @@ fn call_with_values(
             let skip = emit.unique_label("skip_output_value");
             call_values_load(
                 emit,
-                MemoryWidth::Word,
+                MemoryWidth::Byte,
                 X12,
                 MachineMemoryAddress::offset(X21, field.instruction_offset as i64),
             )?;
             if field.optional {
-                move_immediate(emit, X13, -1, IntegerWidth::U32);
+                move_immediate(emit, X13, NO_OPERAND, IntegerWidth::U32);
                 emit!(emit.output, Aarch64;
                     Opcode::CompareRegister(IntegerWidth::U32) => [register X12, register X13];
                     Opcode::BranchCondition(Condition::Equal) => [label skip.clone()];
@@ -1316,12 +1308,12 @@ fn call_with_values(
             let skip = emit.unique_label("skip_exceptional_output");
             call_values_load(
                 emit,
-                MemoryWidth::Word,
+                MemoryWidth::Byte,
                 X12,
                 MachineMemoryAddress::offset(X21, field.instruction_offset as i64),
             )?;
             if field.optional {
-                move_immediate(emit, X13, -1, IntegerWidth::U32);
+                move_immediate(emit, X13, NO_OPERAND, IntegerWidth::U32);
                 emit!(emit.output, Aarch64;
                     Opcode::CompareRegister(IntegerWidth::U32) => [register X12, register X13];
                     Opcode::BranchCondition(Condition::Equal) => [label skip.clone()];
@@ -1779,7 +1771,8 @@ impl Backend for Aarch64Backend {
             operands.physical_register(3),
         ];
         let [dispatch_register, dispatch_scratch] = [operands.physical_register(4), operands.physical_register(5)];
-        use crate::target::registers::aarch64::{SP, X0, X2, X3, X4, X9, X10, X27};
+        use crate::target::registers::aarch64::{SP, X0, X2, X3, X4, X5, X9, X10, X27};
+        let length = emit.binary_slow_path_instruction_length()?;
 
         emit!(emit.output, Aarch64;
             Opcode::AddSubtractImmediate { operation: AddSubtractOperation::Subtract, shift: super::ImmediateShift::None, flags: FlagUpdate::Preserve } => [register SP, register SP, immediate 16];
@@ -1791,6 +1784,7 @@ impl Backend for Aarch64Backend {
             destination,
         )?;
         push_parallel_register_moves(emit, &[(X3, lhs), (X4, rhs)], dispatch_scratch);
+        move_immediate(emit, X5, length, IntegerWidth::U32);
         call_values_add(emit, X2, SP, 0);
         vm_pc_arguments(emit);
         store_slow_path_program_counter(emit, dispatch_register, dispatch_scratch)?;

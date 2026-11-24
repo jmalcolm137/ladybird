@@ -108,6 +108,11 @@ Window& Navigation::window() const
     return m_window;
 }
 
+GC::Ptr<Bindings::Wrappable> Navigation::relevant_global_impl() const
+{
+    return m_window;
+}
+
 void Navigation::visit_edges(JS::Cell::Visitor& visitor)
 {
     Base::visit_edges(visitor);
@@ -165,7 +170,7 @@ WebIDL::ExceptionOr<void> Navigation::update_current_entry(NavigationUpdateCurre
         return WebIDL::InvalidStateError::create("Cannot update current NavigationHistoryEntry when there is no current entry"_utf16);
 
     // 3. Let serializedState be StructuredSerializeForStorage(options["state"]), rethrowing any exceptions.
-    auto serialized_state = TRY(structured_serialize_for_storage(window().principal_realm().vm(), options.state));
+    auto serialized_state = TRY(structured_serialize_session_history_state(window().principal_realm().vm(), options.state));
 
     // 4. Set current's session history entry's navigation API state to serializedState.
     current->session_history_entry().set_navigation_api_state(serialized_state);
@@ -267,7 +272,7 @@ WebIDL::ExceptionOr<NavigationResult> Navigation::navigate(Utf16String url, Bind
     //    error result for that exception.
     // NOTE: It is important to perform this step early, since serialization can invoke web developer code, which in
     //       turn might change various things we check in later steps.
-    auto serialized_state_or_error = structured_serialize_for_storage(realm.vm(), state);
+    auto serialized_state_or_error = structured_serialize_session_history_state(realm.vm(), state);
     if (serialized_state_or_error.is_error()) {
         return early_error_result(serialized_state_or_error.release_error());
     }
@@ -281,6 +286,10 @@ WebIDL::ExceptionOr<NavigationResult> Navigation::navigate(Utf16String url, Bind
     // 9. If document's unload counter is greater than 0, then return an early error result for an "InvalidStateError" DOMException.
     if (document.unload_counter() > 0)
         return early_error_result(WebIDL::InvalidStateError::create("Document already unloaded"_utf16));
+
+    // AD-HOC: navigate() ignores this navigation, which would leave the promises unsettled.
+    if (document.navigable()->is_too_deeply_nested_to_load(*url_record))
+        return early_error_result(WebIDL::AbortError::create("Frame is nested too deeply"_utf16));
 
     // 10. Let info be options["info"], if it exists; otherwise, undefined.
     auto info = options.info.value_or(JS::js_undefined());
@@ -325,7 +334,7 @@ WebIDL::ExceptionOr<NavigationResult> Navigation::reload_internal(NavigationRelo
     // NOTE: It is important to perform this step early, since serialization can invoke web developer code, which in
     //       turn might change various things we check in later steps.
     if (options.state.has_value()) {
-        auto serialized_state_or_error = structured_serialize_for_storage(realm.vm(), *options.state);
+        auto serialized_state_or_error = structured_serialize_session_history_state(realm.vm(), *options.state);
         if (serialized_state_or_error.is_error())
             return early_error_result(serialized_state_or_error.release_error());
         serialized_state = serialized_state_or_error.release_value();

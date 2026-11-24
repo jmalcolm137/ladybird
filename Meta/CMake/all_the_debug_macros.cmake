@@ -1,6 +1,5 @@
 set(AK_STRINGBASE_VERIFY_LAUNDER_DEBUG ON)
 set(AUDIO_DEBUG ON)
-set(BMP_DEBUG ON)
 set(CACHE_DEBUG ON)
 set(CALLBACK_MACHINE_DEBUG ON)
 set(COMPOSITOR_DEBUG ON)
@@ -20,7 +19,6 @@ set(HTML_SCRIPT_DEBUG ON)
 set(HTTP_DISK_CACHE_DEBUG ON)
 set(HTTP_MEMORY_CACHE_DEBUG ON)
 set(HTTPJOB_DEBUG ON)
-set(ICO_DEBUG ON)
 set(IDL_DEBUG ON)
 set(IMAGE_DECODER_DEBUG ON)
 set(IMAGE_LOADER_DEBUG ON)
@@ -71,6 +69,8 @@ set(XML_PARSER_DEBUG ON)
 
 # False positive: ANDROID_LOG_DEBUG is a log level, not a debug flag
 # set(ANDROID_LOG_DEBUG ON)
+# False positive: LADYBIRD_SANDBOX_DEBUG is an environment variable, not a debug flag
+# set(LADYBIRD_SANDBOX_DEBUG ON)
 # Third-party: skia vcpkg port overlay
 # set(gn_defines_DEBUG ON)
 # set(gn_include_dirs_DEBUG ON)

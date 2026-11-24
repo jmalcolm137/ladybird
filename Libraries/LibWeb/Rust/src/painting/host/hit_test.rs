@@ -6,46 +6,69 @@
 
 use crate::layout::node_data::NodeSlotId;
 use crate::layout::used_values;
-use crate::painting::display_list::commands::ContextRef;
 use std::ffi::c_void;
 
+/// What the host gives a query of its document's hit test list. The query finds the document scrolled where the scroll
+/// state the host keeps has it.
 #[derive(Clone, Copy)]
 #[repr(C)]
-pub struct FfiHitTestQueryCallbacks {
-    pub context: *mut c_void,
+pub struct FfiHitTestQuery {
     pub device_pixels_per_css_pixel: f64,
-    pub scroll_offsets: *const libgfx_rust::FloatPoint,
-    pub scroll_offsets_len: usize,
+    pub chrome_metrics: crate::painting::ffi::FfiChromeMetrics,
+    /// Where set, the query reads the compositor's animations at this time, as a frame of the compositor's shows them.
+    pub has_visual_animation_sample_time: bool,
+    pub visual_animation_sample_time_ns: i64,
+}
+
+/// What a query of a hit test list reads besides the list, as an entry point put it together.
+#[derive(Clone, Copy)]
+pub struct FfiHitTestQueryCallbacks {
+    pub device_pixels_per_css_pixel: f64,
+    /// Where the query finds the document scrolled to: the scroll state the host keeps, or the offsets a clock lane
+    /// sealed.
+    scroll_offsets: *const libgfx_rust::FloatPoint,
+    scroll_offsets_len: usize,
+    /// The world transforms an entry point builds for the query, from the tree it reads and the offsets.
+    world_transforms: *const c_void,
     pub has_chrome_metrics: bool,
     pub chrome_metrics: crate::painting::ffi::FfiChromeMetrics,
     /// Where set, the query reads the compositor's animations at this time, as a frame of the compositor's shows them.
     pub has_visual_animation_sample_time: bool,
     pub visual_animation_sample_time_ns: i64,
-    /// Private: reached only through the method below, which takes the main thread token.
-    contains: extern "C" fn(*mut c_void, FfiNodeIdentity, FfiNodeIdentity) -> bool,
 }
 
 impl FfiHitTestQueryCallbacks {
     /// Callbacks for a point query on the render owner, which reaches nothing of the host: the scroll offsets and
-    /// chrome metrics are copies the host sealed, and a caret query there asks the style engine's mirror about the DOM.
+    /// chrome metrics are copies the host sealed.
     pub(crate) fn sealed(
         device_pixels_per_css_pixel: f64,
         scroll_offsets: &[libgfx_rust::FloatPoint],
         chrome_metrics: crate::painting::ffi::FfiChromeMetrics,
     ) -> Self {
-        extern "C" fn no_contains(_: *mut c_void, _: FfiNodeIdentity, _: FfiNodeIdentity) -> bool {
-            panic!("a point query on the render owner asks the host nothing of the DOM");
-        }
         Self {
-            context: std::ptr::null_mut(),
             device_pixels_per_css_pixel,
             scroll_offsets: scroll_offsets.as_ptr(),
             scroll_offsets_len: scroll_offsets.len(),
+            world_transforms: std::ptr::null(),
             has_chrome_metrics: true,
             chrome_metrics,
             has_visual_animation_sample_time: false,
             visual_animation_sample_time_ns: 0,
-            contains: no_contains,
+        }
+    }
+
+    /// Callbacks for `query`, a query of the host's, which finds the document scrolled to `scroll_offsets`. The entry
+    /// point keeps the offsets for the query.
+    pub(crate) fn for_host_query(query: &FfiHitTestQuery, scroll_offsets: &[libgfx_rust::FloatPoint]) -> Self {
+        Self {
+            device_pixels_per_css_pixel: query.device_pixels_per_css_pixel,
+            scroll_offsets: scroll_offsets.as_ptr(),
+            scroll_offsets_len: scroll_offsets.len(),
+            world_transforms: std::ptr::null(),
+            has_chrome_metrics: true,
+            chrome_metrics: query.chrome_metrics,
+            has_visual_animation_sample_time: query.has_visual_animation_sample_time,
+            visual_animation_sample_time_ns: query.visual_animation_sample_time_ns,
         }
     }
 
@@ -54,90 +77,66 @@ impl FfiHitTestQueryCallbacks {
             .then_some(self.visual_animation_sample_time_ns)
     }
 
-    /// Whether `node` is `ancestor` or one of its descendants in the DOM.
-    pub(crate) fn contains(
+    /// The world transforms of `tree`, the tree the query reads, under these callbacks' offsets.
+    pub(crate) fn build_world_transforms(
         &self,
-        _: &crate::stage::MainThread,
-        ancestor: FfiNodeIdentity,
-        node: FfiNodeIdentity,
-    ) -> bool {
-        (self.contains)(self.context, ancestor, node)
+        tree: &crate::painting::visual_context::VisualContextTree,
+    ) -> crate::painting::visual_context::WorldTransforms {
+        crate::painting::visual_context::WorldTransforms::new(tree, self.scroll_offsets(), None)
     }
+
+    /// These callbacks with the world transforms the query reads, which `world` holds for the query.
+    pub(crate) fn with_world_transforms(mut self, world: &crate::painting::visual_context::WorldTransforms) -> Self {
+        self.world_transforms = std::ptr::from_ref(world).cast();
+        self
+    }
+
+    /// The mapping between the viewport and the spaces of `tree`, the tree the query reads, under these callbacks'
+    /// offsets.
+    pub(crate) fn viewport_mapping<'a>(
+        &'a self,
+        tree: &'a crate::painting::visual_context::VisualContextTree,
+    ) -> crate::painting::viewport_mapping::ViewportMapping<'a> {
+        crate::painting::viewport_mapping::ViewportMapping::new(
+            tree,
+            self.world_transforms(),
+            self.scroll_offsets(),
+            self.device_pixels_per_css_pixel as f32,
+        )
+    }
+
+    pub(crate) fn world_transforms(&self) -> &crate::painting::visual_context::WorldTransforms {
+        assert!(
+            !self.world_transforms.is_null(),
+            "the query's entry point builds its world transforms"
+        );
+        // SAFETY: The entry point keeps the table alive for the synchronous query.
+        unsafe {
+            &*self
+                .world_transforms
+                .cast::<crate::painting::visual_context::WorldTransforms>()
+        }
+    }
+
     pub(crate) fn scroll_offsets(&self) -> &[libgfx_rust::FloatPoint] {
         if self.scroll_offsets.is_null() {
             return &[];
         }
-        // SAFETY: QueryContext keeps the document and its resolved scroll snapshot alive for the synchronous query.
+        // SAFETY: The entry point keeps the offsets alive for the synchronous query.
         unsafe { ak::slice_from_raw_parts(self.scroll_offsets, self.scroll_offsets_len) }
     }
 }
 
-/// A caret boundary, as the node identities a hit test item can be compared against.
-///
-/// The five questions a caret position query asks of a candidate item all reduce to "which node
-/// is it", so the host resolves the boundary's neighbourhood once before the query runs and the
-/// query compares StyleNodeIDs. A node without one is named by 0, which matches nothing: an item
-/// that stands for no DOM node is named by 0 as well.
-#[derive(Clone, Copy)]
-#[repr(C)]
-pub struct FfiCaretPositionQuery {
-    /// The node the boundary is inside.
-    pub node: u32,
-    /// The child at the boundary's offset, or 0 when the node has no child there.
-    pub child_at_offset: u32,
-    /// The child before the boundary's offset, or 0 at offset 0.
-    pub child_before_offset: u32,
-    /// The length of the node `child_before_offset` names.
-    pub child_before_offset_length: usize,
-    /// `child_at_offset` and the chain of first children descending from it, in order.
-    pub boundary_descent: *const u32,
-    pub boundary_descent_len: usize,
-}
-
-impl FfiCaretPositionQuery {
-    fn names(named: u32, node: u32) -> bool {
-        named != 0 && named == node
-    }
-
-    fn boundary_descent(&self) -> &[u32] {
-        if self.boundary_descent.is_null() {
-            return &[];
-        }
-        // SAFETY: The host keeps the descent alive for the synchronous query.
-        unsafe { ak::slice_from_raw_parts(self.boundary_descent, self.boundary_descent_len) }
-    }
-
-    pub(crate) fn is_query_node(&self, node: u32) -> bool {
-        Self::names(self.node, node)
-    }
-
-    /// Whether the boundary sits immediately before `node` among its parent's children.
-    pub(crate) fn boundary_precedes(&self, node: u32) -> bool {
-        Self::names(self.child_at_offset, node)
-    }
-
-    /// Whether the boundary sits at the end of `node`, which ends at `end_offset`.
-    pub(crate) fn boundary_follows_end(&self, node: u32, end_offset: usize) -> bool {
-        Self::names(self.child_before_offset, node) && end_offset == self.child_before_offset_length
-    }
-
-    /// Whether the boundary sits on either side of `node`.
-    pub(crate) fn is_adjacent_to(&self, node: u32) -> bool {
-        Self::names(self.child_at_offset, node) || Self::names(self.child_before_offset, node)
-    }
-
-    /// Whether descending through first children from the boundary reaches `node`.
-    pub(crate) fn boundary_descends_to(&self, node: u32) -> bool {
-        node != 0 && self.boundary_descent().contains(&node)
-    }
-}
-
+/// A box, text fragment or chrome widget under a point, with what the host needs to turn it into a hit.
 #[derive(Clone, Copy, Debug, Default)]
 #[repr(C)]
-pub struct FfiTopmostItem {
-    pub has_item: bool,
-    pub index: usize,
+pub struct FfiPointHit {
+    pub paintable: NodeSlotId,
+    pub hit_node: NodeSlotId,
+    pub chrome_widget_kind: u8,
+    /// The point in the space of what was hit.
     pub local: used_values::FfiCssPixelPoint,
+    pub resolved: FfiResolvedHit,
 }
 
 pub use crate::layout::node_data::FfiNodeIdentity;
@@ -191,15 +190,4 @@ impl FfiCaretAt {
             caret: FfiResolvedCaret::default(),
         }
     }
-}
-
-#[derive(Clone, Copy, Debug)]
-#[repr(C)]
-pub struct FfiHitTestItemExport {
-    pub can_produce_caret_position: bool,
-    pub paintable: NodeSlotId,
-    pub hit_node: NodeSlotId,
-    pub chrome_widget_kind: u8,
-    pub caret_rect: used_values::FfiCssPixelRect,
-    pub context: ContextRef,
 }

@@ -31,7 +31,7 @@ struct EmojiPresentationResult {
     ForcedPresentation forced { ForcedPresentation::No };
 };
 
-EmojiPresentationResult emoji_presentation_for_code_point(u32 code_point, Optional<u32> next_code_point);
+EmojiPresentationResult emoji_presentation_for_code_point(u32 code_point, Optional<u32> next_code_point, Optional<u32> code_point_after_next = {});
 
 enum class PendingFontState : u8 {
     Invisible,
@@ -59,6 +59,8 @@ public:
         u16 weight { 0 };
         u16 width { 0 };
         u8 slope { 0 };
+        // The features the cascade's request asks of every font, which a system fallback font applies as well.
+        ShapeFeatures shape_features;
     };
     using SystemFontFallbackCallback = Function<RefPtr<Font const>(u32, EmojiPresentation, SystemFallbackRequest const&)>;
 

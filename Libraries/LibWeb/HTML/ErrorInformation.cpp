@@ -60,35 +60,36 @@ ErrorInformation extract_error_information(JS::VM& vm, JS::Value exception)
     // NB: Take the throw site even when an Error's traceback gives the location, so the VM stops keeping it alive.
     auto throw_site = vm.take_throw_site_of(exception);
 
-    // NB: If we got an Error object, then try and extract the information from the location the object was made.
+    // NB: If we got an Error object, then try and extract the information from the location the object was made. Only
+    //     the script-visible frames count, so the location does not change while a debugger is attached.
+    bool has_location = false;
     if (auto object = exception.as_if<JS::Object>(); object && object->error_data()) {
-        for (auto const& frame : object->error_data()->traceback()) {
+        for (auto const& frame : object->error_data()->script_visible_traceback()) {
             auto source_range = frame.source_range();
             if (source_range.start.line != 0 || source_range.start.column != 0) {
                 attributes.filename = source_range.filename();
                 attributes.lineno = source_range.start.line;
                 attributes.colno = source_range.start.column;
+                has_location = true;
                 break;
             }
         }
     }
-    // NB: Otherwise, if a throw statement threw it, take the location from there.
-    else if (throw_site.has_value()) {
+    if (has_location)
+        return attributes;
+
+    // NB: Otherwise, if a throw statement threw it, take the location from there. That includes an Error whose stack
+    //     has no frames, as with Error.stackTraceLimit set to 0.
+    if (throw_site.has_value()) {
         attributes.filename = throw_site->filename();
         attributes.lineno = throw_site->start.line;
         attributes.colno = throw_site->start.column;
     }
     // NB: Otherwise, we fall back to try and find the location of the invocation of the function itself.
-    else {
-        for (auto const& frame : vm.stack_trace()) {
-            if (frame.source_range.has_value()) {
-                auto const& source_range = *frame.source_range;
-                attributes.filename = source_range.filename();
-                attributes.lineno = source_range.start.line;
-                attributes.colno = source_range.start.column;
-                break;
-            }
-        }
+    else if (auto source_range = vm.innermost_source_range(); source_range.has_value()) {
+        attributes.filename = source_range->filename();
+        attributes.lineno = source_range->start.line;
+        attributes.colno = source_range->start.column;
     }
 
     // 4. Return attributes.

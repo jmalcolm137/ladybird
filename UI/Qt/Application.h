@@ -11,7 +11,9 @@
 #include <AK/Platform.h>
 #include <Hub/Application.h>
 #include <Hub/ConnectionFromUI.h>
+#include <LibCore/Forward.h>
 #include <LibCore/Platform/ProcessStatistics.h>
+#include <LibCore/Process.h>
 #include <LibURL/URL.h>
 #include <LibWebCommon/Page/PageId.h>
 #include <LibWebView/Application.h>
@@ -19,6 +21,7 @@
 #include <LibWebView/BrowsingSession.h>
 #include <LibWebView/CrashReportOutbox.h>
 #include <LibWebView/ProcessSnapshot.h>
+#include <LibWebView/UpdateCheck.h>
 #include <UI/Qt/ApplicationActions.h>
 #include <UI/Qt/BrowserWindow.h>
 #include <UI/Qt/HubConnection.h>
@@ -36,7 +39,10 @@ namespace Ladybird {
 class WebUIPages;
 
 class Bookmarks;
+class CompositorLayersWindow;
 class ProcessManagerWindow;
+class SoftwareUpdater;
+class WebContentView;
 
 struct WindowConfiguration {
     Optional<Web::DevicePixels> x {};
@@ -81,8 +87,14 @@ public:
     static Hub::Application& hub() { return Hub::Application::the(); }
     static WebView::BrowserOptions const& browser_options() { return WebView::Application::browser_options(); }
 #endif
+
+    Optional<u16> devtools_port() const { return m_devtools_port; }
+    URL::URL new_bug_report_url() const;
+    bool shows_cpu_painting_bar() const { return !m_gpu_painting_enabled && !m_cpu_painting_bar_dismissed; }
+    void dismiss_cpu_painting_bar();
     bool has_translator() const;
     WebView::MicrophoneAuthorizer* microphone_authorizer() { return m_microphone_authorizer.ptr(); }
+    WebView::DefaultBrowser* default_browser() { return m_default_browser.ptr(); }
     // The status to exit with right away, if the browser has nothing for this process to do.
     Optional<int> exit_status_if_done() const;
     ErrorOr<int> execute();
@@ -137,10 +149,22 @@ public:
     void restart_private_browsing_session();
     void focus_location_editor();
     void show_process_manager();
+    void set_shows_compositor_layers(bool);
     // Asks every window's pages if they may unload, one window at a time. Once all of them agree, it confirms stopping
     // the downloads and quits; if a page refuses or the downloads are kept, the quit is canceled and no window closes.
     void quit();
     bool is_quit_in_progress() const { return m_quit_in_progress; }
+    struct RestartCommand {
+        ByteString executable;
+        Vector<ByteString> arguments;
+        Optional<Core::Process> hub;
+        bool relaunched_by_updater { false };
+
+        ErrorOr<void> run();
+    };
+    void offer_restart_after_update();
+    void restart();
+    Optional<RestartCommand> take_restart_command();
     bool is_finishing_quit() const { return m_quit_is_finishing; }
     bool confirm_stop_active_downloads(QWidget* parent = nullptr);
 
@@ -151,6 +175,10 @@ public:
     void set_active_window(BrowserWindow& window) { m_active_window = &window; }
     BrowserWindow* active_window_if_any() const { return m_active_window; }
     BrowserWindow* non_private_window_if_any() const;
+
+#if defined(LADYBIRD_HAS_SPARKLE)
+    SoftwareUpdater* software_updater() { return m_software_updater.ptr(); }
+#endif
 
     Tab* active_tab() const { return m_active_window ? m_active_window->current_tab() : nullptr; }
     void update_reopen_recently_closed_actions() const;
@@ -221,6 +249,8 @@ private:
 
     OwnPtr<WebView::NotificationBackend> create_notification_backend();
     WebView::NotificationBackend& notification_backend();
+    OwnPtr<WebView::MediaSessionPlatformBackend> create_media_session_platform_backend();
+    WebView::MediaSessionPlatformBackend* media_session_platform_backend();
     void focus_view_from_notification(u64 view_id);
     void open_url_in_new_tab_from_notification(URL::URL const&, Optional<u64> view_id, WebView::IsPrivate);
 
@@ -251,6 +281,9 @@ private:
     void ask_user_for_download_path(u64 request_id, ByteString const& file) const;
     void display_download_confirmation_dialog(StringView download_name, ByteString const& path) const;
     void display_error_dialog(StringView error_message) const;
+#if defined(LADYBIRD_HAS_UPDATE_CHECK)
+    void display_update_check_result(WebView::UpdateCheckResult::Kind, Optional<String> const& version, WebView::InstallMethod, WebView::UpdateCheckTrigger);
+#endif
     void open_file(String const& path) const;
 
     virtual void crash_reports_changed() override;
@@ -274,6 +307,8 @@ private:
     virtual bool platform_reports_scroll_momentum() const override;
     virtual bool platform_scrolls_elastically() const override;
     virtual bool platform_scrollbar_track_press_jumps() const override;
+    virtual bool platform_prefers_reduced_motion() const override;
+    virtual bool platform_prefers_more_contrast() const override;
     virtual Vector<String> platform_preferred_languages() const override;
     virtual Optional<Gfx::GpuDeviceIdentity> platform_presentation_gpu_device() const override;
     virtual Vector<u64> platform_presentation_drm_format_modifiers() const override;
@@ -287,8 +322,10 @@ private:
     NonnullRefPtr<BookmarkPromise> display_add_bookmark_folder_dialog(Optional<String const&> default_title = {}, Optional<String const&> target_folder_id = {}) const;
     NonnullRefPtr<BookmarkPromise> display_edit_bookmark_folder_dialog(BookmarkItem const& current_folder, Optional<String const&> parent_folder_id) const;
 
-    void did_enable_devtools() const;
-    void did_disable_devtools() const;
+    void did_enable_devtools(u16 port);
+    void did_disable_devtools();
+    void did_change_gpu_painting(bool enabled);
+    void update_cpu_painting_bars() const;
     void on_recently_closed_entries_changed() const;
     void did_clear_history_since(UnixDateTime);
     void create_session_store(ByteString const& data_directory, bool persists_sessions);
@@ -298,6 +335,9 @@ private:
     static Application* s_the;
 
     String m_command_line;
+    Optional<u16> m_devtools_port;
+    bool m_gpu_painting_enabled { true };
+    bool m_cpu_painting_bar_dismissed { false };
 
 #ifdef LADYBIRD_HUB_IN_OWN_PROCESS
     ErrorOr<void> connect_to_hub(Main::Arguments const&);
@@ -324,12 +364,16 @@ private:
     OwnPtr<WebView::Translator> m_translator;
     OwnPtr<WebView::SpellChecker> m_spell_checker;
     OwnPtr<WebView::MicrophoneAuthorizer> m_microphone_authorizer;
+    OwnPtr<WebView::DefaultBrowser> m_default_browser;
     OwnPtr<WebView::Settings> m_settings;
-    OwnPtr<BookmarkStore> m_bookmark_store;
+#if defined(LADYBIRD_HAS_SPARKLE)
+    OwnPtr<SoftwareUpdater> m_software_updater;
+#endif
     OwnPtr<SessionStore> m_session_store;
     OwnPtr<SessionStore> m_private_session_store;
     OwnPtr<WebView::FaviconStore> m_favicon_store;
     OwnPtr<WebView::FaviconStore> m_private_favicon_store;
+    OwnPtr<BookmarkStore> m_bookmark_store;
     OwnPtr<WebView::HistoryStore> m_history_store;
     OwnPtr<WebView::AutocompleteService> m_autocomplete_service;
     bool m_should_remove_unreferenced_favicons { false };
@@ -342,16 +386,33 @@ private:
     OwnPtr<QApplication> m_application;
     HashMap<u64, NonnullOwnPtr<WebView::PictureInPictureWindow>> m_picture_in_picture_windows;
     OwnPtr<WebView::NotificationBackend> m_notification_backend;
+    OwnPtr<WebView::MediaSessionPlatformBackend> m_media_session_platform_backend;
     HashMap<u64, NonnullRefPtr<WebView::ExternalURLHandler>> m_external_url_handlers;
     u64 m_next_external_url_handler_id { 1 };
     BrowserWindow* m_active_window { nullptr };
     OwnPtr<ProcessManagerWindow> m_process_manager_window;
+    OwnPtr<CompositorLayersWindow> m_compositor_layers_window;
+    QPointer<WebContentView> m_view_picking_compositor_layer;
     RefPtr<Action> m_open_task_manager_action;
 
     bool m_private_session_restart_in_progress { false };
     bool m_quit_in_progress { false };
     bool m_quit_is_finishing { false };
     Vector<QPointer<BrowserWindow>> m_windows_awaiting_quit_preflight;
+
+#if defined(AK_OS_LINUX)
+    void watch_for_replaced_installation();
+    RefPtr<Core::FileWatcher> m_installation_watcher;
+#endif
+    enum class Restart : u8 {
+        None,
+        ByLadybird,
+        ByUpdater,
+    };
+    Restart m_restart { Restart::None };
+    bool m_installation_replaced { false };
+    bool m_profile_is_temporary { false };
+    RestartCommand m_restart_command;
 };
 
 }

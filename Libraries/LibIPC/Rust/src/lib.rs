@@ -10,7 +10,27 @@
 
 #![deny(unsafe_code)]
 
+extern crate self as libipc_rust;
+
+#[cfg(feature = "allocator")]
+extern crate ladybird_allocator;
+
+#[cfg(feature = "cpp_transport")]
+#[allow(unsafe_code)]
+#[path = "../../../RustDemangle.rs"]
+mod rust_demangle;
+
+#[cfg(feature = "cpp_transport")]
+#[allow(unsafe_code)]
+#[path = "../../../RustPanic.rs"]
+mod rust_panic;
+
 pub mod attachment;
+pub mod cpp_connection;
+#[cfg(all(target_os = "macos", feature = "cpp_transport"))]
+pub mod cpp_mach_bootstrap;
+#[cfg(all(target_vendor = "apple", feature = "cpp_transport"))]
+pub mod cpp_mach_transport;
 mod receive_queue;
 #[cfg(all(unix, not(target_vendor = "apple")))]
 mod shared_memory;
@@ -39,9 +59,14 @@ fn validate_message_size(payload_size: usize, attachment_count: usize) -> std::i
 
 #[cfg(target_vendor = "apple")]
 pub mod mach;
+#[cfg(target_os = "macos")]
+pub mod mach_bootstrap;
 
 pub use attachment::Attachment;
-pub use wire::{Decode, DecodeError, Decoder, Encode, EncodeError, Encoder, EndpointMessage};
+pub use wire::{
+    Decode, DecodeError, Decoder, DispatchError, Encode, EncodeError, EncodedMessage, Encoder, EndpointMessage,
+    Misbehavior,
+};
 
 #[cfg(all(test, unix))]
 mod tests {

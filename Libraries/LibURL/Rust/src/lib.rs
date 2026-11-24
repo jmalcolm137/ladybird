@@ -20,6 +20,7 @@ mod textcodec;
 pub mod url;
 
 pub use ffi::origin::FfiOrigin;
+pub use ffi::url::FfiUrlHost;
 pub use ffi::url::RustUrl;
 pub use url::BasicParseOptions;
 pub use url::State;
@@ -44,6 +45,14 @@ extern "C" fn url_rust_registrable_domain(
     _on_success: unsafe extern "C" fn(*mut std::ffi::c_void, *const u8, usize),
 ) {
 }
+
+#[cfg(test)]
+#[unsafe(no_mangle)]
+extern "C" fn url_rust_blob_url_entry_ref(_entry: *const std::ffi::c_void) {}
+
+#[cfg(test)]
+#[unsafe(no_mangle)]
+extern "C" fn url_rust_blob_url_entry_unref(_entry: *const std::ffi::c_void) {}
 
 // LibUnicode's C++ IDNA implementation is not linked into Rust unit tests.
 #[cfg(test)]

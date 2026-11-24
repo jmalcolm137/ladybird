@@ -18,7 +18,7 @@
 namespace Sandbox {
 
 #if defined(AK_OS_LINUX)
-struct LandlockPath {
+struct PathRule {
     enum class Access {
         ReadOnly,
         ReadAndExecute,
@@ -84,10 +84,15 @@ struct SeatbeltProfile {
 [[nodiscard]] ErrorOr<void> configure_runtime();
 
 #if defined(AK_OS_LINUX)
-[[nodiscard]] ErrorOr<void> add_landlock_path_if_exists(Vector<LandlockPath>& paths, StringView path, LandlockPath::Access);
-[[nodiscard]] ErrorOr<void> add_loaded_library_directories(Vector<LandlockPath>& paths, Optional<StringView> root = {});
-[[nodiscard]] ErrorOr<void> restrict_filesystem_with_landlock(ReadonlySpan<LandlockPath> = {});
-[[nodiscard]] ErrorOr<void> add_gpu_driver_landlock_paths(Vector<LandlockPath>& paths);
+[[nodiscard]] ErrorOr<void> add_path_if_exists(Vector<PathRule>& paths, StringView path, PathRule::Access);
+[[nodiscard]] ErrorOr<void> add_loaded_library_directories(Vector<PathRule>& paths, Optional<StringView> root = {});
+[[nodiscard]] ErrorOr<void> restrict_filesystem(ReadonlySpan<PathRule> = {});
+// Whether restrict_filesystem() also kept this process from signalling any process outside its own tree.
+[[nodiscard]] bool signals_stay_within_the_process_tree();
+// Whether LADYBIRD_SANDBOX_DEBUG asks the sandbox to log what it refuses. The file broker then confines the file system
+// even where Landlock exists, because Landlock refuses a path without telling the process, and the broker can log it.
+[[nodiscard]] bool sandbox_debugging_is_enabled();
+[[nodiscard]] ErrorOr<void> add_gpu_driver_paths(Vector<PathRule>& paths);
 #endif
 
 #if defined(AK_OS_MACOS)

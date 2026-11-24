@@ -117,7 +117,6 @@ public:
 
     void schedule_resume_check();
     void set_post_parse_action(Function<void()> action) { m_post_parse_action = move(action); }
-    void invoke_post_parse_action_for_testing() { invoke_post_parse_action(); }
 
 private:
     static GC::Ptr<DOM::DocumentFragment> try_parse_html_fragment_fast(DOM::Element&, Utf16View);
@@ -196,6 +195,10 @@ private:
 
     // https://html.spec.whatwg.org/multipage/parsing.html#active-speculative-html-parser
     GC::Ptr<SpeculativeHTMLParser> m_active_speculative_html_parser;
+
+    // The speculative HTML parser that the active one is whenever it's not null, so that it can go on from where it
+    // stopped while this parser hasn't got past there.
+    GC::Ptr<SpeculativeHTMLParser> m_speculative_html_parser;
 };
 
 class HTMLParserEndState final : public JS::Cell {
@@ -228,6 +231,7 @@ private:
 
     Phase m_phase { Phase::WaitingForDeferredScripts };
     bool m_check_pending { false };
+    GC::Ptr<DOM::Element> m_fragment_target_awaiting_style_sheets;
 
     GC::Ref<DOM::Document> m_document;
     GC::Ptr<HTMLParser> m_parser;
@@ -241,7 +245,5 @@ RefPtr<CSS::StyleValue const> parse_dimension_value(Utf16View, double& unclamped
 RefPtr<CSS::StyleValue const> parse_nonzero_dimension_value(Utf16View);
 Optional<Color> parse_legacy_color_value(Utf16View);
 RefPtr<CSS::StyleValue const> parse_table_child_element_align_value(Utf16View);
-
-u64 parser_non_append_insertions();
 
 }

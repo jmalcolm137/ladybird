@@ -13,6 +13,7 @@
 #include <AK/String.h>
 #include <AK/Vector.h>
 #include <AK/kmalloc.h>
+#include <LibCompositing/Types.h>
 #include <LibWakeLock/DisplaySleepInhibitor.h>
 #include <LibWebCommon/Page/PageId.h>
 #include <LibWebCommon/Page/ScreenWakeLockState.h>
@@ -34,6 +35,7 @@
 #include <QToolButton>
 #include <QWidget>
 
+class QAction;
 class QColorDialog;
 class QDialog;
 class QFileDialog;
@@ -46,7 +48,6 @@ namespace Ladybird {
 class BookmarkPopover;
 class BrowserWindow;
 enum class ChromeIcon;
-class RestoreSessionCard;
 class JavaScriptDialog;
 class MessagePopover;
 
@@ -67,6 +68,9 @@ struct DeferredTab {
     URL::URL url;
     QString title;
     QIcon favicon;
+    // The history of a discarded tab, which it restores once it is selected, and the state the Hub keeps for it.
+    Optional<WebView::SessionHistorySnapshot> history;
+    Optional<u64> discarded_tab_state_id;
 };
 
 class Popover;
@@ -115,7 +119,6 @@ public:
     void open_file();
 
     void show_find_in_page();
-    void show_restore_session_card(size_t tab_count, Function<void()> on_restore);
     void find_previous();
     void find_next();
 
@@ -137,17 +140,22 @@ public:
     // A tab in the background whose title changes after it has loaded has news, until it is selected.
     bool needs_attention() const { return m_needs_attention; }
     void clear_attention() { m_needs_attention = false; }
+    void set_needs_attention(bool needs_attention) { m_needs_attention = needs_attention; }
     QString title() const;
 
     QMenu* context_menu() const { return m_context_menu; }
 
     LocationEdit& location_edit() { return *m_location_edit; }
     WebView::TabPerformanceStats const& performance_stats() const { return m_performance_stats; }
+    Optional<Compositing::CompositorLayersDescription> const& compositor_layers() const { return m_compositor_layers; }
 
     void set_window(BrowserWindow&);
     void update_hover_label();
 
     void enter_report_review(Tab* tab_to_activate_on_close, Optional<QString> title = {});
+    bool is_in_report_review() const { return m_report_review_navigation_listener.has_value(); }
+    // Another tab stands in for one that was discarded, and takes its place wherever this tab refers to it.
+    void did_replace_tab(Tab const& old_tab, Tab& new_tab);
 
     bool is_pinned() const { return m_is_pinned; }
     // BrowserWindow pins and unpins tabs, since it keeps each window's pinned tabs at the start of its strip.
@@ -157,17 +165,14 @@ public:
     void set_url_is_hidden(bool url_is_hidden) { m_location_edit->set_url_is_hidden(url_is_hidden); }
 
 public:
+    void show_private_session_popover();
+    void show_bookmark_popover();
+    void close_popovers();
+
     enum class FocusRingTransition : u8 {
         FadeIn,
         Immediate,
     };
-    void show_private_session_popover();
-    void show_site_settings_popover();
-    void refresh_site_settings_popover();
-    void show_zoom_popover();
-    void show_translation_menu();
-    void show_bookmark_popover();
-    void close_popovers();
 
 public slots:
     void focus_location_editor(FocusRingTransition = FocusRingTransition::FadeIn);
@@ -177,7 +182,7 @@ public slots:
 signals:
     void title_changed(int id, QString const&);
     void favicon_changed(int id, QIcon const&);
-    void playing_audio_indicator_changed(int id);
+    void audio_state_changed(int id);
     void microphone_in_use_changed();
     void loading_changed();
     void performance_stats_changed();
@@ -197,6 +202,11 @@ private:
 
     virtual void tab_settings_changed() override;
     virtual void config_variable_changed(WebView::ConfigVariableID) override;
+
+    void show_site_settings_popover();
+    void refresh_site_settings_popover();
+    void show_zoom_popover(QAction& zoom_level);
+    void show_translation_menu();
 
     void recreate_location_edit_icons();
     void update_chrome_style();
@@ -226,7 +236,6 @@ private:
     QPointer<LocationEdit> m_location_edit;
     WebContentView* m_view { nullptr };
     FindInPageWidget* m_find_in_page { nullptr };
-    QPointer<RestoreSessionCard> m_restore_session_card;
     Optional<WakeLock::DisplaySleepInhibitor> m_screen_display_sleep_inhibitor;
     BrowserWindow* m_window { nullptr };
     QString m_title;
@@ -253,6 +262,7 @@ private:
 
     QAction* m_pin_tab_action { nullptr };
     WebView::TabPerformanceStats m_performance_stats;
+    Optional<Compositing::CompositorLayersDescription> m_compositor_layers;
 
     JavaScriptDialog* m_javascript_dialog { nullptr };
     Function<void(bool)> m_before_unload_completion;

@@ -4,103 +4,15 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-#include <AK/Mutex.h>
 #include <AK/NonnullOwnPtr.h>
-#include <AK/NumericLimits.h>
-#include <AK/Time.h>
-#include <AK/kmalloc.h>
 #include <LibCore/MachPort.h>
 #include <LibCore/Notifier.h>
-#include <LibCore/Platform/ThreadQoS.h>
 #include <LibCore/System.h>
-#include <LibIPC/Limits.h>
+#include <LibIPC/RawAttachment.h>
+#include <LibIPC/RustFFI.h>
 #include <LibIPC/TransportMachPort.h>
-#include <LibThreading/Thread.h>
-
-#include <mach/mach.h>
 
 namespace IPC {
-
-static constexpr size_t INLINE_MESSAGE_MAX_SIZE = 4096;
-
-struct InlinePayloadHeader {
-    u32 payload_size { 0 };
-};
-
-static size_t round_mach_message_size(size_t size)
-{
-    constexpr size_t alignment = sizeof(natural_t);
-    return ((size + alignment - 1) / alignment) * alignment;
-}
-
-static size_t mach_message_size_for_inline_payload(size_t payload_size, size_t port_count)
-{
-    size_t message_size = sizeof(mach_msg_header_t) + sizeof(InlinePayloadHeader) + payload_size;
-    if (port_count > 0) {
-        message_size += sizeof(mach_msg_body_t);
-        message_size += port_count * sizeof(mach_msg_port_descriptor_t);
-    }
-    return round_mach_message_size(message_size);
-}
-
-static size_t mach_message_size_for_out_of_line_payload(size_t port_count)
-{
-    return round_mach_message_size(sizeof(mach_msg_header_t)
-        + sizeof(mach_msg_body_t)
-        + (port_count * sizeof(mach_msg_port_descriptor_t))
-        + sizeof(mach_msg_ool_descriptor_t));
-}
-
-static ReceivedMessageBytes inline_payload_bytes(u8 const* payload, size_t payload_region_size)
-{
-    VERIFY(payload_region_size >= sizeof(InlinePayloadHeader));
-
-    InlinePayloadHeader payload_header;
-    __builtin_memcpy(&payload_header, payload, sizeof(payload_header));
-
-    VERIFY(payload_header.payload_size <= payload_region_size - sizeof(InlinePayloadHeader));
-
-    Vector<u8> bytes;
-    MUST(bytes.try_append(payload + sizeof(InlinePayloadHeader), payload_header.payload_size));
-    return ReceivedMessageBytes::from_vector(move(bytes));
-}
-
-static void set_mach_port_queue_limit(mach_port_t port)
-{
-    mach_port_limits_t limits { .mpl_qlimit = MACH_PORT_QLIMIT_MAX };
-    // Mach receive rights start with a small queue. Raise it so short bursts can wait in the kernel if this
-    // transport thread falls behind for a moment.
-    mach_port_set_attributes(mach_task_self(), port, MACH_PORT_LIMITS_INFO,
-        reinterpret_cast<mach_port_info_t>(&limits), MACH_PORT_LIMITS_INFO_COUNT);
-}
-
-static Attachment attachment_from_descriptor(mach_msg_port_descriptor_t const& descriptor)
-{
-    VERIFY(descriptor.type == MACH_MSG_PORT_DESCRIPTOR);
-    // NB: A send right arrives as MACH_PORT_DEAD if its port died before this message was received — e.g. a transport
-    // endpoint whose peer closed while the handle was in flight. That's the kernel reporting a fact about the peer, not
-    // a malformed message. So, adopt the dead name like any other, and leave it to whoever consumes the attachment.
-    // Gecko/WebKit/Blink do the same: Gecko ChannelMach::ProcessIncomingMessage, WebKit createMessageDecoder, Blink
-    // ChannelMac::OnMachMessageReceived — each adopting descriptor.name unchecked.
-    VERIFY(descriptor.name != MACH_PORT_NULL);
-
-    switch (descriptor.disposition) {
-    case MACH_MSG_TYPE_MOVE_SEND:
-        return Attachment::from_mach_port(
-            Core::MachPort::adopt_right(descriptor.name, Core::MachPort::PortRight::Send),
-            Core::MachPort::MessageRight::MoveSend);
-    case MACH_MSG_TYPE_MOVE_RECEIVE:
-        return Attachment::from_mach_port(
-            Core::MachPort::adopt_right(descriptor.name, Core::MachPort::PortRight::Receive),
-            Core::MachPort::MessageRight::MoveReceive);
-    case MACH_MSG_TYPE_MOVE_SEND_ONCE:
-        return Attachment::from_mach_port(
-            Core::MachPort::adopt_right(descriptor.name, Core::MachPort::PortRight::SendOnce),
-            Core::MachPort::MessageRight::MoveSendOnce);
-    default:
-        VERIFY_NOT_REACHED();
-    }
-}
 
 ErrorOr<TransportMachPort::Paired> TransportMachPort::create_paired()
 {
@@ -121,512 +33,24 @@ ErrorOr<TransportMachPort::Paired> TransportMachPort::create_paired()
 
 void TransportMachPort::raise_receive_queue_limit(Core::MachPort const& receive_right)
 {
-    set_mach_port_queue_limit(receive_right.port());
+    FFI::ipc_mach_raise_receive_queue_limit(receive_right.port());
 }
 
 TransportMachPort::TransportMachPort(Core::MachPort receive_right, Core::MachPort send_right)
-    : m_receive_port(move(receive_right))
-    , m_send_port(move(send_right))
 {
-    m_port_set = MUST(Core::MachPort::create_with_right(Core::MachPort::PortRight::PortSet));
-    // This thread waits on a port set, not one port. Add the main receive port so the same wait can handle
-    // messages from the peer.
-    auto ret = mach_port_insert_member(mach_task_self(), m_receive_port.port(), m_port_set.port());
-    VERIFY(ret == KERN_SUCCESS);
-
-    m_wakeup_receive_port = MUST(Core::MachPort::create_with_right(Core::MachPort::PortRight::Receive));
-    m_wakeup_send_port = MUST(m_wakeup_receive_port.insert_right(Core::MachPort::MessageRight::MakeSend));
-    // Add the private wakeup port to the same set so queued sends can wake the blocking mach_msg() call.
-    ret = mach_port_insert_member(mach_task_self(), m_wakeup_receive_port.port(), m_port_set.port());
-    VERIFY(ret == KERN_SUCCESS);
-
+    // NB: The transport has the pipe from the start, so that what arrives before set_up_read_hook() still leaves a byte
+    //     in it.
     auto fds = MUST(Core::System::pipe2(O_CLOEXEC | O_NONBLOCK));
     m_notify_hook_read_fd = adopt_ref(*new AutoCloseFileDescriptor(fds[0]));
-    m_notify_hook_write_fd = adopt_ref(*new AutoCloseFileDescriptor(fds[1]));
-
-    set_mach_port_queue_limit(m_receive_port.port());
-
-    mach_port_t prev = MACH_PORT_NULL;
-    // Ask the kernel to send MACH_NOTIFY_NO_SENDERS to our receive port when the peer loses its last send
-    // right. This is how the transport notices that the peer went away.
-    mach_port_request_notification(mach_task_self(),
-        m_receive_port.port(),
-        MACH_NOTIFY_NO_SENDERS,
-        0,
-        m_receive_port.port(),
-        MACH_MSG_TYPE_MAKE_SEND_ONCE,
-        &prev);
-    if (MACH_PORT_VALID(prev)) {
-        // If an older notification right was replaced, mach_port_request_notification returns it in `prev`.
-        // Drop it here so we do not leak that stale send-once right.
-        mach_port_deallocate(mach_task_self(), prev);
-    }
-
-    m_io_thread = Threading::Thread::construct("IPC IO (Mach)"sv, [this] { return io_thread_loop(); });
-    // The IO thread only relays bytes between the kernel and the owning thread. If it ran below that thread, every
-    // message would wait on a lower-priority wakeup.
-    m_io_thread->set_qos(Core::Platform::ThreadQoS::UserInteractive);
-    m_io_thread->start();
+    m_transport = FFI::ipc_mach_transport_create(receive_right.release(), send_right.release(), fds[1]);
+    VERIFY(m_transport);
 }
 
 TransportMachPort::~TransportMachPort()
 {
-    stop_io_thread(IOThreadState::Stopped);
+    // NB: Destroying the transport releases the observer, after which nothing writes to the pipe.
+    FFI::ipc_mach_transport_destroy(m_transport);
     m_read_hook_notifier.clear();
-}
-
-void TransportMachPort::stop_io_thread(IOThreadState desired_state)
-{
-    // NB: The IO thread may already have stopped on its own (e.g. the peer hung up). Stopped is terminal, so never
-    //     overwrite it with a new stop request.
-    auto state = m_io_thread_state.load(AK::MemoryOrder::memory_order_acquire);
-    while (state != IOThreadState::Stopped && !m_io_thread_state.compare_exchange_strong(state, desired_state, AK::MemoryOrder::memory_order_acq_rel)) { }
-    wake_io_thread();
-    if (m_io_thread && m_io_thread->needs_to_be_joined())
-        (void)m_io_thread->join();
-}
-
-void TransportMachPort::wake_io_thread()
-{
-    if (!MACH_PORT_VALID(m_wakeup_send_port.port()))
-        return;
-
-    mach_msg_header_t header {};
-    header.msgh_bits = MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, 0);
-    header.msgh_size = sizeof(header);
-    header.msgh_remote_port = m_wakeup_send_port.port();
-    header.msgh_local_port = MACH_PORT_NULL;
-    header.msgh_id = IPC_WAKEUP_MESSAGE_ID;
-
-    // Send a header-only wakeup message to the private wakeup port. Because that port is in the same port set,
-    // it breaks the blocking mach_msg() call so the thread can flush queued sends.
-    mach_msg(&header, MACH_SEND_MSG | MACH_SEND_TIMEOUT, sizeof(header), 0, MACH_PORT_NULL, 0, MACH_PORT_NULL);
-}
-
-bool TransportMachPort::schedule_read_notification_if_needed_locked()
-{
-    if (m_read_notification_pending)
-        return false;
-
-    m_read_notification_pending = true;
-    return true;
-}
-
-void TransportMachPort::write_read_notification_byte()
-{
-    if (!m_notify_hook_write_fd)
-        return;
-
-    Array<u8, 1> bytes = { 0 };
-    (void)Core::System::write(m_notify_hook_write_fd->value(), bytes);
-}
-
-void TransportMachPort::release_send_waiters()
-{
-    MutexLocker locker(m_send_mutex);
-    m_send_waiters_released = true;
-    m_sent_cv.broadcast();
-}
-
-void TransportMachPort::flush()
-{
-    if (!m_is_open.load(AK::MemoryOrder::memory_order_relaxed))
-        return;
-
-    wake_io_thread();
-
-    MutexLocker locker(m_send_mutex);
-    while (!m_send_waiters_released && (!m_pending_send_messages.is_empty() || m_send_in_progress)) {
-        // The wakeup is best-effort, so re-arm it rather than wait forever if one is ever dropped.
-        if (!m_sent_cv.wait_for(AK::Duration::from_milliseconds(50)))
-            wake_io_thread();
-    }
-}
-
-void TransportMachPort::wait_until_incoming_is_current()
-{
-    MutexLocker locker(m_incoming_mutex);
-    if (m_peer_eof.load() || m_io_thread_state.load() != IOThreadState::Running)
-        return;
-
-    // NB: A marker on the same receive port follows all previously sent messages, including one the IO
-    //     thread has removed from the port but has not published yet. A send-once right preserves EOF detection
-    //     and bypasses the queue limit, so sending while holding m_incoming_mutex cannot block on a full port.
-    mach_port_t send_once_port = MACH_PORT_NULL;
-    mach_msg_type_name_t right_type = 0;
-    auto const extract_ret = mach_port_extract_right(mach_task_self(), m_receive_port.port(),
-        MACH_MSG_TYPE_MAKE_SEND_ONCE, &send_once_port, &right_type);
-    VERIFY(extract_ret == KERN_SUCCESS);
-    auto send_right = Core::MachPort::adopt_right(send_once_port, Core::MachPort::PortRight::SendOnce);
-    mach_msg_header_t header {};
-    header.msgh_bits = MACH_MSGH_BITS(MACH_MSG_TYPE_MOVE_SEND_ONCE, 0);
-    header.msgh_size = sizeof(header);
-    header.msgh_remote_port = send_right.port();
-    header.msgh_id = IPC_RECEIVE_BARRIER_MESSAGE_ID;
-    auto const ret = mach_msg(&header, MACH_SEND_MSG, sizeof(header), 0, MACH_PORT_NULL,
-        MACH_MSG_TIMEOUT_NONE, MACH_PORT_NULL);
-    VERIFY(ret == KERN_SUCCESS);
-    (void)send_right.release();
-    VERIFY(m_receive_barriers_sent < NumericLimits<u64>::max());
-    auto const barrier = ++m_receive_barriers_sent;
-    while (!m_peer_eof.load(AK::MemoryOrder::memory_order_relaxed)
-        && m_io_thread_state.load() == IOThreadState::Running
-        && m_receive_barriers_received < barrier) {
-        m_incoming_cv.wait();
-    }
-}
-
-void TransportMachPort::mark_peer_eof()
-{
-    notify_incoming_message_observer({});
-
-    bool should_write_notification = false;
-    {
-        MutexLocker locker(m_incoming_mutex);
-        m_peer_eof = true;
-        should_write_notification = schedule_read_notification_if_needed_locked();
-    }
-    m_incoming_cv.broadcast();
-    if (should_write_notification)
-        write_read_notification_byte();
-}
-
-static constexpr mach_msg_timeout_t IDLE_MEMORY_RELEASE_DELAY_IN_MILLISECONDS = 1000;
-
-intptr_t TransportMachPort::io_thread_loop()
-{
-    static constexpr size_t RECV_BUFFER_SIZE = 65536;
-    auto buffer = Vector<u8>();
-    buffer.resize(RECV_BUFFER_SIZE);
-
-    // Messages the peer's queue had no room for. They stay here, in order, ahead of anything posted since, and the
-    // loop keeps receiving while it retries them: a thread that blocked in a send would stop draining its own queue,
-    // and two such threads facing each other would wait on each other for good. The ones already sent stay in place
-    // behind a cursor until the whole backlog has gone, so a retry costs nothing per message still waiting.
-    Vector<PendingMessage> backlog;
-    size_t backlog_sent = 0;
-    bool released_memory_since_last_message = true;
-
-    for (;;) {
-        if (m_io_thread_state.load() == IOThreadState::Stopped)
-            break;
-
-        {
-            MutexLocker locker(m_send_mutex);
-            backlog.extend(move(m_pending_send_messages));
-            m_pending_send_messages.clear();
-            if (backlog_sent < backlog.size())
-                m_send_in_progress = true;
-        }
-        bool const had_messages_to_send = backlog_sent < backlog.size();
-        while (backlog_sent < backlog.size()) {
-            if (send_mach_message(backlog[backlog_sent]) == SendOutcome::WouldBlock)
-                break;
-            ++backlog_sent;
-        }
-        bool const backlog_is_empty = backlog_sent == backlog.size();
-        if (backlog_is_empty) {
-            backlog.clear();
-            backlog_sent = 0;
-        }
-        if (had_messages_to_send && backlog_is_empty) {
-            MutexLocker locker(m_send_mutex);
-            m_send_in_progress = false;
-            m_sent_cv.broadcast();
-        }
-
-        if (m_io_thread_state.load() == IOThreadState::SendPendingMessagesAndStop) {
-            MutexLocker locker(m_send_mutex);
-            if (m_pending_send_messages.is_empty() && backlog_is_empty) {
-                m_io_thread_state = IOThreadState::Stopped;
-                break;
-            }
-            // Newly posted messages go out at the top of the loop. A backlog waits for the peer, so the timed receive
-            // below is where this thread waits for it, rather than spinning on the send.
-            if (backlog_is_empty)
-                continue;
-        }
-
-        auto* header = reinterpret_cast<mach_msg_header_t*>(buffer.data());
-        // Wait on the whole port set so one loop can handle peer messages, internal wakeups, and kernel
-        // notifications like MACH_NOTIFY_NO_SENDERS.
-        // With a backlog, the wait is short, so the sends are retried as the peer makes room.
-        bool const waits_without_timeout = backlog_is_empty && released_memory_since_last_message;
-        auto const receive_options = MACH_RCV_MSG | MACH_RCV_LARGE | (waits_without_timeout ? 0 : MACH_RCV_TIMEOUT);
-        auto const receive_timeout = waits_without_timeout ? MACH_MSG_TIMEOUT_NONE
-            : backlog_is_empty                             ? IDLE_MEMORY_RELEASE_DELAY_IN_MILLISECONDS
-                                                           : 1;
-        auto const ret = mach_msg(header, receive_options, 0, buffer.size(),
-            m_port_set.port(), receive_timeout, MACH_PORT_NULL);
-
-        if (ret == MACH_RCV_TIMED_OUT) {
-            // NB: The messages this thread receives are freed by the thread that handles them, and the allocator keeps
-            //     that memory until this thread allocates again or collects, which an idle transport may never do.
-            if (backlog_is_empty) {
-                ak_kmalloc_collect();
-                released_memory_since_last_message = true;
-            }
-            continue;
-        }
-        released_memory_since_last_message = false;
-
-        if (ret == MACH_RCV_TOO_LARGE) {
-            auto needed_size = header->msgh_size + sizeof(mach_msg_trailer_t);
-            buffer.resize(needed_size);
-            header = reinterpret_cast<mach_msg_header_t*>(buffer.data());
-            // MACH_RCV_LARGE tells us the needed size without removing the message. Resize the buffer and try
-            // again so large messages, including large attachment batches, still work.
-            auto const retry_ret = mach_msg(header, MACH_RCV_MSG, 0, needed_size,
-                m_port_set.port(), MACH_MSG_TIMEOUT_NONE, MACH_PORT_NULL);
-            if (retry_ret != KERN_SUCCESS) {
-                dbgln("TransportMachPort: mach_msg retry failed: {}", mach_error_string(retry_ret));
-                m_io_thread_state = IOThreadState::Stopped;
-                break;
-            }
-        } else if (ret != KERN_SUCCESS) {
-            dbgln("TransportMachPort: mach_msg receive failed: {}", mach_error_string(ret));
-            m_io_thread_state = IOThreadState::Stopped;
-            break;
-        }
-
-        if (header->msgh_local_port == m_wakeup_receive_port.port()) {
-            VERIFY(header->msgh_id == IPC_WAKEUP_MESSAGE_ID);
-            continue;
-        }
-
-        VERIFY(header->msgh_local_port == m_receive_port.port());
-
-        switch (header->msgh_id) {
-        case IPC_RECEIVE_BARRIER_MESSAGE_ID: {
-            MutexLocker locker(m_incoming_mutex);
-            ++m_receive_barriers_received;
-            m_incoming_cv.broadcast();
-            continue;
-        }
-        case MACH_NOTIFY_NO_SENDERS:
-            mark_peer_eof();
-            continue;
-        case MACH_NOTIFY_SEND_ONCE:
-            continue;
-        case IPC_DATA_MESSAGE_ID:
-        case IPC_INLINE_DATA_MESSAGE_ID:
-            process_received_message(buffer.data());
-            continue;
-        default:
-            VERIFY_NOT_REACHED();
-        }
-    }
-
-    VERIFY(m_io_thread_state == IOThreadState::Stopped);
-    release_send_waiters();
-    {
-        MutexLocker locker(m_incoming_mutex);
-        m_incoming_cv.broadcast();
-    }
-    // Stopping for transfer tears down the old endpoint on purpose. Do not surface that as peer EOF;
-    // the receive and send rights are about to be adopted by the new transport owner.
-    if (!m_is_being_transferred.load(AK::MemoryOrder::memory_order_acquire))
-        mark_peer_eof();
-    return 0;
-}
-
-TransportMachPort::SendOutcome TransportMachPort::send_mach_message(PendingMessage& msg)
-{
-    auto const& bytes = msg.bytes;
-    auto& attachments = msg.attachments;
-    size_t port_count = attachments.size();
-
-    auto inline_msg_size = mach_message_size_for_inline_payload(bytes.size(), port_count);
-    bool send_payload_inline = inline_msg_size <= INLINE_MESSAGE_MAX_SIZE;
-    auto msg_size = send_payload_inline ? inline_msg_size : mach_message_size_for_out_of_line_payload(port_count);
-
-    if (m_send_buffer.size() < msg_size)
-        m_send_buffer.resize(msg_size);
-
-    auto* header = reinterpret_cast<mach_msg_header_t*>(m_send_buffer.data());
-    header->msgh_bits = MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, 0);
-    header->msgh_size = msg_size;
-    header->msgh_remote_port = m_send_port.port();
-    header->msgh_local_port = MACH_PORT_NULL;
-    header->msgh_id = send_payload_inline ? IPC_INLINE_DATA_MESSAGE_ID : IPC_DATA_MESSAGE_ID;
-
-    u8* inline_payload = nullptr;
-    mach_msg_port_descriptor_t* port_descriptors = nullptr;
-    if (port_count > 0 || !send_payload_inline) {
-        header->msgh_bits |= MACH_MSGH_BITS_COMPLEX;
-
-        auto* body = reinterpret_cast<mach_msg_body_t*>(header + 1);
-        body->msgh_descriptor_count = port_count + (send_payload_inline ? 0 : 1);
-
-        port_descriptors = reinterpret_cast<mach_msg_port_descriptor_t*>(body + 1);
-        for (size_t i = 0; i < port_count; ++i) {
-            auto disposition = static_cast<mach_msg_type_name_t>(attachments[i].message_right());
-            auto port = attachments[i].release_mach_port();
-            port_descriptors[i].name = port.release();
-            port_descriptors[i].disposition = disposition;
-            port_descriptors[i].type = MACH_MSG_PORT_DESCRIPTOR;
-        }
-
-        if (send_payload_inline) {
-            inline_payload = reinterpret_cast<u8*>(&port_descriptors[port_count]);
-        } else {
-            auto* ool_desc = reinterpret_cast<mach_msg_ool_descriptor_t*>(&port_descriptors[port_count]);
-            ool_desc->address = const_cast<void*>(static_cast<void const*>(bytes.data()));
-            ool_desc->size = bytes.size();
-            ool_desc->deallocate = false;
-            ool_desc->copy = MACH_MSG_VIRTUAL_COPY;
-            ool_desc->type = MACH_MSG_OOL_DESCRIPTOR;
-        }
-    } else {
-        inline_payload = reinterpret_cast<u8*>(header + 1);
-    }
-
-    if (send_payload_inline) {
-        VERIFY(inline_payload);
-
-        InlinePayloadHeader payload_header { static_cast<u32>(bytes.size()) };
-        VERIFY(static_cast<size_t>(payload_header.payload_size) == bytes.size());
-
-        __builtin_memcpy(inline_payload, &payload_header, sizeof(payload_header));
-        if (!bytes.is_empty())
-            __builtin_memcpy(inline_payload + sizeof(payload_header), bytes.data(), bytes.size());
-
-        auto used_size = static_cast<size_t>(inline_payload - m_send_buffer.data())
-            + sizeof(payload_header)
-            + bytes.size();
-        VERIFY(used_size <= msg_size);
-        if (used_size < msg_size)
-            __builtin_memset(m_send_buffer.data() + used_size, 0, msg_size - used_size);
-    }
-
-    // Send one Mach message so attachment right transfer stays atomic with the serialized IPC payload.
-    // Small payloads are copied inline to avoid allocating a VM region for the out-of-line descriptor path.
-    // A message that carries nothing but bytes can wait its turn in user space when the peer's queue is full: it is
-    // rebuilt from msg.bytes on every try. A timed-out send comes back pseudo-received, holding what the kernel took
-    // in for it: a send right of its own on the destination, and for an out-of-line payload a copy the kernel made.
-    // Both are released here, or every timeout would leave a right behind and the peer would never hear that its
-    // last sender was gone. One with port rights can't be retried as is — the rights come back changed under it —
-    // so those still wait in the kernel.
-    bool const may_wait_in_user_space = port_count == 0;
-    auto const send_options = MACH_SEND_MSG | (may_wait_in_user_space ? MACH_SEND_TIMEOUT : 0);
-    auto const send_timeout = may_wait_in_user_space ? 0 : MACH_MSG_TIMEOUT_NONE;
-    auto const ret = mach_msg(header, send_options, msg_size, 0, MACH_PORT_NULL, send_timeout, MACH_PORT_NULL);
-    if (ret == MACH_SEND_TIMED_OUT) {
-        if (MACH_MSGH_BITS_REMOTE(header->msgh_bits) == MACH_MSG_TYPE_MOVE_SEND && header->msgh_remote_port != MACH_PORT_NULL)
-            mach_port_deallocate(mach_task_self(), header->msgh_remote_port);
-        if (!send_payload_inline) {
-            auto* ool_desc = reinterpret_cast<mach_msg_ool_descriptor_t*>(&port_descriptors[port_count]);
-            if (ool_desc->address && ool_desc->address != bytes.data())
-                vm_deallocate(mach_task_self(), reinterpret_cast<vm_address_t>(ool_desc->address), ool_desc->size);
-        }
-        return SendOutcome::WouldBlock;
-    }
-    if (ret != KERN_SUCCESS) {
-        if (ret == MACH_SEND_INVALID_DEST) {
-            for (size_t i = 0; i < port_count; ++i) {
-                auto dropped_attachment = attachment_from_descriptor(port_descriptors[i]);
-                (void)dropped_attachment;
-            }
-        }
-        dbgln("TransportMachPort: send failed: {} (send_port={:x})", mach_error_string(ret), m_send_port.port());
-        mark_peer_eof();
-    }
-    return SendOutcome::Sent;
-}
-
-void TransportMachPort::process_received_message(u8* buffer)
-{
-    auto* header = reinterpret_cast<mach_msg_header_t*>(buffer);
-    auto message = make<Message>();
-
-    if (header->msgh_id == IPC_INLINE_DATA_MESSAGE_ID) {
-        VERIFY(header->msgh_size >= sizeof(mach_msg_header_t) + sizeof(InlinePayloadHeader));
-
-        u8 const* payload = nullptr;
-        size_t payload_region_size = 0;
-        mach_msg_size_t attachment_count = 0;
-        mach_msg_port_descriptor_t const* descriptors = nullptr;
-
-        if (header->msgh_bits & MACH_MSGH_BITS_COMPLEX) {
-            auto* body = reinterpret_cast<mach_msg_body_t*>(header + 1);
-            attachment_count = body->msgh_descriptor_count;
-            descriptors = reinterpret_cast<mach_msg_port_descriptor_t*>(body + 1);
-
-            size_t size_with_descriptors = sizeof(mach_msg_header_t)
-                + sizeof(mach_msg_body_t)
-                + (attachment_count * sizeof(mach_msg_port_descriptor_t));
-            VERIFY(size_with_descriptors <= header->msgh_size);
-
-            payload = buffer + size_with_descriptors;
-            payload_region_size = header->msgh_size - size_with_descriptors;
-        } else {
-            payload = reinterpret_cast<u8 const*>(header + 1);
-            payload_region_size = header->msgh_size - sizeof(mach_msg_header_t);
-        }
-
-        for (mach_msg_size_t i = 0; i < attachment_count; ++i) {
-            auto attachment = attachment_from_descriptor(descriptors[i]);
-            message->attachments.enqueue(move(attachment));
-        }
-
-        message->bytes = inline_payload_bytes(payload, payload_region_size);
-    } else {
-        VERIFY(header->msgh_id == IPC_DATA_MESSAGE_ID);
-        VERIFY(header->msgh_bits & MACH_MSGH_BITS_COMPLEX);
-        auto* body = reinterpret_cast<mach_msg_body_t*>(header + 1);
-        VERIFY(body->msgh_descriptor_count > 0);
-        auto attachment_count = body->msgh_descriptor_count - 1;
-        auto* descriptors = reinterpret_cast<mach_msg_port_descriptor_t*>(body + 1);
-        auto const* payload = reinterpret_cast<mach_msg_ool_descriptor_t const*>(&descriptors[attachment_count]);
-
-        VERIFY(payload->type == MACH_MSG_OOL_DESCRIPTOR);
-        auto payload_bytes = ReceivedMessageBytes::adopt_vm_region(payload->address, payload->size);
-
-        for (unsigned int i = 0; i < attachment_count; ++i) {
-            auto attachment = attachment_from_descriptor(descriptors[i]);
-            message->attachments.enqueue(move(attachment));
-        }
-
-        message->bytes = move(payload_bytes);
-    }
-
-    // NB: The rights and the payload region are ours once received, so adopt them first. Dropping the message then
-    //     releases them.
-    if (message->attachments.size() > MAX_MESSAGE_FD_COUNT) {
-        dbgln("TransportMachPort: Rejecting message with {} attachments exceeding limit {}", message->attachments.size(), MAX_MESSAGE_FD_COUNT);
-        mark_peer_eof();
-        return;
-    }
-
-    if (message->bytes.is_empty() && message->attachments.is_empty())
-        return;
-
-    notify_incoming_message_observer(message->bytes.bytes());
-
-    bool should_write_notification = false;
-    {
-        MutexLocker locker(m_incoming_mutex);
-        auto const was_empty = m_incoming_messages.is_empty();
-        m_incoming_messages.append(move(message));
-        if (was_empty)
-            should_write_notification = schedule_read_notification_if_needed_locked();
-    }
-    m_incoming_cv.signal();
-    if (should_write_notification)
-        write_read_notification_byte();
-}
-
-void TransportMachPort::set_incoming_message_observer(Function<void(ReadonlyBytes)> observer)
-{
-    MutexLocker locker(m_incoming_message_observer_mutex);
-    m_incoming_message_observer = move(observer);
-}
-
-void TransportMachPort::notify_incoming_message_observer(ReadonlyBytes bytes)
-{
-    MutexLocker locker(m_incoming_message_observer_mutex);
-    if (m_incoming_message_observer)
-        m_incoming_message_observer(bytes);
 }
 
 void TransportMachPort::set_up_read_hook(Function<void()> hook)
@@ -636,120 +60,108 @@ void TransportMachPort::set_up_read_hook(Function<void()> hook)
     m_read_hook_notifier->on_activation = [this] {
         char buf[64];
         (void)Core::System::read(m_notify_hook_read_fd->value(), { buf, sizeof(buf) });
-        {
-            MutexLocker locker(m_incoming_mutex);
-            m_read_notification_pending = false;
-        }
+        FFI::ipc_mach_transport_acknowledge_read_notification(m_transport);
         if (m_on_read_hook)
             m_on_read_hook();
     };
+    FFI::ipc_mach_transport_schedule_read_notification_if_readable(m_transport);
+}
 
-    bool should_write_notification = false;
-    {
-        MutexLocker locker(m_incoming_mutex);
-        if (!m_incoming_messages.is_empty() || m_peer_eof)
-            should_write_notification = schedule_read_notification_if_needed_locked();
+void TransportMachPort::set_incoming_message_observer(Function<void(ReadonlyBytes)> observer)
+{
+    if (!observer) {
+        FFI::ipc_mach_transport_set_incoming_message_observer(m_transport, nullptr);
+        return;
     }
-    if (should_write_notification)
-        write_read_notification_byte();
+    // NB: The transport owns the observer, and releases the one it replaces once that no longer runs.
+    FFI::CppIncomingMessageObserver const owned_observer {
+        .context = new Function<void(ReadonlyBytes)>(move(observer)),
+        .observe = [](void* observer, ReadonlyBytes bytes) { (*static_cast<Function<void(ReadonlyBytes)>*>(observer))(bytes); },
+        .release = [](void* observer) { delete static_cast<Function<void(ReadonlyBytes)>*>(observer); },
+    };
+    FFI::ipc_mach_transport_set_incoming_message_observer(m_transport, &owned_observer);
 }
 
 bool TransportMachPort::is_open() const
 {
-    return m_is_open && !m_peer_eof;
+    return FFI::ipc_mach_transport_is_open(m_transport);
 }
 
 void TransportMachPort::close()
 {
-    m_is_open = false;
-    stop_io_thread(IOThreadState::Stopped);
-    release_send_right_to_peer();
+    FFI::ipc_mach_transport_close(m_transport);
 }
 
 void TransportMachPort::close_after_sending_all_pending_messages()
 {
-    stop_io_thread(IOThreadState::SendPendingMessagesAndStop);
-    m_is_open = false;
-    release_send_right_to_peer();
+    FFI::ipc_mach_transport_close_after_sending_all_pending_messages(m_transport);
 }
 
-// As closing a socket does, closing the transport tells the peer: its receive port gets MACH_NOTIFY_NO_SENDERS once
-// this send right is gone. The IO thread, the only one that sends through it, has stopped.
-void TransportMachPort::release_send_right_to_peer()
+void TransportMachPort::wait_until_readable(Optional<MonotonicTime> deadline)
 {
-    m_send_port = {};
-}
-
-void TransportMachPort::wait_until_readable()
-{
-    MutexLocker lock(m_incoming_mutex);
-    while (m_incoming_messages.is_empty() && !m_peer_eof && !m_wait_until_readable_interrupted)
-        m_incoming_cv.wait();
-    m_wait_until_readable_interrupted = false;
+    // NB: Rust checks the deadline on the clock MonotonicTime reads, which keeps counting while the system sleeps.
+    FFI::ipc_mach_transport_wait_until_readable(m_transport, deadline.has_value(), deadline.has_value() ? deadline->nanoseconds() : 0);
 }
 
 void TransportMachPort::interrupt_wait_until_readable()
 {
-    MutexLocker lock(m_incoming_mutex);
-    m_wait_until_readable_interrupted = true;
-    m_incoming_cv.broadcast();
+    FFI::ipc_mach_transport_interrupt_wait_until_readable(m_transport);
+}
+
+void TransportMachPort::flush()
+{
+    FFI::ipc_mach_transport_flush(m_transport);
+}
+
+void TransportMachPort::wait_until_incoming_is_current()
+{
+    FFI::ipc_mach_transport_wait_until_incoming_is_current(m_transport);
 }
 
 ErrorOr<void> TransportMachPort::post_message(MessageDataType bytes, Vector<Attachment>& attachments)
 {
-    {
-        MutexLocker locker(m_send_mutex);
-        m_pending_send_messages.append(PendingMessage { move(bytes), move(attachments) });
-    }
-    wake_io_thread();
+    auto raw_attachments = release_raw_attachments(move(attachments));
+    // NB: A message that has to wait behind others keeps the buffer it was encoded into, rather than a copy.
+    auto hand_over_payload = [](void* bytes) -> FFI::HandedOverPayload {
+        auto* payload = new MessageDataType(move(*static_cast<MessageDataType*>(bytes)));
+        return {
+            .data = payload->data(),
+            .size = payload->size(),
+            .owner = payload,
+            .release = [](void* payload) { delete static_cast<MessageDataType*>(payload); },
+        };
+    };
+    // NB: The transport refuses a message once a stop is asked for or a send has failed, which is_open() reports too.
+    if (!FFI::ipc_mach_transport_post(m_transport, bytes.span(), raw_attachments.span(), &bytes, hand_over_payload))
+        return Error::from_string_literal("TransportMachPort: The transport takes no more messages");
     return {};
 }
 
 TransportMachPort::ShouldShutdown TransportMachPort::read_as_many_messages_as_possible_without_blocking(Function<void(Message&&)>&& callback)
 {
-    Vector<NonnullOwnPtr<Message>> messages;
-    bool eof;
-    {
-        MutexLocker locker(m_incoming_mutex);
-        messages = move(m_incoming_messages);
-        // Snapshot EOF with the messages so later arrivals cannot be skipped by reporting shutdown.
-        eof = m_peer_eof;
-    }
-    for (auto& message : messages)
-        callback(move(*message));
-    return eof ? ShouldShutdown::Yes : ShouldShutdown::No;
+    auto take_message = [](void* callback, ReadonlyBytes bytes, FFI::ReceivedPayload* payload, ReadonlySpan<RawAttachment> raw_attachments) {
+        Message message;
+        message.bytes = ReceivedMessageBytes::adopt_foreign_storage(bytes, payload, [](void* payload) {
+            FFI::ipc_mach_received_payload_destroy(static_cast<FFI::ReceivedPayload*>(payload));
+        });
+        for (auto& attachment : adopt_raw_attachments(raw_attachments))
+            message.attachments.enqueue(move(attachment));
+        (*static_cast<Function<void(Message&&)>*>(callback))(move(message));
+    };
+    auto peer_eof = FFI::ipc_mach_transport_take_incoming(m_transport, &callback, take_message);
+    return peer_eof ? ShouldShutdown::Yes : ShouldShutdown::No;
 }
 
 ErrorOr<TransportHandle> TransportMachPort::release_for_transfer()
 {
-    // From this point on, shutdown of the old endpoint is part of handing the transport to another
-    // MessagePort, not evidence that the peer disconnected.
-    m_is_being_transferred.store(true, AK::MemoryOrder::memory_order_release);
-    stop_io_thread(IOThreadState::SendPendingMessagesAndStop);
-    m_is_open = false;
-
-    mach_port_t prev = MACH_PORT_NULL;
-    // Remove the no-senders registration before giving this receive right to another owner. Otherwise the old
-    // transport could still get disconnect notifications for a port it no longer owns.
-    auto ret = mach_port_request_notification(mach_task_self(),
-        m_receive_port.port(),
-        MACH_NOTIFY_NO_SENDERS,
-        0,
-        MACH_PORT_NULL,
-        MACH_MSG_TYPE_MAKE_SEND_ONCE,
-        &prev);
-    VERIFY(ret == KERN_SUCCESS);
-    if (MACH_PORT_VALID(prev))
-        // Removing the registration still returns the old send-once notification right in `prev`.
-        // Release it so the transferred port does not keep leftover notification state.
-        mach_port_deallocate(mach_task_self(), prev);
-
-    // Take the receive right out of this transport's port set before transfer. The next owner should choose its
-    // own wait set, if it needs one.
-    ret = mach_port_extract_member(mach_task_self(), m_receive_port.port(), m_port_set.port());
-    VERIFY(ret == KERN_SUCCESS);
-
-    return TransportHandle { move(m_receive_port), move(m_send_port) };
+    mach_port_t receive_right = MACH_PORT_NULL;
+    mach_port_t send_right = MACH_PORT_NULL;
+    if (!FFI::ipc_mach_transport_release_for_transfer(m_transport, &receive_right, &send_right))
+        return Error::from_string_literal("TransportMachPort: The transport was already handed over");
+    return TransportHandle {
+        Core::MachPort::adopt_right(receive_right, Core::MachPort::PortRight::Receive),
+        Core::MachPort::adopt_right(send_right, Core::MachPort::PortRight::Send),
+    };
 }
 
 }

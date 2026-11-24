@@ -16,124 +16,84 @@ use crate::bytecode::instruction::typed as op;
 use crate::bytecode::operand::*;
 
 use super::context::Generator;
-use super::registers::ScopedOperand;
 
 /// Emit a property access by key, using GetLength for the "length" property.
-pub(super) fn emit_get_by_key(
-    generator: &mut Generator<'_>,
-    dst: &ScopedOperand,
-    base: &ScopedOperand,
-    key: PropertyKeyTableIndex,
-    base_identifier: Option<IdentifierTableIndex>,
-) {
+pub(super) fn emit_get_by_key(generator: &mut Generator<'_>, dst: Operand, base: Operand, key: PropertyKeyTableIndex) {
     if generator.context.names.is_length_property_key(key) {
         generator.length_identifier = Some(key);
         let cache = generator.next_property_lookup_cache();
-        let value_feedback = generator.next_value_feedback();
         let keyed_feedback = generator.next_keyed_feedback();
-        generator.emit(op::GetLength {
-            value_feedback,
+        generator.put(op::GetLength {
             keyed_feedback,
-            dst: dst.operand(),
-            base: base.operand(),
-            base_identifier,
+            dst,
+            base,
             cache,
         });
     } else {
         let cache = generator.next_property_lookup_cache();
-        let value_feedback = generator.next_value_feedback();
-        generator.emit(op::GetById {
-            value_feedback,
-            dst: dst.operand(),
-            base: base.operand(),
+        generator.put(op::GetById {
+            dst,
+            base,
             property: key,
-            base_identifier,
             cache,
         });
     }
 }
 
-/// Emit a property access by name with a this value, using GetLengthWithThis
-/// for the "length" property.
+/// Emit a property access by name with a this value.
 pub(super) fn emit_get_by_id_with_this(
     generator: &mut Generator<'_>,
-    dst: &ScopedOperand,
-    base: &ScopedOperand,
+    dst: Operand,
+    base: Operand,
     property_name: Name,
-    this_value: &ScopedOperand,
+    this_value: Operand,
 ) {
     let key = generator.intern_property_key(property_name);
+    emit_get_by_key_with_this(generator, dst, base, key, this_value);
+}
+
+/// Emit a property access by key with a this value, using GetLengthWithThis for the "length" property.
+fn emit_get_by_key_with_this(
+    generator: &mut Generator<'_>,
+    dst: Operand,
+    base: Operand,
+    key: PropertyKeyTableIndex,
+    this_value: Operand,
+) {
     if generator.context.names.is_length_property_key(key) {
         generator.length_identifier = Some(key);
         let cache = generator.next_property_lookup_cache();
-        let value_feedback = generator.next_value_feedback();
-        generator.emit(op::GetLengthWithThis {
-            value_feedback,
-            dst: dst.operand(),
-            base: base.operand(),
-            this_value: this_value.operand(),
+        generator.put(op::GetLengthWithThis {
+            dst,
+            base,
+            this_value,
             cache,
         });
     } else {
         let cache = generator.next_property_lookup_cache();
-        let value_feedback = generator.next_value_feedback();
-        generator.emit(op::GetByIdWithThis {
-            value_feedback,
-            dst: dst.operand(),
-            base: base.operand(),
+        generator.put(op::GetByIdWithThis {
+            dst,
+            base,
             property: key,
-            this_value: this_value.operand(),
+            this_value,
             cache,
         });
     }
 }
 
 /// Emit a property read by value, optimizing constant string properties to GetById.
-pub(super) fn emit_get_by_value(
-    generator: &mut Generator<'_>,
-    dst: &ScopedOperand,
-    base: &ScopedOperand,
-    property: &ScopedOperand,
-    base_identifier: Option<IdentifierTableIndex>,
-) {
+pub(super) fn emit_get_by_value(generator: &mut Generator<'_>, dst: Operand, base: Operand, property: Operand) {
     if let Some(key) = generator.try_constant_string_to_property_key(property) {
-        if generator.context.names.is_length_property_key(key) {
-            generator.length_identifier = Some(key);
-            let cache = generator.next_property_lookup_cache();
-            let value_feedback = generator.next_value_feedback();
-            let keyed_feedback = generator.next_keyed_feedback();
-            generator.emit(op::GetLength {
-                value_feedback,
-                keyed_feedback,
-                dst: dst.operand(),
-                base: base.operand(),
-                base_identifier,
-                cache,
-            });
-        } else {
-            let cache = generator.next_property_lookup_cache();
-            let value_feedback = generator.next_value_feedback();
-            generator.emit(op::GetById {
-                value_feedback,
-                dst: dst.operand(),
-                base: base.operand(),
-                property: key,
-                base_identifier,
-                cache,
-            });
-        }
+        emit_get_by_key(generator, dst, base, key);
         return;
     }
-    let value_feedback = generator.next_value_feedback();
     let keyed_feedback = generator.next_keyed_feedback();
     let cache = generator.next_property_lookup_cache();
-    generator.emit(op::GetByValue {
-        value_feedback,
+    generator.put(op::GetByValue {
         keyed_feedback,
-        dst: dst.operand(),
-        base: base.operand(),
-        property: property.operand(),
-        base_identifier,
+        dst,
+        base,
+        property,
         cache,
     });
 }
@@ -141,138 +101,81 @@ pub(super) fn emit_get_by_value(
 /// Emit a property read by value with explicit this, optimizing constant string properties.
 pub(super) fn emit_get_by_value_with_this(
     generator: &mut Generator<'_>,
-    dst: &ScopedOperand,
-    base: &ScopedOperand,
-    property: &ScopedOperand,
-    this_value: &ScopedOperand,
+    dst: Operand,
+    base: Operand,
+    property: Operand,
+    this_value: Operand,
 ) {
     if let Some(key) = generator.try_constant_string_to_property_key(property) {
-        if generator.context.names.is_length_property_key(key) {
-            generator.length_identifier = Some(key);
-            let cache = generator.next_property_lookup_cache();
-            let value_feedback = generator.next_value_feedback();
-            generator.emit(op::GetLengthWithThis {
-                value_feedback,
-                dst: dst.operand(),
-                base: base.operand(),
-                this_value: this_value.operand(),
-                cache,
-            });
-        } else {
-            let cache = generator.next_property_lookup_cache();
-            let value_feedback = generator.next_value_feedback();
-            generator.emit(op::GetByIdWithThis {
-                value_feedback,
-                dst: dst.operand(),
-                base: base.operand(),
-                property: key,
-                this_value: this_value.operand(),
-                cache,
-            });
-        }
+        emit_get_by_key_with_this(generator, dst, base, key, this_value);
         return;
     }
     let value_feedback = generator.next_value_feedback();
-    generator.emit(op::GetByValueWithThis {
+    generator.put(op::GetByValueWithThis {
         value_feedback,
-        dst: dst.operand(),
-        base: base.operand(),
-        property: property.operand(),
-        this_value: this_value.operand(),
-    });
-}
-
-/// Emit a normal property write by value, optimizing constant string properties to PutNormalById.
-pub(super) fn emit_put_normal_by_value(
-    generator: &mut Generator<'_>,
-    base: &ScopedOperand,
-    property: &ScopedOperand,
-    src: &ScopedOperand,
-    base_identifier: Option<IdentifierTableIndex>,
-) {
-    if let Some(key) = generator.try_constant_string_to_property_key(property) {
-        let cache = generator.next_property_lookup_cache();
-        generator.emit(op::PutById {
-            base: base.operand(),
-            property: key,
-            src: src.operand(),
-            cache,
-            base_identifier,
-            kind: PutKind::Normal as u32,
-        });
-        return;
-    }
-    let keyed_feedback = generator.next_keyed_feedback();
-    let cache = generator.next_property_lookup_cache();
-    generator.emit(op::PutByValue {
-        keyed_feedback,
-        base: base.operand(),
-        property: property.operand(),
-        src: src.operand(),
-        base_identifier,
-        kind: PutKind::Normal as u32,
-        cache,
+        dst,
+        base,
+        property,
+        this_value,
     });
 }
 
 /// Emit a normal property write by value with explicit this, optimizing constant string properties.
 pub(super) fn emit_put_normal_by_value_with_this(
     generator: &mut Generator<'_>,
-    base: &ScopedOperand,
-    property: &ScopedOperand,
-    this_value: &ScopedOperand,
-    src: &ScopedOperand,
+    base: Operand,
+    property: Operand,
+    this_value: Operand,
+    src: Operand,
 ) {
     if let Some(key) = generator.try_constant_string_to_property_key(property) {
         let cache = generator.next_property_lookup_cache();
-        generator.emit(op::PutByIdWithThis {
-            base: base.operand(),
-            this_value: this_value.operand(),
+        generator.put(op::PutByIdWithThis {
+            base,
+            this_value,
             property: key,
-            src: src.operand(),
+            src,
             cache,
-            kind: PutKind::Normal as u32,
+            kind: PutKind::Normal as u8,
         });
         return;
     }
-    generator.emit(op::PutByValueWithThis {
-        base: base.operand(),
-        property: property.operand(),
-        this_value: this_value.operand(),
-        src: src.operand(),
-        kind: PutKind::Normal as u32,
+    generator.put(op::PutByValueWithThis {
+        base,
+        property,
+        this_value,
+        src,
+        kind: PutKind::Normal as u8,
     });
 }
 
 /// Emit a property write by value, optimizing constant string properties to the ById variant.
 pub(super) fn emit_put_by_value(
     generator: &mut Generator<'_>,
-    base: &ScopedOperand,
-    property: &ScopedOperand,
-    src: &ScopedOperand,
+    base: Operand,
+    property: Operand,
+    src: Operand,
     kind: PutKind,
 ) {
     if let Some(key) = generator.try_constant_string_to_property_key(property) {
         let cache = generator.next_property_lookup_cache();
-        generator.emit(op::PutById {
-            base: base.operand(),
+        generator.put(op::PutById {
+            base,
             property: key,
-            src: src.operand(),
+            src,
             cache,
-            base_identifier: None,
-            kind: kind as u32,
+            kind: kind as u8,
         });
         return;
     }
     let keyed_feedback = generator.next_keyed_feedback();
     let cache = generator.next_property_lookup_cache();
-    generator.emit(op::PutByValue {
+    generator.put(op::PutByValue {
         keyed_feedback,
-        base: base.operand(),
-        property: property.operand(),
-        src: src.operand(),
-        base_identifier: None,
-        kind: kind as u32,
+        base,
+        property,
+        src,
+        kind: kind as u8,
         cache,
     });
 }

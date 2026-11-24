@@ -79,7 +79,7 @@ InputEvent::~InputEvent() = default;
 void InputEvent::visit_edges(Visitor& visitor)
 {
     Base::visit_edges(visitor);
-    visitor.visit(static_cast<GC::Cell*>(m_data_transfer.ptr()));
+    visitor.visit(m_data_transfer);
     visitor.visit(m_target_ranges);
 }
 
@@ -90,6 +90,21 @@ ReadonlySpan<GC::Ref<DOM::StaticRange>> InputEvent::get_target_ranges() const
     // not canceled. The returned StaticRanges MUST cover only the code points that the browser would normally replace,
     // even if they are only part of a grapheme cluster.
     return m_target_ranges;
+}
+
+extern "C" {
+InputEvent const* web_ui_events_input_event_from_event(DOM::Event const*);
+bool web_ui_events_input_event_is_composing(InputEvent const*);
+
+InputEvent const* web_ui_events_input_event_from_event(DOM::Event const* event)
+{
+    return as_if<InputEvent>(event);
+}
+
+bool web_ui_events_input_event_is_composing(InputEvent const* event)
+{
+    return event->is_composing();
+}
 }
 
 }

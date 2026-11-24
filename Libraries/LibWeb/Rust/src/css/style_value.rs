@@ -2285,6 +2285,9 @@ pub struct ConicGradientPayload {
 #[derive(Clone, PartialEq)]
 pub struct RadialGradientPayload {
     pub ending_shape: u8,
+    pub webkit: bool,
+    pub has_explicit_position: bool,
+    pub webkit_size_keyword: u16,
     pub size: RetainedStyleValueData,
     pub position: RetainedStyleValueData,
     pub color_stop_list: RetainedColorStopList,
@@ -3767,6 +3770,9 @@ impl StyleValueData {
             StyleValueData::RadialGradient(radial_gradient_payload) => {
                 let RadialGradientPayload {
                     ending_shape,
+                    webkit,
+                    has_explicit_position,
+                    webkit_size_keyword,
                     size,
                     position,
                     color_stop_list,
@@ -3775,6 +3781,9 @@ impl StyleValueData {
                     color_syntax,
                 } = &**radial_gradient_payload;
                 hasher.write_u8(*ending_shape);
+                write_bool(hasher, *webkit);
+                write_bool(hasher, *has_explicit_position);
+                hasher.write_u16(*webkit_size_keyword);
                 write_value(hasher, size);
                 write_value(hasher, position);
                 write_color_stops(hasher, color_stop_list);
@@ -4374,36 +4383,6 @@ pub unsafe extern "C" fn rust_style_value_create_color_function(
     ))))
 }
 
-/// Takes ownership of one strong reference to the calculation node; the byte blob and ranges
-/// are copied.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_style_value_create_calculated(
-    rust_calculation: *const crate::css::calc::CalcNode,
-    resolved_type: crate::css::calc::FfiNumericType,
-    has_percentages_resolve_as: bool,
-    resolve_as_is_number: bool,
-    resolve_as_base: u8,
-    percentages_resolve_as: u8,
-    resolve_numbers_as_integers: bool,
-    accepted_ranges: *const RetainedNumericRangeByType,
-    accepted_range_count: usize,
-) -> *const StyleValueData {
-    StyleValueArc::into_raw(StyleValueArc::new(StyleValueData::Calculated(StyleValueBox::new(
-        CalculatedPayload {
-            rust_calculation: unsafe { crate::css::calc::CalcNodeHandle::from_raw(rust_calculation) },
-            resolve_as_is_number,
-            resolve_as_base,
-            resolved_type,
-            has_percentages_resolve_as,
-            percentages_resolve_as,
-            resolve_numbers_as_integers,
-            accepted_ranges: RetainedNumericRangeList::from_vec(unsafe {
-                read_elements(accepted_ranges, accepted_range_count)
-            }),
-        },
-    ))))
-}
-
 /// Copies the borrowed native URL text and takes ownership of each modifier string.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rust_style_value_create_image(
@@ -4654,7 +4633,7 @@ mod equality_tests {
     fn unresolved(source: &str) -> StyleValueData {
         let values = consume_a_list_of_component_values(tokenize_for_parser(source.as_bytes())).unwrap();
         let serialized = serialize_component_values_to_utf16(&values, ComponentSerializationMode::Retokenize);
-        unresolved_value(&serialized, values, Default::default())
+        unresolved_value(&serialized, &values, Default::default())
     }
 
     #[test]
@@ -4805,9 +4784,4 @@ pub(crate) fn style_value_dependency_flags(value: &StyleValueData) -> u8 {
 
 pub(crate) fn retained_value_depends_on_current_color(value: &RetainedStyleValueData) -> bool {
     style_value_dependency_flags(value.data()) & 1 != 0
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn rust_style_value_depends_on_current_color(data: &StyleValueData) -> bool {
-    value_depends_on_current_color(data)
 }

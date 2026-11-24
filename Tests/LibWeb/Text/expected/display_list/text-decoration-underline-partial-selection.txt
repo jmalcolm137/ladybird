@@ -5,14 +5,17 @@ AccumulatedVisualContext Tree:
   effects:
     [e0 in s0] effects=[]
 
+Layers (for a window server that shows tiles and filters what is below layers):
+  [L0] base space=viewport
+
 DisplayList:
-DrawGlyphRun@s1/e0 rect=[8,-17 169x100] translation=[8,63] color=rgb(0, 0, 0) inline_clips=[clip=[9,-15 60x91]]
-DrawLine@s1/e0 from=[8,70] to=[45,70] color=rgb(0, 0, 0) thickness=10 style=Solid
-DrawLine@s1/e0 from=[57,70] to=[67,70] color=rgb(0, 0, 0) thickness=10 style=Solid
-DrawGlyphRun@s1/e0 rect=[8,-17 169x100] translation=[8,63] color=rgb(0, 0, 0) inline_clips=[clip=[116,-15 61x91]]
-DrawLine@s1/e0 from=[116,70] to=[153,70] color=rgb(0, 0, 0) thickness=10 style=Solid
-DrawLine@s1/e0 from=[165,70] to=[177,70] color=rgb(0, 0, 0) thickness=10 style=Solid
-FillRect@s1/e0 rect=[69,-17 47x100] color=rgba(101, 2, 0, 0.8)
-DrawGlyphRun@s1/e0 rect=[8,-17 169x100] translation=[8,63] color=rgb(255, 255, 255) inline_clips=[clip=[69,-15 47x91]]
-DrawLine@s1/e0 from=[109,70] to=[116,70] color=rgb(255, 255, 255) thickness=10 style=Solid
+L0 DrawGlyphRun@s1/e0 font_id=font1 glyphs=3 rect=[8,-17 169x100] glyph_bounding_rect=[9,-15 191x91] translation=[8,63] color=rgb(0, 0, 0) inline_clips=[clip=[9,-15 60x91]] text="x" owner=BlockContainer(anonymous) phase=text-fragment
+L0 FillRect@s1/e0 rect=[8,65 37x10] color=rgb(0, 0, 0) owner=BlockContainer(anonymous) phase=text-fragment
+L0 FillRect@s1/e0 rect=[57,65 10x10] color=rgb(0, 0, 0) owner=BlockContainer(anonymous) phase=text-fragment
+L0 DrawGlyphRun@s1/e0 font_id=font1 glyphs=3 rect=[8,-17 169x100] glyph_bounding_rect=[9,-15 191x91] translation=[8,63] color=rgb(0, 0, 0) inline_clips=[clip=[116,-15 61x91]] text="x" owner=BlockContainer(anonymous) phase=text-fragment
+L0 FillRect@s1/e0 rect=[116,65 37x10] color=rgb(0, 0, 0) owner=BlockContainer(anonymous) phase=text-fragment
+L0 FillRect@s1/e0 rect=[165,65 12x10] color=rgb(0, 0, 0) owner=BlockContainer(anonymous) phase=text-fragment
+L0 FillRect@s1/e0 rect=[69,-17 47x100] color=rgba(101, 2, 0, 0.8) owner=BlockContainer(anonymous) phase=text-fragment
+L0 DrawGlyphRun@s1/e0 font_id=font1 glyphs=3 rect=[8,-17 169x100] glyph_bounding_rect=[9,-15 191x91] translation=[8,63] color=rgb(0, 0, 0) inline_clips=[clip=[69,-15 47x91]] text="g" owner=BlockContainer(anonymous) phase=text-fragment
+L0 FillRect@s1/e0 rect=[109,65 7x10] color=rgb(0, 0, 0) owner=BlockContainer(anonymous) phase=text-fragment
 

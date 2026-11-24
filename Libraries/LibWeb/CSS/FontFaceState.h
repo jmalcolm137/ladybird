@@ -26,6 +26,7 @@
 #include <LibWeb/CSS/RustDescriptorBlock.h>
 #include <LibWeb/CSS/StyleValues/ComputationContext.h>
 #include <LibWeb/WebIDL/Buffers.h>
+#include <LibWeb/WebIDL/ExceptionOr.h>
 
 namespace Web::CSS {
 
@@ -52,7 +53,7 @@ public:
     // The serialization of the @font-face descriptor a FontFace attribute reflects.
     Utf16String const& descriptor_text(DescriptorID) const;
     WebIDL::ExceptionOr<void> set_descriptor(DescriptorID, Utf16View);
-    static constexpr size_t attribute_count = 11;
+    static constexpr size_t attribute_count = 12;
 
     bool is_css_connected() const { return m_css_font_face_rule_identity.has_value(); }
     Optional<u64> css_rule_identity() const
@@ -79,6 +80,8 @@ public:
             .width = m_cached_width,
         };
     }
+
+    [[nodiscard]] double size_adjust() const { return m_size_adjust; }
 
     // Whether the font-weight descriptor is auto, which takes the weight range of the font file in place of the
     // range the matching key carries.
@@ -135,7 +138,7 @@ private:
     CSSFontFaceRule& cssom_rule() const;
     RustDescriptorBlock connected_descriptors() const;
 
-    [[nodiscard]] Optional<ComputationContext> computation_context() const;
+    [[nodiscard]] ComputationContext computation_context() const;
     void apply_descriptor(DescriptorID, StyleValue const&);
 
     u64 m_id { 0 };
@@ -146,6 +149,7 @@ private:
 
     FontWeightRange m_cached_weight_range { 400, 400 };
     bool m_weight_descriptor_is_auto { true };
+    double m_size_adjust { 1 };
     int m_cached_slope { 0 };
     int m_cached_width { 100 };
     GC::Ptr<FontLoader> m_font_loader;
@@ -185,17 +189,5 @@ private:
 };
 
 bool font_format_is_supported(Utf16View name);
-
-// Record that a style update wanted a web face loaded, on any thread. Loading a face changes its status, appends it to
-// every FontFaceSet it is in - under an execution context that runs author callbacks - and starts a fetch, none of
-// which may happen while a style update runs, nor anywhere but the main thread.
-void note_wanted_web_face(u64 face_id);
-
-// Load every face wanted since the last call, unless a style update is running: that one drains them at its end.
-void request_wanted_web_faces();
-
-// A style update defers every load its cascades want to its own end.
-void begin_deferred_web_face_loads();
-void end_deferred_web_face_loads();
 
 }

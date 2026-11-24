@@ -39,6 +39,7 @@ SUPPORTED_ATTRIBUTE_EXTENDED_ATTRIBUTES = {
     "AttributeCallbackName",
     "CachedAccessor",
     "CEReactions",
+    "Exposed",
     "FIXME",
     "ImplementedAs",
     "LegacyNullToEmptyString",
@@ -63,9 +64,20 @@ SUPPORTED_OPERATION_EXTENDED_ATTRIBUTES = {
 }
 SUPPORTED_STRINGIFIER_EXTENDED_ATTRIBUTES = {"Exposed"}
 
-# The value of [Exposed] that the Rust bindings handle on a member: a member that only a Window has, which the
-# bindings define when the global object of the realm is a Window.
-SUPPORTED_MEMBER_EXPOSURE = "Window"
+# The values of [Exposed] that the Rust bindings handle on a member, without spaces, with the condition on the realm
+# under which the member is exposed.
+MEMBER_EXPOSURE_CONDITIONS = {
+    "Window": "realm_is_window(realm)",
+    "(Window,Worker)": "window_or_worker_global_scope_from_global_object(realm.global_object()).is_some()",
+}
+
+
+def member_exposure_condition(extended_attributes: dict) -> Optional[str]:
+    """The condition on the realm under which a member is exposed, if it names the globals that expose it."""
+    exposure = extended_attributes.get("Exposed")
+    if exposure is None:
+        return None
+    return MEMBER_EXPOSURE_CONDITIONS.get(exposure.replace(" ", ""))
 
 
 def generated_function_stem(method: str) -> str:
@@ -102,6 +114,10 @@ class RustAttribute:
     @property
     def returns_js_value(self) -> bool:
         return "ReturnsJSValue" in self.attribute.extended_attributes
+
+    @property
+    def exposure_condition(self) -> Optional[str]:
+        return member_exposure_condition(self.attribute.extended_attributes)
 
     @property
     def function_stem(self) -> str:
@@ -169,9 +185,8 @@ class RustOperationSet:
         return "SecureContext" in self.overloads[0].operation.extended_attributes
 
     @property
-    def is_window_only(self) -> bool:
-        """Whether only a Window has the operation: [Exposed=Window] on an interface exposed elsewhere as well."""
-        return self.overloads[0].operation.extended_attributes.get("Exposed") == SUPPORTED_MEMBER_EXPOSURE
+    def exposure_condition(self) -> Optional[str]:
+        return member_exposure_condition(self.overloads[0].operation.extended_attributes)
 
 
 @dataclass
@@ -179,8 +194,8 @@ class RustStringifier:
     """The stringifier of an interface, https://webidl.spec.whatwg.org/#es-stringifier: an operation, which the
     implementation runs through its method to_string, or an attribute, whose getter method it runs."""
 
-    # Whether only a Window has the stringifier.
-    is_window_only: bool
+    # The condition on the realm under which the stringifier is exposed, if it names the globals that expose it.
+    exposure_condition: Optional[str]
     # The getter method of the attribute, for a stringifier that is an attribute.
     attribute_getter_method: Optional[str] = None
 
@@ -223,10 +238,12 @@ class RustIndexedPropertySetter:
 
 @dataclass
 class RustNamedProperties:
-    """The named property getter of an interface and its named property setter and deleter, if it has them, each of
-    which has an identifier: the operation of that identifier, whose method the legacy platform object algorithms call
-    as well, https://webidl.spec.whatwg.org/#idl-named-properties. The implementation gives its supported property names
-    through its method supported_property_names."""
+    """The named property getter of an interface and its named property setter and deleter, if it has them,
+    https://webidl.spec.whatwg.org/#idl-named-properties. One declared with an identifier is the operation of that
+    identifier, whose method the legacy platform object algorithms call as well. The implementation defines the steps of
+    one declared without an identifier as the methods determine_value_of_named_property(),
+    set_value_of_new_named_property() and set_value_of_existing_named_property(), or delete_existing_named_property().
+    The implementation gives its supported property names through its method supported_property_names()."""
 
     getter: RustOperation
     setter: Optional[RustOperation]
@@ -234,7 +251,12 @@ class RustNamedProperties:
 
     @property
     def operations(self) -> List[RustOperation]:
-        return [operation for operation in (self.getter, self.setter, self.deleter) if operation is not None]
+        """The operations declared with an identifier, which the interface prototype object holds as well."""
+        return [
+            operation
+            for operation in (self.getter, self.setter, self.deleter)
+            if operation is not None and operation.operation.name
+        ]
 
 
 @dataclass
@@ -316,6 +338,8 @@ class RustConstructor:
 class RustMembers:
     # The attributes and the operations that the implementation has methods for.
     attributes: List[RustAttribute] = field(default_factory=list)
+    # The static attributes, which the interface object has.
+    static_attributes: List[RustAttribute] = field(default_factory=list)
     operation_sets: List[RustOperationSet] = field(default_factory=list)
     # The static operations, which the interface object has.
     static_operation_sets: List[RustOperationSet] = field(default_factory=list)
@@ -394,7 +418,10 @@ def rust_members(interface: Interface) -> RustMembers:
         event handler."""
         if attribute.readonly or not attribute.name.startswith("on"):
             fail(f"its event handler IDL attribute {attribute.name} is not a plain attribute named on<event type>")
-        check_extended_attributes(attribute.name, attribute.extended_attributes, {"ImplementedAs", "SecureContext"})
+        check_extended_attributes(
+            attribute.name, attribute.extended_attributes, {"Exposed", "ImplementedAs", "SecureContext"}
+        )
+        check_exposure(attribute.name, attribute.extended_attributes)
         setter_method = None
         if "ImplementedAs" in attribute.extended_attributes:
             setter_method = method_of(attribute.name, attribute.extended_attributes)
@@ -404,8 +431,6 @@ def rust_members(interface: Interface) -> RustMembers:
     if interface.async_iterable is not None and interface.async_iterable.key_type is not None:
         fail("it has a pair asynchronously iterable declaration")
     has_value_iterator = interface.iterable is not None and interface.iterable.key_type is None
-    if interface.static_attributes:
-        fail("it has static attributes")
 
     members = RustMembers()
     if interface.async_iterable is not None:
@@ -459,23 +484,33 @@ def rust_members(interface: Interface) -> RustMembers:
             fail("its indexed property setter has an identifier, which the Rust bindings do not handle yet")
         members.indexed_property_setter = RustIndexedPropertySetter(setter.parameters[1])
 
-    def named_property_operation(special_operation: Optional[SpecialOperation], kind: str) -> Optional[RustOperation]:
+    def named_property_operation(
+        special_operation: Optional[SpecialOperation], kind: str, anonymous_method: str
+    ) -> Optional[RustOperation]:
         if special_operation is None:
             return None
-        if not special_operation.name:
-            fail(f"its named property {kind} has no identifier, which the Rust bindings do not handle yet")
-        check_extended_attributes(special_operation.name, special_operation.extended_attributes, {"ImplementedAs"})
         operation = Operation(
             special_operation.name,
             special_operation.return_type,
             special_operation.parameters,
             special_operation.extended_attributes,
         )
+        if not special_operation.name:
+            supported = set() if kind == "getter" else {"CEReactions"}
+            check_extended_attributes(f"its named property {kind}", special_operation.extended_attributes, supported)
+            return RustOperation(operation, anonymous_method)
+        check_extended_attributes(special_operation.name, special_operation.extended_attributes, {"ImplementedAs"})
         return RustOperation(operation, method_of(special_operation.name, special_operation.extended_attributes))
 
-    named_getter = named_property_operation(interface.named_property_getter, "getter")
-    named_setter = named_property_operation(interface.named_property_setter, "setter")
-    named_deleter = named_property_operation(interface.named_property_deleter, "deleter")
+    named_getter = named_property_operation(
+        interface.named_property_getter, "getter", "determine_value_of_named_property"
+    )
+    # NB: An anonymous setter has two methods, set_value_of_new_named_property() and
+    #     set_value_of_existing_named_property(), which the bindings name themselves.
+    named_setter = named_property_operation(interface.named_property_setter, "setter", "")
+    named_deleter = named_property_operation(
+        interface.named_property_deleter, "deleter", "delete_existing_named_property"
+    )
     if named_getter is None and (named_setter is not None or named_deleter is not None):
         fail("it has a named property setter or deleter and no named property getter")
     if named_getter is not None:
@@ -483,10 +518,10 @@ def rust_members(interface: Interface) -> RustMembers:
             fail("it supports both indexed and named properties, which the Rust bindings do not handle yet")
         if interface.parent_name:
             fail("it supports named properties and inherits from another interface")
-        if not named_getter.operation.return_type.nullable:
+        if named_getter.operation.name and not named_getter.operation.return_type.nullable:
             fail(
-                "its named property getter does not return a nullable type, by which the Rust bindings tell the "
-                "names that are not supported property names"
+                "its named property getter has an identifier and does not return a nullable type, by which the Rust "
+                "bindings tell the names that are not supported property names"
             )
         if named_deleter is not None and named_deleter.operation.return_type.name != "undefined":
             fail("its named property deleter returns a value, which the Rust bindings do not handle yet")
@@ -494,22 +529,28 @@ def rust_members(interface: Interface) -> RustMembers:
 
     def check_exposure(member_name: str, extended_attributes: dict) -> None:
         exposure = extended_attributes.get("Exposed")
-        if exposure is not None and exposure != SUPPORTED_MEMBER_EXPOSURE:
+        interface_exposure = interface.extended_attributes.get("Exposed", "")
+        if exposure is None or exposure.replace(" ", "") == interface_exposure.replace(" ", ""):
+            return
+        if exposure.replace(" ", "") not in MEMBER_EXPOSURE_CONDITIONS:
             fail(
-                f"{member_name} is [Exposed={exposure}], and the Rust bindings only handle [Exposed=Window] on members"
+                f"{member_name} is [Exposed={exposure}], and the Rust bindings only handle [Exposed=Window], "
+                "[Exposed=(Window,Worker)], or the exposure of the interface on members"
             )
 
     if interface.stringifier is not None:
         stringifier = interface.stringifier
-        check_extended_attributes(
-            "its stringifier", stringifier.extended_attributes, SUPPORTED_STRINGIFIER_EXTENDED_ATTRIBUTES
-        )
+        supported_attributes = SUPPORTED_STRINGIFIER_EXTENDED_ATTRIBUTES
+        if stringifier.attribute is not None:
+            # The attribute setter handles [CEReactions], including for a stringifier attribute.
+            supported_attributes = supported_attributes | {"CEReactions"}
+        check_extended_attributes("its stringifier", stringifier.extended_attributes, supported_attributes)
         check_exposure("its stringifier", stringifier.extended_attributes)
         attribute_getter_method = None
         if stringifier.attribute is not None:
             attribute_getter_method = method_of(stringifier.attribute.name, stringifier.attribute.extended_attributes)
         members.stringifier = RustStringifier(
-            stringifier.extended_attributes.get("Exposed") == SUPPORTED_MEMBER_EXPOSURE, attribute_getter_method
+            member_exposure_condition(stringifier.extended_attributes), attribute_getter_method
         )
 
     constructor_attributes = {"ImplementedAs"} if len(interface.constructors) > 1 else set()
@@ -539,6 +580,7 @@ def rust_members(interface: Interface) -> RustMembers:
         check_extended_attributes(
             attribute.name, attribute.extended_attributes, SUPPORTED_ATTRIBUTE_EXTENDED_ATTRIBUTES
         )
+        check_exposure(attribute.name, attribute.extended_attributes)
         if "FIXME" in attribute.extended_attributes:
             members.attributes_in_order.append(attribute.name)
             continue
@@ -554,6 +596,17 @@ def rust_members(interface: Interface) -> RustMembers:
             rust_attribute = RustAttribute(attribute, getter_method, setter_method)
         members.attributes.append(rust_attribute)
         members.attributes_in_order.append(rust_attribute)
+
+    for attribute in interface.static_attributes:
+        check_extended_attributes(
+            attribute.name, attribute.extended_attributes, SUPPORTED_ATTRIBUTE_EXTENDED_ATTRIBUTES - {"FIXME"}
+        )
+        check_exposure(attribute.name, attribute.extended_attributes)
+        if not attribute.readonly:
+            fail(f"its static attribute {attribute.name} is not read only, which the Rust bindings do not handle yet")
+        members.static_attributes.append(
+            RustAttribute(attribute, method_of(attribute.name, attribute.extended_attributes), None)
+        )
 
     def operation_sets(static: bool) -> List[RustOperationSet]:
         operations_of_interface = interface.static_operations if static else interface.regular_operations
@@ -647,6 +700,7 @@ def rust_members(interface: Interface) -> RustMembers:
 
     # NB: The spellings of a CSS descriptor or property are attributes with the same steps, which name the same methods.
     attribute_methods = {attribute.getter_method for attribute in members.attributes if attribute.event_type is None}
+    attribute_methods.update(attribute.getter_method for attribute in members.static_attributes)
     attribute_methods.update(
         attribute.setter_method for attribute in members.attributes if attribute.setter_method is not None
     )

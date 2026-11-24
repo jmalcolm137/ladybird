@@ -206,16 +206,6 @@ extern "C" void ladybird_release_unused_allocator_memory()
     ak_kmalloc_collect();
 }
 
-extern "C" void* ladybird_enter_scratch_heap()
-{
-    return ak_enter_scratch_heap();
-}
-
-extern "C" void ladybird_leave_scratch_heap(void* previous_heap)
-{
-    ak_leave_scratch_heap(previous_heap);
-}
-
 extern "C" void* ladybird_realloc(void* pointer, size_t old_size, size_t new_size, size_t alignment)
 {
     if (alignment <= alignof(max_align_t))
@@ -231,9 +221,4 @@ extern "C" void* ladybird_realloc(void* pointer, size_t old_size, size_t new_siz
 extern "C" void* ladybird_js_object_storage_alloc(size_t size)
 {
     return ak_kmalloc(HeapPartition::JSObjectStorage, size);
-}
-
-extern "C" void* ladybird_js_object_storage_realloc(void* pointer, size_t new_size)
-{
-    return ak_krealloc(HeapPartition::JSObjectStorage, pointer, new_size);
 }

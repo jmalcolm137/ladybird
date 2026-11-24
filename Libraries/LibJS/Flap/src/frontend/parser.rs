@@ -575,15 +575,11 @@ impl<'a> Parser<'a> {
             self.consume(TokenKind::Colon, "':'")?;
             self.consume(TokenKind::Colon, "':'")?;
             self.consume_keyword("Type")?;
-            Type::U32
+            Type::U8
         } else if matches!(
             name.as_str(),
-            "ArgumentsKind"
-                | "EnvironmentMode"
-                | "EnvironmentShapeCacheIndex"
-                | "FunctionNamePrefix"
+            "EnvironmentShapeCacheIndex"
                 | "IdentifierTableIndex"
-                | "IteratorHint"
                 | "ObjectPropertyIteratorCacheIndex"
                 | "ObjectShapeCacheIndex"
                 | "PropertyKeyTableIndex"
@@ -591,7 +587,10 @@ impl<'a> Parser<'a> {
                 | "TemplateObjectCacheIndex"
         ) {
             Type::U32
-        } else if name == "PutKind" {
+        } else if matches!(
+            name.as_str(),
+            "ArgumentsKind" | "EnvironmentMode" | "FunctionNamePrefix" | "IteratorHint" | "PutKind"
+        ) {
             Type::U8
         } else {
             let constructor = match name.as_str() {
@@ -619,7 +618,7 @@ impl<'a> Parser<'a> {
             self.advance();
             self.consume(TokenKind::RightBracket, "']'")?;
             if ty == Type::Operand {
-                ty = Type::U32;
+                ty = Type::U8;
             }
             ty = Type::Sequence(Box::new(ty));
         }

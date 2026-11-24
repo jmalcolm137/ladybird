@@ -4,18 +4,16 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-//! The tape of a 2D canvas: the records that a recorder writes for the commands of the canvas, and the entry points
-//! through which the compositor checks and reads a tape that it received.
+//! The tape of a 2D canvas: the records that a recorder writes for the commands of the canvas, and how the compositor
+//! reads a tape that it received.
 
 use super::builder::{append_record, for_each_command};
 use super::commands::*;
 use super::ffi_bytes::FfiBytes;
-use super::validate::validate_canvas_2d_tape;
 use libgfx_rust::{
     AffineTransform, CapStyle, Color, CompositingAndBlendingOperator, FloatPoint, FloatRect, IntPoint, JoinStyle,
     ScalingMode, WindingRule,
 };
-use std::ffi::c_void;
 
 /// The stops of a gradient, as parallel arrays of colors and positions.
 #[derive(Clone, Copy, Debug, Default)]
@@ -373,39 +371,11 @@ impl TapeWriter {
     }
 }
 
-/// Checks the tape of a segment of the canvas 2D stream that came from another process. Returns false with a static
-/// error message, whose address and size it writes, if the tape does not pass.
-#[unsafe(no_mangle)]
-pub extern "C" fn canvas_2d_tape_validate(
-    tape: ak::Span<'_, u8>,
-    error: &mut *const u8,
-    error_size: &mut usize,
-) -> bool {
-    match validate_canvas_2d_tape(tape.as_slice()) {
-        Ok(()) => true,
-        Err(message) => {
-            *error = message.as_ptr();
-            *error_size = message.len();
-            false
-        }
-    }
-}
-
-/// Calls `visit` with the type and the payload of each record of a tape that passed `canvas_2d_tape_validate`, in
-/// order.
-///
-/// # Safety
-/// `visit` runs synchronously and reads the payload only while it runs.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn canvas_2d_tape_for_each_command(
-    tape: ak::Span<'_, u8>,
-    context: *mut c_void,
-    visit: unsafe extern "C" fn(*mut c_void, DisplayListCommandType, ak::Span<'_, u8>),
-) {
-    for_each_command(tape.as_slice(), |header, _, payload| {
+/// Calls `play` with the type and the payload of each record of a tape that passed `validate_canvas_2d_tape`, in order.
+pub fn for_each_canvas_2d_command<'a>(tape: &'a [u8], mut play: impl FnMut(DisplayListCommandType, &'a [u8])) {
+    for_each_command(tape, |header, _, payload| {
         debug_assert!(header.command_type.is_canvas_2d());
-        // SAFETY: The caller reads the payload synchronously.
-        unsafe { visit(context, header.command_type, ak::Span::new(payload)) };
+        play(header.command_type, payload);
     });
 }
 
@@ -414,7 +384,8 @@ mod tests {
     use super::*;
     use crate::display_list::builder::{HEADER_SIZE, read_command, read_header};
     use crate::display_list::nested_records::span_bytes;
-    use crate::display_list::storage::write_run;
+    use crate::display_list::storage::write_run_with_zeroed_padding;
+    use crate::display_list::validate::validate_canvas_2d_tape;
     use crate::display_list::validate::validate_tape;
     use libgfx_rust::IntRect;
 
@@ -454,7 +425,6 @@ mod tests {
         );
         assert_eq!(validate_canvas_2d_tape(writer.bytes()), Ok(()));
         let header = read_header(writer.bytes());
-        assert!(!header.has_bounding_rect);
         assert_eq!(header.inline_clip_count, 0);
         let records = records(writer.bytes());
         assert_eq!(records.len(), 1);
@@ -587,7 +557,7 @@ mod tests {
         let mut writer = TapeWriter::default();
         writer.save();
         let mut run_bytes = vec![0u8; size_of::<DisplayListCommandRun>()];
-        write_run(
+        write_run_with_zeroed_padding(
             &DisplayListCommandRun {
                 offset: 0,
                 size: u32::try_from(writer.bytes().len()).unwrap(),
@@ -686,20 +656,6 @@ mod tests {
             );
             assert_eq!(validate_canvas_2d_tape(writer.bytes()), expected);
         }
-    }
-
-    #[test]
-    fn a_command_with_a_bounding_rect_is_rejected() {
-        let mut writer = TapeWriter::default();
-        writer.save();
-        writer.clear_rect(FloatRect::new(0.0, 0.0, 1.0, 1.0), Color(0));
-        let mut tape = writer.bytes().to_vec();
-        let second_record = read_header(&tape).payload_size as usize + HEADER_SIZE;
-        tape[second_record + std::mem::offset_of!(DisplayListCommandHeader, has_bounding_rect)] = 1;
-        assert_eq!(
-            validate_canvas_2d_tape(&tape),
-            Err("Canvas 2D stream command has a bounding rect")
-        );
     }
 
     #[test]

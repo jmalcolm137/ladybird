@@ -15,6 +15,7 @@ use crate::interpreter::vm::Vm;
 use crate::layout::cell::Gc;
 use crate::layout::object::Object;
 use crate::layout::value::Value;
+use crate::runtime::abstract_operations::preserve_identity_of_value_held_weakly;
 use crate::runtime::object::{MayInterfereWithIndexedPropertyAccess, ORDINARY_OBJECT_METHODS, define_object_class};
 use crate::runtime::realm::Realm;
 
@@ -30,7 +31,7 @@ pub struct WeakRef {
 
 // SAFETY: Visits the target while the execution generation it was last used in is current, which keeps it alive for
 // the rest of the job as AddToKeptObjects does. Otherwise it is held weakly, and remove_dead_cells() forgets it once
-// it dies.
+// it dies, or hands its slot to a collection that moves cells.
 unsafe impl Trace for WeakRef {
     fn trace(&self, visitor: &mut Visitor) {
         self.base.trace(visitor);
@@ -38,7 +39,7 @@ unsafe impl Trace for WeakRef {
         // SAFETY: The VM owns the heap and destroys it before anything else, so it outlives every WeakRef.
         let execution_generation = unsafe { self.vm_execution_generation.as_ref() }.get();
         if execution_generation == self.last_execution_generation.get() {
-            self.value.get().trace(visitor);
+            self.value.trace(visitor);
         }
     }
 }
@@ -52,6 +53,7 @@ impl WeakRef {
     /// A WeakRef to `value`, an object or a symbol.
     pub fn new(vm: &Vm, realm: Gc<Realm>, value: Value, prototype: Gc<Object>) -> WeakRef {
         assert!(value.is_object() || value.is_symbol());
+        preserve_identity_of_value_held_weakly(value);
         WeakRef {
             base: Object::new_with_prototype(
                 vm,
@@ -93,10 +95,13 @@ impl WeakRef {
             .expect("the weak container is a WeakRef");
         let value = weak_ref.value.get();
         let is_alive = value.is_empty() || !sweep.is_dead(value.as_cell());
-        if is_alive {
+        if !is_alive {
+            weak_ref.value.set(Value::EMPTY);
             return;
         }
-
-        weak_ref.value.set(Value::EMPTY);
+        if sweep.moves_cells() {
+            // SAFETY: The slot is in the WeakRef, which nothing changes until the collection is over.
+            unsafe { sweep.record_value_slot(&*weak_ref.value.as_ptr()) };
+        }
     }
 }

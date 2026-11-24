@@ -18,6 +18,8 @@ use std::os::fd::OwnedFd as OwnedDescriptor;
 
 use crate::attachment::Attachment;
 
+pub use libipc_rust_macros::{Decode, Encode};
+
 #[derive(Debug)]
 pub enum EncodeError {
     SizeTooLarge(usize),
@@ -100,10 +102,12 @@ impl Encoder {
         value.encode_owned(self)
     }
 
+    #[inline]
     pub fn append_bytes(&mut self, bytes: &[u8]) {
         self.bytes.extend_from_slice(bytes);
     }
 
+    #[inline]
     pub fn encode_size(&mut self, size: usize) -> Result<(), EncodeError> {
         let size = u32::try_from(size).map_err(|_| EncodeError::SizeTooLarge(size))?;
         self.append_bytes(&size.to_ne_bytes());
@@ -140,6 +144,7 @@ impl<'a> Decoder<'a> {
         T::decode(self)
     }
 
+    #[inline]
     pub fn read_bytes(&mut self, count: usize) -> Result<&'a [u8], DecodeError> {
         let end = self.position.checked_add(count).ok_or(DecodeError::UnexpectedEnd)?;
         let bytes = self.bytes.get(self.position..end).ok_or(DecodeError::UnexpectedEnd)?;
@@ -147,6 +152,7 @@ impl<'a> Decoder<'a> {
         Ok(bytes)
     }
 
+    #[inline]
     pub fn decode_size(&mut self) -> Result<usize, DecodeError> {
         let max_size = std::mem::replace(&mut self.max_size_of_next_value, usize::MAX);
         let size = self.decode::<u32>()? as usize;
@@ -191,6 +197,7 @@ macro_rules! impl_number {
     ($($type:ty),*) => {
         $(
             impl Encode for $type {
+                #[inline]
                 fn encode(&self, encoder: &mut Encoder) -> Result<(), EncodeError> {
                     encoder.append_bytes(&self.to_ne_bytes());
                     Ok(())
@@ -213,6 +220,7 @@ macro_rules! impl_number {
             impl Decode for $type {
                 const MIN_ENCODED_SIZE: usize = size_of::<$type>();
 
+                #[inline]
                 fn decode(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
                     let bytes = decoder.read_bytes(size_of::<$type>())?;
                     Ok(<$type>::from_ne_bytes(bytes.try_into().map_err(|_| DecodeError::UnexpectedEnd)?))
@@ -233,6 +241,7 @@ macro_rules! impl_number {
 impl_number!(u16, u32, u64, i8, i16, i32, i64, f32, f64);
 
 impl Encode for u8 {
+    #[inline]
     fn encode(&self, encoder: &mut Encoder) -> Result<(), EncodeError> {
         encoder.append_bytes(&[*self]);
         Ok(())
@@ -251,6 +260,7 @@ impl Encode for u8 {
 impl Decode for u8 {
     const MIN_ENCODED_SIZE: usize = 1;
 
+    #[inline]
     fn decode(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
         Ok(decoder.read_bytes(1)?[0])
     }
@@ -262,6 +272,7 @@ impl Decode for u8 {
 
 // NB: A size_t encodes as the 64-bit number it is on every target Ladybird supports.
 impl Encode for usize {
+    #[inline]
     fn encode(&self, encoder: &mut Encoder) -> Result<(), EncodeError> {
         (*self as u64).encode(encoder)
     }
@@ -270,6 +281,7 @@ impl Encode for usize {
 impl Decode for usize {
     const MIN_ENCODED_SIZE: usize = 8;
 
+    #[inline]
     fn decode(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
         usize::try_from(decoder.decode::<u64>()?).map_err(|_| DecodeError::InvalidValue("size_t"))
     }
@@ -287,6 +299,7 @@ impl Decode for usize {
 }
 
 impl Encode for bool {
+    #[inline]
     fn encode(&self, encoder: &mut Encoder) -> Result<(), EncodeError> {
         u8::from(*self).encode(encoder)
     }
@@ -295,6 +308,7 @@ impl Encode for bool {
 impl Decode for bool {
     const MIN_ENCODED_SIZE: usize = 1;
 
+    #[inline]
     fn decode(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
         match decoder.decode::<u8>()? {
             0 => Ok(false),
@@ -575,6 +589,53 @@ impl<T: Decode> Decode for Option<T> {
     }
 }
 
+/// A boxed value goes as the value.
+impl<T: Encode + ?Sized> Encode for Box<T> {
+    fn encode(&self, encoder: &mut Encoder) -> Result<(), EncodeError> {
+        (**self).encode(encoder)
+    }
+}
+
+impl<T: Decode> Decode for Box<T> {
+    const MIN_ENCODED_SIZE: usize = T::MIN_ENCODED_SIZE;
+
+    fn decode(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+        Ok(Self::new(decoder.decode()?))
+    }
+}
+
+/// A shared value goes as the value, and decodes to one of its own.
+impl<T: Encode + ?Sized> Encode for std::sync::Arc<T> {
+    fn encode(&self, encoder: &mut Encoder) -> Result<(), EncodeError> {
+        (**self).encode(encoder)
+    }
+}
+
+impl<T: Decode> Decode for std::sync::Arc<T> {
+    const MIN_ENCODED_SIZE: usize = T::MIN_ENCODED_SIZE;
+
+    fn decode(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+        Ok(Self::new(decoder.decode()?))
+    }
+}
+
+/// A shared or boxed slice goes as a `Vector` and decodes to one of its own.
+impl<T: Decode> Decode for std::sync::Arc<[T]> {
+    const MIN_ENCODED_SIZE: usize = Vec::<T>::MIN_ENCODED_SIZE;
+
+    fn decode(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+        Ok(decoder.decode::<Vec<T>>()?.into())
+    }
+}
+
+impl<T: Decode> Decode for Box<[T]> {
+    const MIN_ENCODED_SIZE: usize = Vec::<T>::MIN_ENCODED_SIZE;
+
+    fn decode(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+        Ok(decoder.decode::<Vec<T>>()?.into_boxed_slice())
+    }
+}
+
 /// `IPC::File`: a file descriptor, which goes as an attachment.
 #[derive(Debug)]
 pub struct File(pub OwnedDescriptor);
@@ -629,9 +690,47 @@ pub trait EndpointMessage: Encode {
     }
 }
 
+/// A synchronous message, and the message that answers it.
+pub trait SyncMessage: EndpointMessage {
+    type Response: EndpointMessage + Decode;
+}
+
 /// Reads the endpoint magic number and message ID that a message starts with.
 pub fn decode_message_header(decoder: &mut Decoder<'_>) -> Result<(u32, i32), DecodeError> {
     Ok((decoder.decode()?, decoder.decode()?))
+}
+
+/// A message as it goes to a transport: its bytes, which start with its header, and its attachments.
+pub type EncodedMessage = (Vec<u8>, Vec<Attachment>);
+
+/// What a peer did that it must not do, for which its connection is closed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Misbehavior(pub &'static str);
+
+/// Why the stub of an endpoint did not get to answer a message.
+#[derive(Debug)]
+pub enum DispatchError {
+    Decode(DecodeError),
+    Misbehavior(Misbehavior),
+    EncodeResponse(EncodeError),
+}
+
+impl From<DecodeError> for DispatchError {
+    fn from(error: DecodeError) -> Self {
+        Self::Decode(error)
+    }
+}
+
+impl From<Misbehavior> for DispatchError {
+    fn from(misbehavior: Misbehavior) -> Self {
+        Self::Misbehavior(misbehavior)
+    }
+}
+
+impl From<EncodeError> for DispatchError {
+    fn from(error: EncodeError) -> Self {
+        Self::EncodeResponse(error)
+    }
 }
 
 #[cfg(all(test, unix))]
@@ -805,6 +904,26 @@ mod tests {
     }
 
     #[test]
+    fn boxed_values_go_as_their_values() {
+        let value: Option<Box<[u8; 3]>> = Some(Box::new([1, 2, 3]));
+        let (decoded, bytes) = round_trip(&value);
+        assert_eq!(decoded, value);
+        assert_eq!(bytes, round_trip(&Some([1u8, 2, 3])).1);
+    }
+
+    #[test]
+    fn shared_values_go_as_their_values() {
+        let value = std::sync::Arc::new(vec![1u16, 2, 3]);
+        let (decoded, bytes) = round_trip(&value);
+        assert_eq!(decoded, value);
+        assert_eq!(bytes, round_trip(&*value).1);
+        let shared_slice: std::sync::Arc<[u16]> = std::sync::Arc::from(vec![1u16, 2, 3]);
+        let mut encoder = Encoder::new();
+        encoder.encode(&shared_slice).unwrap();
+        assert_eq!(encoder.finish().0, bytes);
+    }
+
+    #[test]
     fn large_byte_buffers_go_as_their_size_and_bytes() {
         let buffer: Vec<u8> = (0..64 * 1024 * 1024 + 1).map(|index| index as u8).collect();
         let (decoded, bytes) = round_trip(&buffer);
@@ -895,6 +1014,201 @@ mod tests {
         let decoded = Decoder::new(&bytes, []).decode::<Vec<LargeValue>>().unwrap();
         assert_eq!(decoded.capacity(), 1);
         assert_eq!(decoded[0].0[0], 0);
+    }
+
+    #[derive(Debug, PartialEq, Encode, Decode)]
+    struct Point {
+        x: i32,
+        y: u8,
+    }
+
+    #[derive(Debug, PartialEq, Encode, Decode)]
+    struct Wrapper(u16, Option<Point>);
+
+    #[derive(Debug, PartialEq, Encode, Decode)]
+    struct Nothing;
+
+    #[derive(Debug, PartialEq, Encode, Decode)]
+    struct Pair<T> {
+        first: T,
+        second: T,
+    }
+
+    #[test]
+    fn derived_structs_go_as_their_fields_in_order() {
+        let point = Point { x: -2, y: 7 };
+        let (decoded, bytes) = round_trip(&point);
+        assert_eq!(decoded, point);
+        let mut expected = (-2i32).to_ne_bytes().to_vec();
+        expected.push(7);
+        assert_eq!(bytes, expected);
+        assert_eq!(Point::MIN_ENCODED_SIZE, 5);
+
+        let wrapper = Wrapper(3, Some(Point { x: 1, y: 2 }));
+        let (decoded, bytes) = round_trip(&wrapper);
+        assert_eq!(decoded, wrapper);
+        assert_eq!(bytes[..3], [3u16.to_ne_bytes()[0], 3u16.to_ne_bytes()[1], 1]);
+        assert_eq!(bytes.len(), 2 + 1 + 5);
+        assert_eq!(Wrapper::MIN_ENCODED_SIZE, 3);
+
+        assert!(round_trip(&Nothing).1.is_empty());
+        assert_eq!(Nothing::MIN_ENCODED_SIZE, 0);
+
+        let pair = Pair { first: 1u32, second: 2 };
+        assert_eq!(round_trip(&pair).0, pair);
+        assert_eq!(Pair::<u32>::MIN_ENCODED_SIZE, 8);
+    }
+
+    #[derive(Debug, PartialEq, Encode, Decode)]
+    #[ipc(validate = Self::validate)]
+    struct Record {
+        #[ipc(max_size = 4)]
+        name: String,
+        count: u32,
+        #[ipc(skip = 42)]
+        local: u64,
+    }
+
+    impl Record {
+        fn validate(&self) -> Result<(), &'static str> {
+            if self.count == 0 {
+                return Err("Record::count");
+            }
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn derived_fields_can_be_skipped_bounded_and_validated() {
+        let record = |count, local| Record {
+            name: "abc".into(),
+            count,
+            local,
+        };
+        let (decoded, bytes) = round_trip(&record(1, 7));
+        assert_eq!(decoded, record(1, 42));
+        assert_eq!(bytes.len(), 4 + 3 + 4);
+        assert_eq!(Record::MIN_ENCODED_SIZE, 8);
+
+        let mut encoder = Encoder::new();
+        assert!(matches!(
+            encoder.encode(&record(0, 0)),
+            Err(EncodeError::InvalidValue("Record::count"))
+        ));
+        assert!(matches!(
+            encoder.encode_owned(record(0, 0)),
+            Err(EncodeError::InvalidValue("Record::count"))
+        ));
+        assert!(encoder.finish().0.is_empty());
+
+        for (name, count, error) in [
+            ("abc", 0u32, DecodeError::InvalidValue("Record::count")),
+            ("abcde", 1, DecodeError::SizeTooLarge(5)),
+        ] {
+            let mut encoder = Encoder::new();
+            encoder.encode(name).unwrap();
+            encoder.encode(&count).unwrap();
+            assert_eq!(Decoder::new(&encoder.finish().0, []).decode::<Record>(), Err(error));
+        }
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Encode, Decode)]
+    #[repr(i16)]
+    enum Key {
+        Escape = 27,
+        Space = 32,
+        Minus = -1,
+    }
+
+    #[test]
+    fn derived_enums_of_unit_variants_go_as_their_repr() {
+        let (decoded, bytes) = round_trip(&Key::Space);
+        assert_eq!(decoded, Key::Space);
+        assert_eq!(bytes, 32i16.to_ne_bytes());
+        assert_eq!(round_trip(&Key::Escape).0, Key::Escape);
+        assert_eq!(round_trip(&Key::Minus).0, Key::Minus);
+        assert_eq!(Key::MIN_ENCODED_SIZE, 2);
+        assert_eq!(
+            Decoder::new(&28i16.to_ne_bytes(), []).decode::<Key>(),
+            Err(DecodeError::InvalidValue("Key"))
+        );
+    }
+
+    #[derive(Debug, PartialEq, Encode, Decode)]
+    enum Shape {
+        Empty,
+        Circle(u8),
+        Rectangle { width: u16, height: u16 },
+    }
+
+    #[test]
+    fn other_derived_enums_go_as_their_variant_index_and_fields() {
+        assert_eq!(round_trip(&Shape::Empty).1, [0]);
+        let (decoded, bytes) = round_trip(&Shape::Circle(9));
+        assert_eq!(decoded, Shape::Circle(9));
+        assert_eq!(bytes, [1, 9]);
+        let rectangle = Shape::Rectangle { width: 3, height: 4 };
+        let (decoded, bytes) = round_trip(&rectangle);
+        assert_eq!(decoded, rectangle);
+        let mut expected = vec![2];
+        expected.extend_from_slice(&3u16.to_ne_bytes());
+        expected.extend_from_slice(&4u16.to_ne_bytes());
+        assert_eq!(bytes, expected);
+        assert_eq!(Shape::MIN_ENCODED_SIZE, 1);
+        assert_eq!(
+            Decoder::new(&[3], []).decode::<Shape>(),
+            Err(DecodeError::InvalidValue("Shape"))
+        );
+    }
+
+    #[derive(Encode, Decode)]
+    struct CarriedFile {
+        before: u8,
+        file: File,
+    }
+
+    #[derive(Encode, Decode)]
+    enum MaybeFile {
+        Absent,
+        Present(CarriedFile),
+    }
+
+    #[test]
+    fn derived_types_move_their_files_when_owned() {
+        use std::os::fd::AsRawFd;
+        let (mut reader, writer) = std::io::pipe().unwrap();
+        let descriptor = writer.as_raw_fd();
+        let files = vec![
+            MaybeFile::Absent,
+            MaybeFile::Present(CarriedFile {
+                before: 1,
+                file: File(OwnedFd::from(writer)),
+            }),
+        ];
+        let mut encoder = Encoder::new();
+        encoder.encode_owned(files).unwrap();
+        let (bytes, attachments) = encoder.finish();
+        assert_eq!(attachments.len(), 1);
+        let files = Decoder::new(&bytes, attachments).decode::<Vec<MaybeFile>>().unwrap();
+        let [MaybeFile::Absent, MaybeFile::Present(CarriedFile { before: 1, file })] = files.as_slice() else {
+            panic!("the files decode as they were encoded");
+        };
+        #[cfg(not(target_vendor = "apple"))]
+        assert_eq!(file.0.as_raw_fd(), descriptor);
+        #[cfg(target_vendor = "apple")]
+        let _ = (file, descriptor);
+        drop(files);
+        assert_eq!(std::io::Read::read(&mut reader, &mut [0]).unwrap(), 0);
+    }
+
+    #[test]
+    fn shared_and_boxed_slices_go_as_vectors() {
+        let shared: std::sync::Arc<[u16]> = std::sync::Arc::from(vec![1u16, 2, 3]);
+        let (decoded, bytes) = round_trip(&shared);
+        assert_eq!(decoded, shared);
+        assert_eq!(bytes, round_trip(&vec![1u16, 2, 3]).1);
+        let boxed: Box<[String]> = vec!["a".to_string()].into_boxed_slice();
+        assert_eq!(round_trip(&boxed).0, boxed);
     }
 
     #[test]

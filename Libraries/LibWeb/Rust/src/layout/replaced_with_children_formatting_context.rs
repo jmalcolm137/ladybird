@@ -6,7 +6,23 @@
 
 use super::*;
 
-pub(super) fn layout_replaced_with_children(
+/// The formatting context of a replaced box with children, whose shadow content lays out in an anonymous wrapper.
+#[derive(Default)]
+pub(crate) struct ReplacedWithChildrenFormattingContext;
+
+impl<'pass> formatting_context::FormattingContextAlgorithm<'pass> for ReplacedWithChildrenFormattingContext {
+    fn lay_out(
+        &mut self,
+        run: &formatting_context::FormattingContextRun<'pass>,
+        input: formatting_context::AlgorithmInput<'_>,
+    ) -> formatting_context::AlgorithmOutput {
+        let mut root = input.root_cells;
+        let result = layout_replaced_with_children(run, input.body_input, &mut root);
+        formatting_context::AlgorithmOutput::of_root(result, root)
+    }
+}
+
+fn layout_replaced_with_children(
     run: &formatting_context::FormattingContextRun,
     layout_input: geometry::LayoutInput,
     root: &mut used_values::RootInputCells,
@@ -40,16 +56,10 @@ pub(super) fn layout_replaced_with_children(
     let mut wrapper_cells = used_values::cells_before_sizing(&run.pass, wrapper, wrapper_constraints);
     wrapper_cells.set_content_inline_size(content_inline_size);
 
-    let wrapper_outcome = formatting_context::run_formatting_context(
-        run.fragments.is_some(),
-        wrapper_cells,
-        wrapper,
-        run.pass.in_flow_containing_block(wrapper),
-        None,
-        formatting_context::FormattingContextType::Block,
-        run.should_collect_devtools_layout_data,
-        run.pass,
-        geometry::LayoutInput {
+    let plan = formatting_context::ChildRunPlan {
+        fc_type: formatting_context::FormattingContextType::Block,
+        root_containing_block: run.pass.in_flow_containing_block(wrapper),
+        input: geometry::LayoutInput {
             available_space: child_available_space,
             containing_block_constraints: wrapper_constraints,
             sizing: geometry::RootSizingDirectives {
@@ -58,24 +68,21 @@ pub(super) fn layout_replaced_with_children(
             },
             participation: geometry::ParticipationInParentFormattingContext::Item,
         },
-        None,
-    );
-    let formatting_context::ChildLayoutOutcome::Created(wrapper_result) = wrapper_outcome.outcome else {
-        unreachable!("a run creates its root's result");
     };
-    formatting_context::propagate_percentage_block_size_dependency_to_containing_block(
-        run.state,
-        &run.pass,
-        wrapper,
-        wrapper_result.depends_on_percentage_block_size,
+    let wrapper_outcome = formatting_context::run_formatting_context(
+        run.pass,
+        formatting_context::RunRequest::of_child(run, wrapper, plan, wrapper_cells),
+        formatting_context::RunSideInputs::default(),
     );
+    let wrapper_result = *wrapper_outcome.result().expect("a run creates its root's result");
+    wrapper_outcome.report_percentage_block_size_dependency_of(run, wrapper);
     formatting_context::place_child(
         run,
         wrapper,
         wrapper_outcome.placed_child(),
         used_values::FfiCssPixelPoint::default(),
         None,
-        wrapper_outcome.fragment_arrival,
+        wrapper_outcome.into_fragment_arrival(run),
     );
 
     formatting_context::ChildLayoutResult {

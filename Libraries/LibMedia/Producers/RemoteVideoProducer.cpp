@@ -12,6 +12,7 @@ namespace Media {
 NonnullRefPtr<RemoteVideoProducer> RemoteVideoProducer::create(Delegates delegates)
 {
     VERIFY(delegates.request_start);
+    VERIFY(delegates.request_suspend);
     VERIFY(delegates.request_seek);
     return adopt_ref(*new RemoteVideoProducer(move(delegates)));
 }
@@ -42,10 +43,11 @@ void RemoteVideoProducer::receive_frame(u64 lend_id, u32 seek_id, NonnullRefPtr<
     m_wake_handler.dispatch();
 }
 
-void RemoteVideoProducer::receive_status(PipelineStatus status, u32 seek_id)
+void RemoteVideoProducer::receive_status(PipelineStatus status, u32 seek_id, PipelineCheckpoint checkpoint)
 {
     if (m_has_stopped_consuming)
         return;
+    m_checkpoint = max(m_checkpoint, checkpoint);
     // A peer can send any value for the status.
     if (to_underlying(status) > to_underlying(PipelineStatus::Error))
         status = PipelineStatus::Error;
@@ -67,6 +69,11 @@ void RemoteVideoProducer::notify_clock_resumed()
 void RemoteVideoProducer::start()
 {
     m_delegates.request_start();
+}
+
+void RemoteVideoProducer::suspend()
+{
+    m_delegates.request_suspend();
 }
 
 void RemoteVideoProducer::set_wake_handler(PipelineWakeHandler handler)
@@ -105,12 +112,12 @@ bool RemoteVideoProducer::can_satisfy_seek_locally(AK::Duration timestamp) const
 VideoProducerOutput RemoteVideoProducer::peek()
 {
     if (m_has_stopped_consuming)
-        return { nullptr, PipelineStatus::Pending };
+        return { nullptr, PipelineStatus::Pending, m_checkpoint };
     if (!m_queued_frames.is_empty())
-        return { m_queued_frames.first(), PipelineStatus::HaveData };
+        return { m_queued_frames.first(), PipelineStatus::HaveData, m_checkpoint };
     if (!m_status.has_value() || m_status->seek_id != m_expected_seek_id)
-        return { nullptr, PipelineStatus::Pending };
-    return { nullptr, m_status->status };
+        return { nullptr, PipelineStatus::Pending, m_checkpoint };
+    return { nullptr, m_status->status, m_checkpoint };
 }
 
 void RemoteVideoProducer::consume()

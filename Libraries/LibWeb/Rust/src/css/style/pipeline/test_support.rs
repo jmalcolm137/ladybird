@@ -32,7 +32,9 @@ unsafe extern "C" fn resolve_font(
         font_cascade_list: FfiHostHandle::from_pointer(std::ptr::dangling()),
         ascent: 12.0,
         descent: 4.0,
+        line_gap: 0.0,
         x_height: 8.0,
+        cap_height: 11.0,
         zero_advance: 8.0,
         font_size_adjust_from_font: 0.0,
     }
@@ -271,7 +273,7 @@ pub(super) fn add_sheet_with_origin(engine: &mut StyleEngine, scope: TreeScopeID
 
 /// A style rule parsed as the host parses a sheet's: its selectors and its declarations.
 pub(super) struct ParsedRule {
-    selectors: Arc<crate::css::selector_parser::RustParsedSelectorList>,
+    selectors: crate::css::selector_parser::RustParsedSelectorList,
     pub(super) declarations: crate::css::declaration_block::SharedDeclarationBlock,
 }
 
@@ -351,8 +353,9 @@ pub(super) fn add_user_agent_sheet(engine: &mut StyleEngine, source: &str) -> (S
 
 /// Take a style update and every later wave of its pass, as the host does when it installs
 /// each wave; nothing is installed here. The engine, where it owns the document, restyles what
-/// the transaction changed as it does.
+/// the transaction changed as it does. The style trace holds the passes of this update only.
 pub(super) fn run_style_update(engine: &mut StyleEngine, root: StyleNodeID) {
+    engine.retained.live_counters.begin_trace();
     engine.run_style_update(root, |_| {});
 }
 

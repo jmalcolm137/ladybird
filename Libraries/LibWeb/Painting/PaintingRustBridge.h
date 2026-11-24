@@ -7,14 +7,13 @@
 #pragma once
 
 #include <AK/Types.h>
-#include <LibCompositing/DisplayList/AccumulatedVisualContext.h>
-#include <LibCompositing/DisplayList/DisplayListResourceStorage.h>
 #include <LibWeb/CSS/StyleValues/AbstractImageStyleValue.h>
 #include <LibWeb/Compositor/NavigablePresenter.h>
 #include <LibWeb/Export.h>
 #include <LibWeb/Forward.h>
 #include <LibWeb/HTML/PaintConfig.h>
 #include <LibWeb/Layout/LayoutRustFFI.h>
+#include <LibWeb/Painting/DisplayListDumpOptions.h>
 #include <LibWeb/Painting/DisplayListRecording.h>
 #include <LibWeb/Painting/DocumentPaintState.h>
 #include <LibWeb/Painting/FlexboxInspectorOverlay.h>
@@ -23,6 +22,7 @@
 
 namespace Web::Compositor {
 
+class CompositorHost;
 struct FlightPresentation;
 
 }
@@ -35,13 +35,10 @@ struct ImagePaintRequest;
 WEB_API void dump_stacking_context_tree(Layout::BegunRead const&, StringBuilder&, DOM::Document const&);
 WEB_API void dump_layout_tree(StringBuilder&, Layout::Node const&, bool interactive);
 
-WEB_API Layout::RustFFI::FfiVisualContextUpdateOutcome rust_update_accumulated_visual_contexts(Layout::BegunRead const&, DOM::Document&);
-WEB_API Vector<u32> rust_owned_visual_context_node_indices(Layout::Node const&, Layout::RustFFI::FfiVisualContextBoxNodeList);
+WEB_API Compositing::RustFFI::FfiVisualContextTreeInputs visual_context_tree_inputs(DOM::Document&);
 WEB_API bool rust_background_color_can_be_compositor_animated(Layout::Node const&);
-WEB_API void const* retain_rust_main_visual_context_tree(Layout::BegunRead const&, DOM::Document const&);
 WEB_API Layout::RustFFI::FfiPhysicalOverflowDirections rust_physical_overflow_directions(Layout::Node const&);
 WEB_API void register_geometry_host(Layout::NodeArena&);
-WEB_API Layout::RustFFI::FfiRenderingPreparationOutcome rust_prepare_for_rendering(Layout::BegunRead const&, DOM::Document&, bool visual_context_update_pending);
 WEB_API void rust_update_visual_viewport_transform(Layout::BegunRead const&, DOM::Document&);
 struct InspectorOverlayInputs {
     Layout::Node const* highlighted_layout_node { nullptr };
@@ -61,28 +58,39 @@ struct InspectorOverlayInputs {
     Optional<CSSPixelRect> caret_debug_rect;
 };
 
-// Starts recording the document's viewport against `visual_context_tree`, unless it has no box to record. The recording
-// flies where `blocker` is none, and takes `flight`, if any, to present its frame with beside the event loop.
-// Records the document's viewport for the host to publish, or, given `committed`, the presentation of the navigable's
-// next frame, commits the frame to the render owner, which presents it beside the event loop.
-WEB_API Optional<DisplayListRecording> start_rust_display_list_recording(Layout::BegunRead const&, DOM::Document&, Compositing::AccumulatedVisualContextTree, Optional<Gfx::Color> surface_clear_color, PaintCommandCacheMode, HTML::PaintConfig const&, InspectorOverlayInputs const&, Optional<Compositor::FlightPresentation> committed = {});
+// Starts recording the document's viewport against its visual context tree, of the structural epoch given, unless it has
+// no box to record. Records the document's viewport for the host to publish, or, given `committed`, the presentation of
+// the navigable's next frame, commits the frame to the render owner, which presents it beside the event loop.
+WEB_API Optional<DisplayListRecording> start_rust_display_list_recording(Layout::BegunRead const&, DOM::Document&, u64 visual_context_tree_structural_epoch, Optional<Gfx::Color> surface_clear_color, PaintCommandCacheMode, HTML::PaintConfig const&, InspectorOverlayInputs const&, Optional<Compositor::FlightPresentation> committed = {});
 // Commits the navigable's next frame, which keeps the display list the compositor has, to the render owner, which
 // presents it with `presentation` beside the event loop.
 WEB_API void commit_unrecorded_frame(Layout::BegunRead const&, DOM::Document&, Compositor::FlightPresentation presentation);
-// Renders the SVG images of the committed frame of `recording` that waits for them, which only the main thread renders,
-// into a resource storage of their own, and hands the frame back to the Paint thread, which presents it with them.
-WEB_API void render_vector_images(Layout::BegunRead const&, DOM::Document&, DisplayListRecording const& recording);
-// Publishes the recording, which has landed and stands, and makes its display list from what was sealed where it began.
-WEB_API RefPtr<Compositing::DisplayList> finish_rust_display_list_recording(Layout::BegunRead const&, DOM::Document&, DisplayListRecording const&, Compositing::DisplayListResourceStorage&);
+// Renders the SVG images of the document's committed frame that waits for them, which only the main thread renders, and
+// hands the frame back to the Paint thread, which presents it with them.
+WEB_API void render_vector_images(Layout::BegunRead const&, DOM::Document&);
+// Publishes the recording, which has landed and stands.
+WEB_API void publish_rust_display_list_recording(Layout::BegunRead const&, DOM::Document&);
 // Hands the document the trace the recording it took in last left, if it left one.
 WEB_API void take_recording_trace_if_pending(Layout::BegunRead const&, DOM::Document&);
-// Makes the display list of `recording`, published as `presented` says, from what the recording sealed where it began.
-// Reads no document, so it runs wherever the recording is published.
-WEB_API NonnullRefPtr<Compositing::DisplayList> display_list_of_published_recording(DisplayListRecording const&, Layout::RustFFI::FfiPresentedRecording const&);
-WEB_API Utf16String serialize_painting_dump(Layout::BegunRead const&, DOM::Document const&, Compositing::AccumulatedVisualContextTree const&, Compositing::DisplayList const&, Compositing::DisplayListResourceStorage const&);
+// Dumps the display list the document recorded last.
+WEB_API Utf16String serialize_painting_dump(Layout::BegunRead const&, DOM::Document const&, DisplayListDumpOptions const&);
+WEB_API Utf16String display_list_dump_changes(Optional<StringView> previous_jsonl, StringView jsonl);
 
-WEB_API Compositing::DisplayListResource record_image_paint_display_list(ImagePaint const&, ImagePaintRequest const&, double device_pixels_per_css_pixel);
-// Records one image frame drawn into the destination rectangle, in device pixels.
-WEB_API Compositing::DisplayListResource record_image_frame_display_list(Gfx::DecodedImageFrame const&, Gfx::FloatRect const& dest_rect, Gfx::ScalingMode, Compositing::DisplayListResourceStorage&);
+struct OwnersOfVisualContextNodes {
+    // Zero for a document without a visual context tree.
+    u64 structural_epoch { 0 };
+    // By the position of each node among the spatial nodes and then the effect nodes asked of, empty for a node without
+    // a live owner.
+    Vector<String> owners;
+};
+// Describes the boxes that own the nodes of the document's visual context tree, as the boxes describe themselves.
+WEB_API OwnersOfVisualContextNodes describe_owners_of_visual_context_nodes(DOM::Document const&, ReadonlySpan<u32> spatial_node_indices, ReadonlySpan<u32> effect_node_indices);
+
+WEB_API Layout::RustFFI::FfiVectorImageKey vector_image_key_to_ffi(VectorImageKey const&);
+// Has the compositor rasterize `paint` into `target` as `request` asks, which must be a shareable BGRA8888 bitmap with
+// premultiplied alpha. Returns false if nothing was drawn.
+WEB_API bool rasterize_image_paint(Compositor::CompositorHost const&, ImagePaint const&, ImagePaintRequest const&, double device_pixels_per_css_pixel, NonnullRefPtr<Gfx::Bitmap> target);
+// Has the compositor rasterize one image frame drawn into the destination rectangle, in device pixels, into `target`.
+WEB_API bool rasterize_image_frame(Compositor::CompositorHost const&, Gfx::DecodedImageFrame const&, Gfx::FloatRect const& dest_rect, Gfx::ScalingMode, NonnullRefPtr<Gfx::Bitmap> target);
 
 }

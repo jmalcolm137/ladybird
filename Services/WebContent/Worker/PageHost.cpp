@@ -47,7 +47,6 @@ void PageHost::setup_palette()
     auto buffer = buffer_or_error.release_value();
     auto* theme = buffer.data<Gfx::SystemTheme>();
     theme->color[to_underlying(Gfx::ColorRole::Window)] = Color(Color::Magenta).value();
-    theme->color[to_underlying(Gfx::ColorRole::WindowText)] = Color(Color::Cyan).value();
     m_palette_impl = Gfx::PaletteImpl::create_with_anonymous_buffer(buffer);
 }
 
@@ -100,20 +99,22 @@ Optional<Web::Permissions::PermissionSnapshot> PageHost::page_did_request_permis
     return response->take_snapshot();
 }
 
-// NB: The sync requests here fail once the worker is terminated or the UI process is gone. The script that made one no
-//     longer runs by then, so what it gets back here does not matter, but it has to get something.
+bool PageHost::page_did_is_known_hsts_host(String const& domain)
+{
+    auto response = m_client.send_sync_but_allow_failure<Messages::WebWorkerClient::DidIsKnownHstsHost>(domain);
+    if (!response)
+        return true;
+    return response->result();
+}
+
+// NB: The sync requests below fail once the worker is terminated or loses its connection, and the empty answers they
+//     fall back to grant nothing.
 HTTP::Cookie::VersionedCookie PageHost::page_did_request_cookie(Optional<Web::HTML::EnvironmentId> const&, URL::URL const& url, HTTP::Cookie::Source source)
 {
     auto response = m_client.send_sync_but_allow_failure<Messages::WebWorkerClient::DidRequestCookie>(url, source);
     if (!response)
         return {};
     return response->take_cookie();
-}
-
-bool PageHost::page_did_is_known_hsts_host(String const& domain)
-{
-    auto response = m_client.send_sync_but_allow_failure<Messages::WebWorkerClient::DidIsKnownHstsHost>(domain);
-    return response && response->result();
 }
 
 void PageHost::page_did_report_worker_exception(Utf16String const& message, Utf16String const& filename, u32 lineno, u32 colno)
@@ -189,6 +190,11 @@ void PageHost::ensure_compositor_host()
 void PageHost::compositor_process_lost()
 {
     page().notify_all_webgl_contexts_lost();
+}
+
+void PageHost::compositor_process_reconnected()
+{
+    page().notify_all_canvas_elements_of_lost_backing_storage();
 }
 
 void PageHost::did_finish_loading_worker_script(bool worker_is_secure_context)

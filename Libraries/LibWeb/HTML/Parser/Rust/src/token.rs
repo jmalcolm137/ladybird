@@ -4,8 +4,10 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+use crate::code_units::CodeUnits;
 #[cfg(not(test))]
 use ak::Utf16StringUnits;
+use ak::Utf16View;
 use std::cell::RefCell;
 
 /// Source position in the input.
@@ -15,26 +17,101 @@ pub struct Position {
     pub column: u64,
 }
 
+/// Where in the tokenizer's input something starts or ends, as an offset in code units, or nowhere at all.
+///
+/// The tokenizer only works out which line and column an offset is at when it is asked to.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SourceOffset(usize);
+
+impl SourceOffset {
+    pub const NONE: Self = Self(usize::MAX);
+
+    pub fn new(offset: usize) -> Self {
+        debug_assert!(offset != usize::MAX);
+        Self(offset)
+    }
+
+    pub fn get(self) -> Option<usize> {
+        (self != Self::NONE).then_some(self.0)
+    }
+}
+
+impl Default for SourceOffset {
+    fn default() -> Self {
+        Self::NONE
+    }
+}
+
+/// A small number that stands for a known tag name, so that the tree builder can tell which of them a token has
+/// without comparing names. Every other name has the id `UNKNOWN`.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct TagId(u16);
+
+impl TagId {
+    pub const UNKNOWN: Self = Self(0);
+
+    pub const fn from_index(index: u16) -> Self {
+        Self(index)
+    }
+
+    pub const fn index(self) -> usize {
+        self.0 as usize
+    }
+
+    pub fn for_name(name: &str) -> Self {
+        crate::known_names::tag_id_for_name(name.as_bytes())
+    }
+
+    pub fn for_code_units(name: Utf16View<'_>) -> Self {
+        // NB: Every known tag name is ASCII, so a name with other code units in it is found to be none of them.
+        match name {
+            Utf16View::Latin1(name) => crate::known_names::tag_id_for_name(name),
+            Utf16View::Utf16(_) => Self::UNKNOWN,
+        }
+    }
+}
+
+/// A set of known tag names.
+pub struct TagSet([u64; crate::known_names::TAG_SET_WORD_COUNT]);
+
+impl TagSet {
+    pub const fn new(ids: &[TagId]) -> Self {
+        let mut words = [0; crate::known_names::TAG_SET_WORD_COUNT];
+        let mut i = 0;
+        while i < ids.len() {
+            let index = ids[i].0 as usize;
+            assert!(index != 0, "a tag set can only have known tag names in it");
+            words[index / 64] |= 1 << (index % 64);
+            i += 1;
+        }
+        Self(words)
+    }
+
+    #[inline(always)]
+    pub const fn contains(&self, id: TagId) -> bool {
+        let index = id.0 as usize;
+        (self.0[index / 64] >> (index % 64)) & 1 != 0
+    }
+}
+
+/// A set of the known tag names it is given, worked out when the parser is compiled.
+macro_rules! tag_set {
+    ($($name:tt),+ $(,)?) => {
+        const { &$crate::token::TagSet::new(&[$($crate::known_names::tag_id!($name)),+]) }
+    };
+}
+pub(crate) use tag_set;
+
 /// A single attribute on a start or end tag token.
 ///
 #[derive(Clone, Debug, Default)]
 pub struct Attribute {
     pub local_name: HtmlName,
-    pub value: String,
-    pub name_start_position: Position,
-    pub name_end_position: Position,
-    pub value_start_position: Position,
-    pub value_end_position: Position,
-}
-
-impl Attribute {
-    /// An empty attribute, with a spare value buffer when a dropped tag token left one.
-    pub fn with_spare_value_buffer() -> Self {
-        Self {
-            value: SPARE_ATTRIBUTE_VALUES.with_borrow_mut(Vec::pop).unwrap_or_default(),
-            ..Default::default()
-        }
-    }
+    pub value: CodeUnits,
+    pub name_start_offset: SourceOffset,
+    pub name_end_offset: SourceOffset,
+    pub value_start_offset: SourceOffset,
+    pub value_end_offset: SourceOffset,
 }
 
 const MAX_SPARE_ATTRIBUTE_LISTS: usize = 4;
@@ -47,16 +124,28 @@ const MAX_SPARE_ATTRIBUTE_VALUE_CAPACITY: usize = 4096;
 thread_local! {
     // Dropped tag tokens leave their attribute lists and value buffers here for the next tag.
     static SPARE_ATTRIBUTE_LISTS: RefCell<Vec<Vec<Attribute>>> = const { RefCell::new(Vec::new()) };
-    static SPARE_ATTRIBUTE_VALUES: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+    static SPARE_ATTRIBUTE_VALUES: RefCell<Vec<CodeUnits>> = const { RefCell::new(Vec::new()) };
 }
 
-/// The attributes of a tag token, backed by a spare buffer when one is available.
+/// The attributes of a tag token, backed by a spare buffer when there is one and the tag has attributes.
 #[derive(Debug)]
 pub struct AttributeList(Vec<Attribute>);
 
 impl AttributeList {
     pub fn new() -> Self {
-        Self(SPARE_ATTRIBUTE_LISTS.with_borrow_mut(Vec::pop).unwrap_or_default())
+        Self(Vec::new())
+    }
+
+    /// Adds an empty attribute, with a spare value buffer when a dropped tag token left one.
+    pub fn start_new_attribute(&mut self) {
+        // NB: Most tags have no attributes, so a list only takes a spare buffer once it has an attribute to hold.
+        if self.0.capacity() == 0 {
+            self.0 = SPARE_ATTRIBUTE_LISTS.with_borrow_mut(Vec::pop).unwrap_or_default();
+        }
+        self.0.push(Attribute {
+            value: SPARE_ATTRIBUTE_VALUES.with_borrow_mut(Vec::pop).unwrap_or_default(),
+            ..Default::default()
+        });
     }
 }
 
@@ -114,12 +203,12 @@ impl Drop for AttributeList {
                 if spare_values.len() == MAX_SPARE_ATTRIBUTE_VALUES {
                     break;
                 }
-                let capacity = attribute.value.capacity();
+                let mut value = attribute.value;
+                value.clear();
+                let capacity = value.capacity();
                 if capacity == 0 || capacity > MAX_SPARE_ATTRIBUTE_VALUE_CAPACITY {
                     continue;
                 }
-                let mut value = attribute.value;
-                value.clear();
                 spare_values.push(value);
             }
         });
@@ -170,9 +259,30 @@ impl KnownName {
     pub const fn from_literal(name: &'static str) -> Self {
         Self::Literal(name)
     }
+
+    /// The identity of the C++ `Utf16FlyString` that holds this name.
+    #[cfg(not(test))]
+    pub const fn raw_identity(self) -> usize {
+        self.0
+    }
 }
 
 impl HtmlName {
+    pub fn from_code_units(name: Utf16View<'_>) -> Self {
+        #[cfg(not(test))]
+        {
+            match name.as_ascii() {
+                // SAFETY: ASCII is valid UTF-8.
+                Some(name) => Self(ak::Utf16FlyString::from_utf8(unsafe { str::from_utf8_unchecked(name) })),
+                None => Self(ak::Utf16FlyString::from_utf16(&name.to_utf16())),
+            }
+        }
+        #[cfg(test)]
+        {
+            Self(String::from_utf16_lossy(&name.to_utf16()))
+        }
+    }
+
     pub fn from_utf8(name: &str) -> Self {
         #[cfg(not(test))]
         {
@@ -334,9 +444,9 @@ impl std::fmt::Debug for HtmlName {
 /// Data specific to DOCTYPE tokens.
 #[derive(Clone, Debug, Default)]
 pub struct DoctypeData {
-    pub name: String,
-    pub public_identifier: String,
-    pub system_identifier: String,
+    pub name: CodeUnits,
+    pub public_identifier: CodeUnits,
+    pub system_identifier: CodeUnits,
     pub missing_name: bool,
     pub missing_public_identifier: bool,
     pub missing_system_identifier: bool,
@@ -365,12 +475,13 @@ pub enum TokenPayload {
     None,
     Tag {
         tag_name: HtmlName,
+        tag_id: TagId,
         self_closing: bool,
         // AD-HOC: See AD-HOC comment on Element.m_had_duplicate_attribute_during_tokenization about why this is tracked.
         had_duplicate_attribute: bool,
         attributes: AttributeList,
     },
-    Comment(String),
+    Comment(CodeUnits),
     Doctype(Box<DoctypeData>),
 }
 
@@ -380,8 +491,8 @@ pub struct Token {
     pub token_type: TokenType,
     pub code_point: u32,
     pub payload: TokenPayload,
-    pub start_position: Position,
-    pub end_position: Position,
+    pub start_offset: SourceOffset,
+    pub end_offset: SourceOffset,
 }
 
 impl Token {
@@ -408,9 +519,20 @@ impl Token {
         }
     }
 
-    pub fn set_tag_name(&mut self, name: HtmlName) {
+    #[inline(always)]
+    pub fn tag_id(&self) -> TagId {
+        match &self.payload {
+            TokenPayload::Tag { tag_id, .. } => *tag_id,
+            _ => panic!("tag_id called on non-tag token"),
+        }
+    }
+
+    pub fn set_tag_name(&mut self, name: Utf16View<'_>) {
         match &mut self.payload {
-            TokenPayload::Tag { tag_name, .. } => *tag_name = name,
+            TokenPayload::Tag { tag_name, tag_id, .. } => {
+                *tag_name = HtmlName::from_code_units(name);
+                *tag_id = TagId::for_code_units(name);
+            }
             _ => panic!("set_tag_name called on non-tag token"),
         }
     }
@@ -439,6 +561,14 @@ impl Token {
                 ..
             } => *had_duplicate_attribute,
             _ => false,
+        }
+    }
+
+    #[inline(always)]
+    pub fn start_new_attribute(&mut self) {
+        match &mut self.payload {
+            TokenPayload::Tag { attributes, .. } => attributes.start_new_attribute(),
+            _ => panic!("start_new_attribute called on non-tag token"),
         }
     }
 
@@ -473,7 +603,7 @@ impl Token {
     }
 
     #[inline(always)]
-    pub fn set_comment_data(&mut self, data: String) {
+    pub fn set_comment_data(&mut self, data: CodeUnits) {
         match &mut self.payload {
             TokenPayload::Comment(s) => *s = data,
             _ => panic!("set_comment_data called on non-comment token"),
@@ -499,7 +629,7 @@ mod spare_buffer_tests {
     }
 
     fn spare_value_capacities() -> Vec<usize> {
-        SPARE_ATTRIBUTE_VALUES.with_borrow(|values| values.iter().map(String::capacity).collect())
+        SPARE_ATTRIBUTE_VALUES.with_borrow(|values| values.iter().map(CodeUnits::capacity).collect())
     }
 
     fn spare_list_capacities() -> Vec<usize> {
@@ -508,7 +638,7 @@ mod spare_buffer_tests {
 
     fn attribute_with_value_capacity(capacity: usize) -> Attribute {
         Attribute {
-            value: String::with_capacity(capacity),
+            value: CodeUnits::Latin1(Vec::with_capacity(capacity)),
             ..Default::default()
         }
     }
@@ -522,8 +652,13 @@ mod spare_buffer_tests {
         drop(list);
         assert_eq!(spare_value_capacities().len(), 2);
         assert_eq!(spare_list_capacities().len(), 1);
-        assert!(AttributeList::new().capacity() >= 2);
-        assert!(Attribute::with_spare_value_buffer().value.capacity() >= 16);
+        let mut list = AttributeList::new();
+        assert_eq!(list.capacity(), 0);
+        assert_eq!(spare_list_capacities().len(), 1);
+        list.start_new_attribute();
+        assert!(list.capacity() >= 2);
+        assert!(list[0].value.capacity() >= 16);
+        assert!(spare_list_capacities().is_empty());
     }
 
     #[test]

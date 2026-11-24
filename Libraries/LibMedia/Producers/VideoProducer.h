@@ -19,6 +19,7 @@ namespace Media {
 struct VideoProducerOutput {
     RefPtr<VideoFrame> frame;
     PipelineStatus status;
+    PipelineCheckpoint checkpoint { 0 };
 };
 
 class VideoProducer : public virtual MediaPipelineNode {
@@ -26,6 +27,8 @@ public:
     virtual ~VideoProducer() = default;
 
     virtual void start() = 0;
+    // Drops any decoded output and reports Suspended until the next seek, starting the producer if it hasn't started.
+    virtual void suspend() = 0;
 
     virtual VideoProducerOutput peek() = 0;
     virtual void consume() = 0;

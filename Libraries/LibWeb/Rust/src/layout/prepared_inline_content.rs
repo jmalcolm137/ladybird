@@ -17,6 +17,8 @@ pub(crate) struct PreparedInlineContent {
     pub(super) box_events: Box<[InlineBoxEvent]>,
     pub(super) fonts: Box<[FontHandle]>,
     pub(super) tab_stops: Box<[PreparedTabStop]>,
+    /// Prepared item indices paired with UTF-16 offsets in their text nodes, ordered by item and then offset.
+    pub(super) soft_wraps: Box<[(u32, u32)]>,
 }
 
 const _: () = {
@@ -65,6 +67,7 @@ impl PreparedItem {
     pub(super) const TAKES_TRAILING_EDGES: u16 = 1 << 10;
     pub(super) const UPRIGHT: u16 = 1 << 11;
     pub(super) const TAB_STOP: u16 = 1 << 12;
+    pub(super) const SOFT_WRAPS: u16 = 1 << 13;
 
     pub(super) fn new(type_: ItemType, node: Node, flags: u16) -> Self {
         Self {
@@ -74,6 +77,14 @@ impl PreparedItem {
             length_in_node: 0,
             bits: type_ as u16 | flags,
             font_index: 0,
+        }
+    }
+
+    /// The forced break of a preserved newline at `offset_in_node` in the text of `node`.
+    pub(super) fn newline(node: Node, offset_in_node: usize) -> Self {
+        Self {
+            offset_in_node: u32::try_from(offset_in_node).expect("text offsets fit in 32 bits"),
+            ..Self::new(ItemType::ForcedBreak, node, 0)
         }
     }
 
@@ -187,6 +198,7 @@ pub(crate) struct InlineContentPreparationBuffers {
     pub(super) box_events: Vec<InlineBoxEvent>,
     pub(super) fonts: Vec<FontHandle>,
     pub(super) tab_stops: Vec<PreparedTabStop>,
+    pub(super) soft_wraps: Vec<(u32, u32)>,
     pub(super) box_stack: Vec<Node>,
 }
 
@@ -211,6 +223,7 @@ impl InlineContentPreparationBuffers {
             box_events: self.box_events.drain(..).collect(),
             fonts: self.fonts.drain(..).collect(),
             tab_stops: self.tab_stops.drain(..).collect(),
+            soft_wraps: self.soft_wraps.drain(..).collect(),
         }
     }
 }
@@ -222,10 +235,12 @@ impl PreparedInlineContent {
     }
 
     pub(crate) fn for_block_container(pass: LayoutPass<'_>, block_container: Node) -> Arc<Self> {
-        if pass.reads_no_memoized_layout() || pass.lays_out_with_position_option() {
+        let Some(memos) = pass
+            .prepared_inline_content_memos()
+            .filter(|_| !pass.lays_out_with_position_option())
+        else {
             return Arc::new(Self::prepare(pass, block_container));
-        }
-        let memos = pass.prepared_inline_content_memos();
+        };
         if let Some(kept) = memos.kept(block_container, run_root_validity(&pass, block_container)) {
             if cfg!(debug_assertions) || run_repeatability::verification_is_enabled() {
                 kept.verify_against_fresh_preparation(pass, block_container);
@@ -265,6 +280,7 @@ impl PreparedInlineContent {
             .or_else(|| first_difference("inline box event", &self.box_events, &fresh.box_events))
             .or_else(|| first_difference("font", &self.fonts, &fresh.fonts))
             .or_else(|| first_difference("tab stop", &self.tab_stops, &fresh.tab_stops))
+            .or_else(|| first_difference("soft wrap", &self.soft_wraps, &fresh.soft_wraps))
     }
 }
 

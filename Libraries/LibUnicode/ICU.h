@@ -6,6 +6,7 @@
 
 #pragma once
 
+#include <AK/Array.h>
 #include <AK/Optional.h>
 #include <AK/OwnPtr.h>
 #include <AK/SourceLocation.h>
@@ -21,6 +22,7 @@
 #include <unicode/stringpiece.h>
 #include <unicode/uiter.h>
 #include <unicode/uloc.h>
+#include <unicode/ulocdata.h>
 #include <unicode/unistr.h>
 #include <unicode/utypes.h>
 #include <unicode/uversion.h>
@@ -44,6 +46,11 @@ public:
     AK_ALLOC_WITH_KMALLOC;
 
     static Optional<LocaleData&> for_locale(StringView locale);
+    static Optional<LocaleData&> for_locale(Utf16View const& locale);
+
+    // The data of the locale, or of the default locale where the locale isn't one ICU can parse, such as the raw value
+    // of an element's lang attribute can be.
+    static LocaleData& for_locale_or_default(Utf16View const& locale);
     static Optional<Utf16String> canonicalize(StringView locale);
 
     ALWAYS_INLINE icu::Locale& locale() { return m_locale; }
@@ -56,6 +63,7 @@ public:
     Optional<icu::DateTimePatternGenerator&> date_time_pattern_generator();
 
     icu::TimeZoneNames& time_zone_names();
+    icu::UnicodeString const& quotation_mark(ULocaleDataDelimiterType);
 
     Optional<DigitalFormat> const& digital_format() { return m_digital_format; }
     void set_digital_format(DigitalFormat digital_format) { m_digital_format = move(digital_format); }
@@ -72,6 +80,7 @@ private:
     OwnPtr<icu::DateTimePatternGenerator> m_date_time_pattern_generator;
     OwnPtr<icu::TimeZoneNames> m_time_zone_names;
     Optional<DigitalFormat> m_digital_format;
+    Optional<Array<icu::UnicodeString, 4>> m_quotation_marks;
 };
 
 // Cache entries and their ICU objects are confined to the calling thread.

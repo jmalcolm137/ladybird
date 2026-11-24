@@ -49,7 +49,7 @@ ErrorOr<GC::Ref<BitmapDecodedImageData>> BitmapDecodedImageData::create(Vector<F
     if (frames.is_empty())
         return Error::from_string_literal("Bitmap image has no frames");
     // NB: Only the first frame is kept, so only an image that has just the one can be decoded again.
-    if (frames.size() != 1 || frames[0].frame.bitmap().data_size() < minimum_discardable_frame_size) {
+    if (frames.size() != 1 || frames[0].frame.size_in_bytes() < minimum_discardable_frame_size) {
         encoded_data.clear();
     } else if (encoded_data.capacity() > encoded_data.size()) {
         // NB: The encoded data is kept for as long as the image, so it should not keep the room it was received into.
@@ -85,7 +85,7 @@ void BitmapDecodedImageData::leave_discardable_frames() const
 {
     if (!m_discardable_frame_list_node.is_in_list())
         return;
-    s_discardable_frame_bytes -= m_frame->bitmap().data_size();
+    s_discardable_frame_bytes -= m_frame->size_in_bytes();
     m_discardable_frame_list_node.remove();
 }
 
@@ -94,7 +94,7 @@ void BitmapDecodedImageData::did_decode_frame() const
     VERIFY(m_frame.has_value());
     VERIFY(!m_discardable_frame_list_node.is_in_list());
     discardable_frames().append(const_cast<BitmapDecodedImageData&>(*this));
-    s_discardable_frame_bytes += m_frame->bitmap().data_size();
+    s_discardable_frame_bytes += m_frame->size_in_bytes();
     if (s_discardable_frame_bytes > discardable_frame_budget)
         schedule_discard_of_idle_frames(frame_idle_time_before_discard);
 }
@@ -132,10 +132,10 @@ void BitmapDecodedImageData::discard_idle_frames()
             has_frames_that_become_idle_later = true;
             break;
         }
-        // NB: The frame of an image that may be painted is needed by the next paint, which would decode it again. A
-        //     bitmap that something else still holds, e.g. a display list or a pending texture upload, would stay in
+        // NB: The frame of an image that may be painted is needed by the next paint, which would decode it again.
+        //     Pixels that something else still holds, e.g. a display list or a pending texture upload, would stay in
         //     memory. Discarding either would save nothing.
-        if (image_data.has_clients_that_may_render() || image_data.m_frame->bitmap().ref_count() > 1) {
+        if (image_data.has_clients_that_may_render() || image_data.m_frame->pixels_are_held_elsewhere()) {
             has_held_frames = true;
             continue;
         }
@@ -196,9 +196,16 @@ Optional<Gfx::DecodedImageFrame> BitmapDecodedImageData::ensure_frame() const
         return {};
     }
 
-    m_failed_attempts_to_decode_again = 0;
     // NB: The pixels are those of the discarded frame, so the frame keeps its id, by which caches may still hold it.
-    m_frame = Gfx::DecodedImageFrame::with_id(m_frame_id, move(decoded.bitmap), move(decoded.color_space));
+    auto frame_or_error = Gfx::DecodedImageFrame::create_with_id(m_frame_id, *decoded.bitmap, move(decoded.color_space));
+    if (frame_or_error.is_error()) {
+        dbgln("BitmapDecodedImageData: Could not hold frame decoded again: {}", frame_or_error.error());
+        did_fail_to_decode_again();
+        return {};
+    }
+
+    m_failed_attempts_to_decode_again = 0;
+    m_frame = frame_or_error.release_value();
     did_decode_frame();
     return m_frame;
 }
@@ -233,7 +240,7 @@ size_t BitmapDecodedImageData::external_memory_size() const
 {
     size_t size = m_encoded_data.capacity();
     if (m_frame.has_value())
-        size = JS::saturating_add_external_memory_size(size, m_frame->bitmap().data_size());
+        size = JS::saturating_add_external_memory_size(size, m_frame->size_in_bytes());
     return size;
 }
 
@@ -269,7 +276,18 @@ Optional<Gfx::Color> BitmapDecodedImageData::color_if_single_pixel_bitmap() cons
     auto frame = ensure_frame();
     if (!frame.has_value())
         return {};
-    return frame->bitmap().get_pixel(0, 0);
+    auto bitmap = frame->bitmap_sharing_pixels();
+    auto color = bitmap->get_pixel(0, 0);
+    // NB: The color fills the background like any other color, which applies its alpha, so the pixel of a
+    //     premultiplied bitmap is unpremultiplied first.
+    if (bitmap->alpha_type() != Gfx::AlphaType::Premultiplied || color.alpha() == 255)
+        return color;
+    if (color.alpha() == 0)
+        return Gfx::Color(Gfx::Color::Transparent);
+    auto unpremultiplied = [alpha = color.alpha()](u8 channel) {
+        return static_cast<u8>(min(255, (channel * 255 + alpha / 2) / alpha));
+    };
+    return Gfx::Color(unpremultiplied(color.red()), unpremultiplied(color.green()), unpremultiplied(color.blue()), color.alpha());
 }
 
 Optional<Painting::ImagePaint> BitmapDecodedImageData::image_paint(Painting::ImagePaintRequest const&) const

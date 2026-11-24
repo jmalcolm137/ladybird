@@ -17,6 +17,7 @@ use super::GraphBuilder;
 use super::checks::SlowPaths;
 use crate::CompileFailure;
 use crate::bytecode::Instruction;
+use crate::bytecode::PUT_KIND_NORMAL;
 use crate::code::Dependency;
 use crate::code::Repr;
 use crate::ir::BranchCondition;
@@ -24,16 +25,23 @@ use crate::ir::Comparison;
 use crate::ir::NodeId;
 use crate::ir::Op;
 
-impl GraphBuilder<'_> {
+impl<'a> GraphBuilder<'a, '_> {
     /// Builds `GetById` (`Handling::Expanded`): the property the cache has
     /// for the value (see `Op::ProbePropertyCache`).
     pub(super) fn build_get_by_id(&mut self, instruction: &Instruction) -> Result<Flow, CompileFailure> {
-        let Instruction::GetById { dst, base, cache, .. } = *instruction else {
+        let Instruction::GetById {
+            dst,
+            base,
+            property,
+            cache,
+            ..
+        } = *instruction
+        else {
             unreachable!("only GetById is built here");
         };
         let mut slow_paths = self.start_slow_paths(Some(Repr::Tagged))?;
         let value = self.read(base)?;
-        let property = self.probe_property_cache(&mut slow_paths, value, cache);
+        let property = self.probe_property_cache(&mut slow_paths, value, cache, property.0);
         let result = self.join_slow_paths(slow_paths, Some(property));
         self.write(dst, result.expect("GetById has a value"))?;
         Ok(Flow::Continue)
@@ -42,19 +50,31 @@ impl GraphBuilder<'_> {
     /// Builds `PutById` (`Handling::Expanded`): stores and additions the
     /// cache has for objects.
     pub(super) fn build_put_by_id(&mut self, instruction: &Instruction) -> Result<Flow, CompileFailure> {
-        let Instruction::PutById { base, src, cache, .. } = *instruction else {
+        let Instruction::PutById {
+            base,
+            property,
+            src,
+            kind,
+            cache,
+        } = *instruction
+        else {
             unreachable!("only PutById is built here");
         };
         let mut slow_paths = self.start_slow_paths(None)?;
         let object = self.read(base)?;
         let value = self.read(src)?;
         let executable = self.function.index;
+        let property = if kind == PUT_KIND_NORMAL { property.0 } else { u32::MAX };
         let stored = self.emit(
-            Op::ProbePropertyStore { executable, cache },
-            vec![object, value],
+            Op::ProbePropertyStore {
+                executable,
+                cache,
+                property,
+            },
+            &[object, value],
             Some(Repr::Bool),
         );
-        self.branch_to_slow_path(&mut slow_paths, BranchCondition::Bool, vec![stored], true);
+        self.branch_to_slow_path(&mut slow_paths, BranchCondition::Bool, &[stored], true);
         self.join_slow_paths(slow_paths, None);
         Ok(Flow::Continue)
     }
@@ -78,23 +98,31 @@ impl GraphBuilder<'_> {
         //     set of the realm tells if array iterators have a return method.
         if let Some(return_watchpoint_set) = self.runtime.array_iterator_return_watchpoint_set {
             let (fast_array_mode, iterator_object) =
-                self.branch_both_ways(BranchCondition::NonNegativeInt32, vec![iterator]);
+                self.branch_both_ways(BranchCondition::NonNegativeInt32, &[iterator]);
             self.block = fast_array_mode;
             self.embed(return_watchpoint_set);
             self.assume(Dependency::WatchpointSetValid(return_watchpoint_set));
-            self.end_hot_path(&mut slow_paths, Vec::new());
+            self.end_hot_path(&mut slow_paths, &[]);
             self.block = iterator_object;
         }
 
-        let return_method = self.probe_property_cache(&mut slow_paths, iterator, cache);
-        self.branch_to_slow_path(&mut slow_paths, BranchCondition::Nullish, vec![return_method], true);
+        let return_method = self.probe_property_cache(&mut slow_paths, iterator, cache, u32::MAX);
+        self.branch_to_slow_path(&mut slow_paths, BranchCondition::Nullish, &[return_method], true);
         self.join_slow_paths(slow_paths, None);
         Ok(Flow::Continue)
     }
 
     /// The property that cache `cache` of the instruction has for the value
-    /// `object`, taking a slow path where it has none.
-    fn probe_property_cache(&mut self, slow_paths: &mut SlowPaths, object: NodeId, cache: u32) -> NodeId {
+    /// `object`, taking a slow path where it has none. `property` is the
+    /// index of its name in the property key table, if it has one there (see
+    /// `Op::ProbePropertyCache`).
+    fn probe_property_cache(
+        &mut self,
+        slow_paths: &mut SlowPaths<'a>,
+        object: NodeId,
+        cache: u32,
+        property: u32,
+    ) -> NodeId {
         // NB: The probe looks up the properties of strings, numbers and
         //     booleans in their prototypes, whose addresses it embeds.
         let snapshot = &self.function.executable;
@@ -108,8 +136,12 @@ impl GraphBuilder<'_> {
         }
         let executable = self.function.index;
         let property = self.emit(
-            Op::ProbePropertyCache { executable, cache },
-            vec![object],
+            Op::ProbePropertyCache {
+                executable,
+                cache,
+                property,
+            },
+            &[object],
             Some(Repr::Tagged),
         );
         self.branch_if_empty(slow_paths, property)
@@ -133,17 +165,17 @@ impl GraphBuilder<'_> {
             |builder, slow_paths, case, value| {
                 if case == 0 {
                     let address = builder.cell_address(value);
-                    let (magical, named) = builder.branch_both_ways(BranchCondition::MagicalLength, vec![address]);
+                    let (magical, named) = builder.branch_both_ways(BranchCondition::MagicalLength, &[address]);
                     builder.block = magical;
-                    let array = builder.refine(BranchCondition::MagicalLength, true, vec![address]);
-                    let length = builder.emit(Op::LoadElementsLength, vec![array], Some(Repr::Int32));
+                    let array = builder.refine(BranchCondition::MagicalLength, true, &[address]);
+                    let length = builder.emit(Op::LoadElementsLength, &[array], Some(Repr::Int32));
                     builder.end_with_length(slow_paths, length);
                     builder.block = named;
-                    let length = builder.probe_property_cache(slow_paths, value, cache);
-                    builder.end_hot_path(slow_paths, vec![length]);
+                    let length = builder.probe_property_cache(slow_paths, value, cache, u32::MAX);
+                    builder.end_hot_path(slow_paths, &[length]);
                 } else {
-                    let address = builder.emit(Op::StringAddress, vec![value], Some(Repr::Pointer));
-                    let length = builder.emit(Op::StringLength, vec![address], Some(Repr::Int32));
+                    let address = builder.emit(Op::StringAddress, &[value], Some(Repr::Pointer));
+                    let length = builder.emit(Op::StringLength, &[address], Some(Repr::Int32));
                     builder.end_with_length(slow_paths, length);
                 }
             },
@@ -156,15 +188,15 @@ impl GraphBuilder<'_> {
     /// Ends a path of `GetLength` with the `Repr::Int32` `length`, which
     /// takes a slow path where it is no int32, an unsigned length above
     /// `i32::MAX`.
-    fn end_with_length(&mut self, slow_paths: &mut SlowPaths, length: NodeId) {
+    fn end_with_length(&mut self, slow_paths: &mut SlowPaths<'a>, length: NodeId) {
         let zero = self.int32_constant(0);
         let length = self.branch_to_slow_path(
             slow_paths,
             BranchCondition::Int32(Comparison::GreaterThanEquals),
-            vec![length, zero],
+            &[length, zero],
             true,
         );
-        let length = self.emit(Op::BoxInt32, vec![length], Some(Repr::Tagged));
-        self.end_hot_path(slow_paths, vec![length]);
+        let length = self.emit(Op::BoxInt32, &[length], Some(Repr::Tagged));
+        self.end_hot_path(slow_paths, &[length]);
     }
 }

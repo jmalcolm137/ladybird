@@ -177,9 +177,15 @@ public:
 
     // How many runs in a row, ending with the one before this, ended without mark_clean_exit().
     u32 consecutive_unclean_exits() const { return m_consecutive_unclean_exits; }
+    bool follows_restart() const { return m_follows_restart; }
 
+    enum class AfterExit : u8 {
+        KeepEverything,
+        KeepPinnedTabs,
+        Restart,
+    };
     // Records that this run is ending normally. Only a normal teardown calls it, so a crash never records one.
-    void mark_clean_exit();
+    void mark_clean_exit(AfterExit = AfterExit::KeepEverything);
 
     bool is_persistent() const { return m_persisted_storage.has_value(); }
 
@@ -197,8 +203,6 @@ public:
     Optional<WebView::SessionHistorySnapshot> load_tab_history(SessionTabId);
 
     void flush_dirty_state();
-
-    Optional<TabStateUpdate> cached_tab_state_for_testing(SessionTabId) const;
 
     // Fired when a flush completes a previously failed close.
     Function<void()> on_closed_units_changed;
@@ -255,6 +259,9 @@ private:
         Database::StatementID reopen_closed_session;
         Database::StatementID recover_open_session;
         Database::StatementID delete_empty_open_sessions;
+        Database::StatementID delete_closed_units_left_closed;
+        Database::StatementID delete_unpinned_tabs;
+        Database::StatementID delete_empty_sessions;
         Database::StatementID select_lifecycle;
         Database::StatementID write_lifecycle;
         SessionHistorySnapshotStatements snapshot_statements;
@@ -409,6 +416,7 @@ private:
 
     struct RecoveryResult {
         u32 consecutive_unclean_exits { 0 };
+        bool follows_restart { false };
         Vector<RecoveredWindow> windows;
     };
 
@@ -430,7 +438,8 @@ private:
         ErrorOr<void> clear_startup_recovery_origin();
         ErrorOr<void> delete_session_rows(SessionWindowId);
         ErrorOr<void> prune_closed_units(UnitKind, u32 max_units);
-        ErrorOr<void> write_lifecycle(bool clean_exit, u32 consecutive_unclean_exits);
+        ErrorOr<void> write_lifecycle(bool clean_exit, u32 consecutive_unclean_exits, bool restart = false);
+        ErrorOr<void> forget_all_but_pinned_tabs();
 
         ErrorOr<IdAllocators> create_id_allocators();
         ErrorOr<WebView::SessionHistorySnapshot> load_tab_snapshot(SessionTabId, size_t current_used_step_index);
@@ -441,7 +450,11 @@ private:
         Statements statements;
 
     private:
-        ErrorOr<u32> record_run_start();
+        struct RunStart {
+            u32 consecutive_unclean_exits { 0 };
+            bool follows_restart { false };
+        };
+        ErrorOr<RunStart> record_run_start();
         ErrorOr<void> apply_tab_row_write(TabWrite const&);
         ErrorOr<void> apply_window_metadata(WindowMetadataWrite const&);
         ErrorOr<void> insert_closed_unit_row(ClosedUnitWrite const&);
@@ -541,6 +554,7 @@ private:
     Optional<WindowMetadataWrite> remaining_window_write(SessionWindowId, SessionTabId closing_tab) const;
     TabWrite tab_write_for(SessionTabId, OpenTab const&, i64 tab_ordinal) const;
     bool window_has_pending_tab_closes(SessionWindowId) const;
+    ErrorOr<void> discard_pending_closes();
     ErrorOr<void> finish_tab_close(PendingTabClose const&);
     ErrorOr<void> finish_window_close(PendingWindowClose const&);
     ErrorOr<void> retry_pending_clear_closed_units();
@@ -559,6 +573,7 @@ private:
     Vector<WindowMetadataWrite> m_retired_window_metadata;
     bool m_quitting { false };
     u32 m_consecutive_unclean_exits { 0 };
+    bool m_follows_restart { false };
     Vector<RestoredSessionWindow> m_launch_plan;
 
     IdAllocator m_session_id_allocator;

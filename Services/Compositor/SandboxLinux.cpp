@@ -9,6 +9,10 @@
 #include <LibSandbox/Sandbox.h>
 #include <LibSandbox/Seccomp.h>
 
+#if defined(USE_FONTCONFIG)
+#    include <LibGfx/Font/GlobalFontConfig.h>
+#endif
+
 namespace Compositor {
 
 ErrorOr<void> restrict_filesystem(StringView resource_root)
@@ -16,11 +20,17 @@ ErrorOr<void> restrict_filesystem(StringView resource_root)
     TRY(Sandbox::install_no_new_privileges());
     TRY(Sandbox::configure_runtime());
 
-    Vector<Sandbox::LandlockPath> paths;
-    TRY(Sandbox::add_landlock_path_if_exists(paths, TRY(String::formatted("{}/fonts", resource_root)), Sandbox::LandlockPath::Access::ReadOnly));
-    TRY(Sandbox::add_gpu_driver_landlock_paths(paths));
+#if defined(USE_FONTCONFIG)
+    // We ask fontconfig how to hint each font that we draw. It reads its configuration files when it starts, and they
+    // can be anywhere, so it has to start before the sandbox is in place.
+    (void)Gfx::GlobalFontConfig::the();
+#endif
 
-    TRY(Sandbox::restrict_filesystem_with_landlock(paths.span()));
+    Vector<Sandbox::PathRule> paths;
+    TRY(Sandbox::add_path_if_exists(paths, TRY(String::formatted("{}/fonts", resource_root)), Sandbox::PathRule::Access::ReadOnly));
+    TRY(Sandbox::add_gpu_driver_paths(paths));
+
+    TRY(Sandbox::restrict_filesystem(paths.span()));
     return {};
 }
 

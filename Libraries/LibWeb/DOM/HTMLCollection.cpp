@@ -60,13 +60,11 @@ GC::Cell const& HTMLCollection::owner_cell(Badge<GC::Heap>) const
 void HTMLCollection::remove_dead_cells(Badge<GC::Heap>)
 {
     m_cached_elements.remove_all_matching([&](GC::RawPtr<Element> const& element) {
-        auto* block = GC::HeapBlock::from_cell(element.ptr());
-        return !heap().is_live_heap_block(block) || element->state() != Cell::State::Live || !element->is_marked();
+        return !heap().is_live_cell(element.ptr()) || !element->is_marked();
     });
     if (m_cached_name_to_element_mappings) {
         m_cached_name_to_element_mappings->remove_all_matching([&](Utf16FlyString const&, GC::RawPtr<Element> const& element) {
-            auto* block = GC::HeapBlock::from_cell(element.ptr());
-            return !heap().is_live_heap_block(block) || element->state() != Cell::State::Live || !element->is_marked();
+            return !heap().is_live_cell(element.ptr()) || !element->is_marked();
         });
     }
 }
@@ -111,16 +109,20 @@ void HTMLCollection::collect_elements_into(Vector<GC::RawPtr<Element>>& elements
     }
 }
 
-void HTMLCollection::update_cache_if_needed() const
+bool HTMLCollection::cache_is_valid() const
 {
     auto& document = root()->document();
-    auto invalidation_version = this->invalidation_version(document);
-
-    if (m_cache_registration.list_node.is_in_list()
+    return m_cache_registration.list_node.is_in_list()
         && m_cached_document.ptr().ptr() == &document
-        && m_cached_invalidation_version == invalidation_version) {
+        && m_cached_invalidation_version == invalidation_version(document);
+}
+
+void HTMLCollection::update_cache_if_needed() const
+{
+    if (cache_is_valid())
         return;
-    }
+    auto& document = root()->document();
+    auto invalidation_version = this->invalidation_version(document);
 
     invalidate_cache();
 
@@ -136,7 +138,6 @@ void HTMLCollection::update_cache_if_needed() const
 
     m_cached_document = document;
     m_cached_invalidation_version = invalidation_version;
-    ++m_cache_generation;
     document.register_valid_html_collection_cache(m_attribute_invalidation_type);
     m_root->register_html_collection_with_valid_cache(const_cast<HTMLCollection&>(*this));
 }

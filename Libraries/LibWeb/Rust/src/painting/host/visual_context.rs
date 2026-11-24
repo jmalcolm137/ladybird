@@ -6,6 +6,7 @@
 
 use crate::css::easing::FfiEasingDescriptor;
 use crate::css::ffi_support::FfiUtf16View;
+use crate::layout::svg_formatting_context::FfiSvgNumberPercentage;
 use crate::layout::used_values::OptionalCssPixelRect;
 use libgfx_rust::filter::Filter;
 use libgfx_rust::{Color, CompositingAndBlendingOperator, IntRect, InterpolationColorSpace};
@@ -28,27 +29,6 @@ impl VisualContextUpdateScope {
     pub fn rebuilds_every_box(self) -> bool {
         self != Self::DirtyPath
     }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[repr(u8)]
-#[expect(dead_code, reason = "C++ constructs the variants")]
-#[expect(clippy::enum_variant_names, reason = "C++ names the variants")]
-pub enum FfiVisualContextBoxNodeList {
-    SpatialNodes,
-    ClipNodes,
-    EffectNodes,
-}
-
-#[derive(Clone, Copy, Debug, Default)]
-#[repr(C)]
-pub struct FfiVisualContextUpdateOutcome {
-    pub performed_full_build: bool,
-    pub structural_epoch_changed: bool,
-    pub requires_display_list_recording: bool,
-    /// Whether the update may have given a node of the tree other values: it visited a dirty box, or every box.
-    pub values_may_have_changed: bool,
-    pub structural_epoch: u64,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -112,11 +92,67 @@ pub struct SvgFilterPrimitiveValues {
     pub seed: f32,
     pub stitch_tile_width: f32,
     pub stitch_tile_height: f32,
+    /// feTurbulence: whether `stitchTiles` is `stitch`.
+    pub turbulence_stitches_tiles: bool,
     /// feDisplacementMap: the scale and the channel selector constants.
     pub scale: f32,
     pub x_channel_selector: u16,
     pub y_channel_selector: u16,
     pub image_src_rect: IntRect,
+    /// feImage: the image's natural size, zero along an axis where it has none.
+    pub image_natural_width: f32,
+    pub image_natural_height: f32,
+    /// feImage: how the image fits its subregion, in the encoding of its `preserveAspectRatio`
+    /// attribute facts.
+    pub image_preserve_aspect_ratio_align: u8,
+    pub image_preserve_aspect_ratio_meet_or_slice: u8,
+    /// The primitive's `x`, `y`, `width` and `height`, in `primitiveUnits`, each of them only where
+    /// [`Self::subregion_specified`] has its bit set.
+    pub subregion_x: FfiSvgNumberPercentage,
+    pub subregion_y: FfiSvgNumberPercentage,
+    pub subregion_width: FfiSvgNumberPercentage,
+    pub subregion_height: FfiSvgNumberPercentage,
+    /// Which of the subregion attributes the primitive specifies: x, y, width and height, from the
+    /// lowest bit up.
+    pub subregion_specified: u8,
+}
+
+pub(crate) const SUBREGION_SPECIFIES_X: u8 = 1 << 0;
+pub(crate) const SUBREGION_SPECIFIES_Y: u8 = 1 << 1;
+pub(crate) const SUBREGION_SPECIFIES_WIDTH: u8 = 1 << 2;
+pub(crate) const SUBREGION_SPECIFIES_HEIGHT: u8 = 1 << 3;
+
+/// The attribute facts of an SVG `<filter>` element itself: its filter region and the units its
+/// region and its primitives' lengths are in.
+// https://drafts.csswg.org/filter-effects-1/#FilterEffectsRegion
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[repr(C)]
+pub struct FfiSvgFilterRegion {
+    pub filter_units_are_object_bounding_box: bool,
+    pub primitive_units_are_object_bounding_box: bool,
+    pub x: FfiSvgNumberPercentage,
+    pub y: FfiSvgNumberPercentage,
+    pub width: FfiSvgNumberPercentage,
+    pub height: FfiSvgNumberPercentage,
+}
+
+impl Default for FfiSvgFilterRegion {
+    // https://drafts.csswg.org/filter-effects-1/#element-attrdef-filter-x
+    // If the attribute is not specified, the effect is as if a value of -10% were specified.
+    fn default() -> Self {
+        let percentage = |value| FfiSvgNumberPercentage {
+            value,
+            is_percentage: true,
+        };
+        Self {
+            filter_units_are_object_bounding_box: true,
+            primitive_units_are_object_bounding_box: false,
+            x: percentage(-0.1),
+            y: percentage(-0.1),
+            width: percentage(1.2),
+            height: percentage(1.2),
+        }
+    }
 }
 
 /// One primitive of an SVG `<filter>` as the host flattens it: its values, and the names, lists
@@ -149,35 +185,6 @@ pub(crate) struct ResolvedSvgFilter {
     pub svg_filter_bounds: OptionalCssPixelRect,
 }
 
-/// Whether a keyframe gives a property a value of its own, takes the target's underlying style
-/// for it, or leaves it out.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[repr(u8)]
-pub enum FfiCompositorKeyframeValueState {
-    Absent,
-    UsesUnderlyingStyle,
-    Present,
-}
-
-/// One keyframe of an effect as the compositor animation builder reads it. The values themselves
-/// are resolved through the host on demand; the keyframe only says which properties it carries.
-#[derive(Clone, Copy, Debug)]
-#[repr(C)]
-pub struct FfiCompositorAnimationKeyframe {
-    pub offset: f64,
-    pub easing: FfiEasingDescriptor,
-    /// An easing the main thread could not describe keeps the effect off the compositor.
-    pub easing_is_supported: bool,
-    pub composite_is_replace: bool,
-    pub opacity: FfiCompositorKeyframeValueState,
-    pub background_color: FfiCompositorKeyframeValueState,
-    pub filter: FfiCompositorKeyframeValueState,
-    pub translate: FfiCompositorKeyframeValueState,
-    pub rotate: FfiCompositorKeyframeValueState,
-    pub scale: FfiCompositorKeyframeValueState,
-    pub transform: FfiCompositorKeyframeValueState,
-}
-
 /// The timing of an effect at the moment the main thread anchored it to the monotonic clock.
 #[derive(Clone, Copy, Debug)]
 #[repr(C)]
@@ -185,12 +192,8 @@ pub struct FfiCompositorAnimationTiming {
     pub monotonic_time_at_anchor_ns: i64,
     pub local_time_at_anchor_ms: f64,
     pub playback_rate: f64,
-    pub start_delay_ms: f64,
-    pub iteration_duration_ms: f64,
-    pub iteration_count: f64,
-    pub iteration_start: f64,
-    pub playback_direction: FfiVisualAnimationPlaybackDirection,
-    pub fill_mode: FfiVisualAnimationFillMode,
+    /// The effect's timing, every time in milliseconds.
+    pub effect: crate::animations::timing::AnimationEffectTiming,
     pub easing: FfiEasingDescriptor,
 }
 
@@ -212,11 +215,14 @@ pub struct FfiCompositorAnimationRequest {
     pub target_inherited_ui_values: *const std::ffi::c_void,
     pub target_inherited_text_values: *const std::ffi::c_void,
     pub timing: FfiCompositorAnimationTiming,
-    pub keyframes: *const FfiCompositorAnimationKeyframe,
-    pub keyframe_count: usize,
-    /// The identity of the effect's keyframe set and the versions of the style it resolves against;
-    /// the builder keeps the values it lowered while these stay the same.
-    pub key_frame_set_identity: u64,
+    /// The `KeyframeSet` the effect runs, which the host holds a reference to, or null for an effect with none.
+    pub keyframe_set: *const std::ffi::c_void,
+    /// Whether the effect's composite operation, which a keyframe whose own is `auto` runs, is `replace`.
+    pub effect_composite_is_replace: bool,
+    /// The easing a keyframe that declares none runs: its animation's.
+    pub default_easing: FfiEasingDescriptor,
+    /// The versions of the style the keyframes resolve against; the builder keeps the values it lowered while these
+    /// and the keyframe set stay the same.
     pub target_style_generation: u64,
     pub style_environment_version: u64,
     /// The box transform percentages resolve against, in CSS pixels; zero for the other kinds.
@@ -234,14 +240,13 @@ pub struct FfiCompositorAnimationRequest {
 #[repr(C)]
 pub struct FfiCompositorAnimationHost {
     pub context: *mut std::ffi::c_void,
-    /// The keyframe's value of the property, resolved and absolutized for the target, as a
-    /// retained style value; null when it resolves to nothing usable. With
-    /// `uses_underlying_style` set, the target's computed value without animations instead.
+    /// The value `declared_value` a keyframe declares for the property, resolved and absolutized for the target, as a
+    /// retained style value; null when it resolves to nothing usable. Where `declared_value` is null, the keyframe
+    /// takes the target's underlying style, and the target's computed value without animations is answered instead.
     pub resolved_keyframe_value: unsafe extern "C" fn(
         context: *mut std::ffi::c_void,
-        keyframe_index: usize,
         property_id: u16,
-        uses_underlying_style: bool,
+        declared_value: *const std::ffi::c_void,
     ) -> *const std::ffi::c_void,
 }
 

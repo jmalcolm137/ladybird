@@ -10,7 +10,6 @@
 #include <AK/TemporaryChange.h>
 #include <LibCore/EventLoop.h>
 #include <LibURL/Site.h>
-#include <LibWebCommon/WebView/SiteIsolation.h>
 #include <LibWebView/Application.h>
 #include <LibWebView/CanonicalBrowsingContext.h>
 #include <LibWebView/CanonicalBrowsingContextGroup.h>
@@ -58,6 +57,7 @@ void CanonicalTraversable::set_system_visibility_state(Web::HTML::VisibilityStat
     m_system_visibility_state = visibility_state;
     for_each_hosting_page([&](WebContentPage& page) {
         page.async_set_system_visibility_state(visibility_state);
+        page.client().did_change_visibility_of_a_tab();
     });
 
     // When a user agent determines that the system visibility state for
@@ -980,7 +980,12 @@ void CanonicalTraversable::reconstruct_the_history_to_step(i32 step)
 
 ErrorOr<URL::URL> CanonicalTraversable::restore_session_history_from_ui_snapshot(SessionHistorySnapshot snapshot)
 {
-    TRY(m_session_history.restore_from_ui_snapshot(move(snapshot.entries), move(snapshot.used_steps), snapshot.current_used_step_index, [] { return Application::the().allocate_ui_process_cross_process_id(); }));
+    Vector<DocumentStateLocalFileRoot> local_file_roots;
+    for (auto& [document_state_id, root] : snapshot.local_file_roots_of_document_states) {
+        if (auto restored_root = Application::local_file_grant_policy().restore(move(root)); restored_root.has_value())
+            local_file_roots.append({ document_state_id, restored_root.release_value() });
+    }
+    TRY(m_session_history.restore_from_ui_snapshot(move(snapshot.entries), move(snapshot.used_steps), snapshot.current_used_step_index, [] { return Application::the().allocate_ui_process_cross_process_id(); }, local_file_roots));
     session_history_changed();
 
     return m_session_history.current_entry().url;
@@ -1053,8 +1058,8 @@ struct HistoryOperation {
     Vector<NonnullRefPtr<WebContentPage>> completion_endpoints;
     u64 sequence_number;
     Optional<Web::HTML::CrossProcessId> beforeunload_check_id;
-    // The view is showing a load for the top-level document this traversal has yet to activate.
-    bool has_unactivated_traversal_load { false };
+    // The view is showing a load for the top-level document this operation has yet to activate.
+    bool has_unactivated_load { false };
 
     ChangingNavigable* pending_changing_job(Web::HTML::CrossProcessId navigable_id) const
     {
@@ -1261,7 +1266,7 @@ void CanonicalTraversable::recover_from_web_content_process_crash()
     // The step a traversal the crash interrupted was applying is applied again, otherwise the current step is.
     auto target_step = m_session_history.current_step();
     if (auto* traversal = ongoing_browser_history_traversal())
-        target_step = traversal->browser_traversal().target_step;
+        target_step = m_session_history.get_the_used_step(traversal->browser_traversal().target_step);
     abandon_history_operations();
 
     // The tab's document is reloaded, the crashed process having destroyed the one its entry holds. That reload never
@@ -1409,7 +1414,13 @@ void CanonicalTraversable::did_receive_changing_navigable_history_job_reached_po
         .user_involvement = operation->algorithm->user_involvement(),
         .navigation_id = finalized_navigation_id(*operation, navigable_id).value_or(Utf16String {}),
     };
-    auto loader = NavigationLoader::create(source_page.client().is_private(), move(request));
+    // NB: The process running the job need not have hosted local file content. The UI process reads the entry's file
+    //     for the process creating the document, with the root saved with the document state, or else with the roots
+    //     of the process running the job.
+    auto local_file_access = source_page.client().local_file_access();
+    if (auto const& root = changing_navigable->target_entry->document_state->local_file_root; root.has_value())
+        local_file_access = Vector { *root };
+    auto loader = NavigationLoader::create(move(request), move(local_file_access));
     changing_navigable->population = ChangingNavigable::CreatingNavigationParams { loader };
     source_page.owe_reply({ OwedReply::Kind::ChangingJob, operation_id, navigable_id });
     source_page.async_create_history_navigation_params(operation_id, loader->request(), allow_POST);
@@ -1421,13 +1432,14 @@ void CanonicalTraversable::did_finish_history_navigation_params_creation(WebCont
     auto* changing_navigable = operation ? operation->pending_changing_job(navigable_id) : nullptr;
     auto* creating = changing_navigable ? changing_navigable->population.get_pointer<ChangingNavigable::CreatingNavigationParams>() : nullptr;
     if (!creating || !source_page.take_owed_reply({ OwedReply::Kind::ChangingJob, operation_id, navigable_id })) {
-        NavigationLoader::discard(source_page.client().is_private(), result);
+        NavigationLoader::discard(source_page.client(), result);
         return;
     }
     auto loader = creating->loader;
     changing_navigable->population = ChangingNavigable::AcquiringResponseBody { loader };
+    loader->refuse_made_up_local_file_urls(source_page.client(), result);
     loader->did_finish_navigation_params_creation(move(result));
-    loader->acquire_response_body([this, operation_id, navigable_id](bool succeeded) {
+    loader->acquire_response_body(source_page.client(), [this, operation_id, navigable_id](bool succeeded) {
         auto* operation = find_history_operation(operation_id);
         auto* changing_navigable = operation ? operation->pending_changing_job(navigable_id) : nullptr;
         if (!changing_navigable)
@@ -1490,17 +1502,28 @@ void CanonicalTraversable::continue_history_navigation_population(HistoryOperati
             did_fail_history_navigation_population(*operation, *changing_navigable);
             return;
         }
-        auto& loader = *populating->loader;
-        Web::HTML::HistoryNavigationPopulation population { loader.request(), loader.take_result() };
-        endpoint->owe_reply({ OwedReply::Kind::ChangingJob, operation_id, navigable_id });
-        if (endpoint == job_page) {
-            endpoint->async_continue_history_navigation_population(operation_id, move(population));
-            return;
-        }
-        // NB: The job's steps ran in the process displaying the navigable's document. Another process hosts the document
-        //     the population creates, and creates it there.
-        endpoint->async_populate_history_entry_document(operation_id, changing_navigable->target_entry_descriptor(), operation->algorithm->navigation_type(),
-            changing_navigable->navigable().ongoing_navigation().has<CanonicalNavigable::Traversal>(), move(population));
+        populating->loader->let_host_adopt_response_body(*endpoint, [this, operation_id, navigable_id, weak_loader, endpoint, job_page] {
+            auto* operation = find_history_operation(operation_id);
+            auto* changing_navigable = operation ? operation->pending_changing_job(navigable_id) : nullptr;
+            auto* populating = changing_navigable ? changing_navigable->population.get_pointer<ChangingNavigable::Populating>() : nullptr;
+            if (!populating || !weak_loader || populating->loader.ptr() != weak_loader.ptr())
+                return;
+            if (!endpoint->is_open()) {
+                did_fail_history_navigation_population(*operation, *changing_navigable);
+                return;
+            }
+            auto& loader = *populating->loader;
+            Web::HTML::HistoryNavigationPopulation population { loader.request(), loader.take_result() };
+            endpoint->owe_reply({ OwedReply::Kind::ChangingJob, operation_id, navigable_id });
+            if (endpoint == job_page) {
+                endpoint->async_continue_history_navigation_population(operation_id, move(population));
+                return;
+            }
+            // NB: The job's steps ran in the process displaying the navigable's document. Another process hosts the document
+            //     the population creates, and creates it there.
+            endpoint->async_populate_history_entry_document(operation_id, changing_navigable->target_entry_descriptor(), operation->algorithm->navigation_type(),
+                changing_navigable->navigable().ongoing_navigation().has<CanonicalNavigable::Traversal>(), move(population));
+        });
     };
     loader->move_response_body_to(endpoint->client().request_server_site_bindings(), move(finish_handoff));
 }
@@ -1545,10 +1568,9 @@ bool CanonicalTraversable::run_changing_navigable_history_step_job(ApplyHistoryS
     auto is_traversal_load = !is_reload && populates_target_entry_document && !operation.parameters.has<Web::FinalizeCrossDocumentNavigationHistoryOperationParameters>();
     if (auto view = this->view(); view.has_value() && navigable.is_top_level_traversable() && (is_reload || is_traversal_load)) {
         // NB: A traversal's load returns to a page already visited. A reload's visit transition is the reload's own.
-        if (is_traversal_load) {
+        if (is_traversal_load)
             view->set_next_history_visit_transition(HistoryVisitTransition::Restore);
-            operation.has_unactivated_traversal_load = true;
-        }
+        operation.has_unactivated_load = true;
 
         // NB: A load a history operation starts, rather than a navigation, is tracked as the active document's.
         clear_active_document_load();
@@ -1711,7 +1733,7 @@ void CanonicalTraversable::did_activate_history_entry(HistoryOperation& operatio
         reload->value.activated = true;
     }
     if (navigable.is_top_level_traversable())
-        operation.has_unactivated_traversal_load = false;
+        operation.has_unactivated_load = false;
     auto const* replaced_document = &navigable.active_document();
     // NB: The page that activated the document hosts it: the job's, which hosts the document the job populated, or else
     //     the navigable's.
@@ -1729,6 +1751,7 @@ void CanonicalTraversable::did_activate_history_entry(HistoryOperation& operatio
             // NB: The address bar can already show a pending navigation's URL while the old document
             //     is still visible. Only apply the destination's zoom after its document is activated.
             view->apply_zoom_for_current_host();
+            view->send_force_dark_to_embedded_pages();
             view->m_external_url_request_policy.clear_page_request_allowance();
             if (view->on_top_level_navigation_commit)
                 view->on_top_level_navigation_commit();
@@ -1889,28 +1912,6 @@ bool CanonicalTraversable::client_populates_a_history_entry_for_site(WebContentC
             auto endpoint = changing_job_endpoint(*changing_navigable);
             if (&endpoint->client() == &client
                 && URL::Site::serialize_for_partitioning(changing_navigable->target_entry->url.origin()) == site)
-                return true;
-        }
-    }
-    return false;
-}
-
-// A history step's changing job populates its target entry's document in the process hosting the navigable, which need
-// not have hosted local file content. For an entry whose document state held local file content, that process reads the
-// file the entry's file: URL names.
-bool CanonicalTraversable::page_populates_a_history_entry_for_local_file(WebContentPage const& page, ByteString const& path) const
-{
-    for (auto const& [operation_id, operation] : m_history_operations) {
-        if (!operation->algorithm)
-            continue;
-        for (auto const& changing_navigable : operation->algorithm->changing_navigables()) {
-            if (!changing_navigable->has_pending_job())
-                continue;
-            auto const& target_entry = *changing_navigable->target_entry;
-            if (target_entry.document_state->held_local_file_content
-                && target_entry.url.scheme() == "file"sv
-                && target_entry.url.file_path() == path
-                && changing_job_endpoint(*changing_navigable) == &page)
                 return true;
         }
     }
@@ -2114,7 +2115,7 @@ void CanonicalTraversable::did_attempt_to_populate_the_history_entry_document(We
             && navigation->history_entry->update_from_descriptor(history_entry_descriptor).is_error()) {
             return;
         }
-        navigation->history_entry->document_state->save_the_origin_of_the_populated_document();
+        navigation->history_entry->document_state->save_the_state_of_the_populated_document();
         return;
     }
 
@@ -2745,23 +2746,22 @@ void CanonicalTraversable::finish_history_operation(Web::HTML::CrossProcessId op
     }
 
     // The requesting page learns the result before the operation completes.
-    if (result.has_value()) {
-        if (operation->requesting_page)
-            operation->requesting_page->async_history_step_applied(operation_id, *result);
-        if (auto const* reload = operation->parameters.get_pointer<Web::ReloadHistoryOperationParameters>(); reload && result != Web::HTML::HistoryStepResult::Applied)
-            did_not_apply_reload(reload->navigable_id, reload_navigation_id(operation_id));
+    if (result.has_value() && operation->requesting_page)
+        operation->requesting_page->async_history_step_applied(operation_id, *result);
+
+    // A load the operation began ends with it if the document it was for was never activated.
+    auto const* reload = operation->parameters.get_pointer<Web::ReloadHistoryOperationParameters>();
+    if (reload && ((result.has_value() && *result != Web::HTML::HistoryStepResult::Applied) || operation->has_unactivated_load)) {
+        did_not_apply_reload(reload->navigable_id, reload_navigation_id(operation_id));
+    } else if (operation->has_unactivated_load) {
+        if (auto view = this->view(); view.has_value())
+            view->did_not_activate_history_traversal_load();
     }
 
     // NB: A skipped or stale reload job can finish with "applied" without activating a document.
-    if (auto reload = m_reload_navigation_ids.take(operation_id); reload.has_value() && !reload->activated) {
+    if (auto reload_navigation = m_reload_navigation_ids.take(operation_id); reload_navigation.has_value() && !reload_navigation->activated) {
         if (auto* bidi = WebDriverBiDi::the())
-            bidi->reload_did_not_apply(*this, reload->id);
-    }
-
-    // A load the traversal began ends with it if the document it was for was never activated.
-    if (operation->has_unactivated_traversal_load) {
-        if (auto view = this->view(); view.has_value())
-            view->did_not_activate_history_traversal_load();
+            bidi->reload_did_not_apply(*this, reload_navigation->id);
     }
 
     auto committed_step = operation->algorithm ? operation->algorithm->committed_step() : Optional<i32> {};
@@ -2807,7 +2807,7 @@ void CanonicalTraversable::finish_history_operation(Web::HTML::CrossProcessId op
 void CanonicalTraversable::abandon_browser_traversal_load()
 {
     auto* traversal = ongoing_browser_history_traversal();
-    if (!traversal || !traversal->has_unactivated_traversal_load)
+    if (!traversal || !traversal->has_unactivated_load)
         return;
 
     // NB: Once the job has stopped populating, the displayed document may already be unloading.
@@ -2820,9 +2820,9 @@ void CanonicalTraversable::abandon_browser_traversal_load()
     finish_history_operation(traversal->operation_id);
 }
 
-bool CanonicalTraversable::has_unactivated_traversal_load() const
+bool CanonicalTraversable::has_unactivated_load() const
 {
-    return any_of(m_history_operations, [](auto const& entry) { return entry.value->has_unactivated_traversal_load; });
+    return any_of(m_history_operations, [](auto const& entry) { return entry.value->has_unactivated_load; });
 }
 
 void CanonicalTraversable::abandon_history_operations()

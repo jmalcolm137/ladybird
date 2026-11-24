@@ -92,7 +92,7 @@ public:
     u64 download_file(IsPrivate, URL::URL const&, LexicalPath, MayReplaceDestination = MayReplaceDestination::No);
     using ResponseFinished = Function<void(u64 decoded_body_size, Requests::RequestTimingInfo const*,
         Optional<StringView> error)>;
-    u64 adopt_download(IsPrivate, URL::URL const&, LexicalPath, Optional<u64> total_size, HTTP::Cookie::SameSiteContext, int request_server_client_id, u64 request_server_request_id, ReadonlyBytes initial_data = {}, ResponseFinished = {});
+    u64 adopt_download(IsPrivate, URL::URL const&, LexicalPath, Optional<u64> total_size, HTTP::Cookie::SameSiteContext, int request_server_client_id, u64 request_server_request_id, int owner_client_id, ReadonlyBytes initial_data = {}, ResponseFinished = {});
     u64 start_download(IsPrivate, URL::URL const&, LexicalPath, Optional<u64> total_size = {}, MayReplaceDestination = MayReplaceDestination::No);
     bool has_active_downloads() const;
     bool has_unresumable_downloads() const;
@@ -154,6 +154,7 @@ private:
     void forget_persisted_download(u64 id);
     void restore_persisted_downloads();
     bool restore_persisted_download(DownloadRecord&);
+    void remove_orphaned_temporary_files_once(ByteString const& directory);
     static void remove_orphaned_temporary_files(HashTable<ByteString> const& directories, HashTable<ByteString> const& temporary_paths_in_use);
 
     void maybe_split_download(u64 id);
@@ -173,6 +174,7 @@ private:
     HashMap<u64, NonnullOwnPtr<ActiveDownload>> m_active_downloads;
     Vector<FileDownloaderObserver&> m_observers;
     DownloadStore* m_download_store { nullptr };
+    HashTable<ByteString> m_directories_cleared_of_orphaned_temporary_files;
     u64 m_next_download_id { 0 };
 };
 

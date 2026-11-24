@@ -2,6 +2,9 @@ const tabLayoutGroup = document.querySelector("#tab-layout-group");
 const tabLayoutInputs = tabLayoutGroup.querySelectorAll('input[name="tab-layout"]');
 const verticalTabsExpandOnHover = document.querySelector("#vertical-tabs-expand-on-hover");
 const verticalTabsPosition = document.querySelector("#vertical-tabs-position");
+const showBookmarksBar = document.querySelector("#show-bookmarks-bar");
+const discardHiddenTabsAfter = document.querySelector("#discard-hidden-tabs-after");
+const tabProcesses = document.querySelector("#tab-processes");
 
 let TAB_SETTINGS = {};
 
@@ -22,6 +25,10 @@ const updateVerticalTabsDependentSettings = () => {
         "hidden",
         !verticalTabsEnabled || !!TAB_SETTINGS.everythingInSidebar
     );
+    showBookmarksBar.parentElement.classList.toggle(
+        "hidden",
+        verticalTabsEnabled && !!TAB_SETTINGS.everythingInSidebar
+    );
 };
 
 const tabLayout = () => {
@@ -40,6 +47,13 @@ const loadSettings = settings => {
     for (const input of tabLayoutInputs) input.checked = input.value === layout;
     verticalTabsExpandOnHover.checked = !!TAB_SETTINGS.verticalTabsExpandOnHover;
     verticalTabsPosition.value = TAB_SETTINGS.verticalTabsPosition || "left";
+    const discardMinutes = String(TAB_SETTINGS.discardHiddenTabsAfterMinutes ?? 120);
+    // A value set outside this page, such as in the settings file, gets an option of its own, so the menu shows it.
+    if (![...discardHiddenTabsAfter.options].some(option => option.value === discardMinutes)) {
+        discardHiddenTabsAfter.add(new Option(`After ${discardMinutes} minutes`, discardMinutes));
+    }
+    discardHiddenTabsAfter.value = discardMinutes;
+    tabProcesses.value = TAB_SETTINGS.tabProcesses || "perOrigin";
     updateVerticalTabsDependentSettings();
 };
 
@@ -64,6 +78,16 @@ verticalTabsExpandOnHover.addEventListener("change", () => {
 
 verticalTabsPosition.addEventListener("change", () => {
     TAB_SETTINGS.verticalTabsPosition = verticalTabsPosition.value;
+    saveTabSettings();
+});
+
+discardHiddenTabsAfter.addEventListener("change", () => {
+    TAB_SETTINGS.discardHiddenTabsAfterMinutes = Number(discardHiddenTabsAfter.value);
+    saveTabSettings();
+});
+
+tabProcesses.addEventListener("change", () => {
+    TAB_SETTINGS.tabProcesses = tabProcesses.value;
     saveTabSettings();
 });
 

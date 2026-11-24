@@ -34,7 +34,7 @@ struct FinalizationRecord {
 struct FinalizationRecords(Vec<FinalizationRecord>);
 
 // SAFETY: Visits the held value and the unregister token of every record. The targets are held weakly, and cleared in
-// remove_dead_cells() once they die.
+// remove_dead_cells() once they die, which also hands the slots of those that survived to a collection that moves cells.
 unsafe impl Trace for FinalizationRecords {
     fn trace(&self, visitor: &mut Visitor) {
         for record in &self.0 {
@@ -164,11 +164,17 @@ impl FinalizationRegistry {
             .downcast::<FinalizationRegistry>()
             .expect("the weak container is a FinalizationRegistry");
         let mut any_cells_were_removed = false;
+        let moves_cells = sweep.moves_cells();
         for record in &mut finalization_registry.records.borrow_mut_in_sweep(sweep).0 {
-            let Some(target) = record.target else {
+            let Some(target) = &record.target else {
                 continue;
             };
-            if !sweep.is_dead(target) {
+            if !sweep.is_dead(*target) {
+                if moves_cells {
+                    // SAFETY: Only the registry's own methods change its records, and none runs until the collection
+                    //         is over.
+                    unsafe { sweep.record_slot(target) };
+                }
                 continue;
             }
             record.target = None;

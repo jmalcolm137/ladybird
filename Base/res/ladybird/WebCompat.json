@@ -1,0 +1,31 @@
+[
+    {
+        "sites": [
+            "https://cnn.com",
+            "https://di.se",
+            "https://dn.se",
+            "https://expressen.se",
+            "https://osnews.com"
+        ],
+        "user_agent": [
+            "hide_Ladybird"
+        ]
+    },
+    {
+        "sites": [
+            "https://twitch.tv"
+        ],
+        "user_agent": [
+            "hide_Ladybird",
+            "hide_Chromium"
+        ]
+    },
+    {
+        "sites": [
+            "https://kde.org"
+        ],
+        "user_agent": [
+            "hide_Chromium"
+        ]
+    }
+]

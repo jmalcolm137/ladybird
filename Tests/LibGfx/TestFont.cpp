@@ -90,6 +90,19 @@ static NonnullRefPtr<Gfx::Font> load_text_font(float point_size)
     return adopt_ref(*new Gfx::Font(typeface, point_size, point_size, {}, {}));
 }
 
+#ifdef AK_OS_LINUX
+TEST_CASE(linux_system_font_metrics_enclose_the_legacy_ascent_and_descent)
+{
+    auto file = MUST(Core::MappedFile::map(TEST_INPUT("fonts/text.ttf"sv)));
+    auto typeface = MUST(Gfx::Typeface::try_load_from_temporary_memory(file->bytes()));
+    typeface->set_system_font_identifier({ 1, 1 });
+    auto font = typeface->font(12);
+
+    EXPECT_EQ(font->pixel_metrics().ascent, 16.0f);
+    EXPECT_EQ(font->pixel_metrics().descent, 4.0f);
+}
+#endif
+
 TEST_CASE(pending_font_only_hides_its_unicode_range)
 {
     auto font = load_text_font(16);
@@ -392,6 +405,20 @@ TEST_CASE(font_collection_preserves_each_face_style)
     EXPECT(Gfx::Typeface::try_load_from_temporary_memory(file->bytes(), 3).is_error());
 }
 
+TEST_CASE(face_with_a_symbol_cmap_subtable_is_a_symbol_font)
+{
+    auto file = MUST(Core::MappedFile::map(TEST_INPUT("fonts/symbol-face.ttc"sv)));
+    auto symbol_face = MUST(Gfx::Typeface::try_load_from_temporary_memory(file->bytes(), 0));
+    auto text_face = MUST(Gfx::Typeface::try_load_from_temporary_memory(file->bytes(), 1));
+    EXPECT_EQ(symbol_face->family(), "Symbol Face Test"sv);
+    EXPECT_EQ(text_face->family(), "Symbol Face Test"sv);
+    EXPECT(symbol_face->description().is_symbol_font());
+    EXPECT(!text_face->description().is_symbol_font());
+
+    // The symbol face still maps a letter through its Unicode subtable.
+    EXPECT_NE(symbol_face->font(12)->glyph_id_for_code_point('a'), 0u);
+}
+
 // The answer depends on the installed font set alone, so every thread must reach the same one and
 // the memo must match a code point once however many threads ask at the same moment.
 TEST_CASE(system_fallback_fonts_can_be_matched_on_several_threads)
@@ -434,6 +461,49 @@ TEST_CASE(system_fallback_fonts_can_be_matched_on_several_threads)
     bold_key.weight = 700;
     (void)Gfx::system_fallback_font(bold_key, 12);
     EXPECT_EQ(Gfx::system_fallback_font_cache_size(), 2u);
+}
+
+// A system fallback font applies the features its request asks for, as the cascade's own fonts do, whether the memo
+// already knew its typeface or not.
+TEST_CASE(system_fallback_fonts_apply_the_requested_features)
+{
+    Gfx::clear_system_fallback_font_cache();
+    Gfx::SystemFallbackFontKey key {
+        .code_point = 'A',
+        .weight = 400,
+        .width = Gfx::FontWidth::Normal,
+        .slope = 0,
+        .prefer_color_emoji = false,
+    };
+    Gfx::ShapeFeatures features { { { 'l', 'i', 'g', 'a' }, 0 }, { { 's', 'm', 'c', 'p' }, 1 } };
+
+    // NB: A machine without a font covering the code point answers null, which applies nothing.
+    auto first = Gfx::system_fallback_font(key, 12, features);
+    if (!first)
+        return;
+    EXPECT_EQ(first->features(), features);
+    EXPECT_EQ(Gfx::system_fallback_font(key, 12, features)->features(), features);
+    EXPECT(Gfx::system_fallback_font(key, 12)->features().is_empty());
+}
+
+// A frozen cascade asks the system fallback for its request's features too.
+TEST_CASE(frozen_cascade_asks_the_system_fallback_for_the_requested_features)
+{
+    Gfx::clear_system_fallback_font_cache();
+    auto last_resort_font = load_text_font(16);
+    Gfx::ShapeFeatures features { { { 'l', 'i', 'g', 'a' }, 0 } };
+    auto cascade = Gfx::FontCascadeList::create();
+    cascade->add(last_resort_font, { { 'a', 'a' } });
+    cascade->set_last_resort_font(last_resort_font);
+    cascade->set_system_font_fallback_callback({ .point_size = 12, .weight = 400, .width = Gfx::FontWidth::Normal, .slope = 0, .shape_features = features },
+        [](u32, Gfx::EmojiPresentation, Gfx::FontCascadeList::SystemFallbackRequest const&) -> RefPtr<Gfx::Font const> { return nullptr; });
+    cascade->freeze();
+
+    // NB: Where no installed font covers the code point, the cascade answers with its last-resort font instead.
+    auto const& font = cascade->frozen_font_for_code_point('A');
+    if (&font == last_resort_font.ptr())
+        return;
+    EXPECT_EQ(font.features(), features);
 }
 
 // A frozen cascade answers the same question as the live one, without entering the document.

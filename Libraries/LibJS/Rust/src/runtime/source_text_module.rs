@@ -172,7 +172,7 @@ impl SourceTextModule {
         host_defined: ForeignCellSlot,
         line_number_offset: usize,
     ) -> Result<Gc<SourceTextModule>, Vec<ParserError>> {
-        let parsed = parse(source_code.code(), ProgramType::Module, line_number_offset);
+        let parsed = parse(&source_code.code(), ProgramType::Module, line_number_offset);
         if parsed.has_errors() {
             return Err(ParserError::all_from_parsed_program(&parsed));
         }
@@ -550,17 +550,15 @@ impl SourceTextModule {
         // NOTE: This must be true because we use a reference.
 
         // 11. Set the Realm of moduleContext to module.[[Realm]].
-        self.execution_context.realm.set(Some(realm));
+        self.execution_context.set_realm(Some(realm));
 
         // 12. Set the ScriptOrModule of moduleContext to module.
         self.execution_context
-            .script_or_module
-            .set(ScriptOrModule::Module(self.as_gc()));
+            .set_script_or_module(ScriptOrModule::Module(self.as_gc()));
 
         // 13. Set the VariableEnvironment of moduleContext to module.[[Environment]].
         self.execution_context
-            .variable_environment
-            .set(Some(environment.upcast()));
+            .set_variable_environment(Some(environment.upcast()));
 
         // 14. Set the LexicalEnvironment of moduleContext to module.[[Environment]].
         self.execution_context
@@ -911,12 +909,10 @@ impl SourceTextModule {
         // 2. Set the Function of moduleContext to null.
 
         // 3. Set the Realm of moduleContext to module.[[Realm]].
-        module_context_ref.realm.set(Some(self.realm()));
+        module_context_ref.set_realm(Some(self.realm()));
 
         // 4. Set the ScriptOrModule of moduleContext to module.
-        module_context_ref
-            .script_or_module
-            .set(ScriptOrModule::Module(self.as_gc()));
+        module_context_ref.set_script_or_module(ScriptOrModule::Module(self.as_gc()));
 
         // 5. Assert: module has been linked and declarations in its module environment have been instantiated.
         assert!(!matches!(
@@ -926,7 +922,7 @@ impl SourceTextModule {
         let environment = self.environment().expect("a linked module has an environment");
 
         // 6. Set the VariableEnvironment of moduleContext to module.[[Environment]].
-        module_context_ref.variable_environment.set(Some(environment.upcast()));
+        module_context_ref.set_variable_environment(Some(environment.upcast()));
 
         // 7. Set the LexicalEnvironment of moduleContext to module.[[Environment]].
         module_context_ref.lexical_environment.set(Some(environment.upcast()));

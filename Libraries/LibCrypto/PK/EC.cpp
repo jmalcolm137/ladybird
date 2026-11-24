@@ -5,161 +5,91 @@
  */
 
 #include <AK/ByteBuffer.h>
-#include <AK/StringView.h>
-#include <LibCrypto/ASN1/DER.h>
-#include <LibCrypto/Certificate/Certificate.h>
+#include <AK/ScopeGuard.h>
 #include <LibCrypto/OpenSSL.h>
-
+#include <LibCrypto/PK/EC.h>
+#include <openssl/core_names.h>
 #include <openssl/ec.h>
+#include <openssl/evp.h>
+#include <openssl/param_build.h>
 
 namespace Crypto::PK {
 
-void ECPrivateKey::clear_sensitive_data()
+static ErrorOr<char const*> curve_name(size_t scalar_size)
 {
-    m_d.clear_sensitive_data();
+    switch (scalar_size) {
+    case 32:
+        return "P-256";
+    case 48:
+        return "P-384";
+    case 66:
+        return "P-521";
+    default:
+        return Error::from_string_literal("Unsupported EC curve");
+    }
 }
 
-ErrorOr<ByteBuffer> ECPrivateKey::export_as_der() const
+static ErrorOr<OpenSSL_PKEY> public_key_from_coordinates(ReadonlyBytes x, ReadonlyBytes y)
 {
-    ASN1::Encoder encoder;
-    TRY(encoder.write_constructed(ASN1::Class::Universal, ASN1::Kind::Sequence, [&]() -> ErrorOr<void> {
-        TRY(encoder.write(1u)); // version
+    if (x.size() != y.size())
+        return Error::from_string_literal("EC coordinates have different sizes");
+    auto const* group = TRY(curve_name(x.size()));
+    auto octets = TRY(ByteBuffer::create_uninitialized(1 + x.size() + y.size()));
+    octets[0] = 0x04;
+    octets.overwrite(1, x.data(), x.size());
+    octets.overwrite(1 + x.size(), y.data(), y.size());
 
-        auto d = TRY(d_bytes());
-        TRY(encoder.write<ReadonlyBytes>(d));
+    auto* builder = OPENSSL_TRY_PTR(OSSL_PARAM_BLD_new());
+    ScopeGuard const free_builder = [&] { OSSL_PARAM_BLD_free(builder); };
+    OPENSSL_TRY(OSSL_PARAM_BLD_push_utf8_string(builder, OSSL_PKEY_PARAM_GROUP_NAME, group, 0));
+    OPENSSL_TRY(OSSL_PARAM_BLD_push_octet_string(builder, OSSL_PKEY_PARAM_PUB_KEY, octets.data(), octets.size()));
+    auto* params = OPENSSL_TRY_PTR(OSSL_PARAM_BLD_to_param(builder));
+    ScopeGuard const free_params = [&] { OSSL_PARAM_free(params); };
 
-        if (m_parameters.has_value()) {
-            TRY(encoder.write_constructed(ASN1::Class::Context, static_cast<ASN1::Kind>(0), [&]() -> ErrorOr<void> {
-                TRY(encoder.write<ASN1::ObjectIdentifier>(*m_parameters, {}, ASN1::Kind::ObjectIdentifier));
-                return {};
-            }));
-        }
+    auto ctx = TRY(OpenSSL_PKEY_CTX::wrap(EVP_PKEY_CTX_new_from_name(nullptr, "EC", nullptr)));
+    OPENSSL_TRY(EVP_PKEY_fromdata_init(ctx.ptr()));
+    EVP_PKEY* key_pointer = nullptr;
+    if (EVP_PKEY_fromdata(ctx.ptr(), &key_pointer, EVP_PKEY_PUBLIC_KEY, params) != 1)
+        return Error::from_string_literal("Invalid EC public key");
+    auto key = TRY(OpenSSL_PKEY::wrap(key_pointer));
 
-        if (m_public_key.has_value()) {
-            TRY(encoder.write_constructed(ASN1::Class::Context, static_cast<ASN1::Kind>(1), [&]() -> ErrorOr<void> {
-                auto public_key_bytes = TRY(m_public_key->to_uncompressed());
-                TRY(encoder.write(ASN1::BitStringView(public_key_bytes, 0)));
-
-                return {};
-            }));
-        }
-
-        return {};
-    }));
-
-    return encoder.finish();
+    auto check_ctx = TRY(OpenSSL_PKEY_CTX::wrap(EVP_PKEY_CTX_new_from_pkey(nullptr, key.ptr(), nullptr)));
+    if (EVP_PKEY_public_check(check_ctx.ptr()) != 1)
+        return Error::from_string_literal("Invalid EC public key");
+    return key;
 }
 
-static ErrorOr<ECPublicKey> read_ec_public_key(ReadonlyBytes bytes, Vector<StringView> current_scope)
+ErrorOr<bool> ecdsa_verify(ReadonlyBytes x, ReadonlyBytes y, ReadonlyBytes digest, ReadonlyBytes r, ReadonlyBytes s)
 {
-    // NOTE: Public keys do not have an ASN1 structure
-    if (bytes.size() < 1) {
-        ERROR_WITH_SCOPE("Invalid public key length");
+    auto key = TRY(public_key_from_coordinates(x, y));
+    if (r.size() != x.size() || s.size() != x.size())
+        return false;
+
+    auto* signature_object = OPENSSL_TRY_PTR(ECDSA_SIG_new());
+    ScopeGuard const free_signature_object = [&] { ECDSA_SIG_free(signature_object); };
+    auto* r_value = OPENSSL_TRY_PTR(BN_bin2bn(r.data(), r.size(), nullptr));
+    auto* s_value = BN_bin2bn(s.data(), s.size(), nullptr);
+    if (!s_value || ECDSA_SIG_set0(signature_object, r_value, s_value) != 1) {
+        BN_free(r_value);
+        BN_free(s_value);
+        return Error::from_string_literal("Failed to build the ECDSA signature");
     }
 
-    if (bytes[0] == 0x04) {
-        auto point = TRY(Curves::SECPxxxr1Point::from_uncompressed(bytes));
-        return ECPublicKey { move(point) };
-    }
+    u8* signature = nullptr;
+    ScopeGuard const free_signature = [&] { OPENSSL_free(signature); };
+    auto signature_size = i2d_ECDSA_SIG(signature_object, &signature);
+    if (signature_size <= 0)
+        return Error::from_string_literal("Failed to encode the ECDSA signature");
 
-    // Compressed point format: 0x02 (y even) or 0x03 (y odd)
-    if (bytes[0] == 0x02 || bytes[0] == 0x03) {
-        auto point = TRY(Curves::SECPxxxr1Point::from_compressed(bytes));
-        return ECPublicKey { move(point) };
-    }
-
-    if (bytes.size() % 2 == 0) {
-        // Raw public key, without the 0x04 prefix
-        auto half_size = bytes.size() / 2;
-        return ::Crypto::PK::ECPublicKey {
-            UnsignedBigInteger::import_data(bytes.slice(0, half_size)),
-            UnsignedBigInteger::import_data(bytes.slice(half_size, half_size)),
-            half_size,
-        };
-    }
-
-    ERROR_WITH_SCOPE("Unsupported public key format");
-}
-
-// https://www.rfc-editor.org/rfc/rfc5915#section-3
-ErrorOr<EC::KeyPairType> EC::parse_ec_key(ReadonlyBytes der, bool is_private, Vector<StringView> current_scope)
-{
-    KeyPairType keypair;
-
-    ASN1::Decoder decoder(der);
-
-    if (is_private) {
-        // ECPrivateKey ::= SEQUENCE {
-        //      version         INTEGER { ecPrivkeyVer1(1) }(ecPrivkeyVer1),
-        //      privateKey      OCTET STRING,
-        //      parameters  [0] ECParameters {{ NamedCurve }} OPTIONAL,
-        //      publicKey   [1] BIT STRING OPTIONAL
-        // }
-
-        ENTER_TYPED_SCOPE(Sequence, "ECPrivateKey");
-
-        PUSH_SCOPE("version");
-        READ_OBJECT(Integer, Crypto::UnsignedBigInteger, version);
-        POP_SCOPE();
-
-        if (version != 1) {
-            ERROR_WITH_SCOPE("Invalid version");
-        }
-
-        PUSH_SCOPE("privateKey");
-        READ_OBJECT(OctetString, StringView, private_key_bytes);
-        POP_SCOPE();
-
-        auto private_key = UnsignedBigInteger::import_data(private_key_bytes.bytes());
-
-        Optional<ASN1::ObjectIdentifier> parameters;
-        if (!decoder.eof()) {
-            auto tag = TRY(decoder.peek());
-            if (static_cast<u8>(tag.kind) == 0) {
-                REWRITE_TAG(Sequence);
-                ENTER_TYPED_SCOPE(Sequence, "parameters");
-                parameters = TRY(Crypto::Certificate::parse_ec_parameters(decoder, {}));
-                EXIT_SCOPE();
-            }
-        }
-
-        Optional<ECPublicKey> public_key;
-        if (!decoder.eof()) {
-            auto tag = TRY(decoder.peek());
-            if (static_cast<u8>(tag.kind) == 1) {
-                REWRITE_TAG(Sequence);
-                ENTER_TYPED_SCOPE(Sequence, "publicKey");
-                READ_OBJECT(BitString, Crypto::ASN1::BitStringView, public_key_bits);
-
-                auto public_key_bytes = TRY(public_key_bits.raw_bytes());
-                auto maybe_public_key = read_ec_public_key(public_key_bytes, current_scope);
-                if (maybe_public_key.is_error()) {
-                    ERROR_WITH_SCOPE(maybe_public_key.release_error());
-                }
-
-                keypair.public_key = maybe_public_key.release_value();
-                public_key = keypair.public_key;
-                if (keypair.public_key.scalar_size() != private_key_bytes.length()) {
-                    ERROR_WITH_SCOPE("Invalid public key length");
-                }
-
-                EXIT_SCOPE();
-            }
-        }
-
-        keypair.private_key = ECPrivateKey { private_key, private_key_bytes.length(), parameters, public_key };
-
-        EXIT_SCOPE();
-        return keypair;
-    } else {
-        auto maybe_key = read_ec_public_key(der, current_scope);
-        if (maybe_key.is_error()) {
-            ERROR_WITH_SCOPE(maybe_key.release_error());
-        }
-
-        keypair.public_key = maybe_key.release_value();
-        return keypair;
-    }
+    auto ctx = TRY(OpenSSL_PKEY_CTX::wrap(EVP_PKEY_CTX_new_from_pkey(nullptr, key.ptr(), nullptr)));
+    OPENSSL_TRY(EVP_PKEY_verify_init(ctx.ptr()));
+    auto result = EVP_PKEY_verify(ctx.ptr(), signature, signature_size, digest.data(), digest.size());
+    if (result == 1)
+        return true;
+    if (result == 0)
+        return false;
+    OPENSSL_TRY(result);
+    VERIFY_NOT_REACHED();
 }
 
 }

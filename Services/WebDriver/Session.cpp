@@ -38,18 +38,14 @@ namespace WebDriver {
 static HashMap<String, NonnullRefPtr<Session>> s_sessions;
 static HashMap<String, NonnullRefPtr<Session>> s_http_sessions;
 
-struct SessionCreationState;
-static WeakPtr<SessionCreationState> s_http_session_creation;
+// The session whose browser is starting, until it is appended to the active sessions or closed.
+static RefPtr<Session> s_session_being_created;
 
-struct SessionCreationState
-    : public RefCounted<SessionCreationState>
-    , public Weakable<SessionCreationState> {
-    SessionCreationState(JsonValue capabilities, Web::WebDriver::SessionFlags flags)
+struct SessionCreationState : public RefCounted<SessionCreationState> {
+    SessionCreationState(JsonValue capabilities)
         : capabilities(move(capabilities))
         , promise(Session::NewSessionPromise::construct())
     {
-        if (has_flag(flags, Web::WebDriver::SessionFlags::Http))
-            s_http_session_creation = *this;
     }
 
     JsonValue capabilities;
@@ -64,16 +60,17 @@ static Web::WebDriver::Error session_not_created_error(AK::Error const& error)
 // https://w3c.github.io/webdriver/#dfn-create-a-session
 ErrorOr<NonnullRefPtr<Session::NewSessionPromise>> Session::create(NonnullRefPtr<Client> client, JsonValue capabilities, Web::WebDriver::SessionFlags flags)
 {
-    if (has_flag(flags, Web::WebDriver::SessionFlags::Http) && s_http_session_creation)
-        return Error::from_string_literal("An HTTP session is already being created");
+    if (s_session_being_created)
+        return Error::from_string_literal("A session is already being created");
 
-    auto state = adopt_ref(*new SessionCreationState(move(capabilities), flags));
+    auto state = adopt_ref(*new SessionCreationState(move(capabilities)));
 
     // 1. Let session id be the result of generating a UUID.
     auto session_id = generate_random_uuid();
 
     // 2. Let session be a new session with session ID session id, and HTTP flag flags contains "http".
     auto session = adopt_ref(*new Session(client, state->capabilities.as_object(), move(session_id), flags));
+    s_session_being_created = session;
     auto start_result = session->start(client->launch_browser_callback());
     if (start_result.is_error()) {
         auto error = start_result.release_error();
@@ -205,6 +202,7 @@ ErrorOr<NonnullRefPtr<Session::NewSessionPromise>> Session::create(NonnullRefPtr
                      }
 
                      // 12. Append session to active sessions.
+                     s_session_being_created = nullptr;
                      s_sessions.set(session->session_id(), session);
 
                      // 13. If flags contains "http", append session to active HTTP sessions.
@@ -279,7 +277,7 @@ size_t Session::session_count(Web::WebDriver::SessionFlags session_flags)
 
 bool Session::has_pending_http_session_creation()
 {
-    return s_http_session_creation;
+    return s_session_being_created && has_flag(s_session_being_created->session_flags(), Web::WebDriver::SessionFlags::Http);
 }
 
 NonnullRefPtr<Session::WebDriverPromise> Session::enqueue_http_request(Function<NonnullRefPtr<WebDriverPromise>()> handler)
@@ -327,12 +325,13 @@ void Session::dequeue_current_http_request()
 
 void Session::close_all()
 {
-    // close() unregisters each session as it runs, so snapshot first. s_sessions holds every
-    // session (HTTP ones are also in s_http_sessions), so iterating it alone covers all of them.
+    // Closing unregisters sessions, so snapshot both active and starting sessions first.
     Vector<NonnullRefPtr<Session>> sessions;
-    sessions.ensure_capacity(s_sessions.size());
+    sessions.ensure_capacity(s_sessions.size() + 1);
     for (auto& session : s_sessions)
         sessions.unchecked_append(session.value);
+    if (s_session_being_created)
+        sessions.unchecked_append(*s_session_being_created);
     for (auto& session : sessions)
         session->close();
 }
@@ -349,10 +348,12 @@ void Session::arm_browser_startup_timeout(NonnullRefPtr<ServerPromise> promise)
 {
     m_start_promise = move(promise);
     static constexpr u32 BROWSER_STARTUP_TIMEOUT_MS = 30'000;
-    m_start_timer = Core::Timer::create_single_shot(AK::Duration::from_milliseconds(BROWSER_STARTUP_TIMEOUT_MS), [this] {
-        [[maybe_unused]] auto timer_lifetime_guard = move(m_start_timer);
-        reject_start_promise(Error::from_string_literal("Timed out waiting for browser startup"));
-        close();
+    m_start_timer = Core::Timer::create_single_shot(AK::Duration::from_milliseconds(BROWSER_STARTUP_TIMEOUT_MS), [weak_session = make_weak_ref()] {
+        auto session = weak_session.strong_ref();
+        if (!session)
+            return;
+        session->reject_start_promise(Error::from_string_literal("Timed out waiting for browser startup"));
+        session->close();
     });
     m_start_timer->start();
 }
@@ -388,6 +389,8 @@ void Session::close()
 
     // 2. Remove session from active sessions.
     s_sessions.remove(m_session_id);
+    if (s_session_being_created == this)
+        s_session_being_created = nullptr;
 
     // https://w3c.github.io/webdriver-bidi/#cleanup-the-session
     // 1. Close the WebSocket connections with session.
@@ -446,6 +449,7 @@ void Session::close()
 #if defined(AK_OS_MACOS)
     m_browser_mach_port_server = nullptr;
 #else
+    m_browser_server = nullptr;
     if (!m_browser_endpoint.is_empty())
         MUST(FileSystem::remove(m_browser_endpoint, FileSystem::RecursionMode::Disallowed));
 #endif
@@ -462,31 +466,41 @@ ErrorOr<void> Session::accept_browser_transport(NonnullOwnPtr<IPC::Transport> tr
     auto browser_connection = TRY(adopt_nonnull_ref_or_enomem(new (nothrow) BrowserConnection(move(transport))));
     dbgln("WebDriver is connected to the browser process");
 
-    browser_connection->on_close = [this]() {
-        // Keep the connection alive through this callback, while preventing close() from sending to the dead connection.
-        [[maybe_unused]] auto connection_lifetime_guard = move(m_browser_connection);
-        reject_start_promise(Error::from_string_literal("Browser connection lost"));
-        reject_pending_browser_commands();
-        close();
+    browser_connection->on_close = [weak_session = make_weak_ref()] {
+        auto session = weak_session.strong_ref();
+        if (!session)
+            return;
+        // Prevent close() from sending to the dead connection.
+        session->m_browser_connection = nullptr;
+        session->reject_start_promise(Error::from_string_literal("Browser connection lost"));
+        session->reject_pending_browser_commands();
+        session->close();
     };
-    browser_connection->on_did_create_window = [this](String window_handle) {
-        cancel_browser_startup_timeout();
-        if (!m_windows.contains(window_handle))
-            m_windows.set(window_handle, Session::Window { window_handle });
-        if (m_current_window_handle.is_empty())
-            m_current_window_handle = window_handle;
+    browser_connection->on_did_create_window = [weak_session = make_weak_ref()](String window_handle) {
+        auto session = weak_session.strong_ref();
+        if (!session)
+            return;
+        session->cancel_browser_startup_timeout();
+        if (!session->m_windows.contains(window_handle))
+            session->m_windows.set(window_handle, Session::Window { window_handle });
+        if (session->m_current_window_handle.is_empty())
+            session->m_current_window_handle = window_handle;
 
-        dispatch_window_handle_became_available_callbacks(window_handle);
-        if (auto start_promise = move(m_start_promise))
+        session->dispatch_window_handle_became_available_callbacks(window_handle);
+        if (auto start_promise = move(session->m_start_promise))
             start_promise->resolve({});
     };
-    browser_connection->on_did_close_window = [this](String window_handle) {
-        remove_window(window_handle);
+    browser_connection->on_did_close_window = [weak_session = make_weak_ref()](String window_handle) {
+        if (auto session = weak_session.strong_ref())
+            session->remove_window(window_handle);
     };
-    browser_connection->on_command_complete = [this](u64 command_id, Web::WebDriver::Response response) {
-        auto promise = m_pending_browser_commands.take(command_id);
+    browser_connection->on_command_complete = [weak_session = make_weak_ref()](u64 command_id, Web::WebDriver::Response response) {
+        auto session = weak_session.strong_ref();
+        if (!session)
+            return;
+        auto promise = session->m_pending_browser_commands.take(command_id);
         if (!promise.has_value()) {
-            m_browser_connection->did_misbehave("Received response for unknown WebDriver command ID");
+            session->m_browser_connection->did_misbehave("Received response for unknown WebDriver command ID");
             return;
         }
 
@@ -496,18 +510,17 @@ ErrorOr<void> Session::accept_browser_transport(NonnullOwnPtr<IPC::Transport> tr
             promise.value()->resolve(response.release_value());
     };
 
-    browser_connection->on_bidi_event = [this](String name, JsonValue params, Vector<String> top_level_traversable_ids, Vector<String> user_context_ids) {
-        if (m_bidi_session)
-            m_bidi_session->did_receive_event(name, move(params), top_level_traversable_ids, user_context_ids);
+    browser_connection->on_bidi_event = [weak_session = make_weak_ref()](String name, JsonValue params, Vector<String> top_level_traversable_ids, Vector<String> user_context_ids) {
+        auto session = weak_session.strong_ref();
+        if (session && session->m_bidi_session)
+            session->m_bidi_session->did_receive_event(name, move(params), top_level_traversable_ids, user_context_ids);
     };
 
     m_browser_connection = move(browser_connection);
 #if defined(AK_OS_MACOS)
     m_browser_mach_port_server = nullptr;
 #else
-    m_event_loop.deferred_invoke([session = NonnullRefPtr { *this }] {
-        session->m_browser_server = nullptr;
-    });
+    m_browser_server = nullptr;
 #endif
     return {};
 }
@@ -716,20 +729,24 @@ ErrorOr<void> Session::create_server()
     auto server = Core::LocalServer::construct();
     server->listen(m_browser_endpoint);
 
-    server->on_accept = [this](auto client_socket) {
+    server->on_accept = [weak_session = make_weak_ref()](auto client_socket) {
+        auto session = weak_session.strong_ref();
+        if (!session)
+            return;
         auto maybe_transport = IPC::Transport::from_socket(move(client_socket));
         if (maybe_transport.is_error()) {
-            reject_start_promise(maybe_transport.release_error());
+            session->reject_start_promise(maybe_transport.release_error());
             return;
         }
-        if (auto result = accept_browser_transport(maybe_transport.release_value()); result.is_error())
-            reject_start_promise(result.release_error());
+        if (auto result = session->accept_browser_transport(maybe_transport.release_value()); result.is_error())
+            session->reject_start_promise(result.release_error());
     };
 
-    server->on_accept_error = [this](auto error) {
-        if (m_browser_connection)
+    server->on_accept_error = [weak_session = make_weak_ref()](auto error) {
+        auto session = weak_session.strong_ref();
+        if (!session || session->m_browser_connection)
             return;
-        reject_start_promise(move(error));
+        session->reject_start_promise(move(error));
     };
 
     m_browser_server = server;

@@ -6,7 +6,7 @@
 
 #include <AK/Hex.h>
 #include <AK/WeakPtr.h>
-#include <LibCrypto/Hash/SHA2.h>
+#include <LibCrypto/Hash/Hash.h>
 #include <LibURL/URL.h>
 #include <LibWebView/CrashReportDiagnostics.h>
 #include <LibWebView/CrashReportReview.h>
@@ -20,7 +20,7 @@ static String to_string(StringView text)
 
 static ByteString sha256_hex(ReadonlyBytes bytes)
 {
-    return encode_hex(Crypto::Hash::SHA256::hash(bytes).bytes());
+    return encode_hex(Crypto::Hash::digest(Crypto::Hash::HashKind::SHA256, bytes).bytes());
 }
 
 CrashReportReview::CrashReportReview(CrashReportStore& store)
@@ -83,6 +83,7 @@ ErrorOr<CrashReportReview::Report> CrashReportReview::open(ByteString const& rep
     add_field("Process"sv, diagnostics.header("Process"sv));
     add_field("Architecture"sv, diagnostics.header("Architecture"sv));
     add_field("Git commit"sv, diagnostics.header("Git commit"sv), true);
+    add_field("Sandbox"sv, diagnostics.header("Sandbox"sv));
 
     return report;
 }

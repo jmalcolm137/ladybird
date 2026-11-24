@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<video id="video"></video>
+<script src="../include.js"></script>
+<script>
+    asyncTest(done => {
+        const video = document.getElementById("video");
+        const mediaSource = new MediaSource();
+        video.src = URL.createObjectURL(mediaSource);
+
+        function rangesOf(timeRanges) {
+            const ranges = [];
+            for (let i = 0; i < timeRanges.length; ++i)
+                ranges.push(`[${timeRanges.start(i)}, ${timeRanges.end(i)}]`);
+            return ranges.join(" ") || "none";
+        }
+
+        mediaSource.addEventListener("sourceopen", async () => {
+            const sourceBuffer = mediaSource.addSourceBuffer('video/webm;codecs="vp9"');
+            const response = await fetch("../../../Assets/vp9-frame-rate-change.webm");
+            const data = new Uint8Array(await response.arrayBuffer());
+            await new Promise(resolve => {
+                sourceBuffer.addEventListener("updateend", resolve, { once: true });
+                sourceBuffer.appendBuffer(data);
+            });
+
+            mediaSource.duration = Infinity;
+            mediaSource.setLiveSeekableRange(40, 42);
+            println(`buffered: ${rangesOf(video.buffered)}`);
+            println(`seekable: ${rangesOf(video.seekable)}`);
+
+            function checkEndingCondition() {
+                if (video.currentTime !== 42) {
+                    setTimeout(checkEndingCondition, 0);
+                    return;
+                }
+                println(`seeking to 50 lands at ${video.currentTime}`);
+                done();
+            }
+
+            video.currentTime = 50;
+            video.addEventListener("seeking", () => {
+                checkEndingCondition();
+            }, { once: true });
+        });
+    });
+</script>

@@ -48,6 +48,7 @@ use crate::bytecode::Instruction;
 use crate::bytecode::MAPPED_ARGUMENTS;
 use crate::bytecode::OpCode;
 use crate::bytecode::Operand;
+use crate::bytecode::SlotKind;
 use crate::code::ExitKind;
 use crate::code::Repr;
 use crate::ir::Graph;
@@ -55,6 +56,7 @@ use crate::ir::NodeId;
 use crate::ir::Op;
 use crate::ir::value;
 use crate::snapshot::Intrinsic;
+use ak::ZoneVec;
 
 /// Whether an instruction with `opcode` may write a binding of the function's
 /// environment (where a mapped arguments object's parameters live), or create
@@ -64,6 +66,7 @@ pub(super) fn may_write_parameter_bindings(opcode: OpCode) -> bool {
     matches!(
         opcode,
         O::NewFunction
+            | O::NewFunctionWide
             | O::NewClass
             | O::InitializeVariableBinding
             | O::DynamicInitializeLexicalBinding
@@ -102,6 +105,36 @@ pub(super) fn can_create_virtual_arguments(function: &super::Function<'_>, instr
             && function.may_write_parameter_bindings)
 }
 
+/// The index of `instruction` of `function` if it is a `GetArgument` of a
+/// constant index that may be a passed argument.
+fn constant_index(function: &super::Function<'_>, instruction: &Instruction) -> Option<u32> {
+    let Instruction::GetArgument { index, .. } = *instruction else {
+        return None;
+    };
+    let SlotKind::Constant(constant) = function.layout.slot_kind(index) else {
+        return None;
+    };
+    function.snapshot[function.executable.constants]
+        .get(constant as usize)
+        .and_then(|bits| value::as_int32(*bits))
+        .and_then(|index| u32::try_from(index).ok())
+}
+
+/// Whether `instruction` of `function` is a `GetArgument` of a constant
+/// index that may be a passed argument.
+pub(super) fn has_constant_index(function: &super::Function<'_>, instruction: &Instruction) -> bool {
+    constant_index(function, instruction).is_some()
+}
+
+/// Whether `function` reads an argument of a constant index that a call
+/// passing `passed_argument_count` arguments does not pass, which an inlined
+/// call of it could not read (see `try_build_argument()`).
+pub(super) fn reads_argument_not_passed(function: &super::Function<'_>, passed_argument_count: u32) -> bool {
+    function.instructions.iter().any(|instruction| {
+        constant_index(function, &instruction.instruction).is_some_and(|index| index >= passed_argument_count)
+    })
+}
+
 /// Whether a node of `graph` takes a virtual arguments object as an input,
 /// which only a real object can be.
 pub(super) fn uses_virtual_arguments(graph: &Graph) -> bool {
@@ -115,7 +148,7 @@ pub(super) fn uses_virtual_arguments(graph: &Graph) -> bool {
     })
 }
 
-impl GraphBuilder<'_> {
+impl<'a> GraphBuilder<'a, '_> {
     /// Whether `node` is the virtual arguments object.
     pub(super) fn is_virtual_arguments(&self, node: NodeId) -> bool {
         self.graph
@@ -130,7 +163,7 @@ impl GraphBuilder<'_> {
         self.function
             .layout
             .tracked_index(operand)
-            .is_some_and(|slot| matches!(self.frame.slots[slot], super::SlotState::Value { node, .. } if self.is_virtual_arguments(node)))
+            .is_some_and(|slot| self.is_virtual_arguments(self.frame.slots[slot].node))
     }
 
     /// Builds `CreateArguments` as a virtual arguments object, if it can be
@@ -177,23 +210,31 @@ impl GraphBuilder<'_> {
         let slot = layout
             .tracked_index(Operand::from_raw(layout.arguments_base() + argument))
             .expect("arguments are tracked");
-        match self.frame.slots[slot] {
-            super::SlotState::Value { node, .. } => Some(node),
-            super::SlotState::InMemory => unreachable!("inlined callees hold their slots as values"),
-        }
+        Some(self.frame.slots[slot].node)
+    }
+
+    /// `inlined_call_argument()` of the constant index that `index` is, if it
+    /// is one.
+    fn inlined_call_argument_at(&self, index: NodeId) -> Option<NodeId> {
+        self.graph
+            .constant_value(index)
+            .and_then(value::as_int32)
+            .and_then(|index| u32::try_from(index).ok())
+            .and_then(|index| self.inlined_call_argument(index))
     }
 
     /// The values the call of the inlined callee being built passed it, all
     /// of them, as arguments of a call it inlines, and their count; `None`
     /// outside inlined callees.
-    pub(super) fn inlined_call_arguments(&self) -> Option<(Vec<InlineValue>, u32)> {
+    pub(super) fn inlined_call_arguments(&self) -> Option<(ZoneVec<'a, InlineValue>, u32)> {
         let count = self.function.inline.as_ref()?.passed_argument_count;
-        let values = (0..count)
-            .map(|argument| {
+        let values = ZoneVec::from_iter_in(
+            (0..count).map(|argument| {
                 let node = self.inlined_call_argument(argument).expect("the call passed it");
                 InlineValue::Node(node)
-            })
-            .collect();
+            }),
+            self.work,
+        );
         Some((values, count))
     }
 
@@ -221,7 +262,7 @@ impl GraphBuilder<'_> {
             self.write(dst, count)?;
             return Ok(true);
         }
-        let count = self.emit(Op::ArgumentCount, Vec::new(), Some(Repr::Tagged));
+        let count = self.emit(Op::ArgumentCount, &[], Some(Repr::Tagged));
         self.write(dst, count)?;
         Ok(true)
     }
@@ -241,13 +282,7 @@ impl GraphBuilder<'_> {
         // NB: Inlined callees read constant indices of what their call passed.
         if self.function.is_virtual() {
             let index = self.read(property)?;
-            let Some(value) = self
-                .graph
-                .constant_value(index)
-                .and_then(value::as_int32)
-                .and_then(|index| u32::try_from(index).ok())
-                .and_then(|index| self.inlined_call_argument(index))
-            else {
+            let Some(value) = self.inlined_call_argument_at(index) else {
                 return Ok(false);
             };
             self.write(dst, value)?;
@@ -258,7 +293,40 @@ impl GraphBuilder<'_> {
         }
         let index = self.read(property)?;
         let arguments_base = self.function.layout.arguments_base();
-        let argument = self.emit_checked(Op::LoadArgument { arguments_base }, vec![index], Some(Repr::Tagged));
+        let argument = self.emit_checked(Op::LoadArgument { arguments_base }, &[index], Some(Repr::Tagged));
+        self.write(dst, argument)?;
+        Ok(true)
+    }
+
+    /// Builds `dst = arguments[index]` of a function that reads its arguments
+    /// from the frame (`GetArgument`), which has no arguments object, like
+    /// `try_build_arguments_index()` does for a virtual one. Returns false,
+    /// having built nothing that matters, where it can only be the slow path.
+    pub(super) fn try_build_argument(&mut self, dst: Operand, index: Operand) -> Result<bool, CompileFailure> {
+        // NB: Inlined callees read constant indices of what their call passed, as their current values: a mapped
+        //     arguments object aliases the parameters, and an unmapped one belongs to a function that never writes
+        //     them. Calls that do not pass an index that the callee reads are not inlined (see `inline_call()`), and
+        //     anything else has the graph built again without inlining such callees (see `can_inline()`).
+        if self.function.is_virtual() {
+            self.virtualize_arguments.inlined_callees_virtualized.set(true);
+            let index = self.read(index)?;
+            let Some(value) = self.inlined_call_argument_at(index) else {
+                return Err(CompileFailure::UnsupportedInstruction {
+                    pc: self.function.pc,
+                    opcode: OpCode::GetArgument,
+                    reason: "reads an argument that the inlined call did not pass",
+                });
+            };
+            self.write(dst, value)?;
+            return Ok(true);
+        }
+        // NB: Frame memory has the argument slots that the function never writes, and the slow path the others.
+        if self.function.writes_arguments || !self.may_speculate(ExitKind::ArgumentsIndex) {
+            return Ok(false);
+        }
+        let index = self.read(index)?;
+        let arguments_base = self.function.layout.arguments_base();
+        let argument = self.emit_checked(Op::LoadArgument { arguments_base }, &[index], Some(Repr::Tagged));
         self.write(dst, argument)?;
         Ok(true)
     }
@@ -282,7 +350,7 @@ impl GraphBuilder<'_> {
         else {
             return Ok(None);
         };
-        let (forwarded, start) = match arguments.as_slice() {
+        let (forwarded, start) = match *arguments {
             [forwarded] => (*forwarded, None),
             [forwarded, start] => (*forwarded, Some(*start)),
             _ => return Ok(None),
@@ -320,7 +388,7 @@ impl GraphBuilder<'_> {
         if let Some(slice) = slice_check {
             self.check_callee(*this_value, slice)?;
         }
-        let array = self.emit_checked(Op::SliceArguments, vec![start], Some(Repr::Tagged));
+        let array = self.emit_checked(Op::SliceArguments, &[start], Some(Repr::Tagged));
         self.write(*dst, array)?;
         Ok(Some(super::Flow::Continue))
     }
@@ -331,7 +399,7 @@ impl GraphBuilder<'_> {
         let Instruction::Call { callee, arguments, .. } = instruction else {
             return None;
         };
-        let [_, forwarded] = arguments.as_slice() else {
+        let [_, forwarded] = *arguments else {
             return None;
         };
         // NB: CallForwardingArguments reads the running frame, which is not an
@@ -372,16 +440,20 @@ impl GraphBuilder<'_> {
             return Ok(None);
         };
         let call_pc = call.pc;
-        let call_instruction = call.instruction.clone();
+        let call_instruction = call.instruction;
         let block = self.function.cfg.block_for_pc(self.function.pc);
         let in_one_block = block.is_some()
             && block == self.function.cfg.block_for_pc(append.pc)
             && block == self.function.cfg.block_for_pc(call_pc);
-        let array_dies = self
-            .function
-            .layout
-            .tracked_index(array)
-            .is_some_and(|slot| !self.function.liveness.live_out(index + 2).contains(slot));
+        let array_dies = match self.function.layout.tracked_index(array) {
+            Some(slot) => {
+                let live = self.live_out(index + 2);
+                let dies = !live.contains(slot);
+                self.release_slot_set(live);
+                dies
+            }
+            None => false,
+        };
         if dst != array
             || self.function.is_virtual()
             || arguments != array

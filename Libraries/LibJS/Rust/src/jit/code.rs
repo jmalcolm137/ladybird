@@ -9,13 +9,17 @@
 use core::cell::{Cell, OnceCell, RefCell};
 use core::ffi::c_void;
 use core::ops::ControlFlow;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
+use ak::Zone;
+use libjs_jit::artifact::{Artifact, FrameView, Layout, Patch, SiteView};
 use libjs_jit::bytecode::{EnvironmentCoordinate, decode_instruction};
+use libjs_jit::code::ExitKind;
 pub use libjs_jit::code::INLINED_CALL_SITE_BIT;
-use libjs_jit::code::{ExitKind, Site};
 use libjs_runtime_macros::Trace;
 
+use super::allocation::SampleSlots;
+use super::data_memory::DataMemory;
 use super::entry_table::{JIT_ENTRY_SLOT_MASK, JitEntryTable, NO_JIT_ENTRY_SLOT};
 use super::executable_memory::ExecutableMemory;
 use crate::bytecode::executable::{Executable, PropertyLookupCache, PropertyLookupCacheTier};
@@ -28,6 +32,8 @@ use crate::layout::execution_context::ExecutionContext;
 use crate::layout::function_object::EcmascriptFunctionObject;
 use crate::layout::object::Object;
 use crate::layout::property_lookup_cache::PropertyLookupCacheEntryType;
+use crate::layout::realm::Realm;
+use crate::layout::shape::Shape;
 use crate::runtime::native_javascript_backed_function::NativeJavaScriptBackedFunction;
 
 /// The status word of what JIT code returns, `libjs_jit::code::JitStatus`.
@@ -129,6 +135,26 @@ pub fn speculated_cache_size(cache: &PropertyLookupCache) -> u8 {
     u8::try_from(entries).expect("caches that are not megamorphic have few entries")
 }
 
+/// The property lookup cache that the instruction at `pc` of `bytecode` speculates on (see
+/// `Instruction::speculated_property_lookup_cache()`), if it has one.
+fn speculated_property_lookup_cache_index(bytecode: &[u8], pc: u32) -> Option<u32> {
+    // NB: A zone takes no memory before it gives some out, and it gives out memory only for the array of an
+    //     instruction, which no instruction that speculates on a property lookup cache has.
+    let zone = Zone::new(DECODED_ARRAY_LIMIT, c"LibJS decoded instruction");
+    decode_instruction(bytecode, pc, &zone)
+        .ok()?
+        .instruction
+        .speculated_property_lookup_cache()
+}
+
+/// The most memory the array of one decoded instruction takes.
+const DECODED_ARRAY_LIMIT: usize = 1 << 30;
+
+/// JIT code that was detached from its executable and waits to be dropped (see
+/// `JitState::parking_for_detached_code()`).
+#[allow(clippy::vec_box, reason = "the code moves over from the JIT entry table in its box")]
+pub type DetachedJitCode = Vec<Box<JitCode>>;
+
 /// The function object of an inlined executable, which its materialized frames run.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Trace)]
 pub enum InlinedFunction {
@@ -136,6 +162,16 @@ pub enum InlinedFunction {
     /// A builtin written in JavaScript, whose frames are set up like those of other builtins.
     Builtin(Gc<NativeJavaScriptBackedFunction>),
 }
+
+/// A word of the tables of installed code (see `libjs_jit::artifact`), which are in memory that the tables of other
+/// code share (see `DataMemory`).
+pub type TableWord = Cell<u32>;
+
+/// A site of installed code.
+pub type Site<'a> = SiteView<'a, TableWord>;
+
+/// The interpreter state of one frame at a site of installed code.
+pub type FrameState<'a> = FrameView<'a, TableWord>;
 
 /// Installed machine code for one executable, with what exits need to rebuild interpreter frames. While JIT code runs
 /// frames of its executable, it stays attached to the executable (in its slot of the JIT entry table, where
@@ -151,28 +187,28 @@ pub struct JitCode {
     interpreted_frame_count_to_forget_at: Cell<usize>,
     memory: ExecutableMemory,
     entry: JitEntry,
-    sites: Vec<Site>,
-    /// The cells the code compares against or uses. The executable the code is attached to keeps them alive, so they
-    /// keep their addresses for as long as the code may run.
+    /// The tables of the code that the runtime reads once the code is installed, which have `layout`.
+    tables: DataMemory,
+    layout: Layout,
+    /// The cells the code compares against or uses, which keep their addresses for as long as the code lives. While a
+    /// frame runs the code, the VM keeps them alive. Otherwise the code keeps a realm, a shape or an object alive only
+    /// while that realm is otherwise alive (see `realm_of_embedded_cell()`), so that the code of one realm does not
+    /// keep another realm that went away alive through the shapes of its objects. The code is dropped once one of
+    /// them dies (see `Executable::drop_jit_code_that_lost_embedded_cells()`). The inlined functions of
+    /// `snapshot_executables` are held the same way.
     embedded_cells: Vec<Gc<CellHeader>>,
+    /// Cells that belong to an ECMAScript function among the embedded cells, with that function: its environments,
+    /// which the code embeds too, and its shared data and executable if the code embeds them. The code keeps such a
+    /// cell alive only while the function is alive, as these cells may reach the function's realm, but have no realm
+    /// of their own (see `split_function_cells()`).
+    function_cells: FunctionCells,
     snapshot_executables: Vec<SnapshotExecutable>,
-    /// Where a frame running in the interpreter at `pc` can continue in this code (see `osr_entry()`).
-    osr_entries: Vec<(u32, JitEntry)>,
-    /// The loop back edges from where a frame running in the interpreter reaches one of the `osr_entries` without
-    /// leaving the loop it is in.
-    osr_loop_back_edges: Vec<u32>,
-    /// The loop back edges in the loops around those of the `osr_entries`, from where a frame running in the
-    /// interpreter may reach one of them on a later iteration.
-    osr_outer_loop_back_edges: Vec<u32>,
-    /// The pcs of the `Catch` of the exception handlers that have no catch entry only because they never caught an
-    /// exception before the compile.
-    uncaught_handlers: Vec<u32>,
+    /// The slots of the samples the code copies closures of, whose addresses the code holds rather than those of the
+    /// samples. A collection rewrites them where they are when a sample moves.
+    sample_slots: SampleSlots,
     /// Identifies the code among all code the VM installed, for the dependencies it registers (see
     /// `super::dependencies`).
     id: u64,
-    /// The bytes that invalidate the code at each offset of it: jumps to the exits of its `AssumeValid` nodes, which
-    /// are no-ops until then.
-    invalidation_patches: Vec<(u32, Vec<u8>)>,
     invalidated: Cell<bool>,
     /// See `libjs_jit::code::CompiledCode::site_index_frame_offset`.
     site_index_frame_offset: i32,
@@ -188,55 +224,55 @@ pub struct JitCode {
 }
 
 /// An object created for a frame running JIT code, standing for the object its code never allocated at `allocation`
-/// (see `libjs_jit::code::VirtualObjectDescriptor`).
+/// (see `libjs_jit::artifact::ObjectView`).
 struct MaterializedObject {
     frame: *const ExecutionContext,
     allocation: u32,
     object: Gc<Object>,
 }
 
+/// The entry point at `offset` of the code in `memory`.
+fn entry_at(memory: &ExecutableMemory, offset: u32) -> JitEntry {
+    assert!((offset as usize) < memory.size());
+    // SAFETY: The code has an entry point with the JitEntry calling convention at the offset.
+    unsafe { core::mem::transmute::<*const u8, JitEntry>(memory.address().add(offset as usize)) }
+}
+
 impl JitCode {
-    #[allow(clippy::too_many_arguments)]
+    /// Code in `memory` with its entry point at `entry_offset`, and with `tables`, which have `layout`.
     pub fn new(
         memory: ExecutableMemory,
         entry_offset: u32,
-        osr_entry_offsets: &[(u32, u32)],
-        osr_loop_back_edges: Vec<u32>,
-        sites: Vec<Site>,
+        tables: DataMemory,
+        layout: Layout,
         embedded_cells: Vec<Gc<CellHeader>>,
         snapshot_executables: Vec<SnapshotExecutable>,
-        _defer_gc: &DeferGc<'_>,
+        defer_gc: &DeferGc<'_>,
     ) -> Self {
-        let entry_at = |offset: u32| {
-            assert!((offset as usize) < memory.size());
-            // SAFETY: The code has an entry point with the JitEntry calling convention at the offset.
-            unsafe { core::mem::transmute::<*const u8, JitEntry>(memory.address().add(offset as usize)) }
-        };
-        let entry = entry_at(entry_offset);
-        let osr_entries = osr_entry_offsets
-            .iter()
-            .map(|&(pc, offset)| (pc, entry_at(offset)))
-            .collect();
+        let entry = entry_at(&memory, entry_offset);
+        let (embedded_cells, function_cells) = split_function_cells(embedded_cells, defer_gc);
         Self {
             exit_count: Cell::new(0),
             interpreted_frames: RefCell::new(HashMap::new()),
             interpreted_frame_count_to_forget_at: Cell::new(MIN_INTERPRETED_FRAME_COUNT_TO_FORGET_AT),
             memory,
             entry,
-            sites,
+            tables,
+            layout,
             embedded_cells,
+            function_cells,
             snapshot_executables,
-            osr_entries,
-            osr_loop_back_edges,
-            osr_outer_loop_back_edges: Vec::new(),
-            uncaught_handlers: Vec::new(),
+            sample_slots: Vec::new(),
             id: 0,
-            invalidation_patches: Vec::new(),
             invalidated: Cell::new(false),
             site_index_frame_offset: 0,
             register_dump_frame_offset: 0,
             materialized_objects: RefCell::new(Vec::new()),
         }
+    }
+
+    fn artifact(&self) -> Artifact<'_, TableWord> {
+        Artifact::new(self.tables.words(), &self.layout)
     }
 
     /// Gives the code where its frames keep the index of a site and the register dump the runtime reads.
@@ -289,29 +325,58 @@ impl JitCode {
             .retain(|materialized| materialized.frame != frame);
     }
 
-    /// Gives the code its id among all code the VM installed, and the bytes that invalidate it.
-    pub fn set_invalidation(&mut self, id: u64, invalidation_patches: Vec<(u32, Vec<u8>)>) {
+    /// Gives the code its id among all code the VM installed.
+    pub fn set_id(&mut self, id: u64) {
         self.id = id;
-        self.invalidation_patches = invalidation_patches;
     }
 
-    /// Gives the code the loop back edges in the loops around those of its on-stack replacement entries.
-    pub fn set_osr_outer_loop_back_edges(&mut self, osr_outer_loop_back_edges: Vec<u32>) {
-        self.osr_outer_loop_back_edges = osr_outer_loop_back_edges;
-    }
-
-    pub fn set_uncaught_handlers(&mut self, uncaught_handlers: Vec<u32>) {
-        self.uncaught_handlers = uncaught_handlers;
+    /// Gives the code the slots of the samples it copies closures of.
+    pub fn set_sample_slots(&mut self, sample_slots: SampleSlots, _defer_gc: &DeferGc<'_>) {
+        self.sample_slots = sample_slots;
     }
 
     /// Whether the handler whose `Catch` is at `pc` has no catch entry only because it never caught an exception
     /// before the compile, so that a compile now would give it one.
     pub fn compiled_before_handler_caught(&self, pc: u32) -> bool {
-        self.uncaught_handlers.contains(&pc)
+        self.artifact().uncaught_handlers().contains(pc)
     }
 
     pub fn id(&self) -> u64 {
         self.id
+    }
+
+    /// The embedded cells and the inlined functions, which the code holds only while their realms are alive (see
+    /// `JitCode::embedded_cells`), without the cells of functions.
+    fn cells_held_by_realm(&self) -> impl Iterator<Item = Gc<CellHeader>> {
+        let functions = self
+            .snapshot_executables
+            .iter()
+            .filter_map(|snapshot| snapshot.function)
+            .map(|function| match function {
+                InlinedFunction::Ecmascript(function) => function.upcast(),
+                InlinedFunction::Builtin(function) => function.upcast(),
+            });
+        self.embedded_cells.iter().copied().chain(functions)
+    }
+
+    /// Keeps the embedded cells and the inlined functions alive, for code that a frame runs.
+    fn trace_embedded_cells(&self, visitor: &mut Visitor) {
+        for cell in self.cells_held_by_realm() {
+            visitor.visit(cell);
+        }
+        for &(_, cell) in &self.function_cells {
+            visitor.visit(cell);
+        }
+    }
+
+    /// Whether a cell the code embeds or an inlined function died in the collection.
+    fn lost_embedded_cell(&self, sweep: &Sweep<'_>) -> bool {
+        self.cells_held_by_realm().any(|cell| sweep.is_dead(cell))
+            || self.function_cells.iter().any(|&(_, cell)| sweep.is_dead(cell))
+            || self
+                .snapshot_executables
+                .iter()
+                .any(|snapshot| sweep.is_dead(snapshot.executable))
     }
 
     pub fn is_invalidated(&self) -> bool {
@@ -325,7 +390,9 @@ impl JitCode {
         if self.invalidated.replace(true) {
             return;
         }
-        self.memory.patch(&self.invalidation_patches);
+        // NB: The patches are jumps to the exits of the `AssumeValid` nodes of the code, which are no-ops until then.
+        let patches = self.artifact().invalidation_patches().collect::<Vec<Patch>>();
+        self.memory.patch(&patches);
     }
 
     pub fn entry(&self) -> JitEntry {
@@ -336,31 +403,25 @@ impl JitCode {
     /// loop back edge, the resume entry at a continuation of a generator's suspension, or the catch entry after the
     /// `Catch` of an exception handler.
     pub fn osr_entry(&self, pc: u32) -> Option<JitEntry> {
-        self.osr_entries
-            .iter()
-            .find(|(entry_pc, _)| *entry_pc == pc)
-            .map(|(_, entry)| *entry)
+        self.artifact()
+            .osr_entry(pc)
+            .map(|offset| entry_at(&self.memory, offset))
     }
 
     /// Whether a frame running in the interpreter at the loop back edge `pc` reaches an on-stack replacement entry
     /// without leaving the loop it is in.
     pub fn reaches_osr_entry_from(&self, pc: u32) -> bool {
-        self.osr_loop_back_edges.contains(&pc)
+        self.artifact().osr_loop_back_edges().contains(pc)
     }
 
     /// Whether a frame running in the interpreter at the loop back edge `pc` may reach an on-stack replacement entry
     /// on a later iteration of a loop it is in.
     pub fn may_reach_osr_entry_from(&self, pc: u32) -> bool {
-        self.osr_outer_loop_back_edges.contains(&pc)
+        self.artifact().osr_outer_loop_back_edges().contains(pc)
     }
 
-    pub fn site(&self, index: u32) -> &Site {
-        &self.sites[index as usize]
-    }
-
-    /// Takes the sites of code that died, so that they can be dropped elsewhere.
-    pub fn take_sites(&mut self) -> Vec<Site> {
-        core::mem::take(&mut self.sites)
+    pub fn site(&self, index: u32) -> Site<'_> {
+        self.artifact().site(index)
     }
 
     pub fn snapshot_executable(&self, index: u32) -> &SnapshotExecutable {
@@ -426,15 +487,106 @@ impl JitCode {
     }
 }
 
+/// Cells that belong to ECMAScript functions, each with its function (see `JitCode::function_cells`).
+type FunctionCells = Vec<(Gc<CellHeader>, Gc<CellHeader>)>;
+
+/// Splits the cells that belong to an ECMAScript function among `embedded_cells` off them (see
+/// `JitCode::function_cells`), returning the other embedded cells and those cells, with their functions.
+fn split_function_cells(
+    mut embedded_cells: Vec<Gc<CellHeader>>,
+    _defer_gc: &DeferGc<'_>,
+) -> (Vec<Gc<CellHeader>>, FunctionCells) {
+    let embedded: HashSet<usize> = embedded_cells.iter().map(|cell| cell.as_ptr().addr()).collect();
+    let mut function_cells = Vec::new();
+    for function in embedded_cells
+        .iter()
+        .filter_map(|cell| cell.downcast::<EcmascriptFunctionObject>())
+    {
+        // NB: Code that embeds an ECMAScript function may also embed the words its frames start with (see
+        //     `FunctionFrameFields`), whose environment the code then keeps from moving like the cells it lists.
+        let environment = function.environment().map(Gc::upcast);
+        let shared_data = function.shared_data();
+        let embedded_code = [
+            Some(shared_data.upcast::<CellHeader>()),
+            shared_data.executable().map(Gc::upcast),
+        ]
+        .into_iter()
+        .flatten()
+        .filter(|cell| embedded.contains(&cell.as_ptr().addr()));
+        for cell in environment.into_iter().chain(embedded_code) {
+            function_cells.push((function.upcast(), cell));
+        }
+    }
+    let function_owned: HashSet<usize> = function_cells.iter().map(|&(_, cell)| cell.as_ptr().addr()).collect();
+    embedded_cells.retain(|cell| !function_owned.contains(&cell.as_ptr().addr()));
+    (embedded_cells, function_cells)
+}
+
+/// The realm of a realm, a shape or an object, which code that embeds the cell keeps alive only while the realm is
+/// alive. Other cells, such as executables, strings and environments, belong to no realm, and the code keeps them
+/// alive.
+fn realm_of_embedded_cell(cell: Gc<CellHeader>) -> Option<Gc<Realm>> {
+    if let Some(realm) = cell.downcast::<Realm>() {
+        return Some(realm);
+    }
+    if let Some(shape) = cell.downcast::<Shape>() {
+        return Some(shape.realm());
+    }
+    cell.downcast::<Object>().map(|object| object.shape().realm())
+}
+
+// SAFETY: Visits what the code keeps alive. The realms, shapes and objects it embeds and its inlined functions stay
+// where they are, and are kept alive only while their realms are. The code is dropped before any of them that died is
+// swept (see `JitCode::embedded_cells`).
 unsafe impl Trace for JitCode {
     fn trace(&self, visitor: &mut Visitor) {
-        for cell in &self.embedded_cells {
-            visitor.visit(*cell);
+        for cell in self.cells_held_by_realm() {
+            match realm_of_embedded_cell(cell) {
+                Some(realm) => visitor.visit_ephemeron_cell(realm, cell),
+                None => visitor.visit(cell),
+            }
+        }
+        for &(function, cell) in &self.function_cells {
+            visitor.visit_ephemeron_cell(function, cell);
         }
         for materialized in self.materialized_objects.borrow().iter() {
             visitor.visit(materialized.object);
         }
-        self.snapshot_executables.trace(visitor);
+        // NB: The executables of inlined calls are held like the cells of their functions.
+        for snapshot in &self.snapshot_executables {
+            match snapshot.function {
+                Some(InlinedFunction::Ecmascript(function)) => {
+                    visitor.visit_ephemeron_cell(function, snapshot.executable);
+                }
+                Some(InlinedFunction::Builtin(function)) => {
+                    visitor.visit_ephemeron_cell(function, snapshot.executable);
+                }
+                None => visitor.visit(snapshot.executable),
+            }
+        }
+        for slot in &self.sample_slots {
+            // SAFETY: Nothing writes the slots, and only dropping the code frees them, which a sweep callback defers until
+            //         the collection is over if it moves cells (see `Executable::drop_jit_code_that_lost_embedded_cells()`).
+            unsafe { visitor.visit_owned_values(core::slice::from_ref(&**slot)) };
+        }
+    }
+}
+
+/// A reason to discard JIT code that says nothing about the code.
+#[derive(Clone, Copy)]
+enum UncountedDiscard {
+    /// The executable idled (see `Executable::flush_idle_jit_code()`).
+    IdleFlush,
+    /// A cell the code embeds died (see `Executable::drop_jit_code_that_lost_embedded_cells()`).
+    LostEmbeddedCell,
+}
+
+impl UncountedDiscard {
+    fn coverage_key(self) -> &'static str {
+        match self {
+            Self::IdleFlush => "flush",
+            Self::LostEmbeddedCell => "lost-embedded-cell",
+        }
     }
 }
 
@@ -461,6 +613,9 @@ pub struct ExecutableJitState {
     /// Whether the executable is refused once its discarded code is detached, because it was refused while frames
     /// still ran that code (see `refuse_jit_compile_once_detached()`).
     refused_once_detached: Cell<bool>,
+    /// Why the discarded code is discarded, if for a reason that says nothing about the code, which does not count as
+    /// a discard.
+    uncounted_discard: Cell<Option<UncountedDiscard>>,
     /// The loads and stores of bindings of the environments of the executable's closure (see `jit::snapshot`). The
     /// bytecode never changes, so snapshots find them once.
     pub(crate) captured_binding_accesses: OnceCell<CapturedBindingAccesses>,
@@ -556,18 +711,13 @@ impl Executable {
         let Some(table) = vm.jit.entry_table.as_ref() else {
             return;
         };
-        let Some(mut code) = table.free(
+        let Some(code) = table.free(
             self.head.jit_entry_slot.get(),
             core::ptr::from_ref(&self.head) as u64,
             sweep,
         ) else {
             return;
         };
-        // OPTIMIZATION: The compile threads allocated the sites, so one of them frees them, outside the collection
-        //               this runs in.
-        if let Some(queue) = vm.jit.started_compile_queue() {
-            queue.drop_sites(code.take_sites());
-        }
         drop(code);
     }
 
@@ -581,6 +731,14 @@ impl Executable {
     pub fn trace_jit_code(&self, visitor: &mut Visitor) {
         if let Some(code) = self.jit_code(Vm::of_cell(self)) {
             code.trace(visitor);
+        }
+    }
+
+    /// Keeps the cells that the executable's attached JIT code embeds alive, for an executable that a frame runs in JIT
+    /// code (see `JitCode::embedded_cells`).
+    pub fn trace_embedded_cells_of_jit_code(&self, vm: &Vm, visitor: &mut Visitor) {
+        if let Some(code) = self.jit_code(vm) {
+            code.trace_embedded_cells(visitor);
         }
     }
 
@@ -612,8 +770,7 @@ impl Executable {
     /// The property lookup cache that the instruction at `pc` speculates on (see
     /// `Instruction::speculated_property_lookup_cache()`), if it has one.
     fn speculated_property_lookup_cache(&self, pc: u32) -> Option<&PropertyLookupCache> {
-        let decoded = decode_instruction(self.bytecode(), pc).ok()?;
-        let index = decoded.instruction.speculated_property_lookup_cache()?;
+        let index = speculated_property_lookup_cache_index(self.bytecode(), pc)?;
         self.property_lookup_caches().get(index as usize)
     }
 
@@ -621,9 +778,7 @@ impl Executable {
     /// `ExitKind::BadShape` at `pc`. Returns whether that code speculated on more shapes there than the code that
     /// exited there before, so that a recompile learns from the exit.
     pub fn note_jit_shape_exit(&self, pc: u32, cache_sizes: &[u8]) -> bool {
-        let Some(size) = decode_instruction(self.bytecode(), pc)
-            .ok()
-            .and_then(|decoded| decoded.instruction.speculated_property_lookup_cache())
+        let Some(size) = speculated_property_lookup_cache_index(self.bytecode(), pc)
             .and_then(|index| cache_sizes.get(index as usize).copied())
         else {
             return false;
@@ -710,6 +865,25 @@ impl Executable {
         self.head.tier_up_budget.set(super::tier_up::recompile_budget(&vm.jit));
     }
 
+    /// Drops the JIT code of an executable that idled long enough (see `bytecode::flushing`), like discard_jit_code()
+    /// but without counting a discard: it says nothing about the code. The executable has to get hot again to be
+    /// compiled again.
+    pub fn flush_idle_jit_code(&self, vm: &Vm) {
+        self.discard_jit_code_without_counting(vm, UncountedDiscard::IdleFlush);
+    }
+
+    /// Discards the executable's JIT code like discard_jit_code(), without counting a discard. The executable has to
+    /// get hot again to be compiled again.
+    fn discard_jit_code_without_counting(&self, vm: &Vm, reason: UncountedDiscard) {
+        self.jit_state().uncounted_discard.set(Some(reason));
+        self.discard_jit_code(vm);
+        if self.jit_compile_state() == CompileState::Discarding {
+            self.head
+                .tier_up_budget
+                .set(super::tier_up::initial_tier_up_budget(&vm.jit));
+        }
+    }
+
     /// Drops the JIT code of an executable whose code was discarded if no live frame of the executable is run by JIT
     /// code. Returns whether it did.
     ///
@@ -740,6 +914,31 @@ impl Executable {
         true
     }
 
+    /// Drops the executable's JIT code if a cell it embeds died in the collection whose sweep callback calls this. No
+    /// frame runs such code, as the VM keeps the embedded cells of code that frames run alive, so it is dropped before
+    /// the dead cell is swept and its memory reused.
+    pub fn drop_jit_code_that_lost_embedded_cells(&self, vm: &Vm, sweep: &Sweep<'_>) {
+        if !self.jit_code(vm).is_some_and(|code| code.lost_embedded_cell(sweep)) {
+            return;
+        }
+        // NB: A collection that moves cells may still rewrite the slots that the code's trace handed it (see
+        //     `JitCode::sample_slots`), so the code is only dropped once the collection is over.
+        let _deferral = sweep
+            .moves_cells()
+            .then(|| vm.jit.defer_code_drops_until_collection_is_over(vm));
+        match self.jit_compile_state() {
+            CompileState::Installed => self.discard_jit_code_without_counting(vm, UncountedDiscard::LostEmbeddedCell),
+            CompileState::Discarding => {
+                self.detach_discarded_jit_code_if_unused(vm);
+            }
+            state => unreachable!("only installed or discarded code is attached, not in state {state:?}"),
+        }
+        assert!(
+            self.jit_code(vm).is_none(),
+            "no frame runs code that lost an embedded cell"
+        );
+    }
+
     /// Makes the executable's frames run in the interpreter for good, like `tier_up::refuse_jit_compile()`, once its
     /// discarded code, which frames still run, is detached.
     pub fn refuse_jit_compile_once_detached(&self) {
@@ -751,7 +950,17 @@ impl Executable {
     fn detach_jit_code(&self, vm: &Vm) {
         let state = self.jit_state();
         let (table, slot) = self.jit_entry_table_slot(vm).expect("the code is attached");
-        table.detach_code(slot);
+        table.detach_code(slot, vm.jit.parking_for_detached_code());
+        if let Some(reason) = state.uncounted_discard.take()
+            && !state.refused_once_detached.get()
+        {
+            vm.jit.count_coverage(reason.coverage_key());
+            self.set_jit_compile_state(CompileState::None);
+            self.head
+                .tier_up_budget
+                .set(super::tier_up::initial_tier_up_budget(&vm.jit));
+            return;
+        }
         vm.jit.count_coverage("discard");
         let discard_count = state.discard_count.get() + 1;
         state.discard_count.set(discard_count);

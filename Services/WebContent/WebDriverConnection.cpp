@@ -1928,8 +1928,8 @@ Web::WebDriver::Response WebDriverConnection::element_send_keys_impl(StringView 
         // 6. Complete implementation specific steps equivalent to setting the selected files on the input element. If
         //    multiple is true files are be appended to element's selected files.
         // NB: Each file is opened in the unsandboxed UI process, because the WebContent sandbox blocks this
-        //     process from opening arbitrary paths.
-        auto read_files_and_apply_selection = [connection = this, input_element = GC::make_root(input_element)](this auto const& self, Vector<String> paths, size_t index, Vector<Web::HTML::SelectedFile> selected_files) -> void {
+        //     process from opening arbitrary paths. The UI process opens only the files listed in the command's text.
+        auto read_files_and_apply_selection = [connection = this, command_id = *m_current_command_id, input_element = GC::make_root(input_element)](this auto const& self, Vector<String> paths, size_t index, Vector<Web::HTML::SelectedFile> selected_files) -> void {
             if (index < paths.size()) {
                 auto path = paths[index].to_byte_string();
 
@@ -1950,7 +1950,7 @@ Web::WebDriver::Response WebDriverConnection::element_send_keys_impl(StringView 
                     self(move(paths), index + 1, move(selected_files));
                 });
 
-                connection->current_browsing_context().page().client().request_file(move(file_request));
+                connection->m_page_client->request_file_for_webdriver(command_id, move(file_request));
                 return;
             }
 
@@ -2638,7 +2638,15 @@ Web::WebDriver::Response WebDriverConnection::take_element_screenshot(String ele
             if (!connection)
                 return;
             // a. Let element rect be element's rectangle.
-            auto element_rect = connection->calculate_absolute_rect_of_element(element);
+            // NB: The framebuffer is the viewport, so the rectangle is the element's bounding client rect, which is
+            //     relative to the viewport rather than to the document.
+            auto bounding_rect = element->get_bounding_client_rect();
+            Gfx::IntRect element_rect {
+                static_cast<int>(bounding_rect.x()),
+                static_cast<int>(bounding_rect.y()),
+                static_cast<int>(bounding_rect.width()),
+                static_cast<int>(bounding_rect.height())
+            };
 
             // b. Let screenshot result be the result of trying to call draw a bounding box from the framebuffer, given element rect as an argument.
             Web::WebDriver::draw_bounding_box_from_the_framebuffer(connection->current_browsing_context(), element, element_rect, [connection](auto canvas_or_error) mutable {

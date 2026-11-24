@@ -188,11 +188,6 @@ WebIDL::ExceptionOr<void> initialize_window_web_interfaces(HTML::Window& window,
     window_global_mixin.initialize(realm, global_object);
     window_global_mixin.define_unforgeable_attributes(realm, global_object);
 
-    // The interface/unforgeable setup above is realm-scoped and must run for every Window wrapper realm.
-    // WindowOrWorkerGlobalScopeMixin state is impl-scoped and shared by all worlds for this Window.
-    if (&realm == &window.principal_realm())
-        window.WindowOrWorkerGlobalScopeMixin::initialize();
-
     if (window.is_internals_object_exposed())
         Bindings::define_internals_property(realm, window, global_object);
 
@@ -391,7 +386,6 @@ void Window::visit_edges(JS::Cell::Visitor& visitor)
     visitor.visit(m_statusbar);
     visitor.visit(m_toolbar);
     visitor.visit(m_external);
-    m_event_timing_state.visit_edges(visitor);
 }
 
 void Window::finalize()
@@ -643,7 +637,7 @@ CSS::Parser::ValueParserFFI::FfiMediaFeatureValue Window::query_media_feature(CS
         // FIXME: Detect if window is fullscreen
         return ident_media_feature_value(CSS::Keyword::Browser);
     case CSS::MediaFeatureID::DynamicRange:
-        return ident_media_feature_value(CSS::Keyword::Standard);
+        return ident_media_feature_value(page().client().screen_shows_high_dynamic_range() ? CSS::Keyword::High : CSS::Keyword::Standard);
     case CSS::MediaFeatureID::EnvironmentBlending:
         return ident_media_feature_value(CSS::Keyword::Opaque);
     case CSS::MediaFeatureID::ForcedColors:
@@ -695,7 +689,8 @@ CSS::Parser::ValueParserFFI::FfiMediaFeatureValue Window::query_media_feature(CS
             return ident_media_feature_value(CSS::Keyword::NoPreference);
         case CSS::PreferredContrast::Auto:
         default:
-            // FIXME: Fallback to system settings
+            // The browser resolves Auto from the platform's settings before a page sees it, so Auto only remains where
+            // nothing reads them.
             return ident_media_feature_value(CSS::Keyword::NoPreference);
         }
     case CSS::MediaFeatureID::PrefersReducedData:
@@ -709,7 +704,8 @@ CSS::Parser::ValueParserFFI::FfiMediaFeatureValue Window::query_media_feature(CS
             return ident_media_feature_value(CSS::Keyword::Reduce);
         case CSS::PreferredMotion::Auto:
         default:
-            // FIXME: Fallback to system settings
+            // The browser resolves Auto from the platform's settings before a page sees it, so Auto only remains where
+            // nothing reads them.
             return ident_media_feature_value(CSS::Keyword::NoPreference);
         }
     case CSS::MediaFeatureID::PrefersReducedTransparency:
@@ -731,7 +727,9 @@ CSS::Parser::ValueParserFFI::FfiMediaFeatureValue Window::query_media_feature(CS
     case CSS::MediaFeatureID::VideoColorGamut:
         return ident_media_feature_value(CSS::Keyword::Srgb);
     case CSS::MediaFeatureID::VideoDynamicRange:
-        return ident_media_feature_value(CSS::Keyword::Standard);
+        return ident_media_feature_value(page().client().screen_shows_high_dynamic_range() ? CSS::Keyword::High : CSS::Keyword::Standard);
+    case CSS::MediaFeatureID::WebkitDevicePixelRatio:
+        return { .kind = CSS::Parser::ValueParserFFI::FfiMediaFeatureValueKind::Number, .keyword = 0, .value = device_pixel_ratio(), .second_value = 0 };
     case CSS::MediaFeatureID::WebkitTransform3d:
         // https://compat.spec.whatwg.org/#css-media-queries-webkit-transform-3d
         // If the user agent supports 3D transforms, the value will be 1. Otherwise the value is 0.
@@ -1028,7 +1026,7 @@ void Window::invoke_idle_callbacks()
         // 1. Pop the top callback from window's list of runnable idle callbacks.
         auto callback = m_runnable_idle_callbacks.take_first();
         if (callback->timeout_timer_id().has_value()) {
-            clear_timeout(*callback->timeout_timer_id());
+            cancel_timeout_steps(*callback->timeout_timer_id());
             callback->clear_timeout_timer_id();
         }
         // 2. Let deadlineArg be a new IdleDeadline whose [get deadline time algorithm] is getDeadline.
@@ -1579,7 +1577,7 @@ GC::Ref<CookieStore::CookieStore> Window::cookie_store()
 {
     // The cookieStore getter steps are to return this’s associated CookieStore.
     if (!m_cookie_store)
-        m_cookie_store = GC::Heap::the().allocate<CookieStore::CookieStore>(page().client());
+        m_cookie_store = CookieStore::CookieStore::create(relevant_realm(*this));
     return *m_cookie_store;
 }
 
@@ -1680,6 +1678,7 @@ void web_window_queue_posted_message(JSVM*, Window*, SerializedTransferRecord*, 
 EnvironmentSettingsObject* web_window_post_message_incumbent_settings();
 void web_window_post_message_settings_origin(EnvironmentSettingsObject*, void*, void (*)(void*, URL::FFI::FfiOrigin const*));
 WindowProxy* web_window_post_message_source(EnvironmentSettingsObject*);
+JSObject* web_window_post_message_source_object(WindowProxy*);
 void web_window_post_message_parse_target_origin(FlatPtr, void*, void (*)(void*, URL::FFI::FfiOrigin const*));
 void* web_window_post_message_realm(Window*);
 void web_window_post_message_document_origin(Window*, void*, void (*)(void*, URL::FFI::FfiOrigin const*));
@@ -1698,6 +1697,11 @@ void web_window_post_message_settings_origin(EnvironmentSettingsObject* settings
 WindowProxy* web_window_post_message_source(EnvironmentSettingsObject* settings)
 {
     return window_proxy_from_global_this_value(settings->realm().global_environment().global_this_value()).ptr();
+}
+
+JSObject* web_window_post_message_source_object(WindowProxy* source)
+{
+    return JS::HostABI::object_to_abi(&source->object());
 }
 
 void web_window_post_message_parse_target_origin(FlatPtr raw_target_origin, void* context, void (*receive)(void*, URL::FFI::FfiOrigin const*))
@@ -2219,8 +2223,7 @@ u32 Window::request_idle_callback(IdleCallbackHandler callback, IdleRequestOptio
     // 6. If the timeout property is present in options and has a positive value:
     if (options.timeout.has_value() && *options.timeout > 0) {
         // 1. Wait for timeout milliseconds.
-        auto timeout = min(*options.timeout, static_cast<u32>(NumericLimits<i32>::max()));
-        auto timeout_timer_id = run_steps_after_a_timeout(static_cast<i32>(timeout), GC::create_function(GC::Heap::the(), GC::captures(*this, handle), [](Window& self, u32 handle) {
+        auto timeout_timer_id = run_steps_after_a_timeout(*options.timeout, GC::create_function(GC::Heap::the(), GC::captures(*this, handle), [](Window& self, u32 handle) {
             // FIXME: 2. Wait until all invocations of this algorithm, whose timeout added to their posted time occurred before this one's, have completed.
             // FIXME: 3. Optionally, wait a further user-agent defined length of time.
 
@@ -2250,7 +2253,7 @@ void Window::cancel_idle_callback(u32 handle)
         if (!callback.has_value())
             return;
         if ((*callback)->timeout_timer_id().has_value())
-            clear_timeout(*(*callback)->timeout_timer_id());
+            cancel_timeout_steps(*(*callback)->timeout_timer_id());
     };
     remove_callback(m_idle_request_callbacks);
     remove_callback(m_runnable_idle_callbacks);

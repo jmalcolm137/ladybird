@@ -157,20 +157,17 @@ fn bytecode_field_type_name(field: &crate::metadata::Field) -> String {
 fn bytecode_field_type_matches(field: &crate::metadata::Field, parameter_type: &Type) -> bool {
     if field.is_array {
         return match field.ty.as_str() {
-            "Operand" | "Optional<Operand>" => *parameter_type == Type::Sequence(Box::new(Type::U32)),
+            "Operand" | "Optional<Operand>" => *parameter_type == Type::Sequence(Box::new(Type::U8)),
             "Value" => *parameter_type == Type::Sequence(Box::new(Type::Value)),
             _ => false,
         };
     }
     match field.ty.as_str() {
         "bool" => *parameter_type == Type::Bool || *parameter_type == Type::U8,
+        "u8" => *parameter_type == Type::U8,
+        "u16" => *parameter_type == Type::U16,
         "u32"
-        | "Completion::Type"
-        | "IteratorHint"
-        | "EnvironmentMode"
         | "EnvironmentShapeCacheIndex"
-        | "ArgumentsKind"
-        | "FunctionNamePrefix"
         | "IdentifierTableIndex"
         | "ObjectPropertyIteratorCacheIndex"
         | "ObjectShapeCacheIndex"
@@ -191,7 +188,9 @@ fn bytecode_field_type_matches(field: &crate::metadata::Field, parameter_type: &
         "EnvironmentCoordinateCacheIndex" => *parameter_type == Type::EnvironmentCoordinateCacheIndex,
         "GlobalVariableCacheIndex" => *parameter_type == Type::GlobalVariableCacheIndex,
         "PropertyLookupCacheIndex" => *parameter_type == Type::PropertyLookupCacheIndex,
-        "PutKind" => *parameter_type == Type::U8,
+        "ProfiledPropertyLookupCacheIndex" => *parameter_type == Type::ProfiledPropertyLookupCacheIndex,
+        "Completion::Type" | "IteratorHint" | "EnvironmentMode" | "PutKind" | "ArgumentsKind"
+        | "FunctionNamePrefix" => *parameter_type == Type::U8,
         _ => false,
     }
 }

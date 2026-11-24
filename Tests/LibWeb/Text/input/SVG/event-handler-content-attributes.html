@@ -1,0 +1,33 @@
+<!DOCTYPE html>
+<script src="../include.js"></script>
+<script>
+    const order = [];
+    function log(entry) {
+        order.push(entry);
+    }
+</script>
+<svg id="outer" onload="log('load at the outer svg')">
+    <svg id="inner" onload="log('load at the inner svg')"></svg>
+    <rect id="rect" width="10" height="10" onclick="log('click at the rect')"></rect>
+</svg>
+<div><template shadowrootmode="open"><svg onload="log('load at the svg in a shadow tree')"></svg></template></div>
+<script>
+    asyncTest(done => {
+        const rect = document.getElementById("rect");
+        println(`rect.onclick is a function: ${typeof rect.onclick === "function"}`);
+        rect.dispatchEvent(new MouseEvent("click"));
+
+        rect.setAttribute("onclick", "log('click at the rect, after the attribute changed')");
+        rect.dispatchEvent(new MouseEvent("click"));
+        rect.removeAttribute("onclick");
+        println(`rect.onclick after removing the attribute: ${rect.onclick}`);
+        rect.dispatchEvent(new MouseEvent("click"));
+
+        window.addEventListener("load", () => {
+            log("load at the window");
+            for (const entry of order)
+                println(entry);
+            done();
+        });
+    });
+</script>

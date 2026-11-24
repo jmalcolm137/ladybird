@@ -204,10 +204,26 @@ void SourceBufferProcessor::set_append_done_callback(AppendDoneCallback callback
     m_append_done_callback = move(callback);
 }
 
-// https://w3c.github.io/media-source/#sourcebuffer-segment-parser-loop
 void SourceBufferProcessor::run_segment_parser_loop()
 {
+    switch (run_segment_parser_loop_steps()) {
+    case SegmentParserLoopOutcome::NeedMoreData:
+        m_append_done_callback();
+        return;
+    case SegmentParserLoopOutcome::AppendError:
+        m_append_error_callback();
+        return;
+    }
+    VERIFY_NOT_REACHED();
+}
+
+// https://w3c.github.io/media-source/#sourcebuffer-segment-parser-loop
+SourceBufferProcessor::SegmentParserLoopOutcome SourceBufferProcessor::run_segment_parser_loop_steps()
+{
     VERIFY(m_parser);
+
+    // NB: Let the demuxer itself defer changes until the segment parser loop completes to avoid unnecessary work.
+    Optional<SourceBufferDemuxer::ChangeBatch> change_batch;
 
     while (true) {
         // 1. Loop Top: If the [[input buffer]] is empty, then jump to the need more data step below.
@@ -225,18 +241,16 @@ void SourceBufferProcessor::run_segment_parser_loop()
             if (skip_result.is_error()) {
                 if (skip_result.error().category() == Media::DecoderErrorCategory::EndOfStream)
                     goto need_more_data;
-                m_append_error_callback();
-                return;
+                return SegmentParserLoopOutcome::AppendError;
             }
-            drop_consumed_bytes_from_input_buffer();
+            // AD-HOC: Removal costs a copy every time, so it is deferred until the loop exits.
         }
 
         // 4. If the [[append state]] equals WAITING_FOR_SEGMENT, then run the following steps:
         if (m_append_state == AppendState::WaitingForSegment) {
             auto sniff_result = m_parser->sniff_segment_type(*m_cursor);
             if (sniff_result.is_error()) {
-                m_append_error_callback();
-                return;
+                return SegmentParserLoopOutcome::AppendError;
             }
             auto segment_type = sniff_result.value();
 
@@ -255,8 +269,7 @@ void SourceBufferProcessor::run_segment_parser_loop()
                 goto need_more_data;
             } else {
                 VERIFY(segment_type == SegmentType::Unknown);
-                m_append_error_callback();
-                return;
+                return SegmentParserLoopOutcome::AppendError;
             }
 
             // 3. Jump to the loop top step above.
@@ -273,20 +286,19 @@ void SourceBufferProcessor::run_segment_parser_loop()
                     goto need_more_data;
 
                 // AD-HOC: Handle bytes that violate the byte stream format specification as specified above.
-                m_append_error_callback();
-                return;
+                return SegmentParserLoopOutcome::AppendError;
             }
 
             // 2. Run the initialization segment received algorithm.
-            // AD-HOC: If the initialization-segment-received algorithm ran the append-error algorithm, abort this.
+            // AD-HOC: If the initialization-segment-received algorithm must run the append-error algorithm, abort this.
             //         Otherwise, this loop would complete normally and invoke the append done callback — and the
             //         buffer-append algorithm would complete the failed append, firing update and updateend events
             //         after the error and updateend events queued by the append-error algorithm.
-            if (!initialization_segment_received())
-                return;
+            if (initialization_segment_received() == InitializationSegmentOutcome::AppendError)
+                return SegmentParserLoopOutcome::AppendError;
 
             // 3. Remove the initialization segment bytes from the beginning of the [[input buffer]].
-            drop_consumed_bytes_from_input_buffer();
+            // AD-HOC: Removal costs a copy every time, so it is deferred until the loop exits.
 
             // 4. Set [[append state]] to WAITING_FOR_SEGMENT.
             m_append_state = AppendState::WaitingForSegment;
@@ -300,8 +312,7 @@ void SourceBufferProcessor::run_segment_parser_loop()
             // 1. If the [[first initialization segment received flag]] is false or the [[pending initialization
             //    segment for changeType flag]] is true, then run the append error algorithm and abort this algorithm.
             if (!m_first_initialization_segment_received_flag || m_pending_initialization_segment_for_change_type_flag) {
-                m_append_error_callback();
-                return;
+                return SegmentParserLoopOutcome::AppendError;
             }
 
             {
@@ -310,14 +321,18 @@ void SourceBufferProcessor::run_segment_parser_loop()
                 auto parse_result = m_parser->parse_media_segment(*m_cursor);
                 if (parse_result.is_error()) {
                     // AD-HOC: Handle bytes that violate the byte stream format specification as specified above.
-                    m_append_error_callback();
-                    return;
+                    return SegmentParserLoopOutcome::AppendError;
                 }
 
+                // NB: The demuxer may have been created by an initialization segment earlier in this loop.
+                if (!change_batch.has_value())
+                    change_batch.emplace(m_demuxer);
                 run_coded_frame_processing(parse_result.value().coded_frames);
 
-                // FIXME: 3. If this SourceBuffer is full and cannot accept more media data, then set the [[buffer full flag]]
-                //           to true.
+                // 3. If this SourceBuffer is full and cannot accept more media data, then set the [[buffer full flag]]
+                //    to true.
+                if (total_buffered_bytes() >= capacity_in_bytes())
+                    m_buffer_full_flag = true;
 
                 // 4. If the [[input buffer]] does not contain a complete media segment, then jump to the need more
                 //    data step below.
@@ -326,7 +341,7 @@ void SourceBufferProcessor::run_segment_parser_loop()
             }
 
             // 5. Remove the media segment bytes from the beginning of the [[input buffer]].
-            drop_consumed_bytes_from_input_buffer();
+            // AD-HOC: Removal costs a copy every time, so it is deferred until the loop exits.
 
             // 6. Set [[append state]] to WAITING_FOR_SEGMENT.
             m_append_state = AppendState::WaitingForSegment;
@@ -338,8 +353,7 @@ void SourceBufferProcessor::run_segment_parser_loop()
         // 7. Need more data: Return control to the calling algorithm.
     need_more_data:
         drop_consumed_bytes_from_input_buffer();
-        m_append_done_callback();
-        return;
+        return SegmentParserLoopOutcome::NeedMoreData;
     }
 }
 
@@ -381,7 +395,7 @@ void SourceBufferProcessor::reset_parser_state()
 
 // https://w3c.github.io/media-source/#sourcebuffer-init-segment-received
 // AD-HOC: Returns false if the append-error algorithm was run — so that the segment parser loop can abort.
-bool SourceBufferProcessor::initialization_segment_received()
+SourceBufferProcessor::InitializationSegmentOutcome SourceBufferProcessor::initialization_segment_received()
 {
     // 1. Update the duration attribute if it currently equals NaN:
     // AD-HOC: Pass off the duration to the callback, and allow it to check for NaN.
@@ -401,8 +415,7 @@ bool SourceBufferProcessor::initialization_segment_received()
     // 2. If the initialization segment has no audio, video, or text tracks, then run the append error algorithm
     //    and abort these steps.
     if (m_parser->video_tracks().is_empty() && m_parser->audio_tracks().is_empty() && m_parser->text_tracks().is_empty()) {
-        m_append_error_callback();
-        return false;
+        return InitializationSegmentOutcome::AppendError;
     }
 
     // 3. If the [[first initialization segment received flag]] is true, then run the following steps:
@@ -421,18 +434,15 @@ bool SourceBufferProcessor::initialization_segment_received()
                 track_count++;
                 auto track_buffer = m_track_buffers.get(track.identifier());
                 if (!track_buffer.has_value() || track_buffer.value()->track().type() != track.type()) {
-                    m_append_error_callback();
-                    return false;
+                    return InitializationSegmentOutcome::AppendError;
                 }
             }
             if (!codecs_are_supported(*tracks)) {
-                m_append_error_callback();
-                return false;
+                return InitializationSegmentOutcome::AppendError;
             }
         }
         if (track_count != m_track_buffers.size()) {
-            m_append_error_callback();
-            return false;
+            return InitializationSegmentOutcome::AppendError;
         }
 
         // 2. Add the appropriate track descriptions from this initialization segment to each of the track buffers.
@@ -453,8 +463,7 @@ bool SourceBufferProcessor::initialization_segment_received()
         //    the append error algorithm and abort these steps.
         for (auto const* tracks : { &m_parser->audio_tracks(), &m_parser->video_tracks(), &m_parser->text_tracks() }) {
             if (!codecs_are_supported(*tracks)) {
-                m_append_error_callback();
-                return false;
+                return InitializationSegmentOutcome::AppendError;
             }
         }
 
@@ -501,7 +510,7 @@ bool SourceBufferProcessor::initialization_segment_received()
     //     above. Since active track flag is only true if the first initialization segment was being received, this
     //     will only need to happen when that callback is invoked, so we don't need separate one.
 
-    return true;
+    return InitializationSegmentOutcome::Accepted;
 }
 
 // https://w3c.github.io/media-source/#sourcebuffer-coded-frame-processing
@@ -711,6 +720,9 @@ void SourceBufferProcessor::run_coded_frame_processing(Vector<DemuxedCodedFrame>
 // https://w3c.github.io/media-source/#dfn-coded-frame-removal
 void SourceBufferProcessor::run_coded_frame_removal(AK::Duration start, AK::Duration end)
 {
+    // NB: Let the demuxer itself defer changes until removal is complete to avoid unnecessary work.
+    SourceBufferDemuxer::ChangeBatch change_batch { m_demuxer };
+
     // 1. Let start be the starting presentation timestamp for the removal range.
     // 2. Let end be the end presentation timestamp for the removal range.
 
@@ -774,6 +786,9 @@ void SourceBufferProcessor::run_coded_frame_removal(AK::Duration start, AK::Dura
 // https://w3c.github.io/media-source/#sourcebuffer-coded-frame-eviction
 void SourceBufferProcessor::run_coded_frame_eviction(size_t new_data_size, AK::Duration current_time)
 {
+    // NB: Let the demuxer itself defer changes until eviction is done to avoid unnecessary work.
+    SourceBufferDemuxer::ChangeBatch change_batch { m_demuxer };
+
     // https://w3c.github.io/media-source/#dfn-coded-frame-removal
     // AD-HOC: We'll run some of the final steps from the coded frame removal algorithm below.
     //         We explicitly do not remove dependencies here (step 4), since that may evict data ahead of what the
@@ -797,79 +812,131 @@ void SourceBufferProcessor::run_coded_frame_eviction(size_t new_data_size, AK::D
     if (!m_buffer_full_flag)
         return;
 
-    // 3. Let removal ranges equal a list of presentation time ranges that can be evicted from the presentation to make
-    //    room for the new data.
-    // 4. For each range in removal ranges, run the coded frame removal algorithm with start and end equal to the
-    //    removal range start and end timestamp respectively.
-    // AD-HOC: Steps 3 and 4 are completed together by removing frames relative to the current playback position. We
-    //         first evict frames strictly before current_time across all tracks (oldest first), and if more room is
-    //         needed, evict frames beyond the buffered segment containing current_time (latest first). The per-track
-    //         demuxer enforces the "don't break the currently-playing segment" boundary so seeks naturally preserve
-    //         data around the new position.
+    // AD-HOC: Steps 3 and 4 run twice, removing frames relative to the current playback position. We first evict
+    //         frames strictly before current_time across all tracks (oldest first), and if more room is needed, evict
+    //         frames beyond the buffered segment containing current_time (latest first). The per-track demuxer
+    //         enforces the "don't break the currently-playing segment" boundary so seeks naturally preserve data
+    //         around the new position.
+
     VERIFY(consumed_bytes_after_append > current_capacity_in_bytes);
     auto bytes_to_evict = consumed_bytes_after_append - current_capacity_in_bytes;
     size_t bytes_evicted = 0;
 
-    while (bytes_evicted < bytes_to_evict) {
-        TrackBuffer* oldest_track_buffer = nullptr;
-        AK::Duration oldest_timestamp;
-        for (auto& [track_id, track_buffer] : m_track_buffers) {
-            auto candidate = track_buffer->demuxer().earliest_evictable_frame_timestamp(track_buffer->track(), current_time);
-            if (!candidate.has_value())
-                continue;
-            if (!oldest_track_buffer || candidate.value() < oldest_timestamp) {
-                oldest_track_buffer = track_buffer.ptr();
-                oldest_timestamp = candidate.value();
+    {
+        // 3. Let removal ranges equal a list of presentation time ranges that can be evicted from the presentation to
+        //    make room for the new data.
+        struct EarliestRemovalRange {
+            TrackBuffer& track_buffer;
+            Vector<SourceBufferDemuxer::EarliestEvictableGroup> evictable_groups;
+            size_t group_count { 0 };
+
+            size_t freed_bytes() const { return group_count == 0 ? 0 : evictable_groups[group_count - 1].bytes_freed_by_evicting_through_this_group; }
+        };
+        Vector<EarliestRemovalRange> removal_ranges;
+        for (auto& [track_id, track_buffer] : m_track_buffers)
+            removal_ranges.append({ *track_buffer, track_buffer->demuxer().earliest_evictable_groups(track_buffer->track(), current_time, bytes_to_evict) });
+
+        size_t planned_bytes = 0;
+        while (planned_bytes < bytes_to_evict) {
+            EarliestRemovalRange* oldest_range = nullptr;
+            AK::Duration oldest_timestamp;
+            for (auto& range : removal_ranges) {
+                if (range.group_count == range.evictable_groups.size())
+                    continue;
+                auto candidate = range.evictable_groups[range.group_count].presentation_timestamp;
+                if (!oldest_range || candidate < oldest_timestamp) {
+                    oldest_range = &range;
+                    oldest_timestamp = candidate;
+                }
             }
+            if (!oldest_range)
+                break;
+            planned_bytes -= oldest_range->freed_bytes();
+            oldest_range->group_count++;
+            planned_bytes += oldest_range->freed_bytes();
         }
-        if (!oldest_track_buffer)
-            break;
-        bytes_evicted += oldest_track_buffer->demuxer().take_earliest_frame_and_dependants(oldest_track_buffer->track());
+
+        // 4. For each range in removal ranges, run the coded frame removal algorithm with start and end equal to the
+        //    removal range start and end timestamp respectively.
+        for (auto& range : removal_ranges) {
+            if (range.group_count > 0)
+                bytes_evicted += range.track_buffer.demuxer().take_earliest_groups(range.track_buffer.track(), range.group_count);
+        }
     }
 
-    while (bytes_evicted < bytes_to_evict) {
-        TrackBuffer* latest_track_buffer = nullptr;
-        AK::Duration latest_timestamp;
-        for (auto& [track_id, track_buffer] : m_track_buffers) {
-            auto candidate = track_buffer->demuxer().latest_evictable_frame_timestamp(track_buffer->track(), current_time);
-            if (!candidate.has_value())
-                continue;
-            if (!latest_track_buffer || candidate.value() > latest_timestamp) {
-                latest_track_buffer = track_buffer.ptr();
-                latest_timestamp = candidate.value();
+    if (bytes_evicted < bytes_to_evict) {
+        auto remaining_bytes_to_evict = bytes_to_evict - bytes_evicted;
+
+        // 3. Let removal ranges equal a list of presentation time ranges that can be evicted from the presentation to
+        //    make room for the new data.
+        struct LatestRemovalRange {
+            TrackBuffer& track_buffer;
+            Vector<SourceBufferDemuxer::LatestEvictableFrame> evictable_frames;
+            size_t frame_count { 0 };
+        };
+        Vector<LatestRemovalRange> removal_ranges;
+        for (auto& [track_id, track_buffer] : m_track_buffers)
+            removal_ranges.append({ *track_buffer, track_buffer->demuxer().latest_evictable_frames(track_buffer->track(), current_time, remaining_bytes_to_evict) });
+
+        Vector<LatestRemovalRange*> removal_order;
+        size_t planned_bytes = 0;
+        while (planned_bytes < remaining_bytes_to_evict) {
+            LatestRemovalRange* latest_range = nullptr;
+            AK::Duration latest_timestamp;
+            for (auto& range : removal_ranges) {
+                if (range.frame_count == range.evictable_frames.size())
+                    continue;
+                auto candidate = range.evictable_frames[range.frame_count].presentation_timestamp;
+                if (!latest_range || candidate > latest_timestamp) {
+                    latest_range = &range;
+                    latest_timestamp = candidate;
+                }
             }
+            if (!latest_range)
+                break;
+            planned_bytes += latest_range->evictable_frames[latest_range->frame_count].byte_count;
+            latest_range->frame_count++;
+            removal_order.append(latest_range);
         }
-        if (!latest_track_buffer)
-            break;
-        auto last_decode_timestamp = latest_track_buffer->last_decode_timestamp();
-        auto removed_frame = latest_track_buffer->demuxer().take_latest_frame(latest_track_buffer->track());
-        bytes_evicted += removed_frame.byte_size;
+
+        // 4. For each range in removal ranges, run the coded frame removal algorithm with start and end equal to the
+        //    removal range start and end timestamp respectively.
+        for (auto& range : removal_ranges) {
+            if (range.frame_count > 0)
+                bytes_evicted += range.track_buffer.demuxer().take_latest_frames(range.track_buffer.track(), range.frame_count);
+        }
 
         // https://w3c.github.io/media-source/#dfn-coded-frame-removal
-        // AD-HOC: Steps starting from 3.3.1 are implemented here.
+        // AD-HOC: Steps starting from 3.3.1 are implemented here, for each removed frame in the order it was removed.
+        for (auto& range : removal_ranges)
+            range.frame_count = 0;
+        for (auto* range : removal_order) {
+            auto const& removed_frame = range->evictable_frames[range->frame_count++];
+            auto last_decode_timestamp = range->track_buffer.last_decode_timestamp();
 
-        // 1. For each removed frame, if the frame has a decode timestamp equal to the last decode timestamp for the
-        //    frame's track, run the following steps:
-        // AD-HOC: The spec doesn't nest steps 2-5 below under step 1's if statement, but clearing the last decode
-        //         timestamp upon every removal here would potentially force a RAP unexpectedly.
-        //         https://github.com/w3c/media-source/issues/290
-        if (last_decode_timestamp.has_value() && removed_frame.decode_timestamp == last_decode_timestamp.value()) {
-            // -> If mode equals "segments":
-            if (m_mode == AppendMode::Segments) {
-                // Set [[group end timestamp]] to presentation timestamp.
-                m_group_end_timestamp = latest_timestamp;
+            // 1. For each removed frame, if the frame has a decode timestamp equal to the last decode timestamp for
+            //    the frame's track, run the following steps:
+            // AD-HOC: The spec doesn't nest steps 2-5 below under step 1's if statement, but clearing the last decode
+            //         timestamp upon every removal here would potentially force a RAP unexpectedly.
+            //         https://github.com/w3c/media-source/issues/290
+            if (last_decode_timestamp.has_value() && removed_frame.decode_timestamp == last_decode_timestamp.value()) {
+                // -> If mode equals "segments":
+                if (m_mode == AppendMode::Segments) {
+                    // Set [[group end timestamp]] to presentation timestamp.
+                    m_group_end_timestamp = removed_frame.presentation_timestamp;
+                }
+                // -> If mode equals "sequence":
+                else if (m_mode == AppendMode::Sequence) {
+                    // Set [[group start timestamp]] equal to the [[group end timestamp]].
+                    m_group_start_timestamp = m_group_end_timestamp;
+                }
+                // 2. Unset the last decode timestamp on all track buffers.
+                // 3. Unset the last frame duration on all track buffers.
+                // 4. Unset the highest end timestamp on all track buffers.
+                unset_all_track_buffer_timestamps();
+                // 5. Set the need random access point flag on all track buffers to true.
+                set_need_random_access_point_flag_on_all_track_buffers(true);
             }
-            // -> If mode equals "sequence":
-            else if (m_mode == AppendMode::Sequence) {
-                // Set [[group start timestamp]] equal to the [[group end timestamp]].
-                m_group_start_timestamp = m_group_end_timestamp;
-            }
-            // 2. Unset the last decode timestamp on all track buffers.
-            // 3. Unset the last frame duration on all track buffers.
-            // 4. Unset the highest end timestamp on all track buffers.
-            unset_all_track_buffer_timestamps();
-            // 5. Set the need random access point flag on all track buffers to true.
-            set_need_random_access_point_flag_on_all_track_buffers(true);
         }
     }
 

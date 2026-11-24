@@ -24,6 +24,7 @@
 #include <LibMedia/Forward.h>
 #include <LibMedia/MediaSourceExtensions/SourceBufferProcessor.h>
 #include <LibMedia/MediaTime.h>
+#include <LibMedia/MediaTimeline.h>
 #include <LibMedia/PlaybackStates/AvailableData.h>
 #include <LibMedia/PlaybackStates/PlaybackState.h>
 #include <LibMedia/SeekMode.h>
@@ -52,11 +53,12 @@ public:
     u64 session_id() const { return m_session_id; }
     Client* client() { return m_client.ptr(); }
 
-    AK::Duration duration() const { return m_duration; }
+    AK::Duration duration() const { return m_timeline.duration; }
     void set_duration(AK::Duration);
     AK::Duration current_time() const;
 
     Optional<AK::UnixDateTime> start_time_realtime() const { return m_start_time_realtime; }
+    AK::Duration earliest_possible_position() const { return m_timeline.earliest_possible_position; }
 
     Vector<Media::Track> const& video_tracks() const { return m_video_tracks; }
     Vector<Media::Track> const& audio_tracks() const { return m_audio_tracks; }
@@ -84,17 +86,29 @@ public:
     void seek(AK::Duration timestamp, Media::SeekMode);
 
     bool is_playing() const { return m_is_playing; }
-    Media::PlaybackState state() const { return m_state; }
+    Media::PlaybackState state() const;
     Media::AvailableData available_data() const { return m_available_data; }
+    // Whether the playback state can only change through further input, such as more data or a seek.
+    bool playback_state_is_settled() const;
     Media::BufferedRanges buffered_time_ranges() const;
+    // This is never more than one range, and that range may start and end at the same time.
+    Optional<Media::TimeRanges::Range> seekable_time_ranges() const;
+    // The range a live stream's player says can be sought to, besides the buffered ranges.
+    void set_live_seekable_range(Optional<Media::TimeRanges::Range>);
 
     void set_volume(double);
     void set_playback_rate(float);
     void set_audio_group(Audio::PlaybackGroupId);
 
     Function<void()> on_playback_state_change;
+    Function<void()> on_playback_state_settled_change;
     Function<void(AK::Duration)> on_duration_change;
     Function<void()> on_buffered_ranges_change;
+    // Called for each seek, before any state change the seek causes.
+    Function<void(Media::SeekDecision)> on_seek_decided;
+    // Called whenever an input of the seekable ranges changes: the duration, the buffered ranges, or the live seekable
+    // range.
+    Function<void()> on_seekable_ranges_change;
     Function<void(Media::DecoderError&&)> on_error;
 
     void register_source_buffer(Badge<RemoteSourceBuffer>, RemoteSourceBuffer&);
@@ -103,10 +117,11 @@ public:
 
     void connection_lost(Badge<Client>) { handle_connection_lost(); }
     void clock_changed(Badge<Client>, Media::MediaTimeReader);
-    void media_source_added(Badge<Client>, Optional<u64> stream_id, Vector<Media::Track> audio_tracks, Vector<Media::Track> video_tracks, Optional<Media::Track> preferred_audio_track, Optional<Media::Track> preferred_video_track, Optional<AK::UnixDateTime> start_time_realtime, Media::DemuxerScanState);
+    void media_source_added(Badge<Client>, Optional<u64> stream_id, Vector<Media::Track> audio_tracks, Vector<Media::Track> video_tracks, Optional<Media::Track> preferred_audio_track, Optional<Media::Track> preferred_video_track, Optional<AK::UnixDateTime> start_time_realtime, AK::Duration earliest_possible_position, Media::DemuxerScanState);
     void media_stream_source_failed(Badge<Client>, u64 stream_id, Media::DecoderError);
     void duration_changed(Badge<Client>, AK::Duration);
-    void state_changed(Badge<Client>, u64 applied_seek_request_id, Media::PlaybackState, bool is_playing, Media::AvailableData, AK::Duration current_time);
+    void seek_decided(Badge<Client>, u64 seek_request_id, Media::SeekDecision);
+    void state_changed(Badge<Client>, u64 applied_seek_request_id, Media::PlaybackState, bool is_playing, Media::AvailableData, bool server_playback_state_is_settled, AK::Duration current_time);
     void media_stream_scan_state_changed(Badge<Client>, u64 stream_id, Media::DemuxerScanState);
     void error(Badge<Client>, Media::DecoderError);
     void video_resized(Badge<Client>, Media::VideoSinkHandle, Gfx::Size<u32>);
@@ -141,16 +156,20 @@ private:
     void dispatch_error(Media::DecoderError&&);
     RemoteSourceBuffer* find_source_buffer(u64 source_buffer_id);
     void dispatch_state_change() const;
+    void advance_seek_request_id();
+    void dispatch_playback_state_settled_change_if_changed(bool was_settled) const;
     void dispatch_buffered_ranges_change() const;
+    void dispatch_seekable_ranges_change() const;
     bool source_has_enabled_track(ReadonlySpan<Media::Track> audio_tracks, ReadonlySpan<Media::Track> video_tracks) const;
     Media::CombinedScanState scan_state_for_enabled_tracks(Media::DemuxerScanState const&, ReadonlySpan<Media::Track> audio_tracks, ReadonlySpan<Media::Track> video_tracks) const;
+    Vector<Media::CombinedScanState> enabled_source_scan_states() const;
 
     RefPtr<Client> m_client;
     u64 m_session_id { 0 };
 
     Optional<Media::MediaTimeReader> m_time_reader;
-    AK::Duration m_duration;
-    bool m_duration_was_provided { false };
+    Media::MediaTimeline m_timeline;
+    bool m_duration_is_set_by_owner { false };
     Optional<AK::UnixDateTime> m_start_time_realtime;
     bool m_is_in_error_state { false };
     Vector<Media::Track> m_audio_tracks;
@@ -165,6 +184,12 @@ private:
     // A seek reports its target as the current time until the server has chosen where it lands. State reported
     // before the server applied the latest seek request is stale, and is ignored.
     u64 m_latest_seek_request_id { 0 };
+    // Track changes also advance the seek request ID, so they don't supersede the decision for the latest seek.
+    u64 m_request_id_of_latest_seek { 0 };
+    // Set from a seek until the server reports its state after applying the seek, unless the seek is skipped.
+    bool m_seek_is_beginning { false };
+    u64 m_latest_reported_seek_request_id { 0 };
+    bool m_server_playback_state_is_settled { true };
     AK::Duration m_seek_timestamp;
 
     HashTable<Media::Track> m_enabled_audio_tracks;

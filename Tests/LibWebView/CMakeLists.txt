@@ -2,7 +2,10 @@ if (BUILD_TESTING AND NOT WIN32)
     if (APPLE OR LINUX)
         ladybird_python_test(test-devtools-catch-up-layout.py ARGS $<TARGET_FILE:ladybird>)
         ladybird_python_test(test-devtools-client-follows-the-tab.py ARGS $<TARGET_FILE:ladybird>)
+        ladybird_python_test(test-devtools-network-events.py ARGS $<TARGET_FILE:ladybird>)
         ladybird_python_test(test-iframe-console.py ARGS $<TARGET_FILE:ladybird>)
+        ladybird_python_test(test-console-previews.py ARGS $<TARGET_FILE:ladybird>)
+        ladybird_python_test(test-console-output-escapes-control-characters.py ARGS $<TARGET_FILE:ladybird>)
         ladybird_python_test(test-message-port-collection.py ARGS $<TARGET_FILE:WebDriver>)
         ladybird_python_test(test-shared-stylesheet-memory.py ARGS $<TARGET_FILE:WebDriver> TIMEOUT 180)
         ladybird_python_test(test-user-agent-preset-reaches-child-frames.py ARGS $<TARGET_FILE:ladybird>)
@@ -21,15 +24,27 @@ if (BUILD_TESTING AND NOT WIN32)
         endforeach()
     endif()
 
+    # The browser's UI runs on Qt's offscreen platform here, with no display. The macOS UI takes every window for an
+    # AppKit view, which only the Cocoa platform makes.
+    if (LINUX)
+        ladybird_python_test(test-webdriver-graphical-pointer-actions.py ARGS $<TARGET_FILE:WebDriver>)
+    endif()
+
     ladybird_python_test(test-webdriver-bidi.py ARGS $<TARGET_FILE:WebDriver>)
+    ladybird_python_test(test-webdriver-command-privileges.py ARGS $<TARGET_FILE:WebDriver>)
     ladybird_python_test(test-webdriver-content-blockers.py ARGS $<TARGET_FILE:WebDriver> TIMEOUT 180)
+    ladybird_python_test(test-webdriver-default-browser.py ARGS $<TARGET_FILE:WebDriver>)
     ladybird_python_test(test-webdriver-delete-session.py ARGS $<TARGET_FILE:WebDriver>)
+    ladybird_python_test(test-webdriver-element-screenshot.py ARGS $<TARGET_FILE:WebDriver>)
+    ladybird_python_test(test-webdriver-element-send-keys-files.py ARGS $<TARGET_FILE:WebDriver>)
     ladybird_python_test(test-webdriver-error-keep-alive.py ARGS $<TARGET_FILE:WebDriver>)
     ladybird_python_test(test-webdriver-force-dark.py ARGS $<TARGET_FILE:WebDriver>)
-    ladybird_python_test(test-webdriver-location-policy.py ARGS $<TARGET_FILE:WebDriver>)
-    ladybird_python_test(test-webdriver-microphone-policy.py ARGS $<TARGET_FILE:WebDriver>)
-    ladybird_python_test(test-webdriver-notifications-policy.py ARGS $<TARGET_FILE:WebDriver>)
     ladybird_python_test(test-webdriver-permissions-settings.py ARGS $<TARGET_FILE:WebDriver>)
+    if (PDFJS_FOUND)
+        ladybird_python_test(test-webdriver-pdf-viewer-ignores-the-csp-of-its-pdf.py ARGS $<TARGET_FILE:WebDriver>)
+    endif()
+    ladybird_python_test(test-webdriver-rejects-web-page-requests.py ARGS $<TARGET_FILE:WebDriver>)
+    ladybird_python_test(test-webdriver-screenshot-with-cross-site-iframe.py ARGS $<TARGET_FILE:WebDriver>)
     ladybird_python_test(test-webdriver-search-engine-settings.py ARGS $<TARGET_FILE:WebDriver>)
     ladybird_python_test(test-webdriver-set-permission.py ARGS $<TARGET_FILE:WebDriver>)
     ladybird_python_test(test-webdriver-settings-changes.py ARGS $<TARGET_FILE:WebDriver>)
@@ -47,6 +62,8 @@ if (BUILD_BROWSER_TESTS_ONLY)
 endif()
 
 ladybird_test_suite(LibWebView)
+# TestHelperProcessPaths looks for these where the browser would.
+add_dependencies(TestLibWebView Compositor ImageDecoder RequestServer SystemProbe WebContent)
 
 set(TEST_SOURCES
     TestAccessibilityTreeManager.cpp
@@ -63,15 +80,19 @@ set(TEST_SOURCES
     TestFaviconStore.cpp
     TestForceDarkSettings.cpp
     TestHelperProcessEnvironment.cpp
+    TestHelperProcessPaths.cpp
     TestHistoryStore.cpp
     TestHSTSStore.cpp
     TestLingeringIndicator.cpp
+    TestMediaSessionCoordinator.cpp
     TestNavigationLoader.cpp
     TestNotificationAttribution.cpp
     TestNotificationFreedesktopArguments.cpp
+    TestNowPlayingInfo.cpp
     TestOmnibox.cpp
     TestPermissionManager.cpp
     TestPictureInPictureWindow.cpp
+    TestPlatformFeatures.cpp
     TestProfile.cpp
     TestSessionHistory.cpp
     TestSessionHistoryTraversalQueue.cpp
@@ -83,7 +104,12 @@ set(TEST_SOURCES
     TestTabPerformanceStats.cpp
     TestWebDriverBiDiNetwork.cpp
     TestWebViewURL.cpp
+    TestWebWorkerClient.cpp
 )
+
+if (LADYBIRD_ENABLE_UPDATE_CHECK)
+    list(APPEND TEST_SOURCES TestUpdateCheck.cpp)
+endif()
 
 if (APPLE OR LINUX)
     list(APPEND TEST_SOURCES
@@ -91,22 +117,24 @@ if (APPLE OR LINUX)
         TestCrashReportReview.cpp
         TestCrashReportStore.cpp
         TestFontService.cpp
+        TestLocalFileRoot.cpp
+        TestOpenLocalFileForRenderer.cpp
         TestRendererFontService.cpp
     )
 endif()
 
 if (APPLE)
-    list(APPEND TEST_SOURCES TestProcessReaper.cpp)
+    list(APPEND TEST_SOURCES TestPageBackingStores.cpp TestProcessReaper.cpp)
 endif()
 
 if (LINUX)
     list(APPEND TEST_SOURCES TestAudioDaemonSocket.cpp)
 endif()
 
-if (APPLE AND NOT IOS)
+if ((APPLE AND NOT IOS) OR LINUX)
     target_link_libraries(TestLibWebView PRIVATE LibWebSocket OpenSSL::Crypto OpenSSL::SSL)
     target_sources(TestLibWebView PRIVATE
-        TestWebDriverMachBootstrap.cpp
+        TestWebDriverSession.cpp
         "${LADYBIRD_SOURCE_DIR}/Services/WebDriver/BiDiSession.cpp"
         "${LADYBIRD_SOURCE_DIR}/Services/WebDriver/BrowserConnection.cpp"
         "${LADYBIRD_SOURCE_DIR}/Services/WebDriver/Client.cpp"
@@ -117,12 +145,17 @@ if (APPLE AND NOT IOS)
     set_tests_properties(TestLibWebView PROPERTIES TIMEOUT 120)
 endif()
 
+if (APPLE AND NOT IOS)
+    target_sources(TestLibWebView PRIVATE TestWebDriverMachBootstrap.cpp)
+endif()
+
 if (NOT WIN32)
     set(HEADLESS_TEST_SOURCES
         TestApplicationDestruction.cpp
         TestAutocomplete.cpp
         TestBeforeUnload.cpp
         TestBrowserHistoryTraversal.cpp
+        TestCompositorStartup.cpp
         TestCrashOverlay.cpp
         TestCrashReportSubmission.cpp
         TestFavicon.cpp
@@ -133,18 +166,22 @@ if (NOT WIN32)
         TestInputMethodState.cpp
         TestInspectDOMTree.cpp
         TestLinkHoverStatus.cpp
+        TestLocalFileNavigation.cpp
         TestNavigationDownloads.cpp
         TestPictureInPictureUserActivation.cpp
         TestPictureInPictureWindowControls.cpp
         TestPictureInPictureWindowLifetime.cpp
         TestRendererAttentionClaims.cpp
+        TestRendererClipboardFormats.cpp
         TestRendererCookieAccess.cpp
         TestRendererOriginClaims.cpp
+        TestRendererResponseBodyClaims.cpp
         TestRendererViolationReports.cpp
         TestRequestServerClientSessions.cpp
         TestRequestServerDiskCaches.cpp
         TestShadowTreeTooltipsAndLinks.cpp
         TestSharedWorkerHost.cpp
+        TestSpareWebContentProcess.cpp
         TestTitleElementChanges.cpp
         TestUserActivation.cpp
         TestViewSource.cpp

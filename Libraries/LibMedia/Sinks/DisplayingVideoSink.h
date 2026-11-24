@@ -18,6 +18,7 @@
 #include <LibMedia/MediaTime.h>
 #include <LibMedia/PipelineStatus.h>
 #include <LibMedia/Sinks/VideoSink.h>
+#include <LibMedia/Sinks/VideoSinkTicking.h>
 
 namespace Media {
 
@@ -50,8 +51,17 @@ public:
 
     virtual void seek(AK::Duration timestamp, InvalidateHeldData = InvalidateHeldData::No) override;
     virtual void notify_clock_resumed() override;
-    void set_ticking(bool);
-    bool is_ticking() const { return m_is_ticking; }
+    virtual void set_ticking(bool) override;
+    bool is_ticking() const { return m_ticking == VideoSinkTicking::Yes; }
+    bool ticking_is_decided() const { return m_ticking != VideoSinkTicking::Undecided; }
+    // Called when the sink starts or stops ticking, catching up, or having an up-to-date frame.
+    void set_on_freshness_changed(Function<void()> handler) { m_on_freshness_changed = move(handler); }
+    // Seeks the input to the clock's time if the current frame doesn't show it, whether or not the sink is ticking.
+    void catch_up_to_clock();
+    // A catch-up that waits for data keeps the last frame shown until the data arrives, so it is not waited for.
+    bool is_catching_up() const { return m_seek_status == SeekStatus::CatchingUp && m_latest_status != PipelineStatus::Blocked; }
+    // Whether the frame may change if it is ticked.
+    bool frame_is_up_to_date() const { return is_ticking() && m_has_updated_since_ticking_began && !is_catching_up(); }
 
     DisplayingVideoSinkUpdateResult update(MonotonicTime now);
     RefPtr<VideoFrame> current_frame() const;
@@ -60,13 +70,16 @@ public:
     void set_on_present_needed(Function<void()> handler) { m_on_present_needed = move(handler); }
 
 private:
-    void dispatch_state_if_changed(PipelineStatus);
-    void seek_back_to_current_time();
+    void dispatch_latest_state_if_changed();
+    void defer_latest_status_dispatch();
+    void report_freshness_if_changed();
+    void start_input();
 
     MediaTimeReader m_time_reader;
     RefPtr<VideoProducer> m_input;
 
-    bool m_is_ticking { true };
+    VideoSinkTicking m_ticking { VideoSinkTicking::Undecided };
+    bool m_has_updated_since_ticking_began { false };
     RefPtr<VideoFrame> m_next_frame;
     RefPtr<VideoFrame> m_current_frame;
     bool m_cached_frames_are_discontinuous { false };
@@ -75,18 +88,34 @@ private:
 
     enum class SeekStatus : u8 {
         None,
+        // A seek that the sink made to catch its frames up to the clock. A seek from upstream replaces it.
+        CatchingUp,
         InProgress,
     };
     SeekStatus m_seek_status { SeekStatus::None };
+    void begin_seek(AK::Duration timestamp, InvalidateHeldData, SeekStatus);
 
     PipelineStateChangeHandler m_on_state_changed;
+    PipelineStatus m_latest_status { PipelineStatus::Pending };
     PipelineStatus m_last_dispatched_status { PipelineStatus::Pending };
+    PipelineCheckpoint m_input_checkpoint { 0 };
+    PipelineCheckpoint m_last_dispatched_checkpoint { 0 };
     u32 m_seek_id { 0 };
 
     PipelineResizeHandler m_on_resize;
     Gfx::Size<u32> m_last_dispatched_size;
 
     Function<void()> m_on_present_needed;
+    Function<void()> m_on_freshness_changed;
+    struct Freshness {
+        bool is_ticking { false };
+        bool is_catching_up { false };
+        bool frame_is_up_to_date { false };
+
+        bool operator==(Freshness const&) const = default;
+    };
+    Freshness freshness() const;
+    Freshness m_reported_freshness;
     bool m_last_update_may_require_updates { false };
 };
 

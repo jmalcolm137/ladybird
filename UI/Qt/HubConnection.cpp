@@ -30,7 +30,9 @@ HubConnection::HubConnection(NonnullOwnPtr<IPC::Transport> transport)
 
 HubConnection::~HubConnection()
 {
-    s_the = nullptr;
+    // NB: A connection can outlive the one that took its place, as when a launch connects to a second Hub.
+    if (s_the == this)
+        s_the = nullptr;
 }
 
 HubConnection& HubConnection::the()
@@ -146,6 +148,24 @@ void HubConnection::view_clear_backing_stores(u64 view_id)
 {
     if (auto* view = RemoteView::find(view_id))
         view->did_clear_backing_stores();
+}
+
+void HubConnection::view_set_remote_layer(u64 view_id, Compositing::RemoteLayerHostHandle host_handle)
+{
+    if (auto* view = RemoteView::find(view_id))
+        view->did_set_remote_layer(host_handle);
+}
+
+void HubConnection::view_did_present_frame_in_remote_layer(u64 view_id, Gfx::IntSize size, double device_pixel_ratio)
+{
+    if (auto* view = RemoteView::find(view_id))
+        view->did_present_frame_in_remote_layer(size, device_pixel_ratio);
+}
+
+void HubConnection::view_did_take_frame_snapshot(u64 view_id, u64 request_id, Optional<Gfx::ShareableBitmap> snapshot)
+{
+    if (auto* view = RemoteView::find(view_id))
+        view->did_take_frame_snapshot(request_id, move(snapshot));
 }
 
 void HubConnection::view_finish_handling_key_event(u64 view_id, u64 input_id, Web::KeyEvent event)
@@ -293,14 +313,19 @@ void HubConnection::app_quit_for_signal()
     Application::the().quit_for_signal();
 }
 
-void HubConnection::app_did_enable_devtools()
+void HubConnection::app_did_enable_devtools(u16 port)
 {
-    Application::the().did_enable_devtools();
+    Application::the().did_enable_devtools(port);
 }
 
 void HubConnection::app_did_disable_devtools()
 {
     Application::the().did_disable_devtools();
+}
+
+void HubConnection::app_gpu_painting_changed(bool gpu_painting_enabled)
+{
+    Application::the().did_change_gpu_painting(gpu_painting_enabled);
 }
 
 void HubConnection::app_open_urls_in_new_tabs(Vector<URL::URL> urls)
@@ -321,6 +346,13 @@ void HubConnection::app_open_view_in_new_tab(u64 view_id, Optional<u64> source_v
 void HubConnection::app_display_error_dialog(String message)
 {
     Application::the().display_error_dialog(message);
+}
+
+void HubConnection::app_display_update_check_result([[maybe_unused]] WebView::UpdateCheckResult::Kind kind, [[maybe_unused]] Optional<String> version, [[maybe_unused]] WebView::InstallMethod install_method, [[maybe_unused]] WebView::UpdateCheckTrigger trigger)
+{
+#if defined(LADYBIRD_HAS_UPDATE_CHECK)
+    Application::the().display_update_check_result(kind, version, install_method, trigger);
+#endif
 }
 
 void HubConnection::app_display_download_confirmation_dialog(String download_name, ByteString path)
@@ -376,6 +408,12 @@ void HubConnection::pip_set_video_size(u64 view_id, Gfx::IntSize video_size)
 void HubConnection::pip_close(u64 view_id)
 {
     Application::the().close_picture_in_picture_window(view_id);
+}
+
+void HubConnection::media_session_update(Optional<Web::MediaSession::MediaSessionState> state)
+{
+    if (auto* backend = Application::the().media_session_platform_backend())
+        backend->update(state);
 }
 
 void HubConnection::notification_show(u64 id, u64 page_id, Optional<u64> replaces, Web::NotificationsAPI::NotificationData data, String attribution, Optional<Gfx::ShareableBitmap> icon)
@@ -552,6 +590,18 @@ void HubConnection::microphone_request_authorization()
     });
 }
 
+void HubConnection::default_browser_make_default()
+{
+    auto* default_browser = Application::the().default_browser();
+    if (!default_browser) {
+        async_default_browser_make_default_finished(true, {});
+        return;
+    }
+    default_browser->make_default([this](WebView::MakeDefaultBrowserResult const& result) {
+        async_default_browser_make_default_finished(result.failed, result.system_message);
+    });
+}
+
 // NB: The gamepads are read here, as the Hub links no platform input library. The Hub decides which pages learn of them.
 void HubConnection::gamepad_start(bool ignore_system_gamepads)
 {
@@ -691,6 +741,19 @@ void HubConnection::view_page_dumps(u64 view_id, u64 request_id, Optional<String
 {
     if (auto* view = RemoteView::find(view_id))
         view->did_get_page_dumps(request_id, move(dumps));
+}
+
+void HubConnection::fetch_platform_features_description(Function<void(ByteString)> callback)
+{
+    auto request_id = m_next_request_id++;
+    m_platform_features_description_requests.set(request_id, move(callback));
+    async_request_platform_features_description(request_id);
+}
+
+void HubConnection::platform_features_description(u64 request_id, ByteString description)
+{
+    if (auto callback = m_platform_features_description_requests.take(request_id); callback.has_value())
+        (*callback)(move(description));
 }
 
 void HubConnection::app_open_new_tab(Vector<URL::URL> urls)
@@ -838,6 +901,12 @@ void HubConnection::view_activate_tab(u64 view_id)
 {
     if (auto* view = RemoteView::find(view_id); view && view->on_activate_tab)
         view->on_activate_tab();
+}
+
+void HubConnection::view_discard(u64 view_id)
+{
+    if (auto* view = RemoteView::find(view_id); view && view->on_discard)
+        view->on_discard();
 }
 
 void HubConnection::view_close(u64 view_id)
@@ -1108,6 +1177,12 @@ void HubConnection::view_performance_stats(u64 view_id, WebView::TabPerformanceS
 {
     if (auto* view = RemoteView::find(view_id); view && view->on_performance_stats)
         view->on_performance_stats(move(stats));
+}
+
+void HubConnection::view_compositor_layers_change(u64 view_id, Compositing::CompositorLayersDescription layers)
+{
+    if (auto* view = RemoteView::find(view_id); view && view->on_compositor_layers_change)
+        view->on_compositor_layers_change(layers);
 }
 
 }

@@ -19,39 +19,13 @@
 
 namespace Web::Fetch::Infrastructure {
 
+extern "C" {
+
+// Called by Bindings/Rust/src/fetch/infrastructure/http/bodies.rs.
+bool web_fetch_body_length(Body*, u64* out_length);
+}
+
 GC_DEFINE_ALLOCATOR(Body);
-
-FetchBody::FetchBody(Optional<Core::ImmutableBytes> source, Optional<u64> length)
-    : m_source(move(source))
-    , m_length(length)
-{
-}
-
-ResponseBody::ResponseBody(Bytes bytes, Optional<u64> length)
-    : m_bytes(move(bytes))
-    , m_length(length)
-{
-}
-
-ResponseBody ResponseBody::from_bytes(Core::ImmutableBytes bytes)
-{
-    auto length = bytes.size();
-    return ResponseBody { move(bytes), length };
-}
-
-ResponseBody ResponseBody::from_extracted_body(Body const& body)
-{
-    if (auto const& source = body.source(); source.has_value())
-        return ResponseBody { *source, body.length() };
-    return ResponseBody { ReadThroughStream {}, body.length() };
-}
-
-Optional<Core::ImmutableBytes const&> ResponseBody::source() const
-{
-    if (auto const* bytes = m_bytes.get_pointer<Core::ImmutableBytes>())
-        return *bytes;
-    return {};
-}
 
 GC::Ref<Body> Body::create(GC::Ref<Streams::ReadableStream> stream, FetchBody fetch_body)
 {
@@ -223,16 +197,17 @@ GC::Ref<Body> byte_sequence_as_body(JS::Realm& realm, ReadonlyBytes bytes)
     return body;
 }
 
-// https://fetch.spec.whatwg.org/#byte-sequence-as-a-body
-// NB: Each view of the body makes its stream from these bytes.
-ResponseBody byte_sequence_as_response_body(ReadonlyBytes bytes)
-{
-    return ResponseBody::from_bytes(MUST(Core::ImmutableBytes::copy(bytes)));
-}
-
 void cancel_incremental_read(Streams::ReadableStreamDefaultReader& reader)
 {
     reader.cancel({});
+}
+
+bool web_fetch_body_length(Body* body, u64* out_length)
+{
+    if (!body->length().has_value())
+        return false;
+    *out_length = *body->length();
+    return true;
 }
 
 }

@@ -176,14 +176,6 @@ WebIDL::ExceptionOr<void> ShadowRoot::set_inner_html(Utf16View html, GC::Ptr<Tru
     // 4. Replace all with fragment within this.
     this->replace_all(fragment);
 
-    // NOTE: We don't invalidate style & layout for <template> elements since they don't affect rendering.
-    if (!is<HTML::HTMLTemplateElement>(*this)) {
-        if (this->is_connected()) {
-            // NOTE: Since the DOM has changed, we have to rebuild this shadow root's layout subtree.
-            this->set_needs_layout_tree_update(true, SetNeedsLayoutTreeUpdateReason::ShadowRootSetInnerHTML);
-        }
-    }
-
     return {};
 }
 
@@ -304,12 +296,6 @@ void ShadowRoot::for_each_active_css_style_sheet(Function<void(CSS::StyleSheetSt
                 callback(style_sheet);
         });
     }
-}
-
-WebIDL::ExceptionOr<GC::RootVector<GC::Ref<Animations::Animation>>> ShadowRoot::get_animations()
-{
-    document().update_style();
-    return calculate_get_animations(*this);
 }
 
 ElementByIdMap& ShadowRoot::element_by_id() const

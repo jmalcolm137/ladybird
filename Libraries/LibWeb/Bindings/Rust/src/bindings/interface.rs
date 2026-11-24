@@ -29,11 +29,13 @@ use libjs_rust::api::{
 };
 
 use crate::bindings::CallContext;
+use crate::bindings::conversions::implements_cpp_interface;
 use crate::bindings::realm_data::wrapper_world_of;
 use crate::bindings::services::{
     web_bindings_define_unforgeable_attributes, web_bindings_ensure_web_constructor, web_bindings_ensure_web_prototype,
     web_bindings_perform_a_security_check, web_bindings_realm_is_secure_context, web_bindings_realm_is_window,
-    web_bindings_rust_wrapper_for, web_bindings_set_rust_wrapper, web_bindings_with_temporary_execution_context,
+    web_bindings_report_an_exception, web_bindings_rust_wrapper_for, web_bindings_set_rust_wrapper,
+    web_bindings_with_temporary_execution_context,
 };
 
 /// What an implementation can tell the bindings about its objects, as a C++ implementation object does by overriding
@@ -51,10 +53,22 @@ pub(crate) trait Wrappable {
     /// implementation object.
     const OWNS_EXTERNAL_MEMORY: bool = false;
 
+    /// Whether the memory outside the heap that the object owns was made with it, so that allocating the object counts
+    /// it towards the next collection. Not so for an object that reports memory another object holds as well, as a CSS
+    /// rule does the rule its style sheet holds: counting it each time a new one is made would start collections that
+    /// free none of it.
+    const COUNTS_EXTERNAL_MEMORY_WHEN_ALLOCATED: bool = false;
+
     /// How much memory outside the heap the object owns, which LibGC asks for if OWNS_EXTERNAL_MEMORY is true.
     fn external_memory_size(&self) -> usize {
         0
     }
+
+    /// Whether LibGC may only trace the object, and ask for its external_memory_size(), on the thread that owns its heap,
+    /// as it does C++ objects. LibGC traces other objects on several threads at once while that thread is stopped, so
+    /// this must be true for an object whose tracing reaches C++ objects, thread-local state, or state that it shares
+    /// with other objects without synchronization.
+    const TRACED_ON_OWNER_THREAD_ONLY: bool = false;
 
     /// Whether LibGC finalizes the object before it destroys it, which it does through finalize(), as it does a C++
     /// implementation object that overrides Cell::finalize().
@@ -139,6 +153,11 @@ pub(crate) const fn cell_class<T: Wrappable + Trace + 'static>(name: &'static st
     } else {
         EmbedderClass::new(name)
     };
+    let class = if T::TRACED_ON_OWNER_THREAD_ONLY {
+        class.traced_on_owner_thread_only()
+    } else {
+        class
+    };
     if T::FINALIZES {
         class.with_finalize(finalize_object::<T>)
     } else {
@@ -173,10 +192,19 @@ impl<T: Wrappable + Trace + Sized + 'static> Interface for T {
 
 /// A new object of the interface, built as Heap::allocate() builds a cell.
 pub(crate) fn allocate<T: Interface>(vm: &Vm, build: impl FnOnce(&DeferGc<'_>) -> T) -> Ref<T> {
-    T::CELL_CLASS.allocate(vm, |defer_gc| Wrapped {
+    let object = T::CELL_CLASS.allocate(vm, |defer_gc| Wrapped {
         main_world_wrapper: Cell::new(None),
         implementation: build(defer_gc),
-    })
+    });
+    // NB: The memory the object owns outside the heap counts towards the next collection too, or a page could make
+    //     many objects that each own a lot of it, and keep the dead ones until its other allocations started one.
+    if T::OWNS_EXTERNAL_MEMORY && T::COUNTS_EXTERNAL_MEMORY_WHEN_ALLOCATED {
+        let size = object.external_memory_size();
+        if size != 0 {
+            vm.heap().did_allocate_external_memory(size);
+        }
+    }
+    object
 }
 
 /// What the constructor steps or the transfer-receiving steps of an interface create: the implementation of the new
@@ -253,6 +281,33 @@ pub(crate) fn this_object(
     // NB: This runs after the check above, which no Window or Location object passes.
     perform_a_security_check(vm, this_value, identifier, check_type)?;
     vm.throw_completion(ErrorKind::TypeError, ErrorType::NotAnObjectOfType, &[&interface_name])
+}
+
+/// The object an attribute or an operation of an interface implemented in C++ runs on, if it is a wrapper of an object
+/// that implements the interface, which the value of its Web::Bindings::InterfaceName names, with the object's realm.
+/// A nullish this value stands for the global object of the current realm.
+/// https://webidl.spec.whatwg.org/#implementation-check-an-object
+pub(crate) fn this_cpp_object(
+    vm: &Vm,
+    interface_name: u16,
+    name: &str,
+    identifier: &str,
+    check_type: SecurityCheckType,
+) -> ThrowCompletionOr<(Gc<Object>, Gc<Realm>)> {
+    let mut this_value = vm.this_value();
+    if this_value.is_nullish() {
+        let current_realm = vm.current_realm().expect("a native function runs in a realm");
+        this_value = Value::from_object(current_realm.global_object());
+    }
+    if this_value.is_object() {
+        let object = this_value.as_object();
+        if implements_cpp_interface(object, interface_name) {
+            return Ok((object, object.shape().realm()));
+        }
+    }
+    // NB: This runs after the check above, which no Window or Location object passes.
+    perform_a_security_check(vm, this_value, identifier, check_type)?;
+    vm.throw_completion(ErrorKind::TypeError, ErrorType::NotAnObjectOfType, &[&name])
 }
 
 /// The object that a wrapper of exactly the interface wraps.
@@ -441,6 +496,12 @@ pub(crate) fn realm_is_window(realm: Gc<Realm>) -> bool {
 pub(crate) fn realm_is_secure_context(realm: Gc<Realm>) -> bool {
     // SAFETY: The realm is live.
     unsafe { web_bindings_realm_is_secure_context(realm.as_ptr().cast()) }
+}
+
+/// https://html.spec.whatwg.org/multipage/webappapis.html#report-an-exception
+pub(crate) fn report_an_exception(realm: Gc<Realm>, exception: Value) {
+    // SAFETY: The realm and the exception are live.
+    unsafe { web_bindings_report_an_exception(realm.as_ptr().cast(), exception.to_raw()) }
 }
 
 /// Runs the steps while an execution context of the realm is on the stack, for steps that can run script but that do not

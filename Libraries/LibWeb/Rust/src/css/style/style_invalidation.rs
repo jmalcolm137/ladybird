@@ -543,7 +543,11 @@ fn property_invalidation(property: u16, old: ComputedValuesView<'_>, new: Comput
     }
     if matches!(
         property,
-        property_id::APPEARANCE | property_id::CONTENT | property_id::CONTENT_VISIBILITY | property_id::TEXT_TRANSFORM
+        property_id::APPEARANCE
+            | property_id::CONTENT
+            | property_id::CONTENT_VISIBILITY
+            | property_id::TEXT_TRANSFORM
+            | property_id::_WEBKIT_TEXT_SECURITY
     ) {
         return StyleInvalidation::rebuild_layout_tree_from(REBUILD_ROOT_SELF);
     }
@@ -672,8 +676,9 @@ fn property_invalidation(property: u16, old: ComputedValuesView<'_>, new: Comput
     }
     let will_change_covers_property =
         will_change_covers_property(property, old) && will_change_covers_property(property, new);
+    // 'order' and 'z-index' can change stacking order without changing which boxes establish stacking contexts.
     if property_metadata::property_affects_stacking_context(property)
-        && (property == property_id::Z_INDEX
+        && (matches!(property, property_id::ORDER | property_id::Z_INDEX)
             || (!will_change_covers_property
                 && value_creates_stacking_context(property, old) != value_creates_stacking_context(property, new)))
     {
@@ -766,6 +771,23 @@ fn effective_value<'a>(
     longhands.value(property)
 }
 
+/// The indices of the longhands whose bits are set in `words`, one bit per longhand from the first.
+fn longhand_indices(words: [u64; crate::css::property_metadata::LONGHAND_WORD_COUNT]) -> impl Iterator<Item = usize> {
+    words
+        .into_iter()
+        .enumerate()
+        .flat_map(|(word_index, mut word)| {
+            std::iter::from_fn(move || {
+                let bit = word.trailing_zeros() as usize;
+                (word != 0).then(|| {
+                    word &= word - 1;
+                    word_index * 64 + bit
+                })
+            })
+        })
+        .take_while(|&index| index < NUMBER_OF_LONGHAND_PROPERTIES)
+}
+
 fn same_value(first: Option<&StyleValueData>, second: Option<&StyleValueData>) -> bool {
     match (first, second) {
         (Some(first), Some(second)) => std::ptr::eq(first, second) || first == second,
@@ -847,6 +869,7 @@ impl RetainedState {
         animated_overlay: *const AnimatedOverlay,
         payloads: &crate::css::computed_values::StyleGroups,
         is_document_element: bool,
+        is_svg_graphics_element: bool,
     ) -> FfiAnimationInvalidation {
         let longhands = old_record.longhands();
         let old_overlay = old_record.animated_overlay;
@@ -911,6 +934,11 @@ impl RetainedState {
         {
             invalidation.repaint_text_decorations = false;
         }
+        // The layout of SVG text places its text decoration lines along with its glyphs, so a sample that moves the
+        // lines has to reach it.
+        if is_svg_graphics_element && invalidation.repaint_text_decorations {
+            invalidation.ensure_level(INVALIDATION_RELAYOUT);
+        }
         ffi_result.invalidation = invalidation.pack();
         ffi_result
     }
@@ -929,8 +957,14 @@ impl RetainedState {
         let is_document_element =
             self.projection.adjustment_facts(node) & element_adjustment_fact::IS_DOCUMENT_ELEMENT != 0;
         let invalidation = StyleInvalidation::unpack(
-            self.compare_animation_overlay(old_record, animated_overlay, payloads, is_document_element)
-                .invalidation,
+            self.compare_animation_overlay(
+                old_record,
+                animated_overlay,
+                payloads,
+                is_document_element,
+                self.is_svg_graphics_element(node),
+            )
+            .invalidation,
         );
         let SampleBounds {
             scroll_snaps,
@@ -988,6 +1022,10 @@ impl RetainedState {
         }
         result.merge(baked_filter_color_damage(old_values, new_values));
         result.pack()
+    }
+
+    pub(crate) fn is_svg_graphics_element(&self, node: StyleNodeID) -> bool {
+        self.projection.adjustment_facts(node) & element_adjustment_fact::IS_SVG_GRAPHICS_ELEMENT != 0
     }
 
     /// The facts of `node` that what moving it, or one of its pseudo-elements, between records
@@ -1195,6 +1233,12 @@ fn record_move_damage(
         result.any_computed_value_changed = true;
         result.ensure_level(INVALIDATION_RELAYOUT);
     }
+    // Which margins the user agent's style sheet sets decides which margins a quirks-mode body or table cell
+    // ignores, which no longhand's value says.
+    if old_values.user_agent_margin_sides() != new_values.user_agent_margin_sides() {
+        result.any_computed_value_changed = true;
+        result.ensure_level(INVALIDATION_RELAYOUT);
+    }
     if !can_skip {
         if old_values.misc_interaction().implicit_will_change != new_values.misc_interaction().implicit_will_change {
             result.merge(property_invalidation(property_id::WILL_CHANGE, old_values, new_values));
@@ -1231,27 +1275,39 @@ fn record_move_damage(
         let new_direction = new_values.direction();
         // A longhand whose value both records hold in a group they share computes the same in
         // both, which only an animated value or a writing mode mapping it elsewhere would change.
-        let shared = old_table.shared_with(new_table).filter(|_| {
-            old_record.animated_overlay.is_none()
-                && new_record.animated_overlay.is_none()
-                && old_writing_mode == new_writing_mode
-                && old_direction == new_direction
-        });
+        let shared = old_table
+            .shared_with(new_table)
+            .filter(|_| old_writing_mode == new_writing_mode && old_direction == new_direction);
+        let old_overlay = old_record.animated_overlay;
+        let new_overlay = new_record.animated_overlay;
+        // OPTIMIZATION: An animated value only changes the longhand its overlay entry names, so the shared groups
+        //               still compute the same in both records apart from the longhands either overlay holds.
+        let mut animated = [0u64; crate::css::property_metadata::LONGHAND_WORD_COUNT];
+        for entry in old_overlay
+            .into_iter()
+            .chain(new_overlay)
+            .flat_map(|overlay| overlay.entries())
+        {
+            if let Some(index) = entry.property.checked_sub(FIRST_LONGHAND_PROPERTY_ID)
+                && usize::from(index) < NUMBER_OF_LONGHAND_PROPERTIES
+            {
+                animated[usize::from(index) / 64] |= 1 << (index % 64);
+            }
+        }
+        let is_animated = |property: u16| {
+            property
+                .checked_sub(FIRST_LONGHAND_PROPERTY_ID)
+                .is_some_and(|index| animated[usize::from(index) / 64] & (1 << (index % 64)) != 0)
+        };
         let mut effective_changed = [false; NUMBER_OF_LONGHAND_PROPERTIES];
-        let to_compare = shared.map_or(
+        let mut to_compare = shared.map_or(
             [u64::MAX; crate::css::property_metadata::LONGHAND_WORD_COUNT],
             super::computed::SharedLonghands::longhands_to_compare,
         );
-        let indices = to_compare.into_iter().enumerate().flat_map(|(word_index, mut word)| {
-            std::iter::from_fn(move || {
-                let bit = word.trailing_zeros() as usize;
-                (word != 0).then(|| {
-                    word &= word - 1;
-                    word_index * 64 + bit
-                })
-            })
-        });
-        for index in indices.take_while(|&index| index < NUMBER_OF_LONGHAND_PROPERTIES) {
+        for (word, animated_word) in to_compare.iter_mut().zip(animated) {
+            *word |= animated_word;
+        }
+        for index in longhand_indices(to_compare) {
             let changed = &mut effective_changed[index];
             let property = FIRST_LONGHAND_PROPERTY_ID + index as u16;
             let old_physical = if property_metadata::longhand_is_logical_alias(property) {
@@ -1264,7 +1320,11 @@ fn record_move_damage(
             } else {
                 property
             };
-            if shared.is_some_and(|shared| shared.holds(new_physical)) {
+            if shared.is_some_and(|shared| shared.holds(new_physical))
+                && !is_animated(property)
+                && !is_animated(old_physical)
+                && !is_animated(new_physical)
+            {
                 continue;
             }
             let old_value = effective_value(&old_record, old_table, old_physical);
@@ -1298,19 +1358,12 @@ fn record_move_damage(
             result.merge(invalidation);
         }
         result.merge(baked_filter_color_damage(old_values, new_values));
-        let old_overlay = old_record.animated_overlay;
-        let new_overlay = new_record.animated_overlay;
         if old_overlay.is_some() || new_overlay.is_some() {
-            for (index, effective_changed) in effective_changed.into_iter().enumerate() {
-                if effective_changed {
+            for index in longhand_indices(animated) {
+                if effective_changed[index] {
                     continue;
                 }
                 let property = FIRST_LONGHAND_PROPERTY_ID + index as u16;
-                if old_overlay.and_then(|overlay| overlay.get(property)).is_none()
-                    && new_overlay.and_then(|overlay| overlay.get(property)).is_none()
-                {
-                    continue;
-                }
                 let old_physical =
                     crate::css::style_compute::map_logical_alias_to_physical(property, old_writing_mode, old_direction);
                 let new_physical =
@@ -1378,9 +1431,15 @@ pub(crate) fn element_record_damage_of_views(facts: ElementDamageFacts, record_m
         facts.verifies_reads,
     );
     let mut damage = StyleInvalidation::unpack(packed);
-    // Fieldsets with a rendered legend or flex contents transfer overflow to an anonymous
-    // content box during tree construction. Rebuild to refresh both boxes' overrides.
-    if overflow_changed && facts.is_field_set {
+    // Fieldsets with a rendered legend or flex or grid contents transfer overflow, and their flex or grid container
+    // properties, to an anonymous content box during tree construction. Rebuild to refresh both boxes' overrides.
+    let fieldset_content_box_properties_changed = facts.is_field_set
+        && (overflow_changed
+            || old_values.alignment() != new_values.alignment()
+            || old_values.grid_values() != new_values.grid_values()
+            || old_values.grid_auto_flow_row() != new_values.grid_auto_flow_row()
+            || old_values.grid_auto_flow_dense() != new_values.grid_auto_flow_dense());
+    if fieldset_content_box_properties_changed {
         damage.merge(StyleInvalidation::rebuild_layout_tree_from(REBUILD_ROOT_SELF));
     }
     // An SVG currentColor stroke stores its resolved color alongside the fact that it came from
@@ -1389,11 +1448,27 @@ pub(crate) fn element_record_damage_of_views(facts: ElementDamageFacts, record_m
     if facts.is_svg_graphics_element && color_changed && stroke_uses_current_color {
         damage.ensure_level(INVALIDATION_RELAYOUT);
     }
+    // The layout of SVG text places its text decoration lines along with its glyphs, so a change to the lines has to
+    // reach it.
+    if facts.is_svg_graphics_element && damage.repaint_text_decorations {
+        damage.ensure_level(INVALIDATION_RELAYOUT);
+    }
     // Generated pseudo-element boxes are anonymous, so table fixup uses their adjusted display
     // instead.
     if !facts.is_pseudo_element && (table_fixup_child_changed || inline_level_absolutely_positioned_changed) {
         damage.any_computed_value_changed = true;
         damage.merge(StyleInvalidation::full());
+    }
+    // NB: An element that leaves `display: none` has no box to build again, so whatever else changed along with its
+    //     display, its box appears: its layout parent takes the box in as a change of its child list, as it takes in
+    //     the box of an inserted element. And the host tells an element whose box appears from one just inserted,
+    //     whose insertion already asked for its box, by this root.
+    if !facts.is_pseudo_element
+        && damage.level >= INVALIDATION_REBUILD_LAYOUT_TREE
+        && old_values.display().is_none()
+        && !new_values.display().is_none()
+    {
+        damage.rebuild_root = REBUILD_ROOT_BOX_PRESENCE_CHANGE;
     }
     damage.pack()
 }

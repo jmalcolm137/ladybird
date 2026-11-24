@@ -78,7 +78,7 @@ public:
     void run_history_operation_at_queue_position(Web::HTML::CrossProcessId operation_id, Web::HistoryOperationParameters, RefPtr<WebContentPage> requesting_page, u64 sequence_number, RefPtr<CanonicalSessionHistoryEntry> target_entry, NonnullRefPtr<Core::Promise<Empty>>);
     u64 next_sequence_number() { return m_next_sequence_number++; }
     void abandon_history_operations();
-    bool has_unactivated_traversal_load() const;
+    bool has_unactivated_load() const;
 
     RefPtr<WebContentPage> page_hosting(CanonicalNavigable const&) const;
 
@@ -99,6 +99,7 @@ public:
     CanonicalNavigable& insert(NonnullRefPtr<WebContentPage> reporting_page, CanonicalNavigable& parent, CanonicalDocument& container_document, Web::HTML::CrossProcessId frame_id, Web::HTML::HostedNavigableState, NonnullRefPtr<CanonicalSessionHistoryEntry> active_session_history_entry, NonnullRefPtr<CanonicalDocument>);
     void adopt_nested_history_for_created_child(CanonicalNavigable const& parent, CanonicalDocument const& container_document, Web::HTML::CrossProcessId child_navigable_id);
     Optional<CanonicalNavigable&> find(Web::HTML::CrossProcessId navigable_id);
+    void save_session_history_entry_persisted_state(Badge<WebContentPage>, CanonicalNavigable& navigable, Web::HTML::SessionHistoryEntryPersistedState const& persisted_state) { update_session_history_entry_persisted_state(navigable, persisted_state); }
     Optional<CanonicalNavigable const&> find(Web::HTML::CrossProcessId navigable_id) const;
     void remove(CanonicalNavigable&);
     void remove_page(WebContentPage&);
@@ -121,7 +122,6 @@ public:
     bool represents(CanonicalNavigable const&, WebContentPage const&) const;
     bool page_hosts_any(WebContentPage const&) const;
     bool client_populates_a_history_entry_for_site(WebContentClient const&, Utf16String const&) const;
-    bool page_populates_a_history_entry_for_local_file(WebContentPage const&, ByteString const& path) const;
     void stop_hosting_in_page(CanonicalNavigable&, NonnullRefPtr<WebContentPage>);
     void release_page_if_unused(NonnullRefPtr<WebContentPage>);
     void end_history_jobs(CanonicalNavigable const&, CanonicalDocument const* populated_document = nullptr);

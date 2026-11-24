@@ -84,6 +84,8 @@ public:
     virtual Web::PageId routed_page_id() const override { return m_id; }
 
     CanonicalTraversable& traversable() const;
+    // NB: The tab of a page can go away before the page is closed.
+    bool has_traversable() const { return !m_traversable.is_null(); }
     ViewImplementation& view() const;
     bool displays_tab() const;
     String dump_process_tree() const;
@@ -127,6 +129,8 @@ public:
     RefPtr<CanonicalDocument> hosted_document_with_id(Web::HTML::CrossProcessId) const;
     bool hosts_a_document_with_top_level_origin(URL::Origin const&) const;
     bool document_may_use(Web::HTML::CrossProcessId, Web::Permissions::PermissionName) const;
+    // Whether a hosted document of a file: page may use the permission, which it was granted for as long as it lives.
+    bool hosts_a_local_file_document_that_may_use(Web::Permissions::PermissionName) const;
 
     Web::Permissions::PermissionSnapshot set_permission_for_testing(Web::HTML::CrossProcessId document_id, String const& name, String const& state);
     void set_next_permission_prompt_outcome_for_testing(String const& name, String const& outcome, bool held);
@@ -150,6 +154,7 @@ public:
     bool consume_transient_user_activation();
 
     bool needs_beforeunload_check() const { return m_needs_beforeunload_check; }
+    bool had_user_edits() const { return m_had_user_edits; }
     bool detached_close_pending() const { return m_detached_close_pending; }
     void set_detached_close_pending(bool pending) { m_detached_close_pending = pending; }
 
@@ -166,9 +171,11 @@ public:
     // Returns whether the event was posted; a page without a compositor sends it to WebContent itself.
     bool handle_and_dispatch_mouse_event_in_compositor(Web::MouseEvent const&);
     void did_consume_input_event_in_compositor(u64 event_id);
+    void did_update_compositor_layers(Compositing::CompositorLayersDescription const&);
     void did_not_dispatch_input_event_through_compositor(u64 event_id);
     void did_dispatch_input_event_through_compositor(u64 event_id, bool performed_default_action);
     void did_present_bitmap(Gfx::IntRect content_rect, Gfx::IntRect damage_rect, i32 bitmap_id, double device_pixel_ratio);
+    void did_present_frame_in_remote_layer(Gfx::IntRect content_rect, Gfx::IntRect damage_rect, double device_pixel_ratio);
     void did_present_backing_stores(Vector<i32> bitmap_ids, Vector<Gfx::SharedImage> backing_stores);
     void did_add_backing_stores(Vector<i32> bitmap_ids, Vector<Gfx::SharedImage> backing_stores);
     void did_retire_backing_stores(ReadonlySpan<i32> bitmap_ids);
@@ -181,6 +188,7 @@ public:
     Optional<PresentedBackingStores> take_presented_backing_stores();
     void release_presented_bitmap(i32 bitmap_id);
     void fail_renderer_owned_downloads();
+    bool has_renderer_owned_downloads() const { return !m_renderer_owned_downloads.is_empty(); }
     void reset_state_for_testing();
 
 private:
@@ -189,7 +197,6 @@ private:
     bool holds_container_of(CanonicalNavigable const& child_frame, StringView message_name);
     bool continue_navigation_population_in_selected_process(Web::HTML::CrossProcessId navigable_id, Utf16String navigation_id);
     void for_each_hosted_document(Function<IterationDecision(CanonicalDocument&)> const&) const;
-    bool populates_a_navigation_to_local_file(ByteString const& path) const;
     Optional<CanonicalDocument&> document_with_hosted_environment(Web::HTML::EnvironmentId const& environment_id) const;
     StorageJar* storage_jar(Web::StorageAPI::StorageEndpointType) const;
     Optional<String> canonical_storage_key(Web::HTML::EnvironmentId const&) const;
@@ -204,6 +211,7 @@ private:
     virtual void did_request_navigation_of_navigable(Web::HTML::CrossProcessId navigable_id, Web::HTML::CrossProcessId source_navigable_id, Web::HTML::CrossProcessId source_document_id, Web::HTML::PreparedNavigationDescriptor navigation) override;
     virtual void did_post_message_to_navigable(Web::HTML::CrossProcessId navigable_id, Web::HTML::PostedMessageDescriptor posted_message) override;
     virtual void did_report_navigation_violation(Web::HTML::CrossProcessId navigable_id, Utf16String navigation_id, u64 policy_index, Web::ContentSecurityPolicy::RemoteViolationDirective, bool url_is_https) override;
+    virtual void did_report_container_document_navigation_violation(Web::HTML::CrossProcessId navigable_id, Utf16String navigation_id, u64 policy_index, Web::ContentSecurityPolicy::RemoteViolationDirective, bool url_is_https) override;
     virtual void did_request_focusing_steps_for_navigable(Web::HTML::CrossProcessId navigable_id, Web::HTML::FocusTrigger focus_trigger) override;
     virtual void did_request_window_focus_of_navigable(Web::HTML::CrossProcessId navigable_id) override;
     virtual void did_request_set_opener_of_navigable(Web::HTML::CrossProcessId navigable_id, Web::HTML::CrossProcessId opener_navigable_id) override;
@@ -244,6 +252,7 @@ private:
     virtual void did_complete_debugger_breakpoint_operation(u64 request_id, Optional<String> error) override;
     virtual void did_take_screenshot(Gfx::ShareableBitmap screenshot) override;
     virtual void did_get_internal_page_info(WebView::PageInfoType type, Optional<Core::AnonymousBuffer> info) override;
+    virtual void did_describe_owners_of_visual_context_nodes(u64 structural_epoch, Vector<u32> spatial_node_indices, Vector<u32> effect_node_indices, Vector<String> owners) override;
     virtual void did_get_selected_text(u64 request_id, ByteString selection) override;
     virtual void did_get_selected_text_for_lookup(u64 request_id, Optional<DictionaryLookup> lookup) override;
     virtual void did_select_word_for_dictionary_lookup(u64 request_id, bool selected) override;
@@ -262,6 +271,9 @@ private:
     void did_remove_blob_url_entries(Web::HTML::EnvironmentId environment_id, Vector<Utf16String> urls);
     Messages::WebContentClient::ConnectToStorageAreaResponse connect_to_storage_area(Web::StorageAPI::StorageEndpointType storage_endpoint, Web::HTML::EnvironmentId environment_id);
     virtual void did_change_needs_beforeunload_check(bool needs_beforeunload_check) override;
+    virtual void did_change_had_user_edits(bool had_user_edits) override;
+    virtual void did_save_session_history_entry_state(Web::HTML::CrossProcessId navigable_id, Web::HTML::SessionHistoryEntryPersistedState persisted_state) override;
+    virtual void did_save_session_history_entry_states() override;
     virtual void did_consume_user_activation(Web::HTML::UserActivationConsumption consumption) override;
     virtual void did_notify_about_user_activation(Web::HTML::CrossProcessId document_id) override;
     virtual void webdriver_user_prompt_handling_complete(u64 request_id, Web::WebDriver::Response response) override;
@@ -281,6 +293,7 @@ private:
     virtual void did_change_picture_in_picture_video_size(Gfx::IntSize video_size) override;
     virtual void did_change_picture_in_picture_player_controls_visibility(bool shown) override;
     virtual void did_request_file(ByteString path, i32 request_id) override;
+    virtual void did_request_file_for_webdriver(u64 command_id, ByteString path, i32 request_id) override;
     virtual void did_request_color_picker(Color current_color) override;
     virtual void did_request_date_picker(Utf16String input_type, Utf16String value, Utf16String minimum, Utf16String maximum) override;
     virtual void did_request_geolocation_position(u64 request_id, Web::HTML::CrossProcessId document_id) override;
@@ -295,6 +308,8 @@ private:
     virtual void did_request_click_notification_for_testing(u64 notification_id) override;
     virtual void did_request_click_notification_by_id_for_testing(u64 browser_notification_id) override;
     virtual void did_request_dismiss_notification_for_testing(u64 notification_id) override;
+    virtual void did_request_hold_next_notification_show_for_testing() override;
+    virtual void did_request_fail_held_notification_show_for_testing() override;
     virtual void did_request_file_picker(Web::HTML::FileFilter accepted_file_types, Web::HTML::AllowMultipleFiles allow_multiple_files) override;
     virtual void did_start_drag(Web::DragData) override;
     virtual void did_finish_handling_input_event(u64 event_id, Web::EventResult event_result) override;
@@ -302,6 +317,7 @@ private:
     virtual void did_change_theme_color(Gfx::Color color) override;
     virtual void did_change_background_color(Gfx::Color color) override;
     virtual void did_insert_clipboard_item(Web::Clipboard::SystemClipboardItem item, String, Optional<Web::HTML::CrossProcessId> writing_document_id) override;
+    virtual void did_change_media_session_state(Optional<Web::MediaSession::MediaSessionState>) override;
     virtual void did_change_screen_wake_lock_state(Web::ScreenWakeLockState wake_lock_state) override;
     virtual void did_start_using_gamepads() override;
     virtual void did_update_session_history_entry_navigation_api_state(Web::HTML::CrossProcessId navigable_id, Web::HTML::SessionHistoryEntryIdentity entry_identity, Web::HTML::StorageSerializationRecord navigation_api_state) override;
@@ -408,13 +424,15 @@ private:
     virtual void did_simulate_worker_request_server_connection_loss() override;
     Messages::WebContentTestClient::DidRequestUiProcessSessionHistoryForTestingResponse did_request_ui_process_session_history_for_testing();
     Messages::WebContentTestClient::DidRequestSiteIsolationProcessTreeForTestingResponse did_request_site_isolation_process_tree_for_testing();
+    Messages::WebContentTestClient::DidRequestNowPlayingStateForTestingResponse did_request_now_playing_state_for_testing();
+    virtual void trigger_now_playing_action_for_testing(Web::Bindings::MediaSessionAction action, Optional<double> seek_offset, Optional<double> seek_time, Optional<bool> fast_seek) override;
     Messages::WebContentTestClient::DidRequestTabIsPlayingAudioForTestingResponse did_request_tab_is_playing_audio_for_testing();
     Messages::WebContentTestClient::DidRequestTabIsHeardPlayingAudioForTestingResponse did_request_tab_is_heard_playing_audio_for_testing();
     Messages::WebContentTestClient::DidRequestTabIsUsingMicrophoneForTestingResponse did_request_tab_is_using_microphone_for_testing();
     Messages::WebContentTestClient::DidRequestTabIsCapturingAudioForTestingResponse did_request_tab_is_capturing_audio_for_testing();
     void report_audio_capture_for_testing(Web::PageId labelled_page_id, bool capturing);
     void retire_picture_in_picture_window_for_testing();
-    Messages::WebContentTestClient::DidRequestTabAudibilityChangeCountForTestingResponse did_request_tab_audibility_change_count_for_testing();
+    Messages::WebContentTestClient::DidRequestTabAudibilityTransitionsForTestingResponse did_request_tab_audibility_transitions_for_testing();
     virtual void did_request_crash_of_remote_frame_processes_for_testing() override;
     virtual void did_request_close_tab_for_testing() override;
     virtual void did_request_stop_loading_for_testing() override;
@@ -437,6 +455,7 @@ private:
     bool m_capturing_audio { false };
     Optional<PresentedBackingStores> m_presented_backing_stores;
     bool m_needs_beforeunload_check { true };
+    bool m_had_user_edits { false };
     bool m_detached_close_pending { false };
     Optional<String> m_history_recorded_url_for_current_load;
     HashTable<u64> m_renderer_owned_downloads;

@@ -33,6 +33,7 @@
 #include <LibWeb/HTML/ImageBitmap.h>
 #include <LibWeb/HTML/ImageData.h>
 #include <LibWeb/WebIDL/DOMException.h>
+#include <LibWeb/WebIDL/ExceptionOrUtils.h>
 #include <LibWeb/WebIDL/QuotaExceededError.h>
 
 using Web::Crypto::HandleTag;
@@ -86,14 +87,13 @@ TEST_CASE(crypto_key_storage_record_round_trips)
     ReadonlyBytes handle { handle_bytes.data(), handle_bytes.size() };
 
     auto value = MUST(principal_storage_deserialize(crypto_key_secret_record(handle, handle.size())));
-    auto& key = unwrap_wrappable<Web::Crypto::CryptoKey>(value);
-    EXPECT_EQ(key.type(), Web::Crypto::KeyType::Secret);
-    EXPECT_EQ(key.extractable(), false);
-    EXPECT_EQ(key.algorithm_name(), "HKDF"_string);
-    EXPECT_EQ(key.internal_usages().size(), 1u);
-    EXPECT_EQ(key.internal_usages()[0], Web::Bindings::KeyUsage::DeriveKey);
-    EXPECT(key.handle().has<ByteBuffer>());
-    EXPECT_EQ(key.handle().get<ByteBuffer>().span(), handle);
+    expect_utf16_equals(string_property(value, "type"sv), "secret"_utf16);
+    EXPECT_EQ(property_of(value, "extractable"sv).as_bool(), false);
+    expect_utf16_equals(string_property(property_of(value, "algorithm"sv), "name"sv), "HKDF"_utf16);
+    auto usages = property_of(value, "usages"sv);
+    EXPECT_EQ(number_property(usages, "length"sv), 1.0);
+    expect_utf16_equals(MUST(usages.as_object().get(0u)).as_string().utf16_string(), "deriveKey"_utf16);
+    EXPECT_EQ(storage_serialize(GC::Ref { value.as_object() }).data.span(), crypto_key_secret_record(handle, handle.size()).data.span());
 }
 
 TEST_CASE(value_tag_primitives_round_trip)
@@ -161,7 +161,7 @@ TEST_CASE(value_tag_primitives_round_trip)
         value.append(big_integer.data(), big_integer.size());
         auto decoded = decode(value);
         EXPECT(decoded.is_bigint());
-        EXPECT_EQ(MUST(decoded.as_bigint().big_integer().to_base(10)), "123456789012345678901234567890"_string);
+        EXPECT_EQ(decoded.as_bigint().to_string(), "123456789012345678901234567890"_string);
     }
 }
 
@@ -188,7 +188,7 @@ TEST_CASE(value_tag_wrapper_objects_round_trip)
         Array<u8, 3> big_integer { 0x00, 0x03, 0xE7 }; // +999
         append_storage_leb128(value, big_integer.size());
         value.append(big_integer.data(), big_integer.size());
-        EXPECT_EQ(MUST(as<JS::BigIntObject>(decode(value).as_object()).bigint().big_integer().to_base(10)), "999"_string);
+        EXPECT_EQ(as<JS::BigIntObject>(decode(value).as_object()).bigint().to_string(), "999"_string);
     }
 }
 
@@ -590,14 +590,48 @@ TEST_CASE(crypto_key_algorithm_variants_decode_from_frozen_bytes)
     for (auto const& golden : crypto_algorithm_goldens()) {
         auto record = crypto_key_full_record(golden.type, golden.usage, golden.algorithm, golden.handle);
         auto value = MUST(principal_storage_deserialize(record));
-        auto& key = unwrap_wrappable<Web::Crypto::CryptoKey>(value);
-
         if (golden.tag == KeyAlgorithmTag::EcKeyAlgorithm) {
-            auto const& algorithm = key.ec_algorithm();
-            expect_utf16_equals(algorithm.name(), "ECDSA"_utf16);
-            expect_utf16_equals(algorithm.named_curve(), "P-256"_utf16);
+            auto algorithm = property_of(value, "algorithm"sv);
+            expect_utf16_equals(string_property(algorithm, "name"sv), "ECDSA"_utf16);
+            expect_utf16_equals(string_property(algorithm, "namedCurve"sv), "P-256"_utf16);
         }
     }
+}
+
+TEST_CASE(crypto_key_with_an_invalid_ec_point_is_a_data_clone_error)
+{
+    Array<u8, 32> zero {};
+    auto record = crypto_key_full_record("public"sv, "verify"sv, alg_ec_key_algorithm("ECDSA"sv, "P-256"sv), handle_ec_public_key(zero, zero));
+    auto& realm = principal_test_realm();
+    auto result = Web::WebIDL::throw_dom_exception_if_needed(realm.vm(), realm, [&] {
+        return principal_storage_deserialize(record);
+    });
+    EXPECT(result.is_error());
+    if (result.is_error())
+        EXPECT_EQ(unwrap_wrappable<Web::WebIDL::DOMException>(result.error_value()).name(), "DataCloneError"_utf16);
+}
+
+TEST_CASE(crypto_key_with_an_ml_dsa_seed_that_does_not_match_its_public_key_is_a_data_clone_error)
+{
+    auto key = mldsa_44_key();
+    auto other_key = mldsa_44_key(0xff);
+    auto record = crypto_key_full_record("private"sv, "sign"sv, alg_key_algorithm("ML-DSA-44"sv), handle_triple_buffer(6, key.seed, other_key.public_key, key.expanded_key));
+    auto& realm = principal_test_realm();
+    auto result = Web::WebIDL::throw_dom_exception_if_needed(realm.vm(), realm, [&] {
+        return principal_storage_deserialize(record);
+    });
+    EXPECT(result.is_error());
+    if (result.is_error())
+        EXPECT_EQ(unwrap_wrappable<Web::WebIDL::DOMException>(result.error_value()).name(), "DataCloneError"_utf16);
+}
+
+TEST_CASE(crypto_key_with_an_ml_kem_public_key_that_fails_the_encapsulation_key_check_decodes)
+{
+    Array<u8, 800> public_key;
+    public_key.fill(0xff);
+    auto record = crypto_key_full_record("public"sv, "encapsulateBits"sv, alg_key_algorithm("ML-KEM-512"sv), handle_single_buffer(7, public_key));
+    auto value = MUST(principal_storage_deserialize(record));
+    EXPECT_EQ(storage_serialize(GC::Ref { value.as_object() }).data.span(), record.data.span());
 }
 
 TEST_CASE(crypto_key_handle_variants_decode_from_frozen_bytes)
@@ -605,43 +639,25 @@ TEST_CASE(crypto_key_handle_variants_decode_from_frozen_bytes)
     for (auto const& golden : crypto_handle_goldens()) {
         auto record = crypto_key_full_record(golden.type, golden.usage, golden.algorithm, golden.handle);
         auto value = MUST(principal_storage_deserialize(record));
-        auto& key = unwrap_wrappable<Web::Crypto::CryptoKey>(value);
+        EXPECT_EQ(storage_serialize(GC::Ref { value.as_object() }).data.span(), record.data.span());
+    }
+}
 
-        switch (golden.tag) {
-        case HandleTag::ByteBuffer:
-            EXPECT(key.handle().has<ByteBuffer>());
-            break;
-        case HandleTag::RSAPublicKey:
-            EXPECT(key.handle().has<::Crypto::PK::RSAPublicKey>());
-            break;
-        case HandleTag::RSAPrivateKey:
-            EXPECT(key.handle().has<::Crypto::PK::RSAPrivateKey>());
-            break;
-        case HandleTag::ECPublicKey:
-            EXPECT(key.handle().has<::Crypto::PK::ECPublicKey>());
-            break;
-        case HandleTag::ECPrivateKey:
-            EXPECT(key.handle().has<::Crypto::PK::ECPrivateKey>());
-            break;
-        case HandleTag::MLDSAPublicKey:
-            EXPECT(key.handle().has<::Crypto::PK::MLDSAPublicKey>());
-            break;
-        case HandleTag::MLDSAPrivateKey:
-            EXPECT(key.handle().has<::Crypto::PK::MLDSAPrivateKey>());
-            break;
-        case HandleTag::MLKEMPublicKey:
-            EXPECT(key.handle().has<::Crypto::PK::MLKEMPublicKey>());
-            break;
-        case HandleTag::MLKEMPrivateKey:
-            EXPECT(key.handle().has<::Crypto::PK::MLKEMPrivateKey>());
-            break;
-        case HandleTag::OKPPublicKey:
-            EXPECT(key.handle().has<Web::Crypto::OKPPublicKey>());
-            break;
-        case HandleTag::OKPPrivateKey:
-            EXPECT(key.handle().has<Web::Crypto::OKPPrivateKey>());
-            break;
-        }
+TEST_CASE(crypto_key_ec_private_key_stored_without_its_public_key_or_with_its_parameters_decodes)
+{
+    auto x = p256_base_point_x();
+    auto y = p256_base_point_y();
+    auto d = p256_private_value_one();
+    Vector<int> p256 { 1, 2, 840, 10045, 3, 1, 7 };
+    auto algorithm = alg_ec_key_algorithm("ECDSA"sv, "P-256"sv);
+    auto expected = crypto_key_full_record("private"sv, "sign"sv, algorithm, handle_ec_private_key(d, {}, Array<ReadonlyBytes, 2> { x, y }));
+
+    // A stored EC private key may have its curve's parameters and may not have its public key. It is stored again with
+    // its public key and without parameters.
+    for (auto const& handle : { handle_ec_private_key(d, {}, {}), handle_ec_private_key(d, p256, {}), handle_ec_private_key(d, p256, Array<ReadonlyBytes, 2> { x, y }) }) {
+        auto record = crypto_key_full_record("private"sv, "sign"sv, algorithm, handle);
+        auto value = MUST(principal_storage_deserialize(record));
+        EXPECT_EQ(storage_serialize(GC::Ref { value.as_object() }).data.span(), expected.data.span());
     }
 }
 

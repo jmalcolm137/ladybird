@@ -5,29 +5,27 @@
  */
 
 use crate::css::css_pixels::{CssPixelRect, CssPixels};
-use crate::css::ffi_support::{FfiUtf16View, OwnedBox};
+use crate::css::ffi_support::FfiUtf16View;
 use crate::layout::LayoutNodeArena;
-use crate::layout::node_data::NodeSlotId;
+use crate::layout::node_data::{DomPaintFact, NodeSlotId};
+use crate::layout::query::inline_cursor::{CaretPosition, InlineCursor, InlineLine, LineEdge};
+use crate::layout::script_entries::FfiCaretPosition;
 use crate::layout::svg_formatting_context;
 use crate::layout::used_values::FfiCssPixelPoint;
 use crate::layout::used_values::FfiCssPixelRect;
-use crate::layout::used_values::FfiCssPixelSize;
-use crate::painting::force_dark::ForceDarkRole;
 use crate::painting::host::visual_context::FfiSvgFilterPrimitive;
 use crate::painting::paint_changes::{PaintChange, queue};
 use crate::painting::paint_read::{GeometryRead, PaintRead};
 use crate::painting::paintable_data::*;
 use crate::painting::paintable_rows::{PaintableRowsRead, with_inline_pieces};
-use crate::painting::rect_to_viewport_transform::RectToViewportTransform;
 use crate::painting::svg_filter::SvgFilterPrimitive;
 use crate::painting::visual_animation_builder::CompositorAnimationEffectState;
 use crate::render_state::{DocumentHost, RenderWait};
-use libcompositing_rust::ffi::tree_from_handle;
 use std::ffi::c_void;
 
 mod main_thread_entries;
 
-pub(crate) use main_thread_entries::MainThreadFfiEntry;
+pub(crate) use main_thread_entries::{MainThreadFfiEntry, main_visual_context_tree};
 
 crate::render_state::held_node_entries!();
 
@@ -55,6 +53,16 @@ pub(crate) fn paintable_cleared_from_node(
     if arena.slot_is_live(layout_node) {
         arena.invalidate_committed_geometry_of_ancestors(layout_node);
     }
+    paintable_cleared_from_node_leaving_ancestors(host_calls, arena, layout_node);
+}
+
+/// As [`paintable_cleared_from_node`], for a box whose ancestors the build that takes it out of the tree invalidates as
+/// far as its leaving changes them.
+pub(crate) fn paintable_cleared_from_node_leaving_ancestors(
+    host_calls: crate::layout::tree_mutation::HostCalls<'_>,
+    arena: &mut LayoutNodeArena,
+    layout_node: NodeSlotId,
+) {
     arena.clear_committed_fragment_link(layout_node);
     if let Some(reset) = arena.prepare_paintable_row_cleared_reset(layout_node) {
         host_calls.paintable_row_reset(reset);
@@ -154,6 +162,51 @@ pub unsafe extern "C" fn document_host_set_geometry_host(
     host.host_tables().geometry_host.set(Some(callbacks));
 }
 
+/// Has the document of `host` tell paint preparation what it asks of the document through `callbacks`.
+///
+/// # Safety
+///
+/// `host` must be a live document host, on its document's thread. The callbacks must remain valid until the document
+/// clears them, and answer synchronously.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn document_host_set_paint_preparation_host(
+    host: &DocumentHost,
+    callbacks: crate::painting::host::FfiPaintPreparationHostCallbacks,
+) {
+    host.host_tables().paint_preparation_host.set(Some(callbacks));
+}
+
+/// Has the next preparation of the paint and hit testing properties of `host`'s document update its visual contexts.
+#[unsafe(no_mangle)]
+pub extern "C" fn document_host_note_visual_contexts_need_update(host: &DocumentHost) {
+    host.paint_preparation().visual_contexts_need_update.set(true);
+}
+
+/// Whether the next preparation of the paint and hit testing properties of `host`'s document updates its visual
+/// contexts.
+#[unsafe(no_mangle)]
+pub extern "C" fn document_host_visual_contexts_need_update(host: &DocumentHost) -> bool {
+    host.paint_preparation().visual_contexts_need_update.get()
+}
+
+/// Notes that the visual context tree of `host`'s document changed in a way the compositor has not been sent.
+#[unsafe(no_mangle)]
+pub extern "C" fn document_host_note_visual_context_tree_needs_compositor_update(host: &DocumentHost) {
+    host.paint_preparation()
+        .visual_context_tree_needs_compositor_update
+        .set(true);
+}
+
+/// Has `host` forget its document's scroll state and the visual context tree changes left for the compositor, as the
+/// viewport's row or the document's paint state starts over.
+#[unsafe(no_mangle)]
+pub extern "C" fn document_host_viewport_row_was_reset(host: &DocumentHost) {
+    host.forget_scroll_state();
+    host.paint_preparation()
+        .visual_context_tree_needs_compositor_update
+        .set(false);
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn render_state_paintable_scrollable_overflow(
     host: &DocumentHost,
@@ -162,7 +215,7 @@ pub extern "C" fn render_state_paintable_scrollable_overflow(
 ) {
     // The host reads the overflow from the rows it holds, where they were measured and still read as the arena.
     let known = host.read_known_rows(|rows, source| {
-        rows.overflow_is_settled()
+        (rows.measured_overflow() >= crate::layout::row_reads::MeasuredOverflow::Scrollable)
             .then(|| FfiOptionalOverflowData::of(source, slot))
     });
     if let Some(Some(overflow)) = known {
@@ -209,21 +262,25 @@ pub struct FfiBoxModelMetrics {
     pub inset: crate::painting::paintable_data::FfiPixelBox,
 }
 
+/// The geometry the box of an SVG element committed, in the user units of the SVG viewport it is laid out in. Returns
+/// false, writing nothing, for a box without one.
 #[unsafe(no_mangle)]
-pub extern "C" fn render_state_paintable_svg_viewport_size(
+pub extern "C" fn render_state_svg_geometry(
     host: &DocumentHost,
     slot: NodeSlotId,
-    out: &mut FfiCssPixelSize,
-) {
-    *out = {
-        read_arena(host, node_read(), slot, |arena, slot| {
-            let paintable_rows = arena.paintable_rows();
-            if !paintable_rows.paintable_row_is_populated(slot) {
-                return FfiCssPixelSize::default();
-            }
-            crate::painting::paintable_geometry::committed_svg_viewport_size(&paintable_rows, slot)
-        })
+    out: &mut svg_formatting_context::SvgGeometry,
+) -> bool {
+    let geometry = read_arena(host, node_read(), slot, |arena, slot| {
+        if !arena.paintable_row_is_populated(slot) {
+            return None;
+        }
+        crate::painting::paintable_geometry::committed_svg_geometry(arena, slot)
+    });
+    let Some(geometry) = geometry else {
+        return false;
     };
+    *out = geometry;
+    true
 }
 
 #[repr(C)]
@@ -250,19 +307,16 @@ pub extern "C" fn render_state_paintable_svg_viewport_transform(
     })
 }
 
-/// The transform an SVG element's box was laid out with: its own CSS transform reduced to 2D, with a <use> element's
-/// x/y translation multiplied in.
+/// The transform an SVG element's box was laid out with: its own CSS transform about its transform origin, reduced to
+/// 2D, with a <use> element's x/y translation multiplied in.
 #[unsafe(no_mangle)]
 pub extern "C" fn render_state_paintable_svg_element_transform(
     host: &DocumentHost,
     slot: NodeSlotId,
 ) -> svg_formatting_context::FfiAffineTransform {
-    read_arena(host, node_read(), slot, |arena, slot| {
-        if !arena.paintable_row_is_populated(slot) {
-            return svg_formatting_context::FfiAffineTransform::default();
-        }
-        crate::painting::paintable_geometry::committed_svg_element_transform(arena, slot).unwrap_or_default()
-    })
+    let mut geometry = svg_formatting_context::SvgGeometry::default();
+    render_state_svg_geometry(host, slot, &mut geometry);
+    geometry.local_transform
 }
 
 #[unsafe(no_mangle)]
@@ -328,44 +382,6 @@ pub extern "C" fn render_state_background_color_can_be_compositor_animated(
     })
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn render_state_paintable_visual_context_node_count(
-    host: &DocumentHost,
-    slot: NodeSlotId,
-    list: crate::painting::host::FfiVisualContextBoxNodeList,
-) -> usize {
-    read_arena(host, node_read(), (slot, list), |arena, (slot, list)| {
-        use crate::painting::host::FfiVisualContextBoxNodeList;
-        arena.with_paintable_visual_context_node_handles(slot, |handles| match list {
-            FfiVisualContextBoxNodeList::SpatialNodes => handles.spatial.len(),
-            FfiVisualContextBoxNodeList::ClipNodes => handles.clip_handles().count(),
-            FfiVisualContextBoxNodeList::EffectNodes => handles.effects.len(),
-        })
-    })
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn render_state_paintable_visual_context_copy_node_indices(
-    host: &DocumentHost,
-    slot: NodeSlotId,
-    list: crate::painting::host::FfiVisualContextBoxNodeList,
-    out: ak::SpanMut<'_, u32>,
-) {
-    let indices = {
-        read_arena(host, node_read(), (slot, list), |arena, (slot, list)| {
-            use crate::painting::host::FfiVisualContextBoxNodeList;
-            arena.with_paintable_visual_context_node_handles(slot, |handles| -> Vec<u32> {
-                match list {
-                    FfiVisualContextBoxNodeList::SpatialNodes => handles.spatial.iter().map(|index| index.0).collect(),
-                    FfiVisualContextBoxNodeList::ClipNodes => handles.clip_handles().map(|index| index.0).collect(),
-                    FfiVisualContextBoxNodeList::EffectNodes => handles.effects.iter().map(|index| index.0).collect(),
-                }
-            })
-        })
-    };
-    out.into_slice()[..indices.len()].copy_from_slice(&indices);
-}
-
 pub(super) fn apply_walk_assignments(
     arena: &mut crate::layout::LayoutNodeArena,
     outcome: &mut crate::painting::visual_context::incremental::IncrementalUpdateOutcome,
@@ -374,23 +390,6 @@ pub(super) fn apply_walk_assignments(
     for assignment in std::mem::take(&mut outcome.assignments) {
         assignment.apply(&mut paintable_rows);
     }
-}
-
-/// The index of the sticky node the accumulated visual context tree holds for `paintable`, which
-/// is where the scroll state snapshot keeps its resolved sticky offset, or `u32::MAX` when the tree
-/// holds none.
-#[unsafe(no_mangle)]
-pub extern "C" fn render_state_sticky_spatial_node_index(host: &DocumentHost, paintable: NodeSlotId) -> u32 {
-    read_arena(host, node_read(), paintable, |arena, paintable| {
-        let paint_state = arena.paint_state();
-        paint_state
-            .visual_context
-            .scroll_state
-            .states()
-            .iter()
-            .find(|state| state.is_sticky && state.paintable == paintable)
-            .map_or(u32::MAX, |state| state.node_index.0)
-    })
 }
 
 /// Marks the entry the event loop calls between two tasks to take a finished recording in.
@@ -452,66 +451,6 @@ pub enum FfiRecordingLanding {
     /// The committed frame's recording renders SVG images, which the host renders for it with
     /// `render_state_render_vector_images`, and flies again.
     NeedsVectorImages,
-}
-
-/// A navigable's presenter and the seal of the frame it presents next (`Web::Compositor::NavigablePresenter` and
-/// `Web::Compositor::SealedPresentation`), which pass between the host and what presents a frame beside it. Both or
-/// neither are null.
-#[repr(C)]
-pub struct FfiPresentation {
-    pub presenter: *mut c_void,
-    pub sealed: *mut c_void,
-}
-
-impl Default for FfiPresentation {
-    /// Names no presentation.
-    fn default() -> Self {
-        Self {
-            presenter: std::ptr::null_mut(),
-            sealed: std::ptr::null_mut(),
-        }
-    }
-}
-
-/// What the host reads of a published recording, to build its display list from.
-#[repr(C)]
-pub struct FfiPresentedRecording {
-    pub is_identical_to_published_recording: bool,
-    pub has_blocking_wheel_event_listeners: bool,
-    /// The recorded display list, which the document's last recording holds until the next
-    /// recording replaces it. The host takes a reference of its own to keep it longer.
-    pub display_list: *const c_void,
-    /// The color the canvas holds below the recording's layers.
-    pub root_group_color: libgfx_rust::Color,
-}
-
-impl FfiPresentedRecording {
-    /// What the host reads of a recording published with `output`, whose display list `output` holds for as long as
-    /// the host reads it.
-    pub(crate) fn of_output(output: &crate::painting::record::RecordingOutput) -> Self {
-        Self {
-            is_identical_to_published_recording: output.is_identical_to_published_recording,
-            has_blocking_wheel_event_listeners: output.has_blocking_wheel_event_listeners,
-            display_list: std::sync::Arc::as_ptr(&output.display_list).cast(),
-            root_group_color: output.root_group_color,
-        }
-    }
-
-    /// What the host reads of the last recording the document took in.
-    pub(crate) fn of_last_recording(arena: &LayoutNodeArena) -> Self {
-        let paint_state = arena.paint_state();
-        let recording = paint_state.last_recording.as_deref();
-        Self {
-            is_identical_to_published_recording: recording
-                .is_some_and(|recording| recording.is_identical_to_published_recording),
-            has_blocking_wheel_event_listeners: recording
-                .is_some_and(|recording| recording.has_blocking_wheel_event_listeners),
-            display_list: recording.map_or(std::ptr::null(), |recording| {
-                std::sync::Arc::as_ptr(&recording.display_list).cast()
-            }),
-            root_group_color: recording.map_or(libgfx_rust::Color::TRANSPARENT, |recording| recording.root_group_color),
-        }
-    }
 }
 
 /// One `<area>` of an image map, as the document hands it over: the style-tree identity to name as
@@ -579,135 +518,6 @@ pub unsafe extern "C" fn layout_arena_svg_paint_resources_push_pattern(
     );
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[repr(u8)]
-#[expect(dead_code, reason = "C++ constructs the variants")]
-pub enum FfiImagePaintRecordKind {
-    DecodedFrame,
-    NestedDisplayList,
-    Gradient,
-}
-
-#[derive(Clone, Copy)]
-#[repr(C)]
-pub struct FfiImagePaintRecordInputs {
-    pub kind: FfiImagePaintRecordKind,
-    pub device_pixels_per_css_pixel: f64,
-    pub dest_rect: libgfx_rust::FloatRect,
-    pub frame_id: u64,
-    pub scaling_mode: libgfx_rust::ScalingMode,
-    pub nested_display_list_id: u64,
-    pub nested_display_list_size: libgfx_rust::IntSize,
-    pub gradient_style_value: *const c_void,
-    pub gradient_tile_size: FfiCssPixelSize,
-    /// The `FfiColorResolutionStyle` the gradient's color stops resolve against.
-    pub gradient_stop_color_resolution_style: *const c_void,
-}
-
-/// # Safety
-///
-/// `inputs`, and the gradient style value and color resolution style it points at, must be
-/// live for the call. `consume` is called synchronously and takes ownership of the command
-/// storage and visual context tree handles.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn ladybird_web_record_image_paint_display_list(
-    inputs: &FfiImagePaintRecordInputs,
-    context: *mut c_void,
-    consume: unsafe extern "C" fn(*mut c_void, *const c_void, *const c_void),
-) {
-    use crate::css::color_resolution::ColorResolutionInput;
-    use crate::painting::display_list::commands::{DisplayListResourceId, ImageFrameResourceId};
-    use crate::painting::display_list::device_pixels::DevicePixelConverter;
-    use crate::painting::display_list::recorder::DisplayListRecorder;
-    use crate::painting::record::paint::gradient_resolution::{
-        record_resolved_gradient_fill, resolve_gradient_paint_with_input,
-    };
-    use crate::painting::visual_context::{TransformData, TransformDataRole, VisualContextTree};
-    use libgfx_rust::{CompositingAndBlendingOperator, FloatMatrix4x4, FloatPoint};
-    let tree = VisualContextTree::create(TransformData {
-        matrix: FloatMatrix4x4::identity(),
-        origin: FloatPoint::default(),
-        sorting_context_root_index: None,
-        flattens_inherited_transform: false,
-        role: TransformDataRole::CssTransform,
-        synthetic_plane: false,
-        establishes_sorting_context: false,
-        bounds: libgfx_rust::FloatRect::default(),
-    });
-    // Force-dark never reaches here: an image is darkened by classifying the image itself — not by inverting the
-    // fills that raster it.
-    let mut recorder = DisplayListRecorder::new(None);
-    let dest_rect = inputs.dest_rect;
-    match inputs.kind {
-        FfiImagePaintRecordKind::DecodedFrame => recorder.draw_scaled_decoded_image_frame(
-            dest_rect,
-            None,
-            ImageFrameResourceId(inputs.frame_id),
-            inputs.scaling_mode,
-            CompositingAndBlendingOperator::Normal,
-            None,
-            ForceDarkRole::None,
-        ),
-        FfiImagePaintRecordKind::NestedDisplayList => recorder.paint_nested_display_list(
-            DisplayListResourceId(inputs.nested_display_list_id),
-            dest_rect,
-            inputs.nested_display_list_size,
-        ),
-        FfiImagePaintRecordKind::Gradient => {
-            // SAFETY: the host keeps the gradient style value and the style its color stops
-            // resolve against live for the duration of the call.
-            let (gradient_style_value, color_input) = unsafe {
-                (
-                    &*inputs
-                        .gradient_style_value
-                        .cast::<crate::css::style_value::StyleValueData>(),
-                    ColorResolutionInput::for_ffi_style(inputs.gradient_stop_color_resolution_style.cast()),
-                )
-            };
-            let resolved =
-                resolve_gradient_paint_with_input(gradient_style_value, inputs.gradient_tile_size.into(), &color_input);
-            record_resolved_gradient_fill(
-                &mut recorder,
-                DevicePixelConverter::new(inputs.device_pixels_per_css_pixel),
-                &resolved,
-                dest_rect,
-                CompositingAndBlendingOperator::Normal,
-                ForceDarkRole::None,
-            );
-        }
-    }
-    let recorded = recorder.into_builder().finish();
-    unsafe {
-        consume(
-            context,
-            std::sync::Arc::into_raw(std::sync::Arc::new(recorded)).cast(),
-            std::sync::Arc::into_raw(std::sync::Arc::new(tree)).cast(),
-        );
-    }
-}
-
-/// The bounds of the geometry that a path-like SVG element's box committed. Returns false for any other box.
-#[unsafe(no_mangle)]
-pub extern "C" fn render_state_paintable_computed_svg_path_bounding_box(
-    host: &DocumentHost,
-    paintable: NodeSlotId,
-    out: &mut libgfx_rust::FloatRect,
-) -> bool {
-    let bounding_box = read_arena(host, node_read(), paintable, |arena, paintable| {
-        let paintable_rows = arena.paintable_rows();
-        if !paintable_rows.paintable_row_is_populated(paintable) {
-            return None;
-        }
-        crate::painting::paintable_geometry::committed_svg_path(&paintable_rows, paintable)
-            .map(|path| path.bounding_box())
-    });
-    let Some(bounding_box) = bounding_box else {
-        return false;
-    };
-    *out = libgfx_rust::FloatRect::from_array(bounding_box);
-    true
-}
-
 /// The glyph cells a text content element's box committed for its own characters, one per code
 /// unit. The cells belong to the committed fragment, so they are read before the next commit.
 #[repr(C)]
@@ -740,48 +550,23 @@ pub extern "C" fn render_state_paintable_svg_text_character_cells(
     })
 }
 
-#[repr(C)]
-pub struct FfiCaretRectResult {
-    pub found: bool,
-    pub rect: FfiCssPixelRect,
-    pub style_source: NodeSlotId,
-    pub owner_paintable: NodeSlotId,
-    pub nearest_self_painting_inline: NodeSlotId,
-}
-
-#[repr(C)]
-pub struct FfiEmptyLineCaretRect {
-    pub has_value: bool,
-    pub rect: FfiCssPixelRect,
-    pub style_source: NodeSlotId,
-}
-
-/// What maps a rect to the viewport, as C++ lends it for `'a`: a non-null `visual_context_tree` is a live retained tree
-/// handle, and `scroll_offsets` addresses `scroll_offsets_len` points. Rust never makes one.
-#[repr(C)]
-pub struct FfiRectToViewportTransform<'a> {
-    visual_context_tree: *const c_void,
-    scroll_offsets: *const libgfx_rust::FloatPoint,
-    scroll_offsets_len: usize,
-    device_pixels_per_css_pixel: f32,
-    lent: std::marker::PhantomData<&'a [libgfx_rust::FloatPoint]>,
-}
-
-impl<'a> FfiRectToViewportTransform<'a> {
-    /// The transform, or none where C++ lends no visual context tree.
-    pub(crate) fn transform(&self) -> Option<RectToViewportTransform<'a>> {
-        if self.visual_context_tree.is_null() {
-            return None;
-        }
-        // SAFETY: C++ lends a live tree and the scroll offsets for 'a.
-        unsafe {
-            Some(RectToViewportTransform {
-                visual_context_tree: tree_from_handle(self.visual_context_tree),
-                scroll_offsets: ak::slice_from_raw_parts(self.scroll_offsets, self.scroll_offsets_len),
-                device_pixels_per_css_pixel: self.device_pixels_per_css_pixel,
-            })
-        }
-    }
+/// The part of `rect`, in the viewport, that the content clips of the containing blocks of the box in `slot` leave.
+#[unsafe(no_mangle)]
+pub extern "C" fn render_state_visible_rect_in_containing_blocks(
+    host: &DocumentHost,
+    slot: NodeSlotId,
+    viewport_mapping: crate::painting::viewport_mapping::FfiViewportMapping<'_>,
+    rect: FfiCssPixelRect,
+    space: crate::painting::viewport_mapping::ViewportSpace,
+    out: &mut FfiCssPixelRect,
+) {
+    let viewport_mapping = viewport_mapping.resolve();
+    let viewport_mapping = viewport_mapping.mapping();
+    *out = host.read_rows(node_read(), false, |rows| {
+        let visible =
+            viewport_mapping.visible_rect_in_ancestor(rows, slot, rect.into(), NodeSlotId::INVALID, space, |clip| clip);
+        visible.into()
+    });
 }
 
 /// Whether a row has ever been given a style with `content-visibility: auto`, which is when a
@@ -823,24 +608,6 @@ pub unsafe extern "C" fn render_state_collect_boxes_with_auto_content_visibility
         // SAFETY: The C++ callback appends the slot id to a caller-owned collection.
         unsafe { push_box(context, slot) };
     }
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn render_state_inline_paintable_has_content_pieces(
-    host: &DocumentHost,
-    inline_paintable: NodeSlotId,
-) -> bool {
-    read_arena(host, node_read(), inline_paintable, |arena, inline_paintable| {
-        let mut has_content = false;
-        with_inline_pieces(&arena.paintable_rows(), inline_paintable, |piece| {
-            if !piece.is_geometry_only_placeholder {
-                has_content = true;
-                return false;
-            }
-            true
-        });
-        has_content
-    })
 }
 
 #[repr(C)]
@@ -892,16 +659,15 @@ pub extern "C" fn render_state_inline_paintable_first_piece_position(
     };
 }
 
+/// The DOM offsets a line renders of a DOM text.
 #[repr(C)]
 pub struct FfiVisualLine {
     pub start_offset: usize,
     pub end_offset: usize,
-    pub end_offset_with_trailing_whitespace: usize,
-    pub has_fragments: bool,
-    pub owner_paintable: u32,
-    pub line_index: u32,
 }
 
+/// Pushes the lines that hold rendered text of the DOM text whose layout node is `primary`, in DOM order.
+///
 /// # Safety
 ///
 /// `host` must be a live document host, on its document's thread.
@@ -914,11 +680,10 @@ pub unsafe extern "C" fn render_state_text_visual_lines(
 ) {
     let lines = {
         read_arena(host, node_read(), primary, |arena, primary| {
-            let fragments = arena.text_fragments(primary);
-            crate::painting::visual_lines::collect_visual_lines(&arena.paintable_rows(), fragments.as_slice())
+            InlineCursor::new(&arena.paintable_rows()).lines_of_text(primary)
         })
     };
-    for line in lines {
+    for line in lines.into_iter().filter(|line| line.has_fragments) {
         // SAFETY: The consumer copies the POD line synchronously.
         unsafe {
             push(
@@ -926,14 +691,124 @@ pub unsafe extern "C" fn render_state_text_visual_lines(
                 FfiVisualLine {
                     start_offset: line.start_offset,
                     end_offset: line.end_offset,
-                    end_offset_with_trailing_whitespace: line.end_offset_with_trailing_whitespace,
-                    has_fragments: line.has_fragments,
-                    owner_paintable: line.owner.index,
-                    line_index: line.line_index,
                 },
             );
         }
     }
+}
+
+/// Whether a line holds rendered text of the DOM text whose layout node is `primary`.
+#[unsafe(no_mangle)]
+pub extern "C" fn render_state_text_has_rendered_text(host: &DocumentHost, primary: NodeSlotId) -> bool {
+    read_arena(host, node_read(), primary, |arena, primary| {
+        InlineCursor::new(&arena.paintable_rows())
+            .lines_of_text(primary)
+            .iter()
+            .any(|line| line.has_fragments)
+    })
+}
+
+/// Whether the DOM text whose layout node is `primary` is on a line: one that holds rendered text of it, or one that a
+/// preserved newline in it ends with nothing on it.
+#[unsafe(no_mangle)]
+pub extern "C" fn render_state_text_has_lines(host: &DocumentHost, primary: NodeSlotId) -> bool {
+    read_arena(host, node_read(), primary, |arena, primary| {
+        !InlineCursor::new(&arena.paintable_rows())
+            .lines_of_text(primary)
+            .is_empty()
+    })
+}
+
+/// The first and last DOM offsets on lines belonging to this text, including fragmentless preserved breaks.
+#[unsafe(no_mangle)]
+pub extern "C" fn render_state_text_line_bounds(
+    host: &DocumentHost,
+    primary: NodeSlotId,
+    bounds: &mut FfiVisualLine,
+) -> bool {
+    fn line_bounds(rows: &impl PaintRead, primary: NodeSlotId) -> Option<FfiVisualLine> {
+        let lines = InlineCursor::new(rows).lines_of_text(primary);
+        Some(FfiVisualLine {
+            start_offset: lines.first()?.start_offset,
+            end_offset: lines.last()?.end_offset,
+        })
+    }
+
+    // A fragmentless break maps its rendered offset back to the DOM through the text of its row.
+    let known = host.read_known_rows(|snapshot, rows| {
+        snapshot
+            .text_awaiting_render()
+            .is_empty()
+            .then(|| line_bounds(rows, primary))
+    });
+    let result = known.flatten().unwrap_or_else(|| {
+        read_arena(host, node_read(), primary, |arena, primary| {
+            line_bounds(&arena.paintable_rows(), primary)
+        })
+    });
+    if let Some(result) = result {
+        *bounds = result;
+        return true;
+    }
+    false
+}
+
+/// The caret position at the start of the first line of the DOM text whose layout node is `primary`, or at the end of
+/// its last line.
+#[unsafe(no_mangle)]
+pub extern "C" fn render_state_text_edge(
+    host: &DocumentHost,
+    primary: NodeSlotId,
+    end: bool,
+) -> FfiInlineCaretPosition {
+    read_arena(host, node_read(), (primary, end), |arena, (primary, end)| {
+        FfiInlineCaretPosition::of(InlineCursor::new(&arena.paintable_rows()).text_edge(primary, end))
+    })
+}
+
+/// The first line of the DOM text whose layout node is `primary`, or its last, where it holds rendered text of it.
+#[unsafe(no_mangle)]
+pub extern "C" fn render_state_text_rendered_edge_line(
+    host: &DocumentHost,
+    primary: NodeSlotId,
+    end: bool,
+) -> FfiInlineLine {
+    read_arena(host, node_read(), (primary, end), |arena, (primary, end)| {
+        FfiInlineLine::of(InlineCursor::new(&arena.paintable_rows()).rendered_text_edge_line(primary, end))
+    })
+}
+
+/// The caret position one grapheme right of (`forward`) or left of `offset` in the DOM text whose layout node is
+/// `primary`, where the grapheme boundary of the DOM text that way is `grapheme_boundary`, if `has_grapheme_boundary`.
+#[unsafe(no_mangle)]
+pub extern "C" fn render_state_text_character_step(
+    host: &DocumentHost,
+    primary: NodeSlotId,
+    offset: usize,
+    downstream: bool,
+    forward: bool,
+    has_grapheme_boundary: bool,
+    grapheme_boundary: usize,
+) -> FfiInlineCaretPosition {
+    let args = (
+        primary,
+        offset,
+        downstream,
+        forward,
+        has_grapheme_boundary.then_some(grapheme_boundary),
+    );
+    read_arena(host, node_read(), args, |arena, args| {
+        let (text, offset, downstream, forward, grapheme_boundary) = args;
+        FfiInlineCaretPosition::of(
+            InlineCursor::new(&arena.paintable_rows()).position_after_character_step(
+                text,
+                offset,
+                downstream,
+                forward,
+                grapheme_boundary,
+            ),
+        )
+    })
 }
 
 fn has_rendered_text_matching(
@@ -983,81 +858,368 @@ pub extern "C" fn render_state_text_has_rendered_text_after(
 }
 
 #[repr(C)]
+#[derive(Default)]
 pub struct FfiOptionalCssPixels {
     pub has_value: bool,
     pub value: CssPixels,
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn render_state_visual_line_caret_inline_coordinate(
-    host: &DocumentHost,
-    owner_paintable: u32,
-    line_index: u32,
-    primary: NodeSlotId,
-    offset: usize,
-    out: &mut FfiOptionalCssPixels,
-) {
-    *out = {
-        read_arena(
-            host,
-            node_read(),
-            (owner_paintable, line_index, primary, offset),
-            |arena, (owner_paintable, line_index, primary, offset)| {
-                let paintable_rows = arena.paintable_rows();
-                let fragments = arena.text_fragments(primary);
-                let node_slots = fragments.as_slice();
-                let coordinate = crate::painting::visual_lines::caret_inline_coordinate(
-                    &paintable_rows,
-                    owner_paintable,
-                    line_index,
-                    node_slots,
-                    offset,
-                );
-                match coordinate {
-                    Some(value) => FfiOptionalCssPixels { has_value: true, value },
-                    None => FfiOptionalCssPixels {
-                        has_value: false,
-                        value: CssPixels::from_raw(0),
-                    },
-                }
-            },
-        )
-    };
+impl FfiOptionalCssPixels {
+    fn of(value: Option<CssPixels>) -> Self {
+        Self {
+            has_value: value.is_some(),
+            value: value.unwrap_or_default(),
+        }
+    }
 }
 
+/// A line of the line root `root`, or none where `root` is invalid.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct FfiInlineLine {
+    pub root: NodeSlotId,
+    pub index: u32,
+}
+
+impl FfiInlineLine {
+    fn of(line: Option<InlineLine>) -> Self {
+        line.map_or(
+            Self {
+                root: NodeSlotId::INVALID,
+                index: 0,
+            },
+            |line| Self {
+                root: line.root,
+                index: line.index,
+            },
+        )
+    }
+
+    fn line(self, arena: &impl PaintRead) -> Option<InlineLine> {
+        let line = InlineLine {
+            root: self.root,
+            index: self.index,
+        };
+        (!self.root.is_invalid()
+            && arena.paintable_row_is_populated(self.root)
+            && (line.index as usize) < arena.committed_side_data(self.root).lines().len())
+        .then_some(line)
+    }
+}
+
+#[repr(u8)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum FfiInlineCaretPositionKind {
+    None,
+    Text,
+    BesideAtomicInline,
+    BeforeForcedBreak,
+    StartOfBox,
+}
+
+/// A caret position as InlineCursor names it: `offset` in the DOM text whose layout node is `node` (leaning to the next
+/// line where `downstream`), beside the atomic inline `node` (`after` it or before it), before the <br> `node`, or at the
+/// start of the box `node`.
+#[repr(C)]
+pub struct FfiInlineCaretPosition {
+    pub kind: FfiInlineCaretPositionKind,
+    pub node: NodeSlotId,
+    pub offset: usize,
+    pub downstream: bool,
+    pub after: bool,
+}
+
+impl FfiInlineCaretPosition {
+    fn of(position: Option<CaretPosition>) -> Self {
+        let (kind, node, offset, downstream, after) = match position {
+            None => (FfiInlineCaretPositionKind::None, NodeSlotId::INVALID, 0, true, false),
+            Some(CaretPosition::Text {
+                text,
+                offset,
+                downstream,
+            }) => (FfiInlineCaretPositionKind::Text, text, offset, downstream, false),
+            Some(CaretPosition::BesideAtomicInline { node, after }) => {
+                (FfiInlineCaretPositionKind::BesideAtomicInline, node, 0, true, after)
+            }
+            Some(CaretPosition::BeforeForcedBreak { node }) => {
+                (FfiInlineCaretPositionKind::BeforeForcedBreak, node, 0, true, false)
+            }
+            Some(CaretPosition::StartOfBox { node }) => (FfiInlineCaretPositionKind::StartOfBox, node, 0, true, false),
+        };
+        Self {
+            kind,
+            node,
+            offset,
+            downstream,
+            after,
+        }
+    }
+}
+
+/// The caret positions that produce a caret: those in DOM text and beside DOM elements, not in generated content.
+fn produces_caret(arena: &impl PaintRead, fragment: &FragmentRecord) -> bool {
+    arena.node_is_dom_backed(fragment.layout_node)
+}
+
+/// The caret positions a move between lines can start from at `position`: those it can take, and in DOM text that no line
+/// holds there, such as collapsed whitespace, the nearest position that one does.
+fn navigation_candidates<'a, A: PaintRead>(
+    cursor: &'a InlineCursor<'a, A>,
+    rows: &'a A,
+    position: &'a FfiCaretPosition,
+) -> impl Iterator<Item = CaretPosition> + 'a {
+    position.candidates(rows).chain(
+        std::iter::once_with(move || {
+            rows.node_kind_if_live(position.node)
+                .is_some_and(crate::layout::node_facts::kind_is_text)
+                .then(|| cursor.nearest_text_position_on_a_line(position.node, position.offset))
+                .flatten()
+        })
+        .flatten(),
+    )
+}
+
+/// The line the caret at `position` is on, if any.
 #[unsafe(no_mangle)]
-pub extern "C" fn render_state_visual_line_offset_closest_to_inline_coordinate(
+pub extern "C" fn render_state_caret_line(host: &DocumentHost, position: FfiCaretPosition) -> FfiInlineLine {
+    read_arena(host, node_read(), position, |arena, position| {
+        let rows = arena.paintable_rows();
+        let cursor = InlineCursor::new(&rows);
+        FfiInlineLine::of(
+            navigation_candidates(&cursor, &rows, &position).find_map(|candidate| cursor.line_of_position(candidate)),
+        )
+    })
+}
+
+/// The line that holds `line` outside the atomic inline boxes its line root is in.
+#[unsafe(no_mangle)]
+pub extern "C" fn render_state_caret_line_outside_atomic_inlines(
     host: &DocumentHost,
-    owner_paintable: u32,
-    line_index: u32,
-    primary: NodeSlotId,
-    inline_coordinate: CssPixels,
-    fallback_offset: usize,
-) -> usize {
+    line: FfiInlineLine,
+) -> FfiInlineLine {
+    read_arena(host, node_read(), line, |arena, line| {
+        let rows = arena.paintable_rows();
+        FfiInlineLine::of(
+            line.line(&rows)
+                .map(|line| InlineCursor::new(&rows).line_outside_atomic_inlines(line)),
+        )
+    })
+}
+
+/// The next line after `line` (or the previous one) in its line root that holds a caret position, if any.
+#[unsafe(no_mangle)]
+pub extern "C" fn render_state_adjacent_caret_line(
+    host: &DocumentHost,
+    line: FfiInlineLine,
+    forward: bool,
+) -> FfiInlineLine {
+    read_arena(host, node_read(), (line, forward), |arena, (line, forward)| {
+        let rows = arena.paintable_rows();
+        FfiInlineLine::of(
+            line.line(&rows)
+                .and_then(|line| InlineCursor::new(&rows).adjacent_line(line, forward)),
+        )
+    })
+}
+
+/// The caret position on `line` nearest the inline coordinate `x`, which a move between lines kept.
+#[unsafe(no_mangle)]
+pub extern "C" fn render_state_caret_position_at_inline_coordinate(
+    host: &DocumentHost,
+    line: FfiInlineLine,
+    x: CssPixels,
+) -> FfiInlineCaretPosition {
+    read_arena(host, node_read(), (line, x), |arena, (line, x)| {
+        let rows = arena.paintable_rows();
+        FfiInlineCaretPosition::of(line.line(&rows).and_then(|line| {
+            InlineCursor::new(&rows).position_at_inline_coordinate(line, x, |fragment| produces_caret(&rows, fragment))
+        }))
+    })
+}
+
+/// The caret position at `edge` of `line`, among its editable line content where `editable_only`.
+#[unsafe(no_mangle)]
+pub extern "C" fn render_state_caret_position_at_line_edge(
+    host: &DocumentHost,
+    line: FfiInlineLine,
+    edge: LineEdge,
+    editable_only: bool,
+) -> FfiInlineCaretPosition {
     read_arena(
         host,
         node_read(),
-        (owner_paintable, line_index, primary, inline_coordinate, fallback_offset),
-        |arena, (owner_paintable, line_index, primary, inline_coordinate, fallback_offset)| {
-            let paintable_rows = arena.paintable_rows();
-            let fragments = arena.text_fragments(primary);
-            let node_slots = fragments.as_slice();
-            crate::painting::visual_lines::offset_closest_to_inline_coordinate(
-                &paintable_rows,
-                owner_paintable,
-                line_index,
-                node_slots,
-                inline_coordinate,
-            )
-            .unwrap_or(fallback_offset)
+        (line, edge, editable_only),
+        |arena, (line, edge, editable_only)| {
+            let rows = arena.paintable_rows();
+            let is_editable = |node: NodeSlotId| {
+                [Some(node), rows.node_parent_if_live(node)]
+                    .into_iter()
+                    .flatten()
+                    .any(|node| rows.node_has_dom_paint_fact(node, DomPaintFact::EditableOrEditingHost))
+            };
+            FfiInlineCaretPosition::of(line.line(&rows).and_then(|line| {
+                InlineCursor::new(&rows).line_edge(line, edge, |fragment| {
+                    produces_caret(&rows, fragment) && (!editable_only || is_editable(fragment.layout_node))
+                })
+            }))
         },
     )
 }
 
+/// The middle of `line` along the block axis.
+#[unsafe(no_mangle)]
+pub extern "C" fn render_state_caret_line_block_coordinate(
+    host: &DocumentHost,
+    line: FfiInlineLine,
+    out: &mut CssPixels,
+) {
+    *out = read_arena(host, node_read(), line, |arena, line| {
+        let rows = arena.paintable_rows();
+        line.line(&rows)
+            .map(|line| InlineCursor::new(&rows).line_block_coordinate(line))
+            .unwrap_or_default()
+    });
+}
+
+/// The inline coordinate of the caret at `position`, which a move to another line keeps.
+#[unsafe(no_mangle)]
+pub extern "C" fn render_state_caret_inline_coordinate(
+    host: &DocumentHost,
+    position: FfiCaretPosition,
+    out: &mut FfiOptionalCssPixels,
+) {
+    *out = read_arena(host, node_read(), position, |arena, position| {
+        let rows = arena.paintable_rows();
+        let cursor = InlineCursor::new(&rows);
+        FfiOptionalCssPixels::of(
+            navigation_candidates(&cursor, &rows, &position)
+                .find_map(|candidate| cursor.inline_coordinate_of(candidate)),
+        )
+    });
+}
+
+#[repr(u8)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+#[expect(dead_code, reason = "C++ constructs the variants")]
+pub enum FfiTextCaretMovement {
+    NextLine,
+    PreviousLine,
+    NextPage,
+    PreviousPage,
+    LineStart,
+    LineEnd,
+    LineLeft,
+    LineRight,
+}
+
 #[repr(C)]
-pub struct FfiOptionalCssPixelRect {
-    pub has_value: bool,
-    pub rect: FfiCssPixelRect,
+#[derive(Default)]
+pub struct FfiTextCaretMove {
+    pub found: bool,
+    pub offset: usize,
+    pub downstream: bool,
+    /// For a move to another line, the inline coordinate it kept, for the next such move to keep.
+    pub inline_coordinate: FfiOptionalCssPixels,
+}
+
+/// Moves the caret at `offset` in the DOM text (`text_length` long) whose layout node is `primary`: to an edge of its
+/// line, or to the position nearest `inline_coordinate` (or else the caret's own) on the next or previous line, or on
+/// the farthest line no more than `page_distance` away. A move past the last or first line goes to the end or start of
+/// the text.
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub extern "C" fn render_state_text_caret_move(
+    host: &DocumentHost,
+    primary: NodeSlotId,
+    offset: usize,
+    downstream: bool,
+    text_length: usize,
+    movement: FfiTextCaretMovement,
+    inline_coordinate: FfiOptionalCssPixels,
+    page_distance: CssPixels,
+    out: &mut FfiTextCaretMove,
+) {
+    let args = (
+        primary,
+        offset,
+        downstream,
+        text_length,
+        movement,
+        inline_coordinate,
+        page_distance,
+    );
+    *out = read_arena(host, node_read(), args, |arena, args| {
+        use FfiTextCaretMovement::*;
+        let (text, offset, downstream, text_length, movement, inline_coordinate, page_distance) = args;
+        let rows = arena.paintable_rows();
+        let cursor = InlineCursor::new(&rows);
+        let fragments = arena.text_fragments(text);
+        let in_text = |node: &NodeSlotId| fragments.as_slice().contains(node);
+        let moved = |position, inline_coordinate| match position {
+            Some(CaretPosition::Text {
+                text,
+                offset,
+                downstream,
+            }) if in_text(&text) => FfiTextCaretMove {
+                found: true,
+                offset,
+                downstream,
+                inline_coordinate: FfiOptionalCssPixels::of(inline_coordinate),
+            },
+            _ => FfiTextCaretMove::default(),
+        };
+        let mut position = CaretPosition::Text {
+            text,
+            offset,
+            downstream,
+        };
+        let Some(start) = cursor.line_of(text, offset, downstream) else {
+            return FfiTextCaretMove::default();
+        };
+        let accepts = |fragment: &FragmentRecord| in_text(&fragment.layout_node);
+        let edge = |edge| moved(cursor.line_edge(start.line, edge, accepts), None);
+        let forward = match movement {
+            LineStart => return edge(LineEdge::Start),
+            LineEnd => return edge(LineEdge::End),
+            LineLeft => return edge(LineEdge::Left),
+            LineRight => return edge(LineEdge::Right),
+            NextLine | NextPage => true,
+            PreviousLine | PreviousPage => false,
+        };
+        let page_distance = matches!(movement, NextPage | PreviousPage).then_some(page_distance);
+        let goal = if inline_coordinate.has_value {
+            inline_coordinate.value
+        } else if let Some(coordinate) = cursor.caret_inline_coordinate(start.line, position) {
+            coordinate
+        } else {
+            return FfiTextCaretMove::default();
+        };
+        let start_coordinate = cursor.line_block_coordinate(start.line);
+        let mut line = start.line;
+        while let Some(next) = cursor.adjacent_line(line, forward) {
+            let distance = cursor.line_block_coordinate(next) - start_coordinate;
+            if page_distance.is_some_and(|page_distance| distance.max(-distance) > page_distance) {
+                return moved(Some(position), Some(goal));
+            }
+            let Some(position_on_next) = cursor.position_at_inline_coordinate(next, goal, accepts) else {
+                return moved(Some(position), Some(goal));
+            };
+            position = position_on_next;
+            line = next;
+            if page_distance.is_none() {
+                return moved(Some(position), Some(goal));
+            }
+        }
+        let offset = if forward { text_length } else { 0 };
+        moved(
+            Some(CaretPosition::Text {
+                text,
+                offset,
+                downstream: true,
+            }),
+            Some(goal),
+        )
+    });
 }
 
 /// # Safety
@@ -1143,24 +1305,6 @@ pub extern "C" fn render_state_paintable_used_grid_tracks(
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn render_state_main_visual_context_tree_retain(
-    host: &DocumentHost,
-    read: &crate::render_state::BegunRead,
-) -> *const c_void {
-    fn retain(tree: Option<&std::sync::Arc<crate::painting::visual_context::VisualContextTree>>) -> *const c_void {
-        tree.map_or(std::ptr::null(), |tree| {
-            std::sync::Arc::into_raw(std::sync::Arc::clone(tree)).cast()
-        })
-    }
-    if let Some(tree) = host.read_known_rows(|rows, _| retain(rows.visual_context_tree.as_ref())) {
-        return tree;
-    }
-    read_arena(host, read, (), |arena, ()| {
-        retain(arena.paint_state().visual_context.tree.as_ref())
-    })
-}
-
-#[unsafe(no_mangle)]
 pub extern "C" fn render_state_has_visual_context_tree(
     host: &DocumentHost,
     read: &crate::render_state::BegunRead,
@@ -1168,24 +1312,6 @@ pub extern "C" fn render_state_has_visual_context_tree(
     read_arena(host, read, (), |arena, ()| {
         let paint_state = arena.paint_state();
         paint_state.visual_context.tree.is_some()
-    })
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn render_state_visual_context_tree_structural_epoch(
-    host: &DocumentHost,
-    read: &crate::render_state::BegunRead,
-) -> u64 {
-    let known = host.read_known_rows(|rows, _| {
-        rows.visual_context_tree
-            .as_ref()
-            .map_or(0, |tree| tree.structural_epoch)
-    });
-    known.unwrap_or_else(|| {
-        read_arena(host, read, (), |arena, ()| {
-            let paint_state = arena.paint_state();
-            paint_state.visual_context.structural_epoch()
-        })
     })
 }
 
@@ -1245,33 +1371,33 @@ pub unsafe extern "C" fn render_state_background_color_animation_keyframe_colors
     }
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn compositor_animation_effect_state_create() -> *mut CompositorAnimationEffectState {
-    Box::into_raw(Box::new(CompositorAnimationEffectState::default()))
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn compositor_animation_effect_state_destroy(state: OwnedBox<CompositorAnimationEffectState>) {
-    drop(state);
-}
-
 /// Builds the animation of the request's target kind for the effect and keeps it pending with the
-/// effect. The target's nodes come from the arena's main tree.
+/// effect, which runs with the timing of the effect record `effect` and of the record of its associated animation
+/// `animation`. The target's nodes come from the arena's main tree.
 ///
 /// # Safety
 ///
 /// `document_host` must be a live document host on its document's thread, and the request and host, with every range
-/// they address, live for the call. The host's callbacks run synchronously and may not touch the arena.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn compositor_animation_effect_build(
+/// they address, live for the call. The host's callbacks run synchronously and may not touch the arena or the records.
+pub(crate) unsafe fn build_compositor_animation_effect(
     state: &mut CompositorAnimationEffectState,
     document_host: &DocumentHost,
-    request: *const crate::painting::host::FfiCompositorAnimationRequest,
+    mut ffi_request: crate::painting::host::FfiCompositorAnimationRequest,
+    effect: &crate::animations::effect::AnimationEffectCell,
+    animation: &crate::animations::animation::AnimationCell,
     host: &crate::painting::host::FfiCompositorAnimationHost,
 ) -> crate::painting::host::FfiCompositorAnimationBuildOutcome {
     use crate::painting::visual_animation_builder::{Host, Request};
+    // NB: The easing descriptor borrows the control points of the effect's timing function, which the build leaves as
+    //     they are.
+    ffi_request.timing.playback_rate = animation.borrow().playback().playback_rate;
+    {
+        let effect = effect.borrow();
+        ffi_request.timing.effect = effect.timing();
+        ffi_request.timing.easing = effect.timing_function().descriptor();
+    }
     // SAFETY: Guaranteed by the caller.
-    let mut request = unsafe { Request::new(&*request) };
+    let mut request = unsafe { Request::new(&ffi_request) };
     let host = Host::new(host);
     let layout_node = request.layout_node();
     if request.target_kind() == crate::painting::host::FfiVisualAnimationTargetKind::Transform {
@@ -1293,65 +1419,6 @@ pub unsafe extern "C" fn compositor_animation_effect_build(
             },
         )
     })
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn compositor_animation_effect_discard_pending(
-    state: &mut CompositorAnimationEffectState,
-    kind: crate::painting::host::FfiVisualAnimationTargetKind,
-) {
-    state.discard_pending(kind);
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn compositor_animation_effect_has_pending(state: &CompositorAnimationEffectState) -> bool {
-    state.has_pending()
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn compositor_animation_effect_clear_pending(state: &mut CompositorAnimationEffectState) {
-    state.clear_pending();
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn compositor_animation_effect_has_retained(state: &CompositorAnimationEffectState) -> bool {
-    state.has_retained()
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn compositor_animation_effect_clear_retained(state: &mut CompositorAnimationEffectState) {
-    state.clear_retained();
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn compositor_animation_effect_reset(state: &mut CompositorAnimationEffectState) {
-    state.reset();
-}
-
-/// # Safety
-///
-/// The request and host, with every range they address, must be live for the call.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn compositor_animation_effect_only_translates_horizontally(
-    request: *const crate::painting::host::FfiCompositorAnimationRequest,
-    host: &crate::painting::host::FfiCompositorAnimationHost,
-) -> bool {
-    use crate::painting::visual_animation_builder::{Host, Request, effect_only_translates_horizontally};
-    let request = unsafe { Request::new(&*request) };
-    effect_only_translates_horizontally(&request, &Host::new(host))
-}
-
-/// # Safety
-///
-/// The request and host, with every range they address, must be live for the call.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn compositor_animation_effect_transform_preserves_axes(
-    request: *const crate::painting::host::FfiCompositorAnimationRequest,
-    host: &crate::painting::host::FfiCompositorAnimationHost,
-) -> bool {
-    use crate::painting::visual_animation_builder::{Host, Request, effect_transform_preserves_axes};
-    let request = unsafe { Request::new(&*request) };
-    effect_transform_preserves_axes(&request, &Host::new(host))
 }
 
 /// Starts an update pass: the effects publish into an empty document list.
@@ -1412,8 +1479,22 @@ pub unsafe extern "C" fn layout_arena_paint_push_svg_filter_primitive(
     sink: *mut c_void,
     primitive: *const FfiSvgFilterPrimitive,
 ) {
-    let primitives = unsafe { &mut *sink.cast::<Vec<SvgFilterPrimitive>>() };
-    primitives.push(unsafe { svg_filter_primitive_from_ffi(&*primitive) });
+    let filter = unsafe { &mut *sink.cast::<crate::painting::svg_paint_resources::PublishedSvgFilter>() };
+    filter
+        .primitives
+        .push(unsafe { svg_filter_primitive_from_ffi(&*primitive) });
+}
+
+/// # Safety
+///
+/// `sink` must be the pointer handed to the callback, used synchronously, and `region` must be readable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn layout_arena_paint_set_svg_filter_region(
+    sink: *mut c_void,
+    region: *const crate::painting::host::visual_context::FfiSvgFilterRegion,
+) {
+    let filter = unsafe { &mut *sink.cast::<crate::painting::svg_paint_resources::PublishedSvgFilter>() };
+    filter.region = unsafe { *region };
 }
 
 /// Notes that the SVG paint resources the document's rows enrolled may have changed, and answers whether any row

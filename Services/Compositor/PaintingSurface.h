@@ -6,10 +6,11 @@
 
 #pragma once
 
-#include <AK/AtomicRefCounted.h>
 #include <AK/Function.h>
+#include <AK/Noncopyable.h>
 #include <AK/NonnullOwnPtr.h>
 #include <AK/RefPtr.h>
+#include <AK/kmalloc.h>
 #include <Compositor/SkiaBackendContext.h>
 #include <LibGfx/Color.h>
 #include <LibGfx/ColorSpace.h>
@@ -44,31 +45,42 @@ namespace Gfx {
 
 class SharedImage;
 
-class PaintingSurface : public AtomicRefCounted<PaintingSurface> {
+// A surface that the Compositor paints into. A pointer to it is the Rust core's surface itself, which the core and the
+// C++ around it share by reference counting. Only the Compositor's main thread may reference or release it.
+class PaintingSurface {
+    AK_MAKE_NONCOPYABLE(PaintingSurface);
+    AK_MAKE_NONMOVABLE(PaintingSurface);
+
 public:
     enum class Origin {
         TopLeft,
         BottomLeft,
     };
 
-    Function<void(PaintingSurface&)> on_flush;
+    enum class TextAntialiasing {
+        Grayscale,
+        LCD,
+    };
 
     // A surface whose pixels are in the color space, which is sRGB unless one is given.
-    static NonnullRefPtr<PaintingSurface> create_with_size(IntSize size, BitmapFormat color_type, AlphaType alpha_type, RefPtr<SkiaBackendContext> = {}, ColorSpace const& = {});
+    static NonnullRefPtr<PaintingSurface> create_with_size(IntSize size, BitmapFormat color_type, AlphaType alpha_type, RefPtr<SkiaBackendContext> = {}, ColorSpace const& = {}, TextAntialiasing = TextAntialiasing::Grayscale);
     // Fails when neither a GPU surface nor a bitmap of the size can be allocated.
-    static ErrorOr<NonnullRefPtr<PaintingSurface>> try_create_with_size(IntSize size, BitmapFormat color_type, AlphaType alpha_type, RefPtr<SkiaBackendContext> = {}, ColorSpace const& = {});
-    static NonnullRefPtr<PaintingSurface> wrap_bitmap(Bitmap&);
+    static ErrorOr<NonnullRefPtr<PaintingSurface>> try_create_with_size(IntSize size, BitmapFormat color_type, AlphaType alpha_type, RefPtr<SkiaBackendContext> = {}, ColorSpace const& = {}, TextAntialiasing = TextAntialiasing::Grayscale);
+    static NonnullRefPtr<PaintingSurface> wrap_bitmap(Bitmap&, TextAntialiasing = TextAntialiasing::Grayscale);
 
 #ifdef AK_OS_MACOS
     static NonnullRefPtr<PaintingSurface> create_from_shared_image_buffer(SharedImageBuffer&, NonnullRefPtr<SkiaBackendContext>, Origin = Origin::TopLeft);
 #endif
 
 #ifdef USE_VULKAN_DMABUF_IMAGES
-    static NonnullRefPtr<PaintingSurface> create_from_vkimage(NonnullRefPtr<SkiaBackendContext> context, NonnullRefPtr<VulkanImage> vulkan_image, Origin origin);
+    static NonnullRefPtr<PaintingSurface> create_from_vkimage(NonnullRefPtr<SkiaBackendContext> context, NonnullRefPtr<VulkanImage> vulkan_image, Origin origin, TextAntialiasing = TextAntialiasing::Grayscale);
 #endif
 
 #ifdef USE_DIRECTX
     static ErrorOr<NonnullRefPtr<PaintingSurface>> create_from_d3d_texture(NonnullRefPtr<SkiaBackendContext>, NonnullRefPtr<D3DSharedTexture>, Origin = Origin::TopLeft);
+    // Over the texture as one that is drawn from as well as into, so that a snapshot of the surface shares the texture
+    // instead of copying it.
+    static ErrorOr<NonnullRefPtr<PaintingSurface>> create_from_d3d_texture_also_drawn_from(NonnullRefPtr<SkiaBackendContext>, NonnullRefPtr<D3DSharedTexture>, Origin = Origin::TopLeft);
 #endif
 
     // The pixels of the bitmap are in the color space, which is sRGB unless one is given. The surface converts them
@@ -93,16 +105,25 @@ public:
     // Whether the surface draws into an image shared with another process, rather than one Skia allocated.
     bool wraps_shared_image() const;
 
+    // Runs after every flush.
+    void set_on_flush(Function<void(PaintingSurface&)>);
     void flush();
 
-    ~PaintingSurface();
+    void ref() const;
+    void unref() const;
+
+    PaintingSurface() = delete;
+    ~PaintingSurface() = delete;
 
 private:
     struct Impl;
 
-    PaintingSurface(NonnullOwnPtr<Impl>&&);
-
-    NonnullOwnPtr<Impl> m_impl;
+    static NonnullRefPtr<PaintingSurface> adopt_impl(IntSize, NonnullOwnPtr<Impl>);
+    static void destroy_impl(void*);
+    Impl& impl() const;
 };
 
 }
+
+template<>
+inline constexpr bool AllocatedWithCustomAllocator<Gfx::PaintingSurface> = true;

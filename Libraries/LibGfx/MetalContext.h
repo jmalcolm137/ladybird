@@ -29,6 +29,7 @@ public:
 // The component layout a texture reads a surface's plane through, which for a planar surface differs per plane.
 enum class MetalTextureFormat : u8 {
     BGRA8,
+    RGBA8,
     R8,
     RG8,
     R16,
@@ -41,6 +42,8 @@ public:
     virtual void const* queue() const = 0;
 
     virtual OwnPtr<MetalTexture> create_texture_from_iosurface(Core::IOSurfaceHandle const&, MetalTextureFormat, size_t plane) = 0;
+    // Whether the rows of the surface's plane are aligned as the GPU needs the rows of a linear texture in that format.
+    virtual bool rows_have_linear_texture_alignment(Core::IOSurfaceHandle const&, MetalTextureFormat, size_t plane) const = 0;
     // Calls back on a Metal thread.
     virtual void when_committed_work_is_scheduled(Function<void()>&&) = 0;
 

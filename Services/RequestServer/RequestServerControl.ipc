@@ -17,6 +17,9 @@ endpoint RequestServerControl
     // is synchronous, so the binding is in place before the UI process lets the client's process host such a document.
     bind_client_to_site(int client_id, Utf16String top_level_site, Optional<Utf16String> frame_site) => ()
 
+    // A bound client may adopt a leased request once per designation.
+    designate_request_adopter(u64 designation_id, int source_client_id, u64 source_request_id, int adopter_client_id) =|
+
     set_disk_cache_settings(HTTP::DiskCacheSettings disk_cache_settings) =|
 
     // use_tls: enable DNS over TLS
@@ -36,4 +39,6 @@ endpoint RequestServerControl
 
     retrieved_http_cookie(int client_id, u64 request_id, ::RequestServer::RequestType request_type, u64 cookie_request_id, String cookie) =|
     stored_response_cookies_and_hsts_policy(int client_id, u64 request_id, u64 store_request_id) =|
+    // The addresses that the system resolver found for a name, or nothing if the lookup failed.
+    resolved_host_with_system_resolver(u64 resolution_id, Optional<Vector<ByteString>> addresses) =|
 }

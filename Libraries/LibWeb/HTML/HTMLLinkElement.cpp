@@ -31,6 +31,7 @@
 #include <LibWeb/Fetch/Fetching/Fetching.h>
 #include <LibWeb/Fetch/Infrastructure/FetchAlgorithms.h>
 #include <LibWeb/Fetch/Infrastructure/FetchController.h>
+#include <LibWeb/Fetch/Infrastructure/HTTP/Bodies.h>
 #include <LibWeb/Fetch/Infrastructure/HTTP/MIME.h>
 #include <LibWeb/Fetch/Infrastructure/HTTP/Requests.h>
 #include <LibWeb/Fetch/Infrastructure/HTTP/ResponseView.h>
@@ -242,7 +243,9 @@ void HTMLLinkElement::attribute_changed(Utf16FlyString const& name, Optional<Utf
 {
     Base::attribute_changed(name, old_value, value, namespace_);
     if (!namespace_.has_value() && name == AttributeNames::blocking && m_blocking)
-        m_blocking->associated_attribute_changed(value.has_value() ? value->utf16_view() : u""sv);
+        m_blocking->associated_attribute_changed(value);
+    if (!namespace_.has_value() && name == AttributeNames::sizes && m_sizes)
+        m_sizes->associated_attribute_changed(value);
 
     // 4.6.7 Link types - https://html.spec.whatwg.org/multipage/links.html#linkTypes
     auto old_relationship = m_relationship;
@@ -280,8 +283,8 @@ void HTMLLinkElement::attribute_changed(Utf16FlyString const& name, Optional<Utf
             start = i + 1;
         }
 
-        if (m_rel_list)
-            m_rel_list->associated_attribute_changed(value.has_value() ? value->utf16_view() : u""sv);
+        if (!namespace_.has_value() && m_rel_list)
+            m_rel_list->associated_attribute_changed(value);
 
         // NB: A link that no longer represents a stylesheet will not run stylesheet completion steps.
         if ((old_relationship & Relationship::Stylesheet) && !(m_relationship & Relationship::Stylesheet))
@@ -384,7 +387,9 @@ bool HTMLLinkElement::contributes_a_script_blocking_style_sheet() const
 
     // FIXME: el is either a style element or a link element that was an external resource link that contributes to the styling processing model when the el was created by the parser.
 
-    // FIXME: el's media attribute's value matches the environment.
+    // el's media attribute's value matches the environment.
+    if (!CSS::RustMediaList::parse(attribute(AttributeNames::media).value_or({})).evaluate(document()))
+        return false;
 
     // el's style sheet was enabled when the element was created by the parser.
     if (!m_was_enabled_when_created_by_parser)
@@ -1427,7 +1432,7 @@ static NonnullRefPtr<Core::Promise<NonnullRefPtr<Gfx::Bitmap const>>> decode_fav
                     promise->reject(Error::from_string_view("Failed to get bitmap from SVG favicon"sv));
                     return;
                 }
-                promise->resolve(decoded_frame->bitmap_ref());
+                promise->resolve(decoded_frame->bitmap_sharing_pixels());
             })
             .when_rejected([promise](Error& error) {
                 promise->reject(move(error));

@@ -5,6 +5,7 @@
  */
 
 use super::*;
+use crate::css::style::bridge::element_adjustment_fact;
 use std::ops::Range;
 
 pub(crate) const LINE_STYLE_NONE: u8 = 0;
@@ -315,7 +316,6 @@ impl CollapsedBorderGrid {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub(crate) struct Column {
-    pub(crate) inline_offset: CssPixels,
     pub(crate) min_size: CssPixels,
     pub(crate) max_size: CssPixels,
     pub(crate) used_inline_size: CssPixels,
@@ -606,11 +606,28 @@ pub(crate) fn distribute_inline_size(columns: &mut [Column], available: CssPixel
     distribute_excess(columns, available, fixed);
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct TableCellMeasurement {
-    automatic_content_block_size: CssPixels,
-    baselines: DerivedBaselines,
-    depends_on_percentage_block_size: bool,
+/// What a table keeps of a cell while it lays the cell out.
+#[derive(Default)]
+struct CellLayoutState {
+    /// The input cells of the cell's box as this table sizes it, from the box's starting cells through the borders
+    /// and padding of the table's border model and the sizes of its columns and rows to what the cell's run hands back.
+    box_cells: used_values::RootInputCells,
+    /// What the cell's fragment shows of the table's layout.
+    fragment_facts: run_state::FragmentFactsDecidedByParent,
+    inside_layout_input: AvailableSpace,
+    /// The content block size the table hands the cell's run, which the cell's contents resolve percentages against.
+    pre_layout_content_block_size: CssPixels,
+    /// What the layout of the cell hands its placement, which places every cell once the rows are positioned.
+    fragment_arrival: Option<fragment_tree::RunRootFragment>,
+    /// What placing the cell takes of the box its layout handed back.
+    placed: Option<formatting_context::PlacedChild>,
+    content_baselines: DerivedBaselines,
+    /// Whether the cell's run laid out the absolutely positioned boxes the cell contains against its final size.
+    run_laid_out_abspos_contained_by_cell: bool,
+    /// Whether the cell's contents resolve percentages against the block size of the cell.
+    contents_depend_on_percentage_block_size: bool,
+    /// How far the table moves the contents of the cell along the block axis to align them in the rows it spans.
+    contents_block_offset: CssPixels,
 }
 
 #[derive(Clone, Copy)]
@@ -625,8 +642,6 @@ pub(crate) struct TableCell {
     pub(crate) outer_max_inline_size: CssPixels,
     pub(crate) outer_min_block_size: CssPixels,
     pub(crate) outer_max_block_size: CssPixels,
-    // The block size the cell specifies with a length `height`, as an outer size (see cell_specified_outer_block_size).
-    pub(crate) outer_specified_block_size: CssPixels,
     // The max-content inline size of the cell's content box, if its column measures read it (see compute_cell_measures).
     pub(crate) max_content_inline_size: Option<CssPixels>,
 }
@@ -649,7 +664,6 @@ pub(crate) struct Row {
     pub(crate) is_collapsed: bool,
     pub(crate) has_intrinsic_percentage: bool,
     pub(crate) intrinsic_percentage: f64,
-    pub(crate) is_constrained: bool,
 }
 
 impl Row {
@@ -667,7 +681,6 @@ impl Row {
             is_collapsed,
             has_intrinsic_percentage: false,
             intrinsic_percentage: 0.0,
-            is_constrained: false,
         }
     }
 }
@@ -780,6 +793,25 @@ impl TableGridOccupancy {
     fn finish_row(&mut self) {
         self.first_range_of_row.push(self.covered_columns.len());
     }
+
+    /// Ends a row group, whose cells cover no row after it.
+    fn finish_row_group(&mut self) {
+        self.cells_spanning_later_rows.clear();
+    }
+}
+
+/// Ends the row group whose cells start at `first_cell_of_group` in `cells`, now that every one of its rows is built:
+/// No cell spans a row past the last row of its group.
+fn finish_row_group(
+    cells: &mut [TableCell],
+    first_cell_of_group: usize,
+    row_count: usize,
+    occupancy: &mut TableGridOccupancy,
+) {
+    for cell in &mut cells[first_cell_of_group..] {
+        cell.row_span = cell.row_span.min(row_count - cell.row_index);
+    }
+    occupancy.finish_row_group();
 }
 
 #[derive(Clone)]
@@ -937,7 +969,6 @@ pub(crate) fn calculate_table_grid<T: TableTree>(tree: &T, table: Node, missing_
                 outer_max_inline_size: CssPixels::default(),
                 outer_min_block_size: CssPixels::default(),
                 outer_max_block_size: CssPixels::default(),
-                outer_specified_block_size: CssPixels::default(),
                 max_content_inline_size: None,
             });
             current_column += column_span;
@@ -947,8 +978,19 @@ pub(crate) fn calculate_table_grid<T: TableTree>(tree: &T, table: Node, missing_
         rows.push(Row::new(row, tree.row_is_collapsed(row, row_group)));
     };
 
+    // https://html.spec.whatwg.org/multipage/tables.html#forming-a-table
+    // Each row group (and each run of rows that are children of the table itself) forms its own block of rows, which
+    // the "algorithm for ending a row group" closes off. So, a cell's row span ends at the last row of its group.
+    let mut first_cell_of_group = 0usize;
+    let mut in_run_of_rows = false;
     for child in row_containers_in_layout_order(tree, table) {
-        if tree.display(child).is_table_row() {
+        let is_row = tree.display(child).is_table_row();
+        if !(is_row && in_run_of_rows) {
+            finish_row_group(&mut cells, first_cell_of_group, rows.len(), &mut occupancy);
+            first_cell_of_group = cells.len();
+        }
+        in_run_of_rows = is_row;
+        if is_row {
             process_row(
                 tree,
                 child,
@@ -973,8 +1015,9 @@ pub(crate) fn calculate_table_grid<T: TableTree>(tree: &T, table: Node, missing_
         }
     }
 
+    finish_row_group(&mut cells, first_cell_of_group, rows.len(), &mut occupancy);
+
     for cell in &mut cells {
-        cell.row_span = cell.row_span.min(rows.len() - cell.row_index);
         cell.column_span = cell.column_span.min(column_count - cell.column_index);
     }
 
@@ -990,7 +1033,7 @@ pub(super) const BORDER_COLLAPSE_SEPARATE: u8 = 0;
 const TABLE_LAYOUT_FIXED: u8 = 1;
 
 /// The grid columns that a table-column box, or a table-column-group box without table-column children, corresponds
-/// to (see column_track_ranges()).
+/// to (see collect_column_track_ranges()).
 #[derive(Clone, Copy)]
 struct ColumnTrackRange {
     /// The table-column box, or the table-column-group box that stands for the columns it spans itself.
@@ -1047,27 +1090,25 @@ pub(super) struct TableFormattingContext<'pass> {
     participant_constraints: ContainingBlockConstraints,
     available_space: AvailableSpace,
     table_block_size: CssPixels,
+    /// The block size that percentage block sizes of rows and cells resolve against (see compute_table_block_size).
+    table_percentage_basis: CssPixels,
+    /// The border box inline size a flex container sizes the table box to, if it does.
+    forced_border_box_inline_size: Option<CssPixels>,
     pub(super) automatic_content_block_size: CssPixels,
+    /// The collapsed borders the table box's fragment paints, once they are materialized.
+    collapsed_table_borders: Option<std::sync::Arc<OwnedCollapsedTableBorders>>,
     table_box_content_block_offset_in_wrapper: CssPixels,
     min_border_box_block_size_from_flex_item: Option<CssPixels>,
-    needs_fixed_mode_row_measurement: bool,
+    needs_row_measurement: bool,
     cells: Vec<TableCell>,
-    cell_inside_layout_inputs: Vec<AvailableSpace>,
-    cell_pre_layout_content_block_sizes: Vec<CssPixels>,
-    deferred_cell_inside_layouts: Vec<bool>,
-    cell_measurements: Vec<Option<TableCellMeasurement>>,
-    /// What the layout of each cell hands its placement, which places every cell once the rows are positioned.
-    cell_fragment_arrivals: Vec<Option<fragment_tree::RunRootFragment>>,
-    /// What placing each cell takes of the box its committing layout handed back.
-    placed_cells: Vec<Option<formatting_context::PlacedChild>>,
-    /// The baselines of the contents of each cell whose layout handed the box back to this table, which keeps them.
-    content_baselines_of_handed_back_cells: Vec<Option<DerivedBaselines>>,
-    /// What each cell's fragment shows of the table's layout.
-    cell_fragment_facts: Vec<run_state::FragmentFactsDecidedByParent>,
-    /// The input cells of each cell's box as this table sizes it, from the box's starting cells through the borders
-    /// and padding of the table's border model and the sizes of its columns and rows to what the cell's run hands back.
-    cell_box_cells: Vec<used_values::RootInputCells>,
+    /// What the table keeps of each cell while it lays the cell out, by the cell's index in `cells`, once the table
+    /// prepared its participants.
+    cell_layouts: Vec<CellLayoutState>,
     columns: Vec<Column>,
+    column_track_ranges: Vec<ColumnTrackRange>,
+    /// The inline offset of each column from the first, and past the last, each followed by the border spacing after
+    /// it, once the columns are sized.
+    column_offsets: Vec<CssPixels>,
     rows: Vec<Row>,
     /// The box of each row as this table lays it out, by row index, once the table prepared its participants.
     row_boxes: Vec<TableParticipantBox>,
@@ -1160,6 +1201,38 @@ impl TableFormattingContext<'_> {
     }
 }
 
+impl<'pass> formatting_context::FormattingContextAlgorithm<'pass> for TableFormattingContext<'pass> {
+    fn lay_out(
+        &mut self,
+        run: &FormattingContextRun<'pass>,
+        input: formatting_context::AlgorithmInput<'_>,
+    ) -> formatting_context::AlgorithmOutput {
+        self.run(run, input.body_input, input.table_inline_layout);
+        let mut root_payload = fragment_tree::PendingPayload::default();
+        if let Some(collapsed_table_borders) = self.collapsed_table_borders.take() {
+            root_payload.set(fragment_tree::FcPayload::Table(collapsed_table_borders));
+        }
+        formatting_context::AlgorithmOutput::of_root(
+            formatting_context::ChildLayoutResult {
+                automatic_content_block_size: self.automatic_content_block_size,
+                baselines: self.derived_baselines_of_root_box(),
+                ..formatting_context::ChildLayoutResult::default()
+            },
+            self.table_box_cells(),
+        )
+        .with_root_payload(root_payload)
+    }
+
+    fn after_root_is_dimensioned(
+        &self,
+        run: &FormattingContextRun<'pass>,
+        _root_cells_in_own_frame: used_values::RootInputCells,
+    ) -> formatting_context::AfterDimensioning {
+        formatting_context::register_table_abspos_descendants(run, run.box_);
+        formatting_context::AfterDimensioning::LaysOutAbsposContainedByRoot
+    }
+}
+
 impl<'pass> TableFormattingContext<'pass> {
     fn node_facts(&self, node: Node) -> NodeFacts<'_> {
         NodeFacts::new(&self.run.pass, node)
@@ -1183,21 +1256,18 @@ impl<'pass> TableFormattingContext<'pass> {
             participant_constraints: ContainingBlockConstraints::default(),
             available_space: AvailableSpace::default(),
             table_block_size: CssPixels::default(),
+            table_percentage_basis: CssPixels::default(),
+            forced_border_box_inline_size: None,
             automatic_content_block_size: CssPixels::default(),
+            collapsed_table_borders: None,
             table_box_content_block_offset_in_wrapper: CssPixels::default(),
             min_border_box_block_size_from_flex_item: None,
-            needs_fixed_mode_row_measurement: false,
+            needs_row_measurement: false,
             cells: Vec::new(),
-            cell_inside_layout_inputs: Vec::new(),
-            cell_pre_layout_content_block_sizes: Vec::new(),
-            deferred_cell_inside_layouts: Vec::new(),
-            cell_measurements: Vec::new(),
-            cell_fragment_arrivals: Vec::new(),
-            placed_cells: Vec::new(),
-            content_baselines_of_handed_back_cells: Vec::new(),
-            cell_fragment_facts: Vec::new(),
-            cell_box_cells: Vec::new(),
+            cell_layouts: Vec::new(),
             columns: Vec::new(),
+            column_track_ranges: Vec::new(),
+            column_offsets: Vec::new(),
             rows: Vec::new(),
             row_boxes: Vec::new(),
             row_group_boxes: Vec::new(),
@@ -1243,14 +1313,8 @@ impl<'pass> TableFormattingContext<'pass> {
             return false;
         }
 
-        self.cell_inside_layout_inputs = vec![AvailableSpace::default(); self.cells.len()];
-        self.cell_pre_layout_content_block_sizes = vec![CssPixels::default(); self.cells.len()];
-        self.deferred_cell_inside_layouts = vec![false; self.cells.len()];
-        self.cell_measurements = vec![None; self.cells.len()];
-        self.cell_fragment_arrivals = std::iter::repeat_with(|| None).take(self.cells.len()).collect();
-        self.placed_cells = vec![None; self.cells.len()];
-        self.content_baselines_of_handed_back_cells = vec![None; self.cells.len()];
-        self.needs_fixed_mode_row_measurement = false;
+        self.column_track_ranges = self.collect_column_track_ranges();
+        self.needs_row_measurement = false;
         self.prepare_table_participants(TableParticipantPreparation::CellsOfEveryParticipant);
         self.border_conflict_resolution();
         self.compute_table_inline_size();
@@ -1283,7 +1347,7 @@ impl<'pass> TableFormattingContext<'pass> {
     /// A table-column box is a child of a table-column-group, or a direct child of the table root: the fixup
     /// algorithm leaves the latter in place, as "A table-column box is misparented if its parent is neither a
     /// table-column-group box nor a table-root box": https://www.w3.org/TR/css-tables-3/#fixup-algorithm
-    fn column_track_ranges(&mut self) -> Vec<ColumnTrackRange> {
+    fn collect_column_track_ranges(&mut self) -> Vec<ColumnTrackRange> {
         let column_count = self.columns.len();
         let mut ranges = Vec::new();
         let mut column_index = 0usize;
@@ -1310,6 +1374,25 @@ impl<'pass> TableFormattingContext<'pass> {
         ranges
     }
 
+    /// Whether the columns of the table run from right to left: "Column boxes are placed next to each other in the
+    /// order they occur. The first column box may be either on the left or on the right, depending on the value of
+    /// the 'direction' property of the table."
+    /// https://www.w3.org/TR/CSS22/tables.html#table-layout
+    /// The columns are counted in the table's column order, from its first column, so only where they are placed
+    /// do they count from the left (see `physical_columns`).
+    fn is_right_to_left(&self) -> bool {
+        self.style(self.run.box_).direction() == direction::RTL
+    }
+
+    /// The columns `columns` of the table's column order, as physical columns counted from the left.
+    fn physical_columns(&self, columns: Range<usize>) -> Range<usize> {
+        if !self.is_right_to_left() {
+            return columns;
+        }
+        let column_count = self.columns.len();
+        column_count - columns.end..column_count - columns.start
+    }
+
     /// The box whose style gives the width specified for the columns of a range, which is also the one that makes
     /// them constrained and gives them a percentage contribution.
     fn column_sizing_box(&self, range: ColumnTrackRange) -> Node {
@@ -1326,7 +1409,7 @@ impl<'pass> TableFormattingContext<'pass> {
         }
     }
 
-    /// The table-column-group boxes and table-column boxes of the table in tree order (see column_track_ranges()).
+    /// The table-column-group boxes and table-column boxes of the table in tree order (see collect_column_track_ranges()).
     fn column_boxes(&mut self) -> Vec<Node> {
         let mut boxes = Vec::new();
         for child in self.matching_children(self.run.box_, |facts| {
@@ -1398,7 +1481,7 @@ impl<'pass> TableFormattingContext<'pass> {
         participant_box.content_offset.set(content_offset);
     }
 
-    fn border_spacing_inline(&mut self) -> CssPixels {
+    fn border_spacing_inline(&self) -> CssPixels {
         let style = self.style(self.run.box_);
         // When a table is laid out in collapsed-borders mode, the border-spacing of the table-root is ignored (as if it was set to 0px):
         // https://www.w3.org/TR/css-tables-3/#collapsed-style-overrides
@@ -1409,7 +1492,7 @@ impl<'pass> TableFormattingContext<'pass> {
         }
     }
 
-    fn border_spacing_block(&mut self) -> CssPixels {
+    fn border_spacing_block(&self) -> CssPixels {
         let style = self.style(self.run.box_);
         // When a table is laid out in collapsed-borders mode, the border-spacing of the table-root is ignored (as if it was set to 0px):
         // https://www.w3.org/TR/css-tables-3/#collapsed-style-overrides
@@ -1420,7 +1503,7 @@ impl<'pass> TableFormattingContext<'pass> {
         }
     }
 
-    fn element_borders(&mut self, node: Node) -> ElementBorders {
+    fn element_borders(&self, node: Node) -> ElementBorders {
         let style = self.style(node);
         ElementBorders {
             top: formatting_context::BorderData {
@@ -1460,18 +1543,20 @@ impl<'pass> TableFormattingContext<'pass> {
             next_source_order += 1;
             source_order
         };
-        // Cells, column by column so that on ties the cell further to the left, then further to the
-        // top, wins. TableCell spans are already clipped to the table end by TableGrid.
+        // Cells, column by column in the table's column order, so that on ties the cell further to the left (to the
+        // right, in a right-to-left table), then further to the top, wins. TableCell spans are already clipped to the
+        // table end by TableGrid. The border grid counts its columns from the left.
         let mut cells = self.cells.clone();
         cells.sort_by_key(|cell| (cell.column_index, cell.row_index));
         for cell in cells {
             let source_order = take_source_order();
+            let columns = self.physical_columns(cell.column_index..cell.column_index + cell.column_span);
             if cell.row_span > 1 || cell.column_span > 1 {
                 grid.hide_segments_inside_span(
                     cell.row_index,
                     cell.row_index + cell.row_span,
-                    cell.column_index,
-                    cell.column_index + cell.column_span,
+                    columns.start,
+                    columns.end,
                     source_order,
                 );
             }
@@ -1480,8 +1565,8 @@ impl<'pass> TableFormattingContext<'pass> {
                 borders,
                 cell.row_index,
                 cell.row_index + cell.row_span,
-                cell.column_index,
-                cell.column_index + cell.column_span,
+                columns.start,
+                columns.end,
                 source_order,
             );
         }
@@ -1513,9 +1598,9 @@ impl<'pass> TableFormattingContext<'pass> {
         }
 
         // Column (<col>) elements, inside a column group or directly under the table root (see
-        // column_track_ranges()).
+        // collect_column_track_ranges()).
         let mut column_group_ranges: Vec<(Node, usize, usize)> = Vec::new();
-        for range in self.column_track_ranges() {
+        for &range in &self.column_track_ranges {
             if let Some(group) = range.group {
                 match column_group_ranges.last_mut() {
                     Some((last_group, _, group_end)) if *last_group == group => *group_end = range.end,
@@ -1527,14 +1612,18 @@ impl<'pass> TableFormattingContext<'pass> {
             }
             let borders = self.element_borders(range.box_);
             let source_order = take_source_order();
+            // A column spanning several columns applies its borders to them in the table's column order, so that where two
+            // of them tie, the one further to the left (to the right, in a right-to-left table) wins.
             for column_index in range.start..range.end {
-                grid.apply_borders(borders, 0, row_count, column_index, column_index + 1, source_order);
+                let column = self.physical_columns(column_index..column_index + 1).start;
+                grid.apply_borders(borders, 0, row_count, column, column + 1, source_order);
             }
         }
         for (column_group, group_start, group_end) in column_group_ranges {
             if group_start < group_end {
                 let borders = self.element_borders(column_group);
-                grid.apply_borders(borders, 0, row_count, group_start, group_end, take_source_order());
+                let columns = self.physical_columns(group_start..group_end);
+                grid.apply_borders(borders, 0, row_count, columns.start, columns.end, take_source_order());
             }
         }
         let table_borders = self.element_borders(self.run.box_);
@@ -1566,7 +1655,7 @@ impl<'pass> TableFormattingContext<'pass> {
 
         for cell_index in 0..self.cells.len() {
             let cell = self.cells[cell_index];
-            self.cell_box_cells[cell_index].uses_collapsing_borders_model = true;
+            self.cell_layouts[cell_index].box_cells.uses_collapsing_borders_model = true;
             // A missing cell (https://www.w3.org/TR/css-tables-3/#missing-cells-fixup) is an anonymous box without an
             // element, so no border belongs to it: the borders at its edges are those of its neighbours, and it takes
             // no share of them. That keeps a row made of missing cells at its specified block size, with the borders
@@ -1575,9 +1664,9 @@ impl<'pass> TableFormattingContext<'pass> {
                 continue;
             }
             let row_end = cell.row_index + cell.row_span;
-            let column_end = cell.column_index + cell.column_span;
-            let widths = grid.resolve_used_widths_for_cell(cell.row_index, row_end, cell.column_index, column_end);
-            let cell_box = &mut self.cell_box_cells[cell_index];
+            let columns = self.physical_columns(cell.column_index..cell.column_index + cell.column_span);
+            let widths = grid.resolve_used_widths_for_cell(cell.row_index, row_end, columns.start, columns.end);
+            let cell_box = &mut self.cell_layouts[cell_index].box_cells;
             cell_box.border_top = widths.top;
             cell_box.border_right = widths.right;
             cell_box.border_bottom = widths.bottom;
@@ -1596,7 +1685,8 @@ impl<'pass> TableFormattingContext<'pass> {
         if !grid.has_paintable_edges() {
             return;
         }
-        let column_offsets = grid_line_offsets(self.columns.iter().map(|column| column.used_inline_size));
+        // NB: The collapsing border model has no border spacing, so the columns are next to each other.
+        let column_offsets = std::mem::take(&mut self.column_offsets);
         let row_offsets = grid_line_offsets(self.rows.iter().map(|row| {
             if row.is_collapsed {
                 CssPixels::default()
@@ -1605,15 +1695,12 @@ impl<'pass> TableFormattingContext<'pass> {
             }
         }));
         let (horizontal_edges, vertical_edges) = grid.take_edges();
-        let collapsed_table_borders = std::sync::Arc::new(OwnedCollapsedTableBorders {
+        self.collapsed_table_borders = Some(std::sync::Arc::new(OwnedCollapsedTableBorders {
             row_offsets,
             column_offsets,
             horizontal_edges,
             vertical_edges,
-        });
-        self.run.update_fragment_payloads_of(self.run.box_, |payloads| {
-            payloads.collapsed_table_borders = Some(collapsed_table_borders);
-        });
+        }));
     }
 
     // Participants resolve percentages against the table's input basis inside this context, so
@@ -1665,25 +1752,30 @@ impl<'pass> TableFormattingContext<'pass> {
         self.row_group_boxes = row_group_boxes;
         self.column_group_and_column_boxes = column_group_and_column_boxes;
         self.row_boxes = row_boxes;
-        let cell_box_cells = self
+        let cell_layouts = self
             .cells
             .iter()
             .map(|cell| {
-                let cells = used_values::cells_before_sizing(&self.run.pass, cell.box_, self.participant_constraints);
                 note_percentage_block_size_dependency_of(cell.box_);
-                cells
+                CellLayoutState {
+                    box_cells: used_values::cells_before_sizing(
+                        &self.run.pass,
+                        cell.box_,
+                        self.participant_constraints,
+                    ),
+                    fragment_facts: run_state::FragmentFactsDecidedByParent {
+                        show: fragment_tree::ParentShowFacts {
+                            table_column_index: cell.column_index as u32,
+                            table_column_span: cell.column_span as u32,
+                            ..fragment_tree::ParentShowFacts::default()
+                        },
+                        ..run_state::FragmentFactsDecidedByParent::default()
+                    },
+                    ..CellLayoutState::default()
+                }
             })
             .collect();
-        self.cell_fragment_facts = self
-            .cells
-            .iter()
-            .map(|cell| run_state::FragmentFactsDecidedByParent {
-                table_column_index: cell.column_index as u32,
-                table_column_span: cell.column_span as u32,
-                ..run_state::FragmentFactsDecidedByParent::default()
-            })
-            .collect();
-        self.cell_box_cells = cell_box_cells;
+        self.cell_layouts = cell_layouts;
     }
 
     /// Whether a length or percentage `height` on a cell sizes its border box rather than its content box. CSS 2
@@ -1716,11 +1808,18 @@ impl<'pass> TableFormattingContext<'pass> {
     /// of table cells and table rows is calculated when their height is specified using percentage values.")
     /// https://www.w3.org/TR/CSS21/tables.html#height-layout
     fn cell_has_resolvable_percentage_block_size(&self, cell_box: Node) -> bool {
-        self.style(cell_box).height().is_percentage() && !self.table_block_size_is_auto()
+        self.style(cell_box).height().percentage_fraction().is_some() && !self.table_block_size_is_auto()
     }
 
+    /// Whether the table's block size is auto, or a percentage that has nothing to resolve against, which acts as
+    /// auto (see compute_table_block_size).
     fn table_block_size_is_auto(&self) -> bool {
-        self.style(self.run.box_).height().is_auto()
+        let height = self.style(self.run.box_).height();
+        height.is_auto()
+            || (height.contains_percentage()
+                && self.table_constraints.percentage_basis_block_size.is_none()
+                && !(self.node_facts(self.run.box_).document_in_quirks_mode()
+                    && self.table_constraints.quirks_mode_percentage_basis_block_size.is_some()))
     }
 
     fn use_fixed_mode_layout(&self) -> bool {
@@ -1750,19 +1849,14 @@ impl<'pass> TableFormattingContext<'pass> {
 
     fn compute_constrainedness(&mut self) {
         // Definition of constrainedness: https://www.w3.org/TR/css-tables-3/#constrainedness
+        let fixed = self.use_fixed_mode_layout();
         // NB: The definition uses https://www.w3.org/TR/CSS21/visudet.html#propdef-width for width, which doesn't include
         //     keyword values. The remaining checks can be simplified to checking whether the size is a length.
-        for range in self.column_track_ranges() {
+        for &range in &self.column_track_ranges {
             if self.style(self.column_sizing_box(range)).width().is_length() {
                 for index in range.start..range.end {
                     self.columns[index].is_constrained = true;
                 }
-            }
-        }
-        for row_index in 0..self.rows.len() {
-            let row_box = self.rows[row_index].box_;
-            if self.style(row_box).height().is_length() {
-                self.rows[row_index].is_constrained = true;
             }
         }
         for cell_index in 0..self.cells.len() {
@@ -1772,8 +1866,13 @@ impl<'pass> TableFormattingContext<'pass> {
             if cell.column_span == 1 && style.width().is_length() {
                 self.columns[cell.column_index].is_constrained = true;
             }
-            if style.height().is_length() {
-                self.rows[cell.row_index].is_constrained = true;
+            // INTEROP: In fixed mode, a cell of the first row with a length inline size constrains every column it
+            //          spans, which share that inline size, as in other engines: "the width of the cell is divided
+            //          over the columns" (CSS 2.1 §17.5.2.1).
+            if fixed && cell.row_index == 0 && cell.column_span > 1 && style.width().is_length() {
+                for index in cell.column_index..cell.column_index + cell.column_span {
+                    self.columns[index].is_constrained = true;
+                }
             }
         }
     }
@@ -1790,13 +1889,43 @@ impl<'pass> TableFormattingContext<'pass> {
 
     /// The box of the cell at `cell_index`, sized in the cells this table keeps of it.
     fn sized_cell(&self, cell_index: usize) -> sizing_context::SizedBox<'_> {
-        sizing_context::SizedBox::new(self.cells[cell_index].box_, &self.cell_box_cells[cell_index])
+        sizing_context::SizedBox::new(self.cells[cell_index].box_, &self.cell_layouts[cell_index].box_cells)
     }
 
-    fn compute_cell_measures(&mut self, include_rows: bool) {
+    /// What the padding percentages of the cells resolve against once the table is sized: its content inline size
+    /// without the border spacing before the first column and after the last. While the columns are measured, they
+    /// resolve against zero.
+    fn cell_padding_percentage_basis(&self) -> CssPixels {
+        self.table_box_cells.content_inline_size() - self.border_spacing_inline() * 2usize
+    }
+
+    /// The cells of the box of the cell at `cell_index` with its paddings, whose percentages resolve against
+    /// `inline_basis` in both axes, and in the separated borders model its borders.
+    fn cell_box_with_resolved_sides(
+        &self,
+        cell_index: usize,
+        collapsed: bool,
+        inline_basis: CssPixels,
+    ) -> used_values::RootInputCells {
+        let style = self.style(self.cells[cell_index].box_);
+        let mut cell_box = self.cell_layouts[cell_index].box_cells;
+        cell_box.padding_top = style.padding_top().to_px(inline_basis);
+        cell_box.padding_bottom = style.padding_bottom().to_px(inline_basis);
+        cell_box.padding_left = style.padding_left().to_px(inline_basis);
+        cell_box.padding_right = style.padding_right().to_px(inline_basis);
+        // The collapsing border model resolves the borders of cells in border_conflict_resolution().
+        if !collapsed {
+            cell_box.border_top = style.border_top_width();
+            cell_box.border_bottom = style.border_bottom_width();
+            cell_box.border_left = style.border_left_width();
+            cell_box.border_right = style.border_right_width();
+        }
+        cell_box
+    }
+
+    fn compute_cell_measures(&mut self) {
         // Implements https://www.w3.org/TR/css-tables-3/#computing-cell-measures.
         let inline_basis = self.table_constraints.inline_basis();
-        let block_basis = self.table_constraints.block_basis();
         self.compute_constrainedness();
         let fixed = self.use_fixed_mode_layout();
         let collapsed = self.style(self.run.box_).border_collapse() != BORDER_COLLAPSE_SEPARATE;
@@ -1804,28 +1933,8 @@ impl<'pass> TableFormattingContext<'pass> {
         for cell_index in 0..self.cells.len() {
             let cell = self.cells[cell_index];
             let style = self.style(cell.box_);
-            let padding_block_start = style.padding_top().to_px(block_basis);
-            let padding_block_end = style.padding_bottom().to_px(block_basis);
-            let padding_inline_start = style.padding_left().to_px(inline_basis);
-            let padding_inline_end = style.padding_right().to_px(inline_basis);
-            // Implement the collapsing border model https://www.w3.org/TR/CSS22/tables.html#collapsing-borders.
-            let (border_block_start, border_block_end, border_inline_start, border_inline_end) = if collapsed {
-                let cell_box = &self.cell_box_cells[cell_index];
-                (
-                    cell_box.border_top_collapsed(true),
-                    cell_box.border_bottom_collapsed(true),
-                    cell_box.border_left_collapsed(true),
-                    cell_box.border_right_collapsed(true),
-                )
-            } else {
-                (
-                    style.border_top_width(),
-                    style.border_bottom_width(),
-                    style.border_left_width(),
-                    style.border_right_width(),
-                )
-            };
-            let inline_offsets = padding_inline_start + padding_inline_end + border_inline_start + border_inline_end;
+            let cell_box = self.cell_box_with_resolved_sides(cell_index, collapsed, CssPixels::default());
+            let inline_offsets = cell_box.border_box_left(collapsed) + cell_box.border_box_right(collapsed);
             let width = style.width();
             let max_width = style.max_width();
             let mut min_inline = style.min_width().to_px(inline_basis);
@@ -1857,14 +1966,11 @@ impl<'pass> TableFormattingContext<'pass> {
                 //         add the cell intrinsic offsets of a content-box percentage cell to its resolved percentage
                 //         (CSS 2.1's fixed-table-layout-025..031 expect that). The offsets are kept as the outer sizes
                 //         of such a cell and become the column's percentage_offsets in initialize_intrinsic_percentages.
-                let outer = if width.is_percentage() && style.box_sizing() != box_sizing::BORDER_BOX {
+                let outer = if width.percentage_fraction().is_some() && style.box_sizing() != box_sizing::BORDER_BOX {
                     inline_offsets
                 } else {
                     CssPixels::default()
                 };
-                // Rows are never measured in fixed mode here (see run_until_inline_size_calculation), so the block-axis
-                // measures below are not needed.
-                debug_assert!(!include_rows);
                 self.cells[cell_index].outer_min_inline_size = outer;
                 self.cells[cell_index].outer_max_inline_size = outer;
                 continue;
@@ -1890,68 +1996,6 @@ impl<'pass> TableFormattingContext<'pass> {
             let capped_min_content_inline = min_content_inline.min(max_inline);
             self.cells[cell_index].outer_min_inline_size = min_inline.max(capped_min_content_inline) + inline_offsets;
             self.cells[cell_index].max_content_inline_size = (!fixed).then_some(max_content_inline);
-
-            if include_rows {
-                let min_content_block = self.sizing().calculate_min_content_block_size(
-                    self.sized_cell(cell_index),
-                    max_content_inline,
-                    self.participant_constraints,
-                );
-                let max_content_block = self.sizing().calculate_max_content_block_size(
-                    self.sized_cell(cell_index),
-                    min_content_inline,
-                    self.participant_constraints,
-                );
-                let block_offsets = padding_block_start + padding_block_end + border_block_start + border_block_end;
-                let mut min_block = style.min_height().to_px(block_basis);
-                if style.box_sizing() == box_sizing::BORDER_BOX {
-                    min_block = (min_block - block_offsets).max(CssPixels::default());
-                }
-                // The outer min-content block size of a table cell is its minimum block size adjusted by the cell intrinsic offsets.
-                self.cells[cell_index].outer_min_block_size = min_block.max(min_content_block) + block_offsets;
-                // The tables specification isn't explicit on how to use the height and max-height CSS properties in the outer max-content formulas.
-                // However, during this early phase we don't have enough information to resolve percentage sizes yet and the formulas for outer sizes
-                // in the specification give enough clues to pick defaults in a way that makes sense.
-                let height = style.height();
-                let max_height = style.max_height();
-                // The specified block size takes part in the row measures as an outer size (see
-                // initialize_table_measures); a percentage resolves against the basis the table forwards from its
-                // containing block, and a block size that contains a percentage takes no part at all when the table's
-                // own block size is auto (see cell_has_resolvable_percentage_block_size).
-                let specified_outer = if height.is_auto()
-                    || (height.contains_percentage() && self.table_block_size_is_auto())
-                {
-                    CssPixels::default()
-                } else {
-                    self.cell_specified_outer_block_size(cell.box_, &style, height.to_px(block_basis), block_offsets)
-                };
-                self.cells[cell_index].outer_specified_block_size = specified_outer;
-                // The specified sizes below are content box sizes (see cell_specified_block_size_is_border_box).
-                let block_size = if height.is_length() {
-                    (specified_outer - block_offsets).max(CssPixels::default())
-                } else {
-                    CssPixels::default()
-                };
-                let mut max_block = if max_height.is_length() {
-                    max_height.to_px(block_basis)
-                } else {
-                    CssPixels::from_raw(i32::MAX)
-                };
-                if style.box_sizing() == box_sizing::BORDER_BOX {
-                    max_block = (max_block - block_offsets).max(CssPixels::default());
-                }
-                self.cells[cell_index].outer_max_block_size = if self.rows[cell.row_index].is_constrained {
-                    // The outer max-content height of a table-cell in a constrained row is
-                    // max(min-height, height, min-content height, min(max-height, height)) adjusted by the cell intrinsic offsets.
-                    // NB: min(max-height, height) doesn't have any effect here, we can simplify the expression to max(min-height, height, min-content height).
-                    min_block.max(block_size.max(min_content_block)) + block_offsets
-                } else {
-                    // The outer max-content height of a table-cell in a non-constrained row is
-                    // max(min-height, height, min-content height, min(max-height, max-content height)) adjusted by the cell intrinsic offsets.
-                    min_block.max(block_size.max(min_content_block.max(max_block.min(max_content_block))))
-                        + block_offsets
-                };
-            }
 
             // See the explanation for block_size and max_block_size above.
             self.cells[cell_index].outer_max_inline_size = if self.columns[cell.column_index].is_constrained {
@@ -1989,7 +2033,13 @@ impl<'pass> TableFormattingContext<'pass> {
             } else {
                 CssPixels::from_raw(i32::MAX)
             };
-            let size = style.height().to_px(basis);
+            // NB: A percentage block size counts as 0px here, as the specification says above, and is applied when
+            //     the table block size is distributed to the rows (see distribute_block_size_to_rows).
+            let size = if style.height().contains_percentage() {
+                CssPixels::default()
+            } else {
+                style.height().to_px(basis)
+            };
             // The outer min-content block size of a table row or row group is max(min-block-size, block-size).
             self.rows[row_index].min_size = min_size.max(size);
             // The outer max-content block size is max(min-block-size, min(max-block-size, block-size)).
@@ -2022,7 +2072,7 @@ impl<'pass> TableFormattingContext<'pass> {
             // max('min-width', min('max-width', 'width')).
             (min_size.max(size), min_size.max(max_size.min(size)))
         };
-        for range in self.column_track_ranges() {
+        for &range in &self.column_track_ranges {
             let (min_size, max_size) = outer_sizes(self.style(self.column_sizing_box(range)));
             for index in range.start..range.end {
                 self.columns[index].min_size = min_size;
@@ -2124,16 +2174,11 @@ impl<'pass> TableFormattingContext<'pass> {
             TrackAxis::Row => (style.height(), style.max_height()),
             TrackAxis::Column => (style.width(), style.max_width()),
         };
-        let maximum = if max_size.is_percentage() {
-            max_size.length_percentage().as_fraction() * 100.0
-        } else {
-            f64::INFINITY
-        };
-        let preferred = if size.is_percentage() {
-            size.length_percentage().as_fraction() * 100.0
-        } else {
-            0.0
-        };
+        // NB: A calculation that simplified to a percentage, like calc(10% + 15%), is that percentage.
+        let maximum = max_size
+            .percentage_fraction()
+            .map_or(f64::INFINITY, |fraction| fraction * 100.0);
+        let preferred = size.percentage_fraction().map_or(0.0, |fraction| fraction * 100.0);
         preferred.min(maximum)
     }
 
@@ -2142,15 +2187,16 @@ impl<'pass> TableFormattingContext<'pass> {
             for index in 0..self.rows.len() {
                 let style = self.style(self.rows[index].box_);
                 // Definition of percentage contribution: https://www.w3.org/TR/css-tables-3/#percentage-contribution
-                self.rows[index].has_intrinsic_percentage =
-                    style.max_height().is_percentage() || style.height().is_percentage();
+                self.rows[index].has_intrinsic_percentage = style.max_height().percentage_fraction().is_some()
+                    || style.height().percentage_fraction().is_some();
                 self.rows[index].intrinsic_percentage = Self::cell_percentage(style, axis);
             }
         } else {
-            for range in self.column_track_ranges() {
+            for &range in &self.column_track_ranges {
                 let style = self.style(self.column_sizing_box(range));
                 // Definition of percentage contribution: https://www.w3.org/TR/css-tables-3/#percentage-contribution
-                let has_intrinsic_percentage = style.max_width().is_percentage() || style.width().is_percentage();
+                let has_intrinsic_percentage =
+                    style.max_width().percentage_fraction().is_some() || style.width().percentage_fraction().is_some();
                 let intrinsic_percentage = Self::cell_percentage(style, axis);
                 for index in range.start..range.end {
                     self.columns[index].has_intrinsic_percentage = has_intrinsic_percentage;
@@ -2170,7 +2216,7 @@ impl<'pass> TableFormattingContext<'pass> {
                 TrackAxis::Row => style.height(),
                 TrackAxis::Column => style.width(),
             };
-            if !size.is_percentage() {
+            if size.percentage_fraction().is_none() {
                 continue;
             }
             let start = Self::cell_index(cell, axis);
@@ -2273,12 +2319,9 @@ impl<'pass> TableFormattingContext<'pass> {
                     // the largest of the resulting height of the previous row layout, the height specified on the corresponding table-row (if any), and
                     // the largest height specified on cells that span this row only (the algorithm starts by considering cells of span 2 on top of that assignment).
                     // The row measures are outer sizes, so the specified height counts with the cell's padding and
-                    // borders (compute_cell_measures records it; a cell measured in fixed mode has it in its outer
-                    // minimum instead, see compute_table_block_size).
+                    // borders (the cell's outer minimum has it, see compute_table_block_size).
                     let row = &mut self.rows[cell.row_index];
-                    row.min_size = row
-                        .min_size
-                        .max(cell.outer_min_block_size.max(cell.outer_specified_block_size));
+                    row.min_size = row.min_size.max(cell.outer_min_block_size);
                     row.max_size = row.max_size.max(cell.outer_max_block_size);
                 }
             }
@@ -2351,17 +2394,29 @@ impl<'pass> TableFormattingContext<'pass> {
                 let growing_max = growing_tracks
                     .iter()
                     .fold(CssPixels::default(), |sum, &index| sum + self.track_max(axis, index));
-                let share_beyond_max = |index: usize, beyond_max: CssPixels| {
-                    if !growing_tracks.contains(&index) {
-                        CssPixels::default()
-                    } else if growing_max != CssPixels::default() {
-                        CssPixels::nearest_value_for(self.track_max(axis, index).to_double() / growing_max.to_double())
-                            * beyond_max
+                // Each growing track takes its share of what the cell needs beyond the baseline max-content size, in
+                // proportion to its max-content size. The shares are the differences between the rounded running totals
+                // of those proportions, so that they always add up to all of it, however many tracks share it.
+                // AD-HOC: The spec does not define behavior when baseline is zero. We distribute equally.
+                //         This matches how undefined ratios are handled elsewhere.
+                let mut growing_fractions_before = Vec::with_capacity(growing_tracks.len() + 1);
+                growing_fractions_before.push(0.0);
+                let mut fraction_so_far = 0.0;
+                for &index in &growing_tracks {
+                    fraction_so_far += if growing_max != CssPixels::default() {
+                        self.track_max(axis, index).to_double() / growing_max.to_double()
                     } else {
-                        // AD-HOC: The spec does not define behavior when baseline is zero. We distribute equally.
-                        //         This matches how undefined ratios are handled elsewhere.
-                        beyond_max / growing_tracks.len()
-                    }
+                        1.0 / growing_tracks.len() as f64
+                    };
+                    growing_fractions_before.push(fraction_so_far);
+                }
+                let share_beyond_max = |index: usize, beyond_max: CssPixels| {
+                    let Ok(position) = growing_tracks.binary_search(&index) else {
+                        return CssPixels::default();
+                    };
+                    let running_total = |fraction: f64| CssPixels::nearest_value_for(fraction * beyond_max.to_double());
+                    running_total(growing_fractions_before[position + 1])
+                        - running_total(growing_fractions_before[position])
                 };
                 // Add contribution from all rows / columns, since we've weighted the gap to the desired spanned size by the the
                 // ratio of the max-content size based on cells of span up to N-1 of the row / column to the baseline max-content width.
@@ -2593,7 +2648,18 @@ impl<'pass> TableFormattingContext<'pass> {
         if !crate::layout::sizing_context::is_plain_auto(table_style.min_width()) {
             used_min = used_min.max(self.resolve_inline_constraint(table_style.min_width(), grid_min, grid_max, basis));
         }
-        let width_is_auto_or_indefinite_percentage = table_style.width().is_auto()
+        // https://drafts.csswg.org/css-flexbox-1/#flex-items
+        // "[...] like width and height, the flex longhands apply to the table box as follows: the flex item's final
+        // size is calculated by performing layout as if the distance between the table wrapper box's edges and the
+        // table box's content edges were all part of the table box's border+padding area, and the table box were the
+        // flex item."
+        // NB: So once the flex container sizes the wrapper along the table's inline axis, the table fills that size,
+        //     and its specified inline size only takes part in the flex base size, through the max-content inline size.
+        //     The min-content inline size, which the automatic minimum size of the item comes from, ignores it.
+        let width_is_flexed = self.forced_border_box_inline_size.is_some()
+            || (available_inline == AvailableSize::MinContent && self.wrapper_is_flex_item_along_inline_axis());
+        let width_is_auto_or_indefinite_percentage = width_is_flexed
+            || table_style.width().is_auto()
             || (table_style.width().contains_percentage()
                 && self.table_constraints.percentage_basis_inline_size.is_none());
         let mut used = if width_is_auto_or_indefinite_percentage {
@@ -2620,9 +2686,9 @@ impl<'pass> TableFormattingContext<'pass> {
                 for cell_index in 0..self.cells.len() {
                     let cell = self.cells[cell_index];
                     let cell_width = self.style(cell.box_).width();
-                    if cell_width.is_percentage() {
+                    if let Some(fraction) = cell_width.percentage_fraction() {
                         let mut adjusted = spacing;
-                        let percentage = cell_width.length_percentage().as_fraction() * 100.0;
+                        let percentage = fraction * 100.0;
                         if percentage != 0.0 {
                             adjusted += CssPixels::nearest_value_for(
                                 (100.0 / percentage * cell.outer_max_inline_size.to_double()).ceil(),
@@ -2685,9 +2751,46 @@ impl<'pass> TableFormattingContext<'pass> {
         used.max(used_min)
     }
 
+    /// Whether the table wrapper is a flex item whose main axis is the inline axis of the table.
+    fn wrapper_is_flex_item_along_inline_axis(&self) -> bool {
+        let wrapper = self.parent(self.run.box_);
+        if wrapper.is_invalid()
+            || !self.node_facts(wrapper).is_table_wrapper()
+            || self.node_facts(wrapper).is_absolutely_positioned()
+        {
+            return false;
+        }
+        let container = self.parent(wrapper);
+        if container.is_invalid() {
+            return false;
+        }
+        let container_style = self.style(container);
+        if !container_style.display().is_flex_inside()
+            && container_style.display().inside != display_inside::_WEBKIT_BOX
+        {
+            return false;
+        }
+        let is_row_layout = matches!(
+            container_style.effective_flex_direction(),
+            flex_direction::ROW | flex_direction::ROW_REVERSE
+        );
+        let table_is_orthogonal = geometry::Frame::of(self.style(self.run.box_).writing_mode())
+            .is_orthogonal_to(geometry::Frame::of(container_style.writing_mode()));
+        is_row_layout != table_is_orthogonal
+    }
+
     fn compute_table_inline_size(&mut self) {
         let measures = self.table_inline_size_measures();
-        let used = self.used_table_inline_size(self.available_space.inline_size, measures);
+        let available = if let Some(forced) = self.forced_border_box_inline_size {
+            let used = &self.table_box_cells;
+            let collapsed = used.uses_collapsing_borders_model();
+            AvailableSize::definite(
+                (forced - used.border_box_left(collapsed) - used.border_box_right(collapsed)).max(CssPixels::default()),
+            )
+        } else {
+            self.available_space.inline_size
+        };
+        let used = self.used_table_inline_size(available, measures);
         self.table_box_cells.set_content_inline_size(used);
     }
 
@@ -2761,7 +2864,13 @@ impl<'pass> TableFormattingContext<'pass> {
         measures: TableInlineSizeMeasures,
     ) -> CssPixels {
         let intrinsic_inline_size = self.used_table_inline_size(intrinsic_sizing_constraint, measures);
-        if self.max_inline_size_fits_content_to_unknown_containing_block_inline_size() {
+        // NB: The specified inline size of a flexed table takes no part in its min-content inline size (see
+        //     used_table_inline_size).
+        let min_content_ignores_specified_inline_size =
+            intrinsic_sizing_constraint == AvailableSize::MinContent && self.wrapper_is_flex_item_along_inline_axis();
+        if min_content_ignores_specified_inline_size
+            || self.max_inline_size_fits_content_to_unknown_containing_block_inline_size()
+        {
             return intrinsic_inline_size;
         }
         self.used_table_inline_size(AvailableSize::Definite(intrinsic_inline_size), measures)
@@ -2791,19 +2900,13 @@ impl<'pass> TableFormattingContext<'pass> {
         // Determine the number of rows/columns the table requires.
         let table_grid = calculate_table_grid(self, self.run.box_, MissingTableCells::Include);
         self.cells = table_grid.cells;
-        self.cell_inside_layout_inputs = vec![AvailableSpace::default(); self.cells.len()];
-        self.cell_pre_layout_content_block_sizes = vec![CssPixels::default(); self.cells.len()];
-        self.deferred_cell_inside_layouts = vec![false; self.cells.len()];
-        self.cell_measurements = vec![None; self.cells.len()];
-        self.cell_fragment_arrivals = std::iter::repeat_with(|| None).take(self.cells.len()).collect();
-        self.placed_cells = vec![None; self.cells.len()];
-        self.content_baselines_of_handed_back_cells = vec![None; self.cells.len()];
         self.rows = table_grid.rows;
         self.columns = vec![Column::default(); table_grid.column_count];
         for cell in &self.cells {
             self.columns[cell.column_index].has_originating_cells = true;
         }
-        for range in self.column_track_ranges() {
+        self.column_track_ranges = self.collect_column_track_ranges();
+        for &range in &self.column_track_ranges {
             if self.column_is_collapsed(range.box_) {
                 for index in range.start..range.end {
                     self.columns[index].is_collapsed = true;
@@ -2837,93 +2940,54 @@ impl<'pass> TableFormattingContext<'pass> {
         self.prepare_table_participants(participant_preparation);
         self.border_conflict_resolution();
 
-        let mut include_rows = !skip_row_measurement;
-        self.needs_fixed_mode_row_measurement = false;
-        // OPTIMIZATION: Row intrinsic measurements are only needed when row block-size constraints or row spans can affect
-        //               the later row distribution. Simple tables get their actual row block sizes from cell layout.
-        if include_rows && self.can_skip_row_intrinsic_measurement() {
-            include_rows = false;
-        }
-        if include_rows && self.use_fixed_mode_layout() {
-            // https://drafts.csswg.org/css-tables-3/#computing-column-measures
-            // For the purpose of measuring a column when laid out in fixed mode ... the min-content and max-content width
-            // of cells is considered zero.
-            //
-            // https://drafts.csswg.org/css-tables-3/#ROWMIN
-            // ROWMIN is defined as the sum of the minimum block sizes of the rows after a first row layout pass.
-            // NB: So defer fixed-mode row measurement until after columns have their used widths.
-            include_rows = false;
-            self.needs_fixed_mode_row_measurement = true;
-        }
+        // https://drafts.csswg.org/css-tables-3/#ROWMIN
+        // ROWMIN is defined as the sum of the minimum block sizes of the rows after a first row layout pass.
+        // NB: So the rows are measured once the columns have their used inline sizes (see compute_table_block_size),
+        //     where each cell is laid out at the inline size it will have.
+        // OPTIMIZATION: Row measurements are only needed when row block-size constraints or row spans can affect the
+        //               later row distribution. Simple tables get their actual row block sizes from cell layout.
+        self.needs_row_measurement = !skip_row_measurement && !self.can_skip_row_intrinsic_measurement();
         // Compute the minimum width of each column.
-        self.compute_cell_measures(include_rows);
+        self.compute_cell_measures();
         self.compute_outer_content_sizes();
         self.compute_table_measures(TrackAxis::Column);
-        if include_rows {
-            // https://www.w3.org/TR/css-tables-3/#row-layout
-            // Since specified cell block sizes were ignored during row layout and cells spanning multiple rows were not
-            // sized correctly, their block size must eventually be distributed to the rows they span. This is done
-            // by running the same algorithm as the column measurement, with the span=1 value being initialized (for min-content) with the largest
-            // of the resulting block size of the previous row layout, the size specified on the corresponding table row,
-            // and the largest block size specified on cells that span only this row.
-            self.compute_table_measures(TrackAxis::Row);
-        }
     }
 
+    /// Lays out the contents of the cell at `cell_index` with `sizing`, in the cells and with the input this table
+    /// keeps of it, and keeps what its layout hands back.
     fn layout_inside_cell(
         &mut self,
         run: &FormattingContextRun<'pass>,
         cell_index: usize,
-        input: AvailableSpace,
-        adopt_automatic_content_block_size: bool,
-    ) -> (DerivedBaselines, Option<fragment_tree::RunRootFragment>) {
-        let layout_input = LayoutInput {
-            available_space: input,
-            containing_block_constraints: ContainingBlockConstraints::default(),
-            sizing: RootSizingDirectives {
-                content_block_size_after_run: if adopt_automatic_content_block_size {
-                    geometry::ContentBlockSizeAfterRun::Automatic
-                } else {
-                    geometry::ContentBlockSizeAfterRun::HandedOver
-                },
-                ..RootSizingDirectives::default()
-            },
-            participation: ParticipationInParentFormattingContext::Item,
-        };
+        sizing: RootSizingDirectives,
+    ) {
         let cell = self.cells[cell_index];
-        let formatting_context::ChildLayout {
-            outcome,
-            fragment_arrival,
-            laid_out_box,
-        } = formatting_context::layout_inside_child_with_input_cells(
+        let layout = &self.cell_layouts[cell_index];
+        let laid_out = formatting_context::layout_inside_child_with_input_cells(
             run,
             None,
             None,
             cell.box_,
-            layout_input,
-            self.cell_box_cells[cell_index],
+            LayoutInput {
+                available_space: layout.inside_layout_input,
+                containing_block_constraints: ContainingBlockConstraints::default(),
+                sizing,
+                participation: ParticipationInParentFormattingContext::Item,
+            },
+            layout.box_cells,
+            None,
             false,
             // NB: A table cell is a containing block of its own to the percentage block insets of its descendants.
             run.percentage_block_insets_of_root_children_have_definite_basis(&self.table_box_cells),
         );
-        self.cell_box_cells[cell_index] = laid_out_box.cells;
-        self.content_baselines_of_handed_back_cells[cell_index] = Some(laid_out_box.baselines);
-        outcome.report_percentage_block_size_dependency_of(run, cell.box_);
-        let baselines = laid_out_box.baselines;
-        self.placed_cells[cell_index] = Some(formatting_context::PlacedChild::of_laid_out_box(&laid_out_box));
-        (baselines, fragment_arrival)
-    }
-
-    fn keep_fragment_arrival_of_cell(
-        &mut self,
-        cell_index: usize,
-        fragment_arrival: Option<fragment_tree::RunRootFragment>,
-    ) {
-        debug_assert!(
-            self.cell_fragment_arrivals[cell_index].is_none(),
-            "a cell is laid out once before its placement"
-        );
-        self.cell_fragment_arrivals[cell_index] = fragment_arrival;
+        laid_out.report_percentage_block_size_dependency_of(run, cell.box_);
+        let layout = &mut self.cell_layouts[cell_index];
+        layout.box_cells = laid_out.cells();
+        layout.content_baselines = laid_out.baselines();
+        layout.run_laid_out_abspos_contained_by_cell = laid_out.laid_out_abspos_contained_by_root();
+        layout.contents_depend_on_percentage_block_size = laid_out.contents_depend_on_percentage_block_size();
+        layout.placed = Some(laid_out.placed_child());
+        layout.fragment_arrival = laid_out.into_fragment_arrival(run);
     }
 
     /// The baseline of a cell, from the top of its border box: "The baseline of a cell is the baseline of the first
@@ -2931,38 +2995,23 @@ impl<'pass> TableFormattingContext<'pass> {
     /// such line box or table-row, the baseline is the bottom of content edge of the cell."
     /// https://www.w3.org/TR/CSS22/tables.html#height-layout
     /// The cell's own 'vertical-align' says where the cell goes in its row, not where its baseline is.
-    fn cell_baseline(&self, cell_index: usize, committing_run_baselines: Option<DerivedBaselines>) -> CssPixels {
-        let cell_box = &self.cell_box_cells[cell_index];
-        // NB: A cell neither laid out nor handed back has no baselines yet.
-        let content_baselines = committing_run_baselines
-            .or(self.content_baselines_of_handed_back_cells[cell_index])
-            .unwrap_or_default();
+    fn cell_baseline(&self, cell_index: usize) -> CssPixels {
+        let layout = &self.cell_layouts[cell_index];
+        let cell_box = &layout.box_cells;
         let collapsed = cell_box.uses_collapsing_borders_model;
-        cell_box.border_box_top(collapsed) + content_baselines.first.unwrap_or(cell_box.content_block_size)
-    }
-
-    /// Whether a cell is aligned at the baseline of its row. Of the 'vertical-align' values, "the following values
-    /// apply to cells: baseline, top, middle, bottom", while sub, super, text-top, text-bottom, <length> and
-    /// <percentage> "do not apply to cells; the cell is aligned at the baseline instead".
-    /// https://www.w3.org/TR/CSS22/tables.html#height-layout
-    fn cell_is_baseline_aligned(style: &StyleValues<'_>) -> bool {
-        !style.vertical_align_is_keyword()
-            || !matches!(
-                style.vertical_align_keyword(),
-                vertical_align::TOP | vertical_align::MIDDLE | vertical_align::BOTTOM
-            )
+        cell_box.border_box_top(collapsed) + layout.content_baselines.first.unwrap_or(cell_box.content_block_size)
     }
 
     /// Notes what a cell contributes to the baseline of its row (see row_baseline) and to the row's height (see
     /// grow_rows_to_aligned_cells).
     fn note_cell_in_row_baseline(&mut self, cell_index: usize, style: &StyleValues<'_>) {
         let cell = self.cells[cell_index];
-        let cell_box = self.cell_box_cells[cell_index];
+        let cell_box = self.cell_layouts[cell_index].box_cells;
         let collapsed = cell_box.uses_collapsing_borders_model;
         let block_end_offset = cell_box.border_box_bottom(collapsed);
         let block_size = cell_box.border_box_block_size(collapsed);
         let row = &mut self.rows[cell.row_index];
-        if Self::cell_is_baseline_aligned(style) {
+        if box_alignment::cell_alignment(*style) == box_alignment::CellAlignment::Baseline {
             row.baseline = Some(
                 row.baseline
                     .map_or(cell.baseline, |baseline| baseline.max(cell.baseline)),
@@ -2976,48 +3025,6 @@ impl<'pass> TableFormattingContext<'pass> {
             row.smallest_cell_block_end_offset
                 .map_or(block_end_offset, |offset| offset.min(block_end_offset)),
         );
-    }
-
-    /// Measures a cell's content ahead of its committing layout, with everything that layout will be handed but the
-    /// intrinsic block padding, so that the committing run of the cell can replay the measuring one (see
-    /// table_cell_run_shape_ahead_of_its_intrinsic_block_padding).
-    fn measure_cell(
-        &self,
-        run: &FormattingContextRun<'pass>,
-        cell_index: usize,
-        inner: AvailableSpace,
-        adopt_automatic_content_block_size: bool,
-    ) -> Option<TableCellMeasurement> {
-        let cell = self.cells[cell_index];
-        let facts = NodeFacts::new(&self.run.pass, cell.box_);
-        if !facts.can_have_children() {
-            return None;
-        }
-        let shape = formatting_context::table_cell_run_shape_ahead_of_its_intrinsic_block_padding(
-            run,
-            &self.table_box_cells,
-            cell.box_,
-            self.cell_box_cells[cell_index],
-            LayoutInput {
-                available_space: inner,
-                containing_block_constraints: ContainingBlockConstraints::default(),
-                sizing: RootSizingDirectives {
-                    content_block_size_after_run: if adopt_automatic_content_block_size {
-                        geometry::ContentBlockSizeAfterRun::Automatic
-                    } else {
-                        geometry::ContentBlockSizeAfterRun::HandedOver
-                    },
-                    ..RootSizingDirectives::default()
-                },
-                participation: ParticipationInParentFormattingContext::Item,
-            },
-        );
-        let result = formatting_context::lay_out_shape_for_its_result(run.pass, shape);
-        Some(TableCellMeasurement {
-            automatic_content_block_size: result.automatic_content_block_size,
-            baselines: result.baselines,
-            depends_on_percentage_block_size: result.depends_on_percentage_block_size,
-        })
     }
 
     fn compute_table_block_size(&mut self, run: &FormattingContextRun<'pass>) {
@@ -3035,7 +3042,8 @@ impl<'pass> TableFormattingContext<'pass> {
                     .max(height.to_px(CssPixels::default()));
             }
         }
-        let inline_basis = self.participant_constraints.inline_basis();
+        let cell_padding_basis = self.cell_padding_percentage_basis();
+        let fixed = self.use_fixed_mode_layout();
         let participant_block_basis = self.participant_constraints.block_basis();
         let collapsed = self.style(self.run.box_).border_collapse() != BORDER_COLLAPSE_SEPARATE;
         let inline_spacing = self.border_spacing_inline();
@@ -3046,24 +3054,23 @@ impl<'pass> TableFormattingContext<'pass> {
             let span_inline = (0..cell.column_span).fold(CssPixels::default(), |sum, index| {
                 sum + self.columns[cell.column_index + index].used_inline_size
             });
-            let mut cell_box = self.cell_box_cells[cell_index];
-            cell_box.padding_top = style.padding_top().to_px(inline_basis);
-            cell_box.padding_bottom = style.padding_bottom().to_px(inline_basis);
-            cell_box.padding_left = style.padding_left().to_px(inline_basis);
-            cell_box.padding_right = style.padding_right().to_px(inline_basis);
-            if !collapsed {
-                cell_box.border_top = style.border_top_width();
-                cell_box.border_bottom = style.border_bottom_width();
-                cell_box.border_left = style.border_left_width();
-                cell_box.border_right = style.border_right_width();
+            let mut cell_box = self.cell_box_with_resolved_sides(cell_index, collapsed, cell_padding_basis);
+            // NB: A percentage block size of the cell counts as 0px until the rows are sized (see
+            //     initialize_row_content_sizes), so it gives the contents no basis yet.
+            if style.height().contains_percentage() {
+                cell_box.has_definite_block_size = false;
             }
             // A cell whose columns all have 'visibility: collapse' is removed from the display along with them, as in
             // other engines: "This value causes the entire row or column to be removed from the display". It is laid
             // out like any other cell (with no inline size, see remove_collapsed_columns), and painting skips it.
             // https://www.w3.org/TR/CSS22/tables.html#dynamic-effects
             let hidden_by_collapsed_columns = self.visible_spanned_columns(cell) == 0;
-            self.cell_fragment_facts[cell_index].hidden_by_collapsed_columns = hidden_by_collapsed_columns;
+            self.cell_layouts[cell_index]
+                .fragment_facts
+                .show
+                .hidden_by_collapsed_columns = hidden_by_collapsed_columns;
             let height = style.height();
+            let mut specified_outer_block_size = None;
             if !self.rows[cell.row_index].is_collapsed && height.is_length() {
                 let offsets = cell_box.border_box_top(collapsed) + cell_box.border_box_bottom(collapsed);
                 let cell_size = self.cell_specified_outer_block_size(
@@ -3073,7 +3080,13 @@ impl<'pass> TableFormattingContext<'pass> {
                     offsets,
                 );
                 cell_box.set_content_block_size(cell_size - offsets);
-                self.rows[cell.row_index].base_block_size = self.rows[cell.row_index].base_block_size.max(cell_size);
+                specified_outer_block_size = Some(cell_size);
+                // Only a cell that spans its row exclusively gives the row its specified block size (see below). A
+                // cell spanning several rows reaches them through the row measures instead, as its minimum.
+                if cell.row_span == 1 {
+                    self.rows[cell.row_index].base_block_size =
+                        self.rows[cell.row_index].base_block_size.max(cell_size);
+                }
             }
             // Compute cell inline size as specified by https://www.w3.org/TR/css-tables-3/#bounding-box-assignment:
             // The position of any table cell, track, or track group is defined by the sums of its spanned columns and rows:
@@ -3085,45 +3098,38 @@ impl<'pass> TableFormattingContext<'pass> {
             // specified inline size (https://www.w3.org/TR/css-tables-3/#width-distribution-in-fixed-mode), so a
             // column can be narrower than those. The cell still occupies exactly its columns, with an empty content
             // box, as in other engines: shrink its used padding and borders to fit, so that the box painted for the
-            // cell stays within its columns.
-            Self::shrink_cell_offsets_to_fit(&mut cell_box, collapsed, cell_inline_size);
+            // cell stays within its columns. In auto mode, only percentage paddings, which resolve against zero while
+            // the columns are measured, can be wider than the columns: the end padding shrinks to fit, and the start
+            // padding keeps its used value.
+            Self::shrink_cell_offsets_to_fit(&mut cell_box, collapsed, cell_inline_size, fixed);
             cell_box.set_content_inline_size(
                 cell_inline_size - cell_box.border_box_left(collapsed) - cell_box.border_box_right(collapsed),
             );
 
-            let outer_space = self.available_space;
-            let inner = cell_box.available_inner_space_or_constraints_from(outer_space);
-            self.cell_inside_layout_inputs[cell_index] = inner;
-            self.cell_pre_layout_content_block_sizes[cell_index] = cell_box.content_block_size;
-            self.cell_box_cells[cell_index] = cell_box;
-            let defer_inside_layout = style.height().is_percentage()
-                || style.vertical_align_is_keyword()
-                || self.anonymous_cell_wraps_flex_or_grid(cell);
-            self.deferred_cell_inside_layouts[cell_index] = defer_inside_layout;
-            let mut content_baselines = None;
-            if defer_inside_layout {
-                // This cell's final inside layout happens once row heights are final; measure its
-                // content ahead of its intrinsic padding instead of laying out the committing state twice.
-                if let Some(measured) = self.measure_cell(run, cell_index, inner, true) {
-                    self.cell_measurements[cell_index] = Some(measured);
-                    self.cell_box_cells[cell_index].set_content_block_size(measured.automatic_content_block_size);
-                    content_baselines = Some(measured.baselines);
-                }
-            } else {
-                let (baselines, fragment_arrival) = self.layout_inside_cell(run, cell_index, inner, true);
-                self.keep_fragment_arrival_of_cell(cell_index, fragment_arrival);
-                content_baselines = Some(baselines);
-            }
-            let cell_box = self.cell_box_cells[cell_index];
-            if self.needs_fixed_mode_row_measurement {
-                let min_size = style.min_height().to_px(participant_block_basis);
-                let offsets = cell_box.border_box_top(collapsed) + cell_box.border_box_bottom(collapsed);
-                let measured = cell_box.border_box_block_size(collapsed).max(min_size + offsets);
+            let inner = cell_box.available_inner_space_or_constraints_from(self.available_space);
+            let layout = &mut self.cell_layouts[cell_index];
+            layout.inside_layout_input = inner;
+            layout.pre_layout_content_block_size = cell_box.content_block_size;
+            layout.box_cells = cell_box;
+            self.layout_inside_cell(
+                run,
+                cell_index,
+                RootSizingDirectives {
+                    content_block_size_after_run: geometry::ContentBlockSizeAfterRun::Automatic,
+                    ..RootSizingDirectives::default()
+                },
+            );
+            let cell_box = self.cell_layouts[cell_index].box_cells;
+            if self.needs_row_measurement {
+                // The outer min-content block size of a cell is the larger of its laid-out block size and its
+                // specified one.
+                let measured = cell_box
+                    .border_box_block_size(collapsed)
+                    .max(specified_outer_block_size.unwrap_or_default());
                 self.cells[cell_index].outer_min_block_size = measured;
                 self.cells[cell_index].outer_max_block_size = measured;
             }
-            let baseline = self.cell_baseline(cell_index, content_baselines);
-            self.cells[cell_index].baseline = baseline;
+            self.cells[cell_index].baseline = self.cell_baseline(cell_index);
             // Implements https://www.w3.org/TR/css-tables-3/#computing-the-table-height
 
             // The minimum block size of a row is the maximum of:
@@ -3136,7 +3142,7 @@ impl<'pass> TableFormattingContext<'pass> {
                     let size = cell_box.border_box_block_size(collapsed);
                     self.rows[cell.row_index].base_block_size = self.rows[cell.row_index].base_block_size.max(size);
                 }
-                if !self.needs_fixed_mode_row_measurement {
+                if !self.needs_row_measurement {
                     self.rows[cell.row_index].base_block_size = self.rows[cell.row_index]
                         .base_block_size
                         .max(self.rows[cell.row_index].min_size);
@@ -3146,7 +3152,7 @@ impl<'pass> TableFormattingContext<'pass> {
         }
         self.grow_rows_to_aligned_cells(|row| &mut row.base_block_size);
 
-        if self.needs_fixed_mode_row_measurement {
+        if self.needs_row_measurement {
             self.initialize_row_content_sizes();
             self.compute_table_measures(TrackAxis::Row);
             for row in &mut self.rows {
@@ -3175,15 +3181,55 @@ impl<'pass> TableFormattingContext<'pass> {
             self.table_block_size = self.table_block_size.max(content_min);
         }
         let table_style = self.style(self.run.box_);
-        if !table_style.height().is_auto() {
-            // If the table has a `height` property other than auto, it is treated as a minimum block size for the
-            // table grid, and will eventually be distributed to the rows if their collective minimum block size is smaller.
-            let mut specified = table_style.height().to_px(self.table_constraints.block_basis());
-            if table_style.box_sizing() == box_sizing::BORDER_BOX {
-                let used = &self.table_box_cells;
-                let collapsed = used.uses_collapsing_borders_model();
-                specified -= used.border_box_top(collapsed) + used.border_box_bottom(collapsed);
+        // https://quirks.spec.whatwg.org/#the-percentage-height-calculation-quirk
+        // NB: In quirks mode, a percentage block size of the table resolves against the nearest ancestor with a
+        //     block size when its containing block has none.
+        let block_basis = self.table_constraints.percentage_basis_block_size.unwrap_or_else(|| {
+            if self.node_facts(self.run.box_).document_in_quirks_mode() {
+                self.table_constraints
+                    .quirks_mode_percentage_basis_block_size
+                    .unwrap_or_default()
+            } else {
+                CssPixels::default()
             }
+        });
+        let border_box_offsets = if table_style.box_sizing() == box_sizing::BORDER_BOX {
+            let used = &self.table_box_cells;
+            let collapsed = used.uses_collapsing_borders_model();
+            used.border_box_top(collapsed) + used.border_box_bottom(collapsed)
+        } else {
+            CssPixels::default()
+        };
+        // If the table has a `height` property other than auto, it is treated as a minimum block size for the
+        // table grid, and will eventually be distributed to the rows if their collective minimum block size is smaller.
+        // The table's `max-height` lowers that size, and its `min-height` raises it, as for the block size of any box.
+        let mut specified =
+            (!table_style.height().is_auto()).then(|| table_style.height().to_px(block_basis) - border_box_offsets);
+        // https://drafts.csswg.org/css-sizing-4/#aspect-ratio
+        // NB: An auto block size follows from the inline size through the preferred aspect ratio. Like a specified
+        //     block size, it only gives the table grid a minimum block size.
+        if specified.is_none()
+            && let Some(ratio) = self.node_facts(self.run.box_).preferred_aspect_ratio()
+        {
+            let used = &self.table_box_cells;
+            let collapsed = used.uses_collapsing_borders_model();
+            let inline_size = if table_style.box_sizing() == box_sizing::BORDER_BOX {
+                used.border_box_inline_size(collapsed)
+            } else {
+                used.content_inline_size()
+            };
+            specified = Some(ratio.divide(inline_size) - border_box_offsets);
+        }
+        if let Some(size) = specified.as_mut()
+            && table_style.max_height().is_length()
+        {
+            *size = (*size).min(table_style.max_height().to_px(block_basis) - border_box_offsets);
+        }
+        if !crate::layout::sizing_context::is_plain_auto(table_style.min_height()) {
+            let minimum = table_style.min_height().to_px(block_basis) - border_box_offsets;
+            specified = Some(specified.map_or(minimum, |size| size.max(minimum)));
+        }
+        if let Some(specified) = specified {
             self.table_block_size = self.table_block_size.max(specified - row_spacing);
         }
         let table_percentage_basis = self.table_block_size + row_spacing;
@@ -3198,22 +3244,15 @@ impl<'pass> TableFormattingContext<'pass> {
             // the second pass of rows layout.
             row.reference_block_size = row.base_block_size;
         }
-        // Second pass of row block-size calculation:
-        // At this point, percentage row block sizes can be resolved because the final table block size is calculated.
-        for row_index in 0..self.rows.len() {
-            if self.rows[row_index].is_collapsed {
-                self.rows[row_index].reference_block_size = CssPixels::default();
-                continue;
-            }
-            let style = self.style(self.rows[row_index].box_);
-            // NB: A percentage block size resolves against the table's, which an auto-height table doesn't have before
-            //     its rows are sized. So in such a table, a row with a percentage block size is sized as an auto row
-            //     is, as a cell with one is (see cell_has_resolvable_percentage_block_size()).
-            if style.height().is_percentage() && !self.table_block_size_is_auto() {
-                let used = style.height().to_px(table_percentage_basis);
-                self.rows[row_index].reference_block_size = self.rows[row_index].reference_block_size.max(used);
+        // NB: Percentage block sizes of rows and cells don't raise the reference sizes here. They are applied when the
+        //     table block size is distributed to the rows (see distribute_block_size_to_rows), where a row grows to its
+        //     percentage block size only as far as the table block size allows.
+        for row in &mut self.rows {
+            if row.is_collapsed {
+                row.reference_block_size = CssPixels::default();
             }
         }
+        self.table_percentage_basis = table_percentage_basis;
         // Second pass cells layout:
         // At this point, percentage cell block sizes can be resolved because the final table block size is calculated.
         for cell_index in 0..self.cells.len() {
@@ -3222,7 +3261,7 @@ impl<'pass> TableFormattingContext<'pass> {
                 continue;
             }
             let style = self.style(cell.box_);
-            let mut cell_box = self.cell_box_cells[cell_index];
+            let mut cell_box = self.cell_layouts[cell_index].box_cells;
             let offsets = cell_box.border_box_top(collapsed) + cell_box.border_box_bottom(collapsed);
             let cell_size = self.cell_specified_outer_block_size(
                 cell.box_,
@@ -3231,11 +3270,7 @@ impl<'pass> TableFormattingContext<'pass> {
                 offsets,
             );
             cell_box.set_content_block_size(cell_size - offsets);
-            self.cell_pre_layout_content_block_sizes[cell_index] = cell_box.content_block_size;
-            if !self.rows[cell.row_index].is_collapsed {
-                self.rows[cell.row_index].reference_block_size =
-                    self.rows[cell.row_index].reference_block_size.max(cell_size);
-            }
+            self.cell_layouts[cell_index].pre_layout_content_block_size = cell_box.content_block_size;
             let span_inline = (0..cell.column_span).fold(CssPixels::default(), |sum, index| {
                 sum + self.columns[cell.column_index + index].used_inline_size
             });
@@ -3244,17 +3279,21 @@ impl<'pass> TableFormattingContext<'pass> {
                     + inline_spacing * self.visible_spanned_columns(cell).saturating_sub(1),
             );
             let inner = cell_box.available_inner_space_or_constraints_from(self.available_space);
-            self.cell_inside_layout_inputs[cell_index] = inner;
-            self.cell_box_cells[cell_index] = cell_box;
-            // The first pass measured this cell at its automatic block size; measure it again at
-            // the percentage-resolved size to preserve the baseline its final inside layout will use.
-            let content_baselines = self
-                .measure_cell(run, cell_index, inner, false)
-                .map(|measured| measured.baselines);
-            let baseline = self.cell_baseline(cell_index, content_baselines);
-            self.cells[cell_index].baseline = baseline;
+            self.cell_layouts[cell_index].inside_layout_input = inner;
+            self.cell_layouts[cell_index].box_cells = cell_box;
+            // The resolved size supplies the percentage basis for descendants. Keep the content's automatic size
+            // for alignment within the rows, as in the first pass.
+            self.layout_inside_cell(
+                run,
+                cell_index,
+                RootSizingDirectives {
+                    content_block_size_after_run: geometry::ContentBlockSizeAfterRun::Automatic,
+                    ..RootSizingDirectives::default()
+                },
+            );
+            self.cells[cell_index].baseline = self.cell_baseline(cell_index);
             if !self.rows[cell.row_index].is_collapsed {
-                let border_size = cell_box.border_box_block_size(collapsed);
+                let border_size = self.cell_layouts[cell_index].box_cells.border_box_block_size(collapsed);
                 self.rows[cell.row_index].reference_block_size =
                     self.rows[cell.row_index].reference_block_size.max(border_size);
                 self.note_cell_in_row_baseline(cell_index, &style);
@@ -3264,7 +3303,7 @@ impl<'pass> TableFormattingContext<'pass> {
     }
 
     /// Makes each row at least as tall as its baseline-aligned cells reach once they are aligned. A cell whose
-    /// baseline lies above the row's baseline is moved down to it (see cell_intrinsic_block_padding), so the row must
+    /// baseline lies above the row's baseline is moved down to it (see cell_contents_block_offset), so the row must
     /// hold the row's baseline plus the largest descent below it: "First the cells that are aligned on their baseline
     /// are positioned. This will establish the baseline of the row. [...] The row now has a top, possibly a baseline,
     /// and a provisional height, which is the distance from the top to the lowest bottom of the cells positioned so
@@ -3283,13 +3322,24 @@ impl<'pass> TableFormattingContext<'pass> {
     }
 
     /// Shrinks the used padding, then the used borders, of a cell so that they fit within `inline_size`, the inline
-    /// size of the columns the cell spans. The end side goes first so that the content keeps its position relative to
-    /// the start of the cell for as long as possible.
-    fn shrink_cell_offsets_to_fit(cell_box: &mut used_values::RootInputCells, collapsed: bool, inline_size: CssPixels) {
+    /// size of the columns the cell spans, or only its end padding unless `shrinks_start_padding_and_borders`. The end
+    /// side goes first so that the content keeps its position relative to the start of the cell for as long as
+    /// possible.
+    fn shrink_cell_offsets_to_fit(
+        cell_box: &mut used_values::RootInputCells,
+        collapsed: bool,
+        inline_size: CssPixels,
+        shrinks_start_padding_and_borders: bool,
+    ) {
         let excess = |cell_box: &used_values::RootInputCells| {
             cell_box.border_box_left(collapsed) + cell_box.border_box_right(collapsed) - inline_size
         };
-        for is_start_side in [false, true] {
+        let shrinking_sides: &[bool] = if shrinks_start_padding_and_borders {
+            &[false, true]
+        } else {
+            &[false]
+        };
+        for &is_start_side in shrinking_sides {
             let reduction = excess(cell_box)
                 .min(if is_start_side {
                     cell_box.padding_left
@@ -3303,6 +3353,9 @@ impl<'pass> TableFormattingContext<'pass> {
                 &mut cell_box.padding_right
             };
             *padding -= reduction;
+        }
+        if !shrinks_start_padding_and_borders {
+            return;
         }
         for is_start_side in [false, true] {
             let remaining = excess(cell_box);
@@ -3336,57 +3389,165 @@ impl<'pass> TableFormattingContext<'pass> {
         }
     }
 
-    fn distribute_block_size_to_rows(&mut self) {
-        let sum = self
-            .rows
+    /// The block size a row takes from its own percentage block size and those of the cells that span only that
+    /// row, resolved against `basis`, if any of them has one. `cells_of_row` holds the indices of the cells that
+    /// originate in the row.
+    fn row_percentage_block_size(
+        &self,
+        row_index: usize,
+        cells_of_row: &[usize],
+        basis: CssPixels,
+    ) -> Option<CssPixels> {
+        let row_height = self.style(self.rows[row_index].box_).height();
+        let mut size = row_height
+            .percentage_fraction()
+            .is_some()
+            .then(|| row_height.to_px(basis));
+        let collapsed = self.style(self.run.box_).border_collapse() != BORDER_COLLAPSE_SEPARATE;
+        for &cell_index in cells_of_row {
+            let cell = self.cells[cell_index];
+            if cell.row_span != 1 {
+                continue;
+            }
+            let style = self.style(cell.box_);
+            if style.height().percentage_fraction().is_none() {
+                continue;
+            }
+            let cell_box = &self.cell_layouts[cell_index].box_cells;
+            let offsets = cell_box.border_box_top(collapsed) + cell_box.border_box_bottom(collapsed);
+            let cell_size =
+                self.cell_specified_outer_block_size(cell.box_, &style, style.height().to_px(basis), offsets);
+            size = Some(size.map_or(cell_size, |size: CssPixels| size.max(cell_size)));
+        }
+        size
+    }
+
+    /// Whether neither a row nor any of its cells has a specified block size, so that its block size depends only on
+    /// its contents. `cells_of_row` holds the indices of the cells that originate in the row.
+    fn row_is_auto(&self, row_index: usize, cells_of_row: &[usize]) -> bool {
+        // INTEROP: A calculation that mixes a percentage with a length, like calc(25% + 10px), counts as auto here, as
+        //          in other engines.
+        let acts_as_auto = |size: &ComputedSize| {
+            size.is_auto() || (size.contains_percentage() && size.percentage_fraction().is_none())
+        };
+        acts_as_auto(self.style(self.rows[row_index].box_).height())
+            && cells_of_row
+                .iter()
+                .all(|&cell_index| acts_as_auto(self.style(self.cells[cell_index].box_).height()))
+    }
+
+    /// Adds `amount` to the final block sizes of `rows`, in proportion to their current final block sizes, or in
+    /// equal shares if they are all empty.
+    fn grow_rows_proportionally(&mut self, rows: &[usize], amount: CssPixels) {
+        let total = rows.iter().fold(CssPixels::default(), |sum, &index| {
+            sum + self.rows[index].final_block_size
+        });
+        let weights = rows
             .iter()
-            .fold(CssPixels::default(), |sum, row| sum + row.reference_block_size);
+            .map(|&index| {
+                if total > CssPixels::default() {
+                    self.rows[index].final_block_size.to_double()
+                } else {
+                    1.0
+                }
+            })
+            .collect::<Vec<_>>();
+        let total_weight: f64 = weights.iter().sum();
+        // Hand out cumulative shares so that the rounded increments add up to exactly `amount`.
+        let mut accumulated_weight = 0.0;
+        let mut distributed = CssPixels::default();
+        for (&index, weight) in rows.iter().zip(weights) {
+            accumulated_weight += weight;
+            let target = CssPixels::nearest_value_for(amount.to_double() * accumulated_weight / total_weight);
+            self.rows[index].final_block_size += target - distributed;
+            distributed = target;
+        }
+    }
+
+    // NB: The specification's distribution of the table block size to the rows
+    //     (https://drafts.csswg.org/css-tables-3/#distributing-height-to-rows) is not what browsers do, and is
+    //     unresolved (https://github.com/w3c/csswg-drafts/issues/4418).
+    // INTEROP: Rows keep their reference sizes, and the rest of the table block size goes first to rows with a
+    //          percentage block size, in row order, each growing to at most that size. What remains then goes to the
+    //          rows whose block size depends only on their contents, in proportion to their block sizes, or else to
+    //          all rows in proportion to their block sizes. When the table has rows outside of header and footer
+    //          groups, only those rows grow, and their percentages resolve against their share of the table.
+    fn distribute_block_size_to_rows(&mut self) {
         let visible = self.rows.iter().filter(|row| !row.is_collapsed).count();
         if visible == 0 {
             return;
         }
-        let auto_rows = (0..self.rows.len())
-            .filter(|index| {
-                // NB: A row with a percentage block size counts as an auto row in an auto-height table.
-                let height = self.style(self.rows[*index].box_).height();
-                !self.rows[*index].is_collapsed
-                    && (height.is_auto() || (height.is_percentage() && self.table_block_size_is_auto()))
-            })
-            .collect::<Vec<_>>();
-        if self.table_block_size <= sum && sum != CssPixels::default() {
-            // If the table block size is no larger than the sum of reference sizes, each final row block size is the
-            // weighted mean of the base and reference sizes that yields the correct total block size.
-
-            for row in &mut self.rows {
-                if row.is_collapsed {
-                    row.final_block_size = CssPixels::default();
-                } else {
-                    row.final_block_size = CssPixels::nearest_value_for(
-                        self.table_block_size.to_double() * row.reference_block_size.to_double() / sum.to_double(),
-                    );
+        for row in &mut self.rows {
+            row.final_block_size = if row.is_collapsed {
+                CssPixels::default()
+            } else {
+                row.reference_block_size
+            };
+        }
+        let sum = self
+            .rows
+            .iter()
+            .fold(CssPixels::default(), |sum, row| sum + row.final_block_size);
+        if self.table_block_size <= sum {
+            self.table_block_size = sum;
+        } else {
+            let mut excess = self.table_block_size - sum;
+            let mut cells_by_row = vec![Vec::new(); self.rows.len()];
+            for (cell_index, cell) in self.cells.iter().enumerate() {
+                cells_by_row[cell.row_index].push(cell_index);
+            }
+            // NB: Only the first header group and the first footer group are rendered as such, and the rows are in
+            //     layout order, which puts them first and last (see row_containers_in_layout_order). Any other header
+            //     or footer group acts as an ordinary row group.
+            let row_group_if = |row: Option<&Row>, is_group: fn(&NodeFacts) -> bool| {
+                row.map(|row| self.parent(row.box_))
+                    .filter(|&parent| is_group(&self.node_facts(parent)))
+            };
+            let header_group = row_group_if(self.rows.first(), |facts| facts.is_table_header_group());
+            let footer_group = row_group_if(self.rows.last(), |facts| facts.is_table_footer_group());
+            let body_rows = (0..self.rows.len())
+                .filter(|&index| {
+                    if self.rows[index].is_collapsed {
+                        return false;
+                    }
+                    let parent = Some(self.parent(self.rows[index].box_));
+                    parent != header_group && parent != footer_group
+                })
+                .collect::<Vec<_>>();
+            let (growing_rows, percentage_basis) = if body_rows.is_empty() || body_rows.len() == visible {
+                let rows = (0..self.rows.len())
+                    .filter(|&index| !self.rows[index].is_collapsed)
+                    .collect::<Vec<_>>();
+                (rows, self.table_percentage_basis)
+            } else {
+                let body_sum = body_rows.iter().fold(CssPixels::default(), |sum, &index| {
+                    sum + self.rows[index].final_block_size
+                });
+                (body_rows, body_sum + excess)
+            };
+            for &index in &growing_rows {
+                if excess <= CssPixels::default() {
+                    break;
+                }
+                if let Some(size) = self.row_percentage_block_size(index, &cells_by_row[index], percentage_basis) {
+                    let growth = (size - self.rows[index].final_block_size)
+                        .max(CssPixels::default())
+                        .min(excess);
+                    self.rows[index].final_block_size += growth;
+                    excess -= growth;
                 }
             }
-        } else if !auto_rows.is_empty() {
-            // Else, if the table owns any auto-block-size row, each non-auto row receives its reference block size and
-            // auto rows receive their reference size plus an equal share of the missing table block size.
-
-            for row in &mut self.rows {
-                row.final_block_size = row.reference_block_size;
-            }
-            let increment = (self.table_block_size - sum) / auto_rows.len();
-            for index in auto_rows {
-                self.rows[index].final_block_size += increment;
-            }
-        } else {
-            // Else, all rows receive their reference size plus an equal share of the missing table block size.
-
-            let increment = (self.table_block_size - sum) / visible;
-            for row in &mut self.rows {
-                row.final_block_size = if row.is_collapsed {
-                    CssPixels::default()
+            if excess > CssPixels::default() {
+                let auto_rows = growing_rows
+                    .iter()
+                    .copied()
+                    .filter(|&index| self.row_is_auto(index, &cells_by_row[index]))
+                    .collect::<Vec<_>>();
+                if auto_rows.is_empty() {
+                    self.grow_rows_proportionally(&growing_rows, excess);
                 } else {
-                    row.reference_block_size + increment
-                };
+                    self.grow_rows_proportionally(&auto_rows, excess);
+                }
             }
         }
         // Add undistributable space due to border spacing: https://www.w3.org/TR/css-tables-3/#computing-undistributable-space.
@@ -3468,111 +3629,100 @@ impl<'pass> TableFormattingContext<'pass> {
         self.table_block_size = self.table_block_size.max(total);
     }
 
-    fn layout_deferred_cells_inside(&mut self, run: &FormattingContextRun<'pass>) {
-        // Deferred cells get their one and only committing inside layout here, once row
-        // block sizes are final.
+    /// Whether the block size of a cell is definite once the rows are sized, so that its contents resolve percentage
+    /// block sizes against it.
+    // INTEROP: CSS 2.1 leaves this undefined. Like other engines, the cell's block size is definite when the cell has a
+    //          length block size, or when the table has a computed block size other than auto (even a percentage
+    //          that acts as auto) and the rows gave the cell a block size other than the one its contents gave it. A
+    //          block size the row specifies alone doesn't make it definite.
+    fn cell_block_size_is_definite_after_row_sizing(&self, cell_index: usize, collapsed: bool) -> bool {
+        let cell = self.cells[cell_index];
+        if self.style(cell.box_).height().is_length() {
+            return true;
+        }
+        !self.style(self.run.box_).height().is_auto()
+            && self.compute_row_content_block_size(cell)
+                != self.cell_layouts[cell_index].box_cells.border_box_block_size(collapsed)
+    }
+
+    /// Stretches each cell to the rows it spans and aligns its contents in them: the table moves the contents as it
+    /// places the cell, or, where the cell's run laid out the absolutely positioned boxes the cell contains, lays the
+    /// cell out again at its stretched size with its contents moved, for those boxes to be laid out against it.
+    fn stretch_cells_to_their_rows(&mut self, run: &FormattingContextRun<'pass>) {
         let collapsed = self.style(self.run.box_).border_collapse() != BORDER_COLLAPSE_SEPARATE;
         for cell_index in 0..self.cells.len() {
-            if !self.deferred_cell_inside_layouts[cell_index] {
-                continue;
-            }
             let cell = self.cells[cell_index];
-            let adopt_automatic_content_block_size = !self.cell_has_resolvable_percentage_block_size(cell.box_);
-            let intrinsic_block_padding = self.cell_intrinsic_block_padding(cell_index, collapsed);
-            let measured_content_block_size = self.cell_box_cells[cell_index].content_block_size;
-            if let Some(measurement) = self.cell_measurements[cell_index]
-                && run.fragments.is_none()
-                && self.style(cell.box_).height().is_auto()
-                && !self.node_facts(cell.box_).is_anonymous()
-                && !measurement.depends_on_percentage_block_size
+            if self.cell_layouts[cell_index].contents_depend_on_percentage_block_size
+                && self.cell_block_size_is_definite_after_row_sizing(cell_index, collapsed)
             {
-                // A measurement exports table sizes and row baselines, with no descendant
-                // fragments. Row sizing has already consumed this cell's measured height and
-                // baselines. Apply the final alignment padding without laying out its contents
-                // again. Keep percentage-height cells and anonymous flex/grid wrappers on the
-                // full path until their final-input dependencies are accounted for.
-                let cell_box = &mut self.cell_box_cells[cell_index];
-                cell_box.padding_top += intrinsic_block_padding.0;
-                cell_box.padding_bottom += intrinsic_block_padding.1;
-                let laid_out = run_state::LaidOutChildBox {
-                    cells: *cell_box,
-                    baselines: measurement.baselines,
-                    orthogonal_flow_baselines: None,
-                    line_data: None,
-                };
-                self.placed_cells[cell_index] = Some(formatting_context::PlacedChild::of_laid_out_box(&laid_out));
-                self.content_baselines_of_handed_back_cells[cell_index] = Some(laid_out.baselines);
-                formatting_context::propagate_percentage_block_size_dependency_to_containing_block(
-                    run.state,
-                    &run.pass,
-                    cell.box_,
-                    measurement.depends_on_percentage_block_size,
+                // Lay the contents out again with the final block size of the cell as their percentage basis.
+                let mut cell_box = self.cell_layouts[cell_index].box_cells;
+                let offsets = cell_box.border_box_top(collapsed) + cell_box.border_box_bottom(collapsed);
+                cell_box.set_content_block_size(self.compute_row_content_block_size(cell) - offsets);
+                cell_box.has_definite_block_size = true;
+                let layout = &mut self.cell_layouts[cell_index];
+                layout.inside_layout_input = cell_box.available_inner_space_or_constraints_from(self.available_space);
+                layout.pre_layout_content_block_size = cell_box.content_block_size;
+                layout.box_cells = cell_box;
+                self.layout_inside_cell(
+                    run,
+                    cell_index,
+                    RootSizingDirectives {
+                        content_block_size_after_run: geometry::ContentBlockSizeAfterRun::Automatic,
+                        ..RootSizingDirectives::default()
+                    },
                 );
+            }
+            let laid_out = self.cell_layouts[cell_index].box_cells;
+            let free_space = self.compute_row_content_block_size(cell) - laid_out.border_box_block_size(collapsed);
+            let contents_block_offset = self.cell_contents_block_offset(cell_index, free_space);
+            let stretched_content_block_size = laid_out.content_block_size + free_space;
+            let layout = &mut self.cell_layouts[cell_index];
+            if !layout.run_laid_out_abspos_contained_by_cell
+                || (free_space == CssPixels::default() && contents_block_offset == CssPixels::default())
+            {
+                layout.box_cells.set_content_block_size(stretched_content_block_size);
+                layout.contents_block_offset = contents_block_offset;
                 continue;
             }
-            // The first pass adopted the measured automatic block size so row sizing could read
-            // it; restore the pre-layout size so the cell's children resolve percentages against
-            // the same basis the measurement saw.
-            let pre_layout_content_block_size = self.cell_pre_layout_content_block_sizes[cell_index];
-            let cell_box = &mut self.cell_box_cells[cell_index];
-            cell_box.set_content_block_size(pre_layout_content_block_size);
-            cell_box.padding_top += intrinsic_block_padding.0;
-            cell_box.padding_bottom += intrinsic_block_padding.1;
-            let inner = self.cell_inside_layout_inputs[cell_index];
-            let (_, fragment_arrival) =
-                self.layout_inside_cell(run, cell_index, inner, adopt_automatic_content_block_size);
-            self.keep_fragment_arrival_of_cell(cell_index, fragment_arrival);
-            if adopt_automatic_content_block_size {
-                debug_assert_eq!(
-                    self.cell_box_cells[cell_index].content_block_size, measured_content_block_size,
-                    "measured and committed automatic block sizes diverged"
-                );
-            }
-        }
-    }
-
-    fn cell_intrinsic_block_padding(&mut self, cell_index: usize, collapsed: bool) -> (CssPixels, CssPixels) {
-        let cell = self.cells[cell_index];
-        let row_size = self.compute_row_content_block_size(cell);
-        let used = self.cell_box_cells[cell_index];
-        let style = self.style(cell.box_);
-        // When a table cell is an anonymous wrapper around a flex or grid container (e.g., a <td> with display:flex is
-        // wrapped in an anonymous table-cell box per CSS Tables 3), the cell should be aligned to the top. This allows
-        // the flex/grid container to fill the cell and handle alignment of its children via its own properties.
-        if self.anonymous_cell_wraps_flex_or_grid(cell) {
-            return (CssPixels::default(), row_size - used.border_box_block_size(collapsed));
-        }
-        // The following image shows various alignment lines of a row:
-        // https://www.w3.org/TR/css-tables-3/images/cell-align-explainer.png
-        // https://drafts.csswg.org/css2/#height-layout
-        // In the context of tables, values for vertical-align have the following meanings:
-        if Self::cell_is_baseline_aligned(&style) {
-            // The baseline of the cell is put at the same height as the baseline of the first of the rows it spans.
-            let padding_top = self.rows[cell.row_index].baseline.unwrap_or(cell.baseline) - cell.baseline;
-            return (
-                padding_top,
-                row_size - (used.border_box_block_size(collapsed) + padding_top),
+            layout
+                .box_cells
+                .set_content_block_size(layout.pre_layout_content_block_size);
+            self.layout_inside_cell(
+                run,
+                cell_index,
+                RootSizingDirectives {
+                    content_block_size_after_run: geometry::ContentBlockSizeAfterRun::Given(
+                        stretched_content_block_size,
+                    ),
+                    table_cell_contents_block_offset: contents_block_offset,
+                    ..RootSizingDirectives::default()
+                },
             );
         }
-        match style.vertical_align_keyword() {
-            vertical_align::MIDDLE => {
-                // The center of the cell is aligned with the center of the rows it spans.
-                let difference = row_size - used.border_box_block_size(collapsed);
-                (difference / 2, difference / 2)
+    }
+
+    /// How far the contents of the cell at `cell_index` move down to align them in the rows it spans, which leave
+    /// `free_space` beside its border box.
+    fn cell_contents_block_offset(&self, cell_index: usize, free_space: CssPixels) -> CssPixels {
+        let cell = self.cells[cell_index];
+        // An anonymous cell around a flex or grid container (such as a <td> with display: flex, which CSS Tables 3
+        // wraps in one) aligns the container at its top, so that the container aligns its children itself.
+        if self.anonymous_cell_wraps_flex_or_grid(cell) {
+            return CssPixels::default();
+        }
+        match box_alignment::cell_alignment(self.style(cell.box_)) {
+            // The baseline of the cell is put at the same height as the baseline of the first of the rows it spans.
+            box_alignment::CellAlignment::Baseline => {
+                self.rows[cell.row_index].baseline.unwrap_or(cell.baseline) - cell.baseline
             }
-            vertical_align::TOP => {
-                // The top of the cell box is aligned with the top of the first row it spans.
-                (CssPixels::default(), row_size - used.border_box_block_size(collapsed))
+            box_alignment::CellAlignment::Content(alignment) => {
+                alignment.offset(free_space, box_alignment::OverflowSafety::Safe)
             }
-            vertical_align::BOTTOM => {
-                // The bottom of the cell box is aligned with the bottom of the last row it spans.
-                (row_size - used.border_box_block_size(collapsed), CssPixels::default())
-            }
-            _ => unreachable!("every other value aligns the cell at the baseline"),
         }
     }
 
-    fn compute_row_content_block_size(&mut self, cell: TableCell) -> CssPixels {
+    fn compute_row_content_block_size(&self, cell: TableCell) -> CssPixels {
         // The block size of a cell is the sum of all spanned rows, as described in
         // https://www.w3.org/TR/css-tables-3/#bounding-box-assignment
         let first = &self.row_boxes[cell.row_index].cells;
@@ -3615,14 +3765,6 @@ impl<'pass> TableFormattingContext<'pass> {
     }
 
     fn position_cell_boxes(&mut self) {
-        let spacing = self.border_spacing_inline();
-        let mut offset = CssPixels::default();
-        for column in &mut self.columns {
-            column.inline_offset = offset;
-            if !column.is_collapsed {
-                offset += column.used_inline_size + spacing;
-            }
-        }
         let collapsed = self.style(self.run.box_).border_collapse() != BORDER_COLLAPSE_SEPARATE;
         let table_box = self.table_box_cells();
         let inset_percentage_basis = geometry::LogicalSize {
@@ -3634,18 +3776,19 @@ impl<'pass> TableFormattingContext<'pass> {
             .percentage_block_insets_of_root_children_have_definite_basis(&table_box);
         for cell_index in 0..self.cells.len() {
             let cell = self.cells[cell_index];
-            let cell_box = self.cell_box_cells[cell_index];
+            let cell_box = self.cell_layouts[cell_index].box_cells;
             let row_content_offset = self.row_boxes[cell.row_index].content_offset.get();
             // Compute cell position as specified by https://www.w3.org/TR/css-tables-3/#bounding-box-assignment:
             // left/top location is the sum of:
             // - for top: the height reserved for top captions (including margins), if any
             // - the padding-left/padding-top and border-left-width/border-top-width of the table
-            // - the border spacing after each visible column before the cell (in its column's inline_offset)
+            // - the border spacing after each visible column before the cell (in its column's offset)
             let x = row_content_offset.x
                 + cell_box.border_box_left(collapsed)
-                + self.columns[cell.column_index].inline_offset;
+                + self.column_offsets[self
+                    .physical_columns(cell.column_index..cell.column_index + cell.column_span)
+                    .start];
             let y = row_content_offset.y + cell_box.border_box_top(collapsed);
-            let fragment_arrival = self.cell_fragment_arrivals[cell_index].take();
             // A relatively positioned cell is offset from where the table places it, as any in-flow box is.
             let insets = abspos_engine::compute_inset_native(
                 &self.run,
@@ -3654,18 +3797,23 @@ impl<'pass> TableFormattingContext<'pass> {
                 inset_percentage_basis,
                 percentage_block_insets_have_definite_basis,
             );
-            let placed_cell = self.placed_cells[cell_index]
-                .take()
-                .expect("a cell is laid out before it is placed")
-                .with_fragment_facts(self.cell_fragment_facts[cell_index])
-                .with_in_flow_box_insets(insets);
+            let layout = &mut self.cell_layouts[cell_index];
+            let mut placed_cell = layout.placed.take().expect("a cell is laid out before it is placed");
+            placed_cell.geometry.cells = cell_box;
+            let placed_cell = placed_cell
+                .with_fragment_facts(layout.fragment_facts)
+                .with_in_flow_box_insets(insets)
+                .with_contents_shift(FfiCssPixelPoint {
+                    x: CssPixels::default(),
+                    y: layout.contents_block_offset,
+                });
             formatting_context::place_child(
                 &self.run,
                 cell.box_,
                 placed_cell,
                 FfiCssPixelPoint { x, y },
                 None,
-                fragment_arrival,
+                layout.fragment_arrival.take(),
             );
         }
     }
@@ -3698,26 +3846,15 @@ impl<'pass> TableFormattingContext<'pass> {
         }
         let block_size = block_end - block_start;
 
-        // The inline offsets of the columns, each followed by the border spacing after it, so that a range of
-        // columns spans the spacing between them but not the spacing around them.
-        let column_count = self.columns.len();
-        let mut column_offsets = Vec::with_capacity(column_count + 1);
-        let mut offset = CssPixels::default();
-        for column in &self.columns {
-            column_offsets.push(offset);
-            if !column.is_collapsed {
-                offset += column.used_inline_size + inline_spacing;
-            }
-        }
-        column_offsets.push(offset);
-
+        // A range of columns spans the border spacing between them but not the spacing around them.
+        let column_offsets = &self.column_offsets;
         // Columns are assigned to grid columns in tree order, like the cells they contain (see
-        // column_track_ranges()). A column group is placed before its columns: a table-column-group box is the
+        // collect_column_track_ranges()). A column group is placed before its columns: a table-column-group box is the
         // containing block of its columns, so they are positioned relative to it. So the placements come in the
         // order of column_boxes(), and each column refers to the placement of its group by its index.
         let mut placements: Vec<(Node, Option<usize>, usize, usize)> = Vec::new();
         let mut group_placement: Option<usize> = None;
-        for range in self.column_track_ranges() {
+        for &range in &self.column_track_ranges {
             match range.group {
                 Some(group) => match group_placement {
                     Some(index) if placements[index].0 == group => placements[index].3 = range.end,
@@ -3735,13 +3872,17 @@ impl<'pass> TableFormattingContext<'pass> {
         debug_assert_eq!(placements.len(), self.column_group_and_column_boxes.len());
         for (placement_index, (node, group_placement, start, end)) in placements.into_iter().enumerate() {
             let inline_size = if (start..end).any(|index| !self.columns[index].is_collapsed) {
-                column_offsets[end] - column_offsets[start] - inline_spacing
+                let columns = self.physical_columns(start..end);
+                column_offsets[columns.end] - column_offsets[columns.start] - inline_spacing
             } else {
                 CssPixels::default()
             };
             let fragment_facts = run_state::FragmentFactsDecidedByParent {
-                table_column_index: start as u32,
-                table_column_span: (end - start) as u32,
+                show: fragment_tree::ParentShowFacts {
+                    table_column_index: start as u32,
+                    table_column_span: (end - start) as u32,
+                    ..fragment_tree::ParentShowFacts::default()
+                },
                 ..run_state::FragmentFactsDecidedByParent::default()
             };
             let (column_node, column_box) = &self.column_group_and_column_boxes[placement_index];
@@ -3752,7 +3893,7 @@ impl<'pass> TableFormattingContext<'pass> {
             let used = &column_box.cells;
             used.set_content_inline_size(inline_size);
             used.set_content_block_size(block_size);
-            let mut x = inline_offset + column_offsets[start];
+            let mut x = inline_offset + column_offsets[self.physical_columns(start..end).start];
             let mut y = block_start;
             if let Some((group, group_box)) =
                 group_placement.map(|group_placement| &self.column_group_and_column_boxes[group_placement])
@@ -3789,6 +3930,20 @@ impl<'pass> TableFormattingContext<'pass> {
     /// Rows are positioned in the coordinate space of the table wrapper (see position_row_boxes), so the baselines are
     /// made relative to the content box of the table box here.
     fn derive_table_box_baselines(&self) {
+        let arena = self.run.pass.arena();
+        if arena.element_adjustment_facts(arena.dom_node_style_node(self.run.box_))
+            & element_adjustment_fact::IS_MATHML_MTABLE
+            != 0
+        {
+            let baseline = math_formatting_context::table_baseline(&self.style(self.run.box_), self.table_box_cells());
+            self.derived_baselines_of_root_box.set(DerivedBaselines {
+                first: Some(baseline),
+                last: Some(baseline),
+                inline_alignment: Some(baseline),
+            });
+            return;
+        }
+
         let baseline_in_wrapper =
             |row_index: usize| self.row_boxes[row_index].content_offset.get().y + self.row_baseline(row_index);
         // Collapsed rows are removed from the display (https://www.w3.org/TR/CSS22/tables.html#dynamic-effects).
@@ -3807,14 +3962,10 @@ impl<'pass> TableFormattingContext<'pass> {
         });
     }
 
-    pub(super) fn run(
-        &mut self,
-        run: &FormattingContextRun<'pass>,
-        input: LayoutInput,
-        inline_layout: Option<TableInlineLayout>,
-    ) {
+    fn run(&mut self, run: &FormattingContextRun<'pass>, input: LayoutInput, inline_layout: Option<TableInlineLayout>) {
         self.available_space = input.available_space;
         self.min_border_box_block_size_from_flex_item = input.sizing.forced_min_border_box_block_size.get();
+        self.forced_border_box_inline_size = input.sizing.forced_table_box_border_box_inline_size.get();
         self.table_box_content_block_offset_in_wrapper = input
             .sizing
             .table_box_content_block_offset_in_wrapper
@@ -3847,10 +3998,24 @@ impl<'pass> TableFormattingContext<'pass> {
         // Distribute the inline size of the table among columns.
         distribute_inline_size(&mut self.columns, assignable, fixed);
         self.remove_collapsed_columns();
+        let inline_spacing = self.border_spacing_inline();
+        // The offsets of the columns are physical ones, from the left, as those of the collapsed borders are.
+        let column_inline_size = |column: &Column| {
+            if column.is_collapsed {
+                CssPixels::default()
+            } else {
+                column.used_inline_size + inline_spacing
+            }
+        };
+        self.column_offsets = if self.is_right_to_left() {
+            grid_line_offsets(self.columns.iter().rev().map(column_inline_size))
+        } else {
+            grid_line_offsets(self.columns.iter().map(column_inline_size))
+        };
         self.compute_table_block_size(run);
         self.distribute_block_size_to_rows();
         self.position_row_boxes();
-        self.layout_deferred_cells_inside(run);
+        self.stretch_cells_to_their_rows(run);
         self.position_cell_boxes();
         self.position_column_boxes();
         self.materialize_collapsed_table_borders();
@@ -3859,7 +4024,7 @@ impl<'pass> TableFormattingContext<'pass> {
         self.automatic_content_block_size = self.table_block_size;
     }
 
-    pub(super) fn derived_baselines_of_root_box(&self) -> DerivedBaselines {
+    fn derived_baselines_of_root_box(&self) -> DerivedBaselines {
         self.derived_baselines_of_root_box.get()
     }
 }

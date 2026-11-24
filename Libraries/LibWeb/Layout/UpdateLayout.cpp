@@ -17,6 +17,7 @@
 #include <LibWeb/DOM/ShadowRoot.h>
 #include <LibWeb/HTML/AttributeNames.h>
 #include <LibWeb/HTML/EventLoop/EventLoop.h>
+#include <LibWeb/HTML/HTMLEmbedElement.h>
 #include <LibWeb/HTML/HTMLObjectElement.h>
 #include <LibWeb/HTML/LocalNavigable.h>
 #include <LibWeb/Layout/LayoutRustFFI.h>
@@ -45,10 +46,12 @@ Layout::RustFFI::FfiLayoutUpdateHostCallbacks Document::layout_update_host_callb
             auto viewport_rect = document_is_active ? navigable->viewport_rect() : CSSPixelRect {};
             return {
                 .document_is_active = document_is_active,
-                .document_needs_layout_tree_build = document.needs_layout_tree_update() || document.child_needs_layout_tree_update(),
-                .top_layer_work_pending = document.m_top_layer_needs_layout_zone_rebuild || !document.m_elements_with_pending_top_layer_membership_change.is_empty(),
+                .document_needs_layout_tree_build = document.layout_node_arena_if_created() && Layout::RustFFI::render_state_layout_tree_update_marks_need_build(document.layout_node_arena_if_created()->host()),
+                .top_layer_work_pending = !document.m_elements_with_pending_top_layer_membership_change.is_empty(),
                 .should_collect_devtools_layout_data = document.page().client().has_active_devtools_client(),
                 .document_in_quirks_mode = document.in_quirks_mode(),
+                .document_in_limited_quirks_mode = document.in_limited_quirks_mode(),
+                .suppresses_viewport_scrolling = document_is_active && navigable->container_suppresses_viewport_scrolling(),
                 .viewport_inline_size_raw = viewport_rect.width().raw_value(),
                 .viewport_block_size_raw = viewport_rect.height().raw_value(),
                 .document_style_node = document.style_node_id().value(),
@@ -56,7 +59,6 @@ Layout::RustFFI::FfiLayoutUpdateHostCallbacks Document::layout_update_host_callb
             }; },
         .container_query_evaluation_is_pending = [](void* context, Layout::BegunRead const* read) -> bool { return static_cast<Document*>(context)->has_size_containers_needing_evaluation_after_layout(*read); },
         .needs_style_update_after_layout = [](void* context, Layout::BegunRead const* read) -> bool { return static_cast<Document*>(context)->needs_style_update_after_layout(*read); },
-        .prepare_for_rendering = [](void* context, Layout::BegunRead const* read) { static_cast<Document*>(context)->prepare_for_rendering(*read); },
         .prepare_layout_tree_build = [](void* context, Layout::BegunRead const* read, bool may_create_viewport) -> u64 {
             auto& document = *static_cast<Document*>(context);
             // The viewport's style is the document's, which the style computer makes rather than publishes, so a build
@@ -85,11 +87,9 @@ Layout::RustFFI::FfiLayoutUpdateHostCallbacks Document::layout_update_host_callb
             document.m_paint_state = make<Painting::DocumentPaintState>(arena); },
         .reconcile_stale_list_item_counters_after_tree_build = [](void* context, Layout::RustFFI::FfiNodeIdentity const* rebuilt_roots, size_t count) -> bool { return static_cast<Document*>(context)->reconcile_stale_list_item_counters_after_tree_build({ rebuilt_roots, count }); },
         .after_layout_commit = [](void* context, Layout::BegunRead const* read, bool layout_tree_changed) { static_cast<Document*>(context)->after_layout_commit(*read, layout_tree_changed ? LayoutTreeChanged::Yes : LayoutTreeChanged::No); },
-        .note_full_layout_performed = [](void* context) { static_cast<Document*>(context)->style_invalidation_counters().relayouts_performed++; },
         .evaluate_pending_container_queries = [](void* context, Layout::BegunRead const* read) { static_cast<Document*>(context)->style_computer().style_engine().evaluate_size_containers_needing_evaluation_after_layout(*read); },
         .record_stabilization_bound_failure = [](void* context, Layout::BegunRead const* read) -> Layout::RustFFI::FfiStabilizationBoundFailureHostFacts {
             auto& document = *static_cast<Document*>(context);
-            ++document.m_style_invalidation_counters.style_stabilization_bound_failures;
             auto navigable = document.navigable();
             return {
                 .document_is_top_level = navigable && navigable->is_top_level_traversable(),
@@ -98,10 +98,8 @@ Layout::RustFFI::FfiLayoutUpdateHostCallbacks Document::layout_update_host_callb
                 .has_flown_style_update = document.has_flown_style_update(),
                 .size_containers_await_evaluation = document.has_size_containers_needing_evaluation_after_layout(*read),
                 .list_items_await_renumbering = !document.m_list_owners_pending_item_renumber.is_empty(),
-                .top_layer_zone_rebuild_pending = document.m_top_layer_needs_layout_zone_rebuild,
                 .top_layer_membership_changes_pending = !document.m_elements_with_pending_top_layer_membership_change.is_empty(),
                 .document_needs_layout_tree_update = document.needs_layout_tree_update(),
-                .document_child_needs_layout_tree_update = document.child_needs_layout_tree_update(),
             }; },
         .attach_style_resources = [](void* context, Layout::BegunRead const* read, Compositing::RustFFI::NodeSlotId slot, bool owns_content_replacement_image, Layout::RustFFI::FfiStyleImageFacts images) {
             auto& document = *static_cast<Document*>(context);
@@ -225,7 +223,9 @@ Document::LayoutAsItFlew::LayoutAsItFlew(Document& document)
 Document::LayoutAsItFlew::~LayoutAsItFlew()
 {
     m_document->m_reads_layout_as_it_flew = false;
-    Layout::RustFFI::document_host_queue_writes_set_aside(m_document->layout_node_arena().host());
+    // A recording made while the writes were set aside painted without them, and took the requests to record they made.
+    if (Layout::RustFFI::document_host_queue_writes_set_aside(m_document->layout_node_arena().host()))
+        m_document->set_needs_repaint(InvalidateDisplayList::PaintCommandsAndHitTestList);
 }
 
 void Document::update_style_and_layout_once(Layout::BegunRead const& read, UpdateLayoutReason reason, ThrottledAnimationSamplingScope animation_sampling_scope)
@@ -280,13 +280,17 @@ void Document::update_style_and_layout_once(Layout::BegunRead const& read, Updat
 
     // An <object> showing this document is sized from its <svg> document element, whose natural size only this
     // document's layout works out. Hand it over as it changes.
-    if (auto* object = as_if<HTML::HTMLObjectElement>(navigable->container().ptr())) {
+    auto container = navigable->container();
+    if (container && (is<HTML::HTMLObjectElement>(*container) || is<HTML::HTMLEmbedElement>(*container))) {
         Layout::RustFFI::FfiNaturalSize natural_size {};
         if (Layout::RustFFI::render_state_take_changed_document_svg_root_natural_size(arena.host(), &read, &natural_size)) {
             CSS::SizeWithAspectRatio size { natural_size.width, natural_size.height, {} };
             if (natural_size.has_aspect_ratio)
                 size.aspect_ratio = CSSPixelFraction(natural_size.aspect_ratio_numerator, natural_size.aspect_ratio_denominator);
-            object->set_natural_size_of_content_document(size);
+            if (auto* embed = as_if<HTML::HTMLEmbedElement>(*container))
+                embed->set_natural_size_of_content_document(size);
+            else
+                as<HTML::HTMLObjectElement>(*container).set_natural_size_of_content_document(size);
         }
     }
 }

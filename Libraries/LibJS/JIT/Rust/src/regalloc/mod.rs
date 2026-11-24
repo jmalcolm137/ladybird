@@ -12,7 +12,9 @@
 //!
 //! Spilling is simple: a value that ever needs a stack slot gets one slot for
 //! its whole life, and code generation stores it there right after its
-//! definition. Values live across a call always get one.
+//! definition. Values live across a call always get one. Values loaded from a
+//! frame slot that nothing writes need none: they are reloaded from the frame
+//! (see `frame_home()`).
 //! Phis share their slots with the values flowing into them where their
 //! lives do not overlap (see `coalescing`), so that values carried around
 //! loops in stack slots need no copying.
@@ -39,9 +41,13 @@
 //! every value but `Repr::Float64` ones, which floating point registers hold.
 //! Floating point registers are numbered from `FPR_BASE` on in `Location`s
 //! and masks. Nodes whose slow paths save the general purpose registers
-//! around their calls (see `saves_only_gprs()`) clobber the floating point
+//! around their calls (see `Clobbers::Floats`) clobber the floating point
 //! ones, so float64 values live across them get stack slots, like values
 //! live across a call.
+//!
+//! What each node needs (where its inputs and its output are, its temps and
+//! what it clobbers) is declared next to its lowering, in
+//! `codegen::lowering_info()`.
 
 mod coalescing;
 mod liveness;
@@ -52,14 +58,24 @@ mod verify;
 pub use moves::resolve_parallel_moves;
 pub use verify::verify;
 
+use crate::CompileFailure;
+use crate::asm::Gpr;
 use crate::code::Repr;
-use crate::inline_vec::InlineVec;
+use crate::codegen::lowering_info::Clobbers;
+use crate::codegen::lowering_info::FixedRegister;
+use crate::codegen::lowering_info::InputConstraint;
+use crate::codegen::lowering_info::OutputConstraint;
+use crate::codegen::lowering_info::lowering_info;
 use crate::ir::BlockId;
-use crate::ir::BranchCondition;
 use crate::ir::Graph;
-use crate::ir::Node;
 use crate::ir::NodeId;
 use crate::ir::Op;
+use crate::tables::Lists;
+use crate::tables::Run;
+use ak::Zone;
+use ak::ZoneVec;
+use coalescing::Coalescing;
+use core::fmt;
 use liveness::ValueLiveness;
 use liveness::is_allocated_value;
 use liveness::state_predecessor;
@@ -98,45 +114,6 @@ impl RegisterClass {
     }
 }
 
-/// Whether the lowering of `op` calls out of line keeping only the general
-/// purpose registers (register-saving `CallSlowPath`s, the growth of arrays and named storage, the runtime's
-/// cache probes, and allocations that call the runtime), or stores constants
-/// through a floating point register (frame initialization for such nodes
-/// and calls): it clobbers every floating point register.
-pub fn saves_only_gprs(op: &Op) -> bool {
-    matches!(
-        op,
-        Op::CallSlowPath {
-            saves_registers: true,
-            ..
-        } | Op::InitializeFrame { clobbers_floats: true }
-            | Op::EnsureFrameInitialized { clobbers_floats: true }
-            | Op::CallArrayPush
-            | Op::CallStoreHoleyElement
-            | Op::OpenArrayIteration
-            | Op::AddNamed { .. }
-            | Op::ProbeKeyedStore { .. }
-            | Op::ProbePropertyCache { .. }
-            | Op::ProbePropertyStore { .. }
-            | Op::ProbeHasProperty { .. }
-            | Op::AllocateObject { .. }
-            | Op::AllocateArray { .. }
-            | Op::AllocateFunction { .. }
-            | Op::AllocateEnvironment { .. }
-            | Op::ConcatenateStrings
-    )
-}
-
-/// Whether the lowering of `op` computes its output from its first input
-/// as two-address instructions do, so that the output may take the
-/// register of that input where it dies.
-fn reuses_first_input(op: &Op) -> bool {
-    matches!(
-        op,
-        Op::Int32WrappingBinary { .. } | Op::Int32Binary { .. } | Op::BoolToInt32 | Op::TypedArrayDataAddress
-    )
-}
-
 /// A set of registers, as a bit mask of register numbers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct RegisterMask(pub u64);
@@ -166,9 +143,11 @@ pub struct RegisterSet {
     pub caller_saved_gprs: RegisterMask,
     pub caller_saved_fprs: RegisterMask,
     /// Where calls take their arguments, in order.
-    pub argument_gprs: Vec<u8>,
+    pub argument_gprs: &'static [Gpr],
     /// Where calls return their (first) result.
     pub return_gpr: u8,
+    /// Where shifts by a register amount take the amount, on targets that shift by one register only.
+    pub shift_amount_gpr: Option<u8>,
     /// Never allocated. Moves between stack slots and of constants into stack
     /// slots go through it, and node lowerings may clobber it.
     pub scratch_gpr: u8,
@@ -183,26 +162,51 @@ impl RegisterSet {
         }
     }
 
+    /// The number of the calling convention's register `register`.
+    pub fn fixed(&self, register: FixedRegister) -> u8 {
+        match register {
+            FixedRegister::Argument(index) => self.argument_gprs[usize::from(index)].0,
+            FixedRegister::Return => self.return_gpr,
+            FixedRegister::ShiftAmount => self
+                .shift_amount_gpr
+                .expect("only targets with a shift amount register have fixed shift amounts"),
+        }
+    }
+
+    /// Where an input of `constraint` must be on this target, if it is a constant (`is_constant`) or not.
+    pub fn resolve(&self, constraint: InputConstraint, is_constant: bool) -> InputConstraint {
+        match constraint {
+            InputConstraint::ShiftAmount if is_constant || self.shift_amount_gpr.is_none() => {
+                InputConstraint::RegisterOrConstant
+            }
+            InputConstraint::ShiftAmount => InputConstraint::Fixed(FixedRegister::ShiftAmount),
+            constraint => constraint,
+        }
+    }
+
     /// The registers of both classes a call clobbers.
     pub fn caller_saved(&self) -> RegisterMask {
         RegisterMask(self.caller_saved_gprs.0 | (self.caller_saved_fprs.0 << FPR_BASE))
     }
 
     /// The fewest allocatable registers allocation works with: the ones
-    /// calls take their arguments and return their results in, and
-    /// `extra` more.
+    /// calls take their arguments and return their results in, the one
+    /// shifts take their amount in, and `extra` more.
     pub fn few_registers(&self, extra: u32) -> RegisterMask {
         let mut mask = RegisterMask(0).with(self.return_gpr);
-        for register in &self.argument_gprs {
-            mask = mask.with(*register);
+        for register in self.argument_gprs {
+            mask = mask.with(register.0);
         }
-        let mut mask = RegisterMask(mask.0 & self.allocatable_gprs.0);
+        if let Some(register) = self.shift_amount_gpr {
+            mask = mask.with(register);
+        }
+        let needed = RegisterMask(mask.0 & self.allocatable_gprs.0);
+        let mut mask = needed;
         for register in self
             .allocatable_gprs
             .iter()
-            .filter(|register| !mask.contains(*register))
+            .filter(|register| !needed.contains(*register))
             .take(extra as usize)
-            .collect::<Vec<_>>()
         {
             mask = mask.with(register);
         }
@@ -217,8 +221,9 @@ impl RegisterSet {
             allocatable_fprs: RegisterMask(0b1111_1111),
             caller_saved_gprs: RegisterMask(0b1111_1111),
             caller_saved_fprs: RegisterMask(0b1111_1111),
-            argument_gprs: vec![1, 2, 3],
+            argument_gprs: &[Gpr(1), Gpr(2), Gpr(3)],
             return_gpr: 0,
+            shift_amount_gpr: None,
             scratch_gpr: 7,
         }
     }
@@ -232,6 +237,9 @@ pub enum Location {
     Stack(u32),
     /// A NaN-boxed constant; only ever a move source.
     Constant(u64),
+    /// A slot of the compiled function's frame (an operand), which holds the value loaded from it wherever that value
+    /// is live (see `frame_home()`); only ever a move source.
+    Frame(u32),
 }
 
 impl Default for Location {
@@ -248,15 +256,18 @@ pub struct Move {
     pub to: Location,
 }
 
+/// The most temps a node has (see `LoweringInfo::temps`).
+const MAX_TEMPS: usize = 4;
+
 /// How the allocator placed one node.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct NodeAllocation {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NodeAllocation<'a> {
     /// Moves to perform, in order, right before the node.
-    pub moves_before: Vec<Move>,
+    pub moves_before: &'a [Move],
     /// Where the node finds each input: a register, or a constant for
     /// inputs that may be immediates.
-    pub inputs: InlineVec<Location, 4>,
-    pub temps: InlineVec<u8, 4>,
+    pub inputs: &'a [Location],
+    pub temps: &'a [u8],
     /// Where the node puts its value: a register, or a stack slot for phis.
     pub output: Option<Location>,
     /// If set and the output is a register, the value must be stored to this
@@ -264,314 +275,256 @@ pub struct NodeAllocation {
     pub spill_slot: Option<u32>,
     /// For nodes with a frame state, where the exit finds each of its values,
     /// as (frame slot, location).
-    pub exit_values: Vec<(u32, Location)>,
+    pub exit_values: &'a [(u32, Location)],
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct Allocation {
+/// The row of a node in the tables of an allocation (see `NodeAllocation`). Its lists are parts of the columns that
+/// hold the lists of all the nodes.
+#[derive(Clone, Copy, Default)]
+struct NodeRow {
+    moves_before: Run,
+    inputs: Run,
+    exit_values: Run,
+    output: Option<Location>,
+    spill_slot: Option<u32>,
+    temps: [u8; MAX_TEMPS],
+    temp_count: u8,
+}
+
+/// How large a graph is, in what the tables of the allocator have rows and elements for.
+struct Size {
+    nodes: usize,
+    blocks: usize,
+    frame_states: usize,
+    /// The inputs of all the nodes.
+    inputs: usize,
+    /// The edges from the blocks to the blocks they continue at.
+    edges: usize,
+}
+
+impl Size {
+    /// The size of `graph`. A compile whose graph is larger than the allocator takes fails.
+    fn of(graph: &Graph) -> Result<Self, CompileFailure> {
+        let mut edges = 0;
+        for index in 0..graph.blocks.len() {
+            graph
+                .control(BlockId::from_index(index))
+                .op
+                .for_each_successor(|_| edges += 1);
+        }
+        let size = Self {
+            nodes: graph.nodes.len(),
+            blocks: graph.blocks.len(),
+            frame_states: graph.frame_states.len(),
+            inputs: graph.nodes.iter().map(|node| node.inputs.len()).sum(),
+            edges,
+        };
+        if size.nodes > Allocation::MAX_NODES
+            || size.blocks > Allocation::MAX_BLOCKS
+            || size.frame_states > Allocation::MAX_NODES
+            || size.inputs > Allocation::MAX_ITEMS
+            || size.edges > Allocation::MAX_ITEMS
+        {
+            return Err(CompileFailure::TooLarge);
+        }
+        Ok(size)
+    }
+}
+
+/// Fails the compile if a list of the allocator that grows while it runs, to a length that the size of the graph
+/// does not tell, has more than `Allocation::MAX_ITEMS` elements.
+fn check_items(len: usize) -> Result<(), CompileFailure> {
+    if len > Allocation::MAX_ITEMS {
+        return Err(CompileFailure::TooLarge);
+    }
+    Ok(())
+}
+
+/// Where the allocator placed the values of a graph, in tables in the work zone of a compile.
+pub struct Allocation<'w> {
     /// Indexed by `NodeId`.
-    pub nodes: Vec<NodeAllocation>,
-    /// Moves to perform, in order, at the end of each block, after its body
+    nodes: ZoneVec<'w, NodeRow>,
+    /// The moves before the nodes and at the ends of the blocks.
+    moves: ZoneVec<'w, Move>,
+    /// The locations of the inputs of the nodes.
+    locations: ZoneVec<'w, Location>,
+    exit_values: ZoneVec<'w, (u32, Location)>,
+    /// The moves at the end of each block, as a part of `moves`.
+    block_end_moves: ZoneVec<'w, Run>,
+    pub spill_slot_count: u32,
+    /// The values live into each block, sorted.
+    live_in: Lists<'w, NodeId>,
+}
+
+impl<'w> Allocation<'w> {
+    // NB: A compile whose graph has more of these fails (see `Size::of()` and `check_items()`).
+    const MAX_NODES: usize = 1 << 24;
+    const MAX_BLOCKS: usize = 1 << 24;
+    const MAX_ITEMS: usize = 1 << 26;
+
+    /// An allocation of no node, which takes no memory before it has some.
+    pub fn new_in(work: &'w Zone) -> Self {
+        Self {
+            nodes: ZoneVec::new_in(work),
+            moves: ZoneVec::new_in(work),
+            locations: ZoneVec::new_in(work),
+            exit_values: ZoneVec::new_in(work),
+            block_end_moves: ZoneVec::new_in(work),
+            spill_slot_count: 0,
+            live_in: Lists::new_in(work),
+        }
+    }
+
+    /// Tables for the allocation of a graph of `size`.
+    fn for_graph(size: &Size, work: &'w Zone) -> Self {
+        Self {
+            nodes: ZoneVec::from_elem_in(NodeRow::default(), size.nodes, work),
+            // NB: Most nodes need fewer moves than they have inputs.
+            moves: ZoneVec::with_capacity_in(size.inputs, work),
+            locations: ZoneVec::with_capacity_in(size.inputs, work),
+            exit_values: ZoneVec::new_in(work),
+            block_end_moves: ZoneVec::from_elem_in(Run::default(), size.blocks, work),
+            spill_slot_count: 0,
+            live_in: Lists::new_in(work),
+        }
+    }
+
+    /// How many nodes have an allocation.
+    pub fn node_count(&self) -> usize {
+        self.nodes.len()
+    }
+
+    pub fn node(&self, node: NodeId) -> NodeAllocation<'_> {
+        let row = &self.nodes[node.index()];
+        NodeAllocation {
+            moves_before: &self.moves[row.moves_before.range()],
+            inputs: &self.locations[row.inputs.range()],
+            temps: &row.temps[..usize::from(row.temp_count)],
+            output: row.output,
+            spill_slot: row.spill_slot,
+            exit_values: &self.exit_values[row.exit_values.range()],
+        }
+    }
+
+    /// Moves to perform, in order, at the end of `block`, after its body
     /// and before its control node. Only blocks ending in a jump to a merge
     /// or a loop header have any.
-    pub block_end_moves: Vec<Vec<Move>>,
-    pub spill_slot_count: u32,
-    /// The values live into each block, indexed by `BlockId`.
-    pub live_in: Vec<crate::sparse_bitset::SparseBitSet>,
-}
+    pub fn block_end_moves(&self, block: BlockId) -> &[Move] {
+        &self.moves[self.block_end_moves[block.index()].range()]
+    }
 
-impl Allocation {
-    pub fn node(&self, node: NodeId) -> &NodeAllocation {
-        &self.nodes[node.index()]
+    /// Whether `value` is live into `block`.
+    pub fn is_live_in(&self, block: BlockId, value: NodeId) -> bool {
+        self.live_in.get(block.index()).binary_search(&value).is_ok()
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-enum InputConstraint {
-    #[default]
-    Register,
-    FixedRegister(u8),
-    /// A register, or the constant itself if the input is one, which code
-    /// generation uses as an immediate.
-    RegisterOrConstant,
-    /// Wherever the value is: a register, its stack slot or a constant.
-    Anywhere,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum OutputConstraint {
-    None,
-    Register,
-    FixedRegister(u8),
-}
-
-struct Constraints {
-    inputs: InlineVec<InputConstraint, 4>,
-    output: OutputConstraint,
-    temps: u8,
-    is_call: bool,
-}
-
-fn constraints(node: &Node, registers: &RegisterSet) -> Constraints {
-    let register_inputs = || InlineVec::from_elem(InputConstraint::Register, node.inputs.len());
-    let output = if node.repr.is_some() {
-        OutputConstraint::Register
-    } else {
-        OutputConstraint::None
-    };
-    let mut constraints = Constraints {
-        inputs: register_inputs(),
-        output,
-        temps: 0,
-        is_call: node.op.properties().is_call,
-    };
-    match node.op {
-        Op::Constant(_) | Op::Phi => unreachable!("constants and phis have no constraints"),
-        Op::ToBoolean => {
-            constraints.inputs = InlineVec::from_elem(InputConstraint::FixedRegister(registers.argument_gprs[0]), 1);
-            constraints.output = OutputConstraint::FixedRegister(registers.return_gpr);
-        }
-        // NB: The VM is the first argument.
-        Op::PrimitiveToString | Op::CallIntrinsic { .. } | Op::ToObject | Op::ArrayCreate => {
-            constraints.inputs = (0..node.inputs.len())
-                .map(|index| InputConstraint::FixedRegister(registers.argument_gprs[index + 1]))
-                .collect();
-            constraints.output = OutputConstraint::FixedRegister(registers.return_gpr);
-        }
-        Op::CallArraySplice => {
-            constraints.inputs = (0..node.inputs.len())
-                .map(|index| {
-                    if index < 3 {
-                        InputConstraint::FixedRegister(registers.argument_gprs[index + 1])
-                    } else {
-                        InputConstraint::RegisterOrConstant
-                    }
-                })
-                .collect();
-            constraints.output = OutputConstraint::FixedRegister(registers.return_gpr);
-        }
-        Op::Generic { .. } => {
-            if node.repr.is_some() {
-                constraints.output = OutputConstraint::FixedRegister(registers.return_gpr);
-            }
-        }
-        Op::SliceArguments => {
-            constraints.inputs = InlineVec::from_elem(InputConstraint::FixedRegister(registers.argument_gprs[2]), 1);
-            constraints.output = OutputConstraint::FixedRegister(registers.return_gpr);
-        }
-        Op::Return => {
-            constraints.inputs = InlineVec::from_elem(InputConstraint::FixedRegister(registers.return_gpr), 1);
-        }
-        // Comparisons and int32 arithmetic take a constant right-hand side
-        // as an immediate.
-        Op::Int32Compare { .. }
-        | Op::TaggedEquals { .. }
-        | Op::Branch {
-            condition: BranchCondition::Int32(_) | BranchCondition::TaggedEquals { .. },
-            ..
-        } => constraints.inputs[1] = InputConstraint::RegisterOrConstant,
-        Op::Int32WrappingBinary { .. } => constraints.inputs[1] = InputConstraint::RegisterOrConstant,
-        Op::Int32Binary { op } if op != crate::ir::BinaryOp::Mul => {
-            constraints.inputs[1] = InputConstraint::RegisterOrConstant;
-            // The quotient of a remainder.
-            if op == crate::ir::BinaryOp::Mod {
-                constraints.temps = 1;
-            }
-        }
-        Op::Uint32ShiftRight => constraints.inputs[1] = InputConstraint::RegisterOrConstant,
-        // The new rope string, its length and a temp.
-        Op::ConcatenateStrings => constraints.temps = 3,
-        Op::StringsEqual => constraints.temps = 1,
-        // A value and a cursor for filling the registers and locals.
-        Op::InitializeFrame { .. } | Op::EnsureFrameInitialized { .. } => constraints.temps = 2,
-        // The object's property storage.
-        Op::StoreNamed { .. } | Op::AddNamed { .. } | Op::CheckAccessorFunction { .. } => constraints.temps = 1,
-        // The object whose prototype comes next.
-        Op::HasInPrototypeChain => constraints.temps = 1,
-        // The environment's binding values.
-        Op::StoreGlobalBinding { .. } => constraints.temps = 1,
-        // Direct and native calls with inputs build the callee's frame in
-        // temps.
-        Op::CallDirect {
-            stores_operands: true, ..
-        }
-        | Op::CallNative {
-            stores_operands: true, ..
-        } => {
-            // NB: The call stores its operands to the frame first.
-            constraints.inputs = InlineVec::from_elem(InputConstraint::Anywhere, node.inputs.len());
-            constraints.output = OutputConstraint::FixedRegister(registers.return_gpr);
-        }
-        Op::CallDirect { .. } | Op::CallNative { .. } if !node.inputs.is_empty() => {
-            constraints.temps = crate::codegen::DIRECT_CALL_TEMPS;
-            // NB: Calls in inlined callees return their result.
-            if node.repr.is_some() {
-                constraints.output = OutputConstraint::FixedRegister(registers.return_gpr);
-            }
-        }
-        // Native accessor calls build the callee's frame in temps, and return
-        // the result.
-        Op::CallNativeAccessor { .. } => {
-            constraints.temps = crate::codegen::DIRECT_CALL_TEMPS;
-            constraints.output = OutputConstraint::FixedRegister(registers.return_gpr);
-        }
-        // The object, its shape and the cache entry.
-        Op::ProbePropertyCache { .. } | Op::ProbeKeyedCache { .. } => constraints.temps = 3,
-        // Those, and the named property storage of property additions.
-        Op::ProbeKeyedStore { .. } | Op::ProbePropertyStore { .. } => constraints.temps = 4,
-        // The cache, the global declarative environment, the global object
-        // and a temp.
-        Op::ProbeGlobalCache { .. } | Op::ProbeGlobalStore { .. } => constraints.temps = 4,
-        // The object or its elements, and the keyed cache's registers.
-        Op::ProbeHasProperty { .. } => constraints.temps = 3,
-        // The address of the object.
-        Op::Branch {
-            condition: BranchCondition::ElementsKind(_),
-            ..
-        } => constraints.temps = 1,
-        // NB: Slow path calls read their operands from where they are.
-        Op::CallSlowPath { saves_registers, .. } => {
-            constraints.inputs = InlineVec::from_elem(InputConstraint::Anywhere, node.inputs.len());
-            // NB: A call's value is moved into the return register once its
-            //     slow path continued, where a conditional jump's control
-            //     word is.
-            if !saves_registers && node.repr.is_some() {
-                constraints.output = OutputConstraint::FixedRegister(registers.return_gpr);
-            }
-        }
-        // NB: The output comes from where the slow path call left it.
-        Op::SlowPathOutput { .. } => constraints.inputs = InlineVec::from_elem(InputConstraint::Anywhere, 1),
-        // The object, the property iterator cache, and a temp.
-        Op::Branch {
-            condition: BranchCondition::PropertyIteratorCacheValid,
-            ..
-        } => constraints.temps = 3,
-        // The binding's index, and a temp; the environment's shape and the
-        // binding's index.
-        Op::Branch {
-            condition: BranchCondition::BindingMutable { .. } | BranchCondition::NextBindingOfShape { .. },
-            ..
-        } => constraints.temps = 2,
-        // The array's prototypes.
-        Op::Branch {
-            condition: BranchCondition::HoleFillableArray,
-            ..
-        } => constraints.temps = 1,
-        // The environment's binding values (and their count).
-        Op::StoreEnvironmentBinding { .. } | Op::AppendEnvironmentBinding => constraints.temps = 1,
-        // The array, then its prototypes.
-        Op::CheckAppendableArray => constraints.temps = 2,
-        // The object's prototypes.
-        Op::Branch {
-            condition: BranchCondition::PlainArrayPrototypeChain,
-            ..
-        } => constraints.temps = 1,
-        // The object's shape.
-        Op::Branch {
-            condition: BranchCondition::ArrayWithRealmArrayPrototypeAndNoNamedProperties,
-            ..
-        } => constraints.temps = 1,
-        // The object's elements.
-        Op::LoadElementsCapacity | Op::AppendElement => constraints.temps = 1,
-        // The object, then its elements or element address.
-        Op::CheckElements { .. }
-        | Op::CheckTypedArray
-        | Op::CheckArray
-        | Op::CheckIdentityComparable
-        | Op::CheckClosure { .. } => {
-            constraints.temps = 1;
-        }
-        // The elements or the element address.
-        Op::LoadElementAt { .. } => {
-            constraints.inputs[1] = InputConstraint::RegisterOrConstant;
-            constraints.temps = 1;
-        }
-        // NB: Stores of integer and tagged constants store immediates.
-        Op::StoreElementAt { kind } => {
-            constraints.inputs[1] = InputConstraint::RegisterOrConstant;
-            if kind.stored_repr() != Repr::Float64 {
-                constraints.inputs[2] = InputConstraint::RegisterOrConstant;
-            }
-            constraints.temps = 1;
-        }
-        Op::CheckBounds => {
-            constraints.inputs[0] = InputConstraint::RegisterOrConstant;
-            constraints.inputs[1] = InputConstraint::RegisterOrConstant;
-        }
-        // The heap and a value.
-        Op::AllocateObject { .. } => constraints.temps = 2,
-        // The object's property storage.
-        Op::InitializeNamed { .. } => constraints.temps = 1,
-        // The element storage and a value.
-        Op::AllocateArray { .. } => constraints.temps = 2,
-        // The function and a value.
-        Op::AllocateFunction { .. } | Op::AllocateEnvironment { .. } => constraints.temps = 2,
-        // The array's elements.
-        Op::InitializeElement { .. } => constraints.temps = 1,
-        // The function object.
-        Op::Branch {
-            condition: BranchCondition::Builtin(_),
-            ..
-        } => constraints.temps = 1,
-        _ => {}
+// NB: The tests of the verifier make wrong allocations with these.
+#[cfg(test)]
+impl Allocation<'_> {
+    /// All the moves of the allocation.
+    pub(crate) fn moves(&self) -> &[Move] {
+        &self.moves
     }
-    constraints
+
+    pub(crate) fn set_spill_slot(&mut self, node: NodeId, slot: Option<u32>) {
+        self.nodes[node.index()].spill_slot = slot;
+    }
+
+    pub(crate) fn set_input(&mut self, node: NodeId, index: usize, location: Location) {
+        let inputs = self.nodes[node.index()].inputs.range();
+        self.locations[inputs][index] = location;
+    }
+
+    pub(crate) fn set_move_before(&mut self, node: NodeId, index: usize, new_move: Move) {
+        let moves = self.nodes[node.index()].moves_before.range();
+        self.moves[moves][index] = new_move;
+    }
+
+    /// Adds the allocation of one more node, which has `inputs` and `output` and nothing else.
+    pub(crate) fn push_node(&mut self, inputs: &[Location], output: Option<Location>) {
+        let start = self.locations.len();
+        self.locations.extend_from_slice(inputs);
+        self.nodes.push(NodeRow {
+            inputs: Run::new(start, self.locations.len()),
+            output,
+            ..NodeRow::default()
+        });
+    }
 }
 
-/// Assigns locations to the values of `graph`. The verifier checks the
-/// result where the IR is verified (see `verify()`).
-pub fn allocate(graph: &Graph, registers: &RegisterSet) -> Allocation {
-    Allocator::new(graph, registers).run()
+/// The value each register holds.
+type Contents = [Option<NodeId>; REGISTER_COUNT];
+
+/// The slot of the compiled function's frame that holds `value` wherever it is live, if there is one: a value loaded
+/// from one of the slots whose frame memory never changes (`Graph::unwritten_slots`).
+///
+/// OPTIMIZATION: Such a value needs no spill slot, and no store right after its definition: where no register holds
+///               it, it is reloaded from the frame. Exits find it there too (`code::ValueLocation::Frame`).
+pub fn frame_home(graph: &Graph, value: NodeId) -> Option<u32> {
+    match graph.node(value).op {
+        Op::LoadSlot { slot } if graph.is_unwritten_slot(slot) => Some(slot),
+        _ => None,
+    }
 }
 
-struct Allocator<'a> {
-    graph: &'a Graph,
+/// Assigns locations to the values of `graph`, in tables in `work`. The verifier checks the result where the IR is
+/// verified (see `verify()`).
+pub fn allocate<'w>(graph: &Graph, registers: &RegisterSet, work: &'w Zone) -> Result<Allocation<'w>, CompileFailure> {
+    assert!(registers.allocatable_gprs.0 >> FPR_BASE == 0);
+    assert!(!registers.allocatable_gprs.contains(registers.scratch_gpr));
+    let size = Size::of(graph)?;
+    let liveness = ValueLiveness::compute(graph, &size, work)?;
+    let coalescing = Coalescing::compute(graph, &liveness, work);
+    let loops = Loops::compute(graph, &liveness, work)?;
+    let allocator = Allocator {
+        graph,
+        registers,
+        liveness: &liveness,
+        allocation: Allocation::for_graph(&size, work),
+        contents: [None; REGISTER_COUNT],
+        value_registers: ZoneVec::from_elem_in(None, size.nodes, work),
+        end_contents: ZoneVec::from_elem_in(None, size.blocks * REGISTER_COUNT, work),
+        finished: ZoneVec::from_elem_in(false, size.blocks, work),
+        position: 0,
+        slot_classes: &coalescing.classes,
+        class_slots: ZoneVec::from_elem_in(None, size.nodes, work),
+        parallel_moves: ZoneVec::new_in(work),
+        loops: &loops,
+        work,
+    };
+    let mut allocation = allocator.run()?;
+    // NB: The code generator reads which values are live into a block.
+    allocation.live_in = liveness.live_in;
+    Ok(allocation)
+}
+
+struct Allocator<'a, 'w> {
+    graph: &'a Graph<'a>,
     registers: &'a RegisterSet,
-    liveness: ValueLiveness,
-    allocation: Allocation,
-    /// The value each register holds.
-    contents: Vec<Option<NodeId>>,
+    liveness: &'a ValueLiveness<'w>,
+    allocation: Allocation<'w>,
+    contents: Contents,
     /// The register each value is in, if any.
-    value_registers: Vec<Option<u8>>,
-    /// The register contents at the end of each finished block.
-    end_contents: Vec<Option<Vec<Option<NodeId>>>>,
+    value_registers: ZoneVec<'w, Option<u8>>,
+    /// The register contents at the end of each finished block: `REGISTER_COUNT` values for each block.
+    end_contents: ZoneVec<'w, Option<NodeId>>,
+    /// Whether each block is finished.
+    finished: ZoneVec<'w, bool>,
     /// The position of the node being allocated.
     position: u32,
     /// The spill slot class of each value (see `coalescing`), and the
     /// slot of each class that has one.
-    slot_classes: Vec<u32>,
-    class_slots: Vec<Option<u32>>,
-    loops: Loops,
+    slot_classes: &'a [u32],
+    class_slots: ZoneVec<'w, Option<u32>>,
+    /// Moves that happen in parallel, before they are put in an order.
+    parallel_moves: ZoneVec<'w, Move>,
+    loops: &'a Loops<'w>,
+    work: &'w Zone,
 }
 
-impl<'a> Allocator<'a> {
-    fn new(graph: &'a Graph, registers: &'a RegisterSet) -> Self {
-        assert!(registers.allocatable_gprs.0 >> FPR_BASE == 0);
-        assert!(!registers.allocatable_gprs.contains(registers.scratch_gpr));
-        let liveness = ValueLiveness::compute(graph);
-        let slot_classes = coalescing::spill_slot_classes(graph, &liveness);
-        let loops = Loops::compute(graph, &liveness);
-        Self {
-            graph,
-            registers,
-            liveness,
-            allocation: Allocation {
-                nodes: vec![NodeAllocation::default(); graph.nodes.len()],
-                block_end_moves: vec![Vec::new(); graph.blocks.len()],
-                spill_slot_count: 0,
-                live_in: Vec::new(),
-            },
-            contents: vec![None; REGISTER_COUNT],
-            value_registers: vec![None; graph.nodes.len()],
-            end_contents: vec![None; graph.blocks.len()],
-            position: 0,
-            slot_classes,
-            class_slots: vec![None; graph.nodes.len()],
-            loops,
-        }
-    }
-
-    fn run(mut self) -> Allocation {
+impl<'w> Allocator<'_, 'w> {
+    fn run(mut self) -> Result<Allocation<'w>, CompileFailure> {
         // Give the phis of blocks without a state predecessor their locations
         // up front, since their predecessors may be allocated after them.
         // Phis of loop headers live in registers, which the header starts
@@ -609,9 +562,9 @@ impl<'a> Allocator<'a> {
                 .any(|predecessor| predecessor.index() >= index)
                 && state_predecessor(self.graph, block_id).is_none()
             {
-                let live_in = self.liveness.live_in[index].iter().collect::<Vec<_>>();
-                for value in live_in {
-                    self.ensure_spill_slot(NodeId::from_index(value));
+                let liveness = self.liveness;
+                for value in liveness.live_in.get(index) {
+                    self.ensure_home(*value);
                 }
             }
         }
@@ -626,10 +579,14 @@ impl<'a> Allocator<'a> {
             }
             self.allocation.block_end_moves[block.index()] = self.phi_moves(block, &mut cycle_temp);
             self.allocate_node(self.graph.control_id(block));
-            self.end_contents[block.index()] = Some(self.contents.clone());
+            let start = block.index() * REGISTER_COUNT;
+            self.end_contents[start..start + REGISTER_COUNT].copy_from_slice(&self.contents);
+            self.finished[block.index()] = true;
+            // NB: How many moves and exit values a node gets is known only when it is allocated.
+            check_items(self.allocation.moves.len())?;
+            check_items(self.allocation.exit_values.len())?;
         }
-        self.allocation.live_in = self.liveness.live_in;
-        self.allocation
+        Ok(self.allocation)
     }
 
     /// Gives `phi` its location: `register` if it has one, and its spill
@@ -637,10 +594,7 @@ impl<'a> Allocator<'a> {
     /// allocated before its own) if it has no register or needs a slot.
     fn place_phi(&mut self, phi: NodeId, register: Option<u8>) {
         let slot = match register {
-            Some(_)
-                if !self.liveness.needs_spill.contains(phi.index())
-                    && self.allocation.nodes[phi.index()].spill_slot.is_none() =>
-            {
+            Some(_) if !self.liveness.needs_spill(phi) && self.allocation.nodes[phi.index()].spill_slot.is_none() => {
                 None
             }
             _ => Some(self.ensure_spill_slot(phi)),
@@ -677,7 +631,15 @@ impl<'a> Allocator<'a> {
         slot
     }
 
-    fn set_contents(&mut self, contents: Vec<Option<NodeId>>) {
+    /// Makes sure that `value` is available outside of registers: in its frame slot (see `frame_home()`), or in a
+    /// spill slot.
+    fn ensure_home(&mut self, value: NodeId) {
+        if frame_home(self.graph, value).is_none() {
+            self.ensure_spill_slot(value);
+        }
+    }
+
+    fn set_contents(&mut self, contents: Contents) {
         for value in self.contents.iter().flatten() {
             self.value_registers[value.index()] = None;
         }
@@ -691,13 +653,16 @@ impl<'a> Allocator<'a> {
 
     /// The register contents at the end of `predecessor` (which comes before
     /// `block` in linear order) that are live into `block`.
-    fn contents_entering(&self, predecessor: BlockId, block: BlockId) -> Vec<Option<NodeId>> {
-        let live_in = &self.liveness.live_in[block.index()];
-        let mut contents = self.end_contents[predecessor.index()]
-            .clone()
-            .expect("blocks come after the predecessor whose state they start with");
+    fn contents_entering(&self, predecessor: BlockId, block: BlockId) -> Contents {
+        assert!(
+            self.finished[predecessor.index()],
+            "blocks come after the predecessor whose state they start with"
+        );
+        let start = predecessor.index() * REGISTER_COUNT;
+        let mut contents = [None; REGISTER_COUNT];
+        contents.copy_from_slice(&self.end_contents[start..start + REGISTER_COUNT]);
         for value in &mut contents {
-            if value.is_some_and(|value| !live_in.contains(value.index())) {
+            if value.is_some_and(|value| !self.liveness.is_live_in(block, value)) {
                 *value = None;
             }
         }
@@ -709,14 +674,14 @@ impl<'a> Allocator<'a> {
     fn loop_leaves_in_stack(&self, block: BlockId, value: NodeId) -> bool {
         self.loops
             .headed_by(block)
-            .is_some_and(|loop_| loop_.carries_through(value.index()))
-            && self.liveness.needs_spill.contains(value.index())
+            .is_some_and(|loop_| self.loops.carries_through(loop_, value))
+            && self.liveness.needs_spill(value)
     }
 
     /// The register contents a merge with a state predecessor starts with:
     /// those at the end of that predecessor, live into the merge (but those
     /// a loop leaves in their stack slots), and the phis in their registers.
-    fn merge_contents(&self, block: BlockId) -> Option<Vec<Option<NodeId>>> {
+    fn merge_contents(&self, block: BlockId) -> Option<Contents> {
         let predecessor = state_predecessor(self.graph, block)?;
         let mut contents = self.contents_entering(predecessor, block);
         for value in &mut contents {
@@ -750,7 +715,7 @@ impl<'a> Allocator<'a> {
             // Merges and loop headers start with every value in its stack
             // slot, and phis in their registers.
             _ => {
-                let mut contents = vec![None; REGISTER_COUNT];
+                let mut contents = [None; REGISTER_COUNT];
                 for phi in &block_data.phis {
                     if let Some(Location::Register(register)) = self.allocation.nodes[phi.index()].output {
                         contents[register as usize] = Some(*phi);
@@ -778,10 +743,10 @@ impl<'a> Allocator<'a> {
     }
 
     /// Removes the value in `register` from it. The value stays available in
-    /// its spill slot, which it gets if it had none.
+    /// its frame slot or its spill slot, which it gets if it had none.
     fn evict(&mut self, register: u8) {
         if let Some(value) = self.contents[register as usize] {
-            self.ensure_spill_slot(value);
+            self.ensure_home(value);
             self.free_register(register);
         }
     }
@@ -790,7 +755,7 @@ impl<'a> Allocator<'a> {
     /// the uses later in the iteration come first, then the values the next iteration reads (live into the loop and
     /// used in it before here), in the order it reads them, then the values used after the loop.
     fn next_use(&self, value: NodeId) -> (u8, u32) {
-        let uses = &self.liveness.use_positions[value.index()];
+        let uses = self.liveness.use_positions(value);
         let index = uses.partition_point(|position| *position <= self.position);
         let next = uses.get(index).copied();
         let Some(loop_) = self.loops.innermost_at(self.position) else {
@@ -799,7 +764,7 @@ impl<'a> Allocator<'a> {
         if let Some(position) = self.loops.first_use_in(loop_, uses, index..uses.len()) {
             return (0, position);
         }
-        if self.liveness.live_in[loop_.header.index()].contains(value.index())
+        if self.liveness.is_live_in(loop_.header, value)
             && let Some(position) = self.loops.first_use_in(loop_, uses, 0..index)
         {
             return (1, position - loop_.start);
@@ -822,7 +787,7 @@ impl<'a> Allocator<'a> {
         let victim = candidates()
             .max_by_key(|register| {
                 let value = self.contents[*register as usize].expect("no free register");
-                (self.next_use(value), std::cmp::Reverse(*register))
+                (self.next_use(value), core::cmp::Reverse(*register))
             })
             .expect("a node needs more registers than the target has");
         self.evict(victim);
@@ -841,6 +806,9 @@ impl<'a> Allocator<'a> {
         if let Some(register) = self.value_registers[value.index()] {
             return Location::Register(register);
         }
+        if let Some(slot) = frame_home(self.graph, value) {
+            return Location::Frame(slot);
+        }
         let slot = self.allocation.nodes[value.index()]
             .spill_slot
             .unwrap_or_else(|| panic!("v{} is neither in a register nor spilled", value.0));
@@ -850,108 +818,120 @@ impl<'a> Allocator<'a> {
     /// Whether `value`, which `node` uses or which is in a register at
     /// `node`, is still needed after it. Registers only ever hold live values.
     fn is_live_after(&self, value: NodeId, node: NodeId) -> bool {
-        !self.liveness.dies_at[node.index()].contains(&value)
+        !self.liveness.dies_at(node).contains(&value)
     }
 
-    fn exit_values(&self, node: NodeId) -> Vec<(u32, Location)> {
-        let Some(frame_state) = self.graph.node(node).frame_state else {
-            return Vec::new();
-        };
-        self.graph
-            .frame_state_values(frame_state)
-            .map(|(slot, value)| (slot, self.current_location(value)))
-            .collect()
+    /// Adds a move before the node that is being allocated.
+    fn add_move(&mut self, from: Location, to: Location) {
+        self.allocation.moves.push(Move { from, to });
     }
 
     fn allocate_node(&mut self, node_id: NodeId) {
         let node = self.graph.node(node_id);
         self.position = self.liveness.positions[node_id.index()];
-        let constraints = constraints(node, self.registers);
-        let mut moves = Vec::new();
+        let constraints = lowering_info(node);
+        // NB: The moves, the input locations and the exit values of the node go to the ends of their columns, where
+        //     nothing else is added while the node is allocated.
+        let moves_start = self.allocation.moves.len();
+        let inputs_start = self.allocation.locations.len();
+        self.allocation
+            .locations
+            .resize(inputs_start + node.inputs.len(), Location::Register(0));
+        let constrained_inputs = node.inputs.len().min(constraints.inputs.len());
+        let constraint_of = |allocator: &Self, index: usize| {
+            allocator.registers.resolve(
+                constraints.inputs.get(index),
+                allocator.graph.constant_value(node.inputs[index]).is_some(),
+            )
+        };
         let mut blocked = RegisterMask::default();
-        let mut inputs = InlineVec::from_elem(Location::Register(0), node.inputs.len());
 
         // Fixed register inputs first, so that inputs in any register do not
         // take their registers.
-        for (index, (input, constraint)) in node.inputs.iter().zip(&constraints.inputs).enumerate() {
-            let InputConstraint::FixedRegister(register) = *constraint else {
+        for index in 0..constrained_inputs {
+            let input = node.inputs[index];
+            let InputConstraint::Fixed(register) = constraint_of(self, index) else {
                 continue;
             };
-            let is_value = is_allocated_value(self.graph, *input);
+            let register = self.registers.fixed(register);
+            let is_value = is_allocated_value(self.graph, input);
             if !is_value || self.value_registers[input.index()] != Some(register) {
                 debug_assert!(!blocked.contains(register), "two inputs need the same register");
                 self.evict(register);
-                let from = self.current_location(*input);
-                moves.push(Move {
-                    from,
-                    to: Location::Register(register),
-                });
+                let from = self.current_location(input);
+                self.add_move(from, Location::Register(register));
                 match from {
                     // The value moves, unless an earlier input of this node
                     // needs it where it is; then this is a copy for the node.
                     Location::Register(previous) if !blocked.contains(previous) => {
                         self.free_register(previous);
-                        self.assign_register(register, *input);
+                        self.assign_register(register, input);
                     }
-                    Location::Stack(_) => self.assign_register(register, *input),
+                    Location::Stack(_) => self.assign_register(register, input),
                     _ => {}
                 }
             }
             blocked = blocked.with(register);
-            inputs[index] = Location::Register(register);
+            self.allocation.locations[inputs_start + index] = Location::Register(register);
         }
-        for (index, (input, constraint)) in node.inputs.iter().zip(&constraints.inputs).enumerate() {
-            if *constraint == InputConstraint::RegisterOrConstant
-                && let Some(bits) = self.graph.constant_value(*input)
+        for index in 0..constrained_inputs {
+            let input = node.inputs[index];
+            let constraint = constraint_of(self, index);
+            if constraint == InputConstraint::RegisterOrConstant
+                && let Some(bits) = self.graph.constant_value(input)
             {
-                inputs[index] = Location::Constant(bits);
+                self.allocation.locations[inputs_start + index] = Location::Constant(bits);
                 continue;
             }
-            if *constraint == InputConstraint::Anywhere {
-                inputs[index] = self.current_location(*input);
+            if constraint == InputConstraint::Anywhere {
+                self.allocation.locations[inputs_start + index] = self.current_location(input);
                 continue;
             }
-            if matches!(constraint, InputConstraint::FixedRegister(_)) {
+            if matches!(constraint, InputConstraint::Fixed(_)) {
                 continue;
             }
             let register = match self.value_registers[input.index()] {
-                Some(register) if is_allocated_value(self.graph, *input) => register,
+                Some(register) if is_allocated_value(self.graph, input) => register,
                 _ => {
-                    let register = self.pick_register(blocked, RegisterClass::of(self.graph.node(*input).repr));
-                    moves.push(Move {
-                        from: self.current_location(*input),
-                        to: Location::Register(register),
-                    });
-                    if is_allocated_value(self.graph, *input) {
-                        self.assign_register(register, *input);
+                    let register = self.pick_register(blocked, RegisterClass::of(self.graph.node(input).repr));
+                    let from = self.current_location(input);
+                    self.add_move(from, Location::Register(register));
+                    if is_allocated_value(self.graph, input) {
+                        self.assign_register(register, input);
                     }
                     register
                 }
             };
             blocked = blocked.with(register);
-            inputs[index] = Location::Register(register);
+            self.allocation.locations[inputs_start + index] = Location::Register(register);
         }
 
-        let mut temps = InlineVec::new();
-        for _ in 0..constraints.temps {
+        let temp_count = usize::from(constraints.temps);
+        assert!(
+            temp_count <= MAX_TEMPS,
+            "a node has more temps than an allocation has room for"
+        );
+        let mut temps = [0; MAX_TEMPS];
+        for temp in &mut temps[..temp_count] {
             let register = self.pick_register(blocked, RegisterClass::General);
             blocked = blocked.with(register);
-            temps.push(register);
+            *temp = register;
         }
 
         // NB: Two-address instructions (like those of x86) write their output
         //     over their first input, which then needs no copy where it dies
         //     here. Nodes that may exit keep their inputs for the exit.
-        let first_input_register = match inputs.first() {
+        let first_input = self.allocation.locations[inputs_start..].first().copied();
+        let first_input_register = match first_input {
             Some(Location::Register(register))
                 if node.frame_state.is_none()
-                    && reuses_first_input(&node.op)
+                    && constraints.reuses_first_input
                     && is_allocated_value(self.graph, node.inputs[0])
-                    && self.liveness.dies_at[node_id.index()].contains(&node.inputs[0])
-                    && RegisterClass::of_register(*register) == RegisterClass::of(node.repr)
-                    && !temps.contains(register) =>
+                    && self.liveness.dies_at(node_id).contains(&node.inputs[0])
+                    && RegisterClass::of_register(register) == RegisterClass::of(node.repr)
+                    && !temps[..temp_count].contains(&register) =>
             {
-                Some(*register)
+                Some(register)
             }
             _ => None,
         };
@@ -964,24 +944,24 @@ impl<'a> Allocator<'a> {
             OutputConstraint::Register => Some(
                 first_input_register.unwrap_or_else(|| allocator.pick_register(blocked, RegisterClass::of(node.repr))),
             ),
-            OutputConstraint::FixedRegister(register) => {
-                debug_assert!(constraints.is_call || !blocked.contains(register));
+            OutputConstraint::Return => {
+                let register = allocator.registers.return_gpr;
+                debug_assert!(constraints.clobbers == Clobbers::CallerSaved || !blocked.contains(register));
                 allocator.evict(register);
                 Some(register)
             }
         };
-        let clobbered = if constraints.is_call {
-            self.registers.caller_saved()
-        } else if saves_only_gprs(&node.op) {
-            self.registers.allocatable(RegisterClass::Float)
-        } else {
-            RegisterMask::default()
+        let clobbered = match constraints.clobbers {
+            Clobbers::CallerSaved => self.registers.caller_saved(),
+            Clobbers::Floats => self.registers.allocatable(RegisterClass::Float),
+            Clobbers::Nothing => RegisterMask::default(),
         };
         {
             for register in clobbered.iter() {
                 if let Some(value) = self.contents.get(register as usize).copied().flatten() {
                     debug_assert!(
                         self.allocation.nodes[value.index()].spill_slot.is_some()
+                            || frame_home(self.graph, value).is_some()
                             || !self.is_live_after(value, node_id),
                         "v{} is live across a call that clobbers its register without a spill slot",
                         value.0
@@ -993,11 +973,17 @@ impl<'a> Allocator<'a> {
         let output = pick_output(self);
         // Lazy exits of calls happen after the call returns, so they find
         // their values after the clobber.
-        let exit_values = self.exit_values(node_id);
+        let exit_values_start = self.allocation.exit_values.len();
+        if let Some(frame_state) = node.frame_state {
+            for (slot, value) in self.graph.frame_state_values(frame_state, self.work) {
+                let location = self.current_location(value);
+                self.allocation.exit_values.push((slot, location));
+            }
+        }
 
         // Values whose last use is this node no longer need their registers.
-        for index in 0..self.liveness.dies_at[node_id.index()].len() {
-            let value = self.liveness.dies_at[node_id.index()][index];
+        let liveness = self.liveness;
+        for value in liveness.dies_at(node_id) {
             if let Some(register) = self.value_registers[value.index()] {
                 self.free_register(register);
             }
@@ -1005,18 +991,22 @@ impl<'a> Allocator<'a> {
 
         if let Some(register) = output {
             self.assign_register(register, node_id);
-            if self.liveness.needs_spill.contains(node_id.index()) {
-                self.ensure_spill_slot(node_id);
+            if self.liveness.needs_spill(node_id) {
+                self.ensure_home(node_id);
             }
-            if self.liveness.dead_outputs.contains(node_id.index()) {
+            if self.liveness.is_dead_output(node_id) {
                 self.free_register(register);
             }
         }
 
+        let moves_before = Run::new(moves_start, self.allocation.moves.len());
+        let inputs = Run::new(inputs_start, self.allocation.locations.len());
+        let exit_values = Run::new(exit_values_start, self.allocation.exit_values.len());
         let allocation = &mut self.allocation.nodes[node_id.index()];
-        allocation.moves_before = moves;
+        allocation.moves_before = moves_before;
         allocation.inputs = inputs;
         allocation.temps = temps;
+        allocation.temp_count = constraints.temps;
         allocation.output = output.map(Location::Register);
         allocation.exit_values = exit_values;
     }
@@ -1025,10 +1015,11 @@ impl<'a> Allocator<'a> {
     /// state predecessor: registers that hold no value live into the merge
     /// (preferably the input's own), or stack slots if there are none.
     fn place_merge_phis(&mut self, predecessor: BlockId, join: BlockId) {
-        let live_in = &self.liveness.live_in[join.index()];
         let mut taken = RegisterMask::default();
         for (register, value) in self.contents.iter().enumerate() {
-            if value.is_some_and(|value| live_in.contains(value.index()) && !self.loop_leaves_in_stack(join, value)) {
+            if value
+                .is_some_and(|value| self.liveness.is_live_in(join, value) && !self.loop_leaves_in_stack(join, value))
+            {
                 taken = taken.with(u8::try_from(register).expect("register numbers fit in u8"));
             }
         }
@@ -1042,7 +1033,7 @@ impl<'a> Allocator<'a> {
                     .iter()
                     .filter(|register| !taken.contains(*register));
                 let first = free.next()?;
-                std::iter::once(first)
+                core::iter::once(first)
                     .chain(free)
                     .find(|register| self.contents[*register as usize].is_none())
                     .or(Some(first))
@@ -1054,65 +1045,74 @@ impl<'a> Allocator<'a> {
         }
     }
 
-    /// The moves at the end of `block` that put the values live into the
-    /// merge `join` (and its phis' inputs) where the merge expects them.
-    fn merge_moves(&self, block: BlockId, join: BlockId) -> Vec<Move> {
+    /// Adds the moves into the phis of `successor` at the end of `block`, as moves that happen in parallel.
+    fn add_phi_moves(&mut self, block: BlockId, successor: BlockId) {
+        for (phi, input) in liveness::phi_inputs_from(self.graph, block, successor) {
+            let parallel_move = Move {
+                from: self.current_location(input),
+                to: self.allocation.nodes[phi.index()].output.expect("phis have locations"),
+            };
+            self.parallel_moves.push(parallel_move);
+        }
+    }
+
+    /// Adds the moves at the end of `block` that put the values live into the
+    /// merge `join` (and its phis' inputs) where the merge expects them, as moves that happen in parallel.
+    fn add_merge_moves(&mut self, block: BlockId, join: BlockId) {
         let contents = self.merge_contents(join).expect("the merge has a state predecessor");
         let phis = &self.graph.block(join).phis;
-        contents
-            .iter()
-            .enumerate()
-            .filter_map(|(register, value)| {
-                let value = (*value)?;
-                if phis.contains(&value) {
-                    return None;
-                }
-                let to = Location::Register(u8::try_from(register).expect("register numbers fit in u8"));
-                let from = self.current_location(value);
-                (from != to).then_some(Move { from, to })
-            })
-            .chain(
-                liveness::phi_inputs_from(self.graph, block, join).map(|(phi, input)| Move {
-                    from: self.current_location(input),
-                    to: self.allocation.nodes[phi.index()].output.expect("phis have locations"),
-                }),
-            )
-            .collect()
+        for (register, value) in contents.iter().enumerate() {
+            let Some(value) = *value else {
+                continue;
+            };
+            if phis.contains(&value) {
+                continue;
+            }
+            let to = Location::Register(u8::try_from(register).expect("register numbers fit in u8"));
+            let from = self.current_location(value);
+            if from != to {
+                self.parallel_moves.push(Move { from, to });
+            }
+        }
+        self.add_phi_moves(block, join);
     }
 
     /// The moves at the end of `block` that put the inputs of the phis of its
-    /// successor in place.
-    fn phi_moves(&mut self, block: BlockId, cycle_temp: &mut Option<u32>) -> Vec<Move> {
-        let successors = self.graph.successors(block);
-        let [successor] = &*successors else {
-            for successor in successors.iter() {
+    /// successor in place, as a part of the moves of the allocation.
+    fn phi_moves(&mut self, block: BlockId, cycle_temp: &mut Option<u32>) -> Run {
+        let liveness = self.liveness;
+        let successors = liveness.successors.get(block.index());
+        let [successor] = successors else {
+            for successor in successors {
                 debug_assert!(self.graph.block(*successor).phis.is_empty(), "critical edge into a phi");
             }
-            return Vec::new();
+            return Run::default();
         };
-        let moves = match state_predecessor(self.graph, *successor) {
-            Some(predecessor) if predecessor != block => self.merge_moves(block, *successor),
+        self.parallel_moves.clear();
+        match state_predecessor(self.graph, *successor) {
+            Some(predecessor) if predecessor != block => self.add_merge_moves(block, *successor),
             merge => {
                 if merge.is_some() {
                     self.place_merge_phis(block, *successor);
                 }
-                liveness::phi_inputs_from(self.graph, block, *successor)
-                    .map(|(phi, input)| Move {
-                        from: self.current_location(input),
-                        to: self.allocation.nodes[phi.index()].output.expect("phis have locations"),
-                    })
-                    .collect::<Vec<_>>()
+                self.add_phi_moves(block, *successor);
             }
-        };
-        if moves.is_empty() {
-            return moves;
+        }
+        if self.parallel_moves.is_empty() {
+            return Run::default();
         }
         let temp = *cycle_temp.get_or_insert_with(|| {
             let slot = self.allocation.spill_slot_count;
             self.allocation.spill_slot_count += 1;
             slot
         });
-        resolve_parallel_moves(&moves, Location::Stack(temp))
+        let start = self.allocation.moves.len();
+        resolve_parallel_moves(
+            &mut self.parallel_moves,
+            Location::Stack(temp),
+            &mut self.allocation.moves,
+        );
+        Run::new(start, self.allocation.moves.len())
     }
 }
 
@@ -1135,67 +1135,95 @@ pub fn phi_spill_store(graph: &Graph, allocation: &Allocation, phi: NodeId) -> O
 
 /// Prints the allocation of `graph` as text: every node with the moves
 /// before it, the locations of its inputs and output, and its spill slot.
-pub fn dump_allocation(graph: &Graph, allocation: &Allocation) -> String {
-    use std::fmt::Write;
-    let location_name = |location: &Location| match location {
-        Location::Register(register) if *register >= FPR_BASE => format!("f{}", register - FPR_BASE),
-        Location::Register(register) => format!("r{register}"),
-        Location::Stack(slot) => format!("s{slot}"),
-        Location::Constant(bits) => format!("#{}", crate::ir::value::describe(*bits)),
-    };
-    let moves_text = |moves: &[Move]| {
-        moves
-            .iter()
-            .map(|m| format!("{} -> {}", location_name(&m.from), location_name(&m.to)))
-            .collect::<Vec<_>>()
-            .join(", ")
-    };
-    let mut out = String::new();
-    for index in 0..graph.blocks.len() {
-        let block = BlockId::from_index(index);
-        writeln!(out, "b{index}:").unwrap();
-        for node_id in graph.block_nodes(block) {
-            let node = &allocation.nodes[node_id.index()];
-            if Some(node_id) == graph.block(block).control && !allocation.block_end_moves[index].is_empty() {
-                writeln!(out, "  moves {}", moves_text(&allocation.block_end_moves[index])).unwrap();
-            }
-            if !node.moves_before.is_empty() {
-                writeln!(out, "  moves {}", moves_text(&node.moves_before)).unwrap();
-            }
-            write!(out, "  v{} {}", node_id.0, graph.node(node_id).op.name()).unwrap();
-            if !node.inputs.is_empty() {
-                let inputs = node.inputs.iter().map(location_name).collect::<Vec<_>>();
-                write!(out, " ({})", inputs.join(", ")).unwrap();
-            }
-            if let Some(output) = &node.output {
-                write!(out, " -> {}", location_name(output)).unwrap();
-            }
-            if !node.temps.is_empty() {
-                let temps = node
-                    .temps
-                    .iter()
-                    .map(|register| format!("r{register}"))
-                    .collect::<Vec<_>>();
-                write!(out, " temps {}", temps.join(", ")).unwrap();
-            }
-            if let Some(slot) = node.spill_slot
-                && graph.node(node_id).op != Op::Phi
-            {
-                write!(out, " spill s{slot}").unwrap();
-            }
-            if !node.exit_values.is_empty() {
-                let values = node
-                    .exit_values
-                    .iter()
-                    .map(|(slot, location)| format!("{slot}={}", location_name(location)))
-                    .collect::<Vec<_>>();
-                write!(out, " exit {{{}}}", values.join(", ")).unwrap();
-            }
-            out.push('\n');
+pub fn dump_allocation<'a, 'z, 'w>(graph: &'a Graph<'z>, allocation: &'a Allocation<'w>) -> AllocationDump<'a, 'z, 'w> {
+    AllocationDump { graph, allocation }
+}
+
+/// The text of `dump_allocation()`.
+pub struct AllocationDump<'a, 'z, 'w> {
+    graph: &'a Graph<'z>,
+    allocation: &'a Allocation<'w>,
+}
+
+struct LocationName(Location);
+
+impl fmt::Display for LocationName {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.0 {
+            Location::Register(register) if register >= FPR_BASE => write!(f, "f{}", register - FPR_BASE),
+            Location::Register(register) => write!(f, "r{register}"),
+            Location::Stack(slot) => write!(f, "s{slot}"),
+            Location::Constant(bits) => write!(f, "#{}", crate::ir::value::describe(bits)),
+            Location::Frame(slot) => write!(f, "frame{slot}"),
         }
     }
-    writeln!(out, "spill slots: {}", allocation.spill_slot_count).unwrap();
-    out
+}
+
+impl fmt::Display for AllocationDump<'_, '_, '_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        /// Writes the text of each item, with ", " between them.
+        fn write_list<T>(
+            f: &mut fmt::Formatter<'_>,
+            items: &[T],
+            write_item: impl Fn(&mut fmt::Formatter<'_>, &T) -> fmt::Result,
+        ) -> fmt::Result {
+            for (index, item) in items.iter().enumerate() {
+                if index != 0 {
+                    f.write_str(", ")?;
+                }
+                write_item(f, item)?;
+            }
+            Ok(())
+        }
+        let write_move =
+            |f: &mut fmt::Formatter<'_>, m: &Move| write!(f, "{} -> {}", LocationName(m.from), LocationName(m.to));
+        let write_location = |f: &mut fmt::Formatter<'_>, location: &Location| write!(f, "{}", LocationName(*location));
+        let (graph, allocation) = (self.graph, self.allocation);
+        for index in 0..graph.blocks.len() {
+            let block = BlockId::from_index(index);
+            writeln!(f, "b{index}:")?;
+            for node_id in graph.block_nodes(block) {
+                let node = allocation.node(node_id);
+                if Some(node_id) == graph.block(block).control && !allocation.block_end_moves(block).is_empty() {
+                    f.write_str("  moves ")?;
+                    write_list(f, allocation.block_end_moves(block), write_move)?;
+                    f.write_str("\n")?;
+                }
+                if !node.moves_before.is_empty() {
+                    f.write_str("  moves ")?;
+                    write_list(f, node.moves_before, write_move)?;
+                    f.write_str("\n")?;
+                }
+                write!(f, "  v{} {}", node_id.0, graph.node(node_id).op.name())?;
+                if !node.inputs.is_empty() {
+                    f.write_str(" (")?;
+                    write_list(f, node.inputs, write_location)?;
+                    f.write_str(")")?;
+                }
+                if let Some(output) = &node.output {
+                    write!(f, " -> {}", LocationName(*output))?;
+                }
+                if !node.temps.is_empty() {
+                    f.write_str(" temps ")?;
+                    write_list(f, node.temps, |f, register| write!(f, "r{register}"))?;
+                }
+                if let Some(slot) = node.spill_slot
+                    && graph.node(node_id).op != Op::Phi
+                {
+                    write!(f, " spill s{slot}")?;
+                }
+                if !node.exit_values.is_empty() {
+                    f.write_str(" exit {")?;
+                    write_list(f, node.exit_values, |f, (slot, location)| {
+                        write!(f, "{slot}={}", LocationName(*location))
+                    })?;
+                    f.write_str("}")?;
+                }
+                f.write_str("\n")?;
+            }
+        }
+        writeln!(f, "spill slots: {}", allocation.spill_slot_count)
+    }
 }
 
 #[cfg(test)]

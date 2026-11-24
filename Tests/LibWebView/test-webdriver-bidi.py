@@ -135,6 +135,8 @@ class ReloadServer(http.server.ThreadingHTTPServer):
         self.release_interception = threading.Event()
         self.detached_final_received = threading.Event()
         self.interception_transport_closed = threading.Event()
+        self.failing_body_sent = threading.Event()
+        self.release_failing_body = threading.Event()
         self.document_headers_sent: threading.Event = threading.Event()
         self.release_document: threading.Event = threading.Event()
         self.preflight_received: threading.Event = threading.Event()
@@ -143,6 +145,8 @@ class ReloadServer(http.server.ThreadingHTTPServer):
         self.document_body: bytes = (
             b"<!doctype html><title>Adopted document</title><p>" + b"BiDi adopted document\n" * 128
         )
+        self.held_body: bytes = b"BiDi held body\n" * 64
+        self.release_held_body: threading.Event = threading.Event()
 
 
 class ReloadHandler(http.server.BaseHTTPRequestHandler):
@@ -168,6 +172,31 @@ class ReloadHandler(http.server.BaseHTTPRequestHandler):
             except (ConnectionResetError, BrokenPipeError):
                 server.interception_transport_closed.set()
             return
+        if self.path == "/network-events/failing-body":
+            self.send_response(200)
+            self.send_header("Content-Length", "1000000")
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(b"unfinished body")
+            self.wfile.flush()
+            server.failing_body_sent.set()
+            if not server.release_failing_body.wait(30):
+                raise TimeoutError("The test did not release the failing body")
+            # The connection closes with the body unfinished, which fails the body.
+            self.close_connection = True
+            return
+        if self.path == "/network-events/whole-body":
+            body = b"BiDi whole body\n"
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            try:
+                self.wfile.write(body)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+            return
         if self.path.startswith("/network-interception/"):
             # NB: Preserve duplicate fields for assertions even if the transport combines their length values.
             # A stale length on the redirected GET is an assertion failure, not a reason for the fixture to wait.
@@ -185,7 +214,11 @@ class ReloadHandler(http.server.BaseHTTPRequestHandler):
                 server.interception_requests.append(record)
             if self.path == "/network-interception/detached-final":
                 server.detached_final_received.set()
-            if self.path in ["/network-interception/late-enable", "/network-interception/detached-redirect"]:
+            if self.path in [
+                "/network-interception/late-enable",
+                "/network-interception/late-subscribe",
+                "/network-interception/detached-redirect",
+            ]:
                 server.interception_received.set()
                 if not server.release_interception.wait(30):
                     raise TimeoutError("The test did not release its intercepted response")
@@ -221,6 +254,23 @@ class ReloadHandler(http.server.BaseHTTPRequestHandler):
             self.end_headers()
             try:
                 self.wfile.write(body)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+            return
+        if self.path.startswith("/network-held-body/"):
+            body = server.held_body
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            try:
+                self.wfile.write(body[:16])
+                self.wfile.flush()
+                if not server.release_held_body.wait(30):
+                    raise TimeoutError("The test did not release the held body")
+                self.wfile.write(body[16:])
+                self.wfile.flush()
             except (BrokenPipeError, ConnectionResetError):
                 pass
             return
@@ -349,9 +399,14 @@ class ReloadHandler(http.server.BaseHTTPRequestHandler):
     def do_OPTIONS(self):
         server = self.server
         assert isinstance(server, ReloadServer)
+        body = self.rfile.read(int(self.headers.get("Content-Length", "0")))
         with server.interception_lock:
             server.preflight_requests.append(
-                {"path": self.path, "method": self.headers.get("Access-Control-Request-Method")}
+                {
+                    "path": self.path,
+                    "method": self.headers.get("Access-Control-Request-Method"),
+                    "body": body.decode(),
+                }
             )
         server.preflight_received.set()
         if not server.release_preflight.wait(30):
@@ -405,6 +460,24 @@ def fetch_records(bidi, command):
     return json.loads(result["result"]["result"]["value"])
 
 
+def is_network_event_for(event, url, methods=None):
+    if not event["method"].startswith("network.") or (methods is not None and event["method"] not in methods):
+        return False
+    return event["params"].get("request", {}).get("url") == url
+
+
+def next_network_event(bidi, url, methods):
+    while True:
+        for index, event in enumerate(bidi.events):
+            if is_network_event_for(event, url, methods):
+                return bidi.events.pop(index)
+        bidi.read_message()
+
+
+def drop_network_events(bidi, url):
+    bidi.events = [event for event in bidi.events if not is_network_event_for(event, url)]
+
+
 def check_network_late_interception(bidi, context, server, abort=False):
     url = f"http://127.0.0.1:{server.server_port}/network-interception/late-enable"
     server.interception_received.clear()
@@ -454,6 +527,210 @@ def check_network_late_interception(bidi, context, server, abort=False):
             bidi.command("network.removeIntercept", {"intercept": intercept})
             if subscription is not None:
                 bidi.command("session.unsubscribe", {"subscriptions": [subscription]})
+
+
+def check_network_subscription_changes(bidi, context, server):
+    origin = f"http://127.0.0.1:{server.server_port}"
+    methods = ["network.beforeRequestSent", "network.responseStarted", "network.responseCompleted"]
+    held_body = server.held_body.decode()
+
+    # Subscribing while a sent request waits for its headers reports every event of that request.
+    url = f"{origin}/network-interception/late-subscribe"
+    server.interception_received.clear()
+    server.release_interception.clear()
+    with server.interception_lock:
+        server.interception_requests.clear()
+    pending = send_fetch(bidi, context, url)
+    assert server.interception_received.wait(30), "The unobserved request did not reach the server"
+    subscription = bidi.command("session.subscribe", {"events": methods})["subscription"]
+    try:
+        # NB: State broadcasts and response delivery come from different IPC peers.
+        bidi.evaluate(context, "0")
+        server.release_interception.set()
+        reported = [next_network_event(bidi, url, methods) for _ in methods]
+        assert [event["method"] for event in reported] == methods, reported
+        assert len({event["params"]["request"]["request"] for event in reported}) == 1, reported
+        assert not any(event["params"]["isBlocked"] for event in reported), reported
+        records = fetch_records(bidi, pending)
+        assert [record["path"] for record in records] == ["/network-interception/late-subscribe"], records
+
+        # Unsubscribing while a response's body is held suppresses that response's completion.
+        url = f"{origin}/network-held-body/unsubscribe"
+        server.release_held_body.clear()
+        pending = send_fetch(bidi, context, url)
+        next_network_event(bidi, url, ["network.responseStarted"])
+        bidi.command("session.unsubscribe", {"subscriptions": [subscription]})
+        subscription = None
+        bidi.evaluate(context, "0")
+        server.release_held_body.set()
+        result = bidi.response(pending)
+        assert result["type"] == "success" and result["result"]["result"]["value"] == held_body, result
+        bidi.evaluate(context, "0")
+        assert not any(is_network_event_for(event, url, ["network.responseCompleted"]) for event in bidi.events), (
+            bidi.events
+        )
+        drop_network_events(bidi, url)
+
+        # A response handed over before any network event was subscribed reports none of them afterwards.
+        url = f"{origin}/network-held-body/after-handover"
+        server.release_held_body.clear()
+        status = bidi.evaluate(
+            context,
+            f"fetch({json.dumps(url)}).then(response => {{ window.heldBody = response.text(); return response.status; }})",
+            awaitPromise=True,
+        )
+        assert status["result"]["value"] == 200, status
+        subscription = bidi.command("session.subscribe", {"events": methods})["subscription"]
+        bidi.evaluate(context, "0")
+        server.release_held_body.set()
+        body = bidi.evaluate(context, "heldBody", awaitPromise=True)
+        assert body["result"]["value"] == held_body, body
+        bidi.evaluate(context, "0")
+        assert not any(is_network_event_for(event, url) for event in bidi.events), bidi.events
+    finally:
+        server.release_interception.set()
+        server.release_held_body.set()
+        if sys.exc_info()[0] is None and subscription is not None:
+            bidi.command("session.unsubscribe", {"subscriptions": [subscription]})
+
+
+def check_network_isolated_contexts(bidi, context, server):
+    origin = f"http://127.0.0.1:{server.server_port}"
+    url = f"{origin}/network-interception/isolated-contexts"
+    path = urllib.parse.urlsplit(url).path
+    methods = ["network.beforeRequestSent", "network.responseStarted", "network.responseCompleted"]
+    other = bidi.command("browsingContext.create", {"type": "tab", "background": True})["context"]
+    bidi.command(
+        "browsingContext.navigate", {"context": other, "url": f"{origin}/interception-page", "wait": "complete"}
+    )
+    subscriptions = [bidi.command("session.subscribe", {"events": methods, "contexts": [context]})["subscription"]]
+    intercept = bidi.command(
+        "network.addIntercept",
+        {"phases": ["beforeRequestSent"], "contexts": [context], "urlPatterns": [{"type": "string", "pattern": url}]},
+    )["intercept"]
+    every_context_intercept = bidi.command(
+        "network.addIntercept",
+        {"phases": ["beforeRequestSent"], "urlPatterns": [{"type": "string", "pattern": url}]},
+    )["intercept"]
+    try:
+        with server.interception_lock:
+            server.interception_requests.clear()
+        # A request of a context the subscription leaves out is neither reported nor blocked, even by an intercept
+        # for every context.
+        records = fetch_records(bidi, send_fetch(bidi, other, url))
+        assert [record["path"] for record in records] == [path], records
+        bidi.evaluate(other, "0")
+        assert not any(is_network_event_for(event, url) for event in bidi.events), bidi.events
+
+        pending = send_fetch(bidi, context, url)
+        event = intercepted_event(bidi, "network.beforeRequestSent", url)
+        assert event["context"] == context, event
+        bidi.command("network.continueRequest", {"request": event["request"]["request"]})
+        records = fetch_records(bidi, pending)
+        assert [record["path"] for record in records] == [path, path], records
+        drop_network_events(bidi, url)
+
+        bidi.command("network.removeIntercept", {"intercept": every_context_intercept})
+        every_context_intercept = None
+        # The intercept for the subscribed context alone still blocks that context's request.
+        pending = send_fetch(bidi, context, url)
+        event = intercepted_event(bidi, "network.beforeRequestSent", url)
+        assert event["context"] == context, event
+        bidi.command("network.continueRequest", {"request": event["request"]["request"]})
+        records = fetch_records(bidi, pending)
+        assert [record["path"] for record in records] == [path, path, path], records
+        drop_network_events(bidi, url)
+
+        # A subscription for every context reports the other context's request, which the intercept leaves unblocked.
+        every_context = bidi.command("session.subscribe", {"events": ["network.beforeRequestSent"]})["subscription"]
+        subscriptions.append(every_context)
+        pending = send_fetch(bidi, other, url)
+        event = next_network_event(bidi, url, ["network.beforeRequestSent"])["params"]
+        assert event["context"] == other and not event["isBlocked"], event
+        fetch_records(bidi, pending)
+        drop_network_events(bidi, url)
+    finally:
+        if sys.exc_info()[0] is None:
+            if every_context_intercept is not None:
+                bidi.command("network.removeIntercept", {"intercept": every_context_intercept})
+            bidi.command("network.removeIntercept", {"intercept": intercept})
+            bidi.command("session.unsubscribe", {"subscriptions": subscriptions})
+            bidi.command("browsingContext.close", {"context": other})
+
+
+def check_network_removed_intercept(bidi, context, server):
+    url = f"http://127.0.0.1:{server.server_port}/network-interception/removed-intercept"
+    path = urllib.parse.urlsplit(url).path
+    subscription = bidi.command("session.subscribe", {"events": ["network.beforeRequestSent"]})["subscription"]
+    intercept = bidi.command(
+        "network.addIntercept",
+        {"phases": ["beforeRequestSent"], "urlPatterns": [{"type": "string", "pattern": url}]},
+    )["intercept"]
+    try:
+        with server.interception_lock:
+            server.interception_requests.clear()
+        pending = send_fetch(bidi, context, url)
+        event = intercepted_event(bidi, "network.beforeRequestSent", url)
+        # Removing the intercept leaves the request it blocked waiting for a decision.
+        bidi.command("network.removeIntercept", {"intercept": intercept})
+        intercept = None
+        bidi.evaluate(context, "0")
+        with server.interception_lock:
+            assert not server.interception_requests, server.interception_requests
+        bidi.command("network.continueRequest", {"request": event["request"]["request"]})
+        records = fetch_records(bidi, pending)
+        assert [record["path"] for record in records] == [path], records
+        bidi.evaluate(context, "0")
+        with server.interception_lock:
+            assert [record["path"] for record in server.interception_requests] == [path], server.interception_requests
+    finally:
+        if sys.exc_info()[0] is None:
+            if intercept is not None:
+                bidi.command("network.removeIntercept", {"intercept": intercept})
+            bidi.command("session.unsubscribe", {"subscriptions": [subscription]})
+
+
+def check_network_terminated_while_blocked(bidi, context, server):
+    url = f"http://127.0.0.1:{server.server_port}/network-interception/terminated-while-blocked"
+    subscription = bidi.command("session.subscribe", {"events": ["network.beforeRequestSent", "network.fetchError"]})[
+        "subscription"
+    ]
+    intercept = bidi.command(
+        "network.addIntercept",
+        {"phases": ["beforeRequestSent"], "urlPatterns": [{"type": "string", "pattern": url}]},
+    )["intercept"]
+    try:
+        with server.interception_lock:
+            server.interception_requests.clear()
+        pending = bidi.send(
+            "script.evaluate",
+            {
+                "target": {"context": context},
+                "expression": "new Promise(resolve => { window.timedRequest = new XMLHttpRequest(); "
+                f"timedRequest.open('GET', {json.dumps(url)}); "
+                "for (const type of ['load', 'error', 'abort', 'timeout']) "
+                "timedRequest.addEventListener(type, () => resolve(type)); timedRequest.send(); })",
+                "awaitPromise": True,
+            },
+        )
+        event = intercepted_event(bidi, "network.beforeRequestSent", url)
+        request_id = event["request"]["request"]
+        # A timeout that elapses while the request is blocked terminates its fetch.
+        bidi.evaluate(context, "timedRequest.timeout = 1; 0")
+        result = bidi.response(pending)
+        assert result["type"] == "success" and result["result"]["result"]["value"] == "timeout", result
+        error = next_network_event(bidi, url, ["network.fetchError"])["params"]
+        assert error["request"]["request"] == request_id and error["errorText"] == "Fetch was terminated", error
+        result = bidi.response(bidi.send("network.continueRequest", {"request": request_id}))
+        assert result["type"] == "error" and result["error"] == "no such request", result
+        bidi.evaluate(context, "0")
+        assert not any(is_network_event_for(event, url) for event in bidi.events), bidi.events
+        with server.interception_lock:
+            assert not server.interception_requests, server.interception_requests
+    finally:
+        if sys.exc_info()[0] is None:
+            bidi.command("network.removeIntercept", {"intercept": intercept})
+            bidi.command("session.unsubscribe", {"subscriptions": [subscription]})
 
 
 def check_network_override_retries(bidi, context, server, kinds):
@@ -1152,6 +1429,100 @@ def check_network_stopped_fetch_reports_error(bidi, context, server):
             bidi.evaluate(context, "objectFrame.remove(); 0")
 
 
+def check_network_body_error_after_late_subscription(bidi, context, server):
+    url = f"http://127.0.0.1:{server.server_port}/network-events/failing-body"
+    server.failing_body_sent.clear()
+    server.release_failing_body.clear()
+    pending = bidi.send(
+        "script.evaluate",
+        {
+            "target": {"context": context},
+            "expression": "window.failingBodyAbort = new AbortController(); window.failingBodyResponse = false; "
+            f"fetch({json.dumps(url)}, {{signal: failingBodyAbort.signal}}).then(response => "
+            "{ failingBodyResponse = true; return response.text(); }).then(() => 'fulfilled', error => error.name)",
+            "awaitPromise": True,
+        },
+    )
+    subscription = None
+
+    def reported_events():
+        return [
+            (event["method"], event["params"]["request"]["request"])
+            for event in bidi.events
+            if event["method"].startswith("network.") and event["params"]["request"]["url"] == url
+        ]
+
+    try:
+        assert server.failing_body_sent.wait(30), "The request did not reach the server"
+        # No network event is enabled until the fetch has handed its response over.
+        deadline = time.monotonic() + 30
+        while not bidi.evaluate(context, "failingBodyResponse")["result"]["value"]:
+            assert time.monotonic() < deadline, "The response did not arrive"
+            time.sleep(0.01)
+        subscription = bidi.command(
+            "session.subscribe", {"events": ["network.beforeRequestSent", "network.fetchError"]}
+        )["subscription"]
+        # NB: State broadcasts and response delivery come from different IPC peers.
+        bidi.evaluate(context, "0")
+        server.release_failing_body.set()
+        result = bidi.response(pending)
+        assert result["type"] == "success" and result["result"]["result"]["value"] == "TypeError", result
+        events = reported_events()
+        assert [method for method, _ in events] == ["network.beforeRequestSent", "network.fetchError"], events
+        assert events[0][1] == events[1][1], events
+
+        # An abort after the body failed reports nothing more, and no other id for the request.
+        bidi.evaluate(context, "failingBodyAbort.abort(); 0")
+        assert reported_events() == events, (events, reported_events())
+        bidi.events = [
+            event
+            for event in bidi.events
+            if not event["method"].startswith("network.") or event["params"]["request"]["url"] != url
+        ]
+    finally:
+        server.release_failing_body.set()
+        if sys.exc_info()[0] is None and subscription is not None:
+            bidi.command("session.unsubscribe", {"subscriptions": [subscription]})
+
+
+def check_network_end_time_after_late_subscription(bidi, context, server):
+    url = f"http://127.0.0.1:{server.server_port}/network-events/whole-body"
+    # The page leaves the body unread, and the fetch reports its timing once the network has delivered it.
+    bidi.evaluate(
+        context,
+        "window.endTimeAbort = new AbortController(); "
+        f"fetch({json.dumps(url)}, {{signal: endTimeAbort.signal}}).then(response => {{ window.endTimeResponse = response; }}); 0",
+    )
+    subscription = None
+    try:
+        entry_response_end_expression = (
+            f"performance.getEntriesByName({json.dumps(url)}).map(entry => entry.responseEnd).concat([0])[0]"
+        )
+        deadline = time.monotonic() + 30
+        while (entry_response_end := bidi.evaluate(context, entry_response_end_expression)["result"]["value"]) == 0:
+            assert time.monotonic() < deadline, "The fetch did not report its timing"
+            time.sleep(0.01)
+
+        # Network events are subscribed only after the timing report, and the abort then reports the request.
+        subscription = bidi.command(
+            "session.subscribe", {"events": ["network.beforeRequestSent", "network.fetchError"]}
+        )["subscription"]
+        bidi.evaluate(context, "0")
+        bidi.evaluate(context, "endTimeAbort.abort(); 0")
+        events = [
+            next_network_event(bidi, url, ["network.beforeRequestSent"]),
+            next_network_event(bidi, url, ["network.fetchError"]),
+        ]
+        response_ends = [event["params"]["request"]["timings"]["responseEnd"] for event in events]
+        assert all(response_end > 0 for response_end in response_ends), response_ends
+        assert response_ends[0] == response_ends[1], response_ends
+        assert abs(response_ends[0] - entry_response_end) < 1, (response_ends, entry_response_end)
+        drop_network_events(bidi, url)
+    finally:
+        if sys.exc_info()[0] is None and subscription is not None:
+            bidi.command("session.unsubscribe", {"subscriptions": [subscription]})
+
+
 def check_network_continue_after_gc(bidi, context, server):
     subscription = bidi.command(
         "session.subscribe",
@@ -1207,6 +1578,39 @@ def check_network_continue_after_gc(bidi, context, server):
             bidi.command("network.removeIntercept", {"intercept": intercept})
     finally:
         if sys.exc_info()[0] is None:
+            bidi.command("session.unsubscribe", {"subscriptions": [subscription]})
+
+
+def check_network_preflight_body(bidi, context, server):
+    url = f"http://localhost:{server.server_port}/network-interception/cors/preflight-body"
+    path = urllib.parse.urlsplit(url).path
+    subscription = bidi.command("session.subscribe", {"events": ["network.beforeRequestSent"]})["subscription"]
+    intercept = bidi.command(
+        "network.addIntercept",
+        {"phases": ["beforeRequestSent"], "urlPatterns": [{"type": "string", "pattern": url}]},
+    )["intercept"]
+    server.release_preflight.set()
+    try:
+        with server.interception_lock:
+            server.interception_requests.clear()
+            server.preflight_requests.clear()
+        pending = send_fetch(bidi, context, url, {"headers": {"X-BiDi": "1"}})
+        event = intercepted_event(bidi, "network.beforeRequestSent", url)
+        assert event["request"]["method"] == "OPTIONS", event
+        body = {"type": "string", "value": "preflight-body"}
+        bidi.command("network.continueRequest", {"request": event["request"]["request"], "body": body})
+        event = intercepted_event(bidi, "network.beforeRequestSent", url)
+        assert event["request"]["method"] == "GET", event
+        bidi.command("network.continueRequest", {"request": event["request"]["request"]})
+        records = fetch_records(bidi, pending)
+        received = [(record["path"], record["method"], record["body"]) for record in records]
+        assert received == [(path, "GET", "")], records
+        with server.interception_lock:
+            preflights = list(server.preflight_requests)
+        assert preflights == [{"path": path, "method": "GET", "body": "preflight-body"}], preflights
+    finally:
+        if sys.exc_info()[0] is None:
+            bidi.command("network.removeIntercept", {"intercept": intercept})
             bidi.command("session.unsubscribe", {"subscriptions": [subscription]})
 
 
@@ -1490,8 +1894,14 @@ def check_network_interception(bidi, context, server, case="all"):
             check_network_cancel_with_events_off(bidi, context, server, kind)
     if case in ["all", "events-on-stop"]:
         check_network_stopped_fetch_reports_error(bidi, context, server)
+    if case in ["all", "late-events-body-error"]:
+        check_network_body_error_after_late_subscription(bidi, context, server)
+    if case in ["all", "late-events-end-time"]:
+        check_network_end_time_after_late_subscription(bidi, context, server)
     if case in ["all", "continue-after-gc"]:
         check_network_continue_after_gc(bidi, context, server)
+    if case in ["all", "preflight-body"]:
+        check_network_preflight_body(bidi, context, server)
     for action in ["continue", "fail", "provide"]:
         if case in ["all", f"adopted-navigation-{action}"]:
             check_network_intercepted_adopted_navigation(bidi, context, server, action)
@@ -1513,6 +1923,14 @@ def check_network_interception(bidi, context, server, case="all"):
             else [case.removeprefix("auth-")]
         )
         check_network_authentication_gates(bidi, context, server, kinds)
+    if case in ["all", "subscription-changes"]:
+        check_network_subscription_changes(bidi, context, server)
+    if case in ["all", "isolated-contexts"]:
+        check_network_isolated_contexts(bidi, context, server)
+    if case in ["all", "removed-intercept"]:
+        check_network_removed_intercept(bidi, context, server)
+    if case in ["all", "terminated-while-blocked"]:
+        check_network_terminated_while_blocked(bidi, context, server)
 
 
 def check_network_download_events(bidi, context, server, downloads):
@@ -1625,7 +2043,12 @@ def check_network_adopted_navigation_events(bidi, context, server):
     subscription = bidi.command(
         "session.subscribe",
         {
-            "events": ["network.beforeRequestSent", "network.responseStarted", *sorted(terminal_methods)],
+            "events": [
+                "browsingContext.navigationAborted",
+                "network.beforeRequestSent",
+                "network.responseStarted",
+                *sorted(terminal_methods),
+            ],
             "contexts": [context],
         },
     )["subscription"]
@@ -1672,8 +2095,28 @@ def check_network_adopted_navigation_events(bidi, context, server):
                 )
 
                 if kind == "stopped":
-                    # A stop in the document's process ends the adopted body with a fetch error.
+                    # A stop in the document's process ends the adopted body with a fetch error, reported before the
+                    # stop aborts the document's navigation.
                     bidi.evaluate(context, "window.stop()")
+
+                    def is_our_navigation_abort(event, navigation=started["navigation"]):
+                        return (
+                            event["method"] == "browsingContext.navigationAborted"
+                            and event["params"].get("navigation") == navigation
+                        )
+
+                    while True:
+                        reported = [
+                            event["method"]
+                            for event in bidi.events
+                            if (event["method"] in terminal_methods and is_our_event(event))
+                            or is_our_navigation_abort(event)
+                        ]
+                        if len(reported) >= 2:
+                            break
+                        bidi.read_message()
+                    assert reported[:2] == ["network.fetchError", "browsingContext.navigationAborted"], reported
+                    bidi.events = [event for event in bidi.events if not is_our_navigation_abort(event)]
                 else:
                     server.release_document.set()
                 terminal = next_event(terminal_methods)
@@ -1841,7 +2284,8 @@ def check_network_subresource_events(bidi, context, server):
                     # A preflight for this PUT reached the server.
                     with server.interception_lock:
                         preflights = list(server.preflight_requests)
-                    assert {"path": urllib.parse.urlsplit(url).path, "method": "PUT"} in preflights, (host, preflights)
+                    preflight = {"path": urllib.parse.urlsplit(url).path, "method": "PUT", "body": ""}
+                    assert preflight in preflights, (host, preflights)
     finally:
         if sys.exc_info()[0] is None:
             bidi.command("session.unsubscribe", {"subscriptions": [subscription]})
@@ -2473,7 +2917,6 @@ def run_test(
                 webdriver_binary,
                 "--headless",
                 "--expose-internals-object",
-                "--site-isolation=iframe",
                 f"--profile-path={profile}",
                 env={**os.environ, "XDG_DOWNLOAD_DIR": downloads},
             )
@@ -2733,7 +3176,10 @@ if __name__ == "__main__":
             "events-off-abort",
             "events-off-stop",
             "events-on-stop",
+            "late-events-body-error",
+            "late-events-end-time",
             "continue-after-gc",
+            "preflight-body",
             "adopted-navigation-continue",
             "adopted-navigation-fail",
             "adopted-navigation-provide",
@@ -2765,6 +3211,10 @@ if __name__ == "__main__":
             "auth-continue-response",
             "auth-continue-response-default",
             "auth-continue-response-credentials",
+            "subscription-changes",
+            "isolated-contexts",
+            "removed-intercept",
+            "terminated-while-blocked",
         ],
         default="all",
     )

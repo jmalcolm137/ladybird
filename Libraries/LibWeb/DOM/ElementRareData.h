@@ -6,6 +6,7 @@
 
 #pragma once
 
+#include <LibGC/WeakHashSet.h>
 #include <LibWeb/CSS/CustomPropertyData.h>
 #include <LibWeb/CSS/ParkedRandomBaseValues.h>
 #include <LibWeb/CSS/StylePropertyMap.h>
@@ -26,7 +27,6 @@ struct Element::RareData
     virtual ~RareData() override;
     virtual void visit_edges(Cell::Visitor&) override;
 
-    mutable Optional<Utf16FlyString> html_uppercased_qualified_name;
     GC::Ptr<CSS::StylePropertyMap> attribute_style_map;
     GC::Ptr<DOMTokenList> class_list;
     GC::Ptr<DOMTokenList> part_list;
@@ -35,6 +35,10 @@ struct Element::RareData
     CustomHighlightStyles custom_highlight_styles;
     Optional<CSS::PseudoElement> associated_shadow_host_pseudo_element;
     Vector<Utf16FlyString> parts;
+
+    // https://drafts.csswg.org/css-anchor-position-1/#implicit-anchor-element
+    GC::Weak<Element> implicit_anchor_element;
+    GC::WeakHashSet<Element> implicit_anchor_dependents;
 
     // https://html.spec.whatwg.org/multipage/custom-elements.html#custom-element-reaction-queue
     // All elements have an associated custom element reaction queue, initially empty. Each item in the custom element reaction queue is of one of two types:

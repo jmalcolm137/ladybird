@@ -9,16 +9,18 @@
 
 use super::canvas_2d::{Compositing, Paint, Stroke, TapeWriter};
 use super::commands::*;
+use crate::ipc_types::Web_Bindings_PredefinedColorSpace;
 use libgfx_rust::{
     AffineTransform, Color, FloatPoint, FloatRect, IntPoint, IntRect, IntSize, ScalingMode, WindingRule,
 };
+use libipc_rust::wire::{Decode, Encode};
 
 /// The number of commands that the shared stream carries to the Compositor at most in one batch. A batch holds the
 /// image frames of its commands, each a bitmap that an IPC attachment carries, so it has to stay small.
 pub const MAX_PENDING_COMMANDS: usize = 64;
 
 // The values of Gfx::AlphaType.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode)]
 #[repr(u8)]
 pub enum AlphaType {
     Premultiplied,
@@ -37,16 +39,32 @@ pub enum ColorSpace {
     DisplayP3Linear,
 }
 
+pub const MAX_CANVAS_AREA: i64 = 16384 * 16384;
+
+pub fn is_valid_canvas_2d_size(size: IntSize) -> bool {
+    size.width > 0 && size.height > 0 && i64::from(size.width) * i64::from(size.height) <= MAX_CANVAS_AREA
+}
+
+impl From<ColorSpace> for Web_Bindings_PredefinedColorSpace {
+    fn from(color_space: ColorSpace) -> Self {
+        match color_space {
+            ColorSpace::Srgb => Self::Srgb,
+            ColorSpace::SrgbLinear => Self::SrgbLinear,
+            ColorSpace::DisplayP3 => Self::DisplayP3,
+            ColorSpace::DisplayP3Linear => Self::DisplayP3Linear,
+        }
+    }
+}
+
 /// The context of a canvas in the Compositor, and the stream that the commands of every canvas of WebContent share.
-/// In the product that is a RemoteCanvas2DTransport of LibWeb.
+/// In the product that is the CompositorTransport of Libraries/LibWeb/Bindings/Rust/src/canvas_2d/host.rs.
 pub trait Transport {
-    /// A Gfx::Font, lent to the call that takes it.
+    /// A Gfx::Font.
     type Font: ?Sized;
-    /// A Gfx::DecodedImageFrame, lent to the call that takes it.
-    type ImageFrame: ?Sized;
-    /// A Compositing::VideoFrameHold, lent to the call that takes it.
+    /// A Gfx::DecodedImageFrame.
+    type ImageFrame;
+    /// A Compositing::VideoFrameHold.
     type VideoFrameHold: ?Sized;
-    type Bitmap;
 
     fn create_context(&self, size: IntSize, alpha: bool, will_read_frequently: bool, color_space: ColorSpace) -> bool;
     fn canvas_id(&self) -> Option<CanvasId>;
@@ -64,7 +82,12 @@ pub trait Transport {
     fn flush(&self);
 
     /// Unpremultiplied pixels come back as RGBA8888, premultiplied pixels as BGRA8888, in the color space.
-    fn read_back_pixels(&self, rect: IntRect, alpha_type: AlphaType, color_space: ColorSpace) -> Option<Self::Bitmap>;
+    fn read_back_pixels(
+        &self,
+        rect: IntRect,
+        alpha_type: AlphaType,
+        color_space: ColorSpace,
+    ) -> Option<Self::ImageFrame>;
 }
 
 pub struct Recorder<T: Transport> {
@@ -103,7 +126,12 @@ impl<T: Transport> Recorder<T> {
         self.transport.flush();
     }
 
-    pub fn read_back_pixels(&self, rect: IntRect, alpha_type: AlphaType, color_space: ColorSpace) -> Option<T::Bitmap> {
+    pub fn read_back_pixels(
+        &self,
+        rect: IntRect,
+        alpha_type: AlphaType,
+        color_space: ColorSpace,
+    ) -> Option<T::ImageFrame> {
         self.transport.read_back_pixels(rect, alpha_type, color_space)
     }
 
@@ -263,10 +291,12 @@ mod tests {
         RetainVideoFrameHold(u32),
         Present,
         Flush,
+        ReadBackPixels(IntRect),
     }
 
-    // Plays the stream: a font and an image frame are their ids, a video frame hold is a number, and a bitmap is the
-    // rect it was read back from.
+    const ID_OF_FRAME_READ_BACK: u64 = 7;
+
+    // Plays the stream: a font and an image frame are their ids, and a video frame hold is a number.
     #[derive(Default)]
     struct FakeTransport {
         events: RefCell<Vec<Event>>,
@@ -278,7 +308,6 @@ mod tests {
         type Font = u64;
         type ImageFrame = u64;
         type VideoFrameHold = u32;
-        type Bitmap = IntRect;
 
         fn create_context(
             &self,
@@ -333,8 +362,9 @@ mod tests {
             self.pending_command_count.set(0);
         }
 
-        fn read_back_pixels(&self, rect: IntRect, _alpha_type: AlphaType, _color_space: ColorSpace) -> Option<IntRect> {
-            Some(rect)
+        fn read_back_pixels(&self, rect: IntRect, _alpha_type: AlphaType, _color_space: ColorSpace) -> Option<u64> {
+            self.events.borrow_mut().push(Event::ReadBackPixels(rect));
+            Some(ID_OF_FRAME_READ_BACK)
         }
     }
 
@@ -435,9 +465,12 @@ mod tests {
         let rect = IntRect::new(1, 1, 1, 1);
         assert_eq!(
             recorder.read_back_pixels(rect, AlphaType::Premultiplied, ColorSpace::Srgb),
-            Some(rect)
+            Some(ID_OF_FRAME_READ_BACK)
         );
         recorder.destroy_context();
-        assert_eq!(*recorder.transport.events.borrow(), [Event::Present, Event::Flush]);
+        assert_eq!(
+            *recorder.transport.events.borrow(),
+            [Event::Present, Event::Flush, Event::ReadBackPixels(rect)]
+        );
     }
 }

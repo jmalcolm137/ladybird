@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+mod blob_url_entry;
 pub mod form_urlencoded;
 mod host;
 mod input;
@@ -13,6 +14,9 @@ mod scheme;
 mod serialize;
 mod types;
 
+use crate::origin::Host;
+
+pub use self::blob_url_entry::BlobUrlEntry;
 pub(crate) use self::host::parse_host_into;
 pub use self::input::UrlInput;
 pub use self::percent_encoding::percent_decode_bytes;
@@ -53,6 +57,13 @@ impl<'a> BasicParseOptions<'a> {
 // https://url.spec.whatwg.org/#concept-basic-url-parser
 pub fn basic_parse<'a>(input: impl Into<UrlInput<'a>>, options: BasicParseOptions<'_>) -> Option<Url> {
     parser::basic_parse(input.into(), options.base_url, options.encoding)
+}
+
+// https://url.spec.whatwg.org/#concept-host-parser
+pub fn parse_host<'a>(input: impl Into<UrlInput<'a>>) -> Option<Host> {
+    let mut serialization = String::new();
+    let kind = parse_host_into(input.into(), false, &mut serialization)?;
+    Some(Host { kind, serialization })
 }
 
 pub fn create_with_data(mime_type: &str, payload: &str, is_base64: bool) -> Url {

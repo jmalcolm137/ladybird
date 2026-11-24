@@ -22,7 +22,7 @@ use libunicode_rust::character_types::{
     code_point_has_identifier_continue_property, code_point_has_identifier_start_property,
 };
 
-use crate::bindings::conversions::{CppInterface, ToJs, buffer_source_type_of};
+use crate::bindings::conversions::{ToJs, buffer_source_type_of};
 use crate::bindings::cpp_cell::CppCell;
 use crate::bindings::event_target::{CppEvent, CppEventTarget};
 use crate::bindings::interface::{Interface, Ref, implementation_if, implementation_of};
@@ -30,8 +30,9 @@ use crate::bindings::{CallContext, Exception, MustNotThrow, WebIdlResult};
 use crate::dom::event::EventInit;
 use crate::file_api::blob::{AnyBlob, Blob};
 use crate::file_api::file::File;
+use crate::html::dom_string_list::DOMStringList;
 use crate::html::structured_serialize::{structured_deserialize_for_storage, structured_serialize_for_storage};
-use crate::indexed_db::cpp::{DomException, create_dom_string_list};
+use crate::indexed_db::cpp::DomException;
 use crate::indexed_db::idb_cursor::{AnyIDBCursor, IDBCursorDirection};
 use crate::indexed_db::idb_database::{ConnectionState, IDBDatabase, IDBTransactionDurability};
 use crate::indexed_db::idb_key_range::{IDBKeyRange, key_range_from_value};
@@ -864,7 +865,7 @@ pub(crate) fn abort_a_transaction(vm: &Vm, transaction: Ref<IDBTransaction>, err
     }
 
     // 4. Set transaction’s state to finished.
-    transaction.set_state(TransactionState::Finished);
+    IDBTransaction::set_finished(vm, transaction);
 
     // AD-HOC: Clear the cleanup event loop so that the microtask checkpoint doesn't set the state to inactive on a
     //         finished transaction.
@@ -1125,12 +1126,12 @@ pub(crate) fn is_valid_key_path(path: &KeyPath) -> bool {
 }
 
 // https://w3c.github.io/IndexedDB/#create-a-sorted-name-list
-pub(crate) fn create_a_sorted_name_list(cx: &CallContext, mut names: Vec<Utf16String>) -> CppInterface {
+pub(crate) fn create_a_sorted_name_list(vm: &Vm, mut names: Vec<Utf16String>) -> Ref<DOMStringList> {
     // 1. Let sorted be names sorted in ascending order with the code unit less than algorithm.
     names.sort_by(code_unit_order);
 
     // 2. Return a new DOMStringList associated with sorted.
-    create_dom_string_list(cx, &names)
+    DOMStringList::create(vm, names)
 }
 
 // https://w3c.github.io/IndexedDB/#commit-a-transaction
@@ -1173,7 +1174,7 @@ pub(crate) fn commit_a_transaction(vm: &Vm, transaction: Ref<IDBTransaction>) {
                     transaction.discard_mutation_logs(vm);
 
                     // 2. Set transaction’s state to finished.
-                    transaction.set_state(TransactionState::Finished);
+                    IDBTransaction::set_finished(vm, transaction);
 
                     // 3. Fire an event named complete at transaction.
                     transaction.event_target().dispatch_event(&CppEvent::create(

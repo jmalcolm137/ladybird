@@ -44,6 +44,10 @@ struct Resolver
 
     static void reset_connections();
 
+    // From now on, every resolver sends the names that it looks up with the system resolver to the process that
+    // launched RequestServer: RequestServer may not read the files the system resolver needs, like /etc/resolv.conf.
+    static void resolve_system_names_remotely();
+
     DNS::Resolver dns;
 
 private:
@@ -51,6 +55,15 @@ private:
 
     explicit Resolver(Function<ErrorOr<Optional<DNS::Resolver::SocketResult>>()> create_socket);
 };
+
+// curl resolves the host of a proxy given by name itself, with the system resolver, unless the handle's CURLOPT_RESOLVE
+// list pins it. But RequestServer may not read the files the system resolver needs. So this looks the host up with the
+// system resolver the way RequestServer does, for curl_resolve_entry_for_proxy() to pin, and calls back once it has.
+// There's nothing to look up for a proxy given as an address, or for no proxy.
+void resolve_proxy_host(Optional<HTTP::Proxy> const&, Function<void(ErrorOr<void>)>);
+
+// The CURLOPT_RESOLVE entry that pins the host of a proxy given by name to what resolve_proxy_host() found for it.
+Optional<ByteString> curl_resolve_entry_for_proxy(Optional<HTTP::Proxy> const&);
 
 ByteString const& default_certificate_path();
 void set_default_certificate_path(ByteString);

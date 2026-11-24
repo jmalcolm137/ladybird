@@ -27,6 +27,7 @@
 #include <LibWeb/HTML/HTMLHRElement.h>
 #include <LibWeb/HTML/HTMLImageElement.h>
 #include <LibWeb/HTML/HTMLLIElement.h>
+#include <LibWeb/HTML/HTMLSelectElement.h>
 #include <LibWeb/HTML/HTMLTableElement.h>
 #include <LibWeb/HTML/Numbers.h>
 #include <LibWeb/HTML/Scripting/Environments.h>
@@ -819,13 +820,13 @@ Utf16String command_font_size_value(DOM::Document const& document)
     //    the active range, or if there is no such node, the effective command value of the active range's start node,
     //    in either case interpreted as a number of pixels.
     auto first_formattable_node = first_formattable_node_effectively_contained(range);
-    auto value = effective_command_value(
-        first_formattable_node ? first_formattable_node : *range->start_container(),
-        CommandNames::fontSize);
-    auto pixel_size = font_size_to_pixel_size(value.value_or({}));
+    GC::Ref<DOM::Node> node = first_formattable_node ? *first_formattable_node : *range->start_container();
+    auto value = effective_command_value(node, CommandNames::fontSize);
+    auto medium_font_size = medium_font_size_at(node);
+    auto pixel_size = font_size_to_pixel_size(value.value_or({}), medium_font_size);
 
     // 3. Return the legacy font size for pixel size.
-    return legacy_font_size(pixel_size.to_int());
+    return legacy_font_size(pixel_size.to_int(), medium_font_size);
 }
 
 // https://w3c.github.io/editing/docs/execCommand/#the-forecolor-command
@@ -1762,14 +1763,14 @@ bool command_insert_linebreak_action(DOM::Document& document, Utf16View)
         MUST(selection.collapse(start_node->parent(), start_node->index() + 1));
 
     // AD-HOC: In preformatted white-space contexts, use newlines instead of <br> for line breaks. This matches
-    //         Chrome behavior and WPT expectations. The white-space: pre, pre-wrap, and pre-line styles all preserve
-    //         newlines, so inserting a literal newline character is more appropriate than a <br> element.
+    //         Chrome behavior and WPT expectations. The white-space: pre, pre-wrap, pre-line, and break-spaces styles
+    //         all preserve newlines, so inserting a literal newline character is more appropriate than a <br> element.
     //         However, padding line breaks (needed for empty last lines) should still be <br> because they won't
     //         appear in .textContent, making the content easier to work with programmatically.
     // INTEROP: Browsers do insert a <br> if the white-space style comes from the default style of an element such as
     //          pre.
     auto resolved_white_space_collapse = resolved_keyword(*start_node, CSS::PropertyID::WhiteSpaceCollapse);
-    if (resolved_white_space_collapse.has_value() && first_is_one_of(resolved_white_space_collapse.value(), CSS::Keyword::Preserve, CSS::Keyword::PreserveBreaks)
+    if (resolved_white_space_collapse.has_value() && first_is_one_of(resolved_white_space_collapse.value(), CSS::Keyword::Preserve, CSS::Keyword::PreserveBreaks, CSS::Keyword::BreakSpaces)
         && !white_space_is_from_default_style(*start_node)) {
         if (auto* text_node = as_if<DOM::Text>(*start_node)) {
             MUST(insert_data(*text_node, start_offset, "\n"_utf16));
@@ -2361,15 +2362,27 @@ bool command_insert_paragraph_action(DOM::Document& document, Utf16View)
 // https://w3c.github.io/editing/docs/execCommand/#the-inserttext-command
 static bool insert_text(DOM::Document& document, Utf16View value, InsertTextContext context)
 {
-    // 1. Delete the selection, with strip wrappers false.
     auto& selection = *document.get_selection();
+    auto range = active_range(document);
+    if (auto* select = as_if<HTML::HTMLSelectElement>(*range->start_container()); select && select->is_editable()
+        && !select->is_inclusive_ancestor_of(range->end_container())) {
+        // AD-HOC: The spec deletes the selection first. But a replacement starting at a select's edge starts
+        //         outside the control, and an interior position can't accept text, so reject it before deleting.
+        auto offset = range->start_offset();
+        if (offset != 0 && offset != select->child_count())
+            return true;
+        MUST(range->set_start(*select->parent(), select->index() + (offset != 0 ? 1 : 0)));
+    }
+
+    // 1. Delete the selection, with strip wrappers false.
     auto replaces_selection = !selection.is_collapsed();
     delete_the_selection(selection, true, false);
     canonicalize_collapsed_selection_for_editing(selection);
 
     // 2. If the active range's start node is neither editable nor an editing host, return true.
-    auto range = active_range(document);
-    if (!range->start_container()->is_editable_or_editing_host())
+    // NB: A control can itself be removed from an editor, but its content isn't an insertion target.
+    range = active_range(document);
+    if (!range->start_container()->is_editable_or_editing_host() || !range->start_container()->in_editable_subtree())
         return true;
 
     // 3. If value's length is greater than one:

@@ -36,6 +36,12 @@ pub(crate) struct HostFindings {
     pub(crate) container_length_reads: Vec<ContainerLengthRead>,
 }
 
+/// What a run found out besides its result, which the run that takes in its result receives with it.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct RunResidue {
+    pub(crate) host_findings: HostFindings,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct ContainerLengthRead {
     pub(crate) reader: NodeSlotId,
@@ -96,16 +102,19 @@ impl HostFindings {
             FfiCommitMessageKind::StyleDependsOnSizeContainerQuery,
         ));
         for basis in bases.width_and_height() {
-            let Some(container) = basis.container() else {
-                continue;
-            };
-            self.note_message(FfiCommitMessage::new(
-                container.raw(),
-                FfiCommitMessageKind::SizeQueryContainerResolvedAgainst,
-            ));
-            if basis.container_has_no_box() {
+            if let Some(container) = basis.container() {
                 self.note_message(FfiCommitMessage::new(
                     container.raw(),
+                    FfiCommitMessageKind::SizeQueryContainerResolvedAgainst,
+                ));
+            }
+            if let Some(boxless_container) = basis.boxless_container() {
+                self.note_message(FfiCommitMessage::new(
+                    boxless_container.raw(),
+                    FfiCommitMessageKind::SizeQueryContainerResolvedAgainst,
+                ));
+                self.note_message(FfiCommitMessage::new(
+                    boxless_container.raw(),
                     FfiCommitMessageKind::ContainerQueryEvaluationNeededAfterLayout,
                 ));
             }
@@ -216,6 +225,8 @@ pub(crate) struct RunState {
     /// What the run found out for the host so far, which the pass the run is handed notes into.
     host_findings: HostFindingsSink,
     fragments: Option<fragment_tree::RunFragmentBuilder>,
+    /// For the run of a fragmentainer, what it found out so far about breaking in it.
+    fragmentainer_outcome: RefCell<super::fragmentation::FragmentainerOutcome>,
 }
 
 /// Where a box is placed: the offset of its content box in the containing block it is placed in.
@@ -230,30 +241,8 @@ pub(crate) struct BoxPlacement {
 /// box.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct FragmentFactsDecidedByParent {
-    /// For table cells and table-column(-group) boxes: the first grid column the box occupies and the number of grid
-    /// columns it spans, so painting can find the cells that originate in a column (CSS 2.2 §17.5.1).
-    pub(crate) table_column_index: u32,
-    pub(crate) table_column_span: u32,
-    /// For table cells: whether every column the cell spans has 'visibility: collapse', which removes the cell from
-    /// the display along with the columns (CSS 2.2 §17.5.5).
-    pub(crate) hidden_by_collapsed_columns: bool,
-    /// Whether the box lies after the clamp point of a line-clamp container, which hides it.
-    pub(crate) is_invisible_for_line_clamp: bool,
-    /// The physical clip an ancestor's layout puts on the box and its contents, relative to the box's border box: empty
-    /// for a box hidden after a clamp point, and the area before the block-end content edge of a line-clamp container
-    /// for a float inside it.
-    pub(crate) clip_decided_by_parent: Option<CssPixelRect>,
-    /// Whether fragmentation broke the box, so that this fragment continues one in an earlier fragmentainer, or
-    /// continues in a later one.
-    pub(crate) continues_from_previous_fragment: bool,
-    pub(crate) continues_in_next_fragment: bool,
-}
-
-impl FragmentFactsDecidedByParent {
-    pub(crate) fn hide_after_clamp_point(&mut self) {
-        self.is_invisible_for_line_clamp = true;
-        self.clip_decided_by_parent = Some(CssPixelRect::default());
-    }
+    pub(crate) show: fragment_tree::ParentShowFacts,
+    pub(crate) breaks: fragment_tree::BreakFacts,
 }
 
 /// What the parent of a box decides about the box, kept with the box by the run that holds it.
@@ -266,27 +255,31 @@ pub(crate) struct FactsDecidedByParent {
     pub(crate) fragment_facts: FragmentFactsDecidedByParent,
 }
 
-/// What the parent of a box laid out by a run of its own keeps of the box once that run returns: its sizes, size
-/// constraints and box sides in the parent's frame, its baselines, and the lines the run laid out in it.
-#[derive(Clone)]
-pub(crate) struct LaidOutChildBox {
-    pub(crate) cells: used_values::RootInputCells,
-    pub(crate) baselines: DerivedBaselines,
-    /// For a box that establishes an orthogonal flow, its baselines along the horizontal axis of the parent's frame.
-    pub(crate) orthogonal_flow_baselines: Option<DerivedBaselines>,
-    pub(crate) line_data: Option<std::sync::Arc<inline_content::InlineContent>>,
-}
-
-impl LaidOutChildBox {
-    /// A child as the run of its parent left it in `cells`, with the `baselines` of its contents, where that run
-    /// sizes the child itself instead of handing it to a run of its own.
-    pub(crate) fn sized_here(cells: used_values::RootInputCells, baselines: DerivedBaselines) -> Self {
+impl FactsDecidedByParent {
+    /// What the parent decided about a box, as the committed link of the box shows it, read in `frame`, where the
+    /// content box of the box's containing block has the physical size `containing_block_size`.
+    pub(crate) fn of_committed_link(
+        link: &fragment_tree::FragmentLink,
+        frame: geometry::Frame,
+        containing_block_size: FfiCssPixelSize,
+    ) -> Self {
+        let insets = link.placement.insets.in_frame(geometry::Frame::PHYSICAL, frame);
         Self {
-            cells,
-            baselines,
-            // NB: A box that establishes an orthogonal flow is laid out by a run of its own.
-            orthogonal_flow_baselines: None,
-            line_data: None,
+            placement: Some(BoxPlacement {
+                content_offset_in_containing_block: link.offset_in_frame(frame, containing_block_size),
+                containing_block: link.placement.containing_block,
+            }),
+            used_insets: UsedInsets {
+                left: insets.left,
+                right: insets.right,
+                top: insets.top,
+                bottom: insets.bottom,
+            },
+            default_scroll_shift: None,
+            fragment_facts: FragmentFactsDecidedByParent {
+                show: link.placement.shown_as.facts,
+                breaks: fragment_tree::BreakFacts::default(),
+            },
         }
     }
 }
@@ -429,12 +422,24 @@ impl RunState {
             root_anchor_resolved_values,
             host_findings: HostFindingsSink::default(),
             fragments,
+            fragmentainer_outcome: RefCell::default(),
         };
         run(&state, pass.for_run(root, root_containing_block, &state.host_findings))
     }
 
     pub(crate) fn fragments(&self) -> Option<&fragment_tree::RunFragmentBuilder> {
         self.fragments.as_ref()
+    }
+
+    /// Where the run of a fragmentainer keeps what it found out so far about breaking in it.
+    pub(crate) fn fragmentainer_outcome(&self) -> &RefCell<super::fragmentation::FragmentainerOutcome> {
+        &self.fragmentainer_outcome
+    }
+
+    /// What this run found out besides its result, which the result carries to the run that takes it in.
+    pub(crate) fn take_residue(&self) -> Option<Box<RunResidue>> {
+        let host_findings = self.host_findings.take();
+        (!host_findings.is_empty()).then(|| Box::new(RunResidue { host_findings }))
     }
 
     /// What this run found out for the host, which its outputs carry to the run that uses its result.

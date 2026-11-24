@@ -4,7 +4,6 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-use super::encoding::PropertyKeyTableIndex;
 use super::executable::{Executable, append_double_formatted_like_ak, append_value_formatted_like_ak};
 use super::executable_data::ExceptionHandler;
 use super::instruction::dump_instruction_from_bytes;
@@ -158,7 +157,7 @@ impl BytecodeDumper<'_> {
         }
 
         let raw = operand.raw();
-        if raw < self.executable.number_of_registers {
+        if raw < self.executable.number_of_registers() {
             if raw == 2 {
                 self.append("\x1b[33mthis\x1b[0m");
             } else {
@@ -288,18 +287,12 @@ impl BytecodeDumper<'_> {
 
     /// A PropertyKey is the text it was made from, since only canonical index strings become numbers.
     pub fn append_property_key_quoted(&mut self, index: u32) {
-        let key = self
-            .executable
-            .get_property_key(PropertyKeyTableIndex(index))
-            .to_utf16_string();
+        let key = self.executable.property_key(index as usize).to_utf16_string();
         self.append_quoted(Utf16View::of_string(&key));
     }
 
     pub fn append_property_key_plain(&mut self, index: u32) {
-        let key = self
-            .executable
-            .get_property_key(PropertyKeyTableIndex(index))
-            .to_utf16_string();
+        let key = self.executable.property_key(index as usize).to_utf16_string();
         Utf16View::of_string(&key).append_as_wtf8_to(self.output);
     }
 
@@ -319,7 +312,7 @@ impl BytecodeDumper<'_> {
         self.append(&value.to_string());
     }
 
-    pub fn append_put_kind(&mut self, name: &str, value: u32) {
+    pub fn append_put_kind(&mut self, name: &str, value: u8) {
         let kind = match value {
             0 => "Normal",
             1 => "Getter",
@@ -341,7 +334,7 @@ impl BytecodeDumper<'_> {
             if i != 0 {
                 self.append(", ");
             }
-            self.append_operand("", Operand::from_raw(read_u32(bytes, offset + i * 4)));
+            self.append_operand("", Operand::from_raw(u32::from(bytes[offset + i])));
         }
         self.append("]");
     }
@@ -351,10 +344,11 @@ impl BytecodeDumper<'_> {
         self.append(":[");
         let mut first_elem = true;
         for i in 0..count {
-            let raw = read_u32(bytes, offset + i * 4);
-            let Some(operand) = Operand::optional_from_raw(raw) else {
+            let raw = bytes[offset + i];
+            if raw == u8::MAX {
                 continue;
-            };
+            }
+            let operand = Operand::from_raw(u32::from(raw));
             if !first_elem {
                 self.append(", ");
             }
@@ -381,7 +375,7 @@ impl BytecodeDumper<'_> {
         self.append(":[");
         let mut first_elem = true;
         for i in 0..count {
-            let element_offset = offset + i * 8;
+            let element_offset = offset + i * 5;
             if bytes[element_offset + 4] == 0 {
                 continue;
             }

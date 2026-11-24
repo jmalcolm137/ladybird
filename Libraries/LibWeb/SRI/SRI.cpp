@@ -8,10 +8,12 @@
 #include <AK/Base64.h>
 #include <AK/CharacterTypes.h>
 #include <AK/Find.h>
+#include <AK/GenericLexer.h>
 #include <AK/StringBuilder.h>
 #include <AK/Vector.h>
-#include <LibCrypto/Hash/SHA2.h>
+#include <LibCrypto/Hash/Hash.h>
 #include <LibWeb/SRI/SRI.h>
+#include <LibWebCommon/Infra/CharacterTypes.h>
 
 namespace Web::SRI {
 
@@ -52,33 +54,21 @@ static StringView get_prioritized_hash_function(StringView a, StringView b)
 // https://w3c.github.io/webappsec-subresource-integrity/#apply-algorithm-to-response
 ErrorOr<String> apply_algorithm_to_bytes(StringView algorithm, ByteBuffer const& bytes)
 {
-    // NOTE: The steps are duplicated here because each hash algorithm returns a different result type.
+    auto hash_kind = [&] {
+        if (algorithm == "sha256"sv)
+            return Crypto::Hash::HashKind::SHA256;
+        if (algorithm == "sha384"sv)
+            return Crypto::Hash::HashKind::SHA384;
+        if (algorithm == "sha512"sv)
+            return Crypto::Hash::HashKind::SHA512;
+        VERIFY_NOT_REACHED();
+    }();
 
-    if (algorithm == "sha256"sv) {
-        // 1. Let result be the result of applying algorithm to bytes.
-        auto result = Crypto::Hash::SHA256::hash(bytes);
+    // 1. Let result be the result of applying algorithm to bytes.
+    auto result = Crypto::Hash::digest(hash_kind, bytes);
 
-        // 2. Return the result of base64 encoding result.
-        return encode_base64(result.bytes());
-    }
-
-    if (algorithm == "sha384"sv) {
-        // 1. Let result be the result of applying algorithm to bytes.
-        auto result = Crypto::Hash::SHA384::hash(bytes);
-
-        // 2. Return the result of base64 encoding result.
-        return encode_base64(result.bytes());
-    }
-
-    if (algorithm == "sha512"sv) {
-        // 1. Let result be the result of applying algorithm to bytes.
-        auto result = Crypto::Hash::SHA512::hash(bytes);
-
-        // 2. Return the result of base64 encoding result.
-        return encode_base64(result.bytes());
-    }
-
-    VERIFY_NOT_REACHED();
+    // 2. Return the result of base64 encoding result.
+    return encode_base64(result.bytes());
 }
 
 // https://w3c.github.io/webappsec-subresource-integrity/#parse-metadata
@@ -88,7 +78,15 @@ ErrorOr<Vector<Metadata>> parse_metadata(Utf16View metadata)
     Vector<Metadata> result;
 
     // 2. For each item returned by splitting metadata on spaces:
-    for (auto item : metadata.split_view(u' ', SplitBehavior::Nothing)) {
+    // AD-HOC: "spaces" is undefined, so split on ASCII whitespace.
+    //         https://github.com/w3c/webappsec-subresource-integrity/issues/84
+    Utf16GenericLexer lexer { metadata };
+    while (!lexer.is_eof()) {
+        lexer.ignore_while(Infra::is_ascii_whitespace);
+        auto item = lexer.consume_until(Infra::is_ascii_whitespace);
+        if (item.is_empty())
+            continue;
+
         // 1. Let expression-and-options be the result of splitting item on U+003F (?).
         // 2. Let algorithm-expression be expression-and-options[0].
         auto algorithm_expression = item.substring_view(0, item.find_code_unit_offset(u'?').value_or(item.length_in_code_units()));

@@ -18,6 +18,7 @@
 #include <UI/Qt/ChromeLayout.h>
 #include <UI/Qt/ChromeStyle.h>
 #include <UI/Qt/DownloadPresentation.h>
+#include <UI/Qt/ElidedLabel.h>
 #include <UI/Qt/FeedbackPopover.h>
 #include <UI/Qt/Icon.h>
 #include <UI/Qt/LadybirdButton.h>
@@ -233,9 +234,11 @@ private:
 };
 
 // The reload button becomes a stop button while the page loads. So that one click does not do what the user did not aim
-// at, a stop button under the pointer stays until the pointer leaves or a short delay passes, and a click on stop within
-// the double-click interval of a reload click is ignored, so a double-click does not stop the reload it started. The
-// reload action stays attached to the button while it shows stop, so its shortcuts still work during a load.
+// at, a stop button under the pointer stays until the pointer leaves or a short delay passes, and a click within the
+// double-click interval of a click on the other action is ignored, so a double-click does not stop the reload it
+// started or reload the page it stopped. The
+// reload action stays attached to the button while it shows stop, so its shortcuts still work during a load. Like the
+// back and forward buttons, it moves only when clicked: a load started or stopped otherwise changes its icon at once.
 class ReloadButton final : public ToolbarButton {
 public:
     AK_ALLOC_WITH_KMALLOC;
@@ -243,22 +246,30 @@ public:
     explicit ReloadButton(QWidget* parent)
         : ToolbarButton(parent)
     {
-        m_icon_fade.setStartValue(0.0);
-        m_icon_fade.setEndValue(1.0);
-        QObject::connect(&m_icon_fade, &QVariantAnimation::valueChanged, this, [this] { update(); });
+        QObject::connect(&m_morph, &QVariantAnimation::valueChanged, this, [this](QVariant const& value) {
+            m_morph_progress = value.toReal();
+            update();
+        });
 
-        m_double_click_timer.setSingleShot(true);
-        m_double_click_timer.setInterval(QApplication::doubleClickInterval());
+        // NB: A coarse timer can fire early, and show the stop icon for a load that ends just inside the delay.
+        m_morph_delay_timer.setSingleShot(true);
+        m_morph_delay_timer.setTimerType(Qt::PreciseTimer);
+        m_morph_delay_timer.setInterval(MORPH_DELAY_MS);
+        QObject::connect(&m_morph_delay_timer, &QTimer::timeout, this, [this] {
+            show_stop_mode();
+            if (m_load_was_started_by_click)
+                morph_to(1);
+            else
+                show_morph_at(1);
+        });
+
+        m_last_click_timer.setSingleShot(true);
+        m_last_click_timer.setInterval(QApplication::doubleClickInterval());
 
         m_stop_to_reload_timer.setSingleShot(true);
         m_stop_to_reload_timer.setInterval(STOP_TO_RELOAD_DELAY_MS);
         QObject::connect(&m_stop_to_reload_timer, &QTimer::timeout, this, [this] {
             change_mode(m_intended_mode, ForceChange::Yes);
-        });
-
-        QObject::connect(this, &QToolButton::pressed, this, [this] {
-            if (m_visible_mode == Mode::Reload)
-                m_double_click_timer.start();
         });
 
         // NB: A stop click that arrives after the load ended has nothing to stop, so show the reload button right away.
@@ -283,7 +294,11 @@ public:
     // Another tab's state is shown as it stands, without the motion of a change.
     void show_loading_at_once(bool is_loading)
     {
-        m_icon_fade.stop();
+        m_morph_delay_timer.stop();
+        show_morph_at(is_loading ? 1 : 0);
+        m_last_click_timer.stop();
+        m_reload_click_is_pending = false;
+        m_stop_was_clicked = false;
         m_stop_to_reload_timer.stop();
         m_intended_mode = m_visible_mode = is_loading ? Mode::Stop : Mode::Reload;
         setDefaultAction(is_loading ? m_stop_action : m_reload_action);
@@ -306,9 +321,22 @@ protected:
     // any other click there does.
     virtual void nextCheckState() override
     {
-        if (m_visible_mode == Mode::Stop && m_double_click_timer.isActive())
+        // NB: Only a click that reaches an action counts, so a press released outside the button does not animate it.
+        //     During the morph delay the button is still the reload button, but it is about to be the stop button, so
+        //     the second click of a double-click on reload is ignored there too.
+        //     A click that opens a new tab acts on no load here, so it neither counts nor is ignored.
+        auto opens_in_new_tab = click_opens_in_new_tab();
+        auto clicked_mode = m_visible_mode == Mode::Stop || m_morph_delay_timer.isActive() ? Mode::Stop : Mode::Reload;
+        if (!opens_in_new_tab && m_last_click_timer.isActive() && clicked_mode != m_last_clicked_mode)
             return;
-        if (m_visible_mode == Mode::Reload && !click_opens_in_new_tab() && QApplication::keyboardModifiers().testFlag(Qt::ShiftModifier)) {
+        if (m_visible_mode == Mode::Stop)
+            m_stop_was_clicked = true;
+        if (!opens_in_new_tab) {
+            m_last_clicked_mode = m_visible_mode;
+            m_last_click_timer.start();
+            m_reload_click_is_pending = m_visible_mode == Mode::Reload;
+        }
+        if (m_visible_mode == Mode::Reload && !opens_in_new_tab && QApplication::keyboardModifiers().testFlag(Qt::ShiftModifier)) {
             m_reload_bypassing_cache_action->trigger();
             return;
         }
@@ -317,13 +345,8 @@ protected:
 
 private:
     static constexpr int STOP_TO_RELOAD_DELAY_MS = 1000;
-    static constexpr int ARROW_TURN_DURATION_MS = 340;
-    static constexpr int TURN_CROSS_FADE_DELAY_MS = 200;
-    static constexpr int TURN_CROSS_FADE_DURATION_MS = 140;
-    static constexpr int STOP_TURN_DELAY_MS = 180;
-    static constexpr int STOP_TURN_DURATION_MS = 200;
-    static constexpr int RELOAD_TO_STOP_DURATION_MS = STOP_TURN_DELAY_MS + STOP_TURN_DURATION_MS;
-    static constexpr int ICON_CROSS_FADE_DURATION_MS = 160;
+    static constexpr int MORPH_DURATION_MS = 400;
+    static constexpr int MORPH_DELAY_MS = 100;
 
     enum class Mode {
         Reload,
@@ -337,22 +360,40 @@ private:
 
     void change_mode(Mode mode, ForceChange force_change)
     {
+        // NB: A stop click belongs to the load it stopped, not to one that starts while the stop button is held.
+        if (mode == Mode::Stop && m_intended_mode == Mode::Reload)
+            m_stop_was_clicked = false;
         m_intended_mode = mode;
 
-        auto change_is_safe = mode == Mode::Stop || m_visible_mode != Mode::Stop;
+        // NB: The stop button is held under the pointer only once it shows stop; a morph toward it still turns back.
+        auto change_is_safe = mode == Mode::Stop || m_visible_mode != Mode::Stop || m_morph.state() == QAbstractAnimation::Running;
         if (force_change == ForceChange::Yes || !underMouse() || change_is_safe) {
             m_stop_to_reload_timer.stop();
-            if (m_visible_mode != mode && defaultAction() && !SystemAppearance::prefers_reduced_motion()) {
-                m_previous_icon = defaultAction()->icon();
-                // NB: The arrow turns into the stop icon only as the reload button is clicked. A load started otherwise
-                //     cross-fades it, as does the end of a load.
-                m_turns_icon = mode == Mode::Stop && m_double_click_timer.isActive();
-                m_icon_fade.stop();
-                m_icon_fade.setDuration(m_turns_icon ? RELOAD_TO_STOP_DURATION_MS : ICON_CROSS_FADE_DURATION_MS);
-                m_icon_fade.start();
+            // A load that ends within a moment never turns the button into the stop button: it stays the reload button,
+            // action and all, until the delay passes. One that starts while the arrow is still turning back turns it
+            // around at once. A morph under way turns back rather than jumping, whatever changed the load.
+            if (mode == Mode::Stop) {
+                if (m_visible_mode == Mode::Stop || m_morph_delay_timer.isActive())
+                    return;
+                // NB: A reload click animates the one load it started, not another that starts within the same interval.
+                m_load_was_started_by_click = m_reload_click_is_pending && m_last_click_timer.isActive();
+                m_reload_click_is_pending = false;
+                if (m_morph_progress > 0) {
+                    show_stop_mode();
+                    morph_to(1);
+                } else {
+                    m_morph_delay_timer.start();
+                }
+                return;
             }
-            m_visible_mode = mode;
-            setDefaultAction(mode == Mode::Stop ? m_stop_action : m_reload_action);
+            m_morph_delay_timer.stop();
+            if (m_stop_was_clicked || m_morph.state() == QAbstractAnimation::Running)
+                morph_to(0);
+            else
+                show_morph_at(0);
+            m_stop_was_clicked = false;
+            m_visible_mode = Mode::Reload;
+            setDefaultAction(m_reload_action);
             return;
         }
 
@@ -360,51 +401,74 @@ private:
             m_stop_to_reload_timer.start();
     }
 
-    // As a click on it starts a load, the reload arrow turns half a turn, and over its second half cross-fades into the
-    // stop icon, which turns into place. Otherwise, as when the load ends, the two icons only cross-fade.
+    void show_stop_mode()
+    {
+        m_stop_was_clicked = false;
+        m_visible_mode = Mode::Stop;
+        setDefaultAction(m_stop_action);
+    }
+
+    // The arrow morphs into the stop icon as a load starts, and back as it ends. A change partway through turns back
+    // from where the morph is, at the same pace.
+    void morph_to(qreal target)
+    {
+        if (SystemAppearance::prefers_reduced_motion() || !isVisible()) {
+            show_morph_at(target);
+            return;
+        }
+        auto duration = qRound(MORPH_DURATION_MS * abs(target - m_morph_progress));
+        if (duration <= 0) {
+            show_morph_at(target);
+            return;
+        }
+        m_morph.stop();
+        m_morph.setStartValue(m_morph_progress);
+        m_morph.setEndValue(target);
+        m_morph.setDuration(duration);
+        m_morph.start();
+    }
+
+    void show_morph_at(qreal progress)
+    {
+        m_morph.stop();
+        m_morph_progress = progress;
+        update();
+    }
+
     virtual void paintEvent(QPaintEvent* event) override
     {
-        if (m_icon_fade.state() != QAbstractAnimation::Running) {
+        auto shows_action_icon = m_morph.state() != QAbstractAnimation::Running
+            && m_morph_progress == (m_visible_mode == Mode::Stop ? 1 : 0);
+        if (shows_action_icon) {
             ToolbarButton::paintEvent(event);
             return;
         }
 
         QPainter painter(this);
-        painter.setRenderHint(QPainter::SmoothPixmapTransform, true);
         ChromeStyle::paint_control_frame(painter, *this);
-        auto elapsed = m_icon_fade.currentValue().toReal() * m_icon_fade.duration();
-        auto part = [&](qreal delay, qreal duration) { return clamp((elapsed - delay) / duration, 0.0, 1.0); };
-        auto center = QRectF(icon_rect()).center();
-        auto paint_turned = [&](QIcon const& icon, qreal opacity, qreal degrees) {
-            painter.save();
-            painter.setOpacity(opacity);
-            painter.translate(center);
-            painter.rotate(degrees);
-            painter.translate(-center);
-            icon.paint(&painter, icon_rect(), Qt::AlignCenter, icon_mode());
-            painter.restore();
-        };
-        if (!m_turns_icon) {
-            auto fade = part(0, ICON_CROSS_FADE_DURATION_MS);
-            paint_turned(m_previous_icon, 1 - fade, 0);
-            paint_turned(icon(), fade, 0);
-            return;
-        }
-        static auto const easing = Motion::enter_easing();
-        auto fade = part(TURN_CROSS_FADE_DELAY_MS, TURN_CROSS_FADE_DURATION_MS);
-        paint_turned(m_previous_icon, 1 - fade, 180 * easing.valueForProgress(part(0, ARROW_TURN_DURATION_MS)));
-        paint_turned(icon(), fade, -90 * (1 - easing.valueForProgress(part(STOP_TURN_DELAY_MS, STOP_TURN_DURATION_MS))));
+        QIcon icon;
+        if (m_morph_progress <= 0)
+            icon = m_reload_action->icon();
+        else if (m_morph_progress >= 1)
+            icon = m_stop_action->icon();
+        else
+            icon = create_reload_to_stop_icon(Theme::chrome_palette(*this), ChromeStyle::window_activity(*this), m_morph_progress, iconSize().width());
+        icon.paint(&painter, icon_rect(), Qt::AlignCenter, icon_mode());
     }
 
     QAction* m_reload_action { nullptr };
     QAction* m_reload_bypassing_cache_action { nullptr };
     QAction* m_stop_action { nullptr };
-    QIcon m_previous_icon;
-    QVariantAnimation m_icon_fade;
-    bool m_turns_icon { false };
+    QVariantAnimation m_morph;
+    qreal m_morph_progress { 0 };
+    QTimer m_morph_delay_timer;
+    bool m_load_was_started_by_click { false };
+    bool m_stop_was_clicked { false };
     Mode m_visible_mode { Mode::Reload };
     Mode m_intended_mode { Mode::Reload };
-    QTimer m_double_click_timer;
+    QTimer m_last_click_timer;
+    Mode m_last_clicked_mode { Mode::Reload };
+    bool m_reload_click_is_pending { false };
     QTimer m_stop_to_reload_timer;
 };
 
@@ -439,6 +503,7 @@ public:
 
         m_ring_fade.setDuration(RING_FADE_DURATION_MS);
         QObject::connect(&m_ring_fade, &QVariantAnimation::valueChanged, this, [this] { update(); });
+        QObject::connect(&m_ring_fade, &QVariantAnimation::finished, this, [this] { update_icon_size(); });
 
         m_progress_animation.setDuration(PROGRESS_GLIDE_DURATION_MS);
         QObject::connect(&m_progress_animation, &QVariantAnimation::valueChanged, this, [this](QVariant const& value) {
@@ -480,6 +545,7 @@ public:
             m_ring_animation.start();
         else if (!should_turn)
             m_ring_animation.stop();
+        update_icon_size();
         update();
     }
 
@@ -492,6 +558,15 @@ public:
     }
 
 private:
+    // The arrow shrinks while the ring is around it, so that it keeps clear of the ring.
+    void update_icon_size()
+    {
+        auto ring_is_shown = m_downloading || m_ring_fade.state() == QAbstractAnimation::Running;
+        auto size = ring_is_shown ? ICON_SIZE_WITHIN_RING : TOOLBAR_ICON_SIZE;
+        if (iconSize().width() != size)
+            setIconSize({ size, size });
+    }
+
     virtual void paintEvent(QPaintEvent* event) override
     {
         ToolbarButton::paintEvent(event);
@@ -499,7 +574,10 @@ private:
         QPainter painter(this);
         painter.setRenderHint(QPainter::Antialiasing, true);
         auto palette = Theme::chrome_palette(*this);
-        auto center = QRectF(rect()).center();
+        // NB: The arrow is drawn around the middle of the icon grid at 7.5, half a unit above and left of the middle of
+        //     the icon, so the ring is centered on it there.
+        auto grid_offset = 0.5 * iconSize().width() / CHROME_ICON_CANVAS_SIZE;
+        auto center = QRectF(icon_rect()).center() - QPointF(grid_offset, grid_offset);
         auto ring_is_fading = m_ring_fade.state() == QAbstractAnimation::Running;
         if (m_downloading || ring_is_fading) {
             painter.save();
@@ -524,6 +602,7 @@ private:
 
     static constexpr int RING_FADE_DURATION_MS = 200;
     static constexpr int PROGRESS_GLIDE_DURATION_MS = 300;
+    static constexpr int ICON_SIZE_WITHIN_RING = 14;
 
     bool m_downloading { false };
     Optional<double> m_progress;
@@ -653,7 +732,8 @@ static constexpr int FIELD_PANEL_WINDOW_MARGIN = 8;
 // A line inset this far from the surface's sides sets the suggestions apart from the field, and the list has this much
 // room around it.
 static constexpr int FIELD_PANEL_DIVIDER_INSET = 8;
-static constexpr int FIELD_PANEL_LIST_PADDING = 6;
+static constexpr int FIELD_PANEL_LIST_VERTICAL_PADDING = 6;
+static constexpr int FIELD_PANEL_LIST_HORIZONTAL_PADDING = 3;
 
 // The address field floats over its place in the toolbar, in a panel that is a native child of the window wherever the
 // page stays native under it. So the panel stacks above the native views of the sidebar and the page, and can grow over
@@ -751,48 +831,17 @@ private:
 
 // NB: Window controls run to the window's edge. Without them, the address field ends the toolbar, and the room for its
 //     focus ring takes the place of some of the toolbar's margin.
+static int toolbar_left_margin(bool has_custom_window_controls)
+{
+    return has_custom_window_controls ? 0 : TOOLBAR_HORIZONTAL_MARGIN;
+}
+
 static constexpr int toolbar_right_margin(bool has_custom_window_controls)
 {
     return has_custom_window_controls ? 0 : TOOLBAR_HORIZONTAL_MARGIN - TOOLBAR_LOCATION_FOCUS_RING_ROOM;
 }
 static constexpr int DOWNLOADS_POPOVER_WIDTH = 380;
 static constexpr int DOWNLOADS_POPOVER_MAX_HEIGHT = 360;
-class ElidedLabel final : public QLabel {
-public:
-    AK_ALLOC_WITH_KMALLOC;
-
-    explicit ElidedLabel(QString text, Qt::TextElideMode elide_mode, QWidget* parent = nullptr)
-        : QLabel(text, parent)
-        , m_elide_mode(elide_mode)
-    {
-        setMinimumWidth(0);
-        setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Preferred);
-    }
-
-    virtual QSize sizeHint() const override
-    {
-        auto size = QLabel::sizeHint();
-        size.setWidth(0);
-        return size;
-    }
-
-    virtual QSize minimumSizeHint() const override
-    {
-        return { 0, QLabel::minimumSizeHint().height() };
-    }
-
-protected:
-    virtual void paintEvent(QPaintEvent*) override
-    {
-        QPainter painter(this);
-        painter.setFont(font());
-        painter.setPen(palette().color(foregroundRole()));
-        painter.drawText(rect(), alignment() | Qt::TextSingleLine, fontMetrics().elidedText(text(), m_elide_mode, width()));
-    }
-
-private:
-    Qt::TextElideMode m_elide_mode { Qt::ElideRight };
-};
 
 // A small page with the file's extension on it.
 class DownloadFileIcon final : public QWidget {
@@ -1156,6 +1205,7 @@ WindowToolbar::WindowToolbar(WebView::IsPrivate is_private, QWidget* parent)
     : QWidget(parent)
     , WebView::SettingsObserver(Application::settings())
     , m_is_private(is_private)
+    , m_window_controls_on_left(window_controls_on_left())
 {
     auto& application = ApplicationActions::the();
 
@@ -1287,6 +1337,14 @@ WindowToolbar::WindowToolbar(WebView::IsPrivate is_private, QWidget* parent)
     sidebar_slot_layout->addSpacing(SIDEBAR_SLOT_SEPARATOR_MARGIN);
     m_sidebar_slot->hide();
 
+    m_trailing_sidebar_slot = new QWidget(m_toolbar);
+    m_trailing_sidebar_slot->setObjectName("LadybirdTrailingSidebarSlot");
+    m_trailing_sidebar_slot->setProperty(WINDOW_DRAG_REGION_PROPERTY, true);
+    auto* trailing_sidebar_slot_layout = new QHBoxLayout(m_trailing_sidebar_slot);
+    trailing_sidebar_slot_layout->setContentsMargins(0, 0, 0, 0);
+    trailing_sidebar_slot_layout->setSpacing(TOOLBAR_SPACING);
+    m_trailing_sidebar_slot->hide();
+
     m_sidebar_footer = new QWidget(this);
     m_sidebar_footer->setObjectName("LadybirdSidebarFooter");
     m_sidebar_footer->setProperty(WINDOW_DRAG_REGION_PROPERTY, true);
@@ -1343,6 +1401,24 @@ void WindowToolbar::size_navigation_buttons(QSize size, int spacing)
     m_navigation_buttons->layout()->setSpacing(spacing);
 }
 
+void WindowToolbar::restore_trailing_sidebar_slot()
+{
+    if (m_arrangement != ToolbarArrangement::Row || m_trailing_sidebar_slot->parentWidget() == m_toolbar)
+        return;
+    auto* row_layout = static_cast<QBoxLayout*>(m_toolbar->layout());
+    auto index = m_window_controls_on_left ? row_layout->count() : row_layout->indexOf(m_window_controls_separator);
+    row_layout->insertWidget(index, m_trailing_sidebar_slot, 0, Qt::AlignVCenter);
+}
+
+int WindowToolbar::trailing_sidebar_slot_right_inset(bool window_controls_visible) const
+{
+    auto has_trailing_controls = !use_native_macos_window_controls() && !m_window_controls_on_left && window_controls_visible;
+    auto inset = toolbar_right_margin(has_trailing_controls);
+    if (has_trailing_controls)
+        inset += m_window_controls->sizeHint().width() + m_window_controls_separator->width() + (2 * TOOLBAR_SPACING);
+    return inset;
+}
+
 void WindowToolbar::lay_out_as_row()
 {
     size_navigation_buttons(TOOLBAR_BUTTON_SIZE, TOOLBAR_SPACING);
@@ -1351,8 +1427,11 @@ void WindowToolbar::lay_out_as_row()
     toolbar_layout->setSpacing(TOOLBAR_SPACING);
     toolbar_layout->setContentsMargins(TOOLBAR_HORIZONTAL_MARGIN, 0, toolbar_right_margin(false), 0);
 
-    if constexpr (use_native_macos_window_controls())
+    if (m_window_controls_on_left) {
         toolbar_layout->addWidget(m_window_controls, 0, Qt::AlignVCenter);
+        if constexpr (!use_native_macos_window_controls())
+            toolbar_layout->addWidget(m_window_controls_separator, 0, Qt::AlignVCenter);
+    }
     toolbar_layout->addWidget(m_sidebar_slot, 0, Qt::AlignVCenter);
     toolbar_layout->addWidget(m_navigation_buttons, 0, Qt::AlignVCenter);
     m_navigation_buttons->show();
@@ -1360,7 +1439,8 @@ void WindowToolbar::lay_out_as_row()
     toolbar_layout->addWidget(m_downloads_button, 0, Qt::AlignVCenter);
     if (m_feedback_button)
         toolbar_layout->addWidget(m_feedback_button, 0, Qt::AlignVCenter);
-    if constexpr (!use_native_macos_window_controls()) {
+    toolbar_layout->addWidget(m_trailing_sidebar_slot, 0, Qt::AlignVCenter);
+    if (!m_window_controls_on_left) {
         toolbar_layout->addWidget(m_window_controls_separator, 0, Qt::AlignVCenter);
         toolbar_layout->addWidget(m_window_controls, 0, Qt::AlignVCenter);
     }
@@ -1389,6 +1469,7 @@ void WindowToolbar::lay_out_in_sidebar()
 
     // NB: What the sidebar has no room for stays hidden, as widgets left out of a layout would show where they last were.
     m_sidebar_slot->hide();
+    m_trailing_sidebar_slot->hide();
     m_window_controls->hide();
     m_window_controls_separator->hide();
 
@@ -1441,8 +1522,9 @@ void WindowToolbar::create_field_panel()
     // The suggestions are below the line under the field.
     m_suggestions_area = new QWidget(m_field_panel);
     auto* suggestions_layout = new QVBoxLayout(m_suggestions_area);
-    auto padding = FIELD_PANEL_LIST_PADDING;
-    suggestions_layout->setContentsMargins(padding, 1 + padding, padding, padding);
+    auto vertical_padding = FIELD_PANEL_LIST_VERTICAL_PADDING;
+    auto horizontal_padding = FIELD_PANEL_LIST_HORIZONTAL_PADDING;
+    suggestions_layout->setContentsMargins(horizontal_padding, 1 + vertical_padding, horizontal_padding, vertical_padding);
     suggestions_layout->setSpacing(0);
     panel_layout->addWidget(m_suggestions_area);
     m_suggestions_area->hide();
@@ -1471,6 +1553,10 @@ void WindowToolbar::raise_field_panel()
         QEvent z_order_change(QEvent::ZOrderChange);
         QCoreApplication::sendEvent(m_field_panel, &z_order_change);
     }
+
+#if defined(AK_OS_MACOS)
+    ensure_appkit_window_is_exposed(*m_field_panel);
+#endif
 }
 
 void WindowToolbar::update_field_panel()
@@ -1564,12 +1650,15 @@ bool WindowToolbar::eventFilter(QObject* watched, QEvent* event)
     return false;
 }
 
-void WindowToolbar::set_arrangement(ToolbarArrangement arrangement, int sidebar_inset)
+void WindowToolbar::set_arrangement(ToolbarArrangement arrangement, bool window_controls_on_left, int sidebar_inset)
 {
-    if (m_arrangement == arrangement && m_sidebar_inset == sidebar_inset)
+    if (m_arrangement == arrangement && m_sidebar_inset == sidebar_inset && m_window_controls_on_left == window_controls_on_left)
         return;
     m_arrangement = arrangement;
     m_sidebar_inset = sidebar_inset;
+    m_window_controls_on_left = window_controls_on_left;
+    if constexpr (!use_native_macos_window_controls())
+        set_window_control_button_order(*m_window_controls, window_controls_on_left);
 
     // NB: Deleting the layout leaves the widgets it held in place, ready for the next one.
     delete m_toolbar->layout();
@@ -1671,6 +1760,7 @@ void WindowToolbar::bind(Tab* tab)
     // A tab that hasn't loaded has no page yet, so it is shown once it has one.
     if (!tab || !tab->is_loaded()) {
         show_location_edit(nullptr);
+        m_reload_button->show_loading_at_once(false);
         if (tab)
             QObject::connect(tab, &Tab::loaded, this, [this, tab] { show_tab(*tab); }, Qt::SingleShotConnection);
         return;
@@ -1687,6 +1777,7 @@ void WindowToolbar::show_tab(Tab& tab)
 
     m_navigate_back_action.bind(tab.view().navigate_back_action());
     m_navigate_forward_action.bind(tab.view().navigate_forward_action());
+    m_zoom_level_action.bind(tab.view().reset_zoom_action());
     m_reload_button->show_loading_at_once(tab.is_loading());
     m_performance_monitor->set_stats(tab.performance_stats());
 
@@ -1791,7 +1882,7 @@ void WindowToolbar::set_window_controls_visible(bool visible)
     m_window_controls_separator->setVisible(has_custom_window_controls);
     m_window_controls->setVisible(has_native_window_controls || has_custom_window_controls);
     m_toolbar->setFixedHeight(toolbar_height(visible));
-    m_toolbar->layout()->setContentsMargins(TOOLBAR_HORIZONTAL_MARGIN, 0, toolbar_right_margin(has_custom_window_controls), 0);
+    m_toolbar->layout()->setContentsMargins(toolbar_left_margin(has_custom_window_controls && m_window_controls_on_left), 0, toolbar_right_margin(has_custom_window_controls && !m_window_controls_on_left), 0);
     m_toolbar->layout()->invalidate();
 }
 
@@ -1801,8 +1892,11 @@ int WindowToolbar::lead_beside_collapsed_sidebar(QWidget const& ladybird_buttons
 {
     auto toolbar_spacing = m_toolbar->layout()->spacing();
     auto lead = 0;
-    if constexpr (use_native_macos_window_controls())
+    if (m_window_controls_on_left && !m_window_controls->isHidden()) {
         lead += m_window_controls->width() + toolbar_spacing;
+        if constexpr (!use_native_macos_window_controls())
+            lead += m_window_controls_separator->width() + toolbar_spacing;
+    }
 
     auto slot_width = m_sidebar_slot->layout()->sizeHint().width();
     auto slot_spacing = m_sidebar_slot->layout()->spacing();
@@ -1818,10 +1912,12 @@ void WindowToolbar::set_leading_room(int room)
 {
     if (m_arrangement == ToolbarArrangement::Sidebar)
         return;
+    auto has_custom_window_controls = !use_native_macos_window_controls() && m_window_controls_visible;
+    auto left_margin = toolbar_left_margin(has_custom_window_controls && m_window_controls_on_left) + room;
     auto margins = m_toolbar->layout()->contentsMargins();
-    if (margins.left() == TOOLBAR_HORIZONTAL_MARGIN + room)
+    if (margins.left() == left_margin)
         return;
-    margins.setLeft(TOOLBAR_HORIZONTAL_MARGIN + room);
+    margins.setLeft(left_margin);
     m_toolbar->layout()->setContentsMargins(margins);
     // NB: The toolbar moves along with the sidebar's edge at once, so its contents must too, or they lag a frame behind.
     m_toolbar->layout()->activate();
@@ -2013,7 +2109,7 @@ void WindowToolbar::show_feedback_popover()
                 m_tab->view().report_website_issue();
         };
         m_feedback_popover->on_report_bug = [this] {
-            browser_window().new_tab_from_url(WebView::new_bug_report_url(), Web::HTML::ActivateTab::Yes, BrowserWindow::TabLocation::after_current_tab());
+            browser_window().new_tab_from_url(Application::the().new_bug_report_url(), Web::HTML::ActivateTab::Yes, BrowserWindow::TabLocation::after_current_tab());
         };
         m_feedback_popover->on_review_crash_reports = [this] {
             browser_window().new_tab_from_url(URL::URL::about("crashes"sv), Web::HTML::ActivateTab::Yes, BrowserWindow::TabLocation::after_current_tab());

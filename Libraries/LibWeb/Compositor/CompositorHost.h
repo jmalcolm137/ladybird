@@ -15,8 +15,7 @@
 #include <AK/Types.h>
 #include <AK/Vector.h>
 #include <AK/Weakable.h>
-#include <LibCompositing/DisplayList/DisplayListResourceStorage.h>
-#include <LibCompositing/Scrolling/AsyncScrollTree.h>
+#include <LibCompositing/DisplayList/DisplayListResources.h>
 #include <LibCompositing/Types.h>
 #include <LibCompositing/Video/VideoFrameHold.h>
 #include <LibGfx/Bitmap.h>
@@ -30,12 +29,16 @@
 #include <LibWeb/Forward.h>
 #include <LibWebCommon/Page/InputTrace.h>
 
+namespace Web::Layout::RustFFI {
+
+struct DocumentHost;
+struct FfiImageRasterization;
+
+}
+
 namespace Web::Compositor {
 
-class CompositorFrameSink;
 class CompositorHost;
-class NavigablePresenter;
-struct CompositorFrame;
 
 // Whether the compositor took a requested screenshot, so painted the bitmap the request handed it.
 enum class ScreenshotResult : u8 {
@@ -85,7 +88,6 @@ public:
     void set_parent_context(Optional<Web::CompositorContextId>);
     void stop_presenting_to_client();
 
-    void set_video_sink_ticking(Media::VideoSinkHandle, bool should_tick);
     void invalidate_wheel_event_listener_state(u64 generation);
     void invalidate_keyboard_scroll_state(u64 generation);
     Compositing::WheelEventAnswer take_wheel_event_from_main_thread(Web::MouseEvent const&, Compositing::AsyncScrollOperationTracking, Compositing::WheelEventRouting);
@@ -102,6 +104,7 @@ public:
     bool request_rendering_opportunity(double maximum_frames_per_second);
     void hurry_rendering_opportunity();
     void request_screenshot(NonnullRefPtr<Gfx::Bitmap>, Function<void(ScreenshotResult)>&& callback);
+    void prepare_remote_descendants_for_screenshot(Function<void()>&& callback);
     // Sends the canvas commands a frame may sample ahead of it, and answers whether the compositor can be reached.
     bool ready_for_frame();
 
@@ -125,21 +128,25 @@ public:
 
     OwnPtr<CompositorContextHandle> create_context(Web::CompositorContextId);
 
-    Compositing::Canvas2DCommandStream& canvas_2d_stream() { return *m_canvas_2d_stream; }
+    struct Canvas2DTransport {
+        void* stream { nullptr };
+        CompositorConnection* connection { nullptr };
+    };
+    Optional<Canvas2DTransport> create_canvas_2d_transport();
     void flush_canvas_2d_stream();
     void discard_canvas_2d_stream();
-
-    RefPtr<WebGL::RemoteWebGLTransport> create_webgl_transport();
-    RefPtr<HTML::RemoteCanvas2DTransport> create_canvas_2d_transport();
 
     Optional<PlaceholderCanvasLink> allocate_placeholder_canvas();
     void release_placeholder_canvas(Compositing::CanvasId);
     void commit_placeholder_canvas(PlaceholderCanvasLink, Optional<Compositing::CanvasId> source_canvas_id, Gfx::IntSize, bool origin_clean);
     PlaceholderCanvasPixels read_placeholder_canvas_pixels(Compositing::CanvasId, Gfx::IntRect);
 
-    // Has the compositor draw a display list that belongs to no compositor context into the target, which must be a
-    // shareable BGRA8888 bitmap with premultiplied alpha. Returns false if nothing was drawn.
-    bool rasterize_display_list(Compositing::DisplayListResource const&, Compositing::DisplayListResourceStorage const&, NonnullRefPtr<Gfx::Bitmap> target) const;
+    // Has the compositor draw an image into the target, which must be a shareable BGRA8888 bitmap with premultiplied
+    // alpha. Returns false if nothing was drawn.
+    bool rasterize_image(Layout::RustFFI::FfiImageRasterization const&, NonnullRefPtr<Gfx::Bitmap> target) const;
+    // Has the compositor draw the recording the document of the host took in last into the target, a bitmap as
+    // rasterize_image() takes, the size of the document's viewport. Returns false if nothing was drawn.
+    bool rasterize_last_recording(Layout::RustFFI::DocumentHost const&, Layout::BegunRead const&, NonnullRefPtr<Gfx::Bitmap> target) const;
 
     void destroy_context(Web::CompositorContextId);
     void set_parent_context(Web::CompositorContextId, Optional<Web::CompositorContextId>);
@@ -154,9 +161,10 @@ public:
     // A new compositor process has heard of none of the images.
     void register_animated_images_with_new_compositor();
 
-    void add_video_sink(Media::VideoSinkHandle, NonnullRefPtr<Compositing::VideoFramePresentationPage>);
+    // Returns whether a compositor heard of the sink, which one that connects later will not have.
+    [[nodiscard]] bool add_video_sink(Media::VideoSinkHandle, NonnullRefPtr<Compositing::VideoFramePresentationPage>);
     void remove_video_sink(Media::VideoSinkHandle);
-    void set_video_sink_ticking(Media::VideoSinkHandle, bool should_tick);
+    void bring_video_sink_up_to_date(Media::VideoSinkHandle, Optional<MonotonicTime> deadline);
     Compositing::VideoFrameHold::ReleaseThroughCompositor video_frame_hold_releaser_for_current_connection() const;
     void invalidate_wheel_event_listener_state(Web::CompositorContextId, u64 generation);
     void invalidate_keyboard_scroll_state(Web::CompositorContextId, u64 generation);
@@ -174,6 +182,7 @@ public:
     bool request_rendering_opportunity(Web::CompositorContextId, double maximum_frames_per_second);
     void hurry_rendering_opportunity(Web::CompositorContextId);
     void request_screenshot(Web::CompositorContextId, NonnullRefPtr<Gfx::Bitmap>, Function<void(ScreenshotResult)>&& callback);
+    void prepare_remote_descendants_for_screenshot(Web::CompositorContextId, Function<void()>&& callback);
 
 protected:
     CompositorHost();
@@ -187,10 +196,7 @@ private:
 
     HashMap<u64, AnimatedImageRegistration> m_animated_images;
 
-    // Drains the stream, but only when the message can actually be delivered.
-    void send_canvas_2d_stream(Compositing::Canvas2DCommandStream&);
-
-    NonnullRefPtr<Compositing::Canvas2DCommandStream> m_canvas_2d_stream;
+    void* m_canvas_2d_stream { nullptr };
 };
 
 }

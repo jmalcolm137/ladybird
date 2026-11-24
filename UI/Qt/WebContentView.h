@@ -28,6 +28,7 @@
 #include <LibWebView/BrowsingSession.h>
 #include <LibWebView/WebCompatReport.h>
 #include <UI/Qt/BackingStoreRelease.h>
+#include <UI/Qt/CompositorLayerPicker.h>
 #include <UI/Qt/RemoteView.h>
 #include <UI/Qt/ScreenshotSelectionOverlay.h>
 
@@ -112,6 +113,7 @@ struct WebContentViewInitialState {
     WebView::IsPrivate is_private { WebView::IsPrivate::No };
     double maximum_frames_per_second { 60.0 };
     Optional<u64> display_id;
+    bool screen_shows_high_dynamic_range { false };
     Optional<u64> owner_view_id;
     bool is_tab { true };
 };
@@ -177,6 +179,7 @@ public:
     // A card that floats over the page, such as the find bar. Qt paints it above the page, so whatever presents the
     // page above Qt's painting steps aside while it shows.
     void add_floating_surface(QWidget&);
+    void remove_floating_surface(QWidget&);
     // The address field's suggestions float over the page as such a card does, but outlive the view, as they belong to
     // the window.
     void set_suggestions_over_page(bool);
@@ -187,6 +190,8 @@ public:
     void leave_report_review();
     void review_web_compat_report(WebCompatReportCapture);
     void select_web_compat_report_screenshot(Function<void(QImage)> on_selected, Function<void()> on_close = {});
+    void start_compositor_layer_picker(CompositorLayerPicker);
+    void stop_compositor_layer_picker();
 
     Function<void(WebCompatReportCapture)> on_request_web_compat_report_review;
     Function<void(Function<void(QImage)> on_selected)> on_request_web_compat_report_screenshot;
@@ -197,9 +202,9 @@ public:
         Dark,
     };
     void update_palette(PaletteMode = PaletteMode::Default);
-    Optional<QPixmap> tab_preview_pixmap(QSize const& maximum_size) const;
-
-    WebView::AccessibilityTreeManager const* accessibility_tree_manager() const { return m_accessibility_manager.ptr(); }
+    // Frames that the Compositor shows itself are only announced while something here wants to hear of them.
+    void add_frame_notification_interest();
+    void remove_frame_notification_interest();
 
 #if !defined(Q_OS_MACOS) && !defined(Q_OS_WIN)
     QAccessibleInterface* accessibility_interface_for_node(i64 node_id);
@@ -212,7 +217,6 @@ public:
     void set_follows_mouse_while_inactive(bool follows) { m_follows_mouse_while_inactive = follows; }
 
 signals:
-    void ready_to_paint();
     void crash_overlay_changed();
     void image_overlay_unavailable();
     void urls_dropped(QList<QUrl> const&);
@@ -248,6 +252,9 @@ private:
     // The pixels of a frame for Qt to paint, which there is no need to read back while the page's window covers them.
     RefPtr<Gfx::Bitmap const> cpu_bitmap_to_paint(Paintable const&) const;
     QImage visible_snapshot() const;
+    // What the view shows, which the Compositor takes where the view does not hold the frame itself.
+    void take_visible_snapshot(Function<void(QImage)>);
+    bool holds_displayed_frame() const;
 
     void update_viewport_size();
     void update_cursor(Gfx::Cursor cursor);
@@ -332,6 +339,7 @@ private:
 
     PageOverlay* m_crash_overlay { nullptr };
     CrashOverlayUrlLabel* m_crash_overlay_url { nullptr };
+    QLabel* m_crash_overlay_title { nullptr };
     QLabel* m_crash_overlay_message { nullptr };
     QPushButton* m_crash_overlay_reload_button { nullptr };
     QShortcut* m_crash_overlay_reload_shortcut { nullptr };
@@ -339,8 +347,15 @@ private:
     CrashReportReviewWidget* m_crash_report_review { nullptr };
 
     QPointer<ScreenshotSelectionOverlay> m_screenshot_selection_overlay;
+    Optional<CompositorLayerPicker> m_compositor_layer_picker;
+    bool m_swallows_mouse_release_after_compositor_layer_pick { false };
+    size_t m_frame_notification_interest { 0 };
     QPointer<ScreenshotViewer> m_screenshot_viewer;
-    Vector<QPointer<QWidget>> m_floating_surfaces;
+    struct FloatingSurface {
+        QPointer<QWidget> surface;
+        QPointer<QObject> watcher;
+    };
+    Vector<FloatingSurface> m_floating_surfaces;
     bool m_suggestions_over_page { false };
     PageOverlay* m_web_compat_report_overlay { nullptr };
 
@@ -384,6 +399,20 @@ private:
 
     void* m_iosurface_layer { nullptr };
     void* m_page_dim_layer { nullptr };
+
+    // The Compositor commits the page's frames into a remote layer, which this layer shows by the ID of its context.
+    static bool can_host_remote_layers();
+    virtual void remote_layer_changed(Compositing::RemoteLayerHostHandle) override;
+    void update_remote_layer_host();
+    void synchronize_resize_with_remote_layer();
+    void await_resized_frame_before_commit(u64 token);
+    void release_resized_frame_with_commit(u64 token);
+    Optional<u64> m_synchronized_resize_token;
+    MonotonicTime m_last_resize_time { MonotonicTime::now_coarse() };
+    bool m_page_lags_behind_resize { false };
+    void* m_remote_layer_host { nullptr };
+    u32 m_remote_layer_context_id { 0 };
+    bool m_asked_for_remote_layer { false };
 #endif
 
 #ifdef LADYBIRD_QT_USE_RHI_WIDGET
@@ -407,6 +436,16 @@ private:
     void release_imported_d3d_textures();
 
     Vector<ImportedD3DTexture> m_imported_d3d_textures;
+
+    virtual void remote_layer_changed(Compositing::RemoteLayerHostHandle) override;
+    virtual void childEvent(QChildEvent*) override;
+    virtual bool eventFilter(QObject*, QEvent*) override;
+    bool has_visible_child_over_page() const;
+    void update_whether_view_hosts_remote_layer();
+    void native_window_changed();
+    bool m_hosts_remote_layer { false };
+    bool m_vertical_tabs_overlay_page { false };
+    bool m_bookmarks_bar_overlays_page { false };
 #endif
 
 #ifdef LADYBIRD_QT_USE_VULKAN_WINDOW
@@ -417,6 +456,7 @@ private:
     friend struct VulkanWindowRenderer;
 
     void create_vulkan_window();
+    void release_vulkan_window_surface_for_move();
     void destroy_vulkan_window();
     void update_vulkan_window_mask();
     void update_vulkan_alpha_blending_support();
@@ -425,6 +465,7 @@ private:
     void update_vulkan_window_geometry();
     void set_vulkan_window_container_visible(bool);
     void fall_back_to_bitmap_rendering();
+    void fall_back_from_vulkan_window();
     void vulkan_window_exposure_changed();
     QRect rect_covered_by_page_window() const;
     bool vulkan_window_update_would_only_resize() const;
@@ -433,6 +474,8 @@ private:
     virtual void release_backing_store(u64 page_id, i32 bitmap_id) override;
 
 #    ifdef LADYBIRD_HAS_WAYLAND_GPU_QUERY
+    virtual void backing_stores_were_retired() override;
+
     bool create_page_surface();
     enum class PageSurfaceContent {
         Unchanged,
@@ -446,6 +489,7 @@ private:
     void release_retired_backing_stores_no_longer_painted();
     void release_all_retired_backing_stores();
     QRect rect_shown_in_window() const;
+    QPoint position_in_surface_of(QWindow const& parent, QPoint) const;
 
     // Shows the page's frames on Wayland by handing their dma-bufs to the compositor of the desktop. Without it, the
     // page's window draws them in a swap chain of its own.
@@ -453,7 +497,7 @@ private:
     bool m_page_surface_failed { false };
     // Where the page surface shows a frame, in device pixels of the view.
     QRect m_page_surface_rect;
-    // Where the page surface last showed a frame, in the logical coordinates of the browser window.
+    // Where the page surface last showed a frame, in the logical coordinates of the browser window's surface.
     QPoint m_page_surface_position;
     // The backing stores the view is done with that the compositor of the desktop may still read. The page they belong
     // to can stop displaying the tab before the compositor is done.

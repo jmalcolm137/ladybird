@@ -19,7 +19,7 @@ use crate::css::style::style_job::{SealedStyleInputs, StyleJobAnswer};
 use crate::css::style::tree::StyleNodeID;
 use crate::css::transition::HoverTransitions;
 use crate::layout::node_data::NodeSlotId;
-use crate::layout::row_reads::{RowIdentities, RowSnapshot, RowStyles};
+use crate::layout::row_reads::{MeasuredOverflow, RowIdentities, RowSnapshot, RowStyles};
 use crate::layout::tree_update_marks::{LayoutTreeUpdateMarkWrite, LayoutTreeUpdateMarks};
 use crate::layout::{FlownRound, HostTables, RowsVersion};
 use crate::painting::paint_read::PaintSource;
@@ -28,6 +28,7 @@ use crate::painting::recording_slot::{RecordingAnswer, RecordingSlot};
 use crate::painting::visual_animation::VisualAnimation;
 use crate::render_state::TaskBoundary;
 use crate::stage_thread::InFlight;
+use libcompositing_rust::scrolling::ScrollStateSnapshot;
 use libgfx_rust::FloatPoint;
 use std::cell::{Cell, RefCell, RefMut};
 use std::rc::Rc;
@@ -80,6 +81,13 @@ pub struct DocumentHost {
     /// The compositor animations the document's effects published in the current update pass, which the host hands
     /// the render state as the pass ends.
     compositor_animations: RefCell<Vec<VisualAnimation>>,
+    /// Where the document's boxes are scrolled to, as the host refreshed it last: what its queries map through, and its
+    /// frames take to the compositor. It is handed out by reference count, as the rows are.
+    scroll_state: RefCell<Rc<ScrollStateSnapshot>>,
+    /// The visual context trees the viewport mappings the host hands C++ map through.
+    viewport_mapping_trees: RefCell<crate::painting::viewport_mapping::ViewportMappingTrees>,
+    /// The display lists the document was rendered as where it is an SVG image's.
+    vector_images: RefCell<crate::painting::vector_image_cache::VectorImageCache>,
     /// What the host's scopes of a read lend the entries they call.
     begun_read: BegunRead,
     /// The writes the host queued that the render state has not applied yet, in the order the host made them.
@@ -90,6 +98,9 @@ pub struct DocumentHost {
     /// is: nothing was written to it since, queued, in place or by a job. Preparing them again would find nothing
     /// to do.
     paint_preparation_is_current: Cell<bool>,
+    /// What the next preparation of the paint and hit testing properties owes, and what the ones before left for the
+    /// document's frames.
+    paint_preparation: crate::painting::paint_passes::PaintPreparationNotes,
     /// The layout round that flew with the frame, from its landing until the host's next layout update pays it.
     flown_round: RefCell<Option<FlownRound>>,
     /// Whether a job of the host runs, whose host callbacks see rows it freed and the host has not heard of yet.
@@ -200,10 +211,14 @@ impl DocumentHost {
             fresh_transition_sample: Cell::default(),
             absolute_rects: RefCell::default(),
             compositor_animations: RefCell::default(),
+            scroll_state: RefCell::default(),
+            viewport_mapping_trees: RefCell::default(),
+            vector_images: RefCell::default(),
             begun_read: BegunRead::of_host(),
             changes: ChangeQueue::default(),
             flown_style: RefCell::default(),
             paint_preparation_is_current: Cell::new(false),
+            paint_preparation: Default::default(),
             flown_round: RefCell::default(),
             in_job: Cell::new(false),
             streamed: Cell::new(false),
@@ -560,6 +575,12 @@ impl DocumentHost {
         let moves = self.hover_target.get() != target;
         self.hover_target.set(target);
         moves
+    }
+
+    pub(super) fn clear_lane_hover_for_testing(&self) {
+        self.hover_events_owed.set(None);
+        self.lane_move.set(None);
+        self.lane_transitions.borrow_mut().clear();
     }
 
     /// The element the lanes' hover put the hover on at the pointer move with the input event id `input_event_id`, or
@@ -1054,13 +1075,16 @@ impl DocumentHost {
         self.changes.set_aside();
     }
 
-    /// Queues the writes the host set aside behind those it queued meanwhile.
-    pub(crate) fn queue_writes_set_aside(&self) {
+    /// Queues the writes the host set aside behind those it queued meanwhile. Returns whether any of them stales the
+    /// paint and hit testing properties.
+    pub(crate) fn queue_writes_set_aside(&self) -> bool {
         // The paint and hit testing properties prepared while they were set aside read the render state as it was
         // before them.
-        if self.changes.queue_set_aside() {
+        let stales_paint_preparation = self.changes.queue_set_aside();
+        if stales_paint_preparation {
             self.note_render_state_write();
         }
+        stales_paint_preparation
     }
 
     /// Ends the drain of the style update that flew: the writes the host queued beside it are queued again, behind
@@ -1107,6 +1131,13 @@ impl DocumentHost {
 
     pub(crate) fn first_letter_styles_may_be_derived(&self) -> bool {
         self.shared.first_letter_styles_derived.load(Ordering::Relaxed)
+    }
+
+    /// Whether some text row may wait for paint timing to look at it, where no frame flies whose layout may give a row
+    /// new rendered text.
+    pub(crate) fn text_rows_may_await_first_paint(&self) -> bool {
+        self.layout_waits_for_no_frame().is_none()
+            || self.shared.text_rows_noted_for_first_paint.load(Ordering::Relaxed)
     }
 
     /// Whether some element may have random base values to keep, which only then is worth asking the render state.
@@ -1263,7 +1294,7 @@ impl DocumentHost {
     /// The rows as of every change the host queued, which the render state publishes again first where the ones the
     /// host has may be stale, spending `wait`.
     pub(crate) fn fresh_rows(&self, wait: impl RenderWait) -> Rc<RowSnapshot> {
-        self.rows_as_of_writes(wait, false)
+        self.rows_as_of_writes(wait, MeasuredOverflow::None)
     }
 
     /// What each row is and the row each node is bound to, as of every change the host queued. The host reads them from
@@ -1271,7 +1302,7 @@ impl DocumentHost {
     /// render state publishes again first, spending `wait`.
     pub(crate) fn row_identities(&self, wait: impl RenderWait) -> RowIdentities {
         self.known_row_identities()
-            .unwrap_or_else(|| RowIdentities::of(self.rows_as_of_writes(wait, false)))
+            .unwrap_or_else(|| RowIdentities::of(self.rows_as_of_writes(wait, MeasuredOverflow::None)))
     }
 
     /// The style record each row has, and what each row is, as of every change the host queued, for a read of the row
@@ -1283,7 +1314,7 @@ impl DocumentHost {
             self.known_rows(RowWrite::Styles, |rows, version| {
                 rows.reads_styles_as(version) && !self.changes.may_write_style_of(id, rows)
             })
-            .unwrap_or_else(|| self.rows_as_of_writes(wait, false)),
+            .unwrap_or_else(|| self.rows_as_of_writes(wait, MeasuredOverflow::None)),
         )
     }
 
@@ -1303,20 +1334,32 @@ impl DocumentHost {
         Some(RowIdentities::of(rows))
     }
 
-    /// Like [`Self::fresh_rows`], with every row's scrollable overflow measured, as a read of overflow needs.
-    pub(crate) fn fresh_measured_rows(&self, wait: impl RenderWait) -> Rc<RowSnapshot> {
-        self.rows_as_of_writes(wait, true)
+    /// Answers `read` from the rows as of every write the host made, with every row's scrollable overflow and ink
+    /// overflow measured, as a hit test needs.
+    pub(crate) fn read_rows_measured_for_hit_testing<R>(
+        &self,
+        wait: impl RenderWait,
+        read: impl FnOnce(&RowSnapshot, &PaintSource<'_>) -> R,
+    ) -> R {
+        let rows = self.rows_as_of_writes(wait, MeasuredOverflow::ScrollableAndInk);
+        read(&rows, &PaintSource::over_rows(&rows.paintable, &self.absolute_rects))
     }
 
     /// Answers `read` from the rows as of every write the host made, through the paint side's reads, spending `wait`
-    /// where the rows have to be published again, with every row's overflow settled where `settle_overflow`.
+    /// where the rows have to be published again, with every row's scrollable overflow settled where
+    /// `settle_overflow`.
     pub(crate) fn read_rows<R>(
         &self,
         wait: impl RenderWait,
         settle_overflow: bool,
         read: impl FnOnce(&PaintSource<'_>) -> R,
     ) -> R {
-        let rows = self.rows_as_of_writes(wait, settle_overflow);
+        let overflow_to_measure = if settle_overflow {
+            MeasuredOverflow::Scrollable
+        } else {
+            MeasuredOverflow::None
+        };
+        let rows = self.rows_as_of_writes(wait, overflow_to_measure);
         read(&PaintSource::over_rows(&rows.paintable, &self.absolute_rects))
     }
 
@@ -1347,7 +1390,7 @@ impl DocumentHost {
         wait: impl RenderWait,
         read: impl FnOnce(&PaintSource<'_>, &[NodeSlotId]) -> R,
     ) -> R {
-        let rows = self.rows_as_of_writes(wait, false);
+        let rows = self.rows_as_of_writes(wait, MeasuredOverflow::None);
         read(
             &PaintSource::over_rows(&rows.paintable, &self.absolute_rects),
             rows.text_awaiting_render(),
@@ -1357,19 +1400,19 @@ impl DocumentHost {
     /// The rows as of every write the host made: the ones the host has where it knows they still read as the arena,
     /// and otherwise those the render state answers, spending `wait`, which are the ones the host has where they still
     /// read as the arena once the owner has applied the host's writes.
-    fn rows_as_of_writes(&self, wait: impl RenderWait, settle_overflow: bool) -> Rc<RowSnapshot> {
+    fn rows_as_of_writes(&self, wait: impl RenderWait, overflow_to_measure: MeasuredOverflow) -> Rc<RowSnapshot> {
         let held = self
             .rows
             .borrow()
             .clone()
-            .filter(|rows| !settle_overflow || rows.overflow_is_settled());
+            .filter(|rows| rows.measured_overflow() >= overflow_to_measure);
         if let Some(rows) = held.as_ref().filter(|rows| self.knows_rows_read_as_arena(rows)) {
             return Rc::clone(rows);
         }
         let held_version = held.as_ref().map(|rows| rows.version());
         let published = self.ask(wait, |state| {
             let arena = state.arena_mut();
-            (held_version != Some(arena.rows_version())).then(|| arena.publish_row_snapshot(settle_overflow))
+            (held_version != Some(arena.rows_version())).then(|| arena.publish_row_snapshot(overflow_to_measure))
         });
         match published {
             Some(rows) => {
@@ -1512,6 +1555,51 @@ impl DocumentHost {
     pub(crate) fn recording(&self) -> RefMut<'_, RecordingSlot> {
         self.recording.borrow_mut()
     }
+
+    /// Where the document's boxes are scrolled to, as the host refreshed it last.
+    pub(crate) fn scroll_state(&self) -> Rc<ScrollStateSnapshot> {
+        self.scroll_state.borrow().clone()
+    }
+
+    /// The visual context trees the viewport mappings the host hands C++ map through.
+    pub(crate) fn viewport_mapping_trees(&self) -> RefMut<'_, crate::painting::viewport_mapping::ViewportMappingTrees> {
+        self.viewport_mapping_trees.borrow_mut()
+    }
+
+    /// The display lists the document was rendered as where it is an SVG image's.
+    pub(crate) fn vector_images(&self) -> RefMut<'_, crate::painting::vector_image_cache::VectorImageCache> {
+        self.vector_images.borrow_mut()
+    }
+
+    /// Takes `device_offsets`, the offsets the render state refreshed, as the document's scroll state.
+    pub(crate) fn refresh_scroll_state(&self, device_offsets: Vec<FloatPoint>) {
+        self.scroll_state
+            .replace(Rc::new(ScrollStateSnapshot::from_device_offsets(device_offsets)));
+    }
+
+    /// Forgets where the document's boxes were scrolled to: nothing is scrolled until the next refresh.
+    pub(crate) fn forget_scroll_state(&self) {
+        self.scroll_state.take();
+    }
+
+    /// Whether the paint and hit testing properties of the document were prepared from its render state as it is, so
+    /// that preparing them again would find nothing to do: they were noted current as their preparation began, and
+    /// nothing was written to the render state since, queued, in place or by a job.
+    pub(crate) fn paint_preparation_is_current(&self) -> bool {
+        self.paint_preparation_is_current.get()
+    }
+
+    /// Notes that the paint and hit testing properties of the document are current, as their preparation begins: they
+    /// stay current until something writes to the render state.
+    pub(crate) fn note_paint_preparation_is_current(&self) {
+        self.paint_preparation_is_current.set(true);
+    }
+
+    /// What the next preparation of the paint and hit testing properties owes, and what the ones before left for the
+    /// document's frames.
+    pub(crate) fn paint_preparation(&self) -> &crate::painting::paint_passes::PaintPreparationNotes {
+        &self.paint_preparation
+    }
 }
 
 /// Creates the host of a new document.
@@ -1569,21 +1657,6 @@ impl Drop for TestHost {
     }
 }
 
-/// Whether the paint and hit testing properties of `host`'s document were prepared from its render state as it is, so
-/// that preparing them again would find nothing to do: the host noted them current as it began to prepare them, and
-/// wrote nothing to the render state since, queued, in place or by a job.
-#[unsafe(no_mangle)]
-pub extern "C" fn document_host_paint_preparation_is_current(host: &DocumentHost) -> bool {
-    host.paint_preparation_is_current.get()
-}
-
-/// Notes that the paint and hit testing properties of `host`'s document are current, as the host begins to prepare them:
-/// they stay current until the host writes to the render state.
-#[unsafe(no_mangle)]
-pub extern "C" fn document_host_note_paint_preparation_is_current(host: &DocumentHost) {
-    host.paint_preparation_is_current.set(true);
-}
-
 /// What a scope of a read of a document's render state reads of the document's host: whether the host waits for the
 /// frame, which it keeps up to date, and the read the scope lends.
 #[repr(C)]
@@ -1615,10 +1688,11 @@ pub extern "C" fn document_host_set_writes_aside(host: &DocumentHost) {
     host.set_writes_aside();
 }
 
-/// Queues the writes `host` set aside behind the writes it queued meanwhile.
+/// Queues the writes `host` set aside behind the writes it queued meanwhile. Returns whether any of them stales the
+/// paint and hit testing properties, which a recording made while they were set aside did not see.
 #[unsafe(no_mangle)]
-pub extern "C" fn document_host_queue_writes_set_aside(host: &DocumentHost) {
-    host.queue_writes_set_aside();
+pub extern "C" fn document_host_queue_writes_set_aside(host: &DocumentHost) -> bool {
+    host.queue_writes_set_aside()
 }
 
 /// Destroys `host`, and has the render owner drop the render state of its document, where a job made one, without
@@ -1692,6 +1766,43 @@ mod tests {
     fn begin_drain(host: &DocumentHost) {
         *host.flown_style.borrow_mut() = Some(FlownStyle::Draining);
         host.changes.stop_holding_style();
+    }
+
+    #[test]
+    fn test_reset_forgets_hover_already_owed_to_the_host() {
+        use super::super::clock::{LaneMove, LaneReport, PendingPointer, document_host_forget_pointer_for_testing};
+
+        let host = TestHost::new();
+        let host = host.host();
+        let [target] = style_nodes(host);
+        let _ = host.ticks.pointer_moved(PendingPointer {
+            position: Some(FloatPoint { x: 50.0, y: 50.0 }),
+            buttons: 0,
+            scrolled_since_frame: false,
+            input_event_id: 1,
+        });
+        host.keep_what_lanes_did(
+            Some(LaneReport {
+                last_move: Some(LaneMove {
+                    input_event_id: 1,
+                    target: Some(Some(target)),
+                    handed: false,
+                }),
+                ..Default::default()
+            }),
+            0,
+        );
+        assert!(host.hover_events_owed.get().is_some());
+        assert!(host.lane_hover_target_for(1).is_some());
+
+        document_host_forget_pointer_for_testing(host);
+
+        assert!(host.take_hover_events_owed().is_none());
+        assert!(host.lane_hover_target_for(1).is_none());
+        assert!(host.ticks.newest_pointer().is_none());
+        assert!(!host.ticks.pointer_waits());
+        host.take_in_what_clock_lanes_did(0);
+        assert!(host.take_hover_events_owed().is_none());
     }
 
     #[test]

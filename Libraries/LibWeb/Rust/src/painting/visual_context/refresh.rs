@@ -5,7 +5,7 @@
  */
 
 use super::scroll_state::{NO_SCROLL_STATE_SLOT, ScrollState, ScrollStateSlot};
-use super::{SpatialData, StickyData, VisualContextTree};
+use super::{SpatialData, StickyData, UniqueNodeId, VisualContextTree};
 use crate::css::computed_value_types::ComputedLengthPercentageOrAuto;
 use crate::css::css_pixels::{CssPixelPoint, CssPixelRect, CssPixelSize, CssPixels};
 use crate::layout::geometry::{Frame, Side};
@@ -86,8 +86,12 @@ fn resolve_sticky_insets_in_css_pixels(
             Side::Top | Side::Bottom => (Side::Top, Side::Bottom, scrollport_size.height, border_box_size.height),
             Side::Left | Side::Right => (Side::Left, Side::Right, scrollport_size.width, border_box_size.width),
         };
-        let view_extent =
-            extent - insets[first as usize].unwrap_or_default() - insets[second as usize].unwrap_or_default();
+        // AD-HOC: Preserve a lone specified inset when its opposite side is auto. Although the rule above treats auto
+        //         as zero, reducing that inset would detach an oversized box from the edge the page specified.
+        let (Some(first_inset), Some(second_inset)) = (insets[first as usize], insets[second as usize]) else {
+            continue;
+        };
+        let view_extent = extent - first_inset - second_inset;
         if let Some(inset) = insets[end as usize].as_mut() {
             *inset -= (border_extent - view_extent).max(CssPixels::default());
         }
@@ -178,6 +182,8 @@ pub(crate) fn compute_sticky_data(
     if !layout_arena.paintable_row_is_populated(paintable) || !layout_arena.paintable_row_is_populated(scroller) {
         return data;
     }
+    data.box_node_id = UniqueNodeId(layout_arena.unique_node_ids().id(paintable));
+    data.box_pseudo_element_type = layout_arena.node_generated_for(paintable).saturating_sub(1);
 
     // NB: Only scroll containers with scrollable overflow, or that keep their scrolls, get a scroll node. When the
     //     nearest scroll container has none, it sits inside the scroller of the scroll node, and its scrollport never
@@ -243,6 +249,7 @@ pub(crate) fn compute_sticky_data(
         sticky_border_box_rect.x - scroller_rect.x,
         sticky_border_box_rect.y - scroller_rect.y,
     ));
+    data.border_box_origin = device_point(sticky_border_box_rect.location());
     data.border_box_size = device_size(sticky_border_box_rect.size());
     data.scrollport_size = device_size(scroller_rect.size());
     data.containing_block_region = FloatRect {

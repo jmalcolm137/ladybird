@@ -19,6 +19,7 @@ FetchParams::FetchParams(NonnullRefPtr<Request> request, GC::Ref<FetchAlgorithms
 {
     controller.set_algorithms({}, algorithms);
     controller.set_original_fetch_params({}, *this);
+    controller.set_network_observation({}, m_request->ensure_network_observation());
 }
 
 FetchParams::FetchParams(FetchParams const& params)
@@ -33,6 +34,8 @@ FetchParams::FetchParams(FetchParams const& params)
     , m_has_response_body_transfer_lease(params.m_has_response_body_transfer_lease)
     , m_blob_url_entry(params.m_blob_url_entry)
     , m_loader_config(params.m_loader_config)
+    , m_engine_record(params.m_engine_record)
+    , m_is_cors_preflight(params.m_is_cors_preflight)
 {
 }
 
@@ -46,6 +49,36 @@ NonnullRefPtr<FetchParams> FetchParams::copy(FetchParams const& params)
     return adopt_ref(*new FetchParams(params));
 }
 
+Engine::StartFetchInput FetchParams::start_fetch_input(Engine::FetchId fetch_id, NonnullOwnPtr<Engine::EngineEventSink> event_sink) const
+{
+    return Engine::StartFetchInput { {}, fetch_id, m_control_block->body_intent(), m_blob_url_entry, move(event_sink) };
+}
+
+void FetchParams::set_body_transport(Engine::FetchBodyDeliveryGate::Transport& transport) const
+{
+    VERIFY(m_engine_record);
+    if (m_is_cors_preflight)
+        m_engine_record->set_cors_preflight_body_transport(transport);
+    else
+        m_engine_record->set_body_transport(transport);
+}
+
+void FetchParams::stop_body_transport() const
+{
+    if (!m_engine_record)
+        return;
+    if (m_is_cors_preflight)
+        m_engine_record->stop_cors_preflight_body_transport();
+    else
+        m_engine_record->stop_body_transport();
+}
+
+void FetchParams::discard_response_body(Response const& response) const
+{
+    response.release_request_transfer_lease();
+    stop_body_transport();
+}
+
 GC::Ref<FetchController> FetchParams::controller() const
 {
     VERIFY(m_controller_registry);
@@ -57,16 +90,13 @@ GC::Ref<FetchController> FetchParams::controller() const
 // https://fetch.spec.whatwg.org/#fetch-params-aborted
 bool FetchParams::is_aborted() const
 {
-    // A fetch params fetchParams is aborted if its controller’s state is "aborted".
-    return m_control_block->state() == FetchControlBlock::State::Aborted;
+    return m_control_block->is_aborted();
 }
 
 // https://fetch.spec.whatwg.org/#fetch-params-canceled
 bool FetchParams::is_canceled() const
 {
-    // A fetch params fetchParams is canceled if its controller’s state is "aborted" or "terminated".
-    auto state = m_control_block->state();
-    return state == FetchControlBlock::State::Aborted || state == FetchControlBlock::State::Terminated;
+    return m_control_block->is_canceled();
 }
 
 }

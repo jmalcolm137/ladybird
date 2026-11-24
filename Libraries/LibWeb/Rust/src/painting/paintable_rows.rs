@@ -12,7 +12,7 @@ use crate::painting::node_painting;
 use crate::painting::paint_read::{GeometryRead, PaintRead};
 use crate::painting::paintable_data::*;
 use crate::painting::published_frame::PublishedRows;
-use crate::painting::record::damage::{DamageSet, PaintDamage, RowPaintState};
+use crate::painting::record::change_ticks::{PaintChangeStamps, PaintGenerations, RowPaintChange};
 use crate::painting::stacking_context::entries::{StackingContextEntryColumn, drop_table};
 use crate::painting::visual_context::dirty::{RemovedBoxBlocks, VisualContextBoxDirtyKind, VisualContextUpdateScope};
 use crate::painting::visual_context::{
@@ -51,7 +51,7 @@ mod tests {
         assert!(slot_with(link.clone()) == slot_with(link.clone()));
 
         let mut moved = link.clone();
-        moved.committed_offset.x = crate::css::css_pixels::CssPixels::from_integer(10);
+        moved.offset.x = crate::css::css_pixels::CssPixels::from_integer(10);
         assert!(slot_with(link.clone()) != slot_with(moved));
 
         // An equal fragment laid out again is a different fragment.
@@ -209,6 +209,25 @@ impl UniqueNodeIdColumn {
         }
     }
 
+    /// Publishes the names of the nodes the rows of a chunk new to the arena carry, from its first slot
+    /// `first_slot_index` on, each in its first generation, `generation`; a row whose name is 0 carries none.
+    pub(crate) fn publish_new_chunk(&mut self, first_slot_index: usize, generation: u8, ids: &[i64]) {
+        if ids.iter().all(|&id| id == 0) {
+            return;
+        }
+        debug_assert!(self.ids.len() <= first_slot_index);
+        self.ids.resize_with_default(first_slot_index);
+        let block: Vec<(NodeSlotId, i64)> = ids
+            .iter()
+            .enumerate()
+            .map(|(offset, &id)| match id {
+                0 => Default::default(),
+                id => (NodeSlotId::new((first_slot_index + offset) as u32, generation), id),
+            })
+            .collect();
+        self.ids.extend_from_slice(&block);
+    }
+
     pub(crate) fn publish(&mut self, slot: NodeSlotId, id: i64) {
         if slot.is_invalid() || self.id(slot) == id {
             return;
@@ -224,11 +243,19 @@ impl UniqueNodeIdColumn {
 #[derive(Clone, Default)]
 pub(crate) struct PaintableRowStore {
     rows: CowColumn<PaintableData, PAINTABLE_SLOTS_PER_CHUNK>,
+    pub(crate) ink_overflow: CowColumn<crate::painting::ink_overflow::InkOverflow, PAINTABLE_SLOTS_PER_CHUNK>,
+    pub(crate) ink_overflow_stamp: u64,
+    /// Names what the rows say can be hit, and where: it moves with every write that can change a hit-test item.
+    /// Scrolling and selecting change none.
+    pub(crate) hit_test_items_stamp: u64,
+    pub(crate) ink_overflow_audit_sequence: u64,
+    pub(crate) ink_overflow_dirty: crate::fork_vec::ForkVec<bool>,
+    pub(crate) ink_overflow_requests: Vec<NodeSlotId>,
     /// In chunks a fork of the arena shares until either side writes one, so forking does not copy every row's.
     side_data: CowVec<PaintableSideData, PAINTABLE_SLOTS_PER_CHUNK>,
     committed_side_data: CowColumn<CommittedSideData, PAINTABLE_SLOTS_PER_CHUNK>,
-    pub(crate) row_paint_states: crate::fork_vec::ForkVec<RowPaintState>,
-    pub(crate) damage: DamageSet,
+    pub(crate) paint_change_stamps: CowColumn<PaintChangeStamps, PAINTABLE_SLOTS_PER_CHUNK>,
+    pub(crate) paint_generations: PaintGenerations,
     // NB: Boxed, as most rows have no record, and a row holds no more than a pointer for one.
     visual_context_records: CowColumn<Option<Box<PaintableVisualContextRecord>>, PAINTABLE_SLOTS_PER_CHUNK>,
     /// The visual context node handles of each row that has a record. They are kept here only, in
@@ -402,7 +429,7 @@ where
                 continue;
             }
             if node_painting::has_lines(&*self, current) || node_painting::is_fragmented_inline(&*self, current) {
-                self.arena.push_paint_damage(current, PaintDamage::DRAW_FOREGROUND);
+                self.arena.note_paint_change(current, RowPaintChange::DRAWING);
             }
             if let Some(first_child) = crate::painting::paint_order::first_paint_child(&*self, current) {
                 stack.push(first_child);
@@ -429,7 +456,7 @@ where
     /// Starts committing a row anew. The commit writes its geometry and inline content over what it committed last, so
     /// that a row it commits as it was copies no chunk a published generation shares.
     pub(crate) fn begin_paintable_row_recommit(&mut self, id: NodeSlotId) {
-        // The row's damage is deliberately kept; the commit diff pushes what actually changed.
+        // The row's stamps are deliberately kept; the commit diff stamps what actually changed.
         let filter = self.arena.committed_side_data_mut(id).fragment_ownership.take();
         if filter.is_some() {
             self.arena
@@ -614,14 +641,14 @@ impl LayoutNodeArena {
     // A row whose ordering decisions changed is placed differently by its ancestors' plans and
     // may plan its own descendants differently.
     pub(crate) fn note_paint_order_changed(&mut self, row: NodeSlotId) {
-        self.push_paint_damage(row, PaintDamage::ORDER);
-        self.push_enclosing_paint_order_damage(row);
+        self.note_paint_change(row, RowPaintChange::ORDER);
+        self.note_enclosing_paint_order_change(row);
     }
 
     // The entry tables decide how a stacking context composes its hoisted content, so a table
     // change reorders the context's own painting even when no row changed its own decisions.
     pub(crate) fn note_stacking_context_composition_changed(&mut self, context_root: NodeSlotId) {
-        self.push_paint_damage(context_root, PaintDamage::CONTEXT_ORDER);
+        self.note_paint_change(context_root, RowPaintChange::ORDER);
     }
 
     pub(crate) fn paintable_rows(&self) -> PaintableRowsRef<'_> {
@@ -640,6 +667,10 @@ impl LayoutNodeArena {
         let store = &mut self.paintable_rows;
         PublishedRows {
             geometry_epoch: store.absolute_rect_memo_epoch,
+            ink_overflow: store.ink_overflow.publish(),
+            ink_overflow_stamp: store.ink_overflow_stamp,
+            hit_test_items_stamp: store.hit_test_items_stamp,
+            paint_change_stamps: store.paint_change_stamps.publish(),
             nodes,
             paint_facts,
             rows: store.rows.publish(),
@@ -666,6 +697,7 @@ impl LayoutNodeArena {
             + store.committed_side_data.version()
             + store.stacking_context_entries.version()
             + store.visual_context_node_handles.version()
+            + store.ink_overflow.version()
     }
 
     pub(crate) fn paintable_rows_mut(&mut self) -> PaintableRowsMut<'_> {
@@ -715,9 +747,9 @@ impl LayoutNodeArena {
         store.committed_side_data.grow_to(index + 1);
         store.visual_context_node_handles.grow_to(index + 1);
         store.stacking_context_entries.grow_to(index + 1);
+        store.paint_change_stamps.grow_to(index + 1);
         while store.side_data.len() <= index {
             store.side_data.push(PaintableSideData::default());
-            store.row_paint_states.push(RowPaintState::default());
         }
 
         store.population_writes += 1;
@@ -733,23 +765,37 @@ impl LayoutNodeArena {
             ..Default::default()
         };
         store.committed_side_data.set(index, CommittedSideData::default());
-        store.row_paint_states[index].clear();
+        store.paint_change_stamps.set(
+            index,
+            PaintChangeStamps::of_a_row_new_to_the_document(store.paint_generations.generation_writes_stamp_with()),
+        );
         store.visual_context_records.set(index, None);
         set_visual_context_node_handles(&mut store.visual_context_node_handles, index, None);
         drop_table(&mut store.stacking_context_entries, index);
+        if let Some(dirty) = self.paintable_rows.ink_overflow_dirty.get_mut(index) {
+            *dirty = false;
+        }
+        self.request_ink_overflow_recalculation(layout_node);
+        self.note_hit_test_items_changed();
         self.notify_committed_box_changed(layout_node);
     }
 
     fn reset_paintable_row(&mut self, row_is_still_linked: bool, reset: PaintableRowReset) {
         let id = reset.slot;
+        self.forget_ink_overflow_of_row_being_reset(id);
+        self.note_hit_test_items_changed();
         if row_is_still_linked {
             // A cleared row is still linked, so the ancestor whose plans listed it is known now.
-            self.push_enclosing_paint_order_damage(id);
+            self.note_enclosing_paint_order_change(id);
         }
         if let Some((record, node_handles)) = self.take_paintable_visual_context_record(id) {
             self.withdraw_stacking_context_state_of_reset_row(id, Some(record.stacking_context));
             let former_paint_parent =
                 crate::painting::paint_order::paint_parent(&self.paintable_rows(), id).unwrap_or(NodeSlotId::INVALID);
+            let element = self.node_style_node(id);
+            if let Some(trace) = self.paint_state_mut().visual_context.trace.as_mut() {
+                trace.note_removed_box(id, element);
+            }
             self.paint_state_mut()
                 .visual_context
                 .dirty_boxes
@@ -769,7 +815,7 @@ impl LayoutNodeArena {
         store.rows.set(index, PaintableData::default());
         store.side_data[index] = PaintableSideData::default();
         store.committed_side_data.set(index, CommittedSideData::default());
-        store.row_paint_states[index].clear();
+        store.paint_change_stamps.set(index, PaintChangeStamps::default());
         store.visual_context_records.set(index, None);
         set_visual_context_node_handles(&mut store.visual_context_node_handles, index, None);
         drop_table(&mut store.stacking_context_entries, index);
@@ -1016,8 +1062,6 @@ impl LayoutNodeArena {
     }
 
     pub(crate) fn paintable_row_cleared(&mut self, reset: PaintableRowReset) {
-        // NB: The overflow index may keep listing this box. Overflow measurement passes over boxes without a row, and
-        //     populating the row again notes the box anew.
         self.reset_paintable_row(true, reset);
     }
 
@@ -1062,7 +1106,7 @@ impl LayoutNodeArena {
         if !self.paintable_row_is_populated(containing_block) {
             return;
         }
-        self.push_paint_damage(containing_block, PaintDamage::ALL_PRODUCERS);
+        self.note_paint_change(containing_block, RowPaintChange::EVERYTHING_IT_PAINTS);
         let mut side = self.committed_side_data_mut(containing_block);
         let Some(content) = side.inline_content.as_mut() else {
             return;

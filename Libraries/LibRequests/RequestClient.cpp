@@ -4,16 +4,23 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <AK/Atomic.h>
 #include <LibCore/EventLoop.h>
 #include <LibCore/Promise.h>
-#include <LibCore/System.h>
 #include <LibRequests/Request.h>
 #include <LibRequests/RequestClient.h>
 
 namespace Requests {
 
+static u64 take_transport_epoch()
+{
+    static Atomic<u64> s_next_transport_epoch { 1 };
+    return s_next_transport_epoch.fetch_add(1);
+}
+
 RequestClient::RequestClient(NonnullOwnPtr<IPC::Transport> transport)
     : IPC::ConnectionToServer<RequestClientEndpoint, RequestServerEndpoint>(*this, move(transport))
+    , m_transport_epoch(take_transport_epoch())
 {
     m_request_server_client_id = send_sync<Messages::RequestServer::GetClientId>()->client_id();
 }
@@ -21,6 +28,7 @@ RequestClient::RequestClient(NonnullOwnPtr<IPC::Transport> transport)
 RequestClient::RequestClient(NonnullOwnPtr<IPC::Transport> transport, int client_id)
     : IPC::ConnectionToServer<RequestClientEndpoint, RequestServerEndpoint>(*this, move(transport))
     , m_request_server_client_id(client_id)
+    , m_transport_epoch(take_transport_epoch())
 {
 }
 
@@ -69,20 +77,20 @@ RefPtr<Request> RequestClient::start_request(ByteString const& method, URL::URL 
     auto transfer_lease_key = transfer_lease == TransferLease::Yes
         ? Optional<RequestTransferLeaseKey> { { m_request_server_client_id, request_id } }
         : Optional<RequestTransferLeaseKey> {};
-    IPCProxy::async_start_request(request_id, method, url, headers, request_body, cache_mode, move(network_isolation_key), include_credentials, transfer_lease_key.has_value(), address_selection_hint, cache_miss_notification == CacheMissNotification::Yes, Core::System::getpid(), originating_page_id, same_site_context, force_fresh_connection);
+    IPCProxy::async_start_request(request_id, method, url, headers, request_body, cache_mode, move(network_isolation_key), include_credentials, transfer_lease_key.has_value(), address_selection_hint, cache_miss_notification == CacheMissNotification::Yes, originating_page_id, same_site_context, force_fresh_connection);
     auto request = Request::create_from_id({}, *this, request_id, move(transfer_lease_key));
     m_requests.set(request_id, request);
     return request;
 }
 
-RefPtr<Request> RequestClient::adopt_request(int source_client_id, u64 source_request_id, TransferLease transfer_lease)
+RefPtr<Request> RequestClient::adopt_request(int source_client_id, u64 source_request_id, TransferLease transfer_lease, Optional<int> owner_client_id)
 {
     auto request_id = m_next_request_id++;
 
     auto transfer_lease_key = transfer_lease == TransferLease::Yes
         ? Optional<RequestTransferLeaseKey> { { source_client_id, source_request_id } }
         : Optional<RequestTransferLeaseKey> {};
-    IPCProxy::async_adopt_request(source_client_id, source_request_id, request_id, transfer_lease_key.has_value());
+    IPCProxy::async_adopt_request(source_client_id, source_request_id, request_id, transfer_lease_key.has_value(), owner_client_id);
     auto request = Request::create_from_id({}, *this, request_id, move(transfer_lease_key));
     m_requests.set(request_id, request);
     return request;
@@ -231,11 +239,11 @@ void RequestClient::certificate_info_available(u64 request_id, Requests::Certifi
         request->did_receive_certificate_info({}, move(certificate_info));
 }
 
-void RequestClient::headers_became_available(u64 request_id, Vector<HTTP::Header> response_headers, Optional<u32> status_code, Optional<String> reason_phrase, CacheState cache_state, ByteString http_version)
+void RequestClient::headers_became_available(u64 request_id, URL::URL url, Vector<HTTP::Header> response_headers, Optional<u32> status_code, Optional<String> reason_phrase, CacheState cache_state, ByteString http_version)
 {
     RefPtr<Request> request = m_requests.get(request_id).value_or(nullptr);
     if (request)
-        request->did_receive_headers({}, HTTP::HeaderList::create(move(response_headers)), status_code, reason_phrase, cache_state, move(http_version));
+        request->did_receive_headers({}, move(url), HTTP::HeaderList::create(move(response_headers)), status_code, reason_phrase, cache_state, move(http_version));
     else
         warnln("Received headers for non-existent request {}", request_id);
 }
@@ -249,10 +257,10 @@ void RequestClient::request_transferred(u64 request_id)
     (*request)->did_transfer({});
 }
 
-RefPtr<WebSocket> RequestClient::websocket_connect(URL::URL const& url, Optional<HTTP::NetworkIsolationKey> const& network_isolation_key, ByteString const& origin, Vector<ByteString> const& protocols, Vector<ByteString> const& extensions, HTTP::HeaderList const& request_headers, HTTP::Cookie::SameSiteContext same_site_context)
+RefPtr<WebSocket> RequestClient::websocket_connect(URL::URL const& url, Optional<HTTP::NetworkIsolationKey> const& network_isolation_key, ByteString const& origin, Vector<ByteString> const& protocols, Vector<ByteString> const& extensions, HTTP::HeaderList const& request_headers, u64 originating_page_id, HTTP::Cookie::SameSiteContext same_site_context)
 {
     auto websocket_id = m_next_websocket_id++;
-    IPCProxy::async_websocket_connect(websocket_id, url, network_isolation_key, origin, protocols, extensions, request_headers.headers(), same_site_context);
+    IPCProxy::async_websocket_connect(websocket_id, url, network_isolation_key, origin, protocols, extensions, request_headers.headers(), originating_page_id, same_site_context);
     auto connection = WebSocket::create_from_id({}, *this, websocket_id);
     m_websockets.set(websocket_id, connection);
     return connection;
@@ -268,6 +276,12 @@ void RequestClient::websocket_received(u64 websocket_id, bool is_text, ByteBuffe
 {
     if (auto connection = m_websockets.get(websocket_id); connection.has_value())
         (*connection)->did_receive({}, move(data), is_text);
+}
+
+void RequestClient::websocket_transmitted(u64 websocket_id, u64 message_byte_count)
+{
+    if (auto connection = m_websockets.get(websocket_id); connection.has_value())
+        (*connection)->did_transmit({}, message_byte_count);
 }
 
 void RequestClient::websocket_received_shared(u64 websocket_id, bool is_text, Core::AnonymousBuffer data)

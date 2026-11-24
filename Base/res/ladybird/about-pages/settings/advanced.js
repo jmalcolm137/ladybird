@@ -14,6 +14,8 @@ function createControl(variable) {
     const type = variable.type === "array" && variable.elementType === "string" ? "textarea" : "input";
     const input = document.createElement(type);
     input.id = variable.name;
+    // NB: Configuration values are names, numbers and addresses, not words to check the spelling of.
+    input.spellcheck = false;
 
     if (variable.type === "boolean") {
         input.type = "checkbox";
@@ -67,6 +69,7 @@ function createRow(variable) {
     row.classList.add("card-group");
     row.classList.add("config-row");
     row.classList.add("inline-container");
+    row.classList.add("control-row");
     row.dataset.filterText = `${variable.title} ${variable.description}`.toLowerCase();
 
     const title = document.createElement("p");

@@ -17,21 +17,17 @@ use libgfx_rust::*;
 #[repr(C, align(8))]
 pub struct DisplayListCommandHeader {
     pub command_type: DisplayListCommandType,
-    pub has_bounding_rect: bool,
     pub inline_clip_count: u8,
     pub has_inline_transform: bool,
     pub payload_size: u32,
-    pub bounding_rect: IntRect,
 }
 ffi_bytes_fields!(DisplayListCommandHeader {
     command_type,
-    has_bounding_rect,
     inline_clip_count,
     has_inline_transform,
-    payload_size,
-    bounding_rect
+    payload_size
 });
-const _: () = assert!(std::mem::size_of::<DisplayListCommandHeader>() == 24);
+const _: () = assert!(std::mem::size_of::<DisplayListCommandHeader>() == 8);
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[repr(u8)]
@@ -83,9 +79,10 @@ ffi_bytes_fields!(DisplayListInlineTransform { transform, padding });
 pub const INLINE_TRANSFORM_ENTRY_SIZE: usize = std::mem::size_of::<DisplayListInlineTransform>();
 const _: () = assert!(INLINE_TRANSFORM_ENTRY_SIZE == 32);
 
-// A maximal sequence of consecutive commands sharing one visual context, summarized as the tape is
-// built so that replay can enter a context, cull, and depth-sort per run. The run owns the visual
-// context of its commands, including records nested inside groups. Runs cover the whole tape.
+// A sequence of consecutive commands sharing one visual context, summarized as the tape is built so
+// that replay can enter a context, cull, and depth-sort per run. The run owns the visual context of
+// its commands, including records nested inside groups. Runs cover the whole tape, and a run ends
+// where its context does or where the chunk of the tape that holds it does.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[repr(C)]
 pub struct DisplayListCommandRun {

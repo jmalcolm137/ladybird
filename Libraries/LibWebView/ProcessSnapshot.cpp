@@ -11,6 +11,7 @@
 #include <LibWebView/CanonicalTraversable.h>
 #include <LibWebView/ProcessManager.h>
 #include <LibWebView/ProcessSnapshot.h>
+#include <LibWebView/TabDiscarder.h>
 #include <LibWebView/ViewImplementation.h>
 
 namespace WebView {
@@ -27,6 +28,7 @@ Vector<ProcessSnapshot> process_snapshots(ProcessManager& manager)
     HashMap<u64, ProcessPage> process_pages;
     HashMap<u64, Vector<ProcessTabSnapshot>> process_tabs;
     HashMap<u64, Vector<ProcessFrameSnapshot>> process_frames;
+    auto now = MonotonicTime::now();
     // NB: The Application is only asked once there is a view, so that a ProcessManager without one can be described.
     bool did_look_up_active_view = false;
     Optional<ViewImplementation&> active_view;
@@ -52,14 +54,27 @@ Vector<ProcessSnapshot> process_snapshots(ProcessManager& manager)
         };
         auto top_level_child_id = view.page().client().child_id();
         add_page(top_level_child_id, view.url(), ProcessPageKind::TopLevel);
-        process_tabs.ensure(top_level_child_id).append(ProcessTabSnapshot {
+        ProcessTabSnapshot tab {
             .title = view.title(),
             .page = {
                 .view_id = view.view_id(),
                 .url = view.url(),
                 .kind = ProcessPageKind::TopLevel,
             },
-        });
+            .discard_blockers_under_memory_pressure = view.discard_blockers(ViewImplementation::DiscardReason::MemoryPressure, now),
+            .discard_blockers_after_inactivity = {},
+            .seconds_until_discarded_after_inactivity = {},
+        };
+        if (auto minimum_time_hidden = TabDiscarder::minimum_time_hidden_after_inactivity(); minimum_time_hidden.has_value()) {
+            auto blockers = view.discard_blockers(ViewImplementation::DiscardReason::Inactivity, now);
+            tab.discard_blockers_after_inactivity = blockers;
+            // NB: A tab that the UI was asked to discard already isn't counted down again until the user has seen it.
+            if (blockers == DiscardBlockers::None && view.hidden_since().has_value() && !view.discard_requested()) {
+                auto remaining = *minimum_time_hidden - (now - *view.hidden_since());
+                tab.seconds_until_discarded_after_inactivity = max<i64>(0, remaining.to_seconds());
+            }
+        }
+        process_tabs.ensure(top_level_child_id).append(move(tab));
         view.traversable().for_each_in_subtree([&](auto const& navigable) {
             if (navigable.has_remote_host() && navigable.replicated_state().has_value()) {
                 auto child_id = navigable.remote_host().client().child_id();
@@ -83,6 +98,7 @@ Vector<ProcessSnapshot> process_snapshots(ProcessManager& manager)
             .child_id = process.child_id(),
             .pid = statistics.pid,
             .type = process.type(),
+            .is_private = process.is_private(),
             .title = process.title(),
             .site_url = process.site_url(),
             .owner_child_id = process.owner_child_id(),

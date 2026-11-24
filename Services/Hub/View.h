@@ -21,12 +21,14 @@ public:
         double device_pixel_ratio { 1.0 };
         double maximum_frames_per_second { 60.0 };
         Optional<u64> display_id;
+        bool screen_shows_high_dynamic_range { false };
         Core::AnonymousBuffer system_theme;
         Optional<ScreenRects> screen_rects;
         Optional<u64> owner_view_id;
         bool websites_prefer_dark { false };
         // The view of a tab can open others and ask the user about things, unlike that of a Picture-in-Picture window.
         bool is_tab { true };
+        bool scales_frames_to_fit { false };
     };
 
     explicit View(InitialState);
@@ -47,7 +49,8 @@ public:
     void set_viewport(Web::DevicePixelSize, double device_pixel_ratio);
     void set_system_theme(Core::AnonymousBuffer);
     void set_screen_rects(ScreenRects);
-    bool scales_frames_to_fit() const { return m_scales_frames_to_fit; }
+    void set_wants_frame_notifications(bool wants_frame_notifications) { m_wants_frame_notifications = wants_frame_notifications; }
+    void did_install_backing_stores_in_ui();
 
     using ViewImplementation::microphone_authorizer;
     using ViewImplementation::rect_fitting_frame;
@@ -60,6 +63,8 @@ private:
     virtual Optional<ScreenRects> screen_rects() const override { return m_screen_rects; }
     virtual void update_zoom() override;
     virtual void did_change_state() override { push_state_to_ui(); }
+    virtual bool supports_discarding() const override { return m_is_tab; }
+    virtual void did_request_discard() override;
     virtual Web::DevicePixelSize viewport_size() const override { return m_viewport_size; }
     virtual Gfx::IntPoint to_content_position(Gfx::IntPoint widget_position) const override { return widget_position; }
     virtual Gfx::IntPoint to_widget_position(Gfx::IntPoint content_position) const override { return content_position; }
@@ -72,6 +77,10 @@ private:
     virtual void did_accept_presented_backing_store(i32 bitmap_id, Gfx::IntRect damage_rect) override;
     // NB: The UI hands a backing store back, once it no longer shows what is in it.
     virtual void release_backing_store(i32) override { }
+    virtual void did_create_remote_layer(Compositing::RemoteLayerHostHandle) override;
+    virtual void did_present_frame_in_remote_layer(Gfx::IntSize, double device_pixel_ratio) override;
+    virtual void did_hold_synchronized_resize_frame(u64 token) override;
+    virtual void did_commit_synchronized_resize(u64 token) override;
 
     void forward_callbacks_to_ui(bool is_tab);
 
@@ -79,7 +88,11 @@ private:
     Optional<ScreenRects> m_screen_rects;
     Web::DevicePixelSize m_viewport_size;
     bool m_websites_prefer_dark { false };
+    bool m_is_tab { true };
     ByteBuffer m_last_state_pushed_to_ui;
+    bool m_wants_frame_notifications { false };
+    bool m_ui_hosts_remote_layer { false };
+    bool m_ui_awaits_first_frame_in_remote_layer { false };
 
     // What the view waits to hear from the user, through the UI.
     HashMap<u64, Function<void(bool)>> m_pending_answers;

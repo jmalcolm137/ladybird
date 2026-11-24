@@ -41,7 +41,8 @@
 //! - `token.rs` — Token types
 //! - `tokenize.rs` — Tokens of a source without parsing it, for syntax highlighting
 //! - `lexer.rs` — Tokenizer: UTF-16 input → Token stream, for tokenize.rs
-//! - `parser/` — The parser, the columns of its syntax tree, scope analysis and identifier resolution
+//! - `parser/` — Parse jobs and what is kept of them; the parser, the columns of its syntax tree, scope analysis and
+//!   identifier resolution are the `libjs_parser` crate (Libraries/LibJS/Parser/Rust)
 //! - `ast.rs` — The syntax tree and the typed views that everything after the parser reads it through
 //! - `bytecode/` — Bytecode generator, instruction types, and dumper
 //! - `breakpoint_positions.rs` — Where in a source a debugger can stop
@@ -120,6 +121,12 @@ compile_error!("the JIT supports Windows on x86-64 only: build without the jit f
 #[cfg(all(not(test), not(feature = "jit")))]
 #[path = "jit/disabled.rs"]
 pub mod jit;
+// NB: The thread pool of the compiles and the options of the JIT use nothing of the runtime, so they are part of a
+//     test build, which `jit` is not.
+#[cfg(feature = "jit")]
+pub mod jit_compile_pool;
+#[cfg(feature = "jit")]
+pub mod jit_options;
 #[cfg(not(test))]
 pub mod layout;
 #[cfg(not(test))]
@@ -149,8 +156,10 @@ pub mod slice_block;
 pub mod source_code;
 #[cfg(not(test))]
 pub mod source_range;
+pub mod source_text;
 #[cfg(not(test))]
 pub mod standard_output;
+pub mod terminal;
 pub mod token;
 pub mod tokenize;
 #[cfg(not(test))]
@@ -158,15 +167,12 @@ pub mod unicode;
 pub mod utf16;
 #[cfg(not(test))]
 pub mod utilities;
+mod work_zone;
 
 #[cfg(test)]
 mod test_host;
 
-/// Convert a `usize` to `u32`, panicking if the value exceeds `u32::MAX`.
-/// Prefer this over `as u32` which silently truncates on 64-bit platforms.
-pub(crate) fn u32_from_usize(value: usize) -> u32 {
-    u32::try_from(value).expect("value exceeds u32::MAX")
-}
+pub(crate) use libjs_parser::u32_from_usize;
 
 #[cfg(not(test))]
 mod layout_static_assertions {

@@ -34,6 +34,9 @@
 //! run, so after them it may be. Before nodes that only need the frame
 //! published, where it may not be, it puts a `PublishFrame`.
 
+use ak::Zone;
+use ak::ZoneVec;
+
 use crate::bytecode::FrameLayout;
 use crate::bytecode::RESERVED_REGISTER_COUNT;
 use crate::ir::BlockId;
@@ -73,16 +76,15 @@ impl State {
     }
 
     /// The node to put before a node with `need`, if any, and the state
-    /// after both. If `clobbers_floats`, that node clobbers the floating
-    /// point registers anyway (see `Op::InitializeFrame`).
-    fn satisfy(self, need: &Need, clobbers_floats: bool) -> (Option<Op>, State) {
+    /// after both.
+    fn satisfy(self, need: &Need) -> (Option<Op<'static>>, State) {
         const INITIALIZED: State = State {
             published: Holds::Yes,
             initialized: Holds::Yes,
         };
         match (need, self.initialized, self.published) {
-            (Need::Initialized, Holds::No, _) => (Some(Op::InitializeFrame { clobbers_floats }), INITIALIZED),
-            (Need::Initialized, Holds::Maybe, _) => (Some(Op::EnsureFrameInitialized { clobbers_floats }), INITIALIZED),
+            (Need::Initialized, Holds::No, _) => (Some(Op::InitializeFrame), INITIALIZED),
+            (Need::Initialized, Holds::Maybe, _) => (Some(Op::EnsureFrameInitialized), INITIALIZED),
             (Need::Published, _, Holds::No | Holds::Maybe) => (
                 Some(Op::PublishFrame),
                 State {
@@ -148,13 +150,13 @@ fn need(node: &Node, layout: &FrameLayout) -> Need {
     }
 }
 
-pub fn run(graph: &mut Graph, layout: &FrameLayout) {
+pub fn run(graph: &mut Graph, layout: &FrameLayout, work: &Zone) {
     // Only functions entered through `Enter` initialize their frame.
     let Some((entry_block, entry_node)) = graph.blocks.iter().enumerate().find_map(|(index, block)| {
         block
             .body
             .iter()
-            .find(|node| matches!(graph.node(**node).op, Op::InitializeFrame { .. }))
+            .find(|node| matches!(graph.node(**node).op, Op::InitializeFrame))
             .map(|node| (index, *node))
     }) else {
         return;
@@ -163,14 +165,14 @@ pub fn run(graph: &mut Graph, layout: &FrameLayout) {
     let entry_pc = graph.node(entry_node).pc;
 
     let block_count = graph.blocks.len();
-    let osr_blocks = graph.osr_entries.iter().map(|(_, block)| *block).collect::<Vec<_>>();
-    let mut end_states: Vec<Option<State>> = vec![None; block_count];
+    let osr_blocks = ZoneVec::from_iter_in(graph.osr_entries.iter().map(|(_, block)| *block), work);
+    let mut end_states: ZoneVec<Option<State>> = ZoneVec::from_elem_in(None, block_count, work);
     // Where to put which initialization, as (block, index in its body).
-    let mut insertions: Vec<(usize, usize, Op)>;
-    let mut slow_paths: Vec<NodeId>;
+    let mut insertions: ZoneVec<(usize, usize, Op)> = ZoneVec::new_in(work);
+    let mut slow_paths: ZoneVec<NodeId> = ZoneVec::new_in(work);
     loop {
-        insertions = Vec::new();
-        slow_paths = Vec::new();
+        insertions.clear();
+        slow_paths.clear();
         let mut changed = false;
         for block in 0..block_count {
             let block_id = BlockId::from_index(block);
@@ -216,9 +218,7 @@ pub fn run(graph: &mut Graph, layout: &FrameLayout) {
                     }
                     continue;
                 }
-                let op = &graph.node(*node).op;
-                let clobbers_floats = op.properties().is_call || crate::regalloc::saves_only_gprs(op);
-                let (op, after) = current.satisfy(&need, clobbers_floats);
+                let (op, after) = current.satisfy(&need);
                 if let Some(op) = op {
                     insertions.push((block, index, op));
                 }
@@ -234,11 +234,12 @@ pub fn run(graph: &mut Graph, layout: &FrameLayout) {
         }
     }
 
-    // Insert from the back so earlier indices stay valid.
-    insertions.sort_by_key(|(block, index, _)| (*block, *index));
+    // Insert from the back so earlier indices stay valid. A place gets one
+    // initialization at most.
+    insertions.sort_unstable_by_key(|(block, index, _)| (*block, *index));
     for (block, index, op) in insertions.into_iter().rev() {
-        let node = graph.add_node(Node::new(op, Vec::new(), None, entry_pc));
+        let node = graph.add(op, &[], None, entry_pc);
         graph.blocks[block].body.insert(index, node);
     }
-    graph.slow_paths_initializing_frame = slow_paths;
+    graph.slow_paths_initializing_frame.assign(&slow_paths);
 }

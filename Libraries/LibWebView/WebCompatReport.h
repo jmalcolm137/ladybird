@@ -19,6 +19,7 @@
 #include <LibGfx/Size.h>
 #include <LibURL/URL.h>
 #include <LibWebView/Forward.h>
+#include <LibWebView/Options.h>
 #include <LibWebView/ReportDetail.h>
 #include <LibWebView/ReportSubmission.h>
 
@@ -46,6 +47,11 @@ public:
         Yes,
     };
 
+    enum class IncludePlatformFeatures : bool {
+        No,
+        Yes,
+    };
+
     static Page describe_page(ViewImplementation const&);
     static NonnullRefPtr<Core::Promise<String>> request_page_dumps(ViewImplementation&);
     static Optional<String> validate(StringView description);
@@ -59,9 +65,12 @@ public:
     void set_page_dumps(String);
     bool has_page_dumps() const { return m_page_dumps.has_value(); }
 
-    ByteString diagnostics(IncludePageDumps) const;
+    // Describes the GPU, its driver and the media libraries, and what the browser decided to use of them.
+    void set_platform_features(String description) { m_platform_features = move(description); }
 
-    Optional<String> send(String const& description, Optional<ByteBuffer> screenshot_png, IncludePageDumps);
+    ByteString diagnostics(IncludePageDumps, IncludePlatformFeatures = IncludePlatformFeatures::No) const;
+
+    Optional<String> send(String const& description, Optional<ByteBuffer> screenshot_png, IncludePageDumps, IncludePlatformFeatures = IncludePlatformFeatures::No);
     void retry();
     bool is_sending() const { return m_submission; }
     void cancel_sending();
@@ -76,11 +85,18 @@ private:
 
     Page m_page;
     Optional<String> m_page_dumps;
+    Optional<String> m_platform_features;
     Optional<ReportSubmission::Payload> m_payload;
     RefPtr<ReportSubmission> m_submission;
 };
 
-// A new issue on GitHub, with what we know of this build already filled in.
-WEBVIEW_API URL::URL new_bug_report_url();
+// What a new bug report says about how this browser runs, beyond the details of its build.
+struct BugReportDetails {
+    DisableSandbox disable_sandbox { DisableSandbox::No };
+    bool gpu_painting_enabled { true };
+};
+
+// A new issue on GitHub, with the given details and what we know of this build already filled in.
+WEBVIEW_API URL::URL new_bug_report_url(BugReportDetails const&);
 
 }

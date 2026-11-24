@@ -71,13 +71,15 @@ fn generate_media_features(manifest_dir: &Path, out_dir: &Path) -> Result<(), Bo
          pub(crate) const MEDIA_FEATURE_VALUE_INTEGER: u8 = 1 << 1;\n\
          pub(crate) const MEDIA_FEATURE_VALUE_LENGTH: u8 = 1 << 2;\n\
          pub(crate) const MEDIA_FEATURE_VALUE_RATIO: u8 = 1 << 3;\n\
-         pub(crate) const MEDIA_FEATURE_VALUE_RESOLUTION: u8 = 1 << 4;\n\n\
+         pub(crate) const MEDIA_FEATURE_VALUE_RESOLUTION: u8 = 1 << 4;\n\
+         pub(crate) const MEDIA_FEATURE_VALUE_NUMBER: u8 = 1 << 5;\n\n\
          pub(crate) struct MediaFeatureMetadata {\n\
              pub name: &'static str,\n\
              pub allows_range: bool,\n\
              pub accepted_value_types: u8,\n\
              pub accepted_keywords: &'static [u16],\n\
              pub false_keywords: &'static [u16],\n\
+             pub implied_keywords: &'static [(u16, u16)],\n\
          }\n\n\
          pub(crate) const MEDIA_FEATURES: &[MediaFeatureMetadata] = &[\n",
     );
@@ -97,6 +99,7 @@ fn generate_media_features(manifest_dir: &Path, out_dir: &Path) -> Result<(), Bo
             match value {
                 "<mq-boolean>" => value_types.push("MEDIA_FEATURE_VALUE_BOOLEAN"),
                 "<integer>" => value_types.push("MEDIA_FEATURE_VALUE_INTEGER"),
+                "<number>" => value_types.push("MEDIA_FEATURE_VALUE_NUMBER"),
                 "<length>" => value_types.push("MEDIA_FEATURE_VALUE_LENGTH"),
                 "<ratio>" => value_types.push("MEDIA_FEATURE_VALUE_RATIO"),
                 "<resolution>" => value_types.push("MEDIA_FEATURE_VALUE_RESOLUTION"),
@@ -130,9 +133,28 @@ fn generate_media_features(manifest_dir: &Path, out_dir: &Path) -> Result<(), Bo
             .transpose()?
             .unwrap_or_default()
             .join(", ");
+        // Each environment keyword maps to the queried keywords that it matches as well as itself.
+        let mut implied_keywords = Vec::new();
+        if let Some(implications) = feature.get("implied-keywords") {
+            let implications = implications.as_object().ok_or("implied keywords are not an object")?;
+            for (environment_keyword, queried_keywords) in implications {
+                let queried_keywords = queried_keywords
+                    .as_array()
+                    .ok_or("implied keywords of a keyword are not an array")?;
+                for queried_keyword in queried_keywords {
+                    let queried_keyword = queried_keyword.as_str().ok_or("implied keyword is not a string")?;
+                    implied_keywords.push(format!(
+                        "(crate::css::css_enums::keyword::{}, crate::css::css_enums::keyword::{})",
+                        keyword_constant(environment_keyword),
+                        keyword_constant(queried_keyword)
+                    ));
+                }
+            }
+        }
+        let implied_keywords = implied_keywords.join(", ");
         writeln!(
             output,
-            "    MediaFeatureMetadata {{ name: \"{name}\", allows_range: {allows_range}, accepted_value_types: {value_types}, accepted_keywords: &[{accepted_keywords}], false_keywords: &[{false_keywords}] }},"
+            "    MediaFeatureMetadata {{ name: \"{name}\", allows_range: {allows_range}, accepted_value_types: {value_types}, accepted_keywords: &[{accepted_keywords}], false_keywords: &[{false_keywords}], implied_keywords: &[{implied_keywords}] }},"
         )?;
     }
     output.push_str("];\n");
@@ -1692,6 +1714,26 @@ fn generate_property_metadata(manifest_dir: &Path, out_dir: &Path) -> Result<(),
         idl_names.len(),
         idl_names
     ));
+    // The IDL attribute names of the properties and of their legacy aliases, ASCII-lowercased and sorted, with the
+    // ids they name, as the C++ generator's case-insensitive table of them looks them up. A later name wins where two
+    // lowercase alike, as it does in that table.
+    let mut camel_case_lookup: Vec<(String, u16)> = Vec::new();
+    for (name, value) in &properties {
+        let object = value.as_object().unwrap();
+        let target = object
+            .get("legacy-alias-for")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or(name);
+        let key = camel_case_property_name(name).to_ascii_lowercase();
+        camel_case_lookup.retain(|(existing, _)| *existing != key);
+        camel_case_lookup.push((key, ids[target]));
+    }
+    camel_case_lookup.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+    output.push_str(&format!(
+        "pub(crate) static PROPERTY_CAMEL_CASE_LOOKUP: [(&str, u16); {}] = {:?};\n",
+        camel_case_lookup.len(),
+        camel_case_lookup
+    ));
     output.push_str(&format!(
         "pub(crate) const PROPERTY_IS_LOGICAL_ALIAS: [bool; {}] = {:?};\n\n",
         logical_aliases.len(),
@@ -2332,7 +2374,6 @@ fn expose_shared_abi_types_as_cpp_types(config: &mut cbindgen::Config) {
             "ReplayClip",
             "ReplayLayer",
             "ReplayMask",
-            "FfiVisualViewportTransform",
         ]
         .map(String::from),
     );
@@ -2373,7 +2414,6 @@ fn expose_shared_abi_types_as_cpp_types(config: &mut cbindgen::Config) {
         ("ReplayClip", "Compositing::ReplayClip"),
         ("ReplayLayer", "Compositing::ReplayLayer"),
         ("ReplayMask", "Compositing::ReplayMask"),
-        ("FfiVisualViewportTransform", "Compositing::TransformWithOrigin"),
     ] {
         config.export.rename.insert(rust_name.to_string(), cpp_name.to_string());
     }
@@ -2396,7 +2436,7 @@ fn expose_shared_abi_types_as_cpp_types(config: &mut cbindgen::Config) {
             "LibGfx/Vector3.h",
             "LibGfx/WindingRule.h",
             "LibWeb/Forward.h",
-            "LibCompositing/DisplayList/AccumulatedVisualContext.h",
+            "LibCompositing/DisplayList/ContextRef.h",
             "LibWeb/Painting/ChromeMetrics.h",
             "LibCompositing/DisplayList/DisplayListCommandsGenerated.h",
         ]
@@ -2412,13 +2452,9 @@ fn expose_compositing_types_as_cpp_types(config: &mut cbindgen::Config) {
         "FfiFilterFunctionKind",
         "FfiVisualContextTreeInputs",
         "FfiVisualAnimationTargetKind",
-        "FfiVisualAnimationPlaybackDirection",
-        "FfiVisualAnimationFillMode",
         "FfiVisualAnimationTransformOperationKind",
         "FfiCompositorAnimationPublishOutcome",
         "FfiVisualAnimationSummary",
-        "FfiAnimatedContentViewportEffect",
-        "FfiTestStickyConstraints",
         "FfiDisplayListReplayCallbacks",
         "FfiEasingDescriptor",
         "FfiEasingKind",
@@ -2430,7 +2466,28 @@ fn expose_compositing_types_as_cpp_types(config: &mut cbindgen::Config) {
             .rename
             .insert(name.to_string(), format!("Compositing::RustFFI::{name}"));
     }
+    config.export.exclude.push("SnapSelectionStrategyType".to_string());
+    config.export.rename.insert(
+        "SnapSelectionStrategyType".to_string(),
+        "Compositing::SnapSelectionStrategy::Type".to_string(),
+    );
     config.includes.push("LibCompositing/RustFFI.h".to_string());
+    config
+        .includes
+        .push("LibCompositing/Scrolling/ScrollSnapSelection.h".to_string());
+}
+
+/// Names an animation effect's identity as the animations header does, which declares it the same way.
+fn declare_animation_effect_id_of_animations_header(config: &mut cbindgen::Config) {
+    config.export.exclude.push("AnimationEffectId".to_string());
+    config.export.rename.insert(
+        "AnimationEffectId".to_string(),
+        "Web::Animations::RustFFI::AnimationEffectId".to_string(),
+    );
+    config
+        .after_includes
+        .get_or_insert_with(String::new)
+        .push_str("\nnamespace Web::Animations::RustFFI { using AnimationEffectId = uint64_t; }");
 }
 
 /// Names the document host and the begun read as the layout header declares them, for a header whose entries take them.
@@ -2644,6 +2701,8 @@ fn main() -> Result<(), Box<dyn Error>> {
     // A compositor keyframe value is substituted by the document's style engine, which the document host reaches.
     declare_document_host_of_layout_header(&mut style_value_config);
 
+    // The effects whose descriptions and samples cross here are named by their identities.
+    declare_animation_effect_id_of_animations_header(&mut style_value_config);
     generate_ffi_header(
         style_value_config,
         &[
@@ -2760,7 +2819,6 @@ fn main() -> Result<(), Box<dyn Error>> {
     style_engine_config.namespaces = Some(vec!["Web".to_string(), "CSS".to_string(), "StyleEngineFFI".to_string()]);
     style_engine_config.export.include = vec![
         // Taken only by an entry of the boundary table, which cbindgen does not see.
-        "FfiAppliedAnimationDefinition".to_string(),
         "FfiFrameSetDimension".to_string(),
         "FfiFrameSetBorder".to_string(),
         // Named by no exported signature: a replaced content input crosses as its raw values.
@@ -2775,10 +2833,19 @@ fn main() -> Result<(), Box<dyn Error>> {
         "FfiResolvedFont".to_string(),
         "FontResolutionFeatureInput".to_string(),
     ];
-    // A published keyframe's composite operation is the one the animation sampler composes with.
+    // A published effect's composite operation is the one the animation sampler composes with.
     style_engine_config.export.rename.insert(
         "FfiCompositeOperation".to_string(),
         "Web::CSS::StyleValueFFI::FfiCompositeOperation".to_string(),
+    );
+    // A published effect's default easing is described as the compositing header describes one.
+    style_engine_config
+        .export
+        .exclude
+        .push("FfiEasingDescriptor".to_string());
+    style_engine_config.export.rename.insert(
+        "FfiEasingDescriptor".to_string(),
+        "Compositing::RustFFI::FfiEasingDescriptor".to_string(),
     );
     // A transition step's decision is asked of the engine in the style value header's terms.
     for name in ["FfiTransitionInput", "FfiTransitionAction", "FfiLaneTransition"] {
@@ -2836,6 +2903,8 @@ fn main() -> Result<(), Box<dyn Error>> {
             "\nnamespace Web::CSS::Parser::ValueParserFFI { struct DeclarationBlock; struct NativeRule; struct NativeStyleSheet; }",
         );
 
+    // The effects whose descriptions and samples cross here are named by their identities.
+    declare_animation_effect_id_of_animations_header(&mut style_engine_config);
     generate_ffi_header(
         style_engine_config,
         &[
@@ -2874,10 +2943,8 @@ fn main() -> Result<(), Box<dyn Error>> {
         "BoxValues".to_string(),
         "ComputedVerticalAlign".to_string(),
         "GridValues".to_string(),
-        "GENERATED_CONTENT_DEFINES_COUNTERS".to_string(),
         "GENERATED_CONTENT_DEFINES_LIST_ITEM_COUNTER".to_string(),
         "GENERATED_CONTENT_SHOWS_LIST_ITEM_COUNTER".to_string(),
-        "GENERATED_CONTENT_HAS_QUOTES".to_string(),
         "GRID_NO_INDEX".to_string(),
         "ComputedGridTrackEntryKind".to_string(),
         "ComputedGridPlacementKind".to_string(),
@@ -2930,19 +2997,12 @@ fn main() -> Result<(), Box<dyn Error>> {
     expose_css_pixel_types_as_web_types(&mut computed_values_config);
     // An effect the host samples carries its easing as the compositing crate describes one.
     expose_compositing_types_as_cpp_types(&mut computed_values_config);
-    computed_values_config.export.exclude.push("OptionalF64".to_string());
-    computed_values_config
-        .export
-        .rename
-        .insert("OptionalF64".to_string(), "Optional<double>".to_string());
-    computed_values_config.includes.push("AK/Optional.h".to_string());
-    // The custom property registry and stores, a sample's animated custom properties and a shorthand expansion are
-    // opaque to C++, which holds each by pointer.
+    // The custom property registry and stores and a sample's animated custom properties are opaque to C++, which holds
+    // each by pointer.
     for name in [
         "CustomPropertyRegistry",
         "CustomPropertyStore",
         "AnimatedCustomPropertyResults",
-        "ShorthandExpansion",
     ] {
         computed_values_config
             .export
@@ -2978,9 +3038,32 @@ fn main() -> Result<(), Box<dyn Error>> {
         .push_str("\nnamespace Web::CSS::StyleValueFFI { struct CssString; }");
     // An animation sample and plan read the document's style engine, which the document host reaches.
     declare_document_host_of_layout_header(&mut computed_values_config);
+    // The effects the host samples, and the animations of the element they belong to, are as the animations header
+    // describes them.
+    for name in ["FfiSampledEffect", "ElementAnimations"] {
+        computed_values_config.export.exclude.push(name.to_string());
+        computed_values_config
+            .export
+            .rename
+            .insert(name.to_string(), format!("Web::Animations::RustFFI::{name}"));
+    }
+    computed_values_config
+        .includes
+        .push("LibWeb/Animations/RustFFI.h".to_string());
+
+    computed_values_config.export.rename.insert(
+        "FfiAnimationEffectDescriptions".to_string(),
+        "Web::CSS::StyleEngineFFI::FfiAnimationEffectDescriptions".to_string(),
+    );
+    computed_values_config
+        .after_includes
+        .get_or_insert_with(String::new)
+        .push_str("\nnamespace Web::CSS::StyleEngineFFI { struct FfiAnimationEffectDescriptions; }");
 
     let libgfx_font_source = manifest_dir.join("../../LibGfx/Rust/src/font.rs");
     println!("cargo:rerun-if-changed={}", libgfx_font_source.display());
+    // The effects whose descriptions and samples cross here are named by their identities.
+    declare_animation_effect_id_of_animations_header(&mut computed_values_config);
     generate_ffi_header(
         computed_values_config,
         &[
@@ -3057,7 +3140,6 @@ fn main() -> Result<(), Box<dyn Error>> {
             manifest_dir.join("src/css/ffi_support.rs"),
             manifest_dir.join("src/layout/node_data.rs"),
             manifest_dir.join("src/layout/partial_relayout.rs"),
-            manifest_dir.join("src/layout/box_removal.rs"),
             manifest_dir.join("src/layout/tree_builder.rs"),
             manifest_dir.join("src/layout/tree_update_marks.rs"),
             manifest_dir.join("src/render_state.rs"),
@@ -3068,6 +3150,183 @@ fn main() -> Result<(), Box<dyn Error>> {
         ],
         &out_dir,
         Path::new("Layout/TreeBuilderRustFFI.h"),
+    );
+
+    // The Web Animations timing model - namespace Web::Animations::RustFFI. An easing descriptor is the compositing
+    // header's.
+    let mut animations_config = base_config.clone();
+    animations_config.namespaces = Some(vec!["Web".to_string(), "Animations".to_string(), "RustFFI".to_string()]);
+    animations_config.export.exclude.push("FfiEasingDescriptor".to_string());
+    animations_config.export.rename.insert(
+        "FfiEasingDescriptor".to_string(),
+        "Compositing::RustFFI::FfiEasingDescriptor".to_string(),
+    );
+    animations_config.includes.push("LibCompositing/RustFFI.h".to_string());
+    // A keyframe set notes the attributes its values read through the document's host, and a scroll timeline measures
+    // the boxes it follows there.
+    declare_document_host_of_layout_header(&mut animations_config);
+    animations_config.export.exclude.push("NodeSlotId".to_string());
+    animations_config
+        .export
+        .rename
+        .insert("NodeSlotId".to_string(), "Compositing::RustFFI::NodeSlotId".to_string());
+    // An effect's composite operation is the style value header's.
+    animations_config
+        .export
+        .exclude
+        .push("FfiCompositeOperation".to_string());
+    animations_config.export.rename.insert(
+        "FfiCompositeOperation".to_string(),
+        "Web::CSS::StyleValueFFI::FfiCompositeOperation".to_string(),
+    );
+    animations_config
+        .after_includes
+        .get_or_insert_with(String::new)
+        .push_str("\nnamespace Web::CSS::StyleValueFFI { enum class FfiCompositeOperation : uint8_t; }");
+    // The definition a style computation applies to a CSS animation is the computed values header's.
+    animations_config
+        .export
+        .exclude
+        .push("FfiComputedAnimation".to_string());
+    animations_config.export.rename.insert(
+        "FfiComputedAnimation".to_string(),
+        "Web::CSS::ComputedValuesFFI::FfiComputedAnimation".to_string(),
+    );
+    animations_config
+        .after_includes
+        .get_or_insert_with(String::new)
+        .push_str("\nnamespace Web::CSS::ComputedValuesFFI { struct FfiComputedAnimation; }");
+    // A transition the hover of a clock lane leaves running, and one a style change event reads, are the style value
+    // header's.
+    for name in ["FfiLaneTransition", "FfiExistingTransition"] {
+        animations_config.export.exclude.push(name.to_string());
+        animations_config
+            .export
+            .rename
+            .insert(name.to_string(), format!("Web::CSS::StyleValueFFI::{name}"));
+        animations_config
+            .after_includes
+            .get_or_insert_with(String::new)
+            .push_str(&format!("\nnamespace Web::CSS::StyleValueFFI {{ struct {name}; }}"));
+    }
+    // What an effect built for the compositor is opaque to C++, which hands it to the layout header's functions.
+    animations_config
+        .export
+        .exclude
+        .push("CompositorAnimationEffectState".to_string());
+    animations_config
+        .export
+        .rename
+        .insert("CompositorAnimationEffectState".to_string(), "void".to_string());
+    // The host defines what the timeline records ask of documents, which the tests stub.
+    animations_config
+        .export
+        .exclude
+        .push("ladybird_animations_document_is_active".to_string());
+    animations_config
+        .export
+        .exclude
+        .push("ladybird_animations_element_node_document".to_string());
+    animations_config
+        .export
+        .exclude
+        .push("web_animation_target_facts".to_string());
+    animations_config
+        .export
+        .exclude
+        .push("web_animation_note_rendering_trace_event".to_string());
+    animations_config
+        .export
+        .exclude
+        .push("web_animation_compute_css_keyframe_values".to_string());
+    animations_config
+        .export
+        .exclude
+        .push("web_animation_effective_zoom_of_target".to_string());
+    animations_config
+        .export
+        .exclude
+        .push("web_animation_set_needs_animated_style_update".to_string());
+    // The host defines what the timelines associated with a document ask of it.
+    for name in [
+        "web_animation_document_animations",
+        "web_animation_document_clock",
+        "web_animation_find_scroll_timeline_boxes",
+        "web_animation_scroll_timeline_source",
+    ] {
+        animations_config.export.exclude.push(name.to_string());
+    }
+    // The timing the host publishes of an effect it samples, an effect it samples, and a timeline it creates through
+    // the bindings, which no function here takes.
+    animations_config.export.include.extend(
+        [
+            "EffectTimingSnapshot",
+            "FfiSampledEffect",
+            "FfiTargetFacts",
+            "FfiTimelineDescription",
+            "FfiDocumentClock",
+            "FfiScrollTimelineBoxes",
+        ]
+        .map(String::from),
+    );
+    let animation_timing_dir = manifest_dir.join("../../LibCompositing/Rust/src/animation_timing");
+    println!("cargo:rerun-if-changed={}", animation_timing_dir.display());
+    generate_ffi_header(
+        animations_config,
+        &[
+            animation_timing_dir.join("time_value.rs"),
+            animation_timing_dir.join("effect_timing.rs"),
+            animation_timing_dir.join("playback.rs"),
+            manifest_dir.join("src/animations/animation.rs"),
+            manifest_dir.join("src/animations/effect.rs"),
+            manifest_dir.join("src/animations/compositor_update.rs"),
+            manifest_dir.join("src/animations/document_animations.rs"),
+            manifest_dir.join("src/animations/element_animations.rs"),
+            manifest_dir.join("src/animations/ffi.rs"),
+            manifest_dir.join("src/animations/host_effects.rs"),
+            manifest_dir.join("src/animations/host_timing.rs"),
+            manifest_dir.join("src/animations/css_events.rs"),
+            manifest_dir.join("src/animations/keyframes.rs"),
+            manifest_dir.join("src/animations/pending_animation_events.rs"),
+            manifest_dir.join("src/animations/rendering_update.rs"),
+            manifest_dir.join("src/animations/snapshot.rs"),
+            manifest_dir.join("src/animations/throttling.rs"),
+            manifest_dir.join("src/animations/timeline.rs"),
+            manifest_dir.join("src/animations/timeline_host.rs"),
+            manifest_dir.join("src/animations/transitions.rs"),
+        ],
+        &out_dir,
+        Path::new("Animations/RustFFI.h"),
+    );
+
+    // The lanes of the render clock - namespace Web::Compositor::RustFFI, layered on the layout header for the ticks
+    // the lanes hand on.
+    let mut render_clock_config = base_config.clone();
+    render_clock_config.namespaces = Some(vec!["Web".to_string(), "Compositor".to_string(), "RustFFI".to_string()]);
+    for (rust_name, cpp_name) in [
+        ("ArcRef", "Web::Layout::RustFFI::ArcRef"),
+        ("ClockTicks", "Web::Layout::RustFFI::ClockTicks"),
+        ("FfiThreadSafeMessagePoster", "IPC::FfiThreadSafeMessagePoster"),
+        ("RawMessage", "IPC::FfiRawMessage"),
+    ] {
+        render_clock_config
+            .export
+            .rename
+            .insert(rust_name.to_string(), cpp_name.to_string());
+    }
+    render_clock_config.includes.extend(
+        [
+            "LibIPC/RawMessage.h",
+            "LibIPC/ThreadSafeMessagePoster.h",
+            "LibWeb/Layout/LayoutRustFFI.h",
+        ]
+        .map(String::from),
+    );
+    generate_ffi_header(
+        render_clock_config,
+        &[manifest_dir.join("src/render_state/clock/render_clock.rs")],
+        &out_dir,
+        Path::new("Compositor/RenderClockRustFFI.h"),
     );
 
     // Layout engine header - namespace Web::Layout::RustFFI, layered on the tree-builder
@@ -3086,6 +3345,38 @@ fn main() -> Result<(), Box<dyn Error>> {
     layout_config
         .includes
         .push("LibWeb/Layout/TreeBuilderRustFFI.h".to_string());
+    // Rust posts to the compositor through a poster C++ made.
+    layout_config
+        .export
+        .exclude
+        .push("FfiThreadSafeMessagePoster".to_string());
+    layout_config.export.rename.insert(
+        "FfiThreadSafeMessagePoster".to_string(),
+        "IPC::FfiThreadSafeMessagePoster".to_string(),
+    );
+    layout_config
+        .includes
+        .push("LibIPC/ThreadSafeMessagePoster.h".to_string());
+    // Rust sends synchronous requests to the compositor through the connection C++ made.
+    layout_config.export.exclude.push("FfiConnection".to_string());
+    layout_config
+        .export
+        .rename
+        .insert("FfiConnection".to_string(), "IPC::FfiConnection".to_string());
+    layout_config.includes.push("LibIPC/FfiConnection.h".to_string());
+    // A compositor animation carries its effect's timing as the animations header describes it.
+    layout_config.export.exclude.push("AnimationEffectTiming".to_string());
+    layout_config.export.rename.insert(
+        "AnimationEffectTiming".to_string(),
+        "Web::Animations::RustFFI::AnimationEffectTiming".to_string(),
+    );
+    layout_config.includes.push("LibWeb/Animations/RustFFI.h".to_string());
+    // The render clock's plan takes the scroll timelines it follows as the animations header declares them.
+    layout_config.export.exclude.push("TimelineCell".to_string());
+    layout_config.export.rename.insert(
+        "TimelineCell".to_string(),
+        "Web::Animations::RustFFI::TimelineCell".to_string(),
+    );
     // A compositor animation effect state is opaque to C++, which holds it by pointer, and so are the paint server an
     // SVG paint resource callback fills and a parsed SVG path.
     for name in [
@@ -3096,6 +3387,14 @@ fn main() -> Result<(), Box<dyn Error>> {
         layout_config.export.rename.insert(name.to_string(), "void".to_string());
         layout_config.export.exclude.push(name.to_string());
     }
+    // The host fills in a compositor animation request, and the host its keyframes resolve with, as the animation
+    // records ask it to, which no function here takes.
+    layout_config
+        .export
+        .include
+        .extend(["FfiCompositorAnimationRequest", "FfiCompositorAnimationHost"].map(String::from));
+    // The effects whose descriptions and samples cross here are named by their identities.
+    declare_animation_effect_id_of_animations_header(&mut layout_config);
     generate_ffi_header(
         layout_config,
         &[
@@ -3122,7 +3421,6 @@ fn main() -> Result<(), Box<dyn Error>> {
             manifest_dir.join("src/layout/line_box.rs"),
             manifest_dir.join("src/layout/line_box_fragment.rs"),
             manifest_dir.join("src/painting/paintable_data.rs"),
-            manifest_dir.join("src/painting/paintable_build.rs"),
             manifest_dir.join("src/painting/host/mod.rs"),
             manifest_dir.join("src/painting/host/visual_context.rs"),
             manifest_dir.join("src/painting/host/hit_test.rs"),
@@ -3131,12 +3429,18 @@ fn main() -> Result<(), Box<dyn Error>> {
             manifest_dir.join("src/painting/stacking_context/dump.rs"),
             manifest_dir.join("src/painting/layout_tree_dump.rs"),
             manifest_dir.join("src/painting/ffi.rs"),
+            manifest_dir.join("src/painting/viewport_mapping.rs"),
             manifest_dir.join("src/render_state/clock.rs"),
             manifest_dir.join("src/render_state/clock/hover.rs"),
             manifest_dir.join("src/layout/script_entries.rs"),
+            manifest_dir.join("src/layout/query/inline_cursor.rs"),
             manifest_dir.join("src/painting/paint_changes.rs"),
             manifest_dir.join("src/painting/ffi/main_thread_entries.rs"),
             manifest_dir.join("src/painting/paint_passes.rs"),
+            manifest_dir.join("src/painting/presentation.rs"),
+            manifest_dir.join("src/painting/vector_image_cache.rs"),
+            manifest_dir.join("src/painting/recorded_scrolling.rs"),
+            manifest_dir.join("src/painting/rasterize.rs"),
         ],
         &out_dir,
         Path::new("Layout/LayoutRustFFI.h"),

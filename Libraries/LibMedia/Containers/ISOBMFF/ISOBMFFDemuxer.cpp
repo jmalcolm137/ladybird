@@ -30,6 +30,7 @@ DecoderErrorOr<NonnullRefPtr<Demuxer>> ISOBMFFDemuxer::from_stream(NonnullRefPtr
         if (header.type == MOVIE_BOX) {
             auto movie = TRY(Reader::parse_movie_box(stream, header));
             auto demuxer = make_ref_counted<ISOBMFFDemuxer>(source, move(movie), header.end_position().value_or(stream.position()));
+            demuxer->m_earliest_possible_position = demuxer->find_earliest_possible_position();
             demuxer->start_scan();
             return demuxer;
         }
@@ -51,6 +52,24 @@ ISOBMFFDemuxer::ISOBMFFDemuxer(NonnullRefPtr<MediaStream> stream, Movie movie, s
         m_durations->tracks.set(id, duration);
         m_durations->total = max(m_durations->total, duration);
     }
+}
+
+AK::Duration ISOBMFFDemuxer::find_earliest_possible_position() const
+{
+    auto cursor = m_stream->create_cursor();
+    Optional<AK::Duration> earliest;
+    for (auto const& [id, track] : m_movie.tracks) {
+        if (!first_is_one_of(track->handler_type, HandlerType::Audio, HandlerType::Video))
+            continue;
+        auto iterator = SampleIterator::create(cursor, m_movie, id, m_movie_end);
+        if (iterator.is_error())
+            continue;
+        auto first_sample = iterator.value().next();
+        if (first_sample.is_error() || !first_sample.value().has_value())
+            continue;
+        earliest = min(earliest.value_or(AK::Duration::max()), first_sample.value().value().presentation_timestamp);
+    }
+    return max(earliest.value_or(AK::Duration::zero()), AK::Duration::zero());
 }
 
 ISOBMFFDemuxer::~ISOBMFFDemuxer()
@@ -81,8 +100,15 @@ void ISOBMFFDemuxer::start_scan()
             TimeRanges buffered;
             AK::Duration duration;
             auto iterator = SampleIterator::create(payload.cursor, payload.movie, id, payload.movie_end);
-            bool can_decode = false;
+            // Available samples from a sync sample onward in decode order are playable through their latest end.
+            Optional<TimeRanges::Range> decodable_run;
+            auto end_decodable_run = [&] {
+                if (decodable_run.has_value() && decodable_run->end > decodable_run->start)
+                    buffered.add_range(decodable_run->start, decodable_run->end);
+                decodable_run.clear();
+            };
             bool last_sample_available = false;
+            bool sample_is_first_of_track = true;
             bool track_reached_end = availability.closing_bytes_are_available();
             if (!iterator.is_error()) {
                 for (;;) {
@@ -94,6 +120,7 @@ void ISOBMFFDemuxer::start_scan()
                     if (!next.value().has_value())
                         break;
                     auto const& sample = next.value().value();
+                    bool sample_is_first = exchange(sample_is_first_of_track, false);
                     auto end = sample.presentation_timestamp + sample.duration;
                     duration = max(duration, end);
                     state.duration = max(state.duration, end);
@@ -101,13 +128,19 @@ void ISOBMFFDemuxer::start_scan()
                         return sample.data_position >= range.start && sample.data_position <= range.end && sample.data_size <= range.end - sample.data_position;
                     });
                     last_sample_available = available;
-                    if (!available)
-                        can_decode = false;
-                    else if (sample.is_sync_sample)
-                        can_decode = true;
-                    if (available && can_decode)
-                        buffered.add_range(max(sample.presentation_timestamp, AK::Duration::zero()), end);
+                    if (!available) {
+                        end_decodable_run();
+                        continue;
+                    }
+                    if (decodable_run.has_value()) {
+                        decodable_run->end = max(decodable_run->end, end);
+                    } else if (sample.is_sync_sample) {
+                        // Data from the start of the track is playable from the start of the timeline.
+                        auto start = sample_is_first ? AK::Duration::zero() : max(sample.presentation_timestamp, AK::Duration::zero());
+                        decodable_run = TimeRanges::Range { start, end };
+                    }
                 }
+                end_decodable_run();
             } else {
                 track_reached_end = false;
             }
@@ -184,7 +217,9 @@ DecoderErrorOr<CodedFrame> ISOBMFFDemuxer::get_next_sample_for_track(Track const
     if (status.description_index != sample.sample_description_index)
         configuration = DECODER_TRY_ALLOC(entry->codec_initialization_data.clone());
     status.description_index = sample.sample_description_index;
-    status.last_timestamp = sample.presentation_timestamp;
+    // Treat the first frame as a random access point, since the file must begin with one to decode.
+    if (sample.is_sync_sample || !status.last_keyframe_decode_timestamp.has_value())
+        status.last_keyframe_decode_timestamp = sample.decode_timestamp;
     CodedFrame frame(entry->codec_id, sample.presentation_timestamp, sample.decode_timestamp, sample.duration,
         sample.is_sync_sample ? FrameFlags::Keyframe : FrameFlags::None, move(data), move(configuration));
     status.pending_sample.clear();
@@ -243,12 +278,11 @@ DecoderErrorOr<DemuxerSeekResult> ISOBMFFDemuxer::seek_to_most_recent_keyframe(T
     auto point = TRY(find_seek_point(status.cursor, track, target, SeekMode::FastBefore));
     if (!point.has_value())
         return DecoderError::with_description(DecoderErrorCategory::EndOfStream, "Track has no samples"sv);
-    if (!has_flag(options, DemuxerSeekOptions::Force) && status.last_timestamp.has_value()
-        && point->sample.presentation_timestamp <= status.last_timestamp.value() && status.last_timestamp.value() <= target)
+    if (!has_flag(options, DemuxerSeekOptions::Force) && status.last_keyframe_decode_timestamp == point->sample.decode_timestamp)
         return DemuxerSeekResult::KeptCurrentPosition;
     status.iterator = move(point->iterator);
     status.pending_sample = point->sample;
-    status.last_timestamp.clear();
+    status.last_keyframe_decode_timestamp = point->sample.decode_timestamp;
     return DemuxerSeekResult::MovedPosition;
 }
 

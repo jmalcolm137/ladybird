@@ -42,6 +42,18 @@ test(() => {
 }, "Selection endpoints inside words expand to word boundaries");
 
 test(() => {
+    setFixture(`<p id="target" lang="en_US">before partially after</p>`);
+    const range = rangeWithin(target, 10, 15);
+    assert_equals(generate(range), "https://example.com/page.html#:~:text=before-,partially");
+}, "A lang value that isn't a language tag expands to word boundaries by the default rules");
+
+test(() => {
+    setFixture(`<p id="target" lang="日本語">before partially after</p>`);
+    const range = rangeWithin(target, 10, 15);
+    assert_equals(generate(range), "https://example.com/page.html#:~:text=before-,partially");
+}, "A non-ASCII lang value expands to word boundaries by the default rules");
+
+test(() => {
     setFixture(`<p id="target">these <span>five words</span> form unique text</p>`);
     const range = document.createRange();
     range.setStart(target.firstChild, 0);
@@ -230,6 +242,30 @@ test(() => {
     range.selectNodeContents(target);
     assert_equals(generate(range), null);
 }, "Selections containing form controls are rejected");
+
+test(() => {
+    setFixture(`<p id="target">before \u{1FAE9} after</p>`);
+    const range = rangeWithin(target, 7, 9);
+    assert_equals(generate(range), "https://example.com/page.html#:~:text=before-,%F0%9F%AB%A9");
+}, "A unique emoji selection is not counted as ambiguous");
+
+test(() => {
+    setFixture(`
+        <p>left \u{1FAE9} right</p>
+        <p id="target">before \u{1FAE9} after</p>
+    `);
+    const range = rangeWithin(target, 7, 9);
+    assert_equals(generate(range), "https://example.com/page.html#:~:text=before-,%F0%9F%AB%A9");
+}, "Repeated emoji are disambiguated without restarting inside a surrogate pair");
+
+test(() => {
+    setFixture(`
+        <p>left \u{1F44D}\u{1F3FD} right</p>
+        <p id="target">before \u{1F44D} after</p>
+    `);
+    const range = rangeWithin(target, 7, 9);
+    assert_equals(generate(range), "https://example.com/page.html#:~:text=before-,%F0%9F%91%8D");
+}, "Emoji matches inside a modifier sequence are skipped");
 
 test(() => {
     setFixture(`<p id="target">these five words form unique text</p>`);

@@ -9,11 +9,13 @@
 #include <LibGfx/SharedImageBuffer.h>
 #include <UI/Qt/WaylandPageSurface.h>
 #include <UI/Qt/WaylandRegistry.h>
+#include <UI/Qt/WaylandWindow.h>
 
 #include <QGuiApplication>
 #include <QImage>
+#include <QPlatformSurfaceEvent>
+#include <QTimer>
 #include <QWindow>
-#include <qpa/qplatformwindow_p.h>
 
 #include <libdrm/drm_fourcc.h>
 #include <sys/mman.h>
@@ -43,13 +45,17 @@ static u32 opaque_drm_format(u32 drm_format)
 OwnPtr<WaylandPageSurface> WaylandPageSurface::create()
 {
     static Optional<Globals> const globals = []() -> Optional<Globals> {
-        auto* wayland_application = qGuiApp->nativeInterface<QNativeInterface::QWaylandApplication>();
+        auto* application = wayland_application();
+        auto* compositor = application ? application->compositor() : nullptr;
+        if (!compositor)
+            return {};
+
         auto registry = WaylandRegistry::create();
-        if (!registry || !wayland_application->compositor())
+        if (!registry)
             return {};
 
         Globals globals {
-            .compositor = wayland_application->compositor(),
+            .compositor = compositor,
             .subcompositor = registry->bind<wl_subcompositor>(wl_subcompositor_interface, 1),
             .viewporter = registry->bind<wp_viewporter>(wp_viewporter_interface, 1),
             .dmabuf = registry->bind<zwp_linux_dmabuf_v1>(zwp_linux_dmabuf_v1_interface, 3),
@@ -89,9 +95,18 @@ WaylandPageSurface::~WaylandPageSurface()
     on_backing_store_released = nullptr;
     on_ready_to_present = nullptr;
     destroy_subsurface();
-    QObject::disconnect(m_parent_surface_created_connection);
-    for (auto& buffer : m_buffers)
-        destroy_buffer(*buffer);
+
+    for (auto& buffer : m_buffers) {
+        if (buffer->state != BufferState::Creating) {
+            destroy_buffer(*buffer);
+            continue;
+        }
+        // NB: The listener of the request to create the buffer now owns this record, and destroys it with the answer.
+        buffer->surface = nullptr;
+        buffer->shared_image_buffer = nullptr;
+        (void)buffer.leak_ptr();
+    }
+
     for (auto* buffer : m_overlay_buffers)
         wl_buffer_destroy(buffer);
     wp_viewport_destroy(m_overlay_viewport);
@@ -100,20 +115,58 @@ WaylandPageSurface::~WaylandPageSurface()
     wl_surface_destroy(m_surface);
 }
 
-bool WaylandPageSurface::ensure_subsurface(QWindow& parent)
+bool WaylandPageSurface::eventFilter(QObject* watched, QEvent* event)
 {
-    auto* wayland_window = parent.nativeInterface<QNativeInterface::Private::QWaylandWindow>();
-    auto* parent_surface = wayland_window ? wayland_window->surface() : nullptr;
-    if (!parent_surface) {
-        destroy_subsurface();
-        if (wayland_window)
-            wait_for_parent_surface(*wayland_window);
+    if (watched != m_parent)
+        return false;
+
+    if (event->type() == QEvent::PlatformSurface) {
+        if (static_cast<QPlatformSurfaceEvent*>(event)->surfaceEventType() == QPlatformSurfaceEvent::SurfaceAboutToBeDestroyed) {
+            destroy_subsurface();
+            return false;
+        }
+    } else if (event->type() != QEvent::Show && event->type() != QEvent::Expose) {
         return false;
     }
-    if (m_subsurface && m_parent == &parent && m_parent_surface == parent_surface)
+
+    // Qt can replace the wl_surface without recreating the platform window. Recheck after the native window has
+    // processed the event, so a page can attach its last frame again even if it has nothing new to present.
+    QTimer::singleShot(0, this, [this] {
+        if (!m_parent || !m_parent->isVisible())
+            return;
+
+        auto* parent_surface = wayland_surface_for_window(*m_parent);
+        if (is_attached_to(parent_surface))
+            return;
+
+        destroy_subsurface();
+
+        if (parent_surface && on_ready_to_present)
+            on_ready_to_present();
+    });
+
+    return false;
+}
+
+bool WaylandPageSurface::ensure_subsurface(QWindow& parent)
+{
+    auto* parent_surface = wayland_surface_for_window(parent);
+    if (m_parent == &parent && is_attached_to(parent_surface))
         return true;
 
     destroy_subsurface();
+
+    if (m_parent != &parent) {
+        if (m_parent)
+            m_parent->removeEventFilter(this);
+
+        m_parent = &parent;
+        parent.installEventFilter(this);
+    }
+
+    if (!parent_surface)
+        return false;
+
     m_subsurface = wl_subcompositor_get_subsurface(m_globals.subcompositor, m_surface, parent_surface);
     // NB: A desynchronized subsurface shows each frame as soon as it is committed, without waiting for the browser
     //     window to commit too.
@@ -124,29 +177,20 @@ bool WaylandPageSurface::ensure_subsurface(QWindow& parent)
     // NB: A new subsurface goes on top of its siblings, so the overlay is above the page. It stays synchronized, so
     //     that what it shows and where it shows it change together.
     m_overlay_subsurface = wl_subcompositor_get_subsurface(m_globals.subcompositor, m_overlay_surface, parent_surface);
-    m_parent = &parent;
     m_parent_surface = parent_surface;
-    m_parent_surface_destroyed_connection = QObject::connect(wayland_window, &QNativeInterface::Private::QWaylandWindow::surfaceDestroyed, [this, wayland_window] {
-        destroy_subsurface();
-        wait_for_parent_surface(*wayland_window);
-    });
+    m_parent_surface_id = wl_proxy_get_id(reinterpret_cast<wl_proxy*>(parent_surface));
     return true;
 }
 
-// NB: Qt destroys the window's surface while the window is hidden, and creates a new one when it is shown again.
-void WaylandPageSurface::wait_for_parent_surface(QNativeInterface::Private::QWaylandWindow& wayland_window)
+bool WaylandPageSurface::is_attached_to(wl_surface* parent_surface) const
 {
-    QObject::disconnect(m_parent_surface_created_connection);
-    m_parent_surface_created_connection = QObject::connect(&wayland_window, &QNativeInterface::Private::QWaylandWindow::surfaceCreated, [this] {
-        QObject::disconnect(m_parent_surface_created_connection);
-        if (on_ready_to_present)
-            on_ready_to_present();
-    });
+    // A replacement proxy can reuse the address of the old one.
+    return parent_surface && parent_surface == m_parent_surface
+        && wl_proxy_get_id(reinterpret_cast<wl_proxy*>(parent_surface)) == m_parent_surface_id;
 }
 
 void WaylandPageSurface::destroy_subsurface()
 {
-    QObject::disconnect(m_parent_surface_destroyed_connection);
     if (m_subsurface) {
         wl_subsurface_destroy(m_subsurface);
         m_subsurface = nullptr;
@@ -155,8 +199,8 @@ void WaylandPageSurface::destroy_subsurface()
         wl_subsurface_destroy(m_overlay_subsurface);
         m_overlay_subsurface = nullptr;
     }
-    m_parent = nullptr;
     m_parent_surface = nullptr;
+    m_parent_surface_id = 0;
     m_position.clear();
     hide();
     hide_overlay();
@@ -225,7 +269,10 @@ void WaylandPageSurface::retire_buffer(size_t index)
 {
     // NB: The surface shows nothing at all while its buffer is destroyed, so one on screen lives until it is released.
     auto& buffer = *m_buffers[index];
-    if (buffer.is_held_by_compositor) {
+    // NB: The compositor answers the request to create a buffer with a new object, and libwayland drops the answer to a
+    //     request that was destroyed. The connection breaks at the next new object then, so a buffer that is still being
+    //     created lives until the answer too.
+    if (buffer.is_held_by_compositor || buffer.state == BufferState::Creating) {
         buffer.shared_image_buffer = nullptr;
         return;
     }
@@ -245,10 +292,7 @@ void WaylandPageSurface::forget_buffers_except(ReadonlySpan<Gfx::SharedImageBuff
 void WaylandPageSurface::destroy_buffer(Buffer& buffer)
 {
     VERIFY(!buffer.is_held_by_compositor);
-    if (buffer.params) {
-        zwp_linux_buffer_params_v1_destroy(buffer.params);
-        buffer.params = nullptr;
-    }
+    VERIFY(buffer.state != BufferState::Creating);
     if (buffer.buffer) {
         wl_buffer_destroy(buffer.buffer);
         buffer.buffer = nullptr;
@@ -273,6 +317,22 @@ void WaylandPageSurface::retire_buffers(Function<Function<void()>(HeldBackingSto
     }
 }
 
+// A buffer whose surface or backing store went away while it was being created.
+bool WaylandPageSurface::forget_buffer_nobody_waits_for(Buffer& buffer)
+{
+    if (!buffer.surface) {
+        auto abandoned_buffer = adopt_own(buffer);
+        if (abandoned_buffer->buffer)
+            wl_buffer_destroy(abandoned_buffer->buffer);
+        return true;
+    }
+    if (buffer.shared_image_buffer)
+        return false;
+    auto& surface = *buffer.surface;
+    surface.retire_buffer(*surface.m_buffers.find_first_index_if([&](auto const& candidate) { return candidate.ptr() == &buffer; }));
+    return true;
+}
+
 void WaylandPageSurface::buffer_created(void* data, zwp_linux_buffer_params_v1*, wl_buffer* wayland_buffer)
 {
     auto& buffer = *static_cast<Buffer*>(data);
@@ -280,6 +340,8 @@ void WaylandPageSurface::buffer_created(void* data, zwp_linux_buffer_params_v1*,
     buffer.params = nullptr;
     buffer.buffer = wayland_buffer;
     buffer.state = BufferState::Ready;
+    if (forget_buffer_nobody_waits_for(buffer))
+        return;
 
     static wl_buffer_listener const buffer_listener {
         .release = buffer_released,
@@ -297,6 +359,8 @@ void WaylandPageSurface::buffer_failed(void* data, zwp_linux_buffer_params_v1*)
     buffer.params = nullptr;
     buffer.state = BufferState::Failed;
     dbgln("WaylandPageSurface: The compositor cannot show a page frame in a dma-buf of format {:#x} with modifier {:#x}", buffer.drm_format, buffer.modifier);
+    if (forget_buffer_nobody_waits_for(buffer))
+        return;
 
     if (auto& callback = buffer.surface->on_ready_to_present)
         callback();

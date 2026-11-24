@@ -1,0 +1,52 @@
+<!DOCTYPE html>
+<style>
+    body {
+        margin: 0;
+    }
+    .clip {
+        width: 300px;
+        overflow: hidden;
+        white-space: nowrap;
+    }
+    .clip > * {
+        display: inline-block;
+        width: 100px;
+        height: 100px;
+        vertical-align: top;
+    }
+</style>
+<div class="clip" id="spans"></div>
+<div class="clip" id="images"></div>
+<script src="../include.js"></script>
+<script>
+    promiseTest(async () => {
+        const spans = document.getElementById("spans");
+        for (let i = 0; i < 10; i++)
+            spans.append(document.createElement("span"));
+        const images = document.getElementById("images");
+        for (let i = 0; i < 40; i++) {
+            const image = document.createElement("img");
+            image.loading = "lazy";
+            image.src = `../../../Assets/120.png?${i}`;
+            images.append(image);
+        }
+
+        const intersecting = await new Promise(resolve => {
+            const observer = new IntersectionObserver(entries => {
+                observer.disconnect();
+                resolve(entries.filter(entry => entry.isIntersecting).map(entry => [...spans.children].indexOf(entry.target)));
+            });
+            for (const span of spans.children)
+                observer.observe(span);
+        });
+        println(`spans reported as intersecting: ${intersecting.join(", ")}`);
+
+        const nearbyImage = images.children[9];
+        if (!nearbyImage.complete)
+            await new Promise(resolve => nearbyImage.addEventListener("load", resolve, { once: true }));
+        await animationFrame();
+        await animationFrame();
+        println(`tenth image loaded: ${nearbyImage.naturalWidth > 0}`);
+        println(`eleventh image loaded: ${images.children[10].naturalWidth > 0}`);
+    });
+</script>

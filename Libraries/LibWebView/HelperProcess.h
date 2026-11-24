@@ -8,6 +8,7 @@
 
 #include <AK/Error.h>
 #include <AK/Optional.h>
+#include <AK/Time.h>
 #include <LibGfx/GpuDeviceIdentity.h>
 #include <LibIPC/TransportHandle.h>
 #include <LibMediaClient/Client.h>
@@ -23,19 +24,44 @@
 
 namespace WebView {
 
-WEBVIEW_API ErrorOr<NonnullRefPtr<WebView::WebContentClient>> launch_web_content_process(IsPrivate, Web::PageId initial_page_id, Web::HTML::CrossProcessId root_navigable_id);
+// How long a helper gets to answer a request that the browser waits for.
+constexpr inline auto helper_response_timeout = AK::Duration::from_seconds(30);
 
-WEBVIEW_API ErrorOr<NonnullRefPtr<MediaClient::Client>> launch_media_server_process(u64 owner_child_id);
-WEBVIEW_API ErrorOr<NonnullRefPtr<AudioServerControlClient>> launch_audio_server_process(u64 owner_child_id);
-WEBVIEW_API ErrorOr<NonnullRefPtr<VideoDecoderServerControlClient>> launch_video_decoder_server_process(u64 owner_child_id, Optional<Gfx::GpuDeviceIdentity> const&);
+// When a helper that is asked now has to have answered. A helper that the user debugs gets as long as it takes.
+WEBVIEW_API MonotonicTime deadline_for_helper_response();
+
+// Ends the helper at the other end of the connection, and closes the connection.
+WEBVIEW_API void end_unresponsive_helper(IPC::ConnectionBase&);
+
+// Asks a helper for something that the browser cannot go on without, such as a connection for another process. The
+// browser's main thread waits for the response, so a helper that is running but never responds would stop the whole
+// browser. Such a helper is ended instead, which is handled like a helper that crashed.
+template<typename RequestType, typename ClientType, typename... Args>
+OwnPtr<typename RequestType::ResponseType> send_sync_to_helper(ClientType& client, Args&&... args)
+{
+    auto deadline = deadline_for_helper_response();
+    auto response = client.template send_sync_until<RequestType>(deadline, forward<Args>(args)...);
+    // NB: A wait that ends before its deadline found the helper gone, which the connection handles by itself. A socket
+    //     stays open until then, so the connection being open does not tell the two apart.
+    if (!response && client.is_open() && MonotonicTime::now() >= deadline)
+        end_unresponsive_helper(client);
+    return response;
+}
+
+WEBVIEW_API ErrorOr<NonnullRefPtr<WebView::WebContentClient>> launch_web_content_process(BrowsingSession&, Web::PageId initial_page_id, Web::HTML::CrossProcessId root_navigable_id);
+
+WEBVIEW_API ErrorOr<NonnullRefPtr<MediaClient::Client>> launch_media_server_process(u64 owner_child_id, IsPrivate);
+WEBVIEW_API ErrorOr<NonnullRefPtr<AudioServerControlClient>> launch_audio_server_process(u64 owner_child_id, IsPrivate);
+WEBVIEW_API ErrorOr<NonnullRefPtr<VideoDecoderServerControlClient>> launch_video_decoder_server_process(u64 owner_child_id, IsPrivate, Optional<Gfx::GpuDeviceIdentity> const&);
 WEBVIEW_API void shut_down_video_decoder_servers();
-WEBVIEW_API ErrorOr<NonnullRefPtr<WebView::CompositorClient>> launch_compositor_process();
+// The features are the Compositor's own, in the text form of PlatformFeatures::ProcessFeatures.
+WEBVIEW_API ErrorOr<NonnullRefPtr<WebView::CompositorClient>> launch_compositor_process(ByteString const& platform_features);
 // Serves the given site's partitions, or all partitions if site is empty.
-WEBVIEW_API ErrorOr<NonnullRefPtr<Requests::RequestControlClient>> launch_request_server_process(ByteString const& cache_path, Optional<Utf16String> const& site, HTTPDiskCacheMode, ChildIdentity* identity = nullptr);
+WEBVIEW_API ErrorOr<NonnullRefPtr<Requests::RequestControlClient>> launch_request_server_process(ByteString const& cache_path, Optional<Utf16String> const& site, IsPrivate, HTTPDiskCacheMode, ChildIdentity* identity = nullptr);
 WEBVIEW_API void apply_dns_settings(Requests::RequestControlClient&);
 
 // Launches an ImageDecoder, which is listed with the given site, or with the given process if it serves no site.
-WEBVIEW_API ErrorOr<NonnullRefPtr<ImageDecoderControlClient>> launch_image_decoder_process(u64 owner_child_id, Optional<Utf16String> const& site);
+WEBVIEW_API ErrorOr<NonnullRefPtr<ImageDecoderControlClient>> launch_image_decoder_process(u64 owner_child_id, IsPrivate, Optional<Utf16String> const& site);
 
 // Launches a WebRTCClient that serves the given renderer alone, which talks to it over the returned handle, and ends any
 // helper the renderer had before. The helper exits once that renderer's end of the transport is gone.
@@ -54,7 +80,7 @@ WEBVIEW_API ErrorOr<RequestServerClientConnection> connect_new_request_server_cl
 WEBVIEW_API u64 allocate_audio_tab_id();
 // Launches the AudioServer for a renderer if it has none, keeping its controller connection in the given slot. The
 // server is listed with the renderer's process, which the owner child ID names.
-WEBVIEW_API ErrorOr<void> ensure_audio_server_is_running(RefPtr<AudioServerControlClient>& controller, u64 owner_child_id);
+WEBVIEW_API ErrorOr<void> ensure_audio_server_is_running(RefPtr<AudioServerControlClient>& controller, u64 owner_child_id, IsPrivate);
 // Connects a new client to a running AudioServer as a member of the given tab's mix, or fails without launching
 // another, so that whoever launched the server can tell its replacement what it needs to know first.
 WEBVIEW_API ErrorOr<IPC::TransportHandle> connect_new_audio_server_client(AudioServerControlClient& controller, u64 audio_tab_id);
@@ -66,6 +92,6 @@ struct MediaServerClientConnection {
     IPC::TransportHandle handle;
     int client_id { -1 };
 };
-WEBVIEW_API ErrorOr<MediaServerClientConnection> connect_new_media_server_client(RefPtr<MediaClient::Client>& controller, u64 owner_child_id, Function<ErrorOr<IPC::TransportHandle>()> connect_audio_server);
+WEBVIEW_API ErrorOr<MediaServerClientConnection> connect_new_media_server_client(RefPtr<MediaClient::Client>& controller, u64 owner_child_id, IsPrivate, Function<ErrorOr<IPC::TransportHandle>()> connect_audio_server);
 
 }

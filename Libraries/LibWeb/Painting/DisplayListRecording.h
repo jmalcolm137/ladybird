@@ -6,49 +6,33 @@
 
 #pragma once
 
-#include <AK/NonnullRefPtr.h>
 #include <AK/Optional.h>
-#include <AK/RefPtr.h>
-#include <LibCompositing/DisplayList/AccumulatedVisualContext.h>
-#include <LibCompositing/DisplayList/DisplayList.h>
 #include <LibWeb/Forward.h>
 #include <LibWeb/Painting/PaintableTypes.h>
 
 namespace Web::Painting {
 
-// Whether the hit-test list a recording made still names the document's boxes: not where the recording landed after
-// the host wrote the document's rows.
-enum class HitTestListStands {
+// Whether the hit-test items of the frame a recording made still stand for the document's boxes: not where the
+// recording landed after the host wrote the document's rows.
+enum class HitTestItemsStand {
     No,
     Yes,
 };
 
-// What a document did with the hit-test list a recording made as it took the recording in.
-enum class HitTestListAdoption : u8 {
+// What a document did with the hit-test items of the frame a recording made as it took the recording in.
+enum class HitTestItemsAdoption : u8 {
     Dropped,
     Kept,
     TookNew,
 };
 
-// The read a recording's hit-test list is made in, `read`, where the list stands, and none otherwise.
-inline Optional<Layout::BegunRead const&> hit_test_list_read(Layout::BegunRead const& read, HitTestListStands stands)
-{
-    if (stands == HitTestListStands::No)
-        return {};
-    return read;
-}
-
 // A recording of a document's display list, started from the document as it was then: done in step with the host, or
-// in flight beside the event loop until the event loop takes it in. Its display list is made once it is published.
+// in flight beside the event loop until the event loop takes it in. Rust keeps what it records.
 struct DisplayListRecording {
-    Compositing::AccumulatedVisualContextTree visual_context_tree;
-    Optional<Gfx::Color> surface_clear_color;
+    // The structural epoch of the visual context tree the recording records against, which stays with the render state.
+    u64 visual_context_tree_structural_epoch { 0 };
     PaintCommandCacheMode cache_mode;
     bool in_flight { false };
-    // What its display list is stamped with for async scrolling, sealed where the recording began, and the display list
-    // it copied paint commands from then, which it publishes again where it recorded the same.
-    Optional<Compositing::DisplayList::AsyncScrollingMetadata> async_scrolling_metadata;
-    RefPtr<Compositing::DisplayList> paint_command_cache_source;
 };
 
 }

@@ -29,9 +29,9 @@ use crate::ir::value;
 const INVALID_HOPS: u32 = 0xFFFF_FFFE;
 
 /// `JS::EnvironmentMode::Lexical`.
-const ENVIRONMENT_MODE_LEXICAL: u32 = 0;
+const ENVIRONMENT_MODE_LEXICAL: u8 = 0;
 
-impl GraphBuilder<'_> {
+impl GraphBuilder<'_, '_> {
     /// `field` of the running execution context. Inlined callees need no
     /// function environment and never change their environments, so their
     /// execution contexts are constants.
@@ -42,7 +42,24 @@ impl GraphBuilder<'_> {
             if let Some(value) = self.frame.field(field) {
                 return Ok(value);
             }
-            let value = self.emit(Op::LoadFrameField { field }, Vec::new(), Some(Repr::Pointer));
+            let executable = self.function.executable;
+            let from_function = match field {
+                FrameField::PrivateEnvironment => executable.frames_read_private_environment_from_function,
+                FrameField::VariableEnvironment => executable.frames_read_variable_environment_from_function,
+                _ => false,
+            };
+            let value = if from_function {
+                let function = self.frame_field(FrameField::Function)?;
+                self.emit(
+                    Op::LoadFunctionEnvironment {
+                        private: field == FrameField::PrivateEnvironment,
+                    },
+                    &[function],
+                    Some(Repr::Pointer),
+                )
+            } else {
+                self.emit(Op::LoadFrameField { field }, &[], Some(Repr::Pointer))
+            };
             self.frame.set_field(field, value);
             return Ok(value);
         }
@@ -52,7 +69,7 @@ impl GraphBuilder<'_> {
             let private = match field {
                 FrameField::LexicalEnvironment | FrameField::VariableEnvironment => Some(false),
                 FrameField::PrivateEnvironment => Some(true),
-                FrameField::Realm | FrameField::Executable => None,
+                FrameField::Realm | FrameField::Executable | FrameField::Function => None,
             };
             if let Some(private) = private {
                 // NB: A closure the code creates itself has the environments
@@ -61,11 +78,7 @@ impl GraphBuilder<'_> {
                     return Ok(self.graph.node(closure).inputs[usize::from(private)]);
                 }
                 let address = self.cell_address(closure);
-                return Ok(self.emit(
-                    Op::LoadFunctionEnvironment { private },
-                    vec![address],
-                    Some(Repr::Pointer),
-                ));
+                return Ok(self.emit(Op::LoadFunctionEnvironment { private }, &[address], Some(Repr::Pointer)));
             }
         }
         let executable = self.function.executable;
@@ -77,6 +90,7 @@ impl GraphBuilder<'_> {
             FrameField::LexicalEnvironment | FrameField::VariableEnvironment => executable.environment,
             FrameField::Realm => executable.function.map(|function| function.realm),
             FrameField::Executable => Some(executable.cell),
+            FrameField::Function => executable.function.map(|function| function.function),
             // NB: Inlined callees never read it.
             FrameField::PrivateEnvironment => None,
         }
@@ -140,7 +154,7 @@ impl GraphBuilder<'_> {
         }
         let mut environment = self.frame_field(field)?;
         for _ in 0..coordinate.hops {
-            environment = self.emit(Op::LoadOuterEnvironment, vec![environment], Some(Repr::Pointer));
+            environment = self.emit(Op::LoadOuterEnvironment, &[environment], Some(Repr::Pointer));
         }
         Ok(Some(environment))
     }
@@ -163,7 +177,7 @@ impl GraphBuilder<'_> {
             Op::LoadEnvironmentBinding {
                 index: coordinate.index,
             },
-            vec![environment],
+            &[environment],
             Some(Repr::Tagged),
         );
         // NB: Reading an uninitialized binding of a declarative environment
@@ -174,10 +188,7 @@ impl GraphBuilder<'_> {
         } else {
             self.check_initialized(binding)?
         };
-        let binding = match self
-            .function
-            .executable
-            .captured_bindings
+        let binding = match self.snapshot[self.function.executable.captured_bindings]
             .iter()
             .find(|(captured, _)| *captured == coordinate)
             .map(|(_, value)| *value)
@@ -209,15 +220,15 @@ impl GraphBuilder<'_> {
         let mut slow_paths = self.start_slow_paths(None)?;
         // NB: Bindings of the closure's environments that every environment
         //     of their scope declares mutable need no check of that.
-        let declared_mutable =
-            field == FrameField::LexicalEnvironment && self.function.executable.mutable_bindings.contains(&coordinate);
+        let declared_mutable = field == FrameField::LexicalEnvironment
+            && self.snapshot[self.function.executable.mutable_bindings].contains(&coordinate);
         if !declared_mutable {
             self.branch_to_slow_path(
                 &mut slow_paths,
                 BranchCondition::BindingMutable {
                     index: coordinate.index,
                 },
-                vec![environment],
+                &[environment],
                 true,
             );
         }
@@ -225,21 +236,21 @@ impl GraphBuilder<'_> {
             Op::LoadEnvironmentBinding {
                 index: coordinate.index,
             },
-            vec![environment],
+            &[environment],
             Some(Repr::Tagged),
         );
         let empty = self.constant(value::EMPTY);
         self.branch_to_slow_path(
             &mut slow_paths,
             BranchCondition::TaggedEquals { equal: false },
-            vec![binding, empty],
+            &[binding, empty],
             true,
         );
         self.emit(
             Op::StoreEnvironmentBinding {
                 index: coordinate.index,
             },
-            vec![environment, value],
+            &[environment, value],
             None,
         );
         self.join_slow_paths(slow_paths, None);
@@ -259,7 +270,10 @@ impl GraphBuilder<'_> {
         is_immutable: bool,
         is_strict: bool,
     ) -> Result<Option<Flow>, CompileFailure> {
-        let Some(name) = self.function.executable.identifiers.get(identifier as usize).copied() else {
+        let Some(name) = self.snapshot[self.function.executable.identifiers]
+            .get(identifier as usize)
+            .copied()
+        else {
             return Err(CompileFailure::InvalidBytecode {
                 pc: self.function.pc,
                 reason: "identifier out of range",
@@ -279,10 +293,10 @@ impl GraphBuilder<'_> {
         self.branch_to_slow_path(
             &mut slow_paths,
             BranchCondition::NextBindingOfShape { name, flags },
-            vec![environment],
+            &[environment],
             true,
         );
-        self.emit(Op::AppendEnvironmentBinding, vec![environment], None);
+        self.emit(Op::AppendEnvironmentBinding, &[environment], None);
         self.join_slow_paths(slow_paths, None);
         Ok(Some(Flow::Continue))
     }
@@ -304,7 +318,7 @@ impl GraphBuilder<'_> {
             Op::StoreEnvironmentBinding {
                 index: coordinate.index,
             },
-            vec![environment, value],
+            &[environment, value],
             None,
         );
         Ok(Some(Flow::Continue))

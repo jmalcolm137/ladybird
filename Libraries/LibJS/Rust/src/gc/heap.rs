@@ -302,9 +302,9 @@ impl Heap {
     }
 
     /// allocate_with_size_class() for a cell that another cell keeps its storage in, instead of malloc memory: it never
-    /// collects garbage and does not count towards the next collection, so storage can grow while its owner is between
-    /// states nothing may observe, and callers can hold on to anything across the growth. Live storage counts once a
-    /// collection finds it, through the live cell bytes that set the next threshold.
+    /// collects garbage, so storage can grow while its owner is between states nothing may observe, and callers can hold
+    /// on to anything across the growth. It still counts towards the next collection, which the next allocation that
+    /// may collect starts.
     pub fn allocate_storage_with_size_class<T: GcCell, E: Copy>(
         &self,
         size_class: SizeClassAllocator,
@@ -387,7 +387,7 @@ impl Heap {
         // SAFETY: The allocator belongs to this heap and hands out cells of cell_size bytes.
         let cell = match unsafe { self.take_from_local_free_list(allocator, cell_size, kind) } {
             // SAFETY: The storage is a cell of the allocator, so it has the size and the alignment the caller guarantees.
-            Some(storage) => unsafe { Self::write_cell(storage.cast(), cell, initialize_tail, false) },
+            Some(storage) => unsafe { Self::write_cell(storage.cast(), cell, initialize_tail) },
             // SAFETY: The caller's guarantees about the allocator and the tail pass on.
             None => unsafe { self.allocate_from_heap(&defer_gc, allocator, kind, cell, initialize_tail) },
         };
@@ -409,35 +409,27 @@ impl Heap {
         cell: T,
         initialize_tail: impl FnOnce(*mut u8),
     ) -> Gc<T> {
-        let mut must_mark = false;
         let raw = allocator.raw.as_ptr();
         // SAFETY: The heap and the allocator are live.
         let storage = unsafe {
             match kind {
-                AllocationKind::Cell => capi::gc_heap_allocate_cell(self.raw.as_ptr(), raw, &raw mut must_mark),
-                AllocationKind::Storage => {
-                    capi::gc_heap_allocate_storage_cell(self.raw.as_ptr(), raw, &raw mut must_mark)
-                }
+                AllocationKind::Cell => capi::gc_heap_allocate_cell(self.raw.as_ptr(), raw),
+                AllocationKind::Storage => capi::gc_heap_allocate_storage_cell(self.raw.as_ptr(), raw),
             }
         };
         let storage = NonNull::new(storage).expect("LibGC allocates the cell").cast::<T>();
         // SAFETY: LibGC returned uninitialized storage of at least the size and the alignment of a T, as the caller
         // guarantees.
-        unsafe { Self::write_cell(storage, cell, initialize_tail, must_mark) }
+        unsafe { Self::write_cell(storage, cell, initialize_tail) }
     }
 
-    /// Writes `cell` to `storage` and has `initialize_tail` write the rest of the cell, with `must_mark` as its mark.
+    /// Writes `cell` to `storage` and has `initialize_tail` write the rest of the cell.
     ///
     /// # Safety
     ///
     /// `storage` must be uninitialized storage of at least the size and the alignment of a T, which nothing can collect
     /// garbage before it is written, and `initialize_tail` must write every byte beyond the T.
-    unsafe fn write_cell<T: GcCell>(
-        storage: NonNull<T>,
-        cell: T,
-        initialize_tail: impl FnOnce(*mut u8),
-        must_mark: bool,
-    ) -> Gc<T> {
+    unsafe fn write_cell<T: GcCell>(storage: NonNull<T>, cell: T, initialize_tail: impl FnOnce(*mut u8)) -> Gc<T> {
         // SAFETY: The caller passes storage for a T with room for the tail.
         unsafe {
             storage.write(cell);
@@ -447,14 +439,13 @@ impl Heap {
         // SAFETY: Every cell starts with its header.
         unsafe {
             debug_assert!((*header.as_ptr()).class().is_subclass_of(T::CLASS));
-            (*header.as_ptr()).mark.set(must_mark);
             Gc::from_non_null(storage)
         }
     }
 
     /// Takes a cell from the allocator's local free list, or else from its never-allocated cells, unless LibGC has to
     /// collect garbage first or there is no local free cell, with the bookkeeping gc_heap_allocator_local_free_list()
-    /// describes. These cells never need marking.
+    /// describes. These cells are in blocks that are swept already, so they never need marking.
     ///
     /// # Safety
     ///
@@ -486,13 +477,11 @@ impl Heap {
                 cursor_cell
             };
             let cell = NonNull::new_unchecked(cell);
-            if let AllocationKind::Cell = kind {
-                let allocated_bytes = info.allocated_bytes_since_last_gc.read() + cell_size;
-                if allocated_bytes > info.gc_bytes_threshold.read() {
-                    return None;
-                }
-                info.allocated_bytes_since_last_gc.write(allocated_bytes);
+            let allocated_bytes = info.allocated_bytes_since_last_gc.read() + cell_size;
+            if matches!(kind, AllocationKind::Cell) && allocated_bytes > info.gc_bytes_threshold.read() {
+                return None;
             }
+            info.allocated_bytes_since_last_gc.write(allocated_bytes);
             info.total_allocated_bytes
                 .write(info.total_allocated_bytes.read() + cell_size);
             if from_list {
@@ -531,6 +520,15 @@ impl Heap {
         let raw =
             unsafe { capi::gc_allocator_create(type_info, name.as_ptr().cast(), name.len(), foreign_type.cast()) };
         let raw = NonNull::new(raw).expect("LibGC creates the allocator");
+        if class.is_traced_on_owner_thread_only() {
+            // SAFETY: The allocator is live and has not allocated yet.
+            unsafe { capi::gc_allocator_set_traced_on_owner_thread_only(raw.as_ptr()) };
+        }
+        // NB: The classes derived at run time that share an allocator are never movable.
+        if class.is_movable() && !class_in_tail {
+            // SAFETY: The allocator is live and has not allocated yet.
+            unsafe { capi::gc_allocator_set_movable(raw.as_ptr()) };
+        }
         // SAFETY: The heap and the allocator are live.
         let local_free_list = unsafe { capi::gc_heap_allocator_local_free_list(self.raw.as_ptr(), raw.as_ptr()) };
         HeapAllocator { raw, local_free_list }
@@ -563,6 +561,12 @@ impl Heap {
                 && class.type_info.cell_size == allocating_class.type_info.cell_size
                 && allocating_class.type_info.alignment as usize <= size_of::<&'static Class>(),
             "{} cannot share the allocator of {}",
+            class.name,
+            allocating_class.name
+        );
+        assert!(
+            !class.is_traced_on_owner_thread_only() || allocating_class.is_traced_on_owner_thread_only(),
+            "{} is traced on the owner thread only, unlike the allocator of {} it shares",
             class.name,
             allocating_class.name
         );
@@ -692,6 +696,28 @@ impl Heap {
         capi::gc_heap_collect_garbage(self.handle(), capi::GC_COLLECTION_TYPE_COLLECT_GARBAGE, false);
     }
 
+    /// Collects garbage without scanning the stack, so that only roots keep cells alive, and cells may move.
+    ///
+    /// # Safety
+    ///
+    /// The caller, and every frame above it, must hold no cell that is not rooted, since such a cell may be collected
+    /// or moved.
+    pub unsafe fn collect_garbage_without_scanning_the_stack(&self) {
+        // SAFETY: The caller vouches that the stack holds no cell that is not rooted.
+        unsafe { capi::gc_heap_collect_garbage_without_scanning_the_stack(self.handle()) };
+    }
+
+    /// Whether LIBGC_MOVE_EVERYTHING has collections that do not scan the stack move every cell they can, which test
+    /// runners use to collect that way where they safely can.
+    pub fn moves_everything() -> bool {
+        capi::gc_heap_moves_everything()
+    }
+
+    /// Has the collections of this heap that do not scan the stack move every cell they can, or not, for tests.
+    pub fn set_moves_everything_for_testing(&self, moves_everything: bool) {
+        capi::gc_heap_set_moves_everything_for_testing(self.handle(), moves_everything);
+    }
+
     /// Calls `callback` with `context` during every collection, after marking and finalization and before dead cells
     /// are swept, so that weak holders can drop the cells whose mark is clear.
     ///
@@ -728,6 +754,16 @@ impl Heap {
         } else if old_size > new_size {
             self.did_free_external_memory(old_size - new_size);
         }
+    }
+
+    /// Whether the heap gathers its roots and marks the live cells for a collection now, rather than for a graph dump.
+    pub fn is_marking_for_collection(&self) -> bool {
+        capi::gc_heap_is_marking_for_collection(self.handle())
+    }
+
+    /// Whether the collection that runs is there to give memory back to the system, for a process that is short of it.
+    pub fn is_returning_memory_to_system(&self) -> bool {
+        capi::gc_heap_is_returning_memory_to_system(self.handle())
     }
 
     pub fn should_collect_on_every_allocation(&self) -> bool {
@@ -780,7 +816,7 @@ impl Drop for Heap {
 /// Checks the layouts this crate mirrors against the LibGC it is linked with, and returns LibGC's layout.
 fn check_layout() -> GCLayout {
     let mut layout = GCLayout::default();
-    capi::gc_get_layout(&mut layout);
+    capi::gc_get_layout(&mut layout, size_of::<GCLayout>());
     let expect = |what: &str, actual: u64, expected: u64| {
         assert!(
             actual == expected,
@@ -788,9 +824,9 @@ fn check_layout() -> GCLayout {
         );
     };
     expect(
-        "cell mark offset",
-        layout.cell_mark_offset.into(),
-        offset_of!(CellHeader, mark) as u64,
+        "visitor marker offset",
+        layout.visitor_marker_offset.into(),
+        super::visitor::VISITOR_MARKER_OFFSET as u64,
     );
     expect(
         "cell state offset",
@@ -803,6 +839,22 @@ fn check_layout() -> GCLayout {
         offset_of!(CellHeader, kind) as u64,
     );
     expect("block size", layout.block_size.into(), BLOCK_SIZE as u64);
+    expect(
+        "identity hash state offset",
+        layout.identity_hash_state_offset.into(),
+        crate::layout_forward::IDENTITY_HASH_STATE_OFFSET as u64,
+    );
+    expect(
+        "identity hash state offset in the cell header",
+        layout.identity_hash_state_offset.into(),
+        offset_of!(CellHeader, identity_hash_state) as u64,
+    );
+    expect(
+        "identity hash bits",
+        u64::from(layout.identity_hash_hashed) | (u64::from(layout.identity_hash_moved) << 8),
+        u64::from(crate::layout_forward::IDENTITY_HASH_HASHED)
+            | (u64::from(crate::layout_forward::IDENTITY_HASH_MOVED) << 8),
+    );
     expect(
         "block foreign type offset",
         layout.block_foreign_type_offset.into(),

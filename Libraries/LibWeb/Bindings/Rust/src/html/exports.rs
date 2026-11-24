@@ -9,21 +9,26 @@
 //! Libraries/LibWeb/HTML/MessagePort.cpp declare. A cell is the cell of an object of the interface that the name of
 //! the function says. Libraries/LibWeb/HTML/BroadcastChannel.cpp hands the BroadcastChannel objects the messages that
 //! other processes post, and Libraries/LibWeb/HTML/Window.cpp runs the window post message steps.
+//! Libraries/LibWeb/HTML/TextTrackCue.cpp reads and updates the TextTrackCue objects that its text tracks hold.
 
 use core::ffi::{c_int, c_void};
 use core::ptr::NonNull;
 
-use ak::Utf16String;
+use ak::{Utf16FlyString, Utf16String};
 use libgfx_rust::image_frame::ImageFrameHandle;
-use libjs_rust::api::{Gc, MarkedVec, Object, RawNativeFunctionResult, Value, Vm};
+use libjs_rust::api::{Gc, JSVM, MarkedVec, Object, RawNativeFunctionResult, Value, Vm, vm_from_abi};
 use liburl_rust::FfiOrigin;
 
 use super::broadcast_channel::{BROADCAST_CHANNEL_MESSAGE_CLASS, BroadcastChannel, BroadcastChannelMessage};
+use super::event_source::EventSource;
 use super::image_bitmap::ImageBitmap;
+use super::image_bitmap_rendering_context::ImageBitmapRenderingContext;
 use super::image_data::ImageData;
+use super::message_event::{MessageEvent, MessageEventInit, MessageEventSource};
 use super::message_port::MessagePort;
 use super::storage::{Storage, StorageType};
 use super::storage_event::{StorageEvent, StorageEventInit};
+use super::text_track_cue::AnyTextTrackCue;
 use super::window::{PostedMessage, queue_posted_message, window_post_message_steps};
 use super::window_or_worker_global_scope::structured_clone;
 use crate::bindings::CallContext;
@@ -31,9 +36,11 @@ use crate::bindings::conversions::UsvString;
 use crate::bindings::cpp_cell::CppCell;
 use crate::bindings::environment_settings_object::relevant_settings_object;
 use crate::bindings::event_target::CppEventTarget;
-use crate::bindings::interface::{Interface, Ref, cell_from_abi, cell_into_abi, realm_arguments, wrap};
+use crate::bindings::interface::{Interface, Ref, allocate, cell_from_abi, cell_into_abi, realm_arguments, wrap};
 use crate::bindings::structured_data::{TransferDataReader, TransferDataWriter, Transferable};
+use crate::canvas_2d::canvas::Canvas;
 use crate::dom::event::EventInit;
+use crate::fetch::infrastructure::http::response_view::CppResponseView;
 use crate::html::port_channel::give_up_on_parked_end;
 use crate::html::structured_serialize::cpp::SerializedTransferRecord;
 use crate::html::structured_serialize::message_record::MessageRecord;
@@ -465,8 +472,11 @@ pub unsafe extern "C" fn web_rust_shut_down_agent(vm: *mut c_void) {
     let vm = unsafe { &*vm.cast::<Vm>() };
     MessagePort::shut_down_ports_of_agent(vm);
     crate::html::broadcast_channel::forget_broadcast_channels_of_agent();
+    crate::html::event_source::forget_event_sources_of_agent();
+    crate::web_gl::context_loss::forget_contexts_of_agent();
     crate::web_assembly::Agent::shut_down();
     crate::indexed_db::internal::storage::shut_down_storage();
+    crate::permissions_api::permission_store::forget_statuses_of_this_agent();
 }
 
 /// Steps 6 to 9 of BroadcastChannel's postMessage(), for a message that another process posted, whose channel name
@@ -595,6 +605,64 @@ pub unsafe extern "C" fn web_rust_html_create_storage_event(vm: *mut c_void, rea
         .as_ptr()
 }
 
+/// The Event of a new trusted MessageEvent in the realm, for C++ to fire. Its origin is the origin if there is one,
+/// and the empty string otherwise.
+///
+/// # Safety
+///
+/// The VM, the realm, the data and each port must be live, and so must the source if it is not null. The type, the
+/// port array and the origin are lent for the call.
+#[allow(clippy::too_many_arguments, reason = "C++ passes each member of the dictionary")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn web_rust_html_create_message_event(
+    vm: *mut c_void,
+    realm: *mut c_void,
+    r#type: usize,
+    data: u64,
+    ports: *const *mut c_void,
+    count: usize,
+    source: *mut c_void,
+    origin: *const FfiOrigin,
+) -> *mut c_void {
+    // SAFETY: The caller passes the live VM and a live realm.
+    let (vm, realm) = unsafe { realm_arguments(vm, realm) };
+    let mut event_init = MessageEventInit::new(vm);
+    // SAFETY: The caller passes live data.
+    event_init.data = unsafe { Value::from_raw(data) };
+    // SAFETY: The caller lends the ports for the call.
+    for &port in unsafe { ak::slice_from_raw_parts(ports, count) } {
+        // SAFETY: Each port is a live MessagePort.
+        event_init.ports.push(unsafe { cell_from_abi::<MessagePort>(port) });
+    }
+    if !source.is_null() {
+        // SAFETY: A source that is not null is a live MessagePort.
+        let source = unsafe { cell_from_abi::<MessagePort>(source) };
+        event_init.source = Some(MessageEventSource::MessagePort(source));
+    }
+    // SAFETY: An origin that is not null is lent for the call.
+    let origin = (!origin.is_null()).then(|| unsafe { (*origin).to_origin() });
+    // SAFETY: The caller lends the type for the call.
+    let r#type: Utf16String = unsafe { Utf16FlyString::from_raw_borrowed(r#type) }.into();
+    let event = MessageEvent::create(vm, realm, &r#type, event_init, origin);
+    event.event().set_is_trusted(true);
+    event.event().as_ptr()
+}
+
+/// The Event of a new MessageEvent in the realm whose type is the empty string, for createEvent().
+///
+/// # Safety
+///
+/// The VM and the realm must be live.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn web_rust_html_create_message_event_for_create_event(
+    vm: *mut c_void,
+    realm: *mut c_void,
+) -> *mut c_void {
+    // SAFETY: The caller passes the live VM and a live realm.
+    let (vm, realm) = unsafe { realm_arguments(vm, realm) };
+    MessageEvent::create_for_create_event(vm, realm).event().as_ptr()
+}
+
 /// # Safety
 ///
 /// The VM, the realm, the target and the transferred objects must be live, and the target must be a Window if remote
@@ -670,4 +738,261 @@ pub unsafe extern "C" fn web_rust_structured_clone(
     let (value, transfer) = unsafe { (Value::from_raw(value), objects_from_abi(vm, transfer, count)) };
     let result = structured_clone(&cx, value, &transfer.values());
     RawNativeFunctionResult::from_completion(result.map_err(|exception| exception.throw(&cx)))
+}
+
+/// Creates the ImageBitmapRenderingContext of the HTMLCanvasElement whose cell is `canvas` and whose
+/// Web::HTML::CanvasHost is `canvas_host`, and returns its cell.
+///
+/// # Safety
+///
+/// `canvas` must be the live cell of the canvas, and `canvas_host` the same object as a Web::HTML::CanvasHost.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn web_image_bitmap_rendering_context_create(
+    vm: &Vm,
+    canvas: *mut c_void,
+    canvas_host: *mut c_void,
+    alpha: bool,
+) -> *mut c_void {
+    let canvas = Canvas {
+        cell: NonNull::new(canvas).expect("C++ passes the canvas"),
+        host: NonNull::new(canvas_host).expect("C++ passes the canvas"),
+        is_offscreen: false,
+    };
+    cell_into_abi(allocate(vm, |defer_gc| {
+        ImageBitmapRenderingContext::new(defer_gc, canvas, alpha)
+    }))
+}
+
+/// The Gfx::DecodedImageFrame of the output bitmap of the context, which stays valid until the output bitmap changes,
+/// or null for none.
+///
+/// # Safety
+///
+/// `context` must be a live cell.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn web_image_bitmap_rendering_context_frame(context: *mut c_void) -> *const c_void {
+    // SAFETY: The caller passes a live cell.
+    unsafe { object_from_abi::<ImageBitmapRenderingContext>(context) }.raw_frame()
+}
+
+/// # Safety
+///
+/// `context` must be a live cell.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn web_image_bitmap_rendering_context_is_blank(context: *mut c_void) -> bool {
+    // SAFETY: The caller passes a live cell.
+    unsafe { object_from_abi::<ImageBitmapRenderingContext>(context) }.is_blank()
+}
+
+/// # Safety
+///
+/// `context` must be a live cell.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn web_image_bitmap_rendering_context_origin_clean(context: *mut c_void) -> bool {
+    // SAFETY: The caller passes a live cell.
+    unsafe { object_from_abi::<ImageBitmapRenderingContext>(context) }.origin_clean()
+}
+
+/// # Safety
+///
+/// `context` must be a live cell.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn web_image_bitmap_rendering_context_alpha(context: *mut c_void) -> bool {
+    // SAFETY: The caller passes a live cell.
+    unsafe { object_from_abi::<ImageBitmapRenderingContext>(context) }.alpha()
+}
+
+/// # Safety
+///
+/// `cue` must be the live cell of a TextTrackCue.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn web_text_track_cue_event_target(cue: *mut c_void) -> *mut c_void {
+    // SAFETY: The caller passes a live cell.
+    unsafe { AnyTextTrackCue::from_abi(cue) }.event_target().as_ptr()
+}
+
+/// The cell of the TextTrack whose list of cues the cue is in, or null.
+///
+/// # Safety
+///
+/// `cue` must be the live cell of a TextTrackCue.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn web_text_track_cue_track(cue: *mut c_void) -> *mut c_void {
+    // SAFETY: The caller passes a live cell.
+    let cue = unsafe { AnyTextTrackCue::from_abi(cue) };
+    cue.track_cell().map_or(core::ptr::null_mut(), |track| track.as_ptr())
+}
+
+/// # Safety
+///
+/// `cue` must be the live cell of a TextTrackCue, and `track` a live TextTrack or null.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn web_text_track_cue_set_track(cue: *mut c_void, track: *mut c_void) {
+    // SAFETY: The caller passes a live cell.
+    let cue = unsafe { AnyTextTrackCue::from_abi(cue) };
+    // SAFETY: The caller passes a live TextTrack, or null.
+    let track = (!track.is_null()).then(|| unsafe { CppCell::from_raw(track) });
+    cue.set_track_cell(track);
+}
+
+/// The identifier of the cue, whose reference the caller adopts.
+///
+/// # Safety
+///
+/// `cue` must be the live cell of a TextTrackCue.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn web_text_track_cue_id(cue: *mut c_void) -> usize {
+    // SAFETY: The caller passes a live cell.
+    unsafe { AnyTextTrackCue::from_abi(cue) }.identifier().into_raw()
+}
+
+/// # Safety
+///
+/// `cue` must be the live cell of a TextTrackCue, and `id` a string that the caller lends for the call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn web_text_track_cue_set_id(cue: *mut c_void, id: usize) {
+    // SAFETY: The caller passes a live cell and lends the string.
+    let (cue, id) = unsafe { (AnyTextTrackCue::from_abi(cue), Utf16String::from_raw_borrowed(id)) };
+    cue.set_identifier(id);
+}
+
+/// # Safety
+///
+/// `cue` must be the live cell of a TextTrackCue.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn web_text_track_cue_start_time(cue: *mut c_void) -> f64 {
+    // SAFETY: The caller passes a live cell.
+    unsafe { AnyTextTrackCue::from_abi(cue) }.start_time_value()
+}
+
+/// # Safety
+///
+/// `cue` must be the live cell of a TextTrackCue.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn web_text_track_cue_end_time(cue: *mut c_void) -> f64 {
+    // SAFETY: The caller passes a live cell.
+    unsafe { AnyTextTrackCue::from_abi(cue) }.end_time_value()
+}
+
+/// # Safety
+///
+/// `cue` must be the live cell of a TextTrackCue.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn web_text_track_cue_pause_on_exit(cue: *mut c_void) -> bool {
+    // SAFETY: The caller passes a live cell.
+    unsafe { AnyTextTrackCue::from_abi(cue) }.pause_on_exit_flag()
+}
+
+/// # Safety
+///
+/// `cue` must be the live cell of a TextTrackCue.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn web_text_track_cue_is_active(cue: *mut c_void) -> bool {
+    // SAFETY: The caller passes a live cell.
+    unsafe { AnyTextTrackCue::from_abi(cue) }.is_active()
+}
+
+/// # Safety
+///
+/// `cue` must be the live cell of a TextTrackCue.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn web_text_track_cue_set_active(cue: *mut c_void, active: bool) {
+    // SAFETY: The caller passes a live cell.
+    unsafe { AnyTextTrackCue::from_abi(cue) }.set_active(active);
+}
+
+/// # Safety
+///
+/// `cue` must be the live cell of a TextTrackCue.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn web_text_track_cue_order_added(cue: *mut c_void) -> u64 {
+    // SAFETY: The caller passes a live cell.
+    unsafe { AnyTextTrackCue::from_abi(cue) }.order_added()
+}
+
+/// # Safety
+///
+/// `cue` must be the live cell of a TextTrackCue.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn web_text_track_cue_set_order_added(cue: *mut c_void, order_added: u64) {
+    // SAFETY: The caller passes a live cell.
+    unsafe { AnyTextTrackCue::from_abi(cue) }.set_order_added(order_added);
+}
+
+/// # Safety
+///
+/// `vm` must be the live VM, and `event_source` the live cell of an EventSource.
+unsafe fn event_source_arguments<'vm>(vm: *mut JSVM, event_source: *mut c_void) -> (&'vm Vm, Ref<EventSource>) {
+    // SAFETY: The caller passes the live VM and the live cell of an EventSource.
+    unsafe { (vm_from_abi(vm), cell_from_abi(event_source)) }
+}
+
+/// https://html.spec.whatwg.org/multipage/server-sent-events.html#dom-eventsource
+///
+/// # Safety
+///
+/// `vm` must be the live VM, `event_source` the live cell of an EventSource, and `response` a live ResponseView.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn web_rust_event_source_process_response(
+    vm: *mut JSVM,
+    event_source: *mut c_void,
+    response: *mut c_void,
+) {
+    // SAFETY: The caller passes the live VM, the live cell of an EventSource and a live ResponseView.
+    let ((vm, event_source), response) = unsafe {
+        (
+            event_source_arguments(vm, event_source),
+            CppResponseView::from_raw(response),
+        )
+    };
+    EventSource::process_response(event_source, vm, response);
+}
+
+/// https://html.spec.whatwg.org/multipage/server-sent-events.html#dom-eventsource
+///
+/// # Safety
+///
+/// `vm` must be the live VM, `event_source` the live cell of an EventSource, and `response` a live ResponseView.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn web_rust_event_source_process_response_end_of_body(
+    vm: *mut JSVM,
+    event_source: *mut c_void,
+    response: *mut c_void,
+) {
+    // SAFETY: The caller passes the live VM, the live cell of an EventSource and a live ResponseView.
+    let ((vm, event_source), response) = unsafe {
+        (
+            event_source_arguments(vm, event_source),
+            CppResponseView::from_raw(response),
+        )
+    };
+    EventSource::process_event_source_end_of_body(event_source, vm, response);
+}
+
+/// https://html.spec.whatwg.org/multipage/server-sent-events.html#dom-eventsource
+///
+/// # Safety
+///
+/// `vm` must be the live VM, `event_source` the live cell of an EventSource, and the bytes lent for the call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn web_rust_event_source_process_body_chunk(
+    vm: *mut JSVM,
+    event_source: *mut c_void,
+    bytes: ak::Span<'_, u8>,
+) {
+    // SAFETY: The caller passes the live VM and the live cell of an EventSource.
+    let (vm, event_source) = unsafe { event_source_arguments(vm, event_source) };
+    EventSource::process_body_chunk(event_source, vm, bytes.as_slice());
+}
+
+/// https://html.spec.whatwg.org/multipage/server-sent-events.html#concept-eventsource-forcibly-close
+///
+/// # Safety
+///
+/// `vm` must be the live VM and `realm` a live realm.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn web_rust_event_source_forcibly_close_all(vm: *mut c_void, realm: *mut c_void) {
+    // SAFETY: The caller passes the live VM and a live realm.
+    let (vm, realm) = unsafe { realm_arguments(vm, realm) };
+    EventSource::forcibly_close_all(vm, realm);
 }

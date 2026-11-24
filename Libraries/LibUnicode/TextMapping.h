@@ -35,9 +35,10 @@ void unicode_current_time_zone(UnicodeTextMappingOutput);
 bool unicode_set_current_time_zone(u16 const* time_zone, size_t length);
 void unicode_available_time_zones(void* context, void (*append)(void*, u16 const*, size_t));
 bool unicode_resolve_primary_time_zone(u16 const* time_zone, size_t length, UnicodeTextMappingOutput);
-bool unicode_time_zone_offset(u16 const* time_zone, size_t length, i64 seconds, u32 nanoseconds, i64* offset_nanoseconds, bool* in_dst);
+bool unicode_time_zone_offset(u16 const* time_zone, size_t length, i64 seconds, u32 nanoseconds, bool is_local, i64* offset_nanoseconds, bool* in_dst);
 size_t unicode_disambiguated_time_zone_offsets(u16 const* time_zone, size_t length, i64 seconds, u32 nanoseconds, i64* offset_nanoseconds, bool* in_dst, size_t capacity);
 bool unicode_time_zone_transition(u16 const* time_zone, size_t length, i64 seconds, u32 nanoseconds, u8 direction, bool include_given_time, u8 transition_rule, i64* transition_milliseconds);
 bool unicode_time_zone_display_name(u8 const* locale, size_t locale_length, u8 const* time_zone, size_t time_zone_length, bool in_dst, double time, UnicodeTextMappingOutput);
 void unicode_default_locale(UnicodeTextMappingOutput);
+size_t unicode_quotation_mark(u16 const* language, size_t length, bool open, bool alternate, u16 const** result);
 }

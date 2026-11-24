@@ -14,6 +14,7 @@
     const ACCESS_CONTROL_ALLOW_HEADERS = [
         "Cache-Control",
         "If-Modified-Since",
+        "Pragma",
         "Range",
         TEST_CACHE_ENABLED_HEADER,
         TEST_CACHE_REQUEST_TIME_OFFSET,
@@ -147,12 +148,15 @@
             }
         })();
 
-        // Responses without a Cache-Control or Expires header are not cached.
+        // Responses without a Cache-Control or Expires header are stored, but not reused.
         await (async () => {
             url = await createRequest("/cache-test/missing-headers");
 
             response = await cacheFetch(url);
-            expectCacheStatus(url, response, "not-cached");
+            expectCacheStatus(url, response, "written-to-cache");
+
+            response = await cacheFetch(url);
+            expectCacheStatus(url, response, "written-to-cache");
         })();
 
         // Responses with a no-store Cache-Control directive are not cached.
@@ -265,6 +269,50 @@
             expectCacheStatus(url, response, "read-from-cache");
         })();
 
+        // Requests with a force-cache directive do not receive stale responses if they have a no-cache directive.
+        for (const [name, value] of [["Cache-Control", "no-cache"], ["Pragma", "no-cache"]]) {
+            url = await createRequest(`/cache-test/cache-mode/force-cache-with-${name.toLowerCase()}-no-cache`, {
+                headers: {
+                    Age: "2",
+                    "Cache-Control": "max-age=5",
+                },
+            });
+
+            response = await cacheFetch(url);
+            expectCacheStatus(url, response, "written-to-cache");
+
+            response = await cacheFetch(url, {
+                cache: "force-cache",
+                headers: {
+                    [name]: value,
+                    [TEST_CACHE_REQUEST_TIME_OFFSET]: "5",
+                },
+            });
+            expectCacheStatus(url, response, "written-to-cache");
+        }
+
+        // Requests with a no-cache pragma and no Cache-Control header do not receive stored responses without validation.
+        await (async () => {
+            url = await createRequest("/cache-test/request/pragma-no-cache", {
+                headers: {
+                    "Cache-Control": "max-age=999",
+                },
+            });
+
+            response = await cacheFetch(url);
+            expectCacheStatus(url, response, "written-to-cache");
+
+            response = await cacheFetch(url, {
+                headers: {
+                    Pragma: "no-cache",
+                },
+            });
+            expectCacheStatus(url, response, "written-to-cache");
+
+            response = await cacheFetch(url);
+            expectCacheStatus(url, response, "read-from-cache");
+        })();
+
         // Responses with only a max-age directive are cached.
         await (async () => {
             url = await createRequest("/cache-test/response/max-age", {
@@ -296,7 +344,7 @@
             expectCacheStatus(url, response, "read-from-cache");
         })();
 
-        // Responses with an age equal to their max-age directive are not cached.
+        // Responses with an age equal to their max-age directive are stored, but not reused.
         await (async () => {
             url = await createRequest("/cache-test/response/max-age-expired", {
                 headers: {
@@ -306,7 +354,10 @@
             });
 
             response = await cacheFetch(url);
-            expectCacheStatus(url, response, "not-cached");
+            expectCacheStatus(url, response, "written-to-cache");
+
+            response = await cacheFetch(url);
+            expectCacheStatus(url, response, "written-to-cache");
         })();
 
         // Responses with an age less than the requests's max-age directive are cached.
@@ -329,7 +380,7 @@
             expectCacheStatus(url, response, "read-from-cache");
         })();
 
-        // Responses with an age equal to the request's max-age directive are not cached.
+        // Responses with an age equal to the request's max-age directive are stored, but not reused.
         await (async () => {
             url = await createRequest("/cache-test/request/max-age-expired", {
                 headers: {
@@ -338,12 +389,14 @@
                 },
             });
 
-            response = await cacheFetch(url, {
-                headers: {
-                    "Cache-Control": "max-age=5",
-                },
-            });
-            expectCacheStatus(url, response, "not-cached");
+            for (let i = 0; i < 2; ++i) {
+                response = await cacheFetch(url, {
+                    headers: {
+                        "Cache-Control": "max-age=5",
+                    },
+                });
+                expectCacheStatus(url, response, "written-to-cache");
+            }
         })();
 
         // Responses with an age within the requests's max-stale directive are cached.
@@ -382,6 +435,26 @@
             response = await cacheFetch(url, {
                 headers: {
                     "Cache-Control": "max-stale=5",
+                    [TEST_CACHE_REQUEST_TIME_OFFSET]: "10",
+                },
+            });
+            expectCacheStatus(url, response, "written-to-cache");
+        })();
+
+        // Stale responses with a must-revalidate directive are not reused for a request with a max-stale directive.
+        await (async () => {
+            url = await createRequest("/cache-test/request/max-stale-must-revalidate", {
+                headers: {
+                    "Cache-Control": "max-age=5, must-revalidate",
+                },
+            });
+
+            response = await cacheFetch(url);
+            expectCacheStatus(url, response, "written-to-cache");
+
+            response = await cacheFetch(url, {
+                headers: {
+                    "Cache-Control": "max-stale=60",
                     [TEST_CACHE_REQUEST_TIME_OFFSET]: "10",
                 },
             });
@@ -429,7 +502,7 @@
             expectCacheStatus(url, response, "read-from-cache");
         })();
 
-        // Responses with an age outside of the requests's min-fresh directive are not cached.
+        // Responses with an age outside of the requests's min-fresh directive are stored, but not reused.
         await (async () => {
             url = await createRequest("/cache-test/request/min-fresh-expired", {
                 headers: {
@@ -446,7 +519,7 @@
                     "Cache-Control": "min-fresh=4",
                 },
             });
-            expectCacheStatus(url, response, "not-cached");
+            expectCacheStatus(url, response, "written-to-cache");
         })();
 
         // Incomplete responses are not cached.

@@ -30,8 +30,10 @@
 #include <LibUnicode/TimeZone.h>
 #include <LibWeb/Bindings/MainThreadVM.h>
 #include <LibWeb/DOM/Document.h>
+#include <LibWeb/Fetch/Fetching/FetchEngine.h>
 #include <LibWeb/Fetch/Fetching/Fetching.h>
 #include <LibWeb/HTML/EventLoop/EventLoop.h>
+#include <LibWeb/HTML/Scripting/Agent.h>
 #include <LibWeb/HTML/Window.h>
 #include <LibWeb/HTML/WindowOrWorkerGlobalScope.h>
 #include <LibWeb/Internals/Internals.h>
@@ -161,14 +163,18 @@ static void install_crash_signal_handlers()
 
 static ErrorOr<void> connect_to_resource_loader(GC::Heap& heap, IPC::TransportHandle const& handle, Optional<int> client_id, Optional<Utf16String> const& top_level_site);
 
-ErrorOr<int> ladybird_main(Main::Arguments arguments)
+// What the process keeps for as long as its event loop runs.
+struct ProcessState {
+    NonnullRefPtr<WebContent::ConnectionFromClient> client;
+    OwnPtr<Core::StatsLog> stats_log;
+};
+
+// NB: NEVER_INLINE so that the locals of the setup are gone from the stack before the event loop runs. ladybird_main()
+//     stays on the stack for the life of the process, below every collection. A collection from the outermost turn of
+//     the event loop takes no roots from the stack, so no frame that is still on the stack then may hold the only
+//     reference to a cell. Keep ladybird_main() down to what has to outlive the event loop, and never a cell.
+NEVER_INLINE static ErrorOr<ProcessState> initialize_process(Main::Arguments arguments)
 {
-    AK::set_rich_debug_enabled(true);
-
-    install_crash_signal_handlers();
-
-    auto& event_loop = Core::EventLoop::initialize_for_current_thread();
-
     WebView::platform_init();
 
     Web::Platform::EventLoopPlugin::install(*new Web::Platform::EventLoopPlugin);
@@ -281,6 +287,10 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
 
     Web::Bindings::set_collect_garbage_on_every_allocation_in_new_agents(collect_garbage_on_every_allocation);
     Web::Bindings::initialize_agent(Web::HTML::AgentType::SimilarOriginWindow);
+    auto& agent = Web::HTML::surrounding_agent();
+    agent.fetch_executor = Web::Fetch::Fetching::create_inline_fetch_executor(agent.network_activity_observers);
+    // See initialize_process() and ladybird_main() for what keeps this true.
+    Web::Bindings::main_thread_vm().heap().set_outermost_event_loop_turn_holds_no_cells(true);
     if (stats_log)
         Web::Bindings::main_thread_vm().heap().enable_stats();
 
@@ -326,6 +336,17 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
         });
     }
 
+    return ProcessState { move(webcontent_client), move(stats_log) };
+}
+
+ErrorOr<int> ladybird_main(Main::Arguments arguments)
+{
+    AK::set_rich_debug_enabled(true);
+
+    install_crash_signal_handlers();
+
+    auto& event_loop = Core::EventLoop::initialize_for_current_thread();
+    auto process_state = TRY(initialize_process(arguments));
     return event_loop.exec();
 }
 

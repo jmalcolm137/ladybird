@@ -245,4 +245,16 @@ test("Round trip Date.prototype.to*String", () => {
     expect(Date.parse(epoch.toString())).toBe(epoch.valueOf());
     expect(Date.parse(epoch.toISOString())).toBe(epoch.valueOf());
     expect(Date.parse(epoch.toUTCString())).toBe(epoch.valueOf());
+
+    for (const year of [-1, -999, -12345]) {
+        const date = new Date(Date.UTC(year, 5, 1));
+        expect(Date.parse(date.toUTCString())).toBe(date.valueOf());
+        expect(Date.parse(date.toISOString())).toBe(date.valueOf());
+    }
+});
+
+test("UTC offset hour out of range", () => {
+    expect(Date.parse("2000-01-01T10:00:00+24:00")).toBeNaN();
+    expect(Date.parse("2000-01-01T10:00:00-24:00")).toBeNaN();
+    expect(Date.parse("2000-01-01T10:00:00+23:59")).toBe(946634460000);
 });

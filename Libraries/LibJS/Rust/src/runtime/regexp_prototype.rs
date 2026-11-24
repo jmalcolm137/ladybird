@@ -246,6 +246,15 @@ thread_local! {
         RefCell::new(HashMap::default());
 }
 
+/// Lets go of the compiled regexes of the calling thread that no RegExp object holds, for a process that is short of
+/// memory.
+pub(crate) fn clear_regex_cache() {
+    REGEX_CACHE.with_borrow_mut(|cache| {
+        cache.clear();
+        cache.shrink_to_fit();
+    });
+}
+
 fn get_or_compile_regex(regexp_object: &RegExpObject) -> Option<Rc<EcmaScriptRegex>> {
     // Fast path: check the inline cache on the RegExpObject.
     if let Some(cached) = regexp_object.cached_regex() {
@@ -2430,8 +2439,7 @@ impl RegExpPrototype {
                 && !sticky
                 && let Some(compiled_regex) = get_or_compile_regex(&typed_regexp)
             {
-                let string_data = string.utf16_string();
-                let utf16_view = Utf16View::of_string(&string_data);
+                let utf16_view = string.utf16_string_view();
 
                 if !typed_regexp.legacy_features_enabled() {
                     // Fastest path: just test, no captures or legacy props.

@@ -164,6 +164,7 @@ pub enum FfiMediaFeatureValueKind {
     Length,
     Ratio,
     Resolution,
+    Number,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -507,7 +508,7 @@ fn original_source(values: &[ComponentValue]) -> ParserString {
 
 /// The source text `values` were tokenized from.
 fn source_text(values: &[ComponentValue]) -> CssString {
-    let text: Vec<u16> = values
+    let text: smallvec::SmallVec<[u16; 128]> = values
         .iter()
         .flat_map(|component| component.original_source_text.iter())
         .collect();
@@ -602,8 +603,8 @@ fn parse_boolean_expression_group<F>(
 where
     F: Fn(&mut TokenStream<'_>) -> Option<Expression>,
 {
-    let first = stream.next_token().clone();
-    if let Some(values) = parenthesized_values(&first) {
+    let first = stream.next_token();
+    if let Some(values) = parenthesized_values(first) {
         let mut transaction = stream.begin_transaction();
         transaction.discard_a_token();
         transaction.discard_whitespace();
@@ -793,6 +794,24 @@ where
     if !allow_min_max_prefix || name.len() <= 4 {
         return None;
     }
+    // https://compat.spec.whatwg.org/#css-media-queries-webkit-device-pixel-ratio
+    // The range prefix goes after "-webkit-" for this feature.
+    if kind == QueryKind::Media
+        && name.len() > 12
+        && equals_ascii_case_insensitive(&name[..8], b"-webkit-")
+        && equals_ascii_case_insensitive(&name[12..], b"device-pixel-ratio")
+    {
+        let name_type = if equals_ascii_case_insensitive(&name[8..12], b"min-") {
+            FeatureNameType::Min
+        } else if equals_ascii_case_insensitive(&name[8..12], b"max-") {
+            FeatureNameType::Max
+        } else {
+            return None;
+        };
+        let (id, allows_range) = resolve_feature(kind, &[&name[..8], &name[12..]].concat())?;
+        transaction.commit();
+        return Some((name_type, id, allows_range));
+    }
     let name_type = if equals_ascii_case_insensitive(&name[..4], b"min-") {
         FeatureNameType::Min
     } else if equals_ascii_case_insensitive(&name[..4], b"max-") {
@@ -800,6 +819,9 @@ where
     } else {
         return None;
     };
+    if kind == QueryKind::Media && equals_ascii_case_insensitive(&name[4..], b"-webkit-device-pixel-ratio") {
+        return None;
+    }
     let (id, allows_range) = resolve_feature(kind, &name[4..])?;
     if !allows_range {
         return None;
@@ -910,8 +932,8 @@ where
 {
     let mut transaction = stream.begin_transaction();
     transaction.discard_whitespace();
-    let first = transaction.next_token().clone();
-    let values = parenthesized_values(&first)?;
+    let first = transaction.next_token();
+    let values = parenthesized_values(first)?;
     transaction.discard_a_token();
     let mut inner = TokenStream::new(values);
     let feature = parse_query_feature(&mut inner, QueryKind::Media, resolve_feature)?;
@@ -1134,8 +1156,8 @@ where
 {
     let mut transaction = stream.begin_transaction();
     transaction.discard_whitespace();
-    let first = transaction.consume_a_token().clone();
-    if let Some(values) = parenthesized_values(&first) {
+    let first = transaction.consume_a_token();
+    if let Some(values) = parenthesized_values(first) {
         let values = trim_whitespace(values);
         if looks_like_supports_declaration(values) && contains_only_any_value(values) {
             let matches = evaluate_feature(SupportsFeatureKind::Declaration, &supports_components_source(values));
@@ -1371,8 +1393,8 @@ where
 {
     let mut transaction = stream.begin_transaction();
     transaction.discard_whitespace();
-    let first = transaction.next_token().clone();
-    if let Some(values) = parenthesized_values(&first) {
+    let first = transaction.next_token();
+    if let Some(values) = parenthesized_values(first) {
         transaction.discard_a_token();
         let mut inner = TokenStream::new(values);
         let feature = parse_query_feature(&mut inner, QueryKind::Size, resolve_feature)?;
@@ -1553,6 +1575,54 @@ pub struct FfiQueryHandle {
 }
 
 impl FfiQueryHandle {
+    /// Which first available fonts a container query's size features hold lengths relative to a
+    /// metric of: the container's, through an `ex`, `cap`, `ch` or `lh`, and the document element's,
+    /// through their root-relative forms.
+    pub(crate) fn container_query_font_metric_reads(&self) -> crate::css::animation::FontMetricReads {
+        // NB: A length can sit inside a value of any type a feature takes, a calculated ratio's, e.g.
+        fn read_value(value: &QueryFeatureValue, reads: &mut crate::css::animation::FontMetricReads) {
+            for kind in [
+                FeatureValueParse::Integer,
+                FeatureValueParse::Length,
+                FeatureValueParse::Number,
+                FeatureValueParse::Ratio,
+                FeatureValueParse::Resolution,
+            ] {
+                if let Some(value) = value.parsed_in(kind, FeatureValueQuery::ContainerSize) {
+                    let dependencies = crate::css::style_compute::collect_external_value_dependencies(value);
+                    reads.own |= dependencies.font_metric_relative_length;
+                    reads.root |= dependencies.root_font_reads == crate::css::style_compute::RootFontReads::Metrics;
+                }
+            }
+        }
+        fn read(expression: &Expression, reads: &mut crate::css::animation::FontMetricReads) {
+            match expression {
+                Expression::Not(child)
+                | Expression::InParens(child)
+                | Expression::StyleFunction(child)
+                | Expression::ScrollStateFunction(child) => read(child, reads),
+                Expression::And(children) | Expression::Or(children) => {
+                    children.iter().for_each(|child| read(child, reads));
+                }
+                Expression::QueryFeature(QueryFeature::Plain { value, .. }) => read_value(value, reads),
+                Expression::QueryFeature(QueryFeature::Range { left, right, .. }) => {
+                    if let Some(left) = left {
+                        read_value(&left.0, reads);
+                    }
+                    if let Some(right) = right {
+                        read_value(&right.1, reads);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut reads = crate::css::animation::FontMetricReads::default();
+        if let QueryTree::Expression { expression, .. } = &self.tree {
+            read(expression, &mut reads);
+        }
+        reads
+    }
+
     pub(crate) fn container_requirements(&self) -> u8 {
         let QueryTree::Expression {
             expression,
@@ -1700,6 +1770,12 @@ fn serialize_query_feature_value(sink: &mut TextSink, value: &QueryFeatureValue,
     } else {
         0
     };
+    if media_feature_value_types & MEDIA_FEATURE_VALUE_NUMBER != 0
+        && let Some(parsed) = value.parsed_as(FeatureValueParse::Number)
+    {
+        push_utf16(sink, &crate::css::serialize::serialize_style_value_to_utf16(parsed));
+        return;
+    }
     let is_ratio = media_feature_value_types & MEDIA_FEATURE_VALUE_RATIO != 0 || (kind == QueryKind::Size && id == 0);
     if is_ratio {
         let components = components
@@ -1789,6 +1865,12 @@ fn serialize_query_feature(sink: &mut TextSink, feature: &QueryFeature, kind: Qu
     match feature {
         QueryFeature::Boolean { .. } => sink.push_ascii(name),
         QueryFeature::Plain { name_type, value, .. } => {
+            let name = if name == "-webkit-device-pixel-ratio" {
+                sink.push_ascii("-webkit-");
+                "device-pixel-ratio"
+            } else {
+                name
+            };
             match name_type {
                 FeatureNameType::Normal => {}
                 FeatureNameType::Min => sink.push_ascii("min-"),
@@ -1993,6 +2075,7 @@ fn serialize_media_query(query: &MediaQuery) -> Vec<u16> {
 enum ResolvedFeatureValue {
     Ident(u16),
     Integer(i32),
+    Number(f64),
     Length(f64),
     Ratio { numerator: f64, denominator: f64 },
     Resolution(f64),
@@ -2211,6 +2294,12 @@ fn parse_media_feature_value(
         return resolve_parsed_media_feature_value(integer, length_context, None)
             .unwrap_or(ResolvedFeatureValue::Unknown);
     }
+    if types & MEDIA_FEATURE_VALUE_NUMBER != 0
+        && let Some(number) = value.parsed_as(FeatureValueParse::Number)
+        && let Some(resolved) = resolve_number(number, length_context, None)
+    {
+        return ResolvedFeatureValue::Number(resolved);
+    }
     if types & MEDIA_FEATURE_VALUE_INTEGER != 0
         && let Some(resolved) = resolve_feature_value_parsed_as(value, FeatureValueParse::Integer, length_context)
     {
@@ -2280,6 +2369,7 @@ fn resolved_environment_value(value: &FfiMediaFeatureValue) -> Option<ResolvedFe
         FfiMediaFeatureValueKind::Absent => None,
         FfiMediaFeatureValueKind::Ident => Some(ResolvedFeatureValue::Ident(value.keyword)),
         FfiMediaFeatureValueKind::Integer => Some(ResolvedFeatureValue::Integer(value.value as i32)),
+        FfiMediaFeatureValueKind::Number => Some(ResolvedFeatureValue::Number(value.value)),
         FfiMediaFeatureValueKind::Length => Some(ResolvedFeatureValue::Length(value.value)),
         FfiMediaFeatureValueKind::Ratio => Some(ResolvedFeatureValue::Ratio {
             numerator: value.value,
@@ -2315,7 +2405,8 @@ fn compare_feature_values(
         (ResolvedFeatureValue::Integer(left), ResolvedFeatureValue::Integer(right)) => {
             comparison_matches(Some(left.cmp(right)))
         }
-        (ResolvedFeatureValue::Length(left), ResolvedFeatureValue::Length(right))
+        (ResolvedFeatureValue::Number(left), ResolvedFeatureValue::Number(right))
+        | (ResolvedFeatureValue::Length(left), ResolvedFeatureValue::Length(right))
         | (ResolvedFeatureValue::Resolution(left), ResolvedFeatureValue::Resolution(right)) => {
             comparison_matches(left.partial_cmp(right))
         }
@@ -2334,6 +2425,23 @@ fn compare_feature_values(
         _ => false,
     };
     if matches { MatchResult::True } else { MatchResult::False }
+}
+
+// https://drafts.csswg.org/mediaqueries-5/#dynamic-range
+// "A user agent or underlying display device that matches high must also match the standard value."
+fn environment_value_implies(
+    id: u8,
+    environment_value: &ResolvedFeatureValue,
+    queried_value: &ResolvedFeatureValue,
+) -> bool {
+    let (ResolvedFeatureValue::Ident(environment_keyword), ResolvedFeatureValue::Ident(queried_keyword)) =
+        (environment_value, queried_value)
+    else {
+        return false;
+    };
+    MEDIA_FEATURES[usize::from(id)]
+        .implied_keywords
+        .contains(&(*environment_keyword, *queried_keyword))
 }
 
 fn evaluate_query_feature(
@@ -2356,7 +2464,9 @@ fn evaluate_query_feature(
                     MatchResult::False
                 }
             }
-            ResolvedFeatureValue::Length(value) | ResolvedFeatureValue::Resolution(value) => {
+            ResolvedFeatureValue::Number(value)
+            | ResolvedFeatureValue::Length(value)
+            | ResolvedFeatureValue::Resolution(value) => {
                 if *value != 0.0 {
                     MatchResult::True
                 } else {
@@ -2382,7 +2492,12 @@ fn evaluate_query_feature(
         QueryFeature::Plain { name_type, value, .. } => {
             let value = parse_media_feature_value(id, value, length_context);
             match name_type {
-                FeatureNameType::Normal => compare_feature_values(&value, FeatureComparison::Equal, &queried_value),
+                FeatureNameType::Normal => {
+                    if environment_value_implies(id, &queried_value, &value) {
+                        return MatchResult::True;
+                    }
+                    compare_feature_values(&value, FeatureComparison::Equal, &queried_value)
+                }
                 FeatureNameType::Min => {
                     compare_feature_values(&queried_value, FeatureComparison::GreaterThanOrEqual, &value)
                 }
@@ -2972,7 +3087,6 @@ pub unsafe extern "C" fn rust_parse_sizes_attribute(
     media_environment: Option<&FfiMediaEnvironment<'_>>,
     img_auto_width: Option<&f64>,
 ) -> *const c_void {
-    crate::css::ffi_stats::bump(crate::css::ffi_stats::FfiOp::SizesAttributeParseEntry);
     let Some(source) = source.units() else {
         return std::ptr::null();
     };
@@ -3209,6 +3323,46 @@ mod tests {
             !parse_media_query_list(b"(not (width) and (orientation))".as_slice(), &resolve_query_feature).unwrap()[0]
                 .valid
         );
+    }
+
+    #[test]
+    fn a_screen_with_high_dynamic_range_also_matches_standard() {
+        let absent = FfiMediaFeatureValue {
+            kind: FfiMediaFeatureValueKind::Absent,
+            keyword: 0,
+            value: 0.0,
+            second_value: 0.0,
+        };
+        let id_of = |name: &str| MEDIA_FEATURES.iter().position(|feature| feature.name == name).unwrap();
+        let environment_with_dynamic_range = |keyword| {
+            let mut environment = vec![absent; MEDIA_FEATURES.len()];
+            for name in ["dynamic-range", "video-dynamic-range"] {
+                environment[id_of(name)] = FfiMediaFeatureValue {
+                    kind: FfiMediaFeatureValueKind::Ident,
+                    keyword,
+                    ..absent
+                };
+            }
+            environment
+        };
+        let matches = |environment: &[FfiMediaFeatureValue], source: &str| {
+            let queries = parse_media_query_list(source.as_bytes(), &resolve_query_feature).unwrap();
+            evaluate_media_query(&queries[0], environment, None) == MatchResult::True
+        };
+
+        let high = environment_with_dynamic_range(crate::css::css_enums::keyword::HIGH);
+        for query in [
+            "(dynamic-range: high)",
+            "(dynamic-range: standard)",
+            "(video-dynamic-range: high)",
+            "(video-dynamic-range: standard)",
+        ] {
+            assert!(matches(&high, query), "{query}");
+        }
+
+        let standard = environment_with_dynamic_range(crate::css::css_enums::keyword::STANDARD);
+        assert!(!matches(&standard, "(dynamic-range: high)"));
+        assert!(matches(&standard, "(dynamic-range: standard)"));
     }
 
     #[test]

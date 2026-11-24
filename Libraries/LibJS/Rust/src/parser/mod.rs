@@ -7,61 +7,114 @@
 //! The JavaScript parser. Lexing is driven by the parser, the syntax tree is a set of flat columns, and scope analysis
 //! happens while parsing, with no map per scope. [`crate::ast`] is how everything after the parser reads the tree.
 //!
+//! The parser itself is the `libjs_parser` crate, which does all of its work in the work zone of its thread. This
+//! starts the parse jobs, and copies what they keep out of the zone.
+//!
 //! A source is parsed once for all of its early errors. That leaves a [`ScriptData`], which is all that is kept of the
-//! source, and the tree of its top-level code. A function is parsed again on its own when it is first called. Its tree
-//! lives as long as the compile job that needs it, and nested functions are skipped by what the first parse recorded.
+//! source, and the tree of its top-level code, which lives as long as the job of the parse, so the work that needs it is
+//! part of that job. A function is parsed again on its own when it is first called. Its tree lives as long as the
+//! compile job that needs it, and nested functions are skipped by what the first parse recorded.
 
-pub(crate) mod base;
-pub(crate) mod columns;
-pub(crate) mod expr;
-mod intern;
-mod lexer;
+mod enclosing;
+mod kept;
 pub(crate) mod literals;
-pub(crate) mod resolve;
-mod stmt;
-pub(crate) mod token;
-pub(crate) mod unit;
+
+use libjs_parser::base;
+use libjs_parser::columns;
+use libjs_parser::intern;
+use libjs_parser::resolve;
+use libjs_parser::unit;
 
 use crate::ast::Name;
 use crate::ast::NameTable;
 use crate::ast::Position;
 use crate::ast::ProgramType;
-use crate::ast::Resolution;
 use crate::ast::ScopeTable;
 use crate::ast::SyntaxTree;
+use crate::ast::TreeView;
+use crate::source_text::SourceText;
 use crate::u32_from_usize;
+use crate::work_zone::with_work_zone;
+use ak::Zone;
+use ak::ZoneVec;
 use base::Mode;
+use base::OutOfStack;
 use base::Parser;
+use base::SOURCE_PADDING;
 use columns::Ast;
-use columns::FunctionIndex;
+use columns::AstColumns;
+use columns::FunctionIndexBuilder;
 use columns::function_flag;
 use core::sync::atomic::AtomicBool;
+use core::sync::atomic::AtomicU8;
 use core::sync::atomic::AtomicUsize;
 use core::sync::atomic::Ordering;
+pub(crate) use enclosing::EnclosingCode;
+pub(crate) use enclosing::OuterResolutions;
+pub(crate) use enclosing::outer_entry;
 use intern::Interner;
-pub(crate) use resolve::EnclosingCode;
-pub(crate) use resolve::OuterResolutions;
-use std::cell::Cell;
+use kept::FunctionIndex;
+use kept::KeptNames;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::Weak;
 use unit::Unit;
-
-/// How many zero code units the lexer needs after the source.
-const SOURCE_PADDING: usize = 64;
 
 /// A function of a source, as the row that the first parse of the source gave it.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct FunctionRow(pub(crate) u32);
 
-/// A parser that keeps reparsing the functions of one source: it knows the names of the source.
-enum ReparseContext {
-    Narrow(Box<Parser<'static, u8>>),
-    Wide(Box<Parser<'static, u16>>),
+/// What the parses of the functions of one source again hand on to each other. A parse of a function has its work data
+/// in the work zone of its thread, and this on the heap.
+struct ReparseContext {
+    /// The names of the source.
+    names: KeptNames,
+    /// The state of each name, which is clean between two parses.
+    name_states: Box<[base::NameState]>,
+    /// The last stamp of a name state.
+    stamp: u32,
 }
 
-// SAFETY: The parser of a context only points at what the ScriptData holding the context owns, or, during a reparse, into
-//         the memory of that reparse.
-unsafe impl Send for ReparseContext {}
+/// The sources that have a reparse context now, for [`release_idle_reparse_contexts()`].
+static SOURCES_WITH_REPARSE_CONTEXT: Mutex<Vec<Weak<ScriptData>>> = Mutex::new(Vec::new());
+
+/// How many collections the reparse context of a source stays around for without a function of the source being parsed
+/// again.
+const REPARSE_CONTEXT_IDLE_COLLECTIONS: u8 = 2;
+
+/// Lets go of the reparse contexts that no function was parsed with for a few collections. A context holds every name
+/// of its source a second time, in tables sized for lookups, and most sources stop compiling functions once their page
+/// has loaded. The next function of such a source to be parsed again builds the context again.
+pub(crate) fn release_idle_reparse_contexts() {
+    let mut released = Vec::new();
+    let mut sources = SOURCES_WITH_REPARSE_CONTEXT
+        .lock()
+        .expect("nothing panics with the sources");
+    sources.retain(|source| {
+        let Some(source) = source.upgrade() else {
+            return false;
+        };
+        // NB: The count stops at its largest value, for a compile job that holds the context for very many collections.
+        let idle_collections = source
+            .reparse_context_idle_collections
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
+                Some(count.saturating_add(1))
+            })
+            .expect("the update always gives a value")
+            .saturating_add(1);
+        if idle_collections < REPARSE_CONTEXT_IDLE_COLLECTIONS {
+            return true;
+        }
+        // NB: A compile job that holds the context is using it, and counts from zero again when it is done.
+        let Ok(mut context) = source.reparse_context.try_lock() else {
+            return true;
+        };
+        released.push(context.take());
+        false
+    });
+    // NB: The contexts are freed without the list locked, since compile jobs on other threads wait for it.
+    drop(sources);
+}
 
 /// All that is kept of a source once it is parsed: the source, one row for each of its functions, and the names that the
 /// rows speak of. Compile jobs on any thread parse the functions again from this.
@@ -71,14 +124,14 @@ pub struct ScriptData {
     pub(crate) positions: Arc<SourcePositions>,
     pub(crate) program_type: ProgramType,
     pub(crate) program_context: base::ProgramContext,
-    /// The rows of the top level with marks, or that they did not fit the stack, until the compile of the top level.
-    top_level_rows: Mutex<Option<TopLevelRows>>,
     pub(crate) default_export_name: Name,
     pub(crate) default_constructor_parameter_name: Name,
     /// The undeclared names that something in a `with` uses, which are not simply globals, sorted.
     global_names_used_in_with: Vec<u32>,
     /// Filled in when the first function gets parsed again, for the ones after it.
     reparse_context: Mutex<Option<ReparseContext>>,
+    /// The collections since a function was last parsed again with the reparse context.
+    reparse_context_idle_collections: AtomicU8,
     /// Whether the code that gets compiled for the functions of this source is worth keeping, because the program may
     /// get linked again.
     retains_compiled_functions: AtomicBool,
@@ -86,107 +139,35 @@ pub struct ScriptData {
     retained_code_size: AtomicUsize,
 }
 
-/// The memory of the tree of a function that a compile job is done with, for the next one on the thread.
-struct SpareTreeMemory {
-    ast: Ast,
-    resolutions: Vec<Resolution>,
-    scopes: ScopeTable,
-    function_scope_rows: Vec<(u32, u32)>,
-}
-
-/// The most nodes of a tree whose memory stays around.
-const MAXIMUM_SPARE_NODES: usize = 1 << 16;
-
-thread_local! {
-    static SPARE_TREE_MEMORY: Cell<Option<SpareTreeMemory>> = const { Cell::new(None) };
-}
-
-impl SyntaxTree {
-    /// Leaves the memory of this tree, which is one of a function, to the next one parsed on the thread.
-    pub(crate) fn give_back_memory(self) {
-        if self.ast.tag.capacity() > MAXIMUM_SPARE_NODES {
-            return;
-        }
-        let Self {
-            mut ast,
-            mut resolutions,
-            mut scopes,
-            mut function_scope_rows,
-            ..
-        } = self;
-        ast.reset();
-        resolutions.clear();
-        scopes.clear();
-        function_scope_rows.clear();
-        SPARE_TREE_MEMORY.set(Some(SpareTreeMemory {
-            ast,
-            resolutions,
-            scopes,
-            function_scope_rows,
-        }));
-    }
-}
-
-/// A function could not be parsed or compiled, because the stack that is left does not hold it.
-#[derive(Clone, Copy, Debug)]
-pub struct OutOfStack;
-
-/// The address that the stack can only go `bytes` below where it is now.
-pub fn stack_limit_for_budget(bytes: usize) -> usize {
-    let marker = 0u8;
-    (&raw const marker as usize).saturating_sub(bytes)
-}
-
-#[cfg(target_os = "linux")]
-fn thread_stack_lowest_address() -> Option<usize> {
-    // SAFETY: The attributes live for the calls, and are destroyed once initialized.
-    unsafe {
-        let mut attributes: libc::pthread_attr_t = std::mem::zeroed();
-        if libc::pthread_getattr_np(libc::pthread_self(), &raw mut attributes) != 0 {
-            return None;
-        }
-        let mut address = std::ptr::null_mut();
-        let mut size = 0;
-        let result = libc::pthread_attr_getstack(&raw const attributes, &raw mut address, &raw mut size);
-        libc::pthread_attr_destroy(&raw mut attributes);
-        (result == 0).then_some(address as usize)
-    }
-}
-
-#[cfg(target_os = "macos")]
-#[allow(clippy::unnecessary_wraps)] // The other platforms' versions can fail.
-fn thread_stack_lowest_address() -> Option<usize> {
-    // SAFETY: These only read the stack of the calling thread.
-    unsafe {
-        let thread = libc::pthread_self();
-        let top = libc::pthread_get_stackaddr_np(thread) as usize;
-        Some(top - libc::pthread_get_stacksize_np(thread))
-    }
-}
-
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn thread_stack_lowest_address() -> Option<usize> {
-    None
+/// Checks a regular expression literal with the regex engine of the runtime, for the parser (see `ValidateRegex`).
+fn validate_regex<'z>(zone: &'z Zone, pattern: &[u16], flags: &[u16]) -> Result<(), &'z str> {
+    crate::host::validate_regex(pattern, flags).map_err(|message| {
+        core::str::from_utf8(zone.alloc_slice_copy(message.as_bytes())).expect("a copy of a string is one")
+    })
 }
 
 /// How low a VM lets the stack of this thread go, or `None` if that cannot be told.
 pub(crate) fn vm_stack_limit_of_this_thread() -> Option<usize> {
-    // NB: Asking for the stack of the main thread reads /proc/self/maps on Linux, and eval parses a program every time.
-    thread_local! {
-        static LOWEST_ADDRESS: Option<usize> = thread_stack_lowest_address();
-    }
-    LOWEST_ADDRESS
-        .with(|lowest_address| *lowest_address)
+    ak::stack::lowest_address_of_this_thread()
         .map(|lowest_address| lowest_address.saturating_add(crate::build_configuration::VM_STACK_SPACE_LIMIT as usize))
 }
 
 impl ScriptData {
+    #[cfg(test)]
+    pub(crate) fn has_reparse_context(&self) -> bool {
+        self.reparse_context.lock().expect("a reparse does not panic").is_some()
+    }
+
     pub(crate) fn retains_compiled_functions(&self) -> bool {
         self.retains_compiled_functions.load(Ordering::Relaxed)
     }
 
     pub(crate) fn add_retained_code_size(&self, size: usize) {
         self.retained_code_size.fetch_add(size, Ordering::Relaxed);
+    }
+
+    pub(crate) fn remove_retained_code_size(&self, size: usize) {
+        self.retained_code_size.fetch_sub(size, Ordering::Relaxed);
     }
 
     pub(crate) fn set_retains_compiled_functions(&self, retains_compiled_functions: bool) {
@@ -197,7 +178,7 @@ impl ScriptData {
     /// The bytes of this source and of the tables that compile jobs read, and of the code kept for its functions so far.
     pub(crate) fn memory_size(&self) -> usize {
         size_of::<Self>()
-            + crate::compile::utf16_string_memory_size(&self.positions.source)
+            + self.positions.source.memory_size()
             + self.index.memory_size()
             + self.names.memory_size()
             + self.positions.lines.memory_size()
@@ -205,121 +186,117 @@ impl ScriptData {
             + self.retained_code_size.load(Ordering::Relaxed)
     }
 
-    /// The rows of the top level for a sweep, which the parse of the source left here for its one compile.
-    pub(crate) fn take_top_level_rows(self: &Arc<Self>) -> Result<(SyntaxTree, u32), OutOfStack> {
-        let rows = self.top_level_rows.lock().expect("nothing panics with the rows").take();
-        let (ast, node) = rows.expect("a top level compiles once")?;
-        let tree = SyntaxTree {
+    /// A tree of `columns` with the node `root`, for a sweep, which goes by the summary of the first parse: nothing
+    /// in it is resolved.
+    pub(crate) fn tree_of_rows<'t>(self: &Arc<Self>, columns: AstColumns<'t>, root: u32) -> SyntaxTree<'t> {
+        SyntaxTree {
             script: self.clone(),
-            ast,
-            root: node,
-            first_token_start: 0,
-            is_strict_mode: false,
-            has_top_level_await: false,
-            eval_referenced_private_names: Vec::new(),
-            resolutions: Vec::new(),
-            scopes: ScopeTable::default(),
-            program_scope_row: 0,
-            function_scope_rows: Vec::new(),
+            source: self.positions.source.get(),
+            view: TreeView {
+                ast: columns,
+                root,
+                first_token_start: 0,
+                is_strict_mode: false,
+                has_top_level_await: false,
+                eval_referenced_private_names: &[],
+                resolutions: &[],
+                scopes: ScopeTable::default(),
+                program_scope_row: 0,
+                function_scope_rows: &[],
+            },
             outer_resolutions: None,
-        };
-        Ok((tree, node))
+        }
     }
 
-    /// Parses the function at `row` again into a tree for a sweep, which goes by the summary of the first parse: nothing
-    /// keeps track of scopes.
-    pub(crate) fn reparse_for_sweep(
+    /// Parses the function at `row` again into a tree in `zone` for a sweep, which goes by the summary of the first
+    /// parse: nothing keeps track of scopes.
+    pub(crate) fn reparse_for_sweep<'z>(
         self: &Arc<Self>,
+        zone: &'z Zone,
         row: FunctionRow,
         stack_limit: usize,
-    ) -> Result<(SyntaxTree, u32), OutOfStack> {
-        let memory = SPARE_TREE_MEMORY.take().unwrap_or_else(|| SpareTreeMemory {
-            ast: Ast::with_capacity(256),
-            resolutions: Vec::new(),
-            scopes: ScopeTable::default(),
-            function_scope_rows: Vec::new(),
-        });
+        inline_argument_limit: usize,
+    ) -> Result<(SyntaxTree<'z>, u32), OutOfStack> {
+        let source = self.positions.source.get();
         let (ast, node) = {
             let mut context = self.reparse_context.lock().expect("a reparse does not panic");
-            let context = context.get_or_insert_with(|| self.make_reparse_context());
-            match (context, self.positions.source.as_units()) {
-                (
-                    ReparseContext::Narrow(parser),
-                    ak::Utf16StringUnits::Ascii(units) | ak::Utf16StringUnits::Latin1(units),
-                ) => {
-                    parser.tracks_scopes = false;
-                    parser.marks = true;
-                    let result = self.reparse_code_units(parser, memory.ast, units, row, stack_limit);
-                    parser.tracks_scopes = true;
-                    parser.marks = false;
-                    result
-                }
-                (ReparseContext::Wide(parser), ak::Utf16StringUnits::Utf16(units)) => {
-                    parser.tracks_scopes = false;
-                    parser.marks = true;
-                    let result = self.reparse_code_units(parser, memory.ast, units, row, stack_limit);
-                    parser.tracks_scopes = true;
-                    parser.marks = false;
-                    result
-                }
-                _ => unreachable!("the storage of a source does not change"),
+            if context.is_none() {
+                *context = Some(self.make_reparse_context(zone));
+                SOURCES_WITH_REPARSE_CONTEXT
+                    .lock()
+                    .expect("nothing panics with the sources")
+                    .push(Arc::downgrade(self));
             }
+            self.reparse_context_idle_collections.store(0, Ordering::Relaxed);
+            let context = context.as_mut().expect("the context was just filled in");
+            let result = match source.as_units() {
+                ak::Utf16StringUnits::Ascii(units) | ak::Utf16StringUnits::Latin1(units) => {
+                    self.reparse_code_units(zone, context, units, row, stack_limit, inline_argument_limit)
+                }
+                ak::Utf16StringUnits::Utf16(units) => {
+                    self.reparse_code_units(zone, context, units, row, stack_limit, inline_argument_limit)
+                }
+            };
+            // NB: Collections counted on while the context was held, and it was not idle then.
+            self.reparse_context_idle_collections.store(0, Ordering::Relaxed);
+            result
         }?;
-        let tree = SyntaxTree {
-            script: self.clone(),
-            ast,
-            root: node,
-            first_token_start: 0,
-            is_strict_mode: false,
-            has_top_level_await: false,
-            eval_referenced_private_names: Vec::new(),
-            resolutions: memory.resolutions,
-            scopes: memory.scopes,
-            program_scope_row: 0,
-            function_scope_rows: memory.function_scope_rows,
-            outer_resolutions: None,
-        };
-        Ok((tree, node))
+        Ok((self.tree_of_rows(ast.into_columns(), node), node))
     }
 
-    fn make_reparse_context(&self) -> ReparseContext {
-        let module = self.program_type == ProgramType::Module;
-        let length = u32_from_usize(self.positions.source.length_in_code_units());
-        let interner = Interner::with_names(self.names.parser_names());
-        // SAFETY: The context lives in this ScriptData, whose index stays where it is, since it is shared by an Arc,
-        //         and never changes.
-        unsafe {
-            match self.positions.source.as_units() {
-                ak::Utf16StringUnits::Ascii(_) | ak::Utf16StringUnits::Latin1(_) => {
-                    ReparseContext::Narrow(Box::new(Parser::for_reparsing(module, interner, &self.index, length)))
-                }
-                ak::Utf16StringUnits::Utf16(_) => {
-                    ReparseContext::Wide(Box::new(Parser::for_reparsing(module, interner, &self.index, length)))
-                }
-            }
+    /// A reparse context, whose tables are worked out in `zone` and copied out at their final size.
+    fn make_reparse_context(&self, zone: &Zone) -> ReparseContext {
+        let names = KeptNames::of(&Interner::with_names(zone, self.names.parser_names()).tables());
+        let name_states = vec![base::UNUSED_NAME; names.len().next_power_of_two()].into_boxed_slice();
+        ReparseContext {
+            names,
+            name_states,
+            stamp: 0,
         }
     }
 
     /// Bytes after a function are real source, so that it can be read in place. What the lexer sees of a function that
     /// comes too close to the end of the source for that gets copied, with the padding that the end of the source has
     /// to have.
-    fn reparse_code_units<U: Unit + Default>(
+    fn reparse_code_units<'z, U: Unit + Default>(
         &self,
-        parser: &mut Parser<'static, U>,
-        ast: Ast,
+        zone: &'z Zone,
+        context: &mut ReparseContext,
         source: &[U],
         row: FunctionRow,
         stack_limit: usize,
-    ) -> Result<(Ast, u32), OutOfStack> {
+        inline_argument_limit: usize,
+    ) -> Result<(Ast<'z>, u32), OutOfStack> {
         let row_index = row.0 as usize;
+        // NB: A tree of the whole function is the most it is likely to have, as the tree skips the code of nested
+        //     functions. It starts with room for at most as many nodes as the work zone keeps memory for, and takes
+        //     room for the rest in one step if it outgrows that.
+        let length = (self.index.end[row_index] - self.index.start[row_index]) as usize;
+        let whole_function_nodes = length / 3 + 16;
+        let estimated_nodes = whole_function_nodes.min(1 << 16);
         let needs_padding = self.index.flags[row_index] & function_flag::REACHES_SOURCE_END != 0;
-        let mut tail = Vec::new();
+        let name_count = context.names.len();
+        let mut parser = Parser::for_reparsing(
+            zone,
+            self.program_type == ProgramType::Module,
+            Interner::of_tables(zone, context.names.tables_mut()),
+            &mut context.name_states,
+            context.stamp,
+            self.index.view(),
+            u32_from_usize(source.len()),
+            estimated_nodes,
+            validate_regex,
+        );
+        parser.ast.likely_most_nodes = whole_function_nodes;
+        parser.tracks_scopes = false;
+        parser.marks = true;
+        parser.inline_argument_limit = inline_argument_limit;
         // SAFETY: The source outlives the parse, and the first parse found out that the lexer stays clear of its end
         //         unless the tail is what it reads.
         unsafe {
             if needs_padding {
                 let first_read = self.index.params_start[row_index] as usize;
-                tail.reserve_exact(source.len() - first_read + SOURCE_PADDING);
+                let mut tail = ZoneVec::with_capacity_in(source.len() - first_read + SOURCE_PADDING, zone);
                 tail.extend_from_slice(&source[first_read..]);
                 tail.resize(tail.capacity(), U::default());
                 parser.set_reparse_source(tail.as_ptr(), u32_from_usize(first_read), u32_from_usize(source.len()));
@@ -328,11 +305,16 @@ impl ScriptData {
             }
         }
         parser.stack_limit = stack_limit;
-        parser.ast = ast;
         let node = parser.reparse_function(row.0);
         let error = parser.err.take();
-        let ast = std::mem::replace(&mut parser.ast, Ast::unallocated());
-        parser.finish_reparse();
+        // NB: The tables of the context, and the name states that cover them, stay as they are only if no name is new.
+        assert_eq!(
+            parser.interner.len(),
+            name_count,
+            "a function has only names that the first parse of its source found"
+        );
+        let (ast, stamp) = parser.end_reparse();
+        context.stamp = stamp;
         match error {
             None => Ok((ast, node)),
             Some(error) => {
@@ -349,6 +331,16 @@ impl ScriptData {
     pub(crate) fn is_global_name_used_in_with(&self, name: Name) -> bool {
         self.global_names_used_in_with.binary_search(&name.0).is_ok()
     }
+
+    /// What the resolver reads of this source.
+    fn resolver_view(&self) -> resolve::ScriptView<'_> {
+        resolve::ScriptView {
+            index: self.index.view(),
+            default_export_name: self.default_export_name,
+            is_module: self.program_type == ProgramType::Module,
+            global_names_used_in_with: &self.global_names_used_in_with,
+        }
+    }
 }
 
 pub struct ParseError {
@@ -360,7 +352,7 @@ pub struct ParseError {
 /// What code needs of its source to report positions, which it keeps for as long as it lives. That can be long after the
 /// rest of [`ScriptData`] is of no use to anything.
 pub struct SourcePositions {
-    pub(crate) source: ak::Utf16String,
+    pub(crate) source: Arc<SourceText>,
     pub(crate) lines: LineTable,
 }
 
@@ -383,21 +375,23 @@ impl LineTable {
         (self.line_starts.capacity() + self.low_surrogates.capacity()) * size_of::<u32>()
     }
 
-    fn new<U: Unit>(source: &[U], initial_line_number: u32) -> Self {
-        let mut line_starts = vec![0];
-        let mut low_surrogates = Vec::new();
-        let mut ends_with_lone_line_terminator = false;
+    /// The table of `source`, which is worked out in `zone` and copied out at its final size.
+    fn new<U: Unit>(zone: &Zone, source: &[U], initial_line_number: u32) -> Self {
+        let mut line_starts = ZoneVec::from_slice_in(&[0], zone);
+        let mut low_surrogates = ZoneVec::new_in(zone);
         let mut index = 0;
         while index < source.len() {
             let code_unit = source[index].code();
             index += 1;
-            ends_with_lone_line_terminator = false;
+            // OPTIMIZATION: Nearly every unit is neither a line terminator nor a surrogate, which one range rules out.
+            if (0x0E..0x2028).contains(&code_unit) {
+                continue;
+            }
             if code_unit == 0x0D && source.get(index).is_some_and(|next| next.code() == 0x0A) {
                 index += 1;
                 line_starts.push(u32_from_usize(index));
             } else if matches!(code_unit, 0x0A | 0x0D | 0x2028 | 0x2029) {
                 line_starts.push(u32_from_usize(index));
-                ends_with_lone_line_terminator = true;
             } else if U::WIDE
                 && (0xD800..0xDC00).contains(&code_unit)
                 && source
@@ -408,9 +402,15 @@ impl LineTable {
                 index += 1;
             }
         }
+        // NB: A line feed after a carriage return ends the line that the carriage return started.
+        let ends_with_lone_line_terminator = match source {
+            [.., before, last] if last.code() == 0x0A => before.code() != 0x0D,
+            [.., last] => matches!(last.code(), 0x0A | 0x0D | 0x2028 | 0x2029),
+            [] => false,
+        };
         Self {
-            line_starts,
-            low_surrogates,
+            line_starts: line_starts.to_vec(),
+            low_surrogates: low_surrogates.to_vec(),
             source_length: u32_from_usize(source.len()),
             ends_with_lone_line_terminator,
             initial_line_number,
@@ -533,153 +533,161 @@ impl ParseOptions {
     }
 }
 
-/// What parsing a source without errors leaves behind.
-/// The rows of a top level with marks, and the row of the program.
-type TopLevelRows = Result<(Ast, u32), OutOfStack>;
+/// The rows of a top level with marks for a sweep, and the row of the program, or that they did not fit the stack.
+pub(crate) type TopLevelRows<'z> = Result<(AstColumns<'z>, u32), OutOfStack>;
 
-/// What a parse is for, which decides whether there is any use in rows for a sweep.
+/// What a parse is for, which decides whether there is any use in a tree.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ParsePurpose {
     Compile,
     CheckSyntax,
 }
 
-struct ParserOutput {
-    ast: Ast,
-    top_level_rows: Option<TopLevelRows>,
-    index: FunctionIndex,
-    interner: Interner,
-    root: u32,
-    first_token_start: u32,
-    is_strict_mode: bool,
-    has_top_level_await: bool,
-    eval_referenced_private_names: Vec<u32>,
-    global_names_used_in_with: Vec<u32>,
-    lines: LineTable,
-}
-
-/// Parses `source`, from a copy of it that is followed by the padding the lexer needs for as long as the parse takes.
-fn parse_code_units<U: Unit + Default>(
-    source: &[U],
+/// Parses `units`, the code units of `source`, from a copy of them in `zone` that is followed by the padding the lexer
+/// needs. A parse for a compile runs `job` on the tree of the source and the rows of its top level, in the zone.
+fn parse_code_units<'z, U: Unit + Default, R>(
+    zone: &'z Zone,
+    source: &ak::Utf16String,
+    units: &[U],
     options: &ParseOptions,
     purpose: ParsePurpose,
-) -> Result<ParserOutput, Vec<ParseError>> {
-    let mut padded = Vec::with_capacity(source.len() + SOURCE_PADDING);
-    padded.extend_from_slice(source);
-    padded.resize(source.len() + SOURCE_PADDING, U::default());
+    job: impl FnOnce(&SyntaxTree<'z>, TopLevelRows<'z>) -> R,
+) -> Result<Option<R>, Vec<ParseError>> {
+    let mut padded = ZoneVec::with_capacity_in(units.len() + SOURCE_PADDING, zone);
+    padded.extend_from_slice(units);
+    padded.resize(units.len() + SOURCE_PADDING, U::default());
+    let padded = padded.into_slice();
     // SAFETY: The source is followed by the padding.
     let mut parser = unsafe {
         Parser::new(
-            &padded[..source.len()],
+            zone,
+            &padded[..units.len()],
             options.program_type == ProgramType::Module,
             if options.keep_whole_tree {
                 Mode::Full
             } else {
                 Mode::Lazy
             },
+            &KeptNames::initial(zone).tables(),
+            validate_regex,
+            vm_stack_limit_of_this_thread(),
         )
     };
     parser.strict |= options.starts_in_strict_mode;
     parser.initiated_by_eval = options.initiated_by_eval;
     parser.add_context(options.program_context().context);
     let root = parser.parse_program();
-    let lines = LineTable::new(source, options.initial_line_number);
     if let Some(error) = parser.err.take() {
-        let position = lines.position(error.pos.min(u32_from_usize(source.len())));
+        let lines = LineTable::new(zone, units, options.initial_line_number);
+        let position = lines.position(error.pos.min(u32_from_usize(units.len())));
         return Err(vec![ParseError {
-            message: error.message,
+            message: error.message.to_owned(),
             line: position.line,
             column: position.column,
         }]);
     }
-    let top_level_rows =
-        (purpose == ParsePurpose::Compile).then(|| parser.parse_top_level_rows(options.program_context()));
-    Ok(ParserOutput {
-        top_level_rows,
-        root,
-        first_token_start: parser.first_token_start,
-        is_strict_mode: parser.strict,
-        has_top_level_await: parser.has_top_level_await,
-        ast: parser.ast,
-        index: parser.index,
-        interner: parser.interner,
-        eval_referenced_private_names: parser.eval_referenced_private_names,
-        global_names_used_in_with: parser.global_names_used_in_with,
-        lines,
-    })
-}
-
-/// Parses `source` at the width of its storage.
-fn parse_source(
-    source: &ak::Utf16String,
-    options: &ParseOptions,
-    purpose: ParsePurpose,
-) -> Result<ParserOutput, Vec<ParseError>> {
-    match source.as_units() {
-        ak::Utf16StringUnits::Ascii(units) | ak::Utf16StringUnits::Latin1(units) => {
-            parse_code_units(units, options, purpose)
-        }
-        ak::Utf16StringUnits::Utf16(units) => parse_code_units(units, options, purpose),
+    if purpose == ParsePurpose::CheckSyntax {
+        return Ok(None);
     }
-}
-
-/// Parses `source` into a tree of its top-level code with its identifiers resolved.
-pub fn parse_to_tree(source: &ak::Utf16String, options: &ParseOptions) -> Result<SyntaxTree, Vec<ParseError>> {
-    let mut output = parse_source(source, options, ParsePurpose::Compile)?;
-    let default_export_name = Name(output.interner.intern_bytes(b"*default*"));
-    let default_constructor_parameter_name = Name(output.interner.intern_bytes(b"args"));
-    let names =
-        NameTable::from_parser_names((0..output.interner.len()).map(|name| output.interner.text(u32_from_usize(name))));
-    let mut global_names_used_in_with = output.global_names_used_in_with;
+    let lines = LineTable::new(zone, units, options.initial_line_number);
+    let index = core::mem::replace(&mut parser.index, FunctionIndexBuilder::with_capacity(zone, 0)).finish();
+    let top_level_rows = parser
+        .parse_top_level_rows(
+            options.program_context(),
+            index,
+            crate::bytecode::operand::MAX_OPERAND_LIST_LENGTH,
+        )
+        .map(|(rows, node)| (rows.into_columns(), node));
+    let default_export_name = Name(parser.interner.intern_bytes(b"*default*"));
+    let default_constructor_parameter_name = Name(parser.interner.intern_bytes(b"args"));
+    let interner = &parser.interner;
+    let names = NameTable::from_parser_names((0..interner.len()).map(|name| interner.text(u32_from_usize(name))));
+    let mut global_names_used_in_with = parser.global_names_used_in_with.take();
     global_names_used_in_with.sort_unstable();
     global_names_used_in_with.dedup();
-    output.index.shrink_to_fit();
+    let eval_referenced_private_names =
+        zone.alloc_slice_from_iter(parser.eval_referenced_private_names.iter().map(|&name| Name(name)));
     let script = Arc::new(ScriptData {
-        index: output.index,
+        index: FunctionIndex::of(&index),
         names,
         positions: Arc::new(SourcePositions {
-            source: source.clone(),
-            lines: output.lines,
+            source: SourceText::of(source),
+            lines,
         }),
         program_type: options.program_type,
         program_context: options.program_context(),
-        top_level_rows: Mutex::new(output.top_level_rows),
         default_export_name,
         default_constructor_parameter_name,
-        global_names_used_in_with,
+        global_names_used_in_with: global_names_used_in_with.to_vec(),
         reparse_context: Mutex::new(None),
+        reparse_context_idle_collections: AtomicU8::new(0),
         retains_compiled_functions: AtomicBool::new(false),
         retained_code_size: AtomicUsize::new(0),
     });
-    let mut tree = SyntaxTree {
-        script,
-        ast: output.ast,
-        root: output.root,
-        first_token_start: output.first_token_start,
-        is_strict_mode: output.is_strict_mode,
-        has_top_level_await: options.program_type == ProgramType::Module && output.has_top_level_await,
-        eval_referenced_private_names: output
-            .eval_referenced_private_names
-            .iter()
-            .map(|&name| Name(name))
-            .collect(),
-        resolutions: Vec::new(),
+    let view = TreeView {
+        ast: parser.ast.into_columns(),
+        root,
+        first_token_start: parser.first_token_start,
+        is_strict_mode: parser.strict,
+        has_top_level_await: options.program_type == ProgramType::Module && parser.has_top_level_await,
+        eval_referenced_private_names,
+        resolutions: &[],
         scopes: ScopeTable::default(),
         program_scope_row: 0,
-        function_scope_rows: Vec::new(),
-        outer_resolutions: None,
+        function_scope_rows: &[],
     };
-    resolve::resolve_program(
-        &mut tree,
+    let resolved = resolve::resolve_program(
+        zone,
+        &view,
+        &script.resolver_view(),
         &resolve::ResolveOptions {
             initiated_by_eval: options.initiated_by_eval,
             suppress_globals: options.suppress_globals,
         },
     );
-    Ok(tree)
+    let tree = SyntaxTree {
+        script,
+        source: source.clone(),
+        view: TreeView {
+            resolutions: resolved.resolutions,
+            scopes: resolved.scopes,
+            program_scope_row: resolved.program_scope_row,
+            function_scope_rows: resolved.function_scope_rows,
+            ..view
+        },
+        outer_resolutions: OuterResolutions::of_entries(resolved.outer_entries),
+    };
+    Ok(Some(job(&tree, top_level_rows)))
+}
+
+/// Parses `source` at the width of its storage, in one job with the work zone of the thread for all of its work data.
+fn parse_source<R>(
+    source: &ak::Utf16String,
+    options: &ParseOptions,
+    purpose: ParsePurpose,
+    job: impl for<'z> FnOnce(&SyntaxTree<'z>, TopLevelRows<'z>) -> R,
+) -> Result<Option<R>, Vec<ParseError>> {
+    with_work_zone(|zone| match source.as_units() {
+        ak::Utf16StringUnits::Ascii(units) | ak::Utf16StringUnits::Latin1(units) => {
+            parse_code_units(zone, source, units, options, purpose, job)
+        }
+        ak::Utf16StringUnits::Utf16(units) => parse_code_units(zone, source, units, options, purpose, job),
+    })
+}
+
+/// Parses `source` into a tree of its top-level code with its identifiers resolved, and runs `job` on the tree and the
+/// rows of its top level for a sweep. The tree lives only as long as the job of the parse, so `job` is the rest of the
+/// work that needs it.
+pub fn with_parsed_tree<R>(
+    source: &ak::Utf16String,
+    options: &ParseOptions,
+    job: impl for<'z> FnOnce(&SyntaxTree<'z>, TopLevelRows<'z>) -> R,
+) -> Result<R, Vec<ParseError>> {
+    parse_source(source, options, ParsePurpose::Compile, job)
+        .map(|result| result.expect("a parse for a compile runs its job"))
 }
 
 /// Parses `source` for its syntax errors alone.
 pub fn check_syntax(source: &ak::Utf16String, options: &ParseOptions) -> Result<(), Vec<ParseError>> {
-    parse_source(source, options, ParsePurpose::CheckSyntax).map(|_| ())
+    parse_source(source, options, ParsePurpose::CheckSyntax, |_, _| ()).map(|_| ())
 }

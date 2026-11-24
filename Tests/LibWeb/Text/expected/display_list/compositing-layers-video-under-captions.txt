@@ -1,0 +1,17 @@
+AccumulatedVisualContext Tree:
+  spatial:
+    [s0] transform=[1,0,0,1,0,0] origin=(0,0) (Viewport<#document>)
+      [s1] scroll (Viewport<#document>)
+  effects:
+    [e0 in s0] effects=[]
+
+Layers (for a window server that shows tiles and filters what is below layers):
+  [L0] base space=viewport
+  [L1] video #0 space=viewport region=[7,37 326x186] can be shown by the window server: clip=[0,0 800x600]
+  [L2] painted space=viewport above L1
+
+DisplayList:
+L1 DrawVideoFrame@s1/e0 dst_rect=[10,40 320x180] video_sink_handle=video1 scaling_mode=BilinearMipmap inline_clips=[clip=[10,10 320x240], clip=[10,10 320x240] radii=(16,16,16,16)] owner=VideoBox<VIDEO>#video phase=foreground
+L2 FillRect@s1/e0 rect=[30,200 203x24] color=rgba(0, 0, 0, 0.6) owner=BlockContainer<DIV>#captions phase=background
+L2 DrawGlyphRun@s1/e0 font_id=font1 glyphs=23 rect=[34,204 195x16] glyph_bounding_rect=[34,204 197x15] translation=[34,217] color=rgb(255, 255, 255) text="Captions over the video" owner=BlockContainer<DIV>#captions phase=foreground
+

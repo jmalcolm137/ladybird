@@ -7,8 +7,10 @@
 pub mod ffi_types;
 pub mod queries;
 pub mod scroll_state;
+mod scroll_table;
 pub mod serialize;
 pub mod visual_animations;
+pub mod world_transforms;
 
 use std::collections::HashMap;
 
@@ -18,21 +20,27 @@ use libgfx_rust::{
     CompositingAndBlendingOperator, CornerRadii, FloatMatrix4x4, FloatPoint, FloatRect, FloatSize, IntRect, MaskKind,
     WindingRule, translation_matrix,
 };
+use libipc_rust::wire::{Decode, Encode};
 use scroll_state::{NO_SCROLL_STATE_SLOT, ScrollStateSlot};
 
 pub use crate::display_list::commands::{
-    ClipMode, ClipNodeIndex, ContextRef, EffectNodeIndex, SpatialNodeIndex, VISUAL_VIEWPORT_NODE_INDEX,
+    ClipMode, ClipNodeIndex, ContextRef, EffectNodeIndex, SpatialNodeIndex, UniqueNodeId, VISUAL_VIEWPORT_NODE_INDEX,
 };
 pub use queries::{ClipBehavior, should_cull_back_face};
+pub use scroll_table::{
+    CompositorScrollNodeKind, CompositorScrollNodeRecord, CompositorScrollTable, CompositorSnapAreaRecord,
+    CompositorSnapContainerRecord,
+};
+pub use world_transforms::{RasterRoot, RectMapping, WorldTransforms};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode)]
 #[repr(u8)]
 pub enum TransformDataRole {
     CssTransform,
     SvgViewportTransform,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Encode, Decode)]
 pub struct TransformData {
     pub matrix: FloatMatrix4x4,
     pub origin: FloatPoint,
@@ -54,19 +62,19 @@ impl TransformData {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Encode, Decode)]
 pub struct PerspectiveData {
     pub matrix: FloatMatrix4x4,
     pub flattens_inherited_transform: bool,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode)]
 pub struct BackfaceVisibilityData {
     pub plane_root_index: SpatialNodeIndex,
     pub flattens_inherited_transform: bool,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Encode, Decode)]
 pub struct ClipData {
     pub rect: FloatRect,
     pub corner_radii: CornerRadii,
@@ -80,22 +88,31 @@ pub struct ClipPathData {
     pub fill_rule: WindingRule,
 }
 
-// The filtered backdrop, limited to the box's rounded border box, is the initial content of the box's
-// layer, so the layer's opacity, blend mode and filter apply to it along with the box's content.
-#[derive(Clone, PartialEq)]
-pub struct BackdropFilterData {
-    pub filter: std::sync::Arc<Vec<u8>>,
-    pub region: IntRect,
-    pub corner_radii: CornerRadii,
+impl PartialEq for ClipPathData {
+    fn eq(&self, other: &Self) -> bool {
+        self.bounding_rect == other.bounding_rect
+            && self.fill_rule == other.fill_rule
+            && (std::sync::Arc::ptr_eq(&self.path, &other.path)
+                || self.path.serialize_to_bytes() == other.path.serialize_to_bytes())
+    }
 }
 
-#[derive(Clone)]
+/// The filtered backdrop, limited to the box's rounded border box, is the initial content of the box's layer, so the
+/// layer's opacity, blend mode and filter apply to it along with the box's content.
+#[derive(Clone, PartialEq, Encode, Decode)]
+pub struct BackdropFilterData {
+    pub region: IntRect,
+    pub corner_radii: CornerRadii,
+    pub filter: std::sync::Arc<Vec<u8>>,
+}
+
+#[derive(Clone, PartialEq, Encode, Decode)]
 pub struct EffectsData {
-    pub isolation: bool,
     pub opacity: f32,
     pub blend_mode: CompositingAndBlendingOperator,
     pub filter: Option<std::sync::Arc<Vec<u8>>>,
     pub backdrop_filter: Option<BackdropFilterData>,
+    pub isolation: bool,
 }
 
 impl EffectNodeData {
@@ -130,7 +147,7 @@ impl EffectsData {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode)]
 #[repr(u8)]
 pub enum MaskLayerOrigin {
     CssMaskLayers,
@@ -138,7 +155,7 @@ pub enum MaskLayerOrigin {
     SvgClip,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode)]
 pub struct MaskData {
     pub rect: IntRect,
     pub kind: MaskKind,
@@ -148,34 +165,42 @@ pub struct MaskData {
     pub masks_backdrop: bool,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode)]
 pub struct ScrollData {
+    #[ipc(skip = NO_SCROLL_STATE_SLOT)]
     pub state_slot: ScrollStateSlot,
+    #[ipc(skip = NodeSlotId::INVALID)]
     pub owner_paintable: NodeSlotId,
 }
 
-// A sticky box's shift is derived when the scroll state snapshot is resolved, from the scroller's
-// entry and the parent sticky chain. Both references follow the containing block chain, which
-// continues through fixed-position ancestors, so they need not be spatial ancestors of the node.
-// Geometry is in device pixels.
-#[derive(Clone, Copy, Debug, PartialEq)]
+/// A sticky box's shift is derived when the scroll state snapshot is resolved, from the scroller's entry and the parent
+/// sticky chain. Both references follow the containing block chain, which continues through fixed-position ancestors,
+/// so they need not be spatial ancestors of the node. Geometry is in device pixels.
+#[derive(Clone, Copy, Debug, PartialEq, Encode, Decode)]
 pub struct StickyData {
     pub scroller: SpatialNodeIndex,
     pub parent_sticky: Option<SpatialNodeIndex>,
     pub position_relative_to_scroller: FloatPoint,
+    /// Where the box's border box was recorded, which is where replay rounds it to.
+    pub border_box_origin: FloatPoint,
     pub border_box_size: FloatSize,
     pub scrollport_size: FloatSize,
     pub containing_block_region: FloatRect,
     pub needs_parent_offset_adjustment: bool,
-    // The nearest scroll container of the box when it has no scroll node, because it has no scrollable overflow and
-    // passes its scrolls on. Its scrollport never moves, and the geometry above is relative to it rather than to the
-    // scroller.
+    /// The nearest scroll container of the box when it has no scroll node, because it has no scrollable overflow and
+    /// passes its scrolls on. Its scrollport never moves, and the geometry above is relative to it rather than to the
+    /// scroller.
     pub non_scrolling_scroll_container: NodeSlotId,
     pub inset_top: Option<f32>,
     pub inset_right: Option<f32>,
     pub inset_bottom: Option<f32>,
     pub inset_left: Option<f32>,
+    /// The element the box is generated for, which names the box across relayouts, trees and processes.
+    pub box_node_id: UniqueNodeId,
+    pub box_pseudo_element_type: u8,
+    #[ipc(skip = NO_SCROLL_STATE_SLOT)]
     pub state_slot: ScrollStateSlot,
+    #[ipc(skip = NodeSlotId::INVALID)]
     pub owner_paintable: NodeSlotId,
 }
 
@@ -190,6 +215,7 @@ impl StickyData {
             scroller,
             parent_sticky,
             position_relative_to_scroller: FloatPoint::default(),
+            border_box_origin: FloatPoint::default(),
             border_box_size: FloatSize::default(),
             scrollport_size: FloatSize::default(),
             containing_block_region: FloatRect::default(),
@@ -199,6 +225,8 @@ impl StickyData {
             inset_right: None,
             inset_bottom: None,
             inset_left: None,
+            box_node_id: UniqueNodeId(0),
+            box_pseudo_element_type: 0,
             state_slot,
             owner_paintable,
         }
@@ -209,7 +237,7 @@ impl StickyData {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode)]
 pub struct AnchorScrollShift {
     pub scroll_node_index: SpatialNodeIndex,
     pub negate: bool,
@@ -247,12 +275,41 @@ pub enum IncludeVisualViewportTransform {
     Yes,
 }
 
-struct LocalSpatialMatrix {
-    matrix: FloatMatrix4x4,
-    flattens_inherited_transform: bool,
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum LocalTransformKind {
+    Identity,
+    Translation(FloatPoint),
+    Affine2D,
+    Projective,
 }
 
-#[derive(Clone)]
+/// What one spatial node contributes to the spatial chains through it.
+#[derive(Clone, Copy, Debug)]
+pub struct LocalTransform {
+    pub matrix: FloatMatrix4x4,
+    pub flattens_inherited_transform: bool,
+    pub kind: LocalTransformKind,
+    pub establishes_sorting_context: bool,
+    pub sorting_context_root: Option<SpatialNodeIndex>,
+    pub backface_plane_root: Option<SpatialNodeIndex>,
+}
+
+impl LocalTransform {
+    pub fn applied_to(&self, parent_matrix: FloatMatrix4x4) -> FloatMatrix4x4 {
+        let inherited = if self.flattens_inherited_transform {
+            parent_matrix.flattened()
+        } else {
+            parent_matrix
+        };
+        inherited.multiplied(self.matrix)
+    }
+
+    pub fn is_transform_or_perspective(&self) -> bool {
+        matches!(self.kind, LocalTransformKind::Affine2D | LocalTransformKind::Projective)
+    }
+}
+
+#[derive(Clone, PartialEq, Encode, Decode)]
 pub enum SpatialData {
     Scroll(ScrollData),
     Sticky(StickyData),
@@ -263,17 +320,17 @@ pub enum SpatialData {
     Dead,
 }
 
-// The clip tree holds what narrows the painted region without a layer: rectangle (possibly rounded,
-// possibly subtractive) clips and clip paths. The effect tree holds what needs a layer or a
-// per-box marker: opacity/blend/filter layers, masks and compositor background-color animations.
-#[derive(Clone)]
+/// The clip tree holds what narrows the painted region without a layer: rectangle (possibly rounded, possibly
+/// subtractive) clips and clip paths. The effect tree holds what needs a layer or a per-box marker: opacity, blend and
+/// filter layers, masks and compositor background-color animations.
+#[derive(Clone, PartialEq, Encode, Decode)]
 pub enum ClipNodeData {
     Rect(ClipData),
     Path(ClipPathData),
     Dead,
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Encode, Decode)]
 pub enum EffectNodeData {
     Effects(EffectsData),
     Mask(MaskData),
@@ -288,6 +345,22 @@ impl SpatialData {
 
     pub fn is_scroll_like(&self) -> bool {
         matches!(self, Self::Scroll(_) | Self::Sticky(_))
+    }
+
+    /// Whether the node is what `other` is, but for the scroll state slot and the paintable that the main thread keeps
+    /// of a scroll node or a sticky box.
+    fn has_same_content_as(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Scroll(_), Self::Scroll(_)) => true,
+            (Self::Sticky(sticky), Self::Sticky(other_sticky)) => {
+                StickyData {
+                    state_slot: other_sticky.state_slot,
+                    owner_paintable: other_sticky.owner_paintable,
+                    ..*sticky
+                } == *other_sticky
+            }
+            _ => self == other,
+        }
     }
 }
 
@@ -317,19 +390,19 @@ impl EffectNodeData {
         matches!(self, Self::Effects(_) | Self::Mask(_))
     }
 
-    // An empty mask leaves nothing of the content it wraps.
+    /// An empty mask leaves nothing of the content it wraps.
     pub fn culls_everything(&self) -> bool {
         matches!(self, Self::Mask(mask) if mask.rect.is_empty())
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq)]
 pub struct SpatialNode {
     pub data: SpatialData,
     pub parent: SpatialNodeIndex,
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq)]
 pub struct ClipNode {
     pub data: ClipNodeData,
     pub parent: ClipNodeIndex,
@@ -349,9 +422,9 @@ impl ClipNode {
     }
 }
 
-// The clip in force where an effect begins is a local visual-context fact. Replay
-// widens this boundary to accommodate the recorded descendants' clip chains.
-#[derive(Clone)]
+/// `local_clip` is the clip in force where the effect begins. Replay widens this boundary to accommodate the recorded
+/// descendants' clip chains.
+#[derive(Clone, PartialEq)]
 pub struct EffectNode {
     pub data: EffectNodeData,
     pub parent: EffectNodeIndex,
@@ -375,9 +448,8 @@ impl EffectNode {
     }
 }
 
-// The slot lifecycle every node kind shares: a slot is allocated from the free list or by growing
-// the array, retired into quarantine until the recording that may still name it completes, and
-// released to the free list afterwards.
+/// The slot lifecycle every node kind shares: a slot is allocated from the free list or by growing the array, retired
+/// into quarantine until the recording that may still name it completes, and released to the free list afterwards.
 pub trait SlotNode: Sized {
     type Index: Copy + PartialEq + std::fmt::Debug;
     fn index(raw: u32) -> Self::Index;
@@ -387,7 +459,7 @@ pub trait SlotNode: Sized {
     fn tombstone(&mut self);
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq)]
 struct SlotAccounting<Index> {
     live_count: u32,
     free: Vec<Index>,
@@ -512,18 +584,17 @@ impl SlotNode for EffectNode {
     }
 }
 
-// Marks a spatial node whose content belongs to no 3D rendering context.
 pub const NO_SORTING_CONTEXT: SpatialNodeIndex = SpatialNodeIndex(u32::MAX);
 
-// The plane and 3D rendering context that an established context's own plane renders into.
+/// The plane and 3D rendering context that an established context's own plane renders into.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SortingContextLink {
     pub parent_context: SpatialNodeIndex,
     pub parent_leaf: SpatialNodeIndex,
 }
 
-// Per-spatial-node 3D rendering context membership: the plane each node's content renders into and the context that
-// sorts that plane. A tree without 3D rendering contexts resolves to empty per-node vectors.
+/// Per-spatial-node 3D rendering context membership: the plane each node's content renders into and the context that
+/// sorts that plane. A tree without 3D rendering contexts resolves to empty per-node vectors.
 #[derive(Default)]
 pub struct SortingContexts {
     pub links: HashMap<u32, SortingContextLink>,
@@ -549,6 +620,17 @@ impl SortingContexts {
     }
 }
 
+fn maps_depth_zero_plane_onto_itself_without_foreshortening(matrix: &FloatMatrix4x4) -> bool {
+    let m = &matrix.elements;
+    m[2][0] == 0.0 && m[2][1] == 0.0 && m[2][3] == 0.0 && m[3][0] == 0.0 && m[3][1] == 0.0 && m[3][3] == 1.0
+}
+
+fn plane_leaves_plane_of_its_sorting_context(node: &SpatialNode) -> bool {
+    matches!(&node.data, SpatialData::Transform(transform)
+        if transform.sorting_context_root_index.is_some()
+            && !maps_depth_zero_plane_onto_itself_without_foreshortening(&transform.matrix))
+}
+
 pub fn resolve_sorting_contexts_over_nodes(
     node_count: usize,
     nodes_in_dependency_order: &[u32],
@@ -567,8 +649,8 @@ pub fn resolve_sorting_contexts_over_nodes(
         return SortingContexts::default();
     }
 
-    // The dependency order lists a node after its parent and its sorting context root, so a single
-    // walk along it resolves every node from entries already written.
+    // The dependency order lists a node after its parent and its sorting context root, so a single walk along it
+    // resolves every node from entries already written.
     let mut contexts = SortingContexts {
         links: HashMap::new(),
         leaf_by_node: vec![NO_SORTING_CONTEXT; node_count],
@@ -668,7 +750,7 @@ pub struct VisualContextTreeCopy(u64);
 
 impl VisualContextTreeCopy {
     fn new() -> Self {
-        // NB: The process's counter numbers nothing but what its numbers are told apart from.
+        // NB: Sharing the counter with structural epochs is fine, as copy numbers are only told apart from each other.
         Self(allocate_structural_epoch())
     }
 
@@ -683,25 +765,37 @@ impl Clone for VisualContextTreeCopy {
     }
 }
 
+/// For a tree that holds the values the compositor's animations take at a time, the number of the copy it took them
+/// from. A copy of it takes no number, as anything written to the copy makes it a tree of its own.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct AnimationSamplesTakenFromCopy(Option<u64>);
+
+impl Clone for AnimationSamplesTakenFromCopy {
+    fn clone(&self) -> Self {
+        Self(None)
+    }
+}
+
 #[derive(Clone)]
 pub struct VisualContextTree {
     pub copy: VisualContextTreeCopy,
+    pub animation_samples_taken_from_copy: AnimationSamplesTakenFromCopy,
     pub spatial_nodes: Vec<SpatialNode>,
     pub clip_nodes: Vec<ClipNode>,
     pub effect_nodes: Vec<EffectNode>,
-    // The layer at the root of the effect tree that 3D plane clips are pushed right above.
+    /// The layer at the root of the effect tree that 3D plane clips are pushed right above.
     pub root_isolation_effect: Option<EffectNodeIndex>,
     pub structural_epoch: u64,
     spatial_slots: SlotAccounting<SpatialNodeIndex>,
     clip_slots: SlotAccounting<ClipNodeIndex>,
     effect_slots: SlotAccounting<EffectNodeIndex>,
-    // Keyed by effect node index.
-    sampled_background_colors: HashMap<u32, libgfx_rust::Color>,
-    // The compositor animations the main thread published with this tree, which name its nodes.
+    sampled_background_color_by_effect_index: HashMap<u32, libgfx_rust::Color>,
     visual_animations: std::sync::Arc<[VisualAnimation]>,
+    visual_animation_targets: std::sync::Arc<visual_animations::VisualAnimationTargets>,
+    compositor_scroll_table: CompositorScrollTable,
 }
 
-// A tree is shared by the arena and by the handles C++ retains; any thread may come to hold it.
+// A tree is shared by the arena, recordings, display list storages and presentations; any thread may come to hold it.
 const _: () = {
     const fn assert_send_and_sync<T: Send + Sync>() {}
     assert_send_and_sync::<VisualContextTree>();
@@ -741,9 +835,7 @@ fn for_each_spatial_node_reference(
     }
 }
 
-// Calls `visit` for every live node after its parent, by walking up from each node through the
-// ancestors not yet visited. Unlike the dependency orders this materializes no order and follows
-// parent links only, which is all that per-node values derived from the parent's value need.
+// Unlike the dependency orders, follows parent links only, which is all that values derived from a parent's value need.
 fn visit_nodes_parents_first(
     node_count: usize,
     is_live: impl Fn(usize) -> bool,
@@ -847,6 +939,7 @@ impl VisualContextTree {
             effect_nodes: Vec::new(),
             root_isolation_effect: None,
             copy: VisualContextTreeCopy::new(),
+            animation_samples_taken_from_copy: AnimationSamplesTakenFromCopy::default(),
             structural_epoch: allocate_structural_epoch(),
             spatial_slots: SlotAccounting {
                 live_count: 1,
@@ -854,12 +947,27 @@ impl VisualContextTree {
             },
             clip_slots: SlotAccounting::default(),
             effect_slots: SlotAccounting::default(),
-            sampled_background_colors: HashMap::new(),
+            sampled_background_color_by_effect_index: HashMap::new(),
             visual_animations: std::sync::Arc::from(Vec::new()),
+            visual_animation_targets: std::sync::Arc::default(),
+            compositor_scroll_table: CompositorScrollTable::default(),
         }
     }
 
-    // A tree over decoded arrays: no slot is free or quarantined, the live counts are recounted.
+    pub fn create_identity() -> Self {
+        Self::create(TransformData {
+            matrix: libgfx_rust::FloatMatrix4x4::identity(),
+            origin: libgfx_rust::FloatPoint::default(),
+            sorting_context_root_index: None,
+            flattens_inherited_transform: false,
+            role: TransformDataRole::CssTransform,
+            synthetic_plane: false,
+            establishes_sorting_context: false,
+            bounds: libgfx_rust::FloatRect::default(),
+        })
+    }
+
+    /// A tree over decoded arrays: no slot is free or quarantined, the live counts are recounted.
     pub fn from_nodes(
         spatial_nodes: Vec<SpatialNode>,
         clip_nodes: Vec<ClipNode>,
@@ -882,10 +990,54 @@ impl VisualContextTree {
             effect_nodes,
             root_isolation_effect,
             copy: VisualContextTreeCopy::new(),
+            animation_samples_taken_from_copy: AnimationSamplesTakenFromCopy::default(),
             structural_epoch,
-            sampled_background_colors: HashMap::new(),
+            sampled_background_color_by_effect_index: HashMap::new(),
             visual_animations: std::sync::Arc::from(Vec::new()),
+            visual_animation_targets: std::sync::Arc::default(),
+            compositor_scroll_table: CompositorScrollTable::default(),
         }
+    }
+
+    /// Whether the tree is what `other` is in everything but which copy it is, so that whatever is worked out of one
+    /// holds for the other. What only the main thread reads is left out: which slots are free, and the scroll state
+    /// slots and the paintables of scroll nodes and sticky boxes, which a tree from another process does not carry.
+    pub fn has_same_content_as(&self, other: &Self) -> bool {
+        self.structural_epoch == other.structural_epoch
+            && self.animation_samples_taken_from_copy == other.animation_samples_taken_from_copy
+            && self.root_isolation_effect == other.root_isolation_effect
+            && self.spatial_nodes.len() == other.spatial_nodes.len()
+            && self
+                .spatial_nodes
+                .iter()
+                .zip(&other.spatial_nodes)
+                .all(|(node, other_node)| {
+                    node.parent == other_node.parent && node.data.has_same_content_as(&other_node.data)
+                })
+            && self.clip_nodes == other.clip_nodes
+            && self.effect_nodes == other.effect_nodes
+            && self.sampled_background_color_by_effect_index == other.sampled_background_color_by_effect_index
+            && self.visual_animations == other.visual_animations
+            && self.compositor_scroll_table == other.compositor_scroll_table
+    }
+
+    /// The number of the copy of the tree without the samples of the compositor's animations, which changes only as the
+    /// main thread publishes a tree or the compositor writes to the tree other than by sampling its animations.
+    pub fn copy_without_animation_samples(&self) -> u64 {
+        self.animation_samples_taken_from_copy.0.unwrap_or(self.copy.number())
+    }
+
+    pub fn compositor_scroll_table(&self) -> &CompositorScrollTable {
+        &self.compositor_scroll_table
+    }
+
+    pub fn set_compositor_scroll_table(&mut self, table: CompositorScrollTable) -> bool {
+        debug_assert!(table.is_valid_for_tree(self));
+        if self.compositor_scroll_table == table {
+            return false;
+        }
+        self.compositor_scroll_table = table;
+        true
     }
 
     pub fn spatial_is_live(&self, index: SpatialNodeIndex) -> bool {
@@ -906,7 +1058,6 @@ impl VisualContextTree {
             .is_some_and(|node| node.data.is_live())
     }
 
-    // The absent node passes for live where a reference may be absent.
     pub fn clip_is_none_or_live(&self, index: ClipNodeIndex) -> bool {
         index.is_none() || self.clip_is_live(index)
     }
@@ -1082,13 +1233,12 @@ impl VisualContextTree {
         VisualContextNodeSink::clip_is_ancestor_or_self(self, ancestor, node)
     }
 
-    // Record the clip in force where this effect begins.
     pub fn append_effect_node_under(&mut self, context: ContextRef, data: EffectNodeData) -> ContextRef {
         let effect = self.append_effect(data, context.effect, context.spatial, context.clip);
         ContextRef { effect, ..context }
     }
 
-    // Root path lengths of the clip nodes; the absent clip has depth 0.
+    /// Root path lengths of the clip nodes; the absent clip has depth 0.
     pub fn clip_depths(&self) -> Vec<u32> {
         let mut depths = vec![0; self.clip_nodes.len()];
         self.visit_clip_nodes_parents_first(|index| {
@@ -1102,7 +1252,6 @@ impl VisualContextTree {
         depths
     }
 
-    // Visits every live spatial node after its parent, ending at the visual viewport.
     pub fn visit_spatial_nodes_parents_first(&self, visit: impl FnMut(usize)) {
         visit_nodes_parents_first(
             self.spatial_nodes.len(),
@@ -1181,87 +1330,51 @@ impl VisualContextTree {
         chain
     }
 
-    fn local_spatial_matrix(&self, index: SpatialNodeIndex, scroll_offsets: &[FloatPoint]) -> LocalSpatialMatrix {
-        let translation = |offset: FloatPoint| LocalSpatialMatrix {
-            matrix: translation_matrix(offset.x, offset.y, 0.0),
+    pub fn local_transform(&self, index: SpatialNodeIndex, scroll_offsets: &[FloatPoint]) -> LocalTransform {
+        let mut local = LocalTransform {
+            matrix: FloatMatrix4x4::identity(),
             flattens_inherited_transform: false,
+            kind: LocalTransformKind::Identity,
+            establishes_sorting_context: false,
+            sorting_context_root: None,
+            backface_plane_root: None,
+        };
+        let translation = |offset: FloatPoint| {
+            (
+                translation_matrix(offset.x, offset.y, 0.0),
+                LocalTransformKind::Translation(offset),
+            )
         };
         match &self.spatial_nodes[index.0 as usize].data {
-            SpatialData::Transform(transform) => LocalSpatialMatrix {
-                matrix: transform.matrix_including_origin(),
-                flattens_inherited_transform: transform.flattens_inherited_transform,
-            },
-            SpatialData::Perspective(perspective) => LocalSpatialMatrix {
-                matrix: perspective.matrix,
-                flattens_inherited_transform: perspective.flattens_inherited_transform,
-            },
             SpatialData::Scroll(_) | SpatialData::Sticky(_) => {
-                translation(device_offset_for_index(scroll_offsets, index))
+                (local.matrix, local.kind) = translation(device_offset_for_index(scroll_offsets, index));
             }
-            SpatialData::AnchorScrollShift(shift) => translation(shift.masked_offset(scroll_offsets)),
-            SpatialData::BackfaceVisibility(backface) => LocalSpatialMatrix {
-                matrix: FloatMatrix4x4::identity(),
-                flattens_inherited_transform: backface.flattens_inherited_transform,
-            },
-            SpatialData::Dead => LocalSpatialMatrix {
-                matrix: FloatMatrix4x4::identity(),
-                flattens_inherited_transform: false,
-            },
-        }
-    }
-
-    pub fn accumulated_matrix(
-        &self,
-        index: SpatialNodeIndex,
-        scroll_offsets: &[FloatPoint],
-        include_visual_viewport_transform: IncludeVisualViewportTransform,
-    ) -> FloatMatrix4x4 {
-        let chain = self.ancestor_chain(index);
-        let mut matrix = FloatMatrix4x4::identity();
-        for node_index in chain.into_iter().rev() {
-            if node_index == VISUAL_VIEWPORT_NODE_INDEX
-                && include_visual_viewport_transform == IncludeVisualViewportTransform::No
-            {
-                continue;
+            SpatialData::AnchorScrollShift(shift) => {
+                (local.matrix, local.kind) = translation(shift.masked_offset(scroll_offsets));
             }
-            let local = self.local_spatial_matrix(node_index, scroll_offsets);
-            let inherited = if local.flattens_inherited_transform {
-                matrix.flattened()
-            } else {
-                matrix
-            };
-            matrix = inherited.multiplied(local.matrix);
+            SpatialData::Transform(transform) => {
+                local.matrix = transform.matrix_including_origin();
+                local.flattens_inherited_transform = transform.flattens_inherited_transform;
+                local.kind = if transform.matrix.is_2d_affine() {
+                    LocalTransformKind::Affine2D
+                } else {
+                    LocalTransformKind::Projective
+                };
+                local.establishes_sorting_context = transform.establishes_sorting_context;
+                local.sorting_context_root = transform.sorting_context_root_index;
+            }
+            SpatialData::Perspective(perspective) => {
+                local.matrix = perspective.matrix;
+                local.flattens_inherited_transform = perspective.flattens_inherited_transform;
+                local.kind = LocalTransformKind::Projective;
+            }
+            SpatialData::BackfaceVisibility(backface) => {
+                local.flattens_inherited_transform = backface.flattens_inherited_transform;
+                local.backface_plane_root = Some(backface.plane_root_index);
+            }
+            SpatialData::Dead => {}
         }
-        matrix
-    }
-
-    pub fn accumulated_2d_scale(
-        &self,
-        index: SpatialNodeIndex,
-        scroll_offsets: &[FloatPoint],
-        include_visual_viewport_transform: IncludeVisualViewportTransform,
-    ) -> FloatSize {
-        let affine = self
-            .accumulated_matrix(index, scroll_offsets, include_visual_viewport_transform)
-            .extract_2d_affine();
-        FloatSize {
-            width: affine.x_scale(),
-            height: affine.y_scale(),
-        }
-    }
-
-    pub fn plane_depth_at_point_for_hit_test(
-        &self,
-        plane_node_index: SpatialNodeIndex,
-        screen_point: FloatPoint,
-        scroll_offsets: &[FloatPoint],
-    ) -> Option<f32> {
-        let inverse = self
-            .accumulated_matrix(plane_node_index, scroll_offsets, IncludeVisualViewportTransform::Yes)
-            .inverse()?;
-        let matrix = &inverse.elements;
-        let depth = -(screen_point.x * matrix[2][0] + screen_point.y * matrix[2][1] + matrix[2][3]) / matrix[2][2];
-        depth.is_finite().then_some(depth)
+        local
     }
 
     pub fn spatial_dependency_order_with_back_edges(&self) -> NodeDependencyOrder {
@@ -1293,7 +1406,7 @@ impl VisualContextTree {
         )
     }
 
-    // Output clips live in the clip tree, so they are validated separately rather than ordered here.
+    /// Output clips live in the clip tree, so they are validated separately rather than ordered here.
     pub fn effect_dependency_order_with_back_edges(&self) -> NodeDependencyOrder {
         dependency_order(
             self.effect_nodes.len(),
@@ -1340,6 +1453,73 @@ impl VisualContextTree {
         dependency_order.order
     }
 
+    /// Whether some plane of a 3D sorting context of the tree leaves the plane of its context, so that the planes of
+    /// the context have to be sorted by depth. Planes that all stay in the plane of their context are coplanar, which
+    /// paint order sorts as depth does.
+    pub fn sorts_planes_by_depth(&self) -> bool {
+        self.spatial_nodes.iter().any(plane_leaves_plane_of_its_sorting_context)
+    }
+
+    // A plane whose transform an animation animates holds the value the tree holds while the animation shows none, and
+    // the samples of the animation otherwise.
+    fn plane_may_leave_plane_of_its_sorting_context(&self, index: usize) -> bool {
+        let node = &self.spatial_nodes[index];
+        plane_leaves_plane_of_its_sorting_context(node)
+            || (matches!(&node.data, SpatialData::Transform(transform) if transform.sorting_context_root_index.is_some())
+                && self.transform_animation_of_node_leaves_plane(SpatialNodeIndex(index as u32)))
+    }
+
+    /// As `sorts_planes_by_depth`, for some sample of the animations of the tree: what a plan that holds for every
+    /// sample is made for.
+    pub fn may_sort_planes_by_depth(&self) -> bool {
+        (0..self.spatial_nodes.len()).any(|index| self.plane_may_leave_plane_of_its_sorting_context(index))
+    }
+
+    /// Per spatial node, the root of the outermost 3D sorting context around the content of the node, where some
+    /// plane of that context or of one inside it leaves the plane of its context at some sample of the animations of
+    /// the tree, so that the content is sorted by depth with the rest of the context. The samples of the tree have the
+    /// same roots, unless a transform animation animates a plane whose matrix in the tree leaves the plane of its
+    /// context while the values of the animation stay in it.
+    pub fn roots_of_contexts_sorting_planes_by_depth(&self) -> Vec<Option<SpatialNodeIndex>> {
+        let mut root_of_outermost_context: Vec<Option<SpatialNodeIndex>> = vec![None; self.spatial_nodes.len()];
+        if !self.may_sort_planes_by_depth() {
+            return root_of_outermost_context;
+        }
+        let sorting_context_root_of = |node: &SpatialNode| match &node.data {
+            SpatialData::Transform(transform) => transform.sorting_context_root_index,
+            _ => None,
+        };
+        let mut is_sorting_context_root = vec![false; self.spatial_nodes.len()];
+        for root in self.spatial_nodes.iter().filter_map(sorting_context_root_of) {
+            is_sorting_context_root[root.0 as usize] = true;
+        }
+        self.visit_spatial_nodes_parents_first(|index| {
+            let node = &self.spatial_nodes[index];
+            let root_of_context_around_parent = if index == VISUAL_VIEWPORT_NODE_INDEX.0 as usize {
+                None
+            } else {
+                root_of_outermost_context[node.parent.0 as usize]
+            };
+            root_of_outermost_context[index] = root_of_context_around_parent
+                .or(sorting_context_root_of(node))
+                .or(is_sorting_context_root[index].then_some(SpatialNodeIndex(index as u32)));
+        });
+        let mut context_of_root_sorts_by_depth = vec![false; self.spatial_nodes.len()];
+        for (index, root) in root_of_outermost_context.iter().enumerate() {
+            if self.plane_may_leave_plane_of_its_sorting_context(index)
+                && let Some(root) = root
+            {
+                context_of_root_sorts_by_depth[root.0 as usize] = true;
+            }
+        }
+        for root in &mut root_of_outermost_context {
+            if root.is_some_and(|root| !context_of_root_sorts_by_depth[root.0 as usize]) {
+                *root = None;
+            }
+        }
+        root_of_outermost_context
+    }
+
     pub fn resolve_sorting_contexts(&self) -> SortingContexts {
         self.resolve_sorting_contexts_in_order(&self.spatial_dependency_order())
     }
@@ -1384,8 +1564,7 @@ pub fn clip_is_ancestor_or_self(
     }
 }
 
-// The deepest clip on both root paths; the absent clip when the paths only share the root. The
-// deeper node climbs first, then both climb together.
+/// The deepest clip on both root paths, or the absent clip when the paths only share the root.
 pub fn clip_lowest_common_ancestor_with_depths(
     parent_of: impl Fn(ClipNodeIndex) -> ClipNodeIndex,
     depth_of: impl Fn(ClipNodeIndex) -> u32,
@@ -1534,26 +1713,27 @@ mod tests {
         let child = tree.append_spatial(SpatialData::Transform(scaled(3.0)), scroll);
         let scroll_offsets = [FloatPoint::default(), FloatPoint { x: -10.0, y: -20.0 }];
 
-        let without_viewport = tree.accumulated_matrix(child, &scroll_offsets, IncludeVisualViewportTransform::No);
+        let world = WorldTransforms::new(&tree, &scroll_offsets, None);
+        let without_viewport = world.to_viewport_matrix(child, IncludeVisualViewportTransform::No);
         assert_eq!(
             without_viewport,
             translation_matrix(-10.0, -20.0, 0.0).multiplied(libgfx_rust::scale_matrix(3.0, 3.0, 1.0))
         );
-        let with_viewport = tree.accumulated_matrix(child, &scroll_offsets, IncludeVisualViewportTransform::Yes);
+        let with_viewport = world.to_viewport_matrix(child, IncludeVisualViewportTransform::Yes);
         assert_eq!(
             with_viewport,
             libgfx_rust::scale_matrix(2.0, 2.0, 1.0).multiplied(without_viewport)
         );
 
         assert_eq!(
-            tree.accumulated_2d_scale(child, &scroll_offsets, IncludeVisualViewportTransform::No),
+            world.accumulated_2d_scale(child, IncludeVisualViewportTransform::No),
             FloatSize {
                 width: 3.0,
                 height: 3.0
             }
         );
         assert_eq!(
-            tree.accumulated_2d_scale(child, &[], IncludeVisualViewportTransform::Yes),
+            world.accumulated_2d_scale(child, IncludeVisualViewportTransform::Yes),
             FloatSize {
                 width: 6.0,
                 height: 6.0
@@ -1571,11 +1751,12 @@ mod tests {
             }),
             VISUAL_VIEWPORT_NODE_INDEX,
         );
-        let matrix = tree.accumulated_matrix(child, &[], IncludeVisualViewportTransform::No);
+        let world = WorldTransforms::new(&tree, &[], None);
+        let matrix = world.to_viewport_matrix(child, IncludeVisualViewportTransform::No);
         assert_eq!(matrix.map_vector4([50.0, 50.0, 0.0, 1.0]), [50.0, 50.0, 0.0, 1.0]);
         assert_eq!(matrix.map_vector4([0.0, 0.0, 0.0, 1.0]), [-50.0, -50.0, 0.0, 1.0]);
         assert_eq!(
-            tree.accumulated_2d_scale(child, &[], IncludeVisualViewportTransform::No),
+            world.accumulated_2d_scale(child, IncludeVisualViewportTransform::No),
             FloatSize {
                 width: 2.0,
                 height: 2.0
@@ -1996,7 +2177,8 @@ mod tests {
     fn an_untransformed_plane_has_zero_depth() {
         let tree = tree();
         assert_eq!(
-            tree.plane_depth_at_point_for_hit_test(VISUAL_VIEWPORT_NODE_INDEX, FloatPoint { x: 25.0, y: 50.0 }, &[]),
+            WorldTransforms::new(&tree, &[], None)
+                .plane_depth_at_point_for_hit_test(VISUAL_VIEWPORT_NODE_INDEX, FloatPoint { x: 25.0, y: 50.0 }),
             Some(0.0)
         );
     }
@@ -2012,7 +2194,8 @@ mod tests {
             VISUAL_VIEWPORT_NODE_INDEX,
         );
         assert_eq!(
-            tree.plane_depth_at_point_for_hit_test(plane, FloatPoint { x: 25.0, y: 50.0 }, &[]),
+            WorldTransforms::new(&tree, &[], None)
+                .plane_depth_at_point_for_hit_test(plane, FloatPoint { x: 25.0, y: 50.0 }),
             Some(75.0)
         );
     }
@@ -2034,8 +2217,8 @@ mod tests {
             }),
             perspective,
         );
-        let depth = tree
-            .plane_depth_at_point_for_hit_test(plane, FloatPoint { x: 25.0, y: 50.0 }, &[])
+        let depth = WorldTransforms::new(&tree, &[], None)
+            .plane_depth_at_point_for_hit_test(plane, FloatPoint { x: 25.0, y: 50.0 })
             .unwrap();
         assert!((depth - 1000.0 / 9.0).abs() < 0.0001);
     }
@@ -2051,7 +2234,8 @@ mod tests {
             VISUAL_VIEWPORT_NODE_INDEX,
         );
         assert_eq!(
-            tree.plane_depth_at_point_for_hit_test(plane, FloatPoint { x: 25.0, y: 50.0 }, &[]),
+            WorldTransforms::new(&tree, &[], None)
+                .plane_depth_at_point_for_hit_test(plane, FloatPoint { x: 25.0, y: 50.0 }),
             None
         );
     }

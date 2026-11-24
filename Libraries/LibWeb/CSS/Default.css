@@ -17,7 +17,7 @@ body {
 }
 
 center {
-    text-align: -libweb-center;
+    text-align: -webkit-center;
 }
 
 blink {
@@ -144,15 +144,13 @@ input[type=image] {
     cursor: pointer;
 }
 
-option {
-    display: none;
+option, optgroup {
+    display: block;
 }
 
 /* Custom <input type="range"> styles */
 input[type=range] {
     display: inline-block;
-    width: 129px;
-    height: 16px;
     margin: 2px;
 
     &::slider-track {
@@ -174,7 +172,6 @@ input[type=range] {
     &::slider-thumb {
         display: block;
         position: relative;
-        margin-top: -6px;
         width: 16px;
         height: 16px;
         border-radius: 50%;
@@ -439,19 +436,19 @@ rt {
     display: ruby-text;
 }
 
-:link {
+html|*:link {
     color: LinkText;
 }
 
-:visited {
+html|*:visited {
     color: VisitedText;
 }
 
-:link:active, :visited:active {
+html|*:link:active, html|*:visited:active {
     color: ActiveText;
 }
 
-:link, :visited {
+html|*:link, html|*:visited {
     text-decoration: underline;
     cursor: pointer;
 }
@@ -743,8 +740,19 @@ input, select, button, textarea {
     appearance: auto;
 }
 
+/* NB: A file input's button uses the system font at the size of the input's font, like other buttons, rather than the
+ *     page font that an author style gives the input. Nor does it take on the input's text styling. */
 ::file-selector-button {
     appearance: auto;
+    font: medium system-ui;
+    font-size: inherit;
+    letter-spacing: initial;
+    word-spacing: initial;
+    text-transform: initial;
+    text-indent: initial;
+    text-shadow: initial;
+    text-align: center;
+    white-space: nowrap;
 }
 
 input:not([type=range i], [type=checkbox i], [type=radio i]) {
@@ -1905,10 +1913,18 @@ iframe:fullscreen {
   /* symbols: 'a' 'b' 'c' 'd' 'e' 'f' 'g' 'h' 'i' 'j' 'k' 'l' 'm' 'n' 'o' 'p' 'q' 'r' 's' 't' 'u' 'v' 'w' 'x' 'y' 'z'; */
 }
 
+@counter-style lower-latin {
+  system: extends lower-alpha;
+}
+
 @counter-style upper-alpha {
   system: alphabetic;
   symbols: '\41' '\42' '\43' '\44' '\45' '\46' '\47' '\48' '\49' '\4A' '\4B' '\4C' '\4D' '\4E' '\4F' '\50' '\51' '\52' '\53' '\54' '\55' '\56' '\57' '\58' '\59' '\5A';
   /* symbols: 'A' 'B' 'C' 'D' 'E' 'F' 'G' 'H' 'I' 'J' 'K' 'L' 'M' 'N' 'O' 'P' 'Q' 'R' 'S' 'T' 'U' 'V' 'W' 'X' 'Y' 'Z'; */
+}
+
+@counter-style upper-latin {
+  system: extends upper-alpha;
 }
 
 @counter-style fullwidth-lower-alpha {

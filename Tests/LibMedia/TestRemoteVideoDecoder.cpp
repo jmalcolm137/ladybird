@@ -326,7 +326,7 @@ StalledDecoding submit_until_the_server_stops_answering(size_t unanswered_submis
 
     auto first_coded_frame = MUST(demuxer->get_next_sample_for_track(track));
     auto decoder = MUST(Media::RemoteVideoDecoder::try_create(first_coded_frame.codec_id(), first_coded_frame.new_codec_configuration().value()));
-    decoder->set_output_arrived_callback([] { });
+    decoder->set_decode_completed_callback([](Media::DecodeCompletion) { });
 
     MUST(decoder->receive_coded_data(first_coded_frame, Media::DecodeIntent::Output));
     for (size_t index = 1; index < WithholdingVideoDecoder::MAXIMUM_WITHHELD_OUTPUTS + unanswered_submission_count; index++)
@@ -407,7 +407,9 @@ TEST_CASE(output_the_server_decoder_finishes_later_wakes_the_client)
 
     auto first_coded_frame = TRY_OR_FAIL(demuxer->get_next_sample_for_track(track));
     auto decoder = TRY_OR_FAIL(Media::RemoteVideoDecoder::try_create(first_coded_frame.codec_id(), first_coded_frame.new_codec_configuration().value()));
-    decoder->set_output_arrived_callback([&] {
+    decoder->set_decode_completed_callback([&](Media::DecodeCompletion completion) {
+        if (completion != Media::DecodeCompletion::ProducedOutput)
+            return;
         MutexLocker locker { wake_mutex };
         wake_count++;
         wake_condition.broadcast();
@@ -442,6 +444,61 @@ TEST_CASE(output_the_server_decoder_finishes_later_wakes_the_client)
         EXPECT_EQ(frame.value()->timestamp(), first_coded_frame.presentation_timestamp());
 }
 
+// The server reports its decoder idle once it has sent the frame that the decoder finished, but that frame is still output
+// for the client's caller to take, so the client must keep reporting a decode in progress until the frame is taken.
+TEST_CASE(a_frame_waiting_to_be_taken_counts_as_a_decode_in_progress)
+{
+    auto withheld_outputs = make_ref_counted<WithheldOutputs>();
+    WithholdingVideoDecoder::set_withheld_outputs_for_new_decoders(withheld_outputs);
+    ScopeGuard stop_withholding = [] { WithholdingVideoDecoder::set_withheld_outputs_for_new_decoders(nullptr); };
+
+    auto file = MUST(Core::File::open(test_video_path, Core::File::OpenMode::Read));
+    auto stream = Media::IncrementallyPopulatedStream::create_from_buffer(MUST(file->read_until_eof()));
+    NonnullRefPtr<Media::Demuxer> demuxer = MUST(Media::Matroska::MatroskaDemuxer::from_stream(stream));
+    auto track = MUST(demuxer->get_preferred_track_for_type(Media::TrackType::Video)).release_value();
+    TRY_OR_FAIL(demuxer->create_context_for_track(track));
+
+    Mutex mutex;
+    ConditionVariable condition { mutex };
+    bool output_arrived = false;
+
+    auto coded_frame = TRY_OR_FAIL(demuxer->get_next_sample_for_track(track));
+    auto decoder = TRY_OR_FAIL(Media::RemoteVideoDecoder::try_create(coded_frame.codec_id(), coded_frame.new_codec_configuration().value()));
+    decoder->set_decode_completed_callback([&](Media::DecodeCompletion completion) {
+        if (completion != Media::DecodeCompletion::ProducedOutput)
+            return;
+        MutexLocker locker { mutex };
+        output_arrived = true;
+        condition.broadcast();
+    });
+
+    TRY_OR_FAIL(decoder->receive_coded_data(coded_frame, Media::DecodeIntent::Output));
+    EXPECT(withheld_outputs->wait_until_withheld_count_reaches(1, AK::Duration::from_seconds(5)));
+    EXPECT(decoder->has_any_decode_in_progress());
+
+    EXPECT(withheld_outputs->release_next());
+    {
+        auto deadline = MonotonicTime::now() + AK::Duration::from_seconds(5);
+        MutexLocker locker { mutex };
+        while (!output_arrived && MonotonicTime::now() < deadline)
+            condition.wait_for(deadline - MonotonicTime::now());
+        if (!output_arrived) {
+            FAIL("The frame the server's decoder finished did not reach the client");
+            return;
+        }
+
+        // Give the server's report that its decoder is idle time to arrive.
+        auto settle_deadline = MonotonicTime::now() + AK::Duration::from_milliseconds(300);
+        while (decoder->has_any_decode_in_progress() && MonotonicTime::now() < settle_deadline)
+            condition.wait_for(AK::Duration::from_milliseconds(10));
+    }
+    EXPECT(decoder->has_any_decode_in_progress());
+
+    auto frame = decoder->take_next_output({});
+    EXPECT(!frame.is_error());
+    EXPECT(!decoder->has_any_decode_in_progress());
+}
+
 // Once the client holds every slot the server can decode into, the server waits for one to be released, and the
 // client answers TryAgain until a release of its own lets the server decode again.
 TEST_CASE(a_server_out_of_slots_is_waited_for_until_a_frame_is_released)
@@ -456,7 +513,7 @@ TEST_CASE(a_server_out_of_slots_is_waited_for_until_a_frame_is_released)
     auto decoder = TRY_OR_FAIL(Media::RemoteVideoDecoder::try_create(coded_frame.codec_id(), coded_frame.new_codec_configuration().value()));
     size_t storage_freed_count = 0;
     decoder->set_storage_freed_callback([&] { storage_freed_count++; });
-    decoder->set_output_arrived_callback([] { });
+    decoder->set_decode_completed_callback([](Media::DecodeCompletion) { });
 
     Vector<NonnullRefPtr<Media::VideoFrame>> held_frames;
     auto server_ran_out_of_slots = false;
@@ -497,4 +554,59 @@ TEST_CASE(a_server_out_of_slots_is_waited_for_until_a_frame_is_released)
     else
         EXPECT(frame.value()->timestamp() > last_held_timestamp);
     EXPECT_EQ(storage_freed_count, 1u);
+}
+
+// The file was encoded from hevc_hdr10_plus_in_sei.mkv, so its frames carry the same HDR10+, in BlockAdditions.
+TEST_CASE(scene_peaks_from_the_container_reach_the_server_with_their_frames)
+{
+    ScenePeakChecker scene_peaks { hevc_hdr10_plus_in_sei_scene_peaks };
+    auto file = MUST(Core::File::open("./vp9_hdr10_plus_in_block_additions.webm"sv, Core::File::OpenMode::Read));
+    auto stream = Media::IncrementallyPopulatedStream::create_from_buffer(MUST(file->read_until_eof()));
+    NonnullRefPtr<Media::Demuxer> demuxer = MUST(Media::Matroska::MatroskaDemuxer::from_stream(stream));
+    auto track = MUST(demuxer->get_preferred_track_for_type(Media::TrackType::Video)).release_value();
+    TRY_OR_FAIL(demuxer->create_context_for_track(track));
+
+    Mutex wake_mutex;
+    ConditionVariable wake_condition { wake_mutex };
+    auto first_coded_frame = TRY_OR_FAIL(demuxer->get_next_sample_for_track(track));
+    auto decoder = TRY_OR_FAIL(Media::RemoteVideoDecoder::try_create(first_coded_frame.codec_id(), first_coded_frame.new_codec_configuration().value()));
+    decoder->set_decode_completed_callback([&](Media::DecodeCompletion) {
+        MutexLocker locker { wake_mutex };
+        wake_condition.broadcast();
+    });
+
+    TRY_OR_FAIL(decoder->receive_coded_data(first_coded_frame, Media::DecodeIntent::Output));
+    while (true) {
+        auto sample = demuxer->get_next_sample_for_track(track);
+        if (sample.is_error())
+            break;
+        TRY_OR_FAIL(decoder->receive_coded_data(sample.release_value(), Media::DecodeIntent::Output));
+    }
+    decoder->signal_end_of_stream();
+
+    size_t frame_count = 0;
+    auto reached_end_of_stream = false;
+    auto deadline = MonotonicTime::now() + AK::Duration::from_seconds(5);
+    while (MonotonicTime::now() < deadline) {
+        auto result = decoder->take_next_output({});
+        if (!result.is_error()) {
+            auto const& frame = result.value();
+            scene_peaks.check(frame->timestamp(), frame->color_metadata().maximum_scene_luminance);
+            frame_count++;
+            continue;
+        }
+        if (result.error().category() == Media::DecoderErrorCategory::EndOfStream) {
+            reached_end_of_stream = true;
+            break;
+        }
+        if (result.error().category() != Media::DecoderErrorCategory::NeedsMoreInput) {
+            FAIL(ByteString::formatted("Unexpected decoder error: {}", result.error().description()));
+            return;
+        }
+        MutexLocker locker { wake_mutex };
+        wake_condition.wait_for(AK::Duration::from_milliseconds(100));
+    }
+    EXPECT(reached_end_of_stream);
+    EXPECT_EQ(frame_count, hevc_hdr10_plus_in_sei_scene_peaks.size());
+    scene_peaks.expect_every_frame_checked();
 }

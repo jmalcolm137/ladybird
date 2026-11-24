@@ -46,7 +46,7 @@ pub struct SlowPathArray {
     /// The name of the bytecode field that holds the operands.
     pub name: String,
     pub instruction_offset: usize,
-    /// The instruction offset of the operand count.
+    /// The instruction offset of the operand count, which is one byte.
     pub count_offset: usize,
     pub optional: bool,
 }
@@ -218,27 +218,27 @@ pub struct ArrayLayout {
     pub element_size: usize,
 }
 
+/// The type of an instruction field. Instructions are packed, so fields have no alignment.
 pub struct FieldType {
     pub rust_type: &'static str,
-    pub align: usize,
     pub size: usize,
     pub kind: &'static str,
 }
 
-impl From<(&'static str, usize, usize, &'static str)> for FieldType {
-    fn from(v: (&'static str, usize, usize, &'static str)) -> Self {
+impl From<(&'static str, usize, &'static str)> for FieldType {
+    fn from(v: (&'static str, usize, &'static str)) -> Self {
         Self {
             rust_type: v.0,
-            align: v.1,
-            size: v.2,
-            kind: v.3,
+            size: v.1,
+            kind: v.2,
         }
     }
 }
 
-/// The alignment of every instruction in the bytecode, that of a pointer.
-/// On 64-bit: alignof(void*) = 8.
-pub const STRUCT_ALIGN: usize = 8;
+/// How many bytes an operand takes in an instruction.
+pub const OPERAND_SIZE: usize = 1;
+/// The encoding of an absent optional operand.
+pub const NO_OPERAND: i64 = u8::MAX as i64;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParseError {
@@ -670,37 +670,36 @@ impl SpecializationParser<'_> {
 fn try_field_type_info(ty: &str) -> Option<FieldType> {
     Some(
         match ty {
-            "bool" => ("bool", 1, 1, "bool"),
-            "i32" => ("i32", 4, 4, "i32"),
-            "u32" => ("u32", 4, 4, "u32"),
-            "u64" => ("u64", 8, 8, "u64"),
-            "Operand" => ("Operand", 4, 4, "operand"),
-            "Optional<Operand>" => ("Option<Operand>", 4, 4, "optional_operand"),
-            "Label" => ("Label", 4, 4, "label"),
-            "Optional<Label>" => ("Option<Label>", 4, 8, "optional_label"),
-            "IdentifierTableIndex" => ("IdentifierTableIndex", 4, 4, "u32_newtype"),
-            "Optional<IdentifierTableIndex>" => ("Option<IdentifierTableIndex>", 4, 4, "optional_u32_newtype"),
-            "PropertyKeyTableIndex" => ("PropertyKeyTableIndex", 4, 4, "u32_newtype"),
-            "StringTableIndex" => ("StringTableIndex", 4, 4, "u32_newtype"),
-            "Optional<StringTableIndex>" => ("Option<StringTableIndex>", 4, 4, "optional_u32_newtype"),
-            "EnvironmentCoordinate" => ("EnvironmentCoordinate", 4, 8, "env_coord"),
-            "Builtin" => ("u8", 1, 1, "u8"),
-            "Completion::Type" => ("u32", 4, 4, "u32"),
-            "IteratorHint" => ("u32", 4, 4, "u32"),
-            "EnvironmentMode" => ("u32", 4, 4, "u32"),
-            "PutKind" => ("u32", 4, 4, "u32"),
-            "ArgumentsKind" => ("u32", 4, 4, "u32"),
-            "FunctionNamePrefix" => ("u32", 4, 4, "u32"),
-            "Value" => ("u64", 8, 8, "u64"),
+            "bool" => ("bool", 1, "bool"),
+            "u8" => ("u32", 1, "byte_count"),
+            "u16" => ("u16", 2, "u16"),
+            "i32" => ("i32", 4, "i32"),
+            "u32" => ("u32", 4, "u32"),
+            "u64" => ("u64", 8, "u64"),
+            "Operand" => ("Operand", OPERAND_SIZE, "operand"),
+            "Optional<Operand>" => ("Option<Operand>", OPERAND_SIZE, "optional_operand"),
+            "Label" => ("Label", 4, "label"),
+            "Optional<Label>" => ("Option<Label>", 5, "optional_label"),
+            "IdentifierTableIndex" => ("IdentifierTableIndex", 2, "u32_newtype"),
+            "Optional<IdentifierTableIndex>" => ("Option<IdentifierTableIndex>", 2, "optional_u32_newtype"),
+            "PropertyKeyTableIndex" => ("PropertyKeyTableIndex", 2, "u32_newtype"),
+            "StringTableIndex" => ("StringTableIndex", 2, "u32_newtype"),
+            "Optional<StringTableIndex>" => ("Option<StringTableIndex>", 2, "optional_u32_newtype"),
+            "EnvironmentCoordinate" => ("EnvironmentCoordinate", 3, "env_coord"),
+            "Builtin" | "Completion::Type" | "IteratorHint" | "EnvironmentMode" | "PutKind" | "ArgumentsKind"
+            | "FunctionNamePrefix" => ("u8", 1, "u8"),
+            "Value" => ("u64", 8, "u64"),
             "PropertyLookupCacheIndex"
+            | "ProfiledPropertyLookupCacheIndex"
             | "GlobalVariableCacheIndex"
             | "EnvironmentCoordinateCacheIndex"
-            | "TemplateObjectCacheIndex"
-            | "ObjectShapeCacheIndex"
-            | "ObjectPropertyIteratorCacheIndex"
-            | "EnvironmentShapeCacheIndex" => ("u32", 4, 4, "u32"),
+            | "ObjectShapeCacheIndex" => ("u32", 2, "cache_index"),
+            // NB: The sites of these are rare and they cannot share a slot, so they stay wide.
+            "TemplateObjectCacheIndex" | "ObjectPropertyIteratorCacheIndex" | "EnvironmentShapeCacheIndex" => {
+                ("u32", 4, "u32")
+            }
             "ArithFeedbackIndex" | "CallFeedbackIndex" | "KeyedFeedbackIndex" | "ValueFeedbackIndex" => {
-                ("u16", 2, 2, "u16")
+                ("u16", 2, "u16")
             }
             _ => return None,
         }
@@ -717,11 +716,11 @@ pub fn round_up(value: usize, align: usize) -> usize {
     value.checked_add(align - 1).expect("layout size overflow") & !(align - 1)
 }
 
-/// Returns the user-visible fields (excludes m_type, m_strict, m_length).
+/// Returns the user-visible fields (excludes m_type, m_strict).
 pub fn user_fields(op: &InstructionDefinition) -> Vec<&Field> {
     op.fields
         .iter()
-        .filter(|f| f.name != "m_type" && f.name != "m_strict" && f.name != "m_length")
+        .filter(|f| f.name != "m_type" && f.name != "m_strict")
         .collect()
 }
 
@@ -730,7 +729,7 @@ fn count_field_index(op: &InstructionDefinition, array_field: &Field) -> Option<
     let singular = array_field.name.strip_suffix('s').map(|name| format!("{name}_count"));
     op.fields.iter().position(|field| {
         !field.is_array
-            && field.ty == "u32"
+            && (field.ty == "u32" || field.ty == "u8")
             && (field.name == plural || singular.as_ref().is_some_and(|name| field.name == *name))
     })
 }
@@ -744,7 +743,7 @@ fn validate_op(op: &mut InstructionDefinition) -> Result<(), String> {
         return Err(format!("op '{}' must derive directly from Instruction", op.name));
     }
 
-    let mut offset = 2usize;
+    let mut offset = 1usize;
     let mut field_offsets = HashMap::new();
     let array_indices = op
         .fields
@@ -769,10 +768,6 @@ fn validate_op(op: &mut InstructionDefinition) -> Result<(), String> {
             continue;
         }
         let info = try_field_type_info(&field.ty).expect("field types are checked while parsing");
-        offset = offset
-            .checked_add(info.align - 1)
-            .map(|offset| offset & !(info.align - 1))
-            .ok_or_else(|| format!("layout of op '{}' overflows usize", op.name))?;
         field_offsets.insert(field.name.clone(), offset);
         offset = offset
             .checked_add(info.size)
@@ -780,54 +775,35 @@ fn validate_op(op: &mut InstructionDefinition) -> Result<(), String> {
     }
 
     let array = if let Some(array_index) = array_indices.first().copied() {
-        let length_field = op
-            .fields
-            .iter()
-            .position(|field| field.name == "m_length" && field.ty == "u32" && !field.is_array);
-        if length_field.is_none() {
-            return Err(format!("array op '{}' requires a u32 m_length field", op.name));
-        }
         let count_field_index = count_field_index(op, &op.fields[array_index]).ok_or_else(|| {
             format!(
-                "array field '{}' in op '{}' requires a matching u32 count field",
+                "array field '{}' in op '{}' requires a matching u8 or u32 count field",
                 op.fields[array_index].name, op.name
             )
         })?;
+        if op.fields[array_index].ty == "Operand" && op.fields[count_field_index].ty != "u8" {
+            return Err(format!(
+                "operand array field '{}' in op '{}' requires a u8 count field",
+                op.fields[array_index].name, op.name
+            ));
+        }
         let info = try_field_type_info(&op.fields[array_index].ty).expect("field types are checked while parsing");
-        let array_offset = offset
-            .checked_add(info.align - 1)
-            .map(|offset| offset & !(info.align - 1))
-            .ok_or_else(|| format!("layout of op '{}' overflows usize", op.name))?;
-        field_offsets.insert(op.fields[array_index].name.clone(), array_offset);
+        field_offsets.insert(op.fields[array_index].name.clone(), offset);
         Some(ArrayLayout {
             field_index: array_index,
             count_field_index,
-            offset: array_offset,
+            offset,
             element_size: info.size,
         })
     } else {
         None
     };
-    let size = if array.is_some() {
-        None
-    } else {
-        Some(
-            offset
-                .checked_add(STRUCT_ALIGN - 1)
-                .map(|offset| offset & !(STRUCT_ALIGN - 1))
-                .ok_or_else(|| format!("layout of op '{}' overflows usize", op.name))?,
-        )
-    };
-    let minimum_size = offset
-        .checked_add(STRUCT_ALIGN - 1)
-        .map(|offset| offset & !(STRUCT_ALIGN - 1))
-        .ok_or_else(|| format!("layout of op '{}' overflows usize", op.name))?;
-    let m_length_offset = field_offsets.get("m_length").copied();
+    let size = array.is_none().then_some(offset);
+    let minimum_size = offset;
     op.layout = OpLayout {
         field_offsets,
         size,
         minimum_size,
-        m_length_offset,
     };
     op.array = array;
     Ok(())
@@ -840,10 +816,8 @@ pub struct OpLayout {
     pub field_offsets: HashMap<String, usize>,
     /// Total encoded size (for fixed-size instructions), or None for variable-length.
     pub size: Option<usize>,
-    /// Minimum encoded size, including the fixed header and tail padding.
+    /// Minimum encoded size: the fixed fields, without the array.
     pub minimum_size: usize,
-    /// Byte offset of m_length for variable-length instructions.
-    pub m_length_offset: Option<usize>,
 }
 
 /// Compute field offsets and total sizes for all opcodes.
@@ -926,7 +900,7 @@ mod tests {
     fn lays_out_explicit_helper_values_with_operand_modes() {
         let ops = parse_flap_metadata(
             "test.flap",
-            "handler Call(length: u32, dst: out Operand, callee: in Operand, state: inout Optional<Operand>, argument_count: u32, arguments: Operand[]) = call_slow_path(call);",
+            "handler Call(dst: out Operand, callee: in Operand, state: inout Optional<Operand>, argument_count: u8, arguments: Operand[]) = call_slow_path(call);",
         )
         .unwrap();
         let op = &ops[0];
@@ -979,8 +953,7 @@ mod tests {
             "interpreter.flap",
             r#"
 handler Call(
-    length: u32,
-    argument_count: u32,
+    argument_count: u8,
     arguments: Operand[]
 ) @terminator = call_slow_path(call);
 "#,
@@ -991,8 +964,8 @@ handler Call(
         assert_eq!(ops[0].name, "Call");
         assert!(ops[0].is_terminator);
         assert!(!ops[0].falls_through);
-        assert_eq!(ops[0].fields.len(), 3);
-        assert!(ops[0].fields[2].is_array);
+        assert_eq!(ops[0].fields.len(), 2);
+        assert!(ops[0].fields[1].is_array);
     }
 
     #[test]
@@ -1191,11 +1164,11 @@ specialize JumpLessThan(rhs: Int32);
             ),
             (
                 "handler Array(values: Value[]) { dispatch_next; }\n",
-                "requires a u32 m_length field",
+                "requires a matching u8 or u32 count field",
             ),
             (
-                "handler Array(length: u32, values: Value[]) { dispatch_next; }\n",
-                "requires a matching u32 count field",
+                "handler Call(argument_count: u32, arguments: Operand[]) { dispatch_next; }\n",
+                "requires a u8 count field",
             ),
             (
                 "handler Array(length: u32, value_count: u32, values: Value[], tail: u32) { dispatch_next; }\n",

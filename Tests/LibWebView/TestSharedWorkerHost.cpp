@@ -148,7 +148,7 @@ public:
     Tab open(URL::URL const& url, WebView::IsPrivate is_private = WebView::IsPrivate::No)
     {
         auto tab = WebView::HeadlessWebView::create(m_theme, { 800, 600 }, is_private);
-        tab->load(url);
+        tab->load_from_browser_ui(url);
         (void)worker_status_of(*tab);
         return tab;
     }
@@ -283,7 +283,7 @@ static void owner_in_the_host_navigates_away(Browser& browser)
     auto host_pid = host_tab->web_content_pid();
 
     auto id = browser.worker_status_of(*other_tab).id;
-    host_tab->load(browser.server().url("localhost"sv, "/page?name=navigation"sv));
+    host_tab->load_from_browser_ui(browser.server().url("localhost"sv, "/page?name=navigation"sv));
     Core::EventLoop::current().spin_until([&] { return host_tab->web_content_pid() != host_pid; });
     Core::EventLoop::current().spin_until([&] { return browser.worker_status_of(*host_tab).id != id; });
 
@@ -368,6 +368,22 @@ static void same_url_stays_apart_in_private_and_normal_sessions(Browser& browser
     browser.wait_for_no_workers();
 }
 
+static void same_url_stays_apart_in_private_sessions_either_side_of_a_restart(Browser& browser)
+{
+    auto url = browser.server().url("127.0.0.1"sv, "/page?name=restart"sv);
+    auto previous_tab = browser.open(url, WebView::IsPrivate::Yes);
+    WebView::Application::the().reset_private_browsing_session();
+    auto next_tab = browser.open(url, WebView::IsPrivate::Yes);
+
+    EXPECT_NE(&previous_tab->page().client().session(), &next_tab->page().client().session());
+    EXPECT_NE(browser.worker_status_of(*previous_tab).id, browser.worker_status_of(*next_tab).id);
+    EXPECT_EQ(worker_count(), 2u);
+
+    browser.close(move(previous_tab));
+    browser.close(move(next_tab));
+    browser.wait_for_no_workers();
+}
+
 static void cross_site_pages_never_share_a_process(Browser& browser)
 {
     auto first_tab = browser.open(browser.server().url("127.0.0.1"sv, "/page?name=sites"sv));
@@ -402,6 +418,30 @@ static void cross_origin_isolated_owner_gets_a_process_without_a_page_for_its_wo
     browser.expect_clean_exit(*host_pid);
 }
 
+static void process_without_a_page_for_a_worker_has_the_session_of_its_owner(Browser& browser)
+{
+    auto tab = browser.open(browser.server().url("127.0.0.1"sv, "/isolated-page?name=isolated-private&script=/isolated-worker.js"sv), WebView::IsPrivate::Yes);
+    auto& session = tab->page().client().session();
+
+    // The page starts another worker once the private session it belongs to has been restarted.
+    WebView::Application::the().reset_private_browsing_session();
+    tab->run_javascript("window.laterWorker = new SharedWorker('/isolated-worker.js', { name: 'isolated-private-later' });"_string);
+    Core::EventLoop::current().spin_until([] { return worker_count() == 2; });
+
+    size_t host_count = 0;
+    WebView::WebContentClient::for_each_client([&](WebView::WebContentClient& client) {
+        if (WebView::WorkerAgentManager::the().hosts_shared_worker(client)) {
+            EXPECT_EQ(&client.session(), &session);
+            ++host_count;
+        }
+        return IterationDecision::Continue;
+    });
+    EXPECT_EQ(host_count, 2u);
+
+    browser.close(move(tab));
+    browser.wait_for_no_workers();
+}
+
 TEST_CASE(shared_worker_host)
 {
     Test::HeadlessTestEnvironment environment { "TestSharedWorkerHost"sv, 120 };
@@ -414,8 +454,10 @@ TEST_CASE(shared_worker_host)
     owner_in_the_host_navigates_away(browser);
     crash_of_the_host_reaches_every_owner(browser);
     same_url_stays_apart_in_private_and_normal_sessions(browser);
+    same_url_stays_apart_in_private_sessions_either_side_of_a_restart(browser);
     cross_site_pages_never_share_a_process(browser);
     cross_origin_isolated_owner_gets_a_process_without_a_page_for_its_worker(browser);
+    process_without_a_page_for_a_worker_has_the_session_of_its_owner(browser);
     extended_lifetime_ends_with_the_private_session(browser);
     extended_lifetime_outlives_the_last_tab(browser);
 }

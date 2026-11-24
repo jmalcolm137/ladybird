@@ -10,9 +10,8 @@
 #include <AK/NeverDestroyed.h>
 #include <AK/QuickSort.h>
 #include <LibCrypto/Curves/EdwardsCurve.h>
-#include <LibCrypto/Curves/SECPxxxr1.h>
-#include <LibCrypto/Hash/SHA1.h>
-#include <LibCrypto/Hash/SHA2.h>
+#include <LibCrypto/Hash/Hash.h>
+#include <LibCrypto/PK/EC.h>
 #include <LibCrypto/PK/RSA.h>
 #include <LibDNS/Validator.h>
 
@@ -122,14 +121,7 @@ static ErrorOr<bool> verify_signature(Records::DNSKEY const& key, ReadonlyBytes 
             : key.algorithm == Algorithm::RSASHA512            ? Crypto::Hash::HashKind::SHA512
                                                                : Crypto::Hash::HashKind::SHA1;
         auto components = TRY(key.rsa_public_key_components());
-        Crypto::PK::RSAPublicKey public_key {
-            Crypto::UnsignedBigInteger::import_data(components.modulus),
-            Crypto::UnsignedBigInteger::import_data(components.exponent),
-        };
-        if (!TRY(public_key.is_valid()))
-            return false;
-        Crypto::PK::RSA_PKCS1_EMSA rsa { hash_kind, move(public_key) };
-        return rsa.verify(signed_data, signature);
+        return Crypto::PK::rsa_pkcs1_verify(components.modulus, components.exponent, hash_kind, signed_data, signature);
     }
     case Algorithm::ECDSAP256SHA256:
     case Algorithm::ECDSAP384SHA384: {
@@ -141,29 +133,11 @@ static ErrorOr<bool> verify_signature(Records::DNSKEY const& key, ReadonlyBytes 
         size_t scalar_size = is_p256 ? 32 : 48;
         if (key.public_key.size() != scalar_size * 2 || signature.size() != scalar_size * 2)
             return false;
-        Crypto::Curves::SECPxxxr1Point point {
-            Crypto::UnsignedBigInteger::import_data(key.public_key.bytes().slice(0, scalar_size)),
-            Crypto::UnsignedBigInteger::import_data(key.public_key.bytes().slice(scalar_size, scalar_size)),
-            scalar_size,
-        };
-        Crypto::Curves::SECPxxxr1Signature ecdsa_signature {
-            Crypto::UnsignedBigInteger::import_data(signature.slice(0, scalar_size)),
-            Crypto::UnsignedBigInteger::import_data(signature.slice(scalar_size, scalar_size)),
-            scalar_size,
-        };
-        if (is_p256) {
-            auto digest = Crypto::Hash::SHA256::hash(signed_data);
-            Crypto::Curves::SECP256r1 curve;
-            return curve.verify(digest.bytes(), point, ecdsa_signature);
-        }
-        auto digest = Crypto::Hash::SHA384::hash(signed_data);
-        Crypto::Curves::SECP384r1 curve;
-        return curve.verify(digest.bytes(), point, ecdsa_signature);
+        auto digest = Crypto::Hash::digest(is_p256 ? Crypto::Hash::HashKind::SHA256 : Crypto::Hash::HashKind::SHA384, signed_data);
+        return Crypto::PK::ecdsa_verify(key.public_key.bytes().slice(0, scalar_size), key.public_key.bytes().slice(scalar_size, scalar_size), digest.bytes(), signature.slice(0, scalar_size), signature.slice(scalar_size, scalar_size));
     }
-    case Algorithm::ED25519: {
-        Crypto::Curves::Ed25519 ed25519;
-        return ed25519.verify(key.public_key.bytes(), signature, signed_data);
-    }
+    case Algorithm::ED25519:
+        return Crypto::Curves::ed25519_verify(key.public_key.bytes(), signature, signed_data);
     default:
         return false;
     }
@@ -179,11 +153,11 @@ static ErrorOr<ByteBuffer> ds_digest(DomainName const& owner, Records::DNSKEY co
     TRY(key.to_raw(input));
     switch (digest_type) {
     case DigestType::SHA1:
-        return ByteBuffer::copy(Crypto::Hash::SHA1::hash(input).bytes());
+        return ByteBuffer::copy(Crypto::Hash::digest(Crypto::Hash::HashKind::SHA1, input).bytes());
     case DigestType::SHA256:
-        return ByteBuffer::copy(Crypto::Hash::SHA256::hash(input).bytes());
+        return ByteBuffer::copy(Crypto::Hash::digest(Crypto::Hash::HashKind::SHA256, input).bytes());
     case DigestType::SHA384:
-        return ByteBuffer::copy(Crypto::Hash::SHA384::hash(input).bytes());
+        return ByteBuffer::copy(Crypto::Hash::digest(Crypto::Hash::HashKind::SHA384, input).bytes());
     default:
         return Error::from_string_literal("Unsupported DS digest type");
     }
@@ -389,12 +363,12 @@ static ErrorOr<ByteBuffer> nsec3_hash(DomainName const& name, Records::NSEC3 con
     ByteBuffer input;
     TRY(name.canonicalized().to_raw(input));
     TRY(input.try_append(params.salt));
-    auto digest = Crypto::Hash::SHA1::hash(input);
+    auto digest = Crypto::Hash::digest(Crypto::Hash::HashKind::SHA1, input);
     for (size_t i = 0; i < params.iterations; ++i) {
         ByteBuffer next;
         TRY(next.try_append(digest.bytes()));
         TRY(next.try_append(params.salt));
-        digest = Crypto::Hash::SHA1::hash(next);
+        digest = Crypto::Hash::digest(Crypto::Hash::HashKind::SHA1, next);
     }
     return ByteBuffer::copy(digest.bytes());
 }

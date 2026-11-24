@@ -1,4 +1,10 @@
 {
+  "-webkit-device-pixel-ratio": {
+    "type": "range",
+    "values": [
+      "<number>"
+    ]
+  },
   "-webkit-transform-3d": {
     "type": "discrete",
     "values": [
@@ -90,7 +96,12 @@
     "false-keywords": [
       "standard",
       "high"
-    ]
+    ],
+    "implied-keywords": {
+      "high": [
+        "standard"
+      ]
+    }
   },
   "environment-blending": {
     "type": "discrete",
@@ -315,7 +326,12 @@
     "false-keywords": [
       "standard",
       "high"
-    ]
+    ],
+    "implied-keywords": {
+      "high": [
+        "standard"
+      ]
+    }
   },
   "width": {
     "type": "range",

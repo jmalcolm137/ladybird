@@ -3,23 +3,29 @@ AccumulatedVisualContext Tree:
   spatial:
     [s0] transform=[1,0,0,1,0,0] origin=(0,0) (Viewport<#document>)
       [s1] scroll (Viewport<#document>)
-        [s2] transform=[1,0,0,1,0,0] origin=(58,58) (BlockContainer<DIV>#child)
+        [s2] transform3d=[1,0,0,0,0,1,0,0,0,0,1,10,0,0,0,1] origin=(58,58) bounds=[8,8 100x100] (BlockContainer<DIV>#child)
   effects:
     [e0 in s0] effects=[]
 
+Layers (for a window server that shows tiles and filters what is below layers):
+  [L0] base space=viewport
+
 DisplayList:
-FillRect@s2/e0 rect=[8,8 100x100] color=rgb(0, 128, 0)
+L0 FillRect@s2/e0 rect=[8,8 100x100] color=rgb(0, 128, 0) owner=BlockContainer<DIV>#child phase=background
 
 After perspective change:
 AccumulatedVisualContext Tree:
   spatial:
     [s0] transform=[1,0,0,1,0,0] origin=(0,0) (Viewport<#document>)
       [s1] scroll (Viewport<#document>)
-        [s2] perspective (BlockContainer<DIV>#box)
-          [s3] transform=[1,0,0,1,0,0] origin=(58,58) (BlockContainer<DIV>#child)
+        [s2] perspective=[1,0,-0.58,0,0,1,-0.58,0,0,0,1,0,0,0,-0.01,1] (BlockContainer<DIV>#box)
+          [s3] transform3d=[1,0,0,0,0,1,0,0,0,0,1,10,0,0,0,1] origin=(58,58) flattens_inherited_transform=false bounds=[8,8 100x100] (BlockContainer<DIV>#child)
   effects:
     [e0 in s0] effects=[]
 
+Layers (for a window server that shows tiles and filters what is below layers):
+  [L0] base space=viewport
+
 DisplayList:
-FillRect@s3/e0 rect=[8,8 100x100] color=rgb(0, 128, 0)
+L0 FillRect@s3/e0 rect=[8,8 100x100] color=rgb(0, 128, 0) owner=BlockContainer<DIV>#child phase=background
 

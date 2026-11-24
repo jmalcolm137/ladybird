@@ -49,6 +49,8 @@ unsafe extern "C" {
     pub(crate) fn web_bindings_realm_is_window(realm: *mut c_void) -> bool;
     pub(crate) fn web_bindings_realm_is_secure_context(realm: *mut c_void) -> bool;
 
+    pub(crate) fn web_bindings_report_an_exception(realm: *mut c_void, exception: u64);
+
     /// Runs the steps with the context while an execution context of the realm is on the stack, as an
     /// HTML::TemporaryExecutionContext puts it there, with callbacks enabled if `callbacks_enabled`.
     pub(crate) fn web_bindings_with_temporary_execution_context(
@@ -61,6 +63,13 @@ unsafe extern "C" {
     /// Whether the object is a wrapper of an object that implements the interface, a Web::Bindings::InterfaceName of
     /// an interface that LibWeb implements in C++.
     pub(crate) fn web_bindings_object_implements_interface(object: *mut c_void, interface_name: u16) -> bool;
+
+    /// Whether the object is the exotic object of a WindowProxy.
+    pub(crate) fn web_bindings_object_is_window_proxy(object: *mut c_void) -> bool;
+
+    /// The object that scripts of the realm see for the WindowProxy whose exotic object this is: that of the
+    /// WindowProxy of its browsing context for the wrapper world of the realm, or the object itself if it has none.
+    pub(crate) fn web_bindings_window_proxy_object_in_realm(object: *mut c_void, realm: *mut c_void) -> *mut c_void;
 
     /// Runs the extract an origin operation of the object, https://html.spec.whatwg.org/multipage/browsers.html#extract-an-origin,
     /// if it is a platform object of an interface implemented in C++ or a WindowProxy, and calls `on_origin` with the

@@ -28,6 +28,7 @@ namespace Gfx {
 
 struct FontPixelMetrics {
     float x_height { 0 };
+    float cap_height { 0 };
     float advance_of_ascii_zero { 0 };
 
     // Number of pixels the font extends above the baseline.
@@ -35,6 +36,9 @@ struct FontPixelMetrics {
 
     // Number of pixels the font descends below the baseline.
     float descent { 0 };
+
+    // Number of pixels the font recommends as extra spacing between lines.
+    float line_gap { 0 };
 };
 
 // https://learn.microsoft.com/en-us/typography/opentype/spec/os2#uswidthclass
@@ -61,8 +65,6 @@ public:
     float point_size() const;
     float pixel_size() const;
     FontPixelMetrics const& pixel_metrics() const { return m_pixel_metrics; }
-    // Metrics that only font-size-adjust reads, measured when asked for rather than with the pixel metrics.
-    float cap_height() const;
     Optional<float> horizontal_advance_of_code_point(u32 code_point) const;
     Optional<float> vertical_advance_of_code_point(u32 code_point) const;
     u8 slope() const { return m_style.slope; }

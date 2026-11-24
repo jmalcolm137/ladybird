@@ -21,7 +21,8 @@ ErrorOr<CacheHeader> CacheHeader::read_from_stream(Stream& stream)
     CacheHeader header;
     header.magic = TRY(stream.read_value<u32>());
     header.version = TRY(stream.read_value<u32>());
-    header.key_hash = TRY(stream.read_value<u32>());
+    TRY(stream.read_until_filled(header.cache_key.bytes));
+    TRY(stream.read_until_filled(header.vary_key.bytes));
     header.url_size = TRY(stream.read_value<u32>());
     header.url_hash = TRY(stream.read_value<u32>());
     header.status_code = TRY(stream.read_value<u32>());
@@ -34,7 +35,8 @@ ErrorOr<void> CacheHeader::write_to_stream(Stream& stream) const
 {
     TRY(stream.write_value(magic));
     TRY(stream.write_value(version));
-    TRY(stream.write_value(key_hash));
+    TRY(stream.write_until_depleted(cache_key.bytes));
+    TRY(stream.write_until_depleted(vary_key.bytes));
     TRY(stream.write_value(url_size));
     TRY(stream.write_value(url_hash));
     TRY(stream.write_value(status_code));
@@ -48,7 +50,8 @@ u32 CacheHeader::hash() const
     u32 hash = 0;
     hash = pair_int_hash(hash, magic);
     hash = pair_int_hash(hash, version);
-    hash = pair_int_hash(hash, key_hash);
+    hash = pair_int_hash(hash, Traits<CacheDigest>::hash(cache_key));
+    hash = pair_int_hash(hash, Traits<CacheDigest>::hash(vary_key));
     hash = pair_int_hash(hash, url_size);
     hash = pair_int_hash(hash, url_hash);
     hash = pair_int_hash(hash, status_code);
@@ -72,7 +75,7 @@ ErrorOr<CacheFooter> CacheFooter::read_from_stream(Stream& stream)
     return footer;
 }
 
-CacheEntry::CacheEntry(DiskCache& disk_cache, CacheIndex& index, u64 cache_key, u64 vary_key, String url, Optional<LexicalPath> path, CacheHeader cache_header)
+CacheEntry::CacheEntry(DiskCache& disk_cache, CacheIndex& index, CacheDigest const& cache_key, CacheDigest const& vary_key, String url, Optional<LexicalPath> path, CacheHeader cache_header)
     : m_disk_cache(disk_cache)
     , m_index(index)
     , m_cache_key(cache_key)
@@ -97,18 +100,18 @@ void CacheEntry::close_and_destroy_cache_entry()
     m_disk_cache.cache_entry_closed({}, *this);
 }
 
-ErrorOr<NonnullOwnPtr<CacheEntryWriter>> CacheEntryWriter::create(DiskCache& disk_cache, CacheIndex& index, u64 cache_key, String url, UnixDateTime request_time, AK::Duration current_time_offset_for_testing)
+ErrorOr<NonnullOwnPtr<CacheEntryWriter>> CacheEntryWriter::create(DiskCache& disk_cache, CacheIndex& index, CacheDigest const& cache_key, String url, UnixDateTime request_time, AK::Duration current_time_offset_for_testing)
 {
     CacheHeader cache_header;
-    cache_header.key_hash = u64_hash(cache_key);
+    cache_header.cache_key = cache_key;
     cache_header.url_size = url.byte_count();
     cache_header.url_hash = url.hash();
 
     return adopt_own(*new CacheEntryWriter { disk_cache, index, cache_key, move(url), cache_header, request_time, current_time_offset_for_testing });
 }
 
-CacheEntryWriter::CacheEntryWriter(DiskCache& disk_cache, CacheIndex& index, u64 cache_key, String url, CacheHeader cache_header, UnixDateTime request_time, AK::Duration current_time_offset_for_testing)
-    : CacheEntry(disk_cache, index, cache_key, 0, move(url), {}, cache_header)
+CacheEntryWriter::CacheEntryWriter(DiskCache& disk_cache, CacheIndex& index, CacheDigest const& cache_key, String url, CacheHeader cache_header, UnixDateTime request_time, AK::Duration current_time_offset_for_testing)
+    : CacheEntry(disk_cache, index, cache_key, {}, move(url), {}, cache_header)
     , m_request_time(request_time)
     , m_current_time_offset_for_testing(current_time_offset_for_testing)
 {
@@ -146,19 +149,17 @@ ErrorOr<void> CacheEntryWriter::write_status_and_reason(u32 status_code, Optiona
             return Error::from_string_literal("Response cannot be selected by any request");
 
         m_vary_key = *vary_key;
+        m_cache_header.vary_key = m_vary_key;
 
         // Trailer fields were not considered when deciding cacheability.
         m_response_headers = HeaderList::create(response_headers.headers());
         m_path = path_for_cache_entry(m_disk_cache.cache_directory(), m_cache_key, m_vary_key);
         m_temporary_path = LexicalPath::join(m_disk_cache.cache_directory().string(), ByteString::formatted("{}.tmp", m_path->basename()));
 
-        auto freshness_lifetime = calculate_freshness_lifetime(status_code, response_headers, m_current_time_offset_for_testing);
-        auto current_age = calculate_age(response_headers, m_request_time, m_response_time, m_current_time_offset_for_testing);
-
-        // We can cache already-expired responses if there are other cache directives that allow us to revalidate the
-        // response on subsequent requests. For example, `Cache-Control: max-age=0, must-revalidate`.
-        if (cache_lifetime_status(request_headers, response_headers, freshness_lifetime, current_age) == CacheLifetimeStatus::Expired)
-            return Error::from_string_literal("Response has already expired");
+        // NB: We store a response that is already stale too, even one that has no validator to revalidate it with. A
+        //     request whose cache mode is "force-cache" or "only-if-cached" uses a stored response "not paying attention
+        //     to staleness". A history traversal is such a request, and it can only show the page as it was if the
+        //     response is here.
 
         (void)FileSystem::remove(m_temporary_path->string(), FileSystem::RecursionMode::Disallowed);
         auto unbuffered_file = TRY(Core::File::open(m_temporary_path->string(), Core::File::OpenMode::Write | Core::File::OpenMode::MustBeNew));
@@ -297,7 +298,7 @@ void CacheEntryWriter::remove_incomplete_temporary_file()
     (void)FileSystem::remove(m_temporary_path->string(), FileSystem::RecursionMode::Disallowed);
 }
 
-ErrorOr<NonnullOwnPtr<CacheEntryReader>> CacheEntryReader::create(DiskCache& disk_cache, CacheIndex& index, u64 cache_key, u64 vary_key, NonnullRefPtr<HeaderList> response_headers, u64 data_size)
+ErrorOr<NonnullOwnPtr<CacheEntryReader>> CacheEntryReader::create(DiskCache& disk_cache, CacheIndex& index, CacheDigest const& cache_key, CacheDigest const& vary_key, String const& expected_url, NonnullRefPtr<HeaderList> response_headers, u64 data_size)
 {
     auto path = path_for_cache_entry(disk_cache.cache_directory(), cache_key, vary_key);
 
@@ -319,10 +320,14 @@ ErrorOr<NonnullOwnPtr<CacheEntryReader>> CacheEntryReader::create(DiskCache& dis
         if (cache_header.version != CACHE_VERSION)
             return Error::from_string_literal("Version mismatch");
 
-        if (cache_header.key_hash != u64_hash(cache_key))
-            return Error::from_string_literal("Key hash mismatch");
+        if (cache_header.cache_key != cache_key || cache_header.vary_key != vary_key)
+            return Error::from_string_literal("Key mismatch");
 
+        if (cache_header.url_size != expected_url.byte_count())
+            return Error::from_string_literal("URL mismatch");
         url = TRY(String::from_stream(*file, cache_header.url_size));
+        if (url != expected_url)
+            return Error::from_string_literal("URL mismatch");
         if (url.hash() != cache_header.url_hash)
             return Error::from_string_literal("URL hash mismatch");
 
@@ -345,7 +350,7 @@ ErrorOr<NonnullOwnPtr<CacheEntryReader>> CacheEntryReader::create(DiskCache& dis
     return adopt_own(*new CacheEntryReader { disk_cache, index, cache_key, vary_key, move(url), move(path), move(file), fd, cache_header, move(reason_phrase), move(response_headers), data_offset, data_size });
 }
 
-CacheEntryReader::CacheEntryReader(DiskCache& disk_cache, CacheIndex& index, u64 cache_key, u64 vary_key, String url, LexicalPath path, NonnullOwnPtr<Core::File> file, int fd, CacheHeader cache_header, Optional<String> reason_phrase, NonnullRefPtr<HeaderList> response_headers, u64 data_offset, u64 data_size)
+CacheEntryReader::CacheEntryReader(DiskCache& disk_cache, CacheIndex& index, CacheDigest const& cache_key, CacheDigest const& vary_key, String url, LexicalPath path, NonnullOwnPtr<Core::File> file, int fd, CacheHeader cache_header, Optional<String> reason_phrase, NonnullRefPtr<HeaderList> response_headers, u64 data_offset, u64 data_size)
     : CacheEntry(disk_cache, index, cache_key, vary_key, move(url), move(path), cache_header)
     , m_file(move(file))
     , m_fd(fd)
@@ -356,13 +361,16 @@ CacheEntryReader::CacheEntryReader(DiskCache& disk_cache, CacheIndex& index, u64
 {
 }
 
-void CacheEntryReader::revalidation_succeeded(HeaderList const& response_headers)
+void CacheEntryReader::revalidation_succeeded(HeaderList const& response_headers, UnixDateTime request_time, UnixDateTime response_time)
 {
     dbgln_if(HTTP_DISK_CACHE_DEBUG, "\033[36m[disk]\033[0m \033[34;1mCache revalidation succeeded for\033[0m {}", m_url);
 
     update_header_fields(m_response_headers, response_headers);
 
-    if (auto result = m_index.update_response_headers(m_cache_key, m_vary_key, m_response_headers); result.is_error()) {
+    // The stored response is now as fresh as the response to the validation request, so its age counts from that request
+    // rather than from the one that stored it.
+    // https://httpwg.org/specs/rfc9111.html#freshening.responses
+    if (auto result = m_index.update_response_headers(m_cache_key, m_vary_key, m_response_headers, request_time, response_time); result.is_error()) {
         dbgln_if(HTTP_DISK_CACHE_DEBUG, "\033[36m[disk]\033[0m \033[31;1mUnable to update cache entry for\033[0m {}: {}", m_url, result.error());
         remove();
     } else {

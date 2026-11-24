@@ -43,6 +43,10 @@ pub struct InstalledElementEffects {
     /// last, by index among the swaps of the installation.
     pub(crate) swaps_begin: u32,
     pub(crate) swaps_end: u32,
+    /// The descendants whose styles the element's effects clear, from the first to one past the last, by index among
+    /// the cleared descendants of the installation.
+    pub(crate) cleared_descendants_begin: u32,
+    pub(crate) cleared_descendants_end: u32,
 }
 
 // SAFETY: The pointer only borrows the immutable record the installation pins until the host ended the transaction.
@@ -272,6 +276,8 @@ impl RetainedState {
             }
         };
         let was_none = old_values.is_none_or(is_none);
+        let native_appearance =
+            |values: ComputedValuesView<'_>| (values.appearance(), values.native_appearance_disabled());
         let (damage_effects, rebuild_root) = super::super::style_invalidation::main_effects_of_damage(
             facts.element_damage,
             facts.pseudo_elements.damages.iter().copied(),
@@ -350,7 +356,10 @@ impl RetainedState {
                 MainEffects::ROOT_FONT_METRICS,
                 adjustment_facts & element_adjustment_fact::IS_DOCUMENT_ELEMENT != 0,
             )
-            .with(MainEffects::REVEAL_WAITING, was_none && !is_none(new_values))
+            .with(
+                MainEffects::REVEAL_WAITING,
+                was_none && new.dependency_flags & computed::IN_DISPLAY_NONE_SUBTREE == 0,
+            )
             .with(
                 MainEffects::SVG_REFERENCES,
                 adjustment_facts & element_adjustment_fact::IS_SVG_ELEMENT != 0,
@@ -361,7 +370,10 @@ impl RetainedState {
                 construction_facts
                     & (element_construction_fact::IS_HTML_INPUT_ELEMENT
                         | element_construction_fact::IS_HTML_SELECT_ELEMENT)
-                    != 0,
+                    != 0
+                    || (construction_facts & element_construction_fact::IS_HTML_PROGRESS_OR_METER_ELEMENT != 0
+                        && old_values
+                            .is_none_or(|old_values| native_appearance(old_values) != native_appearance(new_values))),
             );
         InstalledElementEffects {
             style_node: node.raw(),
@@ -380,6 +392,8 @@ impl RetainedState {
             pseudo_element_transition_steps: facts.pseudo_elements.transition_steps,
             swaps_begin: 0,
             swaps_end: 0,
+            cleared_descendants_begin: 0,
+            cleared_descendants_end: 0,
         }
     }
 
@@ -498,7 +512,7 @@ mod tests {
 
         add_class(&mut engine, nodes[1], "hidden");
         run_style_update(&mut engine, nodes[0]);
-        let installation = engine.take_installation();
+        let mut installation = engine.take_installation();
         assert!(
             installation
                 .effects_of(nodes[1])

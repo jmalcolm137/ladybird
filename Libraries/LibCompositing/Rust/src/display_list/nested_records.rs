@@ -14,6 +14,21 @@ pub enum NestedRecordsRole {
     RepeatedTile,
     MaskContent,
     PatternTile,
+    VectorImage,
+}
+
+impl NestedRecordsRole {
+    pub fn is_replayed_where_its_record_plays(self) -> bool {
+        self != Self::MaskContent
+    }
+}
+
+pub fn replays_nested_records_where_it_plays(command_type: DisplayListCommandType, payload: &[u8]) -> bool {
+    let mut replays_nested_records = false;
+    for_each_nested_record_span(command_type, payload, |role, _| {
+        replays_nested_records |= role.is_replayed_where_its_record_plays();
+    });
+    replays_nested_records
 }
 
 pub fn for_each_nested_record_span(
@@ -45,6 +60,12 @@ pub fn for_each_nested_record_span(
             visit(
                 NestedRecordsRole::MaskContent,
                 read_command::<DeclareMaskContent>(payload).content,
+            );
+        }
+        DisplayListCommandType::PaintVectorImage => {
+            visit(
+                NestedRecordsRole::VectorImage,
+                read_command::<PaintVectorImage>(payload).records,
             );
         }
         DisplayListCommandType::FillPath => {

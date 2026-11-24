@@ -15,6 +15,7 @@
 #include <LibRequests/RequestClient.h>
 #include <LibWebView/BrowsingSession.h>
 #include <LibWebView/CrashReportStore.h>
+#include <LibWebView/DefaultBrowser.h>
 #include <LibWebView/GamepadManager.h>
 #include <LibWebView/MicrophoneAuthorizer.h>
 #include <LibWebView/PageTranslation.h>
@@ -22,6 +23,7 @@
 #include <LibWebView/ReportSubmission.h>
 #include <LibWebView/Settings.h>
 #include <LibWebView/TabPerformanceMonitor.h>
+#include <LibWebView/UpdateCheck.h>
 #include <LibWebView/WebCompatReport.h>
 #include <LibWebView/WebUI/ApplicationWebUI.h>
 
@@ -91,9 +93,11 @@ struct InputFromUI final : public Web::BrowserInputData {
     u64 input_id { 0 };
 };
 
-u64 ConnectionFromUI::input_id_of(Web::BrowserInputData const& browser_data)
+Optional<u64> ConnectionFromUI::input_id_of(Web::BrowserInputData const* browser_data)
 {
-    return as<InputFromUI>(browser_data).input_id;
+    if (auto const* input_from_ui = as_if<InputFromUI>(browser_data))
+        return input_from_ui->input_id;
+    return {};
 }
 
 template<typename EventType>
@@ -286,6 +290,17 @@ void ConnectionFromUI::microphone_authorization_changed(WebView::MicrophoneAutho
         authorizer->did_change_authorization(authorization);
 }
 
+void ConnectionFromUI::default_browser_status_changed(WebView::DefaultBrowserStatus status)
+{
+    Application::the().default_browser().did_read_status(status);
+}
+
+void ConnectionFromUI::default_browser_make_default_finished(bool failed, Optional<String> system_message)
+{
+    if (auto* default_browser = DefaultBrowserInUI::the())
+        default_browser->did_make_default({ .failed = failed, .system_message = move(system_message) });
+}
+
 void ConnectionFromUI::gamepad_connected(Web::Gamepad::GamepadDescription description, Web::Gamepad::GamepadState state)
 {
     if (auto* source = GamepadSourceInUI::the(); source && source->on_gamepad_connected)
@@ -352,6 +367,11 @@ void ConnectionFromUI::system_time_zone_changed()
         client.async_system_time_zone_changed();
         return IterationDecision::Continue;
     });
+}
+
+void ConnectionFromUI::media_session_action(Web::Bindings::MediaSessionAction action, Optional<double> seek_offset, Optional<double> seek_time, Optional<bool> fast_seek)
+{
+    Application::the().media_session_coordinator().handle_action(action, seek_offset, seek_time, fast_seek);
 }
 
 void ConnectionFromUI::notification_shown(u64 id)
@@ -432,6 +452,42 @@ void ConnectionFromUI::view_set_reports_session_history(u64 view_id, bool report
         view->set_reports_session_history(reports_session_history);
 }
 
+void ConnectionFromUI::view_set_compositor_layer_hidden(u64 view_id, u64 layer_id, bool hidden)
+{
+    if (auto* view = find_view(view_id))
+        view->set_compositor_layer_hidden(layer_id, hidden);
+}
+
+void ConnectionFromUI::view_set_selected_compositor_layers(u64 view_id, Vector<u64> layer_ids)
+{
+    if (auto* view = find_view(view_id))
+        view->set_selected_compositor_layers(move(layer_ids));
+}
+
+void ConnectionFromUI::view_set_hovered_compositor_layer(u64 view_id, Optional<u64> layer_id)
+{
+    if (auto* view = find_view(view_id))
+        view->set_hovered_compositor_layer(layer_id);
+}
+
+void ConnectionFromUI::view_show_only_compositor_layers(u64 view_id, Vector<u64> layer_ids)
+{
+    if (auto* view = find_view(view_id))
+        view->show_only_compositor_layers(layer_ids);
+}
+
+void ConnectionFromUI::view_show_all_compositor_layers(u64 view_id)
+{
+    if (auto* view = find_view(view_id))
+        view->show_all_compositor_layers();
+}
+
+void ConnectionFromUI::view_reset_compositor_layer_raster_counts(u64 view_id)
+{
+    if (auto* view = find_view(view_id))
+        view->reset_compositor_layer_raster_counts();
+}
+
 void ConnectionFromUI::view_file_picker_closed(u64 view_id, Vector<Web::HTML::SelectedFile> selected_files)
 {
     if (auto* view = find_view(view_id))
@@ -489,6 +545,11 @@ void ConnectionFromUI::view_request_page_dumps(u64 view_id, u64 request_id)
     });
 }
 
+void ConnectionFromUI::request_platform_features_description(u64 request_id)
+{
+    async_platform_features_description(request_id, Application::the().describe_platform_features_for_report({}));
+}
+
 void ConnectionFromUI::view_prepare_for_immediate_close(u64 view_id)
 {
     auto* view = find_view(view_id);
@@ -544,6 +605,8 @@ Messages::HubServer::InitializeResponse ConnectionFromUI::initialize()
     state.scripting_enabled = Application::the().scripting_enabled();
     state.blocks_pop_ups = Application::the().blocks_pop_ups();
     state.devtools_enabled = Application::the().devtools_enabled();
+    state.sandbox_is_disabled = options.disable_sandbox == WebView::DisableSandbox::Yes;
+    state.gpu_painting_enabled = Application::the().compositor_gpu_painting_enabled();
     state.downloads = downloads();
     state.urls = options.urls;
     state.raw_urls = options.raw_urls;
@@ -567,6 +630,7 @@ Messages::HubServer::CreateViewResponse ConnectionFromUI::create_view(Hub::NewVi
         .device_pixel_ratio = request.device_pixel_ratio,
         .maximum_frames_per_second = request.maximum_frames_per_second,
         .display_id = request.display_id,
+        .screen_shows_high_dynamic_range = request.screen_shows_high_dynamic_range,
         .system_theme = move(request.system_theme),
         .screen_rects = move(request.screen_rects),
         .owner_view_id = request.owner_view_id,
@@ -663,6 +727,22 @@ void ConnectionFromUI::stop_request(u64 request_id)
         (*request)->stop();
 }
 
+void ConnectionFromUI::check_for_updates([[maybe_unused]] WebView::UpdateCheckTrigger trigger)
+{
+#if defined(LADYBIRD_HAS_UPDATE_CHECK)
+    if (auto* update_checker = Application::the().update_checker())
+        update_checker->check(trigger);
+#endif
+}
+
+void ConnectionFromUI::skip_update_version([[maybe_unused]] String version)
+{
+#if defined(LADYBIRD_HAS_UPDATE_CHECK)
+    if (auto* update_checker = Application::the().update_checker())
+        update_checker->skip_version(version);
+#endif
+}
+
 void ConnectionFromUI::toggle_devtools_enabled()
 {
     if (auto result = Application::the().toggle_devtools_enabled(); result.is_error())
@@ -709,6 +789,11 @@ void ConnectionFromUI::set_shows_caret_hit_test_debug_overlay(bool shows)
     Application::the().set_shows_caret_hit_test_debug_overlay(shows);
 }
 
+void ConnectionFromUI::set_shows_compositor_layers(bool shows)
+{
+    Application::the().set_shows_compositor_layers(shows);
+}
+
 void ConnectionFromUI::dump_cookies()
 {
     Application::the().dump_cookies();
@@ -722,7 +807,7 @@ void ConnectionFromUI::crash_compositor_process()
 void ConnectionFromUI::launch_devtools_client()
 {
     if (auto result = Application::the().launch_devtools_client(); result.is_error())
-        dbgln("Unable to launch DevTools client: {}", result.error());
+        WebView::Application::the().display_error_dialog(MUST(String::formatted("Unable to launch the DevTools client: {}", result.error())));
 }
 
 void ConnectionFromUI::reset_private_browsing_session()
@@ -779,6 +864,36 @@ Messages::HubServer::ViewRestoreSessionHistoryFromSnapshotResponse ConnectionFro
 {
     auto* view = find_view(view_id);
     return view && !view->restore_session_history_from_snapshot(move(snapshot)).is_error();
+}
+
+Messages::HubServer::ViewKeepStateForDiscardingResponse ConnectionFromUI::view_keep_state_for_discarding(u64 view_id)
+{
+    auto* view = find_view(view_id);
+    if (!view)
+        return Optional<u64> {};
+    return view->keep_state_for_discarding();
+}
+
+void ConnectionFromUI::view_restore_state_of_discarded_tab(u64 view_id, u64 discarded_tab_state_id)
+{
+    auto* view = find_view(view_id);
+    if (!view) {
+        WebView::ViewImplementation::forget_state_of_discarded_tab(discarded_tab_state_id);
+        return;
+    }
+    view->restore_state_of_discarded_tab(discarded_tab_state_id);
+    view->push_state_to_ui();
+}
+
+void ConnectionFromUI::view_decline_discard(u64 view_id)
+{
+    if (auto* view = find_view(view_id))
+        view->did_decline_discard();
+}
+
+void ConnectionFromUI::forget_state_of_discarded_tab(u64 discarded_tab_state_id)
+{
+    WebView::ViewImplementation::forget_state_of_discarded_tab(discarded_tab_state_id);
 }
 
 Messages::HubServer::ViewHistoryStepAtDeltaResponse ConnectionFromUI::view_history_step_at_delta(u64 view_id, i32 delta)
@@ -864,7 +979,7 @@ View* ConnectionFromUI::find_view(u64 view_id)
 void ConnectionFromUI::view_load(u64 view_id, URL::URL url, Web::Bindings::NavigationHistoryBehavior history_behavior)
 {
     if (auto* view = find_view(view_id)) {
-        view->load(url, history_behavior);
+        view->load_from_browser_ui(url, history_behavior);
         view->push_state_to_ui();
     }
 }
@@ -907,6 +1022,66 @@ void ConnectionFromUI::view_set_system_visibility_state(u64 view_id, Web::HTML::
         view->set_system_visibility_state(visibility_state);
         view->push_state_to_ui();
     }
+}
+
+void ConnectionFromUI::view_set_hosts_remote_layer(u64 view_id, bool hosts_remote_layer)
+{
+    if (auto* view = find_view(view_id))
+        view->set_hosts_remote_layer(hosts_remote_layer);
+}
+
+void ConnectionFromUI::view_set_wants_frame_notifications(u64 view_id, bool wants_frame_notifications)
+{
+    if (auto* view = find_view(view_id))
+        view->set_wants_frame_notifications(wants_frame_notifications);
+}
+
+void ConnectionFromUI::view_take_frame_snapshot(u64 view_id, u64 request_id)
+{
+    auto* view = find_view(view_id);
+    if (!view) {
+        async_view_did_take_frame_snapshot(view_id, request_id, {});
+        return;
+    }
+    view->take_frame_snapshot([view_id, request_id](Optional<Gfx::ShareableBitmap> snapshot) {
+        if (auto* ui = ConnectionFromUI::the())
+            ui->async_view_did_take_frame_snapshot(view_id, request_id, move(snapshot));
+    });
+}
+
+void ConnectionFromUI::view_begin_synchronized_resize(u64 view_id, u64 token)
+{
+    if (auto* view = find_view(view_id))
+        view->begin_synchronized_resize(token);
+}
+
+// The UI waits for the answer on its main thread, so a view that is gone answers as well.
+void ConnectionFromUI::view_await_synchronized_resize_frame(u64 view_id, u64 token, Gfx::IntSize size)
+{
+    if (auto* view = find_view(view_id))
+        view->await_synchronized_resize_frame(token, size);
+    else
+        async_view_did_hold_synchronized_resize_frame(view_id, token);
+}
+
+void ConnectionFromUI::view_commit_synchronized_resize(u64 view_id, u64 token)
+{
+    if (auto* view = find_view(view_id))
+        view->commit_synchronized_resize(token);
+    else
+        async_view_did_commit_synchronized_resize(view_id, token);
+}
+
+void ConnectionFromUI::view_set_pinned(u64 view_id, bool pinned)
+{
+    if (auto* view = find_view(view_id))
+        view->set_pinned(pinned);
+}
+
+void ConnectionFromUI::view_set_current_tab_of_window(u64 view_id, bool current_tab_of_window)
+{
+    if (auto* view = find_view(view_id))
+        view->set_current_tab_of_window(current_tab_of_window);
 }
 
 void ConnectionFromUI::view_set_presents_from_cpu_memory(u64 view_id, bool presents_from_cpu_memory)
@@ -1117,10 +1292,10 @@ void ConnectionFromUI::view_reset_zoom(u64 view_id)
     }
 }
 
-void ConnectionFromUI::view_set_display_metadata(u64 view_id, Optional<u64> display_id, double maximum_frames_per_second)
+void ConnectionFromUI::view_set_display_metadata(u64 view_id, Optional<u64> display_id, double maximum_frames_per_second, bool screen_shows_high_dynamic_range)
 {
     if (auto* view = find_view(view_id)) {
-        view->set_display_metadata(display_id, maximum_frames_per_second);
+        view->set_display_metadata(display_id, maximum_frames_per_second, screen_shows_high_dynamic_range);
         view->push_state_to_ui();
     }
 }

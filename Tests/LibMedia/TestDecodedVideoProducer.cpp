@@ -43,11 +43,21 @@ public:
         {
             MutexLocker locker { m_mutex };
             if (m_samples_served >= m_samples_before_blocking) {
-                m_read_is_blocked = true;
-                m_state_changed.broadcast();
-                while (m_blocks_reads && !m_reads_are_aborted && !m_blocked_samples_are_permanently_unavailable)
-                    m_state_changed.wait();
-                m_read_is_blocked = false;
+                auto read_must_wait = [&] {
+                    return m_blocks_reads && !m_reads_are_aborted && !m_blocked_samples_are_permanently_unavailable;
+                };
+                // Like the real demuxers, a read that was aborted before it started never reports that it blocked.
+                if (read_must_wait()) {
+                    m_read_is_blocked = true;
+                    m_state_changed.broadcast();
+                    if (m_read_blocked_change_handler)
+                        m_read_blocked_change_handler(Media::ReadBlocked::Yes);
+                    while (read_must_wait())
+                        m_state_changed.wait();
+                    m_read_is_blocked = false;
+                    if (m_read_blocked_change_handler)
+                        m_read_blocked_change_handler(Media::ReadBlocked::No);
+                }
                 if (m_reads_are_aborted)
                     return Media::DecoderError::with_description(Media::DecoderErrorCategory::Aborted, "Blocking read was aborted"sv);
                 if (m_blocked_samples_are_permanently_unavailable)
@@ -91,7 +101,11 @@ public:
         }
         m_inner->reset_blocking_reads_aborted_for_track(track);
     }
-    virtual void set_read_blocked_change_handler_for_track(Media::Track const& track, Media::ReadBlockedChangeHandler handler) override { m_inner->set_read_blocked_change_handler_for_track(track, move(handler)); }
+    virtual void set_read_blocked_change_handler_for_track(Media::Track const&, Media::ReadBlockedChangeHandler handler) override
+    {
+        MutexLocker locker { m_mutex };
+        m_read_blocked_change_handler = move(handler);
+    }
 
     bool wait_until_a_read_blocks(AK::Duration time_limit)
     {
@@ -148,6 +162,7 @@ private:
     bool m_reads_are_aborted { false };
     bool m_blocked_samples_are_permanently_unavailable { false };
     bool m_read_is_blocked { false };
+    Media::ReadBlockedChangeHandler m_read_blocked_change_handler;
     Atomic<size_t> m_seek_count { 0 };
     Atomic<size_t> m_forced_seek_count { 0 };
     Atomic<bool> m_seek_is_expected { false };
@@ -654,6 +669,50 @@ TEST_CASE(output_that_arrives_while_the_demuxer_blocks_is_delivered)
     demuxer->stop_blocking_reads();
 }
 
+// Output that is still being decoded can arrive without another coded frame, so the producer is only blocked once the
+// decoder has nothing left in progress.
+TEST_CASE(a_blocked_read_reports_blocked_only_once_no_decode_is_in_progress)
+{
+    auto& loop = never_destroyed_event_loop();
+    auto withheld_outputs = make_ref_counted<WithheldOutputs>();
+    WithholdingVideoDecoder::set_withheld_outputs_for_new_decoders(withheld_outputs);
+    ScopeGuard stop_withholding = [] { WithholdingVideoDecoder::set_withheld_outputs_for_new_decoders(nullptr); };
+
+    auto sample_timestamps = presentation_timestamps_of_first_samples("./vp9_in_webm.webm"sv, 3);
+    auto [inner_demuxer, track] = demuxer_and_video_track_for("./vp9_in_webm.webm"sv);
+    auto demuxer = BlockingDemuxer::create(inner_demuxer, sample_timestamps.size());
+    auto producer = TRY_OR_FAIL(Media::DecodedVideoProducer::try_create(loop, demuxer, track));
+    producer->set_error_handler([&](Media::DecoderError&& error) {
+        FAIL(ByteString::formatted("An error occurred while decoding: {}", error.description()));
+    });
+    producer->start();
+
+    auto time_limit = AK::Duration::from_seconds(5);
+    if (!demuxer->wait_until_a_read_blocks(time_limit)) {
+        FAIL("Timed out waiting for the decode thread to block on the demuxer");
+        return;
+    }
+    loop.pump(Core::EventLoop::WaitMode::PollForEvents);
+    EXPECT_EQ(producer->peek().status, Media::PipelineStatus::Pending);
+
+    for (size_t index = 0; index < sample_timestamps.size(); index++) {
+        EXPECT_EQ(producer->peek().status, Media::PipelineStatus::Pending);
+        EXPECT(withheld_outputs->release_next());
+        auto frame = take_frame_within_time_limit(*producer, loop, time_limit);
+        if (frame == nullptr) {
+            FAIL("A withheld output was not delivered");
+            return;
+        }
+    }
+
+    auto deadline = MonotonicTime::now_coarse() + time_limit;
+    while (producer->peek().status != Media::PipelineStatus::Blocked && MonotonicTime::now_coarse() < deadline)
+        loop.pump(Core::EventLoop::WaitMode::PollForEvents);
+    EXPECT_EQ(producer->peek().status, Media::PipelineStatus::Blocked);
+
+    demuxer->stop_blocking_reads();
+}
+
 // The frame a seek resolves on can arrive the same way, and must resolve the seek without decoding from its keyframe
 // again.
 TEST_CASE(a_seek_resolves_on_output_that_arrives_while_the_demuxer_blocks)
@@ -1144,14 +1203,16 @@ TEST_CASE(resuming_from_suspension_partway_into_a_group_of_pictures_moves_the_de
     auto target = AK::Duration::from_microseconds((target_sample_start + target_sample_end) / 2);
 
     auto forced_seek_count_before_resuming = demuxer->forced_seek_count();
-    producer->seek(target);
-    auto frame = take_frame_within_time_limit(*producer, loop, time_limit);
-    if (frame == nullptr) {
+    size_t seek_count = 0;
+    auto output = seek_to_resume_and_pump_until_woken_with_data(loop, *producer, target, seek_count);
+    if (!output.has_value()) {
         FAIL("Timed out waiting for the seek to resolve");
         return;
     }
-    EXPECT_EQ(frame->timestamp(), samples[target_index].timestamp);
-    EXPECT_EQ(demuxer->forced_seek_count(), forced_seek_count_before_resuming + 1);
+    producer->consume();
+    EXPECT_EQ(output->frame->timestamp(), samples[target_index].timestamp);
+    // The producer can suspend again before the test peeks, so each seek that resumes it forces one demuxer seek.
+    EXPECT_EQ(demuxer->forced_seek_count(), forced_seek_count_before_resuming + seek_count);
 }
 
 // The frames a decoder produced before it lost its state are still good, so they stay available while decoding
@@ -1437,4 +1498,275 @@ TEST_CASE(frames_held_by_the_decoder_are_delivered_when_data_becomes_permanently
         loop.pump(Core::EventLoop::WaitMode::PollForEvents);
     EXPECT(demuxer->seek_count() > seek_count);
     EXPECT(demuxer->forced_seek_count() > forced_seek_count);
+}
+
+TEST_CASE(video_producer_seeks_while_frames_are_held)
+{
+    auto& loop = never_destroyed_event_loop();
+
+    auto stream = load_test_file("vp9_oob_blocks.webm"sv);
+    auto demuxer = create_demuxer(stream);
+    auto tracks = TRY_OR_FAIL(demuxer->get_tracks_for_type(Media::TrackType::Video));
+    VERIFY(!tracks.is_empty());
+
+    auto producer = TRY_OR_FAIL(Media::DecodedVideoProducer::try_create(loop, demuxer, tracks[0]));
+    producer->start();
+
+    auto pull_next_frame = [&]() -> RefPtr<Media::VideoFrame> {
+        auto time_limit = AK::Duration::from_seconds(10);
+        auto start_time = MonotonicTime::now_coarse();
+        while (MonotonicTime::now_coarse() - start_time < time_limit) {
+            if (auto output = producer->peek(); output.frame != nullptr) {
+                producer->consume();
+                return output.frame;
+            }
+            loop.pump(Core::EventLoop::WaitMode::PollForEvents);
+        }
+        return nullptr;
+    };
+
+    // Hold a displaying sink's worth of frames plus a lagging media element reference, so the
+    // seek below must decode towards its target while these frame pool slots stay occupied.
+    Vector<NonnullRefPtr<Media::VideoFrame>> held_frames;
+    for (int i = 0; i < 3; i++) {
+        auto frame = pull_next_frame();
+        if (frame == nullptr) {
+            FAIL("Timed out pulling the initial frames");
+            return;
+        }
+        held_frames.append(frame.release_nonnull());
+    }
+
+    // Give the producer time to fill its decode-ahead queue behind the held frames.
+    auto fill_until = MonotonicTime::now_coarse() + AK::Duration::from_milliseconds(250);
+    while (MonotonicTime::now_coarse() < fill_until)
+        loop.pump(Core::EventLoop::WaitMode::PollForEvents);
+
+    producer->seek(AK::Duration::from_seconds(2));
+
+    if (pull_next_frame() == nullptr)
+        FAIL("The seek did not resolve; the producer is likely starved of frame pool slots");
+}
+
+TEST_CASE(video_producer_seeks_past_the_end_resolve_within_queued_data)
+{
+    auto& loop = never_destroyed_event_loop();
+
+    auto stream = load_test_file("vp9_oob_blocks.webm"sv);
+    auto demuxer = create_demuxer(stream);
+    auto tracks = TRY_OR_FAIL(demuxer->get_tracks_for_type(Media::TrackType::Video));
+    VERIFY(!tracks.is_empty());
+
+    auto producer = TRY_OR_FAIL(Media::DecodedVideoProducer::try_create(loop, demuxer, tracks[0]));
+    producer->start();
+
+    auto pump_until = [&](auto condition) {
+        auto deadline = MonotonicTime::now_coarse() + AK::Duration::from_seconds(5);
+        while (MonotonicTime::now_coarse() < deadline) {
+            if (condition())
+                return true;
+            loop.pump(Core::EventLoop::WaitMode::PollForEvents);
+        }
+        return false;
+    };
+
+    auto past_end = AK::Duration::from_seconds(100);
+    producer->seek(past_end);
+    EXPECT(pump_until([&] { return producer->peek().status == Media::PipelineStatus::HaveData; }));
+
+    // Give the decode loop time to observe the demuxer's end of stream behind the queued final frame.
+    auto fill_until = MonotonicTime::now_coarse() + AK::Duration::from_milliseconds(250);
+    while (MonotonicTime::now_coarse() < fill_until)
+        loop.pump(Core::EventLoop::WaitMode::PollForEvents);
+
+    // Nothing exists beyond the queued final frame for the demuxer to re-emit, so a further seek past
+    // the end must resolve with the queued frame instead of discarding it.
+    producer->seek(past_end + AK::Duration::from_seconds(1));
+    auto output = producer->peek();
+    EXPECT_EQ(output.status, Media::PipelineStatus::HaveData);
+    EXPECT(output.frame != nullptr);
+    producer->consume();
+    EXPECT(pump_until([&] { return producer->peek().status == Media::PipelineStatus::EndOfStream; }));
+
+    // With the final frame consumed, nothing downstream is guaranteed to still hold it, so a later seek past the
+    // end re-emits that same frame before reporting end of stream again.
+    producer->seek(past_end + AK::Duration::from_seconds(2));
+    auto re_emitted = producer->peek();
+    EXPECT_EQ(re_emitted.status, Media::PipelineStatus::HaveData);
+    EXPECT(re_emitted.frame.ptr() == output.frame.ptr());
+    producer->consume();
+    EXPECT_EQ(producer->peek().status, Media::PipelineStatus::EndOfStream);
+}
+
+TEST_CASE(video_producer_auto_suspends_and_resumes_only_from_a_seek)
+{
+    auto& loop = never_destroyed_event_loop();
+
+    auto stream = load_test_file("big_buck_bunny_5s.webm"sv);
+    auto demuxer = create_demuxer(stream);
+    auto tracks = TRY_OR_FAIL(demuxer->get_tracks_for_type(Media::TrackType::Video));
+    VERIFY(!tracks.is_empty());
+
+    auto producer = TRY_OR_FAIL(Media::DecodedVideoProducer::try_create(loop, demuxer, tracks[0], SHORT_AUTO_SUSPEND_TIMEOUT));
+    producer->start();
+
+    EXPECT(pump_until(loop, [&] { return has_data_or_already_suspended(producer->peek().status); }));
+
+    // Left idle, the producer suspends. The checking peeks are spaced wider than the idle timeout
+    // so they cannot defer it indefinitely.
+    EXPECT(pump_until(loop, [&] {
+        sleep_past_the_idle_timeout();
+        return producer->peek().status == Media::PipelineStatus::Suspended;
+    }));
+
+    // Peeking and consuming must not resume a suspended producer.
+    for (int i = 0; i < 5; i++) {
+        EXPECT_EQ(producer->peek().status, Media::PipelineStatus::Suspended);
+        producer->consume();
+    }
+    sleep_past_the_idle_timeout();
+    loop.pump(Core::EventLoop::WaitMode::PollForEvents);
+    EXPECT_EQ(producer->peek().status, Media::PipelineStatus::Suspended);
+
+    // A seek resumes decoding and wakes the waiting consumer.
+    EXPECT(seek_to_resume_and_pump_until_woken_with_data(loop, *producer, AK::Duration::zero()).has_value());
+}
+
+TEST_CASE(video_producer_suspended_before_starting_reads_nothing_until_a_seek)
+{
+    auto& loop = never_destroyed_event_loop();
+
+    auto [inner_demuxer, track] = demuxer_and_video_track_for("./vp9_in_webm.webm"sv);
+    auto demuxer = BlockingDemuxer::create(inner_demuxer, NumericLimits<size_t>::max());
+    auto producer = TRY_OR_FAIL(Media::DecodedVideoProducer::try_create(loop, demuxer, track, SHORT_AUTO_SUSPEND_TIMEOUT));
+
+    bool woken = false;
+    producer->set_wake_handler([&] { woken = true; });
+    // A wake can still be queued on the shared event loop once this test returns.
+    ScopeGuard stop_handling_wakes = [&] { producer->set_wake_handler({}); };
+    producer->suspend();
+    EXPECT_EQ(producer->peek().status, Media::PipelineStatus::Suspended);
+    EXPECT(pump_until(loop, [&] { return woken; }));
+
+    sleep_past_the_idle_timeout();
+    loop.pump(Core::EventLoop::WaitMode::PollForEvents);
+    EXPECT_EQ(producer->peek().status, Media::PipelineStatus::Suspended);
+    EXPECT_EQ(demuxer->samples_served(), 0u);
+
+    EXPECT(seek_to_resume_and_pump_until_woken_with_data(loop, *producer, AK::Duration::zero()).has_value());
+    EXPECT(demuxer->samples_served() > 0);
+}
+
+// A producer suspended at the end of its stream no longer reports that end, which may be stale for a new consumer.
+TEST_CASE(video_producer_suspended_at_the_end_of_its_stream_waits_for_a_seek)
+{
+    auto& loop = never_destroyed_event_loop();
+
+    auto [demuxer, track] = demuxer_and_video_track_for("./vp9_in_webm.webm"sv);
+    auto producer = TRY_OR_FAIL(Media::DecodedVideoProducer::try_create(loop, demuxer, track));
+    producer->start();
+    EXPECT(pump_until(loop, [&] {
+        auto output = producer->peek();
+        if (output.frame != nullptr)
+            producer->consume();
+        return output.status == Media::PipelineStatus::EndOfStream;
+    }));
+
+    bool woken = false;
+    producer->set_wake_handler([&] { woken = true; });
+    ScopeGuard stop_handling_wakes = [&] { producer->set_wake_handler({}); };
+    producer->suspend();
+    EXPECT_EQ(producer->peek().status, Media::PipelineStatus::Suspended);
+    EXPECT(pump_until(loop, [&] { return woken; }));
+    sleep_past_the_idle_timeout();
+    loop.pump(Core::EventLoop::WaitMode::PollForEvents);
+    EXPECT_EQ(producer->peek().status, Media::PipelineStatus::Suspended);
+
+    EXPECT(seek_to_resume_and_pump_until_woken_with_data(loop, *producer, AK::Duration::zero()).has_value());
+}
+
+TEST_CASE(video_producer_suspended_during_a_blocked_read_stops_reading)
+{
+    auto& loop = never_destroyed_event_loop();
+
+    auto [inner_demuxer, track] = demuxer_and_video_track_for("./vp9_in_webm.webm"sv);
+    auto demuxer = BlockingDemuxer::create(inner_demuxer, 3);
+    auto producer = TRY_OR_FAIL(Media::DecodedVideoProducer::try_create(loop, demuxer, track));
+    producer->start();
+    EXPECT(demuxer->wait_until_a_read_blocks(AK::Duration::from_seconds(5)));
+
+    producer->suspend();
+    EXPECT_EQ(producer->peek().status, Media::PipelineStatus::Suspended);
+    auto samples_served = demuxer->samples_served();
+    demuxer->stop_blocking_reads();
+    sleep_past_the_idle_timeout();
+    loop.pump(Core::EventLoop::WaitMode::PollForEvents);
+    EXPECT_EQ(demuxer->samples_served(), samples_served);
+    EXPECT_EQ(producer->peek().status, Media::PipelineStatus::Suspended);
+}
+
+// A seek requested before the suspension is not one that the consumer is still waiting for.
+TEST_CASE(video_producer_suspended_with_a_seek_pending_drops_that_seek)
+{
+    auto& loop = never_destroyed_event_loop();
+
+    auto stream = load_test_file("big_buck_bunny_5s.webm"sv);
+    auto demuxer = create_demuxer(stream);
+    auto tracks = TRY_OR_FAIL(demuxer->get_tracks_for_type(Media::TrackType::Video));
+    VERIFY(!tracks.is_empty());
+    auto producer = TRY_OR_FAIL(Media::DecodedVideoProducer::try_create(loop, demuxer, tracks[0]));
+    producer->start();
+    EXPECT(pump_until(loop, [&] { return producer->peek().status == Media::PipelineStatus::HaveData; }));
+
+    producer->seek(AK::Duration::from_seconds(3));
+    producer->suspend();
+    EXPECT_EQ(producer->peek().status, Media::PipelineStatus::Suspended);
+    sleep_past_the_idle_timeout();
+    loop.pump(Core::EventLoop::WaitMode::PollForEvents);
+    EXPECT_EQ(producer->peek().status, Media::PipelineStatus::Suspended);
+
+    auto output = seek_to_resume_and_pump_until_woken_with_data(loop, *producer, AK::Duration::zero());
+    if (!output.has_value()) {
+        FAIL("Expected data after seeking");
+        return;
+    }
+    EXPECT(output->frame->timestamp() < AK::Duration::from_seconds(1));
+}
+
+TEST_CASE(video_producer_suspends_while_frames_are_held_and_wakes_the_consumer)
+{
+    auto& loop = never_destroyed_event_loop();
+
+    auto stream = load_test_file("big_buck_bunny_5s.webm"sv);
+    auto demuxer = create_demuxer(stream);
+    auto tracks = TRY_OR_FAIL(demuxer->get_tracks_for_type(Media::TrackType::Video));
+    VERIFY(!tracks.is_empty());
+
+    auto producer = TRY_OR_FAIL(Media::DecodedVideoProducer::try_create(loop, demuxer, tracks[0], SHORT_AUTO_SUSPEND_TIMEOUT));
+    producer->start();
+
+    // Hold every frame pool slot so the decoder parks waiting for a free slot, as it would behind
+    // a paused sink holding frames downstream.
+    Vector<NonnullRefPtr<Media::VideoFrame>> held_frames;
+    EXPECT(pump_until(loop, [&] {
+        auto output = producer->peek();
+        if (output.frame != nullptr) {
+            held_frames.append(output.frame.release_nonnull());
+            producer->consume();
+        }
+        return held_frames.size() == Media::VideoFramePool::MAX_SLOT_COUNT;
+    }));
+
+    // The queue is drained, so the last observed status is a waiting one and entering suspension
+    // must dispatch a wake.
+    EXPECT_EQ(producer->peek().status, Media::PipelineStatus::Pending);
+    // Run any wake dispatch still queued from draining the frames above, so the wait below only
+    // observes the wake dispatched by entering suspension.
+    loop.pump(Core::EventLoop::WaitMode::PollForEvents);
+    bool woken = false;
+    producer->set_wake_handler([&] { woken = true; });
+    // A wake can still be queued on the shared event loop once this test returns.
+    ScopeGuard stop_handling_wakes = [&] { producer->set_wake_handler({}); };
+    EXPECT(pump_until(loop, [&] { return woken; }));
+    EXPECT_EQ(producer->peek().status, Media::PipelineStatus::Suspended);
 }

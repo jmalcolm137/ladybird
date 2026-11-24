@@ -36,6 +36,25 @@
 
 namespace GC {
 
+// What started a collection, for its report.
+enum class CollectionTrigger : u8 {
+    Explicit,
+    Allocation,
+    IdlePolicy,
+    AbandonedObjectGraph,
+    Compaction,
+    DeferralEnded,
+};
+
+struct CompactionStats;
+
+namespace FFI {
+
+struct EvacuationSet;
+struct IdentityHashes;
+
+}
+
 struct StackFrameInfo {
     String label;
     size_t size_bytes { 0 };
@@ -85,10 +104,27 @@ public:
     //     they are in the frame it runs in, and the frames below become the scan's floor. The definitions are
     //     NO_SANITIZE_ADDRESS so that the capture buffer stays on the real stack rather than ASan's fake one.
     NEVER_INLINE void collect_garbage(CollectionType = CollectionType::CollectGarbage, bool print_report = false);
+
+    // Collects garbage and gives the memory that this frees back to the system before it returns. Otherwise the sweep
+    // happens bit by bit after a collection, and the freed memory goes back to the system some time after that. For a
+    // process that is short of memory now.
+    void collect_garbage_and_return_memory_to_system();
+
+    // Collects without taking any root from the stack or the registers, so no stale or lookalike word there keeps a
+    // cell alive. Only safe where every cell the stack refers to is rooted some other way, as in the outermost turn of
+    // the event loop.
+    void collect_garbage_without_scanning_the_stack();
+
+    // Tells the heap that no frame on the stack of the outermost turn of this thread's event loop holds the only
+    // reference to a cell. The collections that the heap starts from its own timers then leave the stack out when they
+    // run in that turn. Only the embedder can promise this, since those frames include its own, like main().
+    void set_outermost_event_loop_turn_holds_no_cells(bool value) { m_outermost_event_loop_turn_holds_no_cells = value; }
     NEVER_INLINE AK::JsonObject dump_graph();
 
-    // A cell on a retaining path, which reaches the next one through a field it visits.
+    // A cell on a retaining path, which reaches the next one through a field it visits. The cell is live until the next
+    // garbage collection at least.
     struct RetainingPathStep {
+        RawPtr<Cell> cell;
         StringView class_name;
     };
     struct RetainingPath {
@@ -108,6 +144,22 @@ public:
     bool should_collect_on_every_allocation() const { return m_should_collect_on_every_allocation; }
     // This is true for any CollectEverything cycle, not only heap teardown.
     bool is_collecting_everything() const { return m_collecting_garbage && m_current_collection_type == CollectionType::CollectEverything; }
+    // Whether a collection that marks the live cells runs, as opposed to one that only sweeps or a graph dump.
+    bool is_marking_for_collection() const { return m_collecting_garbage && m_current_collection_type == CollectionType::CollectGarbage; }
+
+    // Whether collect_garbage_and_return_memory_to_system() runs, so that what hangs off the heap can let go of more
+    // than it does in other collections.
+    bool is_returning_memory_to_system() const { return m_is_returning_memory_to_system; }
+
+    // Whether the collection in progress may move cells, which only a collection that does not scan the stack does.
+    bool is_moving_cells() const { return m_evacuation; }
+
+    // Whether LIBGC_MOVE_EVERYTHING has every collection that does not scan the stack move every cell it can, which
+    // test runners use to collect without scanning the stack where they safely can.
+    static bool moves_everything();
+    // Has the collections of this heap that do not scan the stack move every cell they can, or not, as
+    // LIBGC_MOVE_EVERYTHING does for every heap, for tests of moving cells.
+    void set_moves_everything_for_testing(bool moves_everything) { m_moves_everything = moves_everything; }
 
     void set_incremental_sweep_enabled(bool enabled) { m_incremental_sweep_enabled = enabled; }
     void set_should_collect_on_every_allocation(bool);
@@ -148,9 +200,21 @@ public:
     FunctionTable& function_table() { return m_function_table; }
     bool is_incremental_sweep_active() const { return m_incremental_sweep_active; }
 
+    // Sweeps the block now if the incremental sweep has yet to, as the sweep timer would.
     void sweep_block(HeapBlock&);
 
-    bool is_live_heap_block(HeapBlock* block) const { return m_live_heap_blocks.contains(block); }
+    // Whether `cell` points at a cell of this heap that is allocated: one that the sweep did not free yet. Code that keeps
+    // pointers to cells that may have died since uses this to tell them apart from live ones.
+    bool is_live_cell(Cell const*) const;
+
+    // How many blocks the heap has, for all types of cells.
+    size_t block_count() const;
+
+    void did_sweep_blocks_for_allocation(Badge<CellAllocator>, size_t swept_blocks, i64 duration_ns);
+
+    // A sweep runs the destructors of dead cells between these, see will_allocate().
+    void will_destroy_swept_cell(Badge<CellAllocator>) { ++m_block_sweeps_in_progress; }
+    void did_destroy_swept_cell(Badge<CellAllocator>) { --m_block_sweeps_in_progress; }
 
     template<typename Callback>
     void for_each_block(Callback callback)
@@ -167,6 +231,12 @@ public:
 
     void did_allocate_external_memory(size_t);
     void did_free_external_memory(size_t);
+
+    // Tells the heap that a large graph of objects, such as a page that went away, has likely just become garbage.
+    // Nothing about allocation shows that, so this brings the next collection forward, and hands what that collection
+    // frees back to the system once it has been swept. It never collects from here, since the graph is often still on
+    // the caller's stack.
+    void did_abandon_object_graph();
 
 private:
     friend struct CAPI;
@@ -215,8 +285,8 @@ private:
     }
 
     // Shared by allocate<T>() and any allocation whose cell type is only known through its allocator descriptor.
-    // Cells that other cells keep their storage in neither collect garbage nor count towards the next collection
-    // (see gc_heap_allocate_storage_cell()).
+    // Cells that other cells keep their storage in never collect garbage, but count towards the next collection (see
+    // gc_heap_allocate_storage_cell()).
     enum class TriggersCollection {
         No,
         Yes,
@@ -228,27 +298,14 @@ private:
         return cell_allocator_for(descriptor).allocate_cell(*this);
     }
 
-    // Cells allocated during incremental sweep in a block that the sweep has
-    // yet to finish must be marked so that it keeps them. The sweep clears the
-    // marks of the blocks it has yet to sweep; cells in the block it is
-    // sweeping right now are remembered so their marks get cleared when the
-    // sweep finishes. Swept and new blocks need nothing.
-    bool mark_if_allocated_during_incremental_sweep(Cell& cell)
+    // Cells allocated during incremental sweep in a block that the sweep has yet to finish must be marked so that it
+    // keeps them. Sweeping a block clears its marks once it is done, so swept and new blocks need nothing.
+    void mark_if_allocated_during_incremental_sweep(Cell& cell)
     {
-        if (!m_incremental_sweep_active)
-            return false;
-        auto* block = HeapBlock::from_cell(&cell);
-        if (block->is_pending_sweep()) {
-            cell.set_marked(true);
-            return true;
-        }
-        if (block->is_being_swept()) {
-            cell.set_marked(true);
-            m_cells_allocated_during_sweep.append(&cell);
-            return true;
-        }
-        return false;
+        if (m_incremental_sweep_active) [[unlikely]]
+            mark_cell_allocated_during_incremental_sweep(cell);
     }
+    void mark_cell_allocated_during_incremental_sweep(Cell&);
 
     // Marking makes every block pending sweep again, which local free lists
     // must never be in, so every collection does this once it has finished the
@@ -258,7 +315,8 @@ private:
     void will_allocate(size_t, TriggersCollection = TriggersCollection::Yes);
     void update_allocation_rate();
     double next_growth_factor(size_t live_cell_bytes);
-    void update_gc_bytes_threshold(size_t live_external_bytes);
+    void update_gc_bytes_threshold();
+    void limit_gc_bytes_threshold_for_abandoned_object_graph();
 
     enum class IncludeIncomingCrossHeapMembers {
         No,
@@ -270,16 +328,24 @@ private:
     struct ConservativeScanOrigin {
         FlatPtr stack_floor { 0 };
         ReadonlySpan<FlatPtr> callee_saved_registers;
+        bool scan_stack { true };
     };
 
     // NB: NEVER_INLINE so that these stay below their entry point's frame, and so that __builtin_frame_address(0)
     //     yields a floor that leaves out their own frames -- which is what keeps the collection's large locals from
     //     being scanned.
-    NEVER_INLINE void run_collection(ReadonlySpan<FlatPtr> callee_saved_registers, CollectionType, bool print_report);
+    NEVER_INLINE void run_collection(ReadonlySpan<FlatPtr> callee_saved_registers, CollectionType, bool print_report, bool scan_stack = true);
     NEVER_INLINE AK::JsonObject build_graph(ReadonlySpan<FlatPtr> callee_saved_registers);
     NEVER_INLINE Vector<RetainingPath> build_retaining_paths(ReadonlySpan<FlatPtr> callee_saved_registers, AK::Function<bool(Cell&)> const& is_target, size_t max_paths);
 
     void gather_roots(ConservativeScanOrigin const&, HashMap<Cell*, HeapRoot>&, Vector<StackFrameInfo>* out_stack_frames = nullptr, IncludeIncomingCrossHeapMembers = IncludeIncomingCrossHeapMembers::Yes);
+    bool should_move_cells(CollectionType, bool scan_stack) const;
+    void begin_evacuation();
+    void evacuate();
+    void end_evacuation();
+    Cell* allocate_destination_for_moved_cell(CellAllocator&);
+    void schedule_collection_that_moves_cells();
+    void schedule_compaction_if_worthwhile();
     static void mark_live_cells_across(ReadonlySpan<Heap* const>, HashMap<Cell*, HeapRoot>& roots);
     void clear_weak_pointers_to_dead_cells(bool report);
     void run_post_mark_phases(bool report);
@@ -292,15 +358,20 @@ private:
     void run_post_gc_tasks();
 
     bool sweep_next_block();
+    void did_sweep(size_t swept_blocks, i64 duration_ns);
     void start_incremental_sweep();
     void finish_incremental_sweep();
     void finish_pending_incremental_sweep();
+    void sweep_in_step_with_allocation();
     void start_incremental_sweep_timer();
     void stop_incremental_sweep_timer();
     void sweep_on_timer();
 
     void start_idle_gc_timer();
     void idle_gc_on_timer();
+    void on_abandoned_object_graph_timer();
+    void schedule_release_of_abandoned_object_graph_memory();
+    void schedule_release_of_allocator_memory();
 
     struct Stats {
         AK_ALLOC_WITH_KMALLOC;
@@ -334,12 +405,14 @@ private:
     HashTable<CrossHeapMemberBase*> m_incoming_cross_heap_members;
     HeapGroup* m_group { nullptr };
     bool m_incremental_sweep_enabled { true };
+    bool m_is_returning_memory_to_system { false };
     WeakContainer::List m_weak_containers;
 
     Vector<Ptr<Cell>> m_uprooted_cells;
 
     size_t m_gc_deferrals { 0 };
     bool m_should_gc_when_deferral_ends { false };
+    bool m_should_return_memory_when_deferral_ends { false };
 
     bool m_collecting_garbage { false };
     bool m_weak_pointers_to_dead_cells_are_cleared { false };
@@ -351,20 +424,51 @@ private:
     Vector<AK::Function<void()>> m_post_gc_tasks;
     Vector<AK::Function<void()>> m_sweep_callbacks;
 
-    HashTable<HeapBlock*> m_live_heap_blocks;
-
     WeakBlock::List m_usable_weak_blocks;
     WeakBlock::List m_full_weak_blocks;
 
     bool m_incremental_sweep_active { false };
+    size_t m_blocks_to_sweep { 0 };
+    size_t m_blocks_swept { 0 };
+    // How many destructors of swept cells are running, see will_allocate().
     size_t m_block_sweeps_in_progress { 0 };
     size_t m_marked_cell_bytes { 0 };
-    size_t m_sweep_live_external_bytes { 0 };
-    Vector<GC::Ptr<Cell>> m_cells_allocated_during_sweep;
+    size_t m_marked_external_bytes { 0 };
     CellAllocator::SweepList m_allocators_to_sweep;
     RefPtr<Core::Timer> m_incremental_sweep_timer;
 
     RefPtr<Core::Timer> m_idle_gc_timer;
+    RefPtr<Core::Timer> m_moving_collection_timer;
+    // Whether the moving collection timer already let queued events go, see schedule_collection_that_moves_cells().
+    bool m_moving_collection_postponed { false };
+    bool m_outermost_event_loop_turn_holds_no_cells { false };
+
+    // The blocks the collection in progress evacuates and the slots it found, while it may move cells.
+    FFI::EvacuationSet* m_evacuation { nullptr };
+    // The blocks it evacuates, those of an allocator one after another.
+    Vector<HeapBlock*> m_evacuated_blocks;
+    // The identity hashes of the cells that moved since they were hashed, see identity_hash().
+    FFI::IdentityHashes* m_identity_hashes { nullptr };
+    bool m_moves_everything { moves_everything() };
+    // Whether the heap went quiet and compacts until there is little left to recover, whether it did so since it was
+    // last busy, and whether the next collection that does not scan the stack compacts, see
+    // schedule_compaction_if_worthwhile().
+    bool m_reducing_memory { false };
+    bool m_compacted_since_activity { false };
+    bool m_should_compact { false };
+    // What the last collection that may have moved cells did, see begin_evacuation().
+    NonnullOwnPtr<CompactionStats> m_compaction_stats;
+    // Whether the idle timer already let queued events go before a collection it decided on, see idle_gc_on_timer().
+    bool m_idle_collection_postponed { false };
+    void collect_garbage_from_timer(CollectionTrigger);
+    enum class AbandonedObjectGraphState : u8 {
+        None,
+        WaitingToCollect,
+        WaitingToReleaseMemory,
+    };
+    AbandonedObjectGraphState m_abandoned_object_graph_state { AbandonedObjectGraphState::None };
+    RefPtr<Core::Timer> m_abandoned_object_graph_timer;
+    RefPtr<Core::Timer> m_allocator_memory_release_timer;
     u64 m_total_allocated_bytes { 0 };
     // The context a heap created through LibGC/CAPI.h was created with.
     void* m_foreign_context { nullptr };

@@ -1,0 +1,6 @@
+target starts outside root: true
+compositor animations:
+  transform div#rotated-parent
+  wakeup timer armed
+  observation timer armed
+target enters root: true

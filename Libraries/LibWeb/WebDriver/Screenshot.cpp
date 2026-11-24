@@ -50,9 +50,10 @@ void draw_bounding_box_from_the_framebuffer(HTML::BrowsingContext& browsing_cont
         return;
     }
 
-    // NB: Validate the bitmap size before requesting canvas backing from the compositor.
+    // NB: Validate the bitmap size before requesting canvas backing from the compositor. The framebuffer is captured
+    //     whole, so that step 6 can draw its region at the rectangle's coordinates.
     Gfx::IntSize paint_size { static_cast<int>(paint_width), static_cast<int>(paint_height) };
-    auto bitmap_or_error = Gfx::Bitmap::create_shareable(Gfx::BitmapFormat::BGRA8888, Gfx::AlphaType::Premultiplied, paint_size);
+    auto bitmap_or_error = Gfx::Bitmap::create_shareable(Gfx::BitmapFormat::BGRA8888, Gfx::AlphaType::Premultiplied, viewport_device_rect.size());
     if (bitmap_or_error.is_error()) {
         callback(Error::from_code(ErrorCode::UnableToCaptureScreen, "Unable to allocate the screenshot"sv));
         return;
@@ -82,8 +83,8 @@ void draw_bounding_box_from_the_framebuffer(HTML::BrowsingContext& browsing_cont
     //    - Height: paint height
     Gfx::IntRect paint_rect { rect.location(), paint_size };
 
-    HTML::PaintConfig paint_config { .canvas_fill_rect = paint_rect };
-    browsing_context.active_document()->navigable()->render_screenshot(bitmap, paint_config, [bitmap, element = GC::make_root(element), canvas = GC::make_root(canvas), callback = move(callback)](auto result) mutable {
+    HTML::PaintConfig paint_config { .canvas_fill_rect = Gfx::IntRect { {}, viewport_device_rect.size() } };
+    browsing_context.active_document()->navigable()->render_screenshot(bitmap, paint_config, [bitmap, paint_rect, element = GC::make_root(element), canvas = GC::make_root(canvas), callback = move(callback)](auto result) mutable {
         if (result == Compositor::ScreenshotResult::Failed) {
             callback(Error::from_code(ErrorCode::UnableToCaptureScreen, "The compositor did not take the screenshot"sv));
             return;
@@ -91,7 +92,13 @@ void draw_bounding_box_from_the_framebuffer(HTML::BrowsingContext& browsing_cont
 
         HTML::TemporaryExecutionContext execution_context { element->document().relevant_settings_object() };
 
-        auto image_bitmap = HTML::ImageBitmap::create(bitmap);
+        // A rectangle can start outside the framebuffer, where nothing is drawn.
+        auto region = bitmap->cropped(paint_rect, Gfx::Color::Transparent);
+        if (region.is_error()) {
+            callback(Error::from_code(ErrorCode::UnableToCaptureScreen, "Unable to allocate the screenshot"sv));
+            return;
+        }
+        auto image_bitmap = HTML::ImageBitmap::create(region.release_value());
         if (!canvas->canvas_rendering_context_2d()->draw_image(*image_bitmap, 0, 0)) {
             callback(Error::from_code(ErrorCode::UnableToCaptureScreen, "Failed to draw the screenshot to the canvas"sv));
             return;
@@ -114,12 +121,12 @@ Response encode_canvas_element(HTML::HTMLCanvasElement& canvas)
         return Error::from_code(ErrorCode::UnableToCaptureScreen, "Captured screenshot is empty"sv);
 
     // 3. Let file be a serialization of the canvas element’s bitmap as a file, using "image/png" as an argument.
-    auto bitmap = canvas.get_bitmap_from_surface();
-    if (!bitmap)
+    auto frame = canvas.get_srgb_frame_from_surface();
+    if (!frame.has_value())
         return Error::from_code(ErrorCode::UnableToCaptureScreen, "Captured screenshot is empty"sv);
     Gfx::PNGWriterOptions png_options;
     png_options.compression = Gfx::PNGCompression::Fast;
-    auto file = Gfx::PNGWriter::encode(*bitmap, png_options);
+    auto file = Gfx::PNGWriter::encode(*frame->bitmap_sharing_pixels(), png_options);
     if (file.is_error())
         return Error::from_code(ErrorCode::UnableToCaptureScreen, "Failed to serialize canvas"sv);
 

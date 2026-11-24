@@ -44,8 +44,13 @@ namespace Ladybird {
 static constexpr int LIST_PADDING = 6;
 static constexpr int FIELD_DIVIDER_HEIGHT = 1;
 static constexpr int ROW_HEIGHT = 34;
-static constexpr int ROW_CORNER_RADIUS = 6;
-static constexpr int CELL_HORIZONTAL_PADDING = 12;
+// NB: The radius nests in the corner of the surface the rows are listed in.
+static constexpr int ROW_CORNER_RADIUS = 4;
+// NB: With the list's 3 px inset, a row's icon and title start 10 px and 36 px in from the surface's edge, on the same
+//     columns as the address field's icon and text.
+static constexpr int CELL_LEADING_PADDING = 7;
+static constexpr int CELL_ICON_TITLE_SPACING = 10;
+static constexpr int CELL_TRAILING_PADDING = 12;
 static constexpr int CELL_ICON_SIZE = 16;
 static constexpr int CELL_SPACING = 12;
 // Search suggestions are set apart from pages by a line, with this much room above and below it.
@@ -133,16 +138,11 @@ public:
     {
         beginResetModel();
         m_suggestions = move(suggestions);
-        m_favicon_cache.clear();
+        m_favicons.clear_with_capacity();
 
-        for (size_t index = 0; index < m_suggestions.size(); ++index) {
-            auto const& suggestion = m_suggestions[index];
-            if (!suggestion.favicon_png.has_value())
-                continue;
-            auto icon = icon_from_png(suggestion.favicon_png->bytes(), CELL_ICON_SIZE);
-            if (icon.isNull())
-                continue;
-            m_favicon_cache.append({ index, move(icon) });
+        for (auto const& suggestion : m_suggestions) {
+            auto favicon_png = suggestion.favicon_png.has_value() ? suggestion.favicon_png->bytes() : ReadonlyBytes {};
+            m_favicons.append(favicon_from_png(favicon_png, CELL_ICON_SIZE));
         }
 
         endResetModel();
@@ -176,11 +176,7 @@ public:
                 return qstring_from_ak_string(*suggestion.subtitle);
             return {};
         case FaviconRole:
-            for (auto const& entry : m_favicon_cache) {
-                if (entry.suggestion_index == suggestion_index)
-                    return entry.icon;
-            }
-            return {};
+            return m_favicons[suggestion_index];
         case SourceRole:
             return static_cast<int>(suggestion.source);
         case SuggestionIndexRole:
@@ -188,11 +184,14 @@ public:
         case HighlightInputRole:
             return qstring_from_ak_string(suggestion.highlight_input);
         case StartsGroupRole: {
-            // Pages that follow search suggestions start a group of their own.
+            // Pages that follow search suggestions start a group of their own. An address the search engine suggested
+            // stays among its other suggestions.
             if (suggestion_index == 0)
                 return false;
-            auto is_search = [](auto const& suggestion) { return suggestion.source == WebView::AutocompleteSuggestionSource::Search; };
-            return is_search(m_suggestions[suggestion_index - 1]) != is_search(suggestion);
+            auto is_from_search = [](auto const& suggestion) {
+                return suggestion.source == WebView::AutocompleteSuggestionSource::Search || suggestion.source == WebView::AutocompleteSuggestionSource::RemoteURL;
+            };
+            return is_from_search(m_suggestions[suggestion_index - 1]) != is_from_search(suggestion);
         }
         default:
             return {};
@@ -206,26 +205,9 @@ public:
         return Qt::ItemIsEnabled | Qt::ItemIsSelectable;
     }
 
-    int table_row_for_suggestion_index(int suggestion_index) const
-    {
-        if (suggestion_index < 0 || suggestion_index >= static_cast<int>(m_suggestions.size()))
-            return -1;
-        return suggestion_index;
-    }
-
-    size_t visible_suggestion_count() const
-    {
-        return m_suggestions.size();
-    }
-
 private:
-    struct FaviconEntry {
-        size_t suggestion_index;
-        QIcon icon;
-    };
-
     Vector<WebView::AutocompleteSuggestion> m_suggestions;
-    Vector<FaviconEntry> m_favicon_cache;
+    Vector<QIcon> m_favicons;
 };
 
 class AutocompleteDelegate final : public QStyledItemDelegate {
@@ -286,7 +268,7 @@ public:
         else if (!title_text.isEmpty())
             detail_text = url_text;
 
-        int x = row_rect.left() + CELL_HORIZONTAL_PADDING;
+        int x = row_rect.left() + CELL_LEADING_PADDING;
         QRect icon_rect(x, row_rect.top() + (row_rect.height() - CELL_ICON_SIZE) / 2, CELL_ICON_SIZE, CELL_ICON_SIZE);
         auto icon_color = selected ? QColor(Qt::white) : panel.muted;
         if (source == WebView::AutocompleteSuggestionSource::Search || source == WebView::AutocompleteSuggestionSource::ChooseSearchEngine)
@@ -295,9 +277,9 @@ public:
             favicon.paint(painter, icon_rect);
         else
             create_chrome_icon(ChromeIcon::Globe, icon_color).paint(painter, icon_rect);
-        x = icon_rect.right() + 1 + CELL_SPACING;
+        x = icon_rect.right() + 1 + CELL_ICON_TITLE_SPACING;
 
-        auto right = row_rect.right() - CELL_HORIZONTAL_PADDING;
+        auto right = row_rect.right() - CELL_TRAILING_PADDING;
 
         auto title_font = autocomplete_title_font();
         auto detail_font = autocomplete_detail_font();
@@ -424,6 +406,15 @@ void Autocomplete::show_current_suggestions()
     update_chrome_style();
     // NB: The host may be hidden until it sees the list is open, so the list's own visibility isn't watched.
     m_list_view->setFixedHeight(list_height());
+    // NB: The list's new height reaches the widgets around it one posted layout request at a time, and Qt may paint
+    //     between two of those. That paint would show the new list in a host of the old size, so they resize now.
+    for (QWidget* ancestor = m_list_view->parentWidget(); ancestor; ancestor = ancestor->parentWidget()) {
+        QEvent layout_request(QEvent::LayoutRequest);
+        QCoreApplication::sendEvent(ancestor, &layout_request);
+        auto* parent = ancestor->parentWidget();
+        if (!parent || !parent->layout() || parent->layout()->indexOf(ancestor) < 0)
+            break;
+    }
     m_list_view->show();
     set_anchor_popup_open(true);
 }
@@ -433,18 +424,10 @@ void Autocomplete::set_selected_suggestion(Optional<size_t> suggestion_index)
     if (!m_list_view)
         return;
 
-    int table_row = suggestion_index.has_value()
-        ? m_model->table_row_for_suggestion_index(static_cast<int>(*suggestion_index))
-        : -1;
-
-    if (table_row == -1) {
-        m_list_view->setCurrentIndex({});
-        return;
-    }
-
-    auto index = m_model->index(table_row, 0);
+    auto index = suggestion_index.has_value() ? m_model->index(static_cast<int>(*suggestion_index), 0) : QModelIndex {};
     m_list_view->setCurrentIndex(index);
-    m_list_view->scrollTo(index);
+    if (index.isValid())
+        m_list_view->scrollTo(index);
 }
 
 bool Autocomplete::close()
@@ -498,7 +481,7 @@ bool Autocomplete::eventFilter(QObject* watched, QEvent* event)
 
 int Autocomplete::list_height() const
 {
-    int visible_count = static_cast<int>(min(m_model->visible_suggestion_count(), MAXIMUM_VISIBLE_AUTOCOMPLETE_SUGGESTIONS));
+    int visible_count = min(m_model->rowCount(), static_cast<int>(MAXIMUM_VISIBLE_AUTOCOMPLETE_SUGGESTIONS));
     int total_height = 0;
     for (int i = 0; i < visible_count; ++i) {
         QStyleOptionViewItem option;

@@ -53,13 +53,19 @@ public:
     ~DecodedVideoProducer();
 
     void set_error_handler(ErrorHandler&&);
-    void set_read_blocked_change_handler(ReadBlockedChangeHandler);
 
     virtual void start() override;
+    virtual void suspend() override;
 
     virtual VideoProducerOutput peek() override;
     virtual void consume() override;
     virtual void set_wake_handler(PipelineWakeHandler) override;
+
+    // Called once a blocked read is able to continue, after the producer has stopped reporting Blocked. It runs on the
+    // thread that delivered the data, under the demuxer's lock, so it must not block or take other locks.
+    void set_read_unblocked_handler(Function<void()>);
+    // Callable from any thread.
+    void set_checkpoint(PipelineCheckpoint);
 
     AK::Duration select_fast_seek_target(AK::Duration timestamp, SeekMode);
     virtual void seek(AK::Duration timestamp, InvalidateHeldData = InvalidateHeldData::No) override;
@@ -71,10 +77,10 @@ private:
         ~ThreadData();
 
         void set_error_handler(ErrorHandler&&);
-        void set_read_blocked_change_handler(ReadBlockedChangeHandler);
         void set_wake_handler(PipelineWakeHandler);
 
         void start();
+        void suspend();
         VideoDecoderSelection select_decoder_for_frame(CodedFrame const&, VideoDecoderSelection after = {}) const;
         void replace_decoder_once_drained(CodedFrame const&, DecodeIntent);
         DecoderErrorOr<void> receive_into_decoder(CodedFrame const&, DecodeIntent);
@@ -82,6 +88,7 @@ private:
         DecoderErrorOr<void> receive_coded_frame(CodedFrame const&, DecodeIntent);
         DecoderErrorOr<bool> replace_drained_decoder();
         bool check_if_seek_is_needed_or_allow_demuxer_reads(u32 seek_id);
+        void note_whether_decoder_has_decode_in_progress();
         void wait_for_another_seek_or_exit(u32 seek_id);
         void release_decoder();
         void exit();
@@ -94,10 +101,12 @@ private:
 
         void seek(AK::Duration timestamp, InvalidateHeldData);
         AK::Duration select_fast_seek_target(AK::Duration target, SeekMode) const;
+        void set_read_unblocked_handler(Function<void()>);
+        void set_checkpoint(PipelineCheckpoint);
 
         void register_decode_thread();
         void wait_for_start();
-        bool should_thread_exit_while_locked() const;
+        bool should_break_out_of_loop_while_locked() const;
         bool should_thread_exit() const;
         bool handle_auto_suspension();
         template<typename Invokee>
@@ -118,6 +127,7 @@ private:
         void enter_halting_state(PipelineStatus, Optional<DecoderError>);
 
         void dispatch_wake_if_needed_while_locked();
+        void dispatch_wake_later();
 
         [[nodiscard]] MutexLocker<Mutex> take_lock() const { return MutexLocker(m_wait_state->mutex); }
         void wake() const { m_wait_state->condition.broadcast(); }
@@ -135,7 +145,7 @@ private:
             ExitDecodeLoop,
         };
         WaitResult wait_for_frame_storage_while_locked();
-        void dispatch_read_blocked_change(ReadBlocked blocked);
+        bool read_is_blocked_while_locked() const;
 
         Core::EventLoop& m_main_thread_event_loop;
 
@@ -172,8 +182,11 @@ private:
         FrameQueue m_queue;
         RefPtr<VideoFrame> m_last_queued_frame;
         ErrorHandler m_error_handler;
-        ReadBlockedChangeHandler m_read_blocked_change_handler;
         PipelineStatus m_current_halting_status { PipelineStatus::Pending };
+        // Set by the demuxer under its own lock, which may be taken while ours is held.
+        Atomic<bool> m_demuxer_read_is_blocked { false };
+        Atomic<PipelineCheckpoint> m_checkpoint { 0 };
+        bool m_decoder_has_decode_in_progress { false };
 
         enum class SeekReason : u8 {
             Normal,
@@ -191,7 +204,12 @@ private:
 
         AK::Duration const m_auto_suspend_idle_timeout;
         mutable MonotonicTime m_last_consumer_activity { MonotonicTime::now() };
-        mutable bool m_auto_suspend_requested { false };
+        enum class SuspensionRequest : u8 {
+            None,
+            Automatic,
+            FromConsumer,
+        };
+        mutable SuspensionRequest m_suspension_request { SuspensionRequest::None };
     };
 
     NonnullRefPtr<ThreadData> m_thread_data;

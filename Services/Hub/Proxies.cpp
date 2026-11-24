@@ -62,6 +62,12 @@ void PictureInPictureWindowInUI::set_video_size(Gfx::IntSize video_size)
         ui->async_pip_set_video_size(m_view_id, video_size);
 }
 
+void MediaSessionPlatformBackendInUI::update(Optional<WebView::NowPlayingState> const& state)
+{
+    if (auto* ui = ConnectionFromUI::the())
+        ui->async_media_session_update(state);
+}
+
 static NotificationBackendInUI* s_notification_backend;
 
 NotificationBackendInUI::NotificationBackendInUI()
@@ -219,6 +225,46 @@ void MicrophoneAuthorizerInUI::did_change_authorization(WebView::MicrophoneAutho
     auto pending_requests = move(m_pending_requests);
     for (auto& on_complete : pending_requests)
         on_complete(authorization);
+}
+
+static DefaultBrowserInUI* s_default_browser = nullptr;
+
+DefaultBrowserInUI::DefaultBrowserInUI()
+{
+    s_default_browser = this;
+}
+
+DefaultBrowserInUI::~DefaultBrowserInUI()
+{
+    s_default_browser = nullptr;
+}
+
+DefaultBrowserInUI* DefaultBrowserInUI::the()
+{
+    return s_default_browser;
+}
+
+void DefaultBrowserInUI::make_default(Function<void(WebView::MakeDefaultBrowserResult const&)> on_complete)
+{
+    // With no UI to ask, nothing would ever answer, and every later request would wait behind this one.
+    auto* ui = ConnectionFromUI::the();
+    if (!ui) {
+        on_complete({ .failed = true, .system_message = {} });
+        return;
+    }
+
+    // Requests made while the system is asking share its answer.
+    m_pending_requests.append(move(on_complete));
+    if (m_pending_requests.size() > 1)
+        return;
+    ui->async_default_browser_make_default();
+}
+
+void DefaultBrowserInUI::did_make_default(WebView::MakeDefaultBrowserResult const& result)
+{
+    auto pending_requests = move(m_pending_requests);
+    for (auto& on_complete : pending_requests)
+        on_complete(result);
 }
 
 static GamepadSourceInUI* s_gamepad_source = nullptr;

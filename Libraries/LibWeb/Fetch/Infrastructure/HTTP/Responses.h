@@ -15,6 +15,7 @@
 #include <AK/Time.h>
 #include <AK/Utf16String.h>
 #include <AK/Vector.h>
+#include <AK/Weakable.h>
 #include <LibCore/ImmutableBytes.h>
 #include <LibHTTP/HeaderList.h>
 #include <LibURL/URL.h>
@@ -22,14 +23,16 @@
 #include <LibWeb/Fetch/Engine/FetchBodyDeliveryGate.h>
 #include <LibWeb/Fetch/Engine/NetworkTransportHandle.h>
 #include <LibWeb/Fetch/Infrastructure/HTTP.h>
-#include <LibWeb/Fetch/Infrastructure/HTTP/Bodies.h>
+#include <LibWeb/Fetch/Infrastructure/HTTP/FetchBody.h>
 #include <LibWebCommon/Fetch/Infrastructure/HTTP/ResponseCacheState.h>
 #include <LibWebCommon/Fetch/Infrastructure/HTTP/Statuses.h>
 
 namespace Web::Fetch::Infrastructure {
 
 // https://fetch.spec.whatwg.org/#concept-response
-class WEB_API Response : public RefCounted<Response> {
+class WEB_API Response
+    : public RefCounted<Response>
+    , public Weakable<Response> {
 public:
     GC_HOLDS_NO_CELL_EDGES;
 
@@ -114,6 +117,7 @@ public:
 
     [[nodiscard]] virtual BodyInfo const& body_info() const { return m_body_info; }
     virtual void set_body_info(BodyInfo body_info) { m_body_info = move(body_info); }
+    void set_body_sizes(u64 encoded_size, u64 decoded_size);
 
     [[nodiscard]] virtual RedirectTaint redirect_taint() const { return m_redirect_taint; }
     virtual void set_redirect_taint(RedirectTaint redirect_taint) { m_redirect_taint = redirect_taint; }
@@ -138,8 +142,9 @@ public:
     [[nodiscard]] virtual Optional<NetworkTransport> const& network_transport() const { return m_network_transport; }
     virtual void set_network_transport(NetworkTransport network_transport) { m_network_transport = move(network_transport); }
     virtual void release_request_transfer_lease() const;
-    virtual void resume_body_delivery() const;
-    virtual void resume_body_delivery_up_to(size_t) const;
+    // Releases the request's transfer lease, and posts the release of the body's navigation hold to the given executor.
+    virtual void resume_body_delivery(Engine::FetchExecutor&) const;
+    virtual void release_navigation_hold_up_to(Engine::FetchExecutor&, size_t) const;
 
     // Stops this process taking the body, and returns the bytes that a process adopting its request reads before the
     // rest.
@@ -277,8 +282,8 @@ public:
     [[nodiscard]] virtual Optional<NetworkTransport> const& network_transport() const override { return m_internal_response->network_transport(); }
     virtual void set_network_transport(NetworkTransport network_transport) override { m_internal_response->set_network_transport(move(network_transport)); }
     virtual void release_request_transfer_lease() const override { m_internal_response->release_request_transfer_lease(); }
-    virtual void resume_body_delivery() const override { m_internal_response->resume_body_delivery(); }
-    virtual void resume_body_delivery_up_to(size_t byte_count) const override { m_internal_response->resume_body_delivery_up_to(byte_count); }
+    virtual void resume_body_delivery(Engine::FetchExecutor& executor) const override { m_internal_response->resume_body_delivery(executor); }
+    virtual void release_navigation_hold_up_to(Engine::FetchExecutor& executor, size_t byte_count) const override { m_internal_response->release_navigation_hold_up_to(executor, byte_count); }
     virtual Vector<Core::ImmutableBytes> release_body_for_transfer() const override { return m_internal_response->release_body_for_transfer(); }
 
     [[nodiscard]] NonnullRefPtr<Response const> internal_response() const { return m_internal_response; }

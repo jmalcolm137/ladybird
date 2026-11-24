@@ -45,21 +45,12 @@ struct Verifier<'a> {
     arena: &'a LayoutNodeArena,
     expected_entries_by_root: HashMap<NodeSlotId, ExpectedEntries>,
     expected_roots: Vec<NodeSlotId>,
-    previous_label: Option<u64>,
     report: Report,
 }
 
 impl Verifier<'_> {
     fn visit(&mut self, slot: NodeSlotId, enclosing: NodeSlotId) {
         let fresh = StackingContextFacts::gather(self.arena, slot, enclosing);
-        let label = self.arena.node_pre_order_label(slot);
-        if self.previous_label.is_some_and(|previous| label <= previous) {
-            self.report.note(format_args!(
-                "pre-order label of {slot:?} is not greater than the previous label"
-            ));
-        }
-        self.previous_label = Some(label);
-
         match self.arena.paintable_visual_context_record(slot) {
             Some(record) => {
                 let stored = record.stacking_context;
@@ -138,6 +129,21 @@ impl Verifier<'_> {
         }
     }
 
+    fn compare_pre_order_labels(&mut self, viewport: NodeSlotId) {
+        let arena = self.arena;
+        let report = &mut self.report;
+        let mut previous_label: Option<u64> = None;
+        arena.for_each_node_in_layout_subtree_in_pre_order(viewport, |slot| {
+            let label = arena.node_pre_order_label(slot);
+            if previous_label.is_some_and(|previous| label <= previous) {
+                report.note(format_args!(
+                    "pre-order label of {slot:?} is not greater than the previous label"
+                ));
+            }
+            previous_label = Some(label);
+        });
+    }
+
     fn compare_tables(&mut self) {
         for root in std::mem::take(&mut self.expected_roots) {
             let expected = self
@@ -146,7 +152,14 @@ impl Verifier<'_> {
                 .expect("every expected root has an expected entry set");
             expected
                 .child_contexts_with_nonzero_z_index
-                .sort_by_key(|(z_index, _)| *z_index);
+                .sort_by(|(left_z_index, left), (right_z_index, right)| {
+                    left_z_index
+                        .cmp(right_z_index)
+                        .then_with(|| self.arena.compare_order_modified_document_order(*left, *right))
+                });
+            expected
+                .stack_level_zero_boxes
+                .sort_by(|&left, &right| self.arena.compare_order_modified_document_order(left, right));
             let Some(table) = self.arena.stacking_context_entries(root) else {
                 self.report
                     .note(format_args!("establishing box {root:?} has no entries table"));
@@ -211,12 +224,12 @@ pub(crate) fn verification_report(arena: &LayoutNodeArena, viewport: NodeSlotId)
         arena,
         expected_entries_by_root: HashMap::new(),
         expected_roots: Vec::new(),
-        previous_label: None,
         report: Report {
             text: String::new(),
             line_count: 0,
         },
     };
+    verifier.compare_pre_order_labels(viewport);
     verifier.visit(viewport, NodeSlotId::INVALID);
     verifier.compare_tables();
     verifier.report.text

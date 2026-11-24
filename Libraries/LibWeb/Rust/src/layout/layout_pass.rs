@@ -27,6 +27,7 @@ pub(crate) struct LayoutPass<'arena> {
     pub(crate) initial_containing_block_inline_size: CssPixels,
     pub(crate) initial_containing_block_block_size: CssPixels,
     pub(crate) document_in_quirks_mode: bool,
+    pub(crate) document_in_limited_quirks_mode: bool,
     /// The frame of the formatting context the pass is laying out, in which style reads see sizes and box sides.
     pub(crate) frame: super::geometry::Frame,
     /// The root of the run this pass view was handed to and that root's containing block, where containing block
@@ -34,12 +35,8 @@ pub(crate) struct LayoutPass<'arena> {
     innermost_run: (Node, Node),
     /// What the run this pass view was handed to found out for the host so far, or the pass outside any run.
     host_findings: &'arena super::run_state::HostFindingsSink,
-    /// The intrinsic sizes the runs this pass view reaches read and measure into: those passes measured, kept for the
-    /// passes after them, or inside a run whose result is discarded, that run's own.
-    intrinsic_size_caches: &'arena super::layout_node_arena::IntrinsicSizeCaches,
-    /// Whether this pass view is inside a run whose result is discarded, which reads no memoized layout from before it
-    /// and keeps none: the run cache, the in-flow block cache, prepared inline content and intrinsic sizes.
-    reads_no_memoized_layout: bool,
+    /// The layout memos the runs this pass view reaches read and keep.
+    memos: MemoScope<'arena>,
     /// The innermost of the position options the boxes this pass view lays out are laid out with.
     position_option_styles: Option<&'arena PositionOptionStyle<'arena>>,
     records_trace: bool,
@@ -100,6 +97,17 @@ impl WorkerScratchOfThisThread {
     }
 }
 
+/// Which layout memos a pass view reads and keeps: the run cache, the in-flow block cache, prepared inline content and
+/// intrinsic sizes.
+#[derive(Clone, Copy)]
+enum MemoScope<'arena> {
+    /// Those kept for the runs and passes after the ones that made them.
+    Kept,
+    /// None from before a run whose result is discarded, which keeps none after it either. It measures intrinsic sizes
+    /// into caches of its own.
+    Discarded(&'arena super::layout_node_arena::IntrinsicSizeCaches),
+}
+
 /// The style a box is laid out with in place of the style of its row: that of one of its position options. It links to
 /// the position option the box is laid out inside of, if any.
 /// https://drafts.csswg.org/css-anchor-position-1/#apply-a-position-option
@@ -124,11 +132,11 @@ impl<'arena> LayoutPass<'arena> {
             initial_containing_block_inline_size: stage.viewport_inline_size,
             initial_containing_block_block_size: stage.viewport_block_size,
             document_in_quirks_mode: stage.document_in_quirks_mode,
+            document_in_limited_quirks_mode: stage.document_in_limited_quirks_mode,
             frame: super::geometry::Frame::PHYSICAL,
             innermost_run: (NodeSlotId::INVALID, NodeSlotId::INVALID),
             host_findings: host_findings_outside_runs,
-            intrinsic_size_caches: &scratch.intrinsic_size_caches,
-            reads_no_memoized_layout: false,
+            memos: MemoScope::Kept,
             position_option_styles: None,
             records_trace: scratch.layout_trace.is_recording(),
             forks_runs: false,
@@ -156,7 +164,7 @@ impl<'arena> LayoutPass<'arena> {
     }
 
     pub(super) fn forks_runs(&self) -> bool {
-        self.forks_runs && !self.reads_no_memoized_layout && !self.records_trace
+        self.forks_runs && !self.is_discarded_run() && !self.records_trace
     }
 
     pub(super) fn noting_host_findings_in<'findings>(
@@ -185,6 +193,7 @@ impl<'arena> LayoutPass<'arena> {
                 viewport_inline_size: CssPixels::default(),
                 viewport_block_size: CssPixels::default(),
                 document_in_quirks_mode: false,
+                document_in_limited_quirks_mode: false,
             },
         )
     }
@@ -228,8 +237,7 @@ impl<'arena> LayoutPass<'arena> {
         intrinsic_size_caches.cover_slots(self.arena.slot_capacity());
         let pass: LayoutPass<'_> = self;
         run(LayoutPass {
-            intrinsic_size_caches: &intrinsic_size_caches,
-            reads_no_memoized_layout: true,
+            memos: MemoScope::Discarded(&intrinsic_size_caches),
             ..pass
         })
     }
@@ -275,30 +283,38 @@ impl<'arena> LayoutPass<'arena> {
     /// Where this pass view records what its runs do while the document traces its layout: the document's layout trace,
     /// or nowhere inside a run whose result is discarded.
     pub(crate) fn layout_trace(&self) -> super::trace::LayoutTraceTarget<'arena> {
-        if self.reads_no_memoized_layout || !self.records_trace {
+        if self.is_discarded_run() || !self.records_trace {
             return super::trace::LayoutTraceTarget::recording_nothing();
         }
         super::trace::LayoutTraceTarget::recording_into(&self.scratch.layout_trace)
     }
 
-    /// The results of formatting context runs, kept for the runs and passes after them.
-    pub(crate) fn fc_run_cache_store(&self) -> &'arena super::fc_run_cache::FcRunCacheStore {
-        self.scratch.fc_run_cache_store()
+    /// The results of formatting context runs, kept for the runs and passes after them, unless this pass view is inside
+    /// a run whose result is discarded.
+    pub(crate) fn fc_run_cache_store(&self) -> Option<&'arena super::fc_run_cache::FcRunCacheStore> {
+        self.kept_memos().then(|| self.scratch.fc_run_cache_store())
     }
 
     pub(crate) fn fragment_builder_scratch(&self) -> &'arena super::fragment_tree::FragmentBuilderScratch {
         self.scratch.fragment_builder_scratch()
     }
 
-    /// The layouts of in-flow blocks, kept for the passes after the one that laid them out.
-    pub(crate) fn in_flow_block_cache_store(&self) -> &'arena super::in_flow_block_cache::InFlowBlockCacheStore {
-        self.scratch.in_flow_block_cache_store()
+    /// The layouts of in-flow blocks, kept for the passes after the one that laid them out, unless this pass view is
+    /// inside a run whose result is discarded.
+    pub(crate) fn in_flow_block_cache_store(
+        &self,
+    ) -> Option<&'arena super::in_flow_block_cache::InFlowBlockCacheStore> {
+        self.kept_memos().then(|| self.scratch.in_flow_block_cache_store())
     }
 
     /// Whether this pass view is inside a run whose result is discarded, which reads no memoized layout from before it
     /// and keeps none.
-    pub(crate) fn reads_no_memoized_layout(&self) -> bool {
-        self.reads_no_memoized_layout
+    pub(crate) fn is_discarded_run(&self) -> bool {
+        matches!(self.memos, MemoScope::Discarded(_))
+    }
+
+    fn kept_memos(&self) -> bool {
+        matches!(self.memos, MemoScope::Kept)
     }
 
     /// Notes what the run this pass view was handed to found out for the host, or the pass outside any run.
@@ -308,6 +324,14 @@ impl<'arena> LayoutPass<'arena> {
 
     pub(crate) fn host_findings_noted_so_far(&self) -> u64 {
         self.host_findings.notes_so_far()
+    }
+
+    /// Hands what a finished run found out besides its result to the run this pass view was handed to, which takes in
+    /// its result.
+    pub(crate) fn receive_residue(&self, residue: Option<Box<super::run_state::RunResidue>>) {
+        if let Some(residue) = residue {
+            self.note_host_findings(|into| into.receive(residue.host_findings));
+        }
     }
 
     /// Hands what a finished run found out to the run this pass view was handed to, which used its result.
@@ -320,7 +344,10 @@ impl<'arena> LayoutPass<'arena> {
     /// The intrinsic sizes passes measured, kept for the passes after them, or inside a run whose result is discarded,
     /// that run's own.
     pub(crate) fn intrinsic_size_caches(&self) -> &'arena super::layout_node_arena::IntrinsicSizeCaches {
-        self.intrinsic_size_caches
+        match self.memos {
+            MemoScope::Kept => &self.scratch.intrinsic_size_caches,
+            MemoScope::Discarded(intrinsic_size_caches) => intrinsic_size_caches,
+        }
     }
 
     #[inline]
@@ -351,10 +378,12 @@ impl<'arena> LayoutPass<'arena> {
         )
     }
 
+    /// The inline content prepared for block containers, kept for the runs after the one that prepared it, unless this
+    /// pass view is inside a run whose result is discarded.
     pub(crate) fn prepared_inline_content_memos(
         &self,
-    ) -> &'arena super::prepared_inline_content::PreparedInlineContentMemos {
-        self.scratch.prepared_inline_content_memos()
+    ) -> Option<&'arena super::prepared_inline_content::PreparedInlineContentMemos> {
+        self.kept_memos().then(|| self.scratch.prepared_inline_content_memos())
     }
 
     pub(crate) fn take_inline_content_preparation_buffers(

@@ -15,7 +15,7 @@ neighbour display | float instead | boxed whitespace 00 | builds 1 | PASS
 neighbour display | no float | boxed whitespace 10 | builds 1 | PASS
 parent white-space | initial | boxed whitespace 00
 parent white-space | pre | boxed whitespace 11 | builds 1 | PASS
-parent white-space | pre-line | boxed whitespace 11 | builds 1 | PASS
+parent white-space | pre-line | boxed whitespace 11 | builds 0 | PASS
 parent white-space | normal | boxed whitespace 00 | builds 1 | PASS
 text before whitespace | initial | boxed whitespace 11
 text before whitespace | add trailing space | boxed whitespace 01 | builds 1 | PASS

@@ -92,11 +92,7 @@ This process runs the WebRTC connections of a **WebContent** process, outside of
 
 ## Site isolation
 
-A renderer may be taken over by a page it hosts, so documents of different sites are kept in different processes. The `--site-isolation` option selects how far this goes:
-
-- `iframe`, the default, isolates every document, including cross-site frames.
-- `top-level` isolates top-level documents, and frames stay in the process of their parent.
-- `disable` keeps every document in the process holding its navigable.
+A renderer may be taken over by a page it hosts, so documents of different sites, cross-site frames included, are kept in different processes. The Memory section of `about:settings` chooses whether tabs of one origin or one site share a process. `--debug-process WebContent` turns isolation off, so that every document of a tab stays in the process a debugger is attached to.
 
 Documents that can script each other synchronously belong to one agent, and an agent runs in one process. A document with an opaque origin goes with the document that created it. Local file content and WebUI documents are kept in processes of their own, because those processes hold privileges that a website must not get.
 
@@ -114,7 +110,9 @@ A renderer that needs a helper it does not have yet asks **Hub** for a connectio
 
 Every process in the table above except **UI** and **Hub** applies a sandbox to itself early in its startup, unless **Hub** was started with `--disable-sandbox`. Each one's sandbox allows only what that process needs, and can be found in the `Sandbox` files in its directory under `Services`. The one of **WebContent** is in `Services/RendererSandbox.h`.
 
-On Linux, sandboxes are built from seccomp and Landlock. On macOS, they use the Seatbelt sandbox. Windows has no sandbox yet.
+On Linux, sandboxes are built from seccomp and Landlock. On kernels without Landlock, seccomp traps every system call that takes a path, and a broker process forked from the helper carries out the ones that the helper's path list permits. On macOS, they use the Seatbelt sandbox. Windows has no sandbox yet.
+
+A system call that a Linux sandbox kills the process for is always logged. Most refusals only make the call fail, though, and the process may never say so. To see those too, start Ladybird with `LADYBIRD_SANDBOX_DEBUG=1`. Every helper then logs each system call that its seccomp policy refuses without killing it, and confines its files with the broker even where Landlock exists, so that it can log each path that it refuses. The broker decides by path where Landlock decides by file, and it does not scope signals or abstract sockets, so a refusal that only Landlock causes does not happen in this mode.
 
 ## Class overview
 

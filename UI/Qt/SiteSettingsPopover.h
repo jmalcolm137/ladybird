@@ -10,6 +10,7 @@
 #include <AK/Optional.h>
 #include <AK/String.h>
 #include <AK/Vector.h>
+#include <LibURL/Origin.h>
 #include <LibWebCommon/Permissions/Permissions.h>
 #include <LibWebView/ContentBlocking.h>
 #include <LibWebView/PermissionManager.h>
@@ -33,15 +34,17 @@ public:
     explicit SiteSettingsPopover(QWidget* parent, WebView::Settings&);
 
     struct Site {
-        String host;
-        String force_dark_host;
+        URL::Origin origin;
+        String host_for_settings;
         bool is_private { false };
-        bool is_secure { false };
         QIcon favicon;
         WebView::ContentBlockingSnapshot content_blocking;
         Vector<WebView::SitePermissionRow> permissions;
     };
     void set_site(Site);
+    // A page that is not from a website, such as about:blank or a file, has no settings, so the popover says so
+    // instead.
+    void set_page_without_site(QString const& title, QString const& explanation, QIcon const& favicon);
     void set_content_blocking(WebView::ContentBlockingSnapshot const&);
     void set_permissions(Vector<WebView::SitePermissionRow> const&);
     void update_chrome_style(QPalette const&);
@@ -56,6 +59,8 @@ public:
 
 private:
     virtual void content_settings_changed() override;
+    virtual void autoplay_settings_changed() override { update_autoplay(); }
+
     void update_autoplay();
     void update_reset_link();
     void update_icons();
@@ -69,13 +74,17 @@ private:
     };
 
     WebView::Settings& m_settings;
+    String m_origin;
     String m_host;
-    String m_force_dark_host;
     bool m_is_private { false };
     QLabel* m_force_dark_icon { nullptr };
     PopoverSwitch* m_force_dark_switch { nullptr };
     QWidget* m_site_page { nullptr };
     QWidget* m_blocked_page { nullptr };
+    QWidget* m_no_site_page { nullptr };
+    QLabel* m_no_site_favicon { nullptr };
+    QLabel* m_no_site_title { nullptr };
+    QLabel* m_no_site_explanation { nullptr };
     QLabel* m_favicon { nullptr };
     QLabel* m_host_label { nullptr };
     QLabel* m_security_label { nullptr };

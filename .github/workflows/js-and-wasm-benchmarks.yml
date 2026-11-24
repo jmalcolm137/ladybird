@@ -20,7 +20,7 @@ jobs:
         arch: ['x86_64']
         package_type: ['Linux-x86_64']
         runner_labels: ['["ubuntu-24.04-internal", "js-benchmarks", "self-hosted"]']
-        container: ['{"image":"ghcr.io/ladybirdbrowser/ladybird-ci:2026.10.29"}']
+        container: ['{"image":"ghcr.io/ladybirdbrowser/ladybird-ci:2026.11.21"}']
 
         include:
           - os_name: 'macOS'
@@ -91,7 +91,7 @@ jobs:
           source .venv/bin/activate
           python3 -m pip install -r requirements.txt
 
-          run_options='--iterations=5'
+          run_options='--iterations=3'
 
           js_path="${GITHUB_WORKSPACE}/js-repl/bin/js"
           run_options="${run_options} --executable=${js_path}"

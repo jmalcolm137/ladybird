@@ -1,0 +1,32 @@
+// Copyright (c) 2026-present, the Ladybird developers.
+//
+// SPDX-License-Identifier: BSD-2-Clause
+
+// What travels beside a display list's tape, which only Rust sends and receives.
+
+struct Compositing::AsyncScrollingMetadata {
+    Optional<Web::UniqueNodeID> document_id;
+    Gfx::IntRect viewport_rect;
+    u64 wheel_event_listener_state_generation;
+    bool has_blocking_wheel_event_listeners;
+    bool has_blocking_wheel_event_region_covering_viewport;
+    bool viewport_keeps_horizontal_scrolls;
+    bool viewport_keeps_vertical_scrolls;
+    double device_pixels_per_css_pixel;
+    Compositing::KeyboardScrollState keyboard_scroll_state;
+}
+
+struct Compositing::DisplayListWindow {
+    Gfx::FloatRect rect;
+    Gfx::IntSize device_viewport_size;
+    double device_pixels_per_css_pixel;
+    Vector<Gfx::FloatPoint> scroll_offsets;
+}
+
+struct Compositing::DisplayListProperties {
+    u64 id;
+    u64 compatible_visual_context_tree_structural_epoch;
+    Optional<Gfx::Color> surface_clear_color;
+    Gfx::Color root_group_color;
+    Optional<Compositing::DisplayListWindow> window;
+}

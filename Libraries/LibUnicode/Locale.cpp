@@ -703,7 +703,7 @@ Optional<Utf16String> add_likely_subtags(Utf16View locale)
 {
     UErrorCode status = U_ZERO_ERROR;
 
-    auto locale_data = LocaleData::for_locale(locale.ascii_bytes());
+    auto locale_data = LocaleData::for_locale(locale);
     if (!locale_data.has_value())
         return {};
 
@@ -730,7 +730,7 @@ Optional<Utf16String> remove_likely_subtags(Utf16View locale)
 {
     UErrorCode status = U_ZERO_ERROR;
 
-    auto locale_data = LocaleData::for_locale(locale.ascii_bytes());
+    auto locale_data = LocaleData::for_locale(locale);
     if (!locale_data.has_value())
         return {};
 
@@ -900,4 +900,16 @@ extern "C" void unicode_default_locale(UnicodeTextMappingOutput output)
     auto* destination = output.allocate_text(output.context, locale.length_in_code_units());
     for (size_t i = 0; i < locale.length_in_code_units(); ++i)
         destination[i] = locale.code_unit_at(i);
+}
+
+extern "C" size_t unicode_quotation_mark(u16 const* language, size_t length, bool open, bool alternate, u16 const** result)
+{
+    auto data = Unicode::LocaleData::for_locale(Utf16View { reinterpret_cast<char16_t const*>(language), length });
+    if (!data.has_value())
+        return 0;
+    auto type = alternate ? (open ? ULOCDATA_ALT_QUOTATION_START : ULOCDATA_ALT_QUOTATION_END)
+                          : (open ? ULOCDATA_QUOTATION_START : ULOCDATA_QUOTATION_END);
+    auto const& mark = data->quotation_mark(type);
+    *result = reinterpret_cast<u16 const*>(mark.getBuffer());
+    return mark.length();
 }

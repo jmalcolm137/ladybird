@@ -21,7 +21,6 @@ use crate::bindings::conversions::CppInterface;
 use crate::bindings::interface::{Ref, Wrappable, allocate};
 use crate::bindings::{CallContext, Exception, WebIdlResult};
 use crate::canvas_2d::canvas::{CanvasImageSourceKind, capture_video_frame, video_transport};
-use crate::canvas_2d::host::LentVideoFrameHold;
 use crate::geometry::dictionaries::{DOMMatrix2DInit, validate_and_fixup_2d};
 
 /// The repetition that a value of the repetition argument of createPattern() names exactly, if it names one.
@@ -44,7 +43,8 @@ pub(crate) fn read_back_current_video_frame(video: CppInterface, color_space: Co
     let transport = video_transport(video)?;
     let mut recorder = Recorder::new(transport);
 
-    let (width, height) = CanvasImageSourceKind::HTMLVideoElement.size(video);
+    // A video has a size of its own, so no default object size applies to it.
+    let (width, height) = CanvasImageSourceKind::HTMLVideoElement.size(video, IntSize::default());
     let frame_rect = IntRect {
         x: 0,
         y: 0,
@@ -66,7 +66,7 @@ pub(crate) fn read_back_current_video_frame(video: CppInterface, color_space: Co
     )]
     let destination = FloatRect::new(0.0, 0.0, width as f32, height as f32);
     recorder.draw_video_frame(
-        &LentVideoFrameHold(captured_frame.hold()),
+        &captured_frame.hold,
         captured_frame.sink_handle,
         captured_frame.generation,
         destination,
@@ -78,9 +78,9 @@ pub(crate) fn read_back_current_video_frame(video: CppInterface, color_space: Co
         },
     );
     recorder.flush();
-    let bitmap = recorder.read_back_pixels(frame_rect, AlphaType::Premultiplied, color_space);
+    let frame = recorder.read_back_pixels(frame_rect, AlphaType::Premultiplied, color_space);
     recorder.destroy_context();
-    Some(bitmap?.into_image_frame(color_space))
+    frame
 }
 
 #[derive(Trace)]

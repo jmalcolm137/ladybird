@@ -143,9 +143,7 @@ impl InitialStyle {
 /// How an element's style came about.
 #[derive(Clone, Copy)]
 pub(super) enum Outcome {
-    Computed {
-        directly: bool,
-    },
+    Computed,
     /// The element took the record of an element it agrees with.
     Shared,
     /// The element took the record of an element whose cascade picked the same declarations.
@@ -280,6 +278,8 @@ pub(super) struct PassContext<'a> {
     pub(super) uses_caches: bool,
     /// What the audit of what the pass reuses asks for, as `LIBWEB_STYLE_AUDIT_CACHES` asks.
     pub(super) cache_audit: super::self_check::Mode,
+    /// Whether the pass notes how each element came by its record, for a test tracing it.
+    pub(super) traces: bool,
     /// The font inputs of the document element's record from before the pass, which elements
     /// resolve root-relative lengths against unless the pass styles the document element.
     pub(super) held_root_font: Option<RootFontInputs>,
@@ -325,6 +325,7 @@ impl<'a> PassContext<'a> {
             waits_once: false,
             uses_caches: true,
             cache_audit: super::self_check::Mode::Off,
+            traces: false,
             held_root_font,
             root_font: Default::default(),
             root_font_moved: Default::default(),
@@ -509,6 +510,8 @@ pub(super) struct Statistics {
     pub(super) suspended: Vec<Suspended>,
     /// The elements the pass styled.
     pub(super) styled: Vec<StyleNodeID>,
+    /// How each element the pass styled came by its record, where it traces.
+    pub(super) traced_outcomes: Vec<(StyleNodeID, super::counters::TracedOutcome)>,
     /// The elements that took the custom properties their parents hand down now without being
     /// styled, keeping their style otherwise.
     pub(super) moved_custom_properties: Vec<StyleNodeID>,
@@ -970,6 +973,11 @@ impl<'a> Scratch<'a> {
                     .records
                     .insert_pseudo_element_records(node, pseudo_element_records);
                 self.statistics.outcomes.note(&Outcome::Shared);
+                if context.traces {
+                    self.statistics
+                        .traced_outcomes
+                        .push((node, super::counters::TracedOutcome::Shared));
+                }
                 self.audit_caches(context, node, cache_audit::Reuse::SharedStyle);
                 #[cfg(test)]
                 context.set_output(node, || ElementOutput {
@@ -1014,7 +1022,6 @@ impl<'a> Scratch<'a> {
                 Some(record) => Ok((
                     record,
                     ComputedFacts {
-                        directly: false,
                         element_dependent: false,
                         reused: true,
                     },
@@ -1063,9 +1070,7 @@ impl<'a> Scratch<'a> {
                     );
                     match computed.reused {
                         true => Outcome::Reused,
-                        false => Outcome::Computed {
-                            directly: computed.directly,
-                        },
+                        false => Outcome::Computed,
                     }
                 }
                 Err(outcome) => {
@@ -1095,6 +1100,9 @@ impl<'a> Scratch<'a> {
             self.statistics.waiting_with_kept_matches.push(node);
         }
         self.statistics.outcomes.note(&outcome);
+        if context.traces {
+            self.statistics.traced_outcomes.push((node, (&outcome).into()));
+        }
         #[cfg(test)]
         context.set_output(node, || ElementOutput {
             matches: matched.then(|| self.matches.clone()),
@@ -1808,7 +1816,6 @@ impl<'a> Scratch<'a> {
                 return Ok((
                     record,
                     ComputedFacts {
-                        directly: false,
                         element_dependent: false,
                         reused: true,
                     },
@@ -2062,7 +2069,6 @@ impl<'a> Scratch<'a> {
         Ok((
             record,
             ComputedFacts {
-                directly: computed.directly,
                 element_dependent: computed.element_dependent,
                 reused: false,
             },
@@ -2606,7 +2612,6 @@ enum PseudoElementOutcome {
 
 /// What came of computing an element besides its record.
 struct ComputedFacts {
-    directly: bool,
     element_dependent: bool,
     /// Whether the record is one computed for an element before, reused.
     reused: bool,
@@ -3052,6 +3057,7 @@ fn style_queued<T: Sync>(
         }
     }
     let mut statistics = Statistics::default();
+    let mut styled_threads = 0u64;
     for (index, scratch) in scratches.slots.into_iter().enumerate() {
         let Some(mut scratch) = scratch.into_inner().expect("no thread panicked while styling") else {
             continue;
@@ -3060,8 +3066,21 @@ fn style_queued<T: Sync>(
             && let Some(cache) = context.group_caches.and_then(|caches| caches.get(index))
         {
             *cache.lock().expect("no thread panicked while styling") = std::mem::take(&mut scratch.groups).kept();
+            styled_threads |= 1 << index;
         }
         statistics.add(scratch);
+    }
+    // NB: The caches of the threads that sat the pass out count it as a small one too, so the room a large pass left
+    //     them goes back while only the calling thread styles, as it does for an animation.
+    if context.uses_caches
+        && let Some(caches) = context.group_caches
+    {
+        for (index, cache) in caches.made_with_index() {
+            if styled_threads & (1 << index) == 0 {
+                let mut cache = cache.lock().expect("no thread panicked while styling");
+                *cache = std::mem::take(&mut *cache).kept();
+            }
+        }
     }
     statistics.cache_audit.conclude(context.cache_audit);
     statistics
@@ -3203,6 +3222,7 @@ impl Statistics {
             .extend(round.waiting_with_kept_matches);
         statistics.waiting_pseudo_elements.extend(round.waiting_pseudo_elements);
         statistics.styled.extend(round.styled);
+        statistics.traced_outcomes.extend(round.traced_outcomes);
         statistics.moved_custom_properties.extend(round.moved_custom_properties);
         statistics.changed_elements += round.changed_elements;
         statistics.children_moved.extend(round.children_moved);

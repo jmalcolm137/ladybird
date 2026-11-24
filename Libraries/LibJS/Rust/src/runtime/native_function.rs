@@ -131,6 +131,11 @@ impl NativeFunction {
     }
 
     fn from_function_object(base: FunctionObject, name: Option<Utf16FlyString>, realm: Gc<Realm>) -> NativeFunction {
+        // NB: The fast paths of calls make the realm of the function's shape current.
+        debug_assert!(
+            base.shape().realm() == realm,
+            "a native function's shape is of its realm"
+        );
         base.inline_named_capacity.set(FUNCTION_LENGTH_AND_NAME_SLOTS as u8);
         NativeFunction {
             base,
@@ -290,7 +295,7 @@ impl NativeFunction {
 
         // 5. Let calleeRealm be F.[[Realm]].
         // 6. Set the Realm of calleeContext to calleeRealm.
-        callee_context.realm.set(Some(function.realm()));
+        // NB: The context gets its realm from its function.
 
         // 7. Set the ScriptOrModule of calleeContext to null.
         // Note: This is already the default value.
@@ -318,23 +323,12 @@ impl NativeFunction {
             callee_context.lexical_environment.set(Some(local_environment.upcast()));
 
             // 9. Set the VariableEnvironment of calleeContext to localEnv.
-            callee_context
-                .variable_environment
-                .set(Some(local_environment.upcast()));
+            callee_context.set_variable_environment(Some(local_environment.upcast()));
         } else {
             callee_context
                 .lexical_environment
                 .set(caller_context.lexical_environment.get());
-            callee_context
-                .variable_environment
-                .set(caller_context.variable_environment.get());
         }
-
-        // Note: Keeping the private environment is probably only needed because of async methods in classes
-        //       calling async_block_start which goes through a NativeFunction here.
-        callee_context
-            .private_environment
-            .set(caller_context.private_environment.get());
 
         // </8.> --------------------------------------------------------------------------
 
@@ -342,7 +336,8 @@ impl NativeFunction {
         if vm.did_reach_stack_space_limit() && !function.methods().ignores_stack_space_limit {
             return vm.throw_completion(ErrorKind::InternalError, ErrorType::CallStackSizeExceeded, &[]);
         }
-        vm.push_execution_context(NonNull::from(callee_context));
+        // NB: The realm of the context is F.[[Realm]] (see step 6).
+        vm.push_execution_context_in_realm(NonNull::from(callee_context), Some(function.realm()));
 
         // 10. Let result be the Completion Record that is the result of evaluating F in a manner that conforms to the specification of F. thisArgument is the this value, argumentsList provides the named parameters, and the NewTarget value is undefined.
         let result = function.call(vm);
@@ -376,7 +371,7 @@ impl NativeFunction {
 
         // 5. Let calleeRealm be F.[[Realm]].
         // 6. Set the Realm of calleeContext to calleeRealm.
-        callee_context.realm.set(Some(function.realm()));
+        // NB: The context gets its realm from its function.
 
         // 7. Set the ScriptOrModule of calleeContext to null.
         // Note: This is already the default value.
@@ -401,22 +396,21 @@ impl NativeFunction {
             callee_context.lexical_environment.set(Some(local_environment.upcast()));
 
             // 9. Set the VariableEnvironment of calleeContext to localEnv.
-            callee_context
-                .variable_environment
-                .set(Some(local_environment.upcast()));
+            callee_context.set_variable_environment(Some(local_environment.upcast()));
         } else {
             callee_context
                 .lexical_environment
                 .set(caller_context.lexical_environment.get());
-            callee_context
-                .variable_environment
-                .set(caller_context.variable_environment.get());
         }
 
         // </8.> --------------------------------------------------------------------------
 
         // 9. Push calleeContext onto the execution context stack; calleeContext is now the running execution context.
-        vm.push_execution_context_checking_stack_space(NonNull::from(callee_context))?;
+        if vm.did_reach_stack_space_limit() {
+            return vm.throw_completion(ErrorKind::InternalError, ErrorType::CallStackSizeExceeded, &[]);
+        }
+        // NB: The realm of the context is F.[[Realm]] (see step 6).
+        vm.push_execution_context_in_realm(NonNull::from(callee_context), Some(function.realm()));
 
         // 10. Let result be the Completion Record that is the result of evaluating F in a manner that conforms to the specification of F. The this value is uninitialized, argumentsList provides the named parameters, and newTarget provides the NewTarget value.
         let result = function.construct(vm, new_target);

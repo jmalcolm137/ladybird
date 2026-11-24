@@ -16,6 +16,7 @@
 #include <LibMediaCodecs/FFmpeg/FFmpegVulkanVideoDecoder.h>
 #include <LibMediaCodecs/Limits.h>
 #include <LibMediaCodecs/VideoFrame.h>
+#include <LibPlatformFeatures/ProcessFeatures.h>
 #include <LibThreading/Thread.h>
 #include <string.h>
 
@@ -94,6 +95,43 @@ FFmpegFunctions const* ffmpeg_for(CodecID codec_id)
     default:
         return nullptr;
     }
+}
+
+// Each codec's feature depends on the feature of the FFmpeg that decodes it.
+bool may_decode(CodecID codec_id)
+{
+    auto feature = [&] -> Optional<PlatformFeatures::Feature> {
+        switch (codec_id) {
+        case CodecID::VP9:
+            return PlatformFeatures::Feature::VulkanVideoBundledFFmpegVP9;
+        case CodecID::AV1:
+            return PlatformFeatures::Feature::VulkanVideoBundledFFmpegAV1;
+        case CodecID::H264:
+            return PlatformFeatures::Feature::VulkanVideoSystemFFmpegH264;
+        case CodecID::H265:
+            return PlatformFeatures::Feature::VulkanVideoSystemFFmpegH265;
+        default:
+            return {};
+        }
+    }();
+    return feature.has_value() && PlatformFeatures::ProcessFeatures::the().is_enabled(*feature);
+}
+
+// Whether decoded images may be exported directly, rather than copied into images that export.
+bool may_export_directly_with(FFmpegFunctions const& functions)
+{
+    auto feature = &functions == &FFmpegFunctions::bundled() ? PlatformFeatures::Feature::VulkanVideoBundledFFmpegDirectExport : PlatformFeatures::Feature::VulkanVideoSystemFFmpegDirectExport;
+    return PlatformFeatures::ProcessFeatures::the().is_enabled(feature);
+}
+
+// FFmpeg decodes references into the output images unless it keeps a separate DPB: before 63.8.101 it does so whenever
+// the driver can, and from then on whenever the driver cannot keep them apart. A later decode may be reading such an
+// image, so it cannot be copied.
+bool decodes_references_into_the_output(FFmpegFunctions const& functions, VkVideoDecodeCapabilityFlagsKHR flags)
+{
+    if (functions.avcodec_version() < AV_VERSION_INT(63, 8, 101))
+        return (flags & VK_VIDEO_DECODE_CAPABILITY_DPB_AND_OUTPUT_COINCIDE_BIT_KHR) != 0;
+    return (flags & VK_VIDEO_DECODE_CAPABILITY_DPB_AND_OUTPUT_DISTINCT_BIT_KHR) == 0;
 }
 
 AVCodec const* vulkan_capable_decoder(FFmpegFunctions const& functions, CodecID codec_id)
@@ -244,7 +282,7 @@ Optional<DecoderCapabilities> FFmpegVulkanVideoDecoder::capabilities(ParsedCodec
 
     auto codec_id = codec.codec_id();
     auto const* functions = ffmpeg_for(codec_id);
-    if (functions == nullptr || !device->has_enabled_extension(decode_extension_for(codec_id)))
+    if (functions == nullptr || !may_decode(codec_id) || !device->has_enabled_extension(decode_extension_for(codec_id)))
         return {};
     if (vulkan_capable_decoder(*functions, codec_id) == nullptr)
         return {};
@@ -363,6 +401,8 @@ Optional<DecoderCapabilities> FFmpegVulkanVideoDecoder::capabilities(ParsedCodec
     video_capabilities.pNext = &decode_capabilities;
     if (device->video_capabilities(profile_info, video_capabilities).is_error())
         return {};
+    if (!may_export_directly_with(*functions) && decodes_references_into_the_output(*functions, decode_capabilities.flags))
+        return {};
 
     return DecoderCapabilities { .smooth = true, .power_efficient = true };
 }
@@ -373,43 +413,23 @@ DecoderErrorOr<NonnullOwnPtr<FFmpegVulkanVideoDecoder>> FFmpegVulkanVideoDecoder
     if (device == nullptr)
         return DecoderError::with_description(DecoderErrorCategory::NotImplemented, "No Vulkan device can decode video in this process"sv);
     auto const* ffmpeg = ffmpeg_for(codec_id);
-    if (ffmpeg == nullptr || !device->has_enabled_extension(decode_extension_for(codec_id)))
+    if (ffmpeg == nullptr || !may_decode(codec_id) || !device->has_enabled_extension(decode_extension_for(codec_id)))
         return DecoderError::format(DecoderErrorCategory::NotImplemented, "The Vulkan device cannot decode codec {}", codec_id);
     auto const& functions = *ffmpeg;
 
     auto* device_context = TRY(device_context_for(functions, *device));
+    if (vulkan_capable_decoder(functions, codec_id) == nullptr)
+        return DecoderError::format(DecoderErrorCategory::NotImplemented, "FFmpeg cannot decode codec {} through Vulkan", codec_id);
+    auto codec_configuration = DECODER_TRY_ALLOC(FixedArray<u8>::create(codec_initialization_data));
 
-    AVCodecContext* codec_context = nullptr;
     AVPacket* packet = nullptr;
     AVFrame* frame = nullptr;
     ArmedScopeGuard memory_guard {
         [&] {
-            functions.avcodec_free_context(&codec_context);
             functions.av_packet_free(&packet);
             functions.av_frame_free(&frame);
         }
     };
-
-    auto const* codec = vulkan_capable_decoder(functions, codec_id);
-    if (codec == nullptr)
-        return DecoderError::format(DecoderErrorCategory::NotImplemented, "FFmpeg cannot decode codec {} through Vulkan", codec_id);
-
-    codec_context = functions.avcodec_alloc_context3(codec);
-    if (codec_context == nullptr)
-        return DecoderError::format(DecoderErrorCategory::Memory, "Failed to allocate FFmpeg codec context for codec {}", codec_id);
-
-    TRY(set_codec_initialization_data(functions, *codec_context, codec_id, codec_initialization_data));
-    // The device already decodes several frames at a time, and frame threading would only hold frames back.
-    VERIFY(functions.av_opt_set_int(codec_context, "threads", 1, 0) == 0);
-    codec_context->max_pixels = MAX_VIDEO_FRAME_AREA;
-    codec_context->hw_device_ctx = functions.av_buffer_ref(device_context);
-    if (codec_context->hw_device_ctx == nullptr)
-        return DecoderError::with_description(DecoderErrorCategory::Memory, "Failed to reference the FFmpeg Vulkan device context"sv);
-    codec_context->get_format = negotiate_pixel_format;
-    codec_context->get_buffer2 = get_buffer;
-
-    if (functions.avcodec_open2(codec_context, codec, nullptr) < 0)
-        return DecoderError::format(DecoderErrorCategory::Unknown, "Unknown error occurred when opening FFmpeg codec {}", codec_id);
 
     packet = functions.av_packet_alloc();
     if (packet == nullptr)
@@ -420,8 +440,8 @@ DecoderErrorOr<NonnullOwnPtr<FFmpegVulkanVideoDecoder>> FFmpegVulkanVideoDecoder
         return DecoderError::with_description(DecoderErrorCategory::Memory, "Failed to allocate FFmpeg frame"sv);
 
     memory_guard.disarm();
-    auto decoder = DECODER_TRY_ALLOC(adopt_nonnull_own_or_enomem(new (nothrow) FFmpegVulkanVideoDecoder(functions, *device, codec_context, packet, frame)));
-    codec_context->opaque = decoder.ptr();
+    auto decoder = DECODER_TRY_ALLOC(adopt_nonnull_own_or_enomem(new (nothrow) FFmpegVulkanVideoDecoder(functions, *device, codec_id, device_context, move(codec_configuration), packet, frame)));
+    decoder->m_codec_context = TRY(decoder->create_codec_context());
 
     decoder->m_completion_thread = DECODER_TRY_ALLOC(Threading::Thread::try_create("VulkanDecode"sv, [decoder = decoder.ptr()] -> intptr_t {
         decoder->complete_frames_until_exit();
@@ -431,13 +451,66 @@ DecoderErrorOr<NonnullOwnPtr<FFmpegVulkanVideoDecoder>> FFmpegVulkanVideoDecoder
     return decoder;
 }
 
-FFmpegVulkanVideoDecoder::FFmpegVulkanVideoDecoder(FFmpegFunctions const& functions, VulkanVideoDevice& device, AVCodecContext* codec_context, AVPacket* packet, AVFrame* received_frame)
+FFmpegVulkanVideoDecoder::FFmpegVulkanVideoDecoder(FFmpegFunctions const& functions, VulkanVideoDevice& device, CodecID codec_id, AVBufferRef* device_context, FixedArray<u8> codec_configuration, AVPacket* packet, AVFrame* received_frame)
     : m_functions(functions)
     , m_device(device)
-    , m_codec_context(codec_context)
+    , m_codec_id(codec_id)
+    , m_device_context(device_context)
     , m_packet(packet)
     , m_received_frame(received_frame)
+    , m_frames_awaiting_output(codec_id, codec_configuration.span())
+    , m_codec_configuration(move(codec_configuration))
 {
+}
+
+DecoderErrorOr<AVCodecContext*> FFmpegVulkanVideoDecoder::create_codec_context()
+{
+    auto const* codec = vulkan_capable_decoder(m_functions, m_codec_id);
+    VERIFY(codec != nullptr);
+
+    auto* codec_context = m_functions.avcodec_alloc_context3(codec);
+    if (codec_context == nullptr)
+        return DecoderError::format(DecoderErrorCategory::Memory, "Failed to allocate FFmpeg codec context for codec {}", m_codec_id);
+    ArmedScopeGuard free_codec_context = [&] { m_functions.avcodec_free_context(&codec_context); };
+
+    TRY(set_codec_initialization_data(m_functions, *codec_context, m_codec_id, m_codec_configuration.span()));
+    // The device already decodes several frames at a time, and frame threading would only hold frames back.
+    VERIFY(m_functions.av_opt_set_int(codec_context, "threads", 1, 0) == 0);
+    codec_context->max_pixels = MAX_VIDEO_FRAME_AREA;
+    codec_context->hw_device_ctx = m_functions.av_buffer_ref(m_device_context);
+    if (codec_context->hw_device_ctx == nullptr)
+        return DecoderError::with_description(DecoderErrorCategory::Memory, "Failed to reference the FFmpeg Vulkan device context"sv);
+    codec_context->get_format = negotiate_pixel_format;
+    codec_context->get_buffer2 = get_buffer;
+    codec_context->opaque = this;
+    // Only the bundled FFmpeg decodes AV1, and it is patched to know this flag.
+    if (m_codec_id == CodecID::AV1 && !PlatformFeatures::ProcessFeatures::the().is_enabled(PlatformFeatures::Feature::VulkanVideoBundledFFmpegAV1KeepSequenceHeaderEnableRefMVsFlag))
+        codec_context->hwaccel_flags |= AV_HWACCEL_FLAG_LADYBIRD_CLEAR_UNUSED_REF_FRAME_MVS;
+
+    if (m_functions.avcodec_open2(codec_context, codec, nullptr) < 0)
+        return DecoderError::format(DecoderErrorCategory::Unknown, "Unknown error occurred when opening FFmpeg codec {}", m_codec_id);
+
+    free_codec_context.disarm();
+    return codec_context;
+}
+
+DecoderErrorOr<void> FFmpegVulkanVideoDecoder::replace_codec_context()
+{
+    // The frames the old context still holds back for reordering come out before the new one starts.
+    m_packet->data = nullptr;
+    m_packet->size = 0;
+    m_packet->pts = 0;
+    m_packet->dts = 0;
+    if (m_functions.avcodec_send_packet(m_codec_context, m_packet) == 0)
+        TRY(receive_decoded_frames(EndOfStreamIsFinal::No));
+
+    auto* codec_context = TRY(create_codec_context());
+    m_functions.avcodec_free_context(&m_codec_context);
+    m_functions.av_buffer_unref(&m_codec_frames_context);
+    m_codec_context = codec_context;
+    m_codec_context_has_negotiated = false;
+    m_codec_context_must_be_replaced = false;
+    return {};
 }
 
 FFmpegVulkanVideoDecoder::~FFmpegVulkanVideoDecoder()
@@ -455,14 +528,27 @@ FFmpegVulkanVideoDecoder::~FFmpegVulkanVideoDecoder()
     free_decoding_frames(decoding_frames);
     m_outputs.clear();
 
+    // A stalled copy may still be pending on its command buffer.
+    if (m_copy_command_pool != VK_NULL_HANDLE && !m_copy_stalled)
+        vkDestroyCommandPool(m_device.logical_device(), m_copy_command_pool, nullptr);
+    m_surfaces_by_image.clear();
+    m_functions.av_buffer_unref(&m_frames_context_of_surfaces);
+    m_functions.av_buffer_unref(&m_exportable_frames_context);
+    m_functions.av_buffer_unref(&m_frames_context_copied_from);
+
     m_functions.av_packet_free(&m_packet);
     m_functions.av_frame_free(&m_received_frame);
     m_functions.avcodec_free_context(&m_codec_context);
+    m_functions.av_buffer_unref(&m_codec_frames_context);
 }
 
 AVPixelFormat FFmpegVulkanVideoDecoder::negotiate_pixel_format(AVCodecContext* codec_context, AVPixelFormat const* pixel_formats)
 {
     auto& decoder = *static_cast<FFmpegVulkanVideoDecoder*>(codec_context->opaque);
+    if (decoder.m_codec_context_has_negotiated) {
+        decoder.m_codec_context_must_be_replaced = true;
+        return AV_PIX_FMT_NONE;
+    }
     for (auto const* pixel_format = pixel_formats; *pixel_format != AV_PIX_FMT_NONE; pixel_format++) {
         if (*pixel_format != AV_PIX_FMT_VULKAN)
             continue;
@@ -471,6 +557,7 @@ AVPixelFormat FFmpegVulkanVideoDecoder::negotiate_pixel_format(AVCodecContext* c
             decoder.m_pixel_format_error = result.release_error();
             return AV_PIX_FMT_NONE;
         }
+        decoder.m_codec_context_has_negotiated = true;
         return AV_PIX_FMT_VULKAN;
     }
     decoder.m_pixel_format_error = DecoderError::with_description(DecoderErrorCategory::NotImplemented, "FFmpeg cannot decode this stream through Vulkan"sv);
@@ -499,22 +586,33 @@ DecoderErrorOr<void> FFmpegVulkanVideoDecoder::create_frames_context()
     // Storage use is only for FFmpeg's own filters, and can rule out the modifiers that export.
     vulkan_frames_context.usage = static_cast<VkImageUsageFlagBits>(vulkan_frames_context.usage & ~VK_IMAGE_USAGE_STORAGE_BIT);
 
-    m_drm_format_modifiers = m_device.exportable_drm_format_modifiers(vulkan_frames_context.format[0], vulkan_frames_context.usage, vulkan_frames_context.img_flags, vulkan_frames_context.create_pnext);
-    if (m_drm_format_modifiers.is_empty())
-        return DecoderError::with_description(DecoderErrorCategory::NotImplemented, "No DRM format modifier can export the decoded images"sv);
+    // Images that a later decode may be reading as references cannot be copied, which capabilities() has ruled out.
+    auto copies_decoded_frames = !may_export_directly_with(m_functions);
+    if (copies_decoded_frames && (vulkan_frames_context.usage & VK_IMAGE_USAGE_VIDEO_DECODE_DPB_BIT_KHR) != 0)
+        return DecoderError::with_description(DecoderErrorCategory::NotImplemented, "Decoded images used as references cannot be copied for export"sv);
 
-    // FFmpeg chains the video profile in, and leaves choosing a modifier to us.
-    m_drm_format_modifier_list = {};
-    m_drm_format_modifier_list.sType = VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_LIST_CREATE_INFO_EXT;
-    m_drm_format_modifier_list.pNext = vulkan_frames_context.create_pnext;
-    m_drm_format_modifier_list.drmFormatModifierCount = m_drm_format_modifiers.size();
-    m_drm_format_modifier_list.pDrmFormatModifiers = m_drm_format_modifiers.data();
-    vulkan_frames_context.tiling = VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT;
-    vulkan_frames_context.create_pnext = &m_drm_format_modifier_list;
+    if (!copies_decoded_frames) {
+        m_drm_format_modifiers = m_device.exportable_drm_format_modifiers(vulkan_frames_context.format[0], vulkan_frames_context.usage, vulkan_frames_context.img_flags, vulkan_frames_context.create_pnext);
+        if (m_drm_format_modifiers.is_empty())
+            return DecoderError::with_description(DecoderErrorCategory::NotImplemented, "No DRM format modifier can export the decoded images"sv);
+
+        // FFmpeg chains the video profile in, and leaves choosing a modifier to us.
+        m_drm_format_modifier_list = {};
+        m_drm_format_modifier_list.sType = VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_LIST_CREATE_INFO_EXT;
+        m_drm_format_modifier_list.pNext = vulkan_frames_context.create_pnext;
+        m_drm_format_modifier_list.drmFormatModifierCount = m_drm_format_modifiers.size();
+        m_drm_format_modifier_list.pDrmFormatModifiers = m_drm_format_modifiers.data();
+        vulkan_frames_context.tiling = VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT;
+        vulkan_frames_context.create_pnext = &m_drm_format_modifier_list;
+    }
 
     if (m_functions.av_hwframe_ctx_init(frames_reference) < 0)
-        return DecoderError::with_description(DecoderErrorCategory::NotImplemented, "FFmpeg could not create exportable Vulkan frames"sv);
+        return DecoderError::with_description(DecoderErrorCategory::NotImplemented, "FFmpeg could not create Vulkan frames"sv);
 
+    VERIFY(m_codec_frames_context == nullptr);
+    m_codec_frames_context = m_functions.av_buffer_ref(frames_reference);
+    if (m_codec_frames_context == nullptr)
+        return DecoderError::with_description(DecoderErrorCategory::Memory, "Could not reference the decoded frames' context"sv);
     m_functions.av_buffer_unref(&m_codec_context->hw_frames_ctx);
     m_codec_context->hw_frames_ctx = frames_reference;
     free_frames_reference.disarm();
@@ -526,7 +624,29 @@ DecoderErrorOr<void> FFmpegVulkanVideoDecoder::receive_coded_data(CodedFrame con
     if (m_pixel_format_error.has_value())
         return *m_pixel_format_error;
 
+    if (auto configuration = coded_frame.new_codec_configuration(); configuration.has_value() && !configuration->is_empty())
+        m_codec_configuration = DECODER_TRY_ALLOC(FixedArray<u8>::create(*configuration));
+
     auto key = TRY(m_frames_awaiting_output.add(coded_frame, intent));
+    auto result = decode_coded_frame(coded_frame, key);
+    if (!m_codec_context_must_be_replaced)
+        return result;
+
+    // A new context lacks the earlier frames, so only a keyframe can start it.
+    if (!coded_frame.is_keyframe())
+        return DecoderError::with_description(DecoderErrorCategory::NotImplemented, "The stream changes its format on a frame other than a keyframe"sv);
+
+    TRY(replace_codec_context());
+    result = decode_coded_frame(coded_frame, key);
+    if (result.is_error() && result.error().category() == DecoderErrorCategory::NotImplemented)
+        return result;
+    if (result.is_error() || m_codec_context_must_be_replaced)
+        return DecoderError::with_description(DecoderErrorCategory::NotImplemented, "The stream changes its format on a keyframe that a new decoder cannot start from"sv);
+    return {};
+}
+
+DecoderErrorOr<void> FFmpegVulkanVideoDecoder::decode_coded_frame(CodedFrame const& coded_frame, u64 key)
+{
     auto result = send_coded_frame(m_functions, *m_codec_context, *m_packet, coded_frame, key);
     // FFmpeg takes no more until the frames it has decoded are taken out.
     if (result.is_error() && result.error().category() == DecoderErrorCategory::TryAgain) {
@@ -556,14 +676,14 @@ void FFmpegVulkanVideoDecoder::signal_end_of_stream()
     }
 }
 
-DecoderErrorOr<void> FFmpegVulkanVideoDecoder::receive_decoded_frames()
+DecoderErrorOr<void> FFmpegVulkanVideoDecoder::receive_decoded_frames(EndOfStreamIsFinal end_of_stream_is_final)
 {
     while (true) {
         auto result = m_functions.avcodec_receive_frame(m_codec_context, m_received_frame);
         if (result == AVERROR(EAGAIN))
             return {};
         if (result == AVERROR_EOF) {
-            if (!m_received_end_of_stream) {
+            if (end_of_stream_is_final == EndOfStreamIsFinal::Yes && !m_received_end_of_stream) {
                 m_received_end_of_stream = true;
                 DecodingFrame end_of_stream;
                 end_of_stream.generation = m_generation;
@@ -593,6 +713,7 @@ DecoderErrorOr<void> FFmpegVulkanVideoDecoder::receive_decoded_frames()
         DecodingFrame decoding_frame;
         decoding_frame.frame = frame;
         decoding_frame.timing = *timing;
+        decoding_frame.cicp = coding_independent_code_points_of(m_functions, *m_codec_context, {});
         decoding_frame.generation = m_generation;
         auto decoded = semaphore_value_of(*frame);
         decoding_frame.semaphore = decoded.semaphore;
@@ -626,6 +747,7 @@ void FFmpegVulkanVideoDecoder::complete_frames_until_exit()
             if (m_completion_thread_should_exit)
                 return;
             decoding_frame = m_decoding_frames.dequeue();
+            m_frame_is_completing = true;
         }
 
         Optional<DecoderErrorOr<DecodedOutput>> output;
@@ -633,6 +755,8 @@ void FFmpegVulkanVideoDecoder::complete_frames_until_exit()
             output = complete_frame(decoding_frame);
 
         MutexLocker locker { m_mutex };
+        m_frame_is_completing = false;
+        auto completion = DecodeCompletion::ProducedNothing;
         if (decoding_frame.generation == m_generation) {
             if (!output.has_value())
                 m_completed_end_of_stream = true;
@@ -640,9 +764,11 @@ void FFmpegVulkanVideoDecoder::complete_frames_until_exit()
                 m_decode_failure = output->release_error();
             else
                 m_outputs.append(output->release_value());
-            if (!m_caller_is_waiting_for_output && m_output_arrived_callback)
-                m_output_arrived_callback();
+            completion = DecodeCompletion::ProducedOutput;
         }
+        auto caller_needs_waking = completion == DecodeCompletion::ProducedOutput || m_decoding_frames.is_empty();
+        if (caller_needs_waking && !m_caller_is_waiting_for_output && m_decode_completed_callback)
+            m_decode_completed_callback(completion);
         m_condition.broadcast();
     }
 }
@@ -650,11 +776,17 @@ void FFmpegVulkanVideoDecoder::complete_frames_until_exit()
 DecoderErrorOr<FFmpegVulkanVideoDecoder::DecodedOutput> FFmpegVulkanVideoDecoder::complete_frame(DecodingFrame& decoding_frame)
 {
     ScopeGuard free_frame = [&] { m_functions.av_frame_free(&decoding_frame.frame); };
-    auto& frame = *decoding_frame.frame;
     auto logical_device = m_device.logical_device();
 
     if (!wait_for_semaphore(logical_device, decoding_frame.semaphore, decoding_frame.decoded_semaphore_value))
         return DecoderError::with_description(DecoderErrorCategory::Unknown, "The Vulkan device failed or stalled while decoding a frame"sv);
+
+    if (static_cast<AVVulkanFramesContext const*>(frames_context_of(*decoding_frame.frame).hwctx)->tiling != VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT) {
+        auto* copied_frame = TRY(copy_into_exportable_frame(*decoding_frame.frame, decoding_frame.semaphore, decoding_frame.decoded_semaphore_value));
+        m_functions.av_frame_free(&decoding_frame.frame);
+        decoding_frame.frame = copied_frame;
+    }
+    auto& frame = *decoding_frame.frame;
 
     // Mapping the frame to dma-bufs hands its image over to whichever device samples it next, which the frame then waits
     // for, so that it leaves the decoder ready to be drawn.
@@ -677,16 +809,242 @@ DecoderErrorOr<FFmpegVulkanVideoDecoder::DecodedOutput> FFmpegVulkanVideoDecoder
     Gfx::Size<u32> size { static_cast<u32>(frame.width), static_cast<u32>(frame.height) };
     auto bit_depth = bit_depth_of(frames_context);
     auto contents = DECODER_TRY_ALLOC(try_make_ref_counted<VulkanFrameContents>(m_functions, exchange(decoding_frame.frame, nullptr)));
-    return DecodedOutput { move(surface), move(contents), decoding_frame.timing, size, bit_depth };
+    return DecodedOutput { move(surface), move(contents), decoding_frame.timing, size, bit_depth, decoding_frame.cicp };
+}
+
+DecoderErrorOr<void> FFmpegVulkanVideoDecoder::prepare_to_copy_frames_from(AVFrame const& frame)
+{
+    if (m_frames_context_copied_from != nullptr && m_frames_context_copied_from->data == frame.hw_frames_ctx->data)
+        return {};
+
+    auto* logical_device = m_device.logical_device();
+    if (m_copy_command_pool == VK_NULL_HANDLE) {
+        VkCommandPoolCreateInfo pool_info {};
+        pool_info.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
+        pool_info.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+        pool_info.queueFamilyIndex = m_device.compute_queue_family();
+        if (vkCreateCommandPool(logical_device, &pool_info, nullptr, &m_copy_command_pool) != VK_SUCCESS)
+            return DecoderError::with_description(DecoderErrorCategory::Memory, "Could not create a command pool for copying decoded frames"sv);
+    }
+    if (m_copy_command_buffer == VK_NULL_HANDLE) {
+        VkCommandBufferAllocateInfo buffer_info {};
+        buffer_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+        buffer_info.commandPool = m_copy_command_pool;
+        buffer_info.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+        buffer_info.commandBufferCount = 1;
+        if (vkAllocateCommandBuffers(logical_device, &buffer_info, &m_copy_command_buffer) != VK_SUCCESS)
+            return DecoderError::with_description(DecoderErrorCategory::Memory, "Could not allocate a command buffer for copying decoded frames"sv);
+    }
+
+    m_functions.av_buffer_unref(&m_exportable_frames_context);
+    m_functions.av_buffer_unref(&m_frames_context_copied_from);
+
+    auto const& source_context = frames_context_of(frame);
+    auto const& source_vulkan_context = *static_cast<AVVulkanFramesContext const*>(source_context.hwctx);
+    if (source_vulkan_context.format[1] != VK_FORMAT_UNDEFINED)
+        return DecoderError::with_description(DecoderErrorCategory::NotImplemented, "Decoded frames that span several images cannot be copied"sv);
+
+    VkImageUsageFlags const usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+    m_exportable_drm_format_modifiers = m_device.exportable_drm_format_modifiers(source_vulkan_context.format[0], usage, 0, source_vulkan_context.create_pnext);
+    if (m_exportable_drm_format_modifiers.is_empty())
+        return DecoderError::with_description(DecoderErrorCategory::NotImplemented, "No DRM format modifier can export copies of the decoded images"sv);
+
+    auto* reference = m_functions.av_hwframe_ctx_alloc(m_device_context);
+    if (reference == nullptr)
+        return DecoderError::with_description(DecoderErrorCategory::Memory, "Could not allocate a frames context for exportable frames"sv);
+    ArmedScopeGuard free_reference = [&] { m_functions.av_buffer_unref(&reference); };
+
+    auto& context = *reinterpret_cast<AVHWFramesContext*>(reference->data);
+    context.format = AV_PIX_FMT_VULKAN;
+    context.sw_format = source_context.sw_format;
+    context.width = source_context.width;
+    context.height = source_context.height;
+
+    // FFmpeg only leaves the usage and flags as given for modifier-tiled images when a video profile list is chained.
+    m_exportable_drm_format_modifier_list = {};
+    m_exportable_drm_format_modifier_list.sType = VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_LIST_CREATE_INFO_EXT;
+    m_exportable_drm_format_modifier_list.pNext = source_vulkan_context.create_pnext;
+    m_exportable_drm_format_modifier_list.drmFormatModifierCount = m_exportable_drm_format_modifiers.size();
+    m_exportable_drm_format_modifier_list.pDrmFormatModifiers = m_exportable_drm_format_modifiers.data();
+
+    auto& vulkan_context = *static_cast<AVVulkanFramesContext*>(context.hwctx);
+    vulkan_context.format[0] = source_vulkan_context.format[0];
+    vulkan_context.tiling = VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT;
+    vulkan_context.usage = static_cast<VkImageUsageFlagBits>(usage);
+    vulkan_context.create_pnext = &m_exportable_drm_format_modifier_list;
+
+    if (m_functions.av_hwframe_ctx_init(reference) < 0)
+        return DecoderError::with_description(DecoderErrorCategory::NotImplemented, "FFmpeg could not create exportable Vulkan frames"sv);
+
+    m_frames_context_copied_from = m_functions.av_buffer_ref(frame.hw_frames_ctx);
+    if (m_frames_context_copied_from == nullptr)
+        return DecoderError::with_description(DecoderErrorCategory::Memory, "Could not reference the decoded frames' context"sv);
+
+    free_reference.disarm();
+    m_exportable_frames_context = reference;
+    return {};
+}
+
+DecoderErrorOr<AVFrame*> FFmpegVulkanVideoDecoder::copy_into_exportable_frame(AVFrame const& frame, VkSemaphore decoded_semaphore, u64 decoded_semaphore_value)
+{
+    if (m_copy_stalled)
+        return DecoderError::with_description(DecoderErrorCategory::Unknown, "The Vulkan device stalled while copying an earlier frame"sv);
+    TRY(prepare_to_copy_frames_from(frame));
+
+    auto* copy = m_functions.av_frame_alloc();
+    if (copy == nullptr)
+        return DecoderError::with_description(DecoderErrorCategory::Memory, "Failed to allocate FFmpeg frame"sv);
+    ArmedScopeGuard free_copy = [&] { m_functions.av_frame_free(&copy); };
+    if (m_functions.av_hwframe_get_buffer(m_exportable_frames_context, copy, 0) < 0)
+        return DecoderError::with_description(DecoderErrorCategory::Memory, "Could not allocate an exportable Vulkan frame"sv);
+    copy->width = frame.width;
+    copy->height = frame.height;
+
+    auto& source_context = frames_context_of(frame);
+    auto& source_vulkan_context = *static_cast<AVVulkanFramesContext*>(source_context.hwctx);
+    auto* source = reinterpret_cast<AVVkFrame*>(frame.data[0]);
+    auto& destination_context = frames_context_of(*copy);
+    auto& destination_vulkan_context = *static_cast<AVVulkanFramesContext*>(destination_context.hwctx);
+    auto* destination = reinterpret_cast<AVVkFrame*>(copy->data[0]);
+
+    VkCommandBufferBeginInfo begin_info {};
+    begin_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    begin_info.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    if (vkBeginCommandBuffer(m_copy_command_buffer, &begin_info) != VK_SUCCESS)
+        return DecoderError::with_description(DecoderErrorCategory::Unknown, "Could not begin recording a frame copy"sv);
+
+    VkImageSubresourceRange const whole_image { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+
+    source_vulkan_context.lock_frame(&source_context, source);
+    VkImageMemoryBarrier2 prepare_barriers[2] {};
+    prepare_barriers[0].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
+    prepare_barriers[0].srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+    prepare_barriers[0].dstStageMask = VK_PIPELINE_STAGE_2_COPY_BIT;
+    prepare_barriers[0].dstAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT;
+    prepare_barriers[0].oldLayout = source->layout[0];
+    prepare_barriers[0].newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    prepare_barriers[0].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    prepare_barriers[0].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    prepare_barriers[0].image = source->img[0];
+    prepare_barriers[0].subresourceRange = whole_image;
+    source->layout[0] = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    source->access[0] = VK_ACCESS_2_TRANSFER_READ_BIT;
+    source_vulkan_context.unlock_frame(&source_context, source);
+
+    // The image's previous contents are discarded, so whichever device last read it needs no handing back.
+    prepare_barriers[1].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
+    prepare_barriers[1].srcStageMask = VK_PIPELINE_STAGE_2_NONE;
+    prepare_barriers[1].dstStageMask = VK_PIPELINE_STAGE_2_COPY_BIT;
+    prepare_barriers[1].dstAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+    prepare_barriers[1].oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    prepare_barriers[1].newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    prepare_barriers[1].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    prepare_barriers[1].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    prepare_barriers[1].image = destination->img[0];
+    prepare_barriers[1].subresourceRange = whole_image;
+
+    VkDependencyInfo prepare_dependency {};
+    prepare_dependency.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+    prepare_dependency.imageMemoryBarrierCount = 2;
+    prepare_dependency.pImageMemoryBarriers = prepare_barriers;
+    vkCmdPipelineBarrier2(m_copy_command_buffer, &prepare_dependency);
+
+    VkImageCopy regions[2] {};
+    regions[0].srcSubresource = { VK_IMAGE_ASPECT_PLANE_0_BIT, 0, 0, 1 };
+    regions[0].dstSubresource = { VK_IMAGE_ASPECT_PLANE_0_BIT, 0, 0, 1 };
+    regions[0].extent = { static_cast<u32>(source_context.width), static_cast<u32>(source_context.height), 1 };
+    regions[1].srcSubresource = { VK_IMAGE_ASPECT_PLANE_1_BIT, 0, 0, 1 };
+    regions[1].dstSubresource = { VK_IMAGE_ASPECT_PLANE_1_BIT, 0, 0, 1 };
+    regions[1].extent = { static_cast<u32>(source_context.width + 1) / 2, static_cast<u32>(source_context.height + 1) / 2, 1 };
+    vkCmdCopyImage(m_copy_command_buffer, source->img[0], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, destination->img[0], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 2, regions);
+
+    // The copy leaves the image ready for whichever device samples it next. FFmpeg shares its images between queue
+    // families whenever there are several, and otherwise leaves them owned by the one family.
+    auto releasing_queue_family = m_device.queue_families().size() > 1 ? VK_QUEUE_FAMILY_IGNORED : m_device.compute_queue_family();
+    VkImageMemoryBarrier2 export_barrier {};
+    export_barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
+    export_barrier.srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT;
+    export_barrier.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+    export_barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    export_barrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+    export_barrier.srcQueueFamilyIndex = releasing_queue_family;
+    export_barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_EXTERNAL;
+    export_barrier.image = destination->img[0];
+    export_barrier.subresourceRange = whole_image;
+
+    VkDependencyInfo export_dependency {};
+    export_dependency.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+    export_dependency.imageMemoryBarrierCount = 1;
+    export_dependency.pImageMemoryBarriers = &export_barrier;
+    vkCmdPipelineBarrier2(m_copy_command_buffer, &export_dependency);
+
+    if (vkEndCommandBuffer(m_copy_command_buffer) != VK_SUCCESS)
+        return DecoderError::with_description(DecoderErrorCategory::Unknown, "Could not finish recording a frame copy"sv);
+
+    destination_vulkan_context.lock_frame(&destination_context, destination);
+    auto destination_semaphore = destination->sem[0];
+    auto copied_semaphore_value = ++destination->sem_value[0];
+    destination->layout[0] = VK_IMAGE_LAYOUT_GENERAL;
+    destination->access[0] = VK_ACCESS_2_MEMORY_READ_BIT;
+    // Mapping the frame only releases it to the external family if it has not been released already.
+    destination->queue_family[0] = VK_QUEUE_FAMILY_EXTERNAL;
+    destination_vulkan_context.unlock_frame(&destination_context, destination);
+
+    VkSemaphoreSubmitInfo wait_info {};
+    wait_info.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO;
+    wait_info.semaphore = decoded_semaphore;
+    wait_info.value = decoded_semaphore_value;
+    wait_info.stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+
+    VkSemaphoreSubmitInfo signal_info {};
+    signal_info.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO;
+    signal_info.semaphore = destination_semaphore;
+    signal_info.value = copied_semaphore_value;
+    signal_info.stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+
+    VkCommandBufferSubmitInfo command_buffer_info {};
+    command_buffer_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO;
+    command_buffer_info.commandBuffer = m_copy_command_buffer;
+
+    VkSubmitInfo2 submit_info {};
+    submit_info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2;
+    submit_info.waitSemaphoreInfoCount = 1;
+    submit_info.pWaitSemaphoreInfos = &wait_info;
+    submit_info.commandBufferInfoCount = 1;
+    submit_info.pCommandBufferInfos = &command_buffer_info;
+    submit_info.signalSemaphoreInfoCount = 1;
+    submit_info.pSignalSemaphoreInfos = &signal_info;
+
+    auto logical_device = m_device.logical_device();
+    auto queue_family = m_device.compute_queue_family();
+    VkQueue queue = VK_NULL_HANDLE;
+    vkGetDeviceQueue(logical_device, queue_family, 0, &queue);
+    m_device.lock_queue(queue_family);
+    auto submit_result = vkQueueSubmit2(queue, 1, &submit_info, VK_NULL_HANDLE);
+    m_device.unlock_queue(queue_family);
+    if (submit_result != VK_SUCCESS)
+        return DecoderError::with_description(DecoderErrorCategory::Unknown, "Could not submit a frame copy"sv);
+
+    // The command buffer is reused for the next copy, and the decoded image goes back to be decoded into.
+    if (!wait_for_semaphore(logical_device, destination_semaphore, copied_semaphore_value)) {
+        m_copy_stalled = true;
+        return DecoderError::with_description(DecoderErrorCategory::Unknown, "The Vulkan device failed or stalled while copying a decoded frame"sv);
+    }
+
+    free_copy.disarm();
+    return copy;
 }
 
 DecoderErrorOr<NonnullRefPtr<VideoSurface>> FFmpegVulkanVideoDecoder::surface_for_exported_frame(AVFrame const& frame, AVFrame const& exported_frame)
 {
-    auto const& frames_context = frames_context_of(frame);
-    if (&frames_context != m_frames_context_of_surfaces) {
+    if (m_frames_context_of_surfaces == nullptr || m_frames_context_of_surfaces->data != frame.hw_frames_ctx->data) {
         m_surfaces_by_image.clear();
-        m_frames_context_of_surfaces = &frames_context;
+        m_functions.av_buffer_unref(&m_frames_context_of_surfaces);
+        m_frames_context_of_surfaces = m_functions.av_buffer_ref(frame.hw_frames_ctx);
+        if (m_frames_context_of_surfaces == nullptr)
+            return DecoderError::with_description(DecoderErrorCategory::Memory, "Could not reference the exported frames' context"sv);
     }
+    auto const& frames_context = frames_context_of(frame);
 
     auto const& vulkan_frame = *reinterpret_cast<AVVkFrame const*>(frame.data[0]);
     u64 image_key = 0;
@@ -726,7 +1084,7 @@ DecoderErrorOr<NonnullRefPtr<VideoSurface>> FFmpegVulkanVideoDecoder::surface_fo
     return surface.release_value();
 }
 
-DecoderErrorOr<NonnullRefPtr<VideoFrame>> FFmpegVulkanVideoDecoder::take_next_output(CodingIndependentCodePoints const& container_cicp, Optional<AK::Duration>)
+DecoderErrorOr<NonnullRefPtr<VideoFrame>> FFmpegVulkanVideoDecoder::take_next_output(ColorMetadata const& container_color_metadata, Optional<AK::Duration>)
 {
     TRY(receive_decoded_frames());
 
@@ -751,8 +1109,10 @@ DecoderErrorOr<NonnullRefPtr<VideoFrame>> FFmpegVulkanVideoDecoder::take_next_ou
     if (!storage)
         return DecoderError::with_description(DecoderErrorCategory::TryAgain, "Every video surface the decoder may hand out is held elsewhere"sv);
 
-    auto cicp = coding_independent_code_points_of(m_functions, *m_codec_context, container_cicp);
-    auto frame = DECODER_TRY_ALLOC(try_make_ref_counted<VideoFrame>(output.timing.timestamp, output.timing.duration, output.size, output.bit_depth, Subsampling::yuv420(), cicp, storage.release_nonnull()));
+    auto color_metadata = container_color_metadata;
+    color_metadata.adopt_specified_values(output.timing.high_dynamic_range_metadata);
+    color_metadata.cicp.adopt_specified_values(output.cicp);
+    auto frame = DECODER_TRY_ALLOC(try_make_ref_counted<VideoFrame>(output.timing.timestamp, output.timing.duration, output.size, output.bit_depth, Subsampling::yuv420(), move(color_metadata), storage.release_nonnull()));
     m_outputs.take_first();
     return frame;
 }
@@ -760,7 +1120,7 @@ DecoderErrorOr<NonnullRefPtr<VideoFrame>> FFmpegVulkanVideoDecoder::take_next_ou
 void FFmpegVulkanVideoDecoder::flush()
 {
     m_functions.avcodec_flush_buffers(m_codec_context);
-    m_frames_awaiting_output.clear();
+    m_frames_awaiting_output.flush();
     m_received_end_of_stream = false;
 
     Vector<DecodingFrame> stale_frames;

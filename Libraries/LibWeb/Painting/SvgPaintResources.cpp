@@ -16,18 +16,30 @@
 
 namespace Web::Painting {
 
-static bool push_svg_filter_reference(void const* url_value, Layout::NodeWithStyle const& layout_node, void* sink)
+bool push_svg_filter_reference(Layout::BegunRead const& read, DOM::Document& document, Compositing::RustFFI::NodeSlotId slot, void const* url_value, void* sink)
 {
+    auto const& layout_node = as<Layout::NodeWithStyle>(*document.layout_node_arena().node_if_live(read, slot));
     auto filter_element = resolve_svg_filter_reference({ .pointer = url_value }, layout_node);
     if (!filter_element)
         return false;
+
+    // INTEROP: Other engines treat a filter with more than a few hundred primitives as an error, which also keeps a
+    //          chain of thousands of primitives from overflowing the stack of the painter that applies them one by one.
+    static constexpr size_t max_primitives_per_filter = 256;
+    size_t primitive_count = 0;
+    for (auto const* child = filter_element->first_child(); child; child = child->next_sibling()) {
+        if (is<DOM::Element>(*child) && ++primitive_count > max_primitives_per_filter)
+            return false;
+    }
+
     auto dest_size = Gfx::enclosing_int_rect(absolute_rect(layout_node).to_type<float>()).size();
     filter_element->push_primitives(sink, dest_size);
     return true;
 }
 
-static void push_svg_paint_server_description(Layout::NodeWithStyle const& layout_node, bool is_stroke, void* sink)
+void push_svg_paint_server_description(Layout::BegunRead const& read, DOM::Document& document, Compositing::RustFFI::NodeSlotId slot, bool is_stroke, void* sink)
 {
+    auto const& layout_node = as<Layout::NodeWithStyle>(*document.layout_node_arena().node_if_live(read, slot));
     auto const* graphics_element = as_if<SVG::SVGGraphicsElement>(layout_node.dom_node());
     if (!graphics_element)
         return;
@@ -39,28 +51,6 @@ static void push_svg_paint_server_description(Layout::NodeWithStyle const& layou
         gradient->push_paint_server_description(sink);
     else if (auto const* pattern = as_if<SVG::SVGPatternElement>(paint_server_element.ptr()))
         pattern->push_paint_server_description(sink, layout_node);
-}
-
-bool sync_svg_paint_resources(Layout::BegunRead const& read, DOM::Document& document)
-{
-    // The boxes the resources are drawn from are found in the read the sync is made in.
-    struct Context {
-        Layout::NodeArena& arena;
-        Layout::BegunRead const& read;
-    } context { document.layout_node_arena(), read };
-    return Layout::RustFFI::render_state_sync_svg_paint_resources(
-        context.arena.host(),
-        &read, &context,
-        [](void* context_pointer, Compositing::RustFFI::NodeSlotId slot, void const* url_value, void* sink) -> bool {
-            auto& context = *static_cast<Context*>(context_pointer);
-            auto const& layout_node = as<Layout::NodeWithStyle>(*context.arena.node_if_live(context.read, slot));
-            return push_svg_filter_reference(url_value, layout_node, sink);
-        },
-        [](void* context_pointer, Compositing::RustFFI::NodeSlotId slot, bool is_stroke, void* sink) {
-            auto& context = *static_cast<Context*>(context_pointer);
-            auto const& layout_node = as<Layout::NodeWithStyle>(*context.arena.node_if_live(context.read, slot));
-            push_svg_paint_server_description(layout_node, is_stroke, sink);
-        });
 }
 
 }

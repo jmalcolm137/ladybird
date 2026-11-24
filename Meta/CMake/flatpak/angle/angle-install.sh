@@ -12,11 +12,8 @@ popd
 # Libraries
 libs=(
   libEGL.so
-  libEGL_vulkan_secondaries.so
   libGLESv1_CM.so
   libGLESv2.so
-  libGLESv2_vulkan_secondaries.so
-  libGLESv2_with_capture.so
   libchrome_zlib.so
   libfeature_support.so
   libthird_party_abseil-cpp_absl.so
@@ -25,6 +22,19 @@ libs=(
 for lib in "${libs[@]}"; do
     install -D -m644 out/"$lib" "$FLATPAK_DEST/lib/$lib"
 done
+
+# Licenses: flatpak-builder only records those at the top of a module's source, and ANGLE is checked out below it,
+# with the third-party code that it builds in.
+licenses="$FLATPAK_DEST/share/licenses/$FLATPAK_ID/angle"
+install -D -m644 LICENSE "$licenses/LICENSE"
+shopt -s nullglob
+# Some keep their license texts in a LICENSES directory.
+for license in {,src/,src/common/}third_party/*/{LICENSE,COPYING}* third_party/*/{src,source}/{LICENSE,COPYING}*; do
+    for file in "$license" "$license"/*; do
+        [[ -f "$file" ]] && install -D -m644 "$file" "$licenses/${file//\//_}"
+    done
+done
+shopt -u nullglob
 
 # Pkg-config
 mkdir -p "$FLATPAK_DEST/lib/pkgconfig"

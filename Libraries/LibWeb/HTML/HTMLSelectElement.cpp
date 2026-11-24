@@ -373,29 +373,15 @@ bool HTMLSelectElement::can_skip_selectedness_update_for_inserted_option(HTMLOpt
     return true;
 }
 
-bool HTMLSelectElement::can_skip_children_changed_selectedness_update(ChildrenChangedMetadata const& metadata) const
-{
-    // If the following criteria are met, there is no need to re-run the selectedness algorithm.
-    // FIXME: We can tighten up these conditions and skip even more work!
-    if (metadata.type != ChildrenChangedMetadata::Type::Inserted)
-        return false;
-
-    if (auto* option = as_if<HTMLOptionElement>(*metadata.node))
-        return can_skip_selectedness_update_for_inserted_option(*option);
-
-    return false;
-}
-
 void HTMLSelectElement::children_changed(ChildrenChangedMetadata const& metadata)
 {
     Base::children_changed(metadata);
 
-    if (can_skip_children_changed_selectedness_update(metadata))
-        return;
-
-    update_cached_list_of_options();
-    update_selectedness();
-    list_box_options_did_change();
+    // NB: The insertion, removing and moving steps of each option run the selectedness setting algorithm when the list
+    //     of options gains or loses it, so the select only builds its list box rows again. Those show the label of
+    //     each optgroup child too, even one with no options.
+    if (metadata.type != ChildrenChangedMetadata::Type::Mutation)
+        list_box_options_did_change();
 }
 
 // https://html.spec.whatwg.org/multipage/form-elements.html#dom-select-type
@@ -555,7 +541,7 @@ void HTMLSelectElement::show_the_picker_if_applicable()
     m_select_item_option_elements.clear();
     auto create_select_item_option = [&](HTMLOptionElement& option_element) {
         m_select_item_option_elements.append(option_element);
-        return SelectItemOption { static_cast<u32>(m_select_item_option_elements.size()), option_element.selected(), option_element.disabled(), Infra::strip_and_collapse_whitespace(option_element.label()), option_element.value() };
+        return SelectItemOption { static_cast<u32>(m_select_item_option_elements.size()), option_element.selected(), option_element.disabled(), Infra::strip_and_collapse_whitespace(option_element.display_label()), option_element.value() };
     };
     for (auto const& child : children_as_vector()) {
         if (auto const* opt_group_element = as_if<HTMLOptGroupElement>(*child)) {
@@ -834,7 +820,7 @@ void HTMLSelectElement::clone_selected_option_into_select_button()
 
     // 3. If option is not null, then set text to option's label.
     if (option.has_value())
-        text = (*option)->label();
+        text = (*option)->display_label();
 
     // 4. Set select's select fallback button text to text.
     m_selected_label_element->string_replace_all(move(text));
@@ -1200,6 +1186,16 @@ void HTMLSelectElement::update_list_box()
     auto rows = max(display_size(), 1u);
     m_list_box_element->set_attribute_value(HTML::AttributeNames::style, Utf16String::formatted("block-size: {}em; overflow-x: hidden; overflow-y: auto;", rows * list_box_row_height_in_em));
 
+    // NB: The rows are built again whenever the options change, so the anchor and focus of a range selection are kept
+    //     on the options they were on, as long as those still have a row.
+    auto option_at = [&](Optional<size_t> index) -> GC::Ptr<HTMLOptionElement> {
+        if (!index.has_value() || *index >= m_list_box_rows.size())
+            return nullptr;
+        return m_list_box_rows[*index].option;
+    };
+    auto anchor_option = option_at(m_list_box_anchor_index);
+    auto focus_option = option_at(m_list_box_focus_index);
+
     m_list_box_rows.clear();
     m_list_box_anchor_index = {};
     m_list_box_focus_index = {};
@@ -1209,7 +1205,7 @@ void HTMLSelectElement::update_list_box()
         if (option.has_attribute(AttributeNames::hidden))
             return;
         auto row = MUST(DOM::create_element(document(), HTML::TagNames::div, Namespace::HTML));
-        MUST(row->append_child(document().create_text_node(Infra::strip_and_collapse_whitespace(option.label()))));
+        MUST(row->append_child(document().create_text_node(Infra::strip_and_collapse_whitespace(option.display_label()))));
         update_list_box_row_style(row, option);
         MUST(m_list_box_element->append_child(row));
         m_list_box_rows.append({ row, option });
@@ -1231,6 +1227,14 @@ void HTMLSelectElement::update_list_box()
             }
         }
     }
+
+    auto index_of = [&](GC::Ptr<HTMLOptionElement> option) -> Optional<size_t> {
+        if (!option)
+            return {};
+        return m_list_box_rows.find_first_index_if([&](auto const& row) { return row.option == option; });
+    };
+    m_list_box_anchor_index = index_of(anchor_option);
+    m_list_box_focus_index = index_of(focus_option);
 }
 
 void HTMLSelectElement::handle_list_box_mousedown(UIEvents::MouseEvent& event)

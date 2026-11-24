@@ -5,530 +5,152 @@
  */
 
 use super::{
-    AnchorScrollShift, BackdropFilterData, BackfaceVisibilityData, ClipData, ClipMode, ClipNode, ClipNodeData,
-    ClipNodeIndex, ClipPathData, EffectNode, EffectNodeData, EffectNodeIndex, EffectsData, MaskData, MaskLayerOrigin,
-    PerspectiveData, ScrollData, SpatialData, SpatialNode, SpatialNodeIndex, StickyData, TransformData,
-    TransformDataRole, VISUAL_VIEWPORT_NODE_INDEX, VisualContextTree, scroll_state::NO_SCROLL_STATE_SLOT,
+    ClipNode, ClipNodeData, ClipNodeIndex, ClipPathData, CompositorScrollTable, EffectNode, EffectNodeData,
+    EffectNodeIndex, SpatialData, SpatialNode, SpatialNodeIndex, VISUAL_VIEWPORT_NODE_INDEX, VisualContextTree,
 };
-use crate::easing::{Easing, FfiEasingKind, FfiLinearEasingPoint};
-use crate::filter_bytes::{FfiFilterFunction, FfiFilterFunctionKind};
-use crate::host::{
-    FfiVisualAnimationFillMode, FfiVisualAnimationPlaybackDirection, FfiVisualAnimationTargetKind,
-    FfiVisualAnimationTransformOperationKind,
-};
-use crate::node_slot_id::NodeSlotId;
+use crate::host::FfiVisualAnimationTransformOperationKind;
 use crate::visual_animation::{
-    MAXIMUM_TRANSFORM_OPERATION_VALUE_COUNT, VisualAnimation, VisualAnimationKeyframe,
-    VisualAnimationTransformOperation, VisualAnimationValue,
+    MAXIMUM_TRANSFORM_OPERATION_VALUE_COUNT, VisualAnimation, VisualAnimationTransformOperation,
 };
 use libgfx_rust::path::Path;
-use libgfx_rust::{
-    Color, ColorFilterType, CompositingAndBlendingOperator, CornerRadii, CornerRadius, FloatMatrix4x4, FloatPoint,
-    FloatRect, FloatSize, IntRect, MaskKind, WindingRule,
-};
+use libipc_rust::wire::{Decode, DecodeError, Decoder, Encode, EncodeError, Encoder};
 
-const SERIALIZED_TREE_MAGIC: u32 = 0x5443_5641;
-const SERIALIZED_TREE_FORMAT: u32 = 10;
-
-const SPATIAL_KIND_SCROLL: u8 = 0;
-const SPATIAL_KIND_STICKY: u8 = 1;
-const SPATIAL_KIND_TRANSFORM: u8 = 2;
-const SPATIAL_KIND_PERSPECTIVE: u8 = 3;
-const SPATIAL_KIND_BACKFACE_VISIBILITY: u8 = 4;
-const SPATIAL_KIND_ANCHOR_SCROLL_SHIFT: u8 = 5;
-const SPATIAL_KIND_DEAD: u8 = 6;
-
-const CLIP_KIND_RECT: u8 = 0;
-const CLIP_KIND_PATH: u8 = 1;
-const CLIP_KIND_DEAD: u8 = 2;
-
-const EFFECT_KIND_EFFECTS: u8 = 0;
-const EFFECT_KIND_MASK: u8 = 1;
-const EFFECT_KIND_BACKGROUND_COLOR_ANIMATION: u8 = 2;
-const EFFECT_KIND_DEAD: u8 = 3;
-
-const MINIMUM_SERIALIZED_SPATIAL_NODE_SIZE: usize = 5;
-const MINIMUM_SERIALIZED_CLIP_NODE_SIZE: usize = 9;
-const MINIMUM_SERIALIZED_EFFECT_NODE_SIZE: usize = 13;
-// A visual animation: kind, node count, anchor, six timing values, direction, fill, a one byte
-// easing at least, and a keyframe count.
-const MINIMUM_SERIALIZED_VISUAL_ANIMATION_SIZE: usize = 1 + 4 + 8 + 6 * 8 + 1 + 1 + 1 + 4;
-// A keyframe: offset, a one byte easing at least, and a four byte value at least.
-const MINIMUM_SERIALIZED_KEYFRAME_SIZE: usize = 8 + 1 + 4;
-const SERIALIZED_LINEAR_EASING_POINT_SIZE: usize = 16;
-const SERIALIZED_FILTER_FUNCTION_SIZE: usize = 1 + 4 + 4 + 4 + 4 + 1;
-// A transform operation: kind, value count and one value at least.
-const MINIMUM_SERIALIZED_TRANSFORM_OPERATION_SIZE: usize = 1 + 1 + 4;
-
-#[derive(Default)]
-struct TreeByteWriter {
-    bytes: Vec<u8>,
+fn decode_nodes_reserving_their_count<T: Decode>(
+    decoder: &mut Decoder<'_>,
+    node_count: usize,
+) -> Result<Vec<T>, DecodeError> {
+    if node_count > decoder.remaining_bytes() / T::MIN_ENCODED_SIZE {
+        return Err(DecodeError::UnexpectedEnd);
+    }
+    let mut nodes = Vec::new();
+    nodes
+        .try_reserve_exact(node_count)
+        .map_err(|_| DecodeError::AllocationFailed)?;
+    for _ in 0..node_count {
+        nodes.push(decoder.decode()?);
+    }
+    Ok(nodes)
 }
 
-impl TreeByteWriter {
-    fn u8(&mut self, value: u8) {
-        self.bytes.push(value);
-    }
-    fn bool(&mut self, value: bool) {
-        self.u8(u8::from(value));
-    }
-    fn u32(&mut self, value: u32) {
-        self.bytes.extend_from_slice(&value.to_ne_bytes());
-    }
-    fn i32(&mut self, value: i32) {
-        self.bytes.extend_from_slice(&value.to_ne_bytes());
-    }
-    fn u64(&mut self, value: u64) {
-        self.bytes.extend_from_slice(&value.to_ne_bytes());
-    }
-    fn i64(&mut self, value: i64) {
-        self.bytes.extend_from_slice(&value.to_ne_bytes());
-    }
-    fn f64(&mut self, value: f64) {
-        self.bytes.extend_from_slice(&value.to_ne_bytes());
-    }
-    fn f32(&mut self, value: f32) {
-        self.bytes.extend_from_slice(&value.to_ne_bytes());
-    }
-    fn optional_f32(&mut self, value: Option<f32>) {
-        self.bool(value.is_some());
-        self.f32(value.unwrap_or_default());
-    }
-    fn spatial_index(&mut self, index: SpatialNodeIndex) {
-        self.u32(index.0);
-    }
-    fn optional_spatial_index(&mut self, index: Option<SpatialNodeIndex>) {
-        self.bool(index.is_some());
-        self.u32(index.map_or(0, |index| index.0));
-    }
-    fn clip_index(&mut self, index: ClipNodeIndex) {
-        self.u32(index.0);
-    }
-    fn effect_index(&mut self, index: EffectNodeIndex) {
-        self.u32(index.0);
-    }
-    fn point(&mut self, point: FloatPoint) {
-        self.f32(point.x);
-        self.f32(point.y);
-    }
-    fn rect(&mut self, rect: FloatRect) {
-        self.f32(rect.x);
-        self.f32(rect.y);
-        self.f32(rect.width);
-        self.f32(rect.height);
-    }
-    fn size(&mut self, size: FloatSize) {
-        self.f32(size.width);
-        self.f32(size.height);
-    }
-    fn float_rect(&mut self, rect: FloatRect) {
-        self.f32(rect.x);
-        self.f32(rect.y);
-        self.f32(rect.width);
-        self.f32(rect.height);
-    }
-    fn int_rect(&mut self, rect: IntRect) {
-        self.i32(rect.x);
-        self.i32(rect.y);
-        self.i32(rect.width);
-        self.i32(rect.height);
-    }
-    fn matrix(&mut self, matrix: FloatMatrix4x4) {
-        for row in matrix.elements {
-            for element in row {
-                self.f32(element);
-            }
-        }
-    }
-    fn corner_radius(&mut self, radius: CornerRadius) {
-        self.i32(radius.horizontal_radius);
-        self.i32(radius.vertical_radius);
-    }
-    fn corner_radii(&mut self, radii: CornerRadii) {
-        self.corner_radius(radii.top_left);
-        self.corner_radius(radii.top_right);
-        self.corner_radius(radii.bottom_right);
-        self.corner_radius(radii.bottom_left);
-    }
-    fn length_prefixed_bytes(&mut self, bytes: &[u8]) {
-        self.u32(bytes.len() as u32);
-        self.bytes.extend_from_slice(bytes);
+impl Encode for SpatialNode {
+    fn encode(&self, encoder: &mut Encoder) -> Result<(), EncodeError> {
+        encoder.encode(&self.parent)?;
+        encoder.encode(&self.data)
     }
 }
 
-struct TreeByteReader<'a> {
-    bytes: &'a [u8],
-    position: usize,
+impl Decode for SpatialNode {
+    const MIN_ENCODED_SIZE: usize = SpatialNodeIndex::MIN_ENCODED_SIZE + SpatialData::MIN_ENCODED_SIZE;
+
+    fn decode(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+        let parent = decoder.decode()?;
+        let data = decoder.decode()?;
+        Ok(Self { data, parent })
+    }
+
+    fn decode_vec(decoder: &mut Decoder<'_>, size: usize) -> Result<Vec<Self>, DecodeError> {
+        decode_nodes_reserving_their_count(decoder, size)
+    }
 }
 
-impl<'a> TreeByteReader<'a> {
-    fn remaining(&self) -> usize {
-        self.bytes.len() - self.position
+impl Encode for ClipPathData {
+    fn encode(&self, encoder: &mut Encoder) -> Result<(), EncodeError> {
+        encoder.encode(&self.bounding_rect)?;
+        encoder.encode(&self.fill_rule)?;
+        encoder.encode(self.path.serialize_to_bytes().as_slice())
     }
-    fn take(&mut self, count: usize) -> Option<&'a [u8]> {
-        if count > self.remaining() {
-            return None;
-        }
-        let slice = &self.bytes[self.position..self.position + count];
-        self.position += count;
-        Some(slice)
-    }
-    fn u8(&mut self) -> Option<u8> {
-        self.take(1).map(|bytes| bytes[0])
-    }
-    fn bool(&mut self) -> Option<bool> {
-        match self.u8()? {
-            0 => Some(false),
-            1 => Some(true),
-            _ => None,
-        }
-    }
-    fn u32(&mut self) -> Option<u32> {
-        self.take(4)
-            .map(|bytes| u32::from_ne_bytes(bytes.try_into().expect("four bytes")))
-    }
-    fn i32(&mut self) -> Option<i32> {
-        self.take(4)
-            .map(|bytes| i32::from_ne_bytes(bytes.try_into().expect("four bytes")))
-    }
-    fn u64(&mut self) -> Option<u64> {
-        self.take(8)
-            .map(|bytes| u64::from_ne_bytes(bytes.try_into().expect("eight bytes")))
-    }
-    fn i64(&mut self) -> Option<i64> {
-        self.take(8)
-            .map(|bytes| i64::from_ne_bytes(bytes.try_into().expect("eight bytes")))
-    }
-    fn f64(&mut self) -> Option<f64> {
-        self.take(8)
-            .map(|bytes| f64::from_ne_bytes(bytes.try_into().expect("eight bytes")))
-    }
-    fn f32(&mut self) -> Option<f32> {
-        self.take(4)
-            .map(|bytes| f32::from_ne_bytes(bytes.try_into().expect("four bytes")))
-    }
-    fn optional_f32(&mut self) -> Option<Option<f32>> {
-        let has_value = self.bool()?;
-        let value = self.f32()?;
-        Some(has_value.then_some(value))
-    }
-    fn spatial_index(&mut self) -> Option<SpatialNodeIndex> {
-        self.u32().map(SpatialNodeIndex)
-    }
-    fn optional_spatial_index(&mut self) -> Option<Option<SpatialNodeIndex>> {
-        let has_value = self.bool()?;
-        let index = self.u32()?;
-        Some(has_value.then_some(SpatialNodeIndex(index)))
-    }
-    fn clip_index(&mut self) -> Option<ClipNodeIndex> {
-        self.u32().map(ClipNodeIndex)
-    }
-    fn effect_index(&mut self) -> Option<EffectNodeIndex> {
-        self.u32().map(EffectNodeIndex)
-    }
-    fn point(&mut self) -> Option<FloatPoint> {
-        Some(FloatPoint {
-            x: self.f32()?,
-            y: self.f32()?,
+}
+
+impl Decode for ClipPathData {
+    fn decode(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+        let bounding_rect = decoder.decode()?;
+        let fill_rule = decoder.decode()?;
+        let serialized_path_size = decoder.decode_size()?;
+        let path = Path::from_serialized_bytes(decoder.read_bytes(serialized_path_size)?);
+        Ok(Self {
+            path: std::sync::Arc::new(path),
+            bounding_rect,
+            fill_rule,
         })
     }
-    fn rect(&mut self) -> Option<FloatRect> {
-        Some(FloatRect {
-            x: self.f32()?,
-            y: self.f32()?,
-            width: self.f32()?,
-            height: self.f32()?,
+}
+
+impl Encode for ClipNode {
+    fn encode(&self, encoder: &mut Encoder) -> Result<(), EncodeError> {
+        encoder.encode(&self.parent)?;
+        encoder.encode(&self.spatial)?;
+        encoder.encode(&self.data)
+    }
+}
+
+impl Decode for ClipNode {
+    const MIN_ENCODED_SIZE: usize =
+        ClipNodeIndex::MIN_ENCODED_SIZE + SpatialNodeIndex::MIN_ENCODED_SIZE + ClipNodeData::MIN_ENCODED_SIZE;
+
+    fn decode(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+        let parent = decoder.decode()?;
+        let spatial = decoder.decode()?;
+        let data = decoder.decode()?;
+        Ok(Self::new(data, parent, spatial))
+    }
+
+    fn decode_vec(decoder: &mut Decoder<'_>, size: usize) -> Result<Vec<Self>, DecodeError> {
+        decode_nodes_reserving_their_count(decoder, size)
+    }
+}
+
+impl Encode for EffectNode {
+    fn encode(&self, encoder: &mut Encoder) -> Result<(), EncodeError> {
+        encoder.encode(&self.parent)?;
+        encoder.encode(&self.spatial)?;
+        encoder.encode(&self.local_clip)?;
+        encoder.encode(&self.data)
+    }
+}
+
+impl Decode for EffectNode {
+    const MIN_ENCODED_SIZE: usize = EffectNodeIndex::MIN_ENCODED_SIZE
+        + SpatialNodeIndex::MIN_ENCODED_SIZE
+        + ClipNodeIndex::MIN_ENCODED_SIZE
+        + EffectNodeData::MIN_ENCODED_SIZE;
+
+    fn decode(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+        Ok(Self {
+            parent: decoder.decode()?,
+            spatial: decoder.decode()?,
+            local_clip: decoder.decode()?,
+            data: decoder.decode()?,
         })
     }
-    fn size(&mut self) -> Option<FloatSize> {
-        Some(FloatSize {
-            width: self.f32()?,
-            height: self.f32()?,
-        })
-    }
-    fn float_rect(&mut self) -> Option<FloatRect> {
-        Some(FloatRect::new(self.f32()?, self.f32()?, self.f32()?, self.f32()?))
-    }
-    fn int_rect(&mut self) -> Option<IntRect> {
-        Some(IntRect::new(self.i32()?, self.i32()?, self.i32()?, self.i32()?))
-    }
-    fn matrix(&mut self) -> Option<FloatMatrix4x4> {
-        let mut elements = [[0.0f32; 4]; 4];
-        for row in &mut elements {
-            for element in row {
-                *element = self.f32()?;
-            }
-        }
-        Some(FloatMatrix4x4 { elements })
-    }
-    fn corner_radius(&mut self) -> Option<CornerRadius> {
-        Some(CornerRadius {
-            horizontal_radius: self.i32()?,
-            vertical_radius: self.i32()?,
-        })
-    }
-    fn corner_radii(&mut self) -> Option<CornerRadii> {
-        Some(CornerRadii {
-            top_left: self.corner_radius()?,
-            top_right: self.corner_radius()?,
-            bottom_right: self.corner_radius()?,
-            bottom_left: self.corner_radius()?,
-        })
-    }
-    fn length_prefixed_bytes(&mut self) -> Option<&'a [u8]> {
-        let length = self.u32()? as usize;
-        self.take(length)
-    }
-    fn winding_rule(&mut self) -> Option<WindingRule> {
-        match self.i32()? {
-            value if value == WindingRule::Nonzero as i32 => Some(WindingRule::Nonzero),
-            value if value == WindingRule::EvenOdd as i32 => Some(WindingRule::EvenOdd),
-            _ => None,
-        }
-    }
-    fn mask_kind(&mut self) -> Option<MaskKind> {
-        match self.i32()? {
-            value if value == MaskKind::Alpha as i32 => Some(MaskKind::Alpha),
-            value if value == MaskKind::Luminance as i32 => Some(MaskKind::Luminance),
-            _ => None,
-        }
-    }
-    fn compositing_and_blending_operator(&mut self) -> Option<CompositingAndBlendingOperator> {
-        CompositingAndBlendingOperator::from_i32(self.i32()?)
-    }
-    fn clip_mode(&mut self) -> Option<ClipMode> {
-        match self.u8()? {
-            value if value == ClipMode::Intersect as u8 => Some(ClipMode::Intersect),
-            value if value == ClipMode::Difference as u8 => Some(ClipMode::Difference),
-            _ => None,
-        }
-    }
-    fn transform_role(&mut self) -> Option<TransformDataRole> {
-        match self.u8()? {
-            value if value == TransformDataRole::CssTransform as u8 => Some(TransformDataRole::CssTransform),
-            value if value == TransformDataRole::SvgViewportTransform as u8 => {
-                Some(TransformDataRole::SvgViewportTransform)
-            }
-            _ => None,
-        }
-    }
-    fn mask_layer_origin(&mut self) -> Option<MaskLayerOrigin> {
-        match self.u8()? {
-            value if value == MaskLayerOrigin::CssMaskLayers as u8 => Some(MaskLayerOrigin::CssMaskLayers),
-            value if value == MaskLayerOrigin::SvgMask as u8 => Some(MaskLayerOrigin::SvgMask),
-            value if value == MaskLayerOrigin::SvgClip as u8 => Some(MaskLayerOrigin::SvgClip),
-            _ => None,
-        }
+
+    fn decode_vec(decoder: &mut Decoder<'_>, size: usize) -> Result<Vec<Self>, DecodeError> {
+        decode_nodes_reserving_their_count(decoder, size)
     }
 }
 
-fn write_spatial_data(writer: &mut TreeByteWriter, data: &SpatialData) {
-    match data {
-        SpatialData::Scroll(_) => writer.u8(SPATIAL_KIND_SCROLL),
-        SpatialData::Sticky(sticky) => {
-            writer.u8(SPATIAL_KIND_STICKY);
-            writer.spatial_index(sticky.scroller);
-            writer.optional_spatial_index(sticky.parent_sticky);
-            writer.point(sticky.position_relative_to_scroller);
-            writer.size(sticky.border_box_size);
-            writer.size(sticky.scrollport_size);
-            writer.float_rect(sticky.containing_block_region);
-            writer.bool(sticky.needs_parent_offset_adjustment);
-            writer.u32(sticky.non_scrolling_scroll_container.index);
-            writer.optional_f32(sticky.inset_top);
-            writer.optional_f32(sticky.inset_right);
-            writer.optional_f32(sticky.inset_bottom);
-            writer.optional_f32(sticky.inset_left);
-        }
-        SpatialData::Transform(transform) => {
-            writer.u8(SPATIAL_KIND_TRANSFORM);
-            writer.matrix(transform.matrix);
-            writer.point(transform.origin);
-            writer.optional_spatial_index(transform.sorting_context_root_index);
-            writer.bool(transform.flattens_inherited_transform);
-            writer.u8(transform.role as u8);
-            writer.bool(transform.synthetic_plane);
-            writer.bool(transform.establishes_sorting_context);
-            writer.rect(transform.bounds);
-        }
-        SpatialData::Perspective(perspective) => {
-            writer.u8(SPATIAL_KIND_PERSPECTIVE);
-            writer.matrix(perspective.matrix);
-            writer.bool(perspective.flattens_inherited_transform);
-        }
-        SpatialData::BackfaceVisibility(backface) => {
-            writer.u8(SPATIAL_KIND_BACKFACE_VISIBILITY);
-            writer.spatial_index(backface.plane_root_index);
-            writer.bool(backface.flattens_inherited_transform);
-        }
-        SpatialData::AnchorScrollShift(shift) => {
-            writer.u8(SPATIAL_KIND_ANCHOR_SCROLL_SHIFT);
-            writer.spatial_index(shift.scroll_node_index);
-            writer.bool(shift.negate);
-            writer.bool(shift.compensate_horizontal_scroll);
-            writer.bool(shift.compensate_vertical_scroll);
-        }
-        SpatialData::Dead => writer.u8(SPATIAL_KIND_DEAD),
+impl Encode for VisualAnimationTransformOperation {
+    fn encode(&self, encoder: &mut Encoder) -> Result<(), EncodeError> {
+        encoder.encode(&self.kind)?;
+        encoder.encode(&(self.values().len() as u8))?;
+        f32::encode_slice(self.values(), encoder)
     }
 }
 
-fn read_spatial_data(reader: &mut TreeByteReader<'_>) -> Option<SpatialData> {
-    Some(match reader.u8()? {
-        SPATIAL_KIND_SCROLL => SpatialData::Scroll(ScrollData {
-            state_slot: NO_SCROLL_STATE_SLOT,
-            owner_paintable: NodeSlotId::INVALID,
-        }),
-        SPATIAL_KIND_STICKY => {
-            let scroller = reader.spatial_index()?;
-            let parent_sticky = reader.optional_spatial_index()?;
-            SpatialData::Sticky(StickyData {
-                scroller,
-                parent_sticky,
-                position_relative_to_scroller: reader.point()?,
-                border_box_size: reader.size()?,
-                scrollport_size: reader.size()?,
-                containing_block_region: reader.float_rect()?,
-                needs_parent_offset_adjustment: reader.bool()?,
-                non_scrolling_scroll_container: NodeSlotId { index: reader.u32()? },
-                inset_top: reader.optional_f32()?,
-                inset_right: reader.optional_f32()?,
-                inset_bottom: reader.optional_f32()?,
-                inset_left: reader.optional_f32()?,
-                state_slot: NO_SCROLL_STATE_SLOT,
-                owner_paintable: NodeSlotId::INVALID,
-            })
-        }
-        SPATIAL_KIND_TRANSFORM => SpatialData::Transform(TransformData {
-            matrix: reader.matrix()?,
-            origin: reader.point()?,
-            sorting_context_root_index: reader.optional_spatial_index()?,
-            flattens_inherited_transform: reader.bool()?,
-            role: reader.transform_role()?,
-            synthetic_plane: reader.bool()?,
-            establishes_sorting_context: reader.bool()?,
-            bounds: reader.rect()?,
-        }),
-        SPATIAL_KIND_PERSPECTIVE => SpatialData::Perspective(PerspectiveData {
-            matrix: reader.matrix()?,
-            flattens_inherited_transform: reader.bool()?,
-        }),
-        SPATIAL_KIND_BACKFACE_VISIBILITY => SpatialData::BackfaceVisibility(BackfaceVisibilityData {
-            plane_root_index: reader.spatial_index()?,
-            flattens_inherited_transform: reader.bool()?,
-        }),
-        SPATIAL_KIND_ANCHOR_SCROLL_SHIFT => SpatialData::AnchorScrollShift(AnchorScrollShift {
-            scroll_node_index: reader.spatial_index()?,
-            negate: reader.bool()?,
-            compensate_horizontal_scroll: reader.bool()?,
-            compensate_vertical_scroll: reader.bool()?,
-        }),
-        SPATIAL_KIND_DEAD => SpatialData::Dead,
-        _ => return None,
-    })
-}
+impl Decode for VisualAnimationTransformOperation {
+    const MIN_ENCODED_SIZE: usize = FfiVisualAnimationTransformOperationKind::MIN_ENCODED_SIZE + size_of::<u8>();
 
-fn write_clip_data(writer: &mut TreeByteWriter, data: &ClipNodeData) {
-    match data {
-        ClipNodeData::Rect(clip) => {
-            writer.u8(CLIP_KIND_RECT);
-            writer.float_rect(clip.rect);
-            writer.corner_radii(clip.corner_radii);
-            writer.u8(clip.mode as u8);
+    fn decode(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+        let kind = decoder.decode()?;
+        let value_count = usize::from(decoder.decode::<u8>()?);
+        if value_count > MAXIMUM_TRANSFORM_OPERATION_VALUE_COUNT {
+            return Err(DecodeError::InvalidValue("VisualAnimationTransformOperation"));
         }
-        ClipNodeData::Path(clip_path) => {
-            writer.u8(CLIP_KIND_PATH);
-            writer.int_rect(clip_path.bounding_rect);
-            writer.i32(clip_path.fill_rule as i32);
-            writer.length_prefixed_bytes(&clip_path.path.serialize_to_bytes());
+        let mut values = [0.0; MAXIMUM_TRANSFORM_OPERATION_VALUE_COUNT];
+        for value in &mut values[..value_count] {
+            *value = decoder.decode()?;
         }
-        ClipNodeData::Dead => writer.u8(CLIP_KIND_DEAD),
+        Self::new(kind, &values[..value_count]).ok_or(DecodeError::InvalidValue("VisualAnimationTransformOperation"))
     }
-}
-
-fn read_clip_data(reader: &mut TreeByteReader<'_>) -> Option<ClipNodeData> {
-    Some(match reader.u8()? {
-        CLIP_KIND_RECT => ClipNodeData::Rect(ClipData {
-            rect: reader.float_rect()?,
-            corner_radii: reader.corner_radii()?,
-            mode: reader.clip_mode()?,
-        }),
-        CLIP_KIND_PATH => {
-            let bounding_rect = reader.int_rect()?;
-            let fill_rule = reader.winding_rule()?;
-            let path = Path::from_serialized_bytes(reader.length_prefixed_bytes()?);
-            ClipNodeData::Path(ClipPathData {
-                path: std::sync::Arc::new(path),
-                bounding_rect,
-                fill_rule,
-            })
-        }
-        CLIP_KIND_DEAD => ClipNodeData::Dead,
-        _ => return None,
-    })
-}
-
-fn write_effect_data(writer: &mut TreeByteWriter, data: &EffectNodeData) {
-    match data {
-        EffectNodeData::Effects(effects) => {
-            writer.u8(EFFECT_KIND_EFFECTS);
-            writer.f32(effects.opacity);
-            writer.i32(effects.blend_mode as i32);
-            writer.bool(effects.filter.is_some());
-            writer.length_prefixed_bytes(effects.filter.as_deref().map_or(&[], Vec::as_slice));
-            writer.bool(effects.backdrop_filter.is_some());
-            if let Some(backdrop_filter) = &effects.backdrop_filter {
-                writer.int_rect(backdrop_filter.region);
-                writer.corner_radii(backdrop_filter.corner_radii);
-                writer.length_prefixed_bytes(&backdrop_filter.filter);
-            }
-            writer.bool(effects.isolation);
-        }
-        EffectNodeData::Mask(mask) => {
-            writer.u8(EFFECT_KIND_MASK);
-            writer.int_rect(mask.rect);
-            writer.i32(mask.kind as i32);
-            writer.u8(mask.origin as u8);
-            writer.bool(mask.masks_backdrop);
-        }
-        EffectNodeData::BackgroundColorAnimation => writer.u8(EFFECT_KIND_BACKGROUND_COLOR_ANIMATION),
-        EffectNodeData::Dead => writer.u8(EFFECT_KIND_DEAD),
-    }
-}
-
-fn read_effect_data(reader: &mut TreeByteReader<'_>) -> Option<EffectNodeData> {
-    Some(match reader.u8()? {
-        EFFECT_KIND_EFFECTS => {
-            let opacity = reader.f32()?;
-            let blend_mode = reader.compositing_and_blending_operator()?;
-            let has_filter = reader.bool()?;
-            let filter_bytes = reader.length_prefixed_bytes()?;
-            let backdrop_filter = if reader.bool()? {
-                Some(BackdropFilterData {
-                    region: reader.int_rect()?,
-                    corner_radii: reader.corner_radii()?,
-                    filter: std::sync::Arc::new(reader.length_prefixed_bytes()?.to_vec()),
-                })
-            } else {
-                None
-            };
-            EffectNodeData::Effects(EffectsData {
-                isolation: reader.bool()?,
-                opacity,
-                blend_mode,
-                filter: has_filter.then(|| std::sync::Arc::new(filter_bytes.to_vec())),
-                backdrop_filter,
-            })
-        }
-        EFFECT_KIND_MASK => EffectNodeData::Mask(MaskData {
-            rect: reader.int_rect()?,
-            kind: reader.mask_kind()?,
-            origin: reader.mask_layer_origin()?,
-            masks_backdrop: reader.bool()?,
-        }),
-        EFFECT_KIND_BACKGROUND_COLOR_ANIMATION => EffectNodeData::BackgroundColorAnimation,
-        EFFECT_KIND_DEAD => EffectNodeData::Dead,
-        _ => return None,
-    })
 }
 
 fn spatial_node_has_ancestor(nodes: &[SpatialNode], mut node: usize, ancestor: SpatialNodeIndex) -> bool {
@@ -619,326 +241,40 @@ impl VisualContextTree {
     }
 }
 
-fn write_easing(writer: &mut TreeByteWriter, easing: &Easing) {
-    writer.u8(easing.kind() as u8);
-    match easing {
-        Easing::Linear(points) => {
-            writer.u32(points.len() as u32);
-            for point in points {
-                writer.f64(point.input);
-                writer.f64(point.output);
-            }
-        }
-        Easing::CubicBezier { x1, y1, x2, y2 } => {
-            writer.f64(*x1);
-            writer.f64(*y1);
-            writer.f64(*x2);
-            writer.f64(*y2);
-        }
-        Easing::Steps {
-            interval_count,
-            position,
-        } => {
-            writer.i32(*interval_count);
-            writer.u8(*position);
-        }
+impl Encode for VisualContextTree {
+    fn encode(&self, encoder: &mut Encoder) -> Result<(), EncodeError> {
+        encoder.encode(&self.structural_epoch)?;
+        encoder.encode(&self.root_isolation_effect)?;
+        encoder.encode(&self.spatial_nodes)?;
+        encoder.encode(&self.clip_nodes)?;
+        encoder.encode(&self.effect_nodes)?;
+        encoder.encode(&self.visual_animations)?;
+        encoder.encode(&self.compositor_scroll_table)
     }
 }
 
-fn read_easing(reader: &mut TreeByteReader<'_>) -> Option<Easing> {
-    match FfiEasingKind::from_u8(reader.u8()?)? {
-        FfiEasingKind::Linear => {
-            let point_count = reader.u32()? as usize;
-            if point_count > reader.remaining() / SERIALIZED_LINEAR_EASING_POINT_SIZE {
-                return None;
-            }
-            let mut points = Vec::with_capacity(point_count);
-            for _ in 0..point_count {
-                points.push(FfiLinearEasingPoint {
-                    input: reader.f64()?,
-                    output: reader.f64()?,
-                });
-            }
-            Some(Easing::Linear(points))
+impl Decode for VisualContextTree {
+    fn decode(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+        let structural_epoch = decoder.decode()?;
+        let root_isolation_effect = decoder.decode()?;
+        let spatial_nodes = decoder.decode::<Vec<SpatialNode>>()?;
+        if spatial_nodes.is_empty() {
+            return Err(DecodeError::InvalidValue("VisualContextTree without a root"));
         }
-        FfiEasingKind::CubicBezier => Some(Easing::CubicBezier {
-            x1: reader.f64()?,
-            y1: reader.f64()?,
-            x2: reader.f64()?,
-            y2: reader.f64()?,
-        }),
-        FfiEasingKind::Steps => Some(Easing::Steps {
-            interval_count: reader.i32()?,
-            position: reader.u8()?,
-        }),
-    }
-}
-
-fn write_filter_function(writer: &mut TreeByteWriter, function: &FfiFilterFunction) {
-    writer.u8(function.kind as u8);
-    writer.f32(function.amount);
-    writer.f32(function.offset_x);
-    writer.f32(function.offset_y);
-    writer.u32(function.color.0);
-    writer.u8(function.color_operation as u8);
-}
-
-fn read_filter_function(reader: &mut TreeByteReader<'_>) -> Option<FfiFilterFunction> {
-    Some(FfiFilterFunction {
-        kind: FfiFilterFunctionKind::from_u8(reader.u8()?)?,
-        amount: reader.f32()?,
-        offset_x: reader.f32()?,
-        offset_y: reader.f32()?,
-        color: Color(reader.u32()?),
-        color_operation: ColorFilterType::from_i32(i32::from(reader.u8()?))?,
-    })
-}
-
-fn write_transform_operation(writer: &mut TreeByteWriter, operation: &VisualAnimationTransformOperation) {
-    writer.u8(operation.kind as u8);
-    writer.u8(operation.values().len() as u8);
-    for value in operation.values() {
-        writer.f32(*value);
-    }
-}
-
-fn read_transform_operation(reader: &mut TreeByteReader<'_>) -> Option<VisualAnimationTransformOperation> {
-    let kind = FfiVisualAnimationTransformOperationKind::from_u8(reader.u8()?)?;
-    let value_count = usize::from(reader.u8()?);
-    if value_count > MAXIMUM_TRANSFORM_OPERATION_VALUE_COUNT {
-        return None;
-    }
-    let mut values = [0.0; MAXIMUM_TRANSFORM_OPERATION_VALUE_COUNT];
-    for value in &mut values[..value_count] {
-        *value = reader.f32()?;
-    }
-    VisualAnimationTransformOperation::new(kind, &values[..value_count])
-}
-
-fn write_keyframe(writer: &mut TreeByteWriter, keyframe: &VisualAnimationKeyframe) {
-    writer.f64(keyframe.offset);
-    write_easing(writer, &keyframe.easing);
-    match &keyframe.value {
-        VisualAnimationValue::Opacity(opacity) => writer.f32(*opacity),
-        VisualAnimationValue::BackgroundColor(color) => writer.u32(color.0),
-        VisualAnimationValue::Filter(functions) => {
-            writer.u32(functions.len() as u32);
-            for function in functions {
-                write_filter_function(writer, function);
-            }
-        }
-        VisualAnimationValue::Transform(operations) => {
-            writer.u32(operations.len() as u32);
-            for operation in operations {
-                write_transform_operation(writer, operation);
-            }
-        }
-    }
-}
-
-fn read_keyframe(
-    reader: &mut TreeByteReader<'_>,
-    target_kind: FfiVisualAnimationTargetKind,
-) -> Option<VisualAnimationKeyframe> {
-    let offset = reader.f64()?;
-    let easing = read_easing(reader)?;
-    let value = match target_kind {
-        FfiVisualAnimationTargetKind::Opacity => VisualAnimationValue::Opacity(reader.f32()?),
-        FfiVisualAnimationTargetKind::BackgroundColor => VisualAnimationValue::BackgroundColor(Color(reader.u32()?)),
-        FfiVisualAnimationTargetKind::Filter => {
-            let function_count = reader.u32()? as usize;
-            if function_count > reader.remaining() / SERIALIZED_FILTER_FUNCTION_SIZE {
-                return None;
-            }
-            let mut functions = Vec::with_capacity(function_count);
-            for _ in 0..function_count {
-                functions.push(read_filter_function(reader)?);
-            }
-            VisualAnimationValue::Filter(functions)
-        }
-        FfiVisualAnimationTargetKind::Transform => {
-            let operation_count = reader.u32()? as usize;
-            if operation_count > reader.remaining() / MINIMUM_SERIALIZED_TRANSFORM_OPERATION_SIZE {
-                return None;
-            }
-            let mut operations = Vec::with_capacity(operation_count);
-            for _ in 0..operation_count {
-                operations.push(read_transform_operation(reader)?);
-            }
-            VisualAnimationValue::Transform(operations)
-        }
-    };
-    Some(VisualAnimationKeyframe { offset, easing, value })
-}
-
-fn write_visual_animation(writer: &mut TreeByteWriter, animation: &VisualAnimation) {
-    writer.u8(animation.target_kind as u8);
-    writer.u32(animation.node_indices.len() as u32);
-    for &node_index in &animation.node_indices {
-        writer.u32(node_index);
-    }
-    writer.i64(animation.monotonic_time_at_anchor_ns);
-    writer.f64(animation.local_time_at_anchor_ms);
-    writer.f64(animation.playback_rate);
-    writer.f64(animation.start_delay_ms);
-    writer.f64(animation.iteration_duration_ms);
-    writer.f64(animation.iteration_count);
-    writer.f64(animation.iteration_start);
-    writer.u8(animation.playback_direction as u8);
-    writer.u8(animation.fill_mode as u8);
-    write_easing(writer, &animation.easing);
-    writer.u32(animation.keyframes.len() as u32);
-    for keyframe in &animation.keyframes {
-        write_keyframe(writer, keyframe);
-    }
-}
-
-fn read_visual_animation(reader: &mut TreeByteReader<'_>) -> Option<VisualAnimation> {
-    let target_kind = FfiVisualAnimationTargetKind::from_u8(reader.u8()?)?;
-    let node_index_count = reader.u32()? as usize;
-    if node_index_count > reader.remaining() / 4 {
-        return None;
-    }
-    let mut node_indices = Vec::with_capacity(node_index_count);
-    for _ in 0..node_index_count {
-        node_indices.push(reader.u32()?);
-    }
-    let monotonic_time_at_anchor_ns = reader.i64()?;
-    let local_time_at_anchor_ms = reader.f64()?;
-    let playback_rate = reader.f64()?;
-    let start_delay_ms = reader.f64()?;
-    let iteration_duration_ms = reader.f64()?;
-    let iteration_count = reader.f64()?;
-    let iteration_start = reader.f64()?;
-    let playback_direction = FfiVisualAnimationPlaybackDirection::from_u8(reader.u8()?)?;
-    let fill_mode = FfiVisualAnimationFillMode::from_u8(reader.u8()?)?;
-    let easing = read_easing(reader)?;
-    let keyframe_count = reader.u32()? as usize;
-    if keyframe_count > reader.remaining() / MINIMUM_SERIALIZED_KEYFRAME_SIZE {
-        return None;
-    }
-    let mut keyframes = Vec::with_capacity(keyframe_count);
-    for _ in 0..keyframe_count {
-        keyframes.push(read_keyframe(reader, target_kind)?);
-    }
-    Some(VisualAnimation {
-        target_kind,
-        node_indices,
-        monotonic_time_at_anchor_ns,
-        local_time_at_anchor_ms,
-        playback_rate,
-        start_delay_ms,
-        iteration_duration_ms,
-        iteration_count,
-        iteration_start,
-        playback_direction,
-        fill_mode,
-        easing,
-        keyframes,
-    })
-}
-
-impl VisualContextTree {
-    pub fn to_bytes(&self) -> Vec<u8> {
-        let mut writer = TreeByteWriter::default();
-        writer.u32(SERIALIZED_TREE_MAGIC);
-        writer.u32(SERIALIZED_TREE_FORMAT);
-        writer.u64(self.structural_epoch);
-        writer.effect_index(self.root_isolation_effect.unwrap_or(EffectNodeIndex::NONE));
-        writer.u32(self.spatial_nodes.len() as u32);
-        writer.u32(self.clip_nodes.len() as u32);
-        writer.u32(self.effect_nodes.len() as u32);
-        for node in &self.spatial_nodes {
-            writer.spatial_index(node.parent);
-            write_spatial_data(&mut writer, &node.data);
-        }
-        for node in &self.clip_nodes {
-            writer.clip_index(node.parent);
-            writer.spatial_index(node.spatial);
-            write_clip_data(&mut writer, &node.data);
-        }
-        for node in &self.effect_nodes {
-            writer.effect_index(node.parent);
-            writer.spatial_index(node.spatial);
-            writer.clip_index(node.local_clip);
-            write_effect_data(&mut writer, &node.data);
-        }
-        writer.u32(self.visual_animations.len() as u32);
-        for animation in self.visual_animations.iter() {
-            write_visual_animation(&mut writer, animation);
-        }
-        writer.bytes
-    }
-
-    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
-        let mut reader = TreeByteReader { bytes, position: 0 };
-        if reader.u32()? != SERIALIZED_TREE_MAGIC || reader.u32()? != SERIALIZED_TREE_FORMAT {
-            return None;
-        }
-        let structural_epoch = reader.u64()?;
-        let root_isolation_effect = reader.effect_index()?;
-        let spatial_count = reader.u32()? as usize;
-        let clip_count = reader.u32()? as usize;
-        let effect_count = reader.u32()? as usize;
-        if spatial_count == 0
-            || spatial_count > reader.remaining() / MINIMUM_SERIALIZED_SPATIAL_NODE_SIZE
-            || clip_count > reader.remaining() / MINIMUM_SERIALIZED_CLIP_NODE_SIZE
-            || effect_count > reader.remaining() / MINIMUM_SERIALIZED_EFFECT_NODE_SIZE
-        {
-            return None;
-        }
-
-        let mut spatial_nodes = Vec::with_capacity(spatial_count);
-        for _ in 0..spatial_count {
-            let parent = reader.spatial_index()?;
-            let data = read_spatial_data(&mut reader)?;
-            spatial_nodes.push(SpatialNode { data, parent });
-        }
-
-        let mut clip_nodes = Vec::with_capacity(clip_count);
-        for _ in 0..clip_count {
-            let parent = reader.clip_index()?;
-            let spatial = reader.spatial_index()?;
-            let data = read_clip_data(&mut reader)?;
-            clip_nodes.push(ClipNode::new(data, parent, spatial));
-        }
-
-        let mut effect_nodes = Vec::with_capacity(effect_count);
-        for _ in 0..effect_count {
-            let parent = reader.effect_index()?;
-            let spatial = reader.spatial_index()?;
-            let local_clip = reader.clip_index()?;
-            let data = read_effect_data(&mut reader)?;
-            effect_nodes.push(EffectNode {
-                data,
-                parent,
-                spatial,
-                local_clip,
-            });
-        }
-
-        let animation_count = reader.u32()? as usize;
-        if animation_count > reader.remaining() / MINIMUM_SERIALIZED_VISUAL_ANIMATION_SIZE {
-            return None;
-        }
-        let mut visual_animations = Vec::with_capacity(animation_count);
-        for _ in 0..animation_count {
-            visual_animations.push(read_visual_animation(&mut reader)?);
-        }
-
-        if reader.remaining() != 0 {
-            return None;
-        }
+        let clip_nodes = decoder.decode()?;
+        let effect_nodes = decoder.decode()?;
+        let visual_animations = decoder.decode::<Vec<VisualAnimation>>()?;
+        let compositor_scroll_table = decoder.decode::<CompositorScrollTable>()?;
 
         let mut tree = Self::from_nodes(
             spatial_nodes,
             clip_nodes,
             effect_nodes,
-            (!root_isolation_effect.is_none()).then_some(root_isolation_effect),
+            root_isolation_effect,
             structural_epoch,
         );
         if !tree.node_references_are_consistent() {
-            return None;
+            return Err(DecodeError::InvalidValue("VisualContextTree node references"));
         }
         // The bytes come from another process: an animation must be one the tree can sample, and
         // must name nodes of the kind it drives.
@@ -946,17 +282,56 @@ impl VisualContextTree {
             animation.is_valid()
                 && tree.visual_animation_targets_are_valid(animation.target_kind, &animation.node_indices)
         }) {
-            return None;
+            return Err(DecodeError::InvalidValue("VisualContextTree animations"));
         }
+        if !compositor_scroll_table.is_valid_for_tree(&tree) {
+            return Err(DecodeError::InvalidValue("VisualContextTree compositor scroll table"));
+        }
+        tree.set_compositor_scroll_table(compositor_scroll_table);
         tree.set_visual_animations(visual_animations);
-        Some(tree)
+        Ok(tree)
+    }
+}
+
+#[cfg(test)]
+impl VisualContextTree {
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut encoder = Encoder::new();
+        encoder.encode(self).expect("a visual context tree encodes");
+        encoder.finish().0
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, DecodeError> {
+        let mut decoder = Decoder::new(bytes, []);
+        let tree = decoder.decode()?;
+        if !decoder.is_at_end() {
+            return Err(DecodeError::InvalidValue("bytes after a VisualContextTree"));
+        }
+        Ok(tree)
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use super::super::{
+        AnchorScrollShift, BackdropFilterData, BackfaceVisibilityData, ClipData, ClipMode, CompositorScrollNodeKind,
+        CompositorScrollNodeRecord, CompositorSnapAreaRecord, CompositorSnapContainerRecord, EffectsData, MaskData,
+        MaskLayerOrigin, PerspectiveData, ScrollData, StickyData, TransformData, TransformDataRole,
+        scroll_state::NO_SCROLL_STATE_SLOT,
+    };
     use super::*;
-    use libgfx_rust::{perspective_matrix, translation_matrix};
+    use crate::animation_timing::{AnimationEffectTiming, FillMode, PlaybackDirection, TimeValue};
+    use crate::css_pixels::{CssPixels, FfiCssPixelPoint, FfiCssPixelRect};
+    use crate::display_list::commands::UniqueNodeId;
+    use crate::easing::{Easing, FfiLinearEasingPoint};
+    use crate::filter_bytes::{FfiFilterFunction, FfiFilterFunctionKind};
+    use crate::host::FfiVisualAnimationTargetKind;
+    use crate::node_slot_id::NodeSlotId;
+    use crate::visual_animation::{VisualAnimationKeyframe, VisualAnimationValue};
+    use libgfx_rust::{
+        Color, ColorFilterType, CompositingAndBlendingOperator, CornerRadii, CornerRadius, FloatMatrix4x4, FloatPoint,
+        FloatRect, FloatSize, IntRect, MaskKind, WindingRule, perspective_matrix, translation_matrix,
+    };
 
     fn transform(matrix: FloatMatrix4x4) -> TransformData {
         TransformData {
@@ -997,6 +372,7 @@ mod tests {
                 scroller: scroll_node,
                 parent_sticky: None,
                 position_relative_to_scroller: FloatPoint { x: 1.0, y: 100.0 },
+                border_box_origin: FloatPoint::default(),
                 border_box_size: FloatSize {
                     width: 800.0,
                     height: 50.0,
@@ -1012,6 +388,8 @@ mod tests {
                 inset_right: None,
                 inset_bottom: Some(2.5),
                 inset_left: None,
+                box_node_id: UniqueNodeId(41),
+                box_pseudo_element_type: 2,
                 state_slot: NO_SCROLL_STATE_SLOT,
                 owner_paintable: NodeSlotId::INVALID,
             }),
@@ -1022,6 +400,7 @@ mod tests {
                 scroller: scroll_node,
                 parent_sticky: Some(outer_sticky),
                 position_relative_to_scroller: FloatPoint { x: 0.0, y: 110.0 },
+                border_box_origin: FloatPoint::default(),
                 border_box_size: FloatSize {
                     width: 800.0,
                     height: 10.0,
@@ -1037,6 +416,8 @@ mod tests {
                 inset_right: Some(1.0),
                 inset_bottom: None,
                 inset_left: Some(3.0),
+                box_node_id: UniqueNodeId(0),
+                box_pseudo_element_type: 0,
                 state_slot: NO_SCROLL_STATE_SLOT,
                 owner_paintable: NodeSlotId::INVALID,
             }),
@@ -1156,12 +537,15 @@ mod tests {
                 monotonic_time_at_anchor_ns: 1_000_000,
                 local_time_at_anchor_ms: 2.5,
                 playback_rate: 1.5,
-                start_delay_ms: 3.0,
-                iteration_duration_ms: 400.0,
-                iteration_count: f64::INFINITY,
-                iteration_start: 0.25,
-                playback_direction: FfiVisualAnimationPlaybackDirection::Alternate,
-                fill_mode: FfiVisualAnimationFillMode::Backwards,
+                timing: AnimationEffectTiming {
+                    start_delay: TimeValue::milliseconds(3.0),
+                    iteration_duration: TimeValue::milliseconds(400.0),
+                    iteration_count: f64::INFINITY,
+                    iteration_start: 0.25,
+                    playback_direction: PlaybackDirection::Alternate,
+                    fill_mode: FillMode::Backwards,
+                    ..VisualAnimation::default().timing
+                },
                 easing: Easing::CubicBezier {
                     x1: 0.1,
                     y1: 0.2,
@@ -1184,8 +568,11 @@ mod tests {
             VisualAnimation {
                 target_kind: FfiVisualAnimationTargetKind::BackgroundColor,
                 node_indices: vec![background_color_animation.0],
-                iteration_duration_ms: 100.0,
-                iteration_count: 2.0,
+                timing: AnimationEffectTiming {
+                    iteration_duration: TimeValue::milliseconds(100.0),
+                    iteration_count: 2.0,
+                    ..VisualAnimation::default().timing
+                },
                 keyframes: vec![
                     animation_keyframe(
                         0.0,
@@ -1203,7 +590,10 @@ mod tests {
             VisualAnimation {
                 target_kind: FfiVisualAnimationTargetKind::Filter,
                 node_indices: vec![root_effect.0],
-                iteration_duration_ms: 100.0,
+                timing: AnimationEffectTiming {
+                    iteration_duration: TimeValue::milliseconds(100.0),
+                    ..VisualAnimation::default().timing
+                },
                 keyframes: vec![
                     animation_keyframe(0.0, Easing::default(), VisualAnimationValue::Filter(Vec::new())),
                     animation_keyframe(
@@ -1234,7 +624,10 @@ mod tests {
             VisualAnimation {
                 target_kind: FfiVisualAnimationTargetKind::Transform,
                 node_indices: vec![VISUAL_VIEWPORT_NODE_INDEX.0],
-                iteration_duration_ms: 100.0,
+                timing: AnimationEffectTiming {
+                    iteration_duration: TimeValue::milliseconds(100.0),
+                    ..VisualAnimation::default().timing
+                },
                 keyframes: vec![
                     animation_keyframe(0.0, Easing::default(), translate_and_rotate(0.0, 0.0, 0.0)),
                     animation_keyframe(1.0, Easing::default(), translate_and_rotate(1.0, 2.0, 3.0)),
@@ -1334,6 +727,301 @@ mod tests {
             assert!(effect_data_matches(&node.data, &other.data));
         }
         assert_eq!(a.visual_animations(), b.visual_animations());
+        assert_eq!(a.compositor_scroll_table(), b.compositor_scroll_table());
+    }
+
+    fn tree_with_compositor_scroll_table() -> VisualContextTree {
+        let mut tree = VisualContextTree::create(transform(FloatMatrix4x4::identity()));
+        let viewport = tree.append_spatial(
+            SpatialData::Scroll(ScrollData {
+                state_slot: NO_SCROLL_STATE_SLOT,
+                owner_paintable: NodeSlotId::INVALID,
+            }),
+            VISUAL_VIEWPORT_NODE_INDEX,
+        );
+        let nested = tree.append_spatial(
+            SpatialData::Scroll(ScrollData {
+                state_slot: NO_SCROLL_STATE_SLOT,
+                owner_paintable: NodeSlotId::INVALID,
+            }),
+            viewport,
+        );
+        let viewport_record = CompositorScrollNodeRecord {
+            scrollable_node_id: UniqueNodeId(17),
+            scroll_node_index: viewport,
+            parent_scroll_node_index: VISUAL_VIEWPORT_NODE_INDEX,
+            scrollport_rect: IntRect::new(0, 0, 800, 600),
+            min_scroll_offset: FloatPoint { x: -12.5, y: 0.0 },
+            max_scroll_offset: FloatPoint { x: 42.25, y: 1200.0 },
+            scroll_node_kind: CompositorScrollNodeKind::Viewport,
+            pseudo_element_type: 0,
+            is_viewport: true,
+            can_be_wheel_scrolled_horizontally: false,
+            can_be_wheel_scrolled_vertically: true,
+            chains_scroll_to_ancestors_horizontally: false,
+            chains_scroll_to_ancestors_vertically: true,
+            shows_overscroll_effect_horizontally: true,
+            shows_overscroll_effect_vertically: false,
+        };
+        tree.set_compositor_scroll_table(CompositorScrollTable {
+            nodes: vec![
+                viewport_record,
+                CompositorScrollNodeRecord {
+                    scrollable_node_id: UniqueNodeId(23),
+                    scroll_node_index: nested,
+                    parent_scroll_node_index: viewport,
+                    scrollport_rect: IntRect::new(10, 20, 200, 100),
+                    scroll_node_kind: CompositorScrollNodeKind::PseudoElement,
+                    pseudo_element_type: 1,
+                    is_viewport: false,
+                    ..viewport_record
+                },
+            ]
+            .into(),
+            snap_containers: vec![CompositorSnapContainerRecord {
+                scroll_node_index: nested,
+                snapport: FfiCssPixelRect {
+                    x: CssPixels::from_raw(1),
+                    y: CssPixels::from_integer(2),
+                    width: CssPixels::from_integer(200),
+                    height: CssPixels::from_integer(100),
+                },
+                min_scroll_offset: FfiCssPixelPoint {
+                    x: CssPixels::from_raw(-1),
+                    y: CssPixels::from_raw(-2),
+                },
+                max_scroll_offset: FfiCssPixelPoint {
+                    x: CssPixels::from_integer(10),
+                    y: CssPixels::from_integer(300),
+                },
+                strictness: 2,
+                snaps_x: false,
+                snaps_y: true,
+                horizontal_writing_mode: true,
+                first_area_index: 0,
+                area_count: 2,
+            }]
+            .into(),
+            snap_areas: vec![
+                CompositorSnapAreaRecord {
+                    area_node_id: UniqueNodeId(24),
+                    pseudo_element_type: 1,
+                    rect: FfiCssPixelRect {
+                        x: CssPixels::from_raw(-17),
+                        y: CssPixels::from_integer(30),
+                        width: CssPixels::from_integer(100),
+                        height: CssPixels::from_integer(50),
+                    },
+                    align_x: 1,
+                    align_y: 2,
+                    always_stop: true,
+                },
+                CompositorSnapAreaRecord {
+                    area_node_id: UniqueNodeId(25),
+                    pseudo_element_type: 0,
+                    rect: FfiCssPixelRect {
+                        x: CssPixels::from_integer(40),
+                        y: CssPixels::from_integer(200),
+                        width: CssPixels::from_integer(80),
+                        height: CssPixels::from_raw(2001),
+                    },
+                    align_x: 0,
+                    align_y: 3,
+                    always_stop: false,
+                },
+            ]
+            .into(),
+        });
+        tree
+    }
+
+    #[test]
+    fn compositor_scroll_table_round_trips() {
+        let tree = tree_with_compositor_scroll_table();
+        let bytes = tree.to_bytes();
+        let decoded = VisualContextTree::from_bytes(&bytes).expect("a scroll table decodes");
+        assert_trees_match(&tree, &decoded);
+        assert_eq!(decoded.to_bytes(), bytes);
+        let cloned = tree.clone();
+        assert!(std::sync::Arc::ptr_eq(
+            &tree.compositor_scroll_table.nodes,
+            &cloned.compositor_scroll_table.nodes
+        ));
+        assert!(std::sync::Arc::ptr_eq(
+            &tree.compositor_scroll_table.snap_containers,
+            &cloned.compositor_scroll_table.snap_containers
+        ));
+        assert!(std::sync::Arc::ptr_eq(
+            &tree.compositor_scroll_table.snap_areas,
+            &cloned.compositor_scroll_table.snap_areas
+        ));
+    }
+
+    #[test]
+    fn compositor_scroll_table_setter_changes_values_without_changing_structure() {
+        let mut tree = tree_with_compositor_scroll_table();
+        let original = tree.clone();
+        let epoch = tree.structural_epoch;
+        assert!(!tree.set_compositor_scroll_table(tree.compositor_scroll_table().clone()));
+        assert_eq!(tree.structural_epoch, epoch);
+        let mut changed = tree.compositor_scroll_table().clone();
+        std::sync::Arc::make_mut(&mut changed.nodes)[1].max_scroll_offset.y += 1.0;
+        assert!(tree.set_compositor_scroll_table(changed));
+        assert_eq!(tree.structural_epoch, epoch);
+        assert_eq!(tree.node_count(), original.node_count());
+        assert_eq!(tree.live_spatial_node_count(), original.live_spatial_node_count());
+        assert_eq!(tree.spatial_slots.free, original.spatial_slots.free);
+        for (node, other) in tree.spatial_nodes.iter().zip(&original.spatial_nodes) {
+            assert_eq!(node.parent, other.parent);
+            assert!(spatial_data_matches(&node.data, &other.data));
+        }
+        assert_ne!(tree.compositor_scroll_table(), original.compositor_scroll_table());
+    }
+
+    #[test]
+    fn invalid_compositor_scroll_table_references_and_ranges_are_rejected() {
+        let rejected = |change: fn(&mut VisualContextTree)| {
+            let mut tree = tree_with_compositor_scroll_table();
+            change(&mut tree);
+            assert!(tree.node_references_are_consistent());
+            assert!(VisualContextTree::from_bytes(&tree.to_bytes()).is_err());
+        };
+        rejected(|tree| {
+            std::sync::Arc::make_mut(&mut tree.compositor_scroll_table.nodes)[1].scroll_node_index =
+                SpatialNodeIndex(999)
+        });
+        rejected(|tree| {
+            std::sync::Arc::make_mut(&mut tree.compositor_scroll_table.nodes)[0].scroll_node_index =
+                VISUAL_VIEWPORT_NODE_INDEX
+        });
+        rejected(|tree| {
+            tree.spatial_nodes[2].parent = VISUAL_VIEWPORT_NODE_INDEX;
+            tree.spatial_nodes[1].data = SpatialData::Dead;
+        });
+        rejected(|tree| std::sync::Arc::make_mut(&mut tree.compositor_scroll_table.nodes).swap(0, 1));
+        rejected(|tree| {
+            std::sync::Arc::make_mut(&mut tree.compositor_scroll_table.nodes)[1].scroll_node_index = SpatialNodeIndex(1)
+        });
+        rejected(|tree| std::sync::Arc::make_mut(&mut tree.compositor_scroll_table.nodes)[1].is_viewport = true);
+        rejected(|tree| {
+            std::sync::Arc::make_mut(&mut tree.compositor_scroll_table.nodes)[1].parent_scroll_node_index =
+                SpatialNodeIndex(999)
+        });
+        rejected(|tree| {
+            std::sync::Arc::make_mut(&mut tree.compositor_scroll_table.nodes)[0].parent_scroll_node_index =
+                SpatialNodeIndex(2)
+        });
+        rejected(|tree| {
+            std::sync::Arc::make_mut(&mut tree.compositor_scroll_table.nodes)[1].parent_scroll_node_index =
+                SpatialNodeIndex(2)
+        });
+        rejected(|tree| {
+            let unlisted_scroll = tree.append_spatial(
+                SpatialData::Scroll(ScrollData {
+                    state_slot: NO_SCROLL_STATE_SLOT,
+                    owner_paintable: NodeSlotId::INVALID,
+                }),
+                VISUAL_VIEWPORT_NODE_INDEX,
+            );
+            std::sync::Arc::make_mut(&mut tree.compositor_scroll_table.snap_containers)[0].scroll_node_index =
+                unlisted_scroll;
+        });
+        rejected(|tree| std::sync::Arc::make_mut(&mut tree.compositor_scroll_table.snap_containers)[0].area_count = 3);
+        rejected(|tree| std::sync::Arc::make_mut(&mut tree.compositor_scroll_table.snap_containers)[0].area_count = 1);
+        rejected(|tree| {
+            std::sync::Arc::make_mut(&mut tree.compositor_scroll_table.snap_containers)[0].first_area_index = 1
+        });
+        rejected(|tree| {
+            std::sync::Arc::make_mut(&mut tree.compositor_scroll_table.snap_containers)[0].first_area_index = u32::MAX
+        });
+        rejected(|tree| {
+            let container = tree.compositor_scroll_table.snap_containers[0];
+            tree.compositor_scroll_table.snap_containers = vec![
+                CompositorSnapContainerRecord {
+                    scroll_node_index: SpatialNodeIndex(1),
+                    ..container
+                },
+                CompositorSnapContainerRecord {
+                    first_area_index: 1,
+                    area_count: 1,
+                    ..container
+                },
+            ]
+            .into();
+        });
+        rejected(|tree| {
+            let container = tree.compositor_scroll_table.snap_containers[0];
+            tree.compositor_scroll_table.snap_containers = vec![container, container].into();
+        });
+        rejected(|tree| {
+            let container = tree.compositor_scroll_table.snap_containers[0];
+            tree.compositor_scroll_table.snap_containers = vec![
+                container,
+                CompositorSnapContainerRecord {
+                    scroll_node_index: SpatialNodeIndex(1),
+                    first_area_index: 2,
+                    area_count: 0,
+                    ..container
+                },
+            ]
+            .into();
+        });
+        rejected(|tree| tree.compositor_scroll_table.snap_containers = Default::default());
+        rejected(|tree| std::sync::Arc::make_mut(&mut tree.compositor_scroll_table.snap_containers)[0].strictness = 3);
+        rejected(|tree| std::sync::Arc::make_mut(&mut tree.compositor_scroll_table.snap_areas)[0].align_x = 4);
+        rejected(|tree| std::sync::Arc::make_mut(&mut tree.compositor_scroll_table.snap_areas)[0].align_y = 4);
+        for value in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            for coordinate in 0..4 {
+                let mut tree = tree_with_compositor_scroll_table();
+                let node = &mut std::sync::Arc::make_mut(&mut tree.compositor_scroll_table.nodes)[0];
+                match coordinate {
+                    0 => node.min_scroll_offset.x = value,
+                    1 => node.min_scroll_offset.y = value,
+                    2 => node.max_scroll_offset.x = value,
+                    _ => node.max_scroll_offset.y = value,
+                }
+                assert!(VisualContextTree::from_bytes(&tree.to_bytes()).is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn malformed_compositor_scroll_table_bytes_are_rejected() {
+        let tree = tree_with_compositor_scroll_table();
+        let bytes = tree.to_bytes();
+        let mut without_table = tree.clone();
+        without_table.set_compositor_scroll_table(CompositorScrollTable::default());
+        let empty_bytes = without_table.to_bytes();
+        assert_eq!(&empty_bytes[empty_bytes.len() - 12..], &[0; 12]);
+        let section_start = empty_bytes.len() - 12;
+        for end in section_start..bytes.len() {
+            assert!(
+                VisualContextTree::from_bytes(&bytes[..end]).is_err(),
+                "truncation at {end} decoded"
+            );
+        }
+        let nodes_start = section_start + 4;
+        let container_count_offset = nodes_start + 2 * CompositorScrollNodeRecord::MIN_ENCODED_SIZE;
+        let container_start = container_count_offset + 4;
+        let area_count_offset = container_start + CompositorSnapContainerRecord::MIN_ENCODED_SIZE;
+        let area_start = area_count_offset + 4;
+        for offset in [section_start, container_count_offset, area_count_offset] {
+            let mut invalid = bytes.clone();
+            invalid[offset..offset + 4].copy_from_slice(&u32::MAX.to_ne_bytes());
+            assert!(VisualContextTree::from_bytes(&invalid).is_err());
+        }
+        for offset in std::iter::once(nodes_start + 48)
+            .chain((nodes_start + 50)..(nodes_start + 57))
+            .chain((container_start + 36)..(container_start + 40))
+            .chain((area_start + 25)..(area_start + 28))
+        {
+            let mut invalid = bytes.clone();
+            invalid[offset] = u8::MAX;
+            assert!(
+                VisualContextTree::from_bytes(&invalid).is_err(),
+                "invalid byte at {offset} decoded"
+            );
+        }
     }
 
     #[test]
@@ -1350,11 +1038,11 @@ mod tests {
     fn an_animation_that_cannot_be_sampled_is_rejected() {
         let tree = tree_with_every_node_kind();
         let valid = tree.visual_animations()[0].clone();
-        assert!(VisualContextTree::from_bytes(&with_animations(tree.clone(), vec![valid.clone()])).is_some());
+        assert!(VisualContextTree::from_bytes(&with_animations(tree.clone(), vec![valid.clone()])).is_ok());
 
         let rejected = |animation: VisualAnimation| {
             assert!(
-                VisualContextTree::from_bytes(&with_animations(tree.clone(), vec![animation.clone()])).is_none(),
+                VisualContextTree::from_bytes(&with_animations(tree.clone(), vec![animation.clone()])).is_err(),
                 "{animation:?} decoded"
             );
         };
@@ -1363,7 +1051,10 @@ mod tests {
             ..valid.clone()
         });
         rejected(VisualAnimation {
-            iteration_duration_ms: 0.0,
+            timing: AnimationEffectTiming {
+                iteration_duration: TimeValue::milliseconds(0.0),
+                ..valid.timing
+            },
             ..valid.clone()
         });
         rejected(VisualAnimation {
@@ -1392,7 +1083,7 @@ mod tests {
 
         let rejected = |animation: VisualAnimation| {
             assert!(
-                VisualContextTree::from_bytes(&with_animations(tree.clone(), vec![animation.clone()])).is_none(),
+                VisualContextTree::from_bytes(&with_animations(tree.clone(), vec![animation.clone()])).is_err(),
                 "{animation:?} decoded"
             );
         };
@@ -1427,10 +1118,13 @@ mod tests {
         let mut tree_without_animations = tree.clone();
         tree_without_animations.clear_visual_animations();
         // The target kind is the first byte after the animation count.
-        let animation_start = tree_without_animations.to_bytes().len() + 4;
+        let animation_start = tree_without_animations.to_bytes().len() - 12;
         assert_eq!(bytes[animation_start], FfiVisualAnimationTargetKind::Opacity as u8);
         bytes[animation_start] = 4;
-        assert!(VisualContextTree::from_bytes(&bytes).is_none());
+        assert_eq!(
+            VisualContextTree::from_bytes(&bytes).err(),
+            Some(DecodeError::InvalidValue("FfiVisualAnimationTargetKind"))
+        );
     }
 
     #[test]
@@ -1501,14 +1195,14 @@ mod tests {
                 flattens_inherited_transform: false,
             })
         });
-        assert!(VisualContextTree::from_bytes(&encode_tree(&plane_root)).is_none());
+        assert!(VisualContextTree::from_bytes(&encode_tree(&plane_root)).is_err());
         let sorting_root = tree_with_tombstoned_target(&|target| {
             SpatialData::Transform(TransformData {
                 sorting_context_root_index: Some(target),
                 ..transform(FloatMatrix4x4::identity())
             })
         });
-        assert!(VisualContextTree::from_bytes(&encode_tree(&sorting_root)).is_none());
+        assert!(VisualContextTree::from_bytes(&encode_tree(&sorting_root)).is_err());
         let anchor = tree_with_tombstoned_target(&|target| {
             SpatialData::AnchorScrollShift(AnchorScrollShift {
                 scroll_node_index: target,
@@ -1517,7 +1211,7 @@ mod tests {
                 compensate_vertical_scroll: true,
             })
         });
-        assert!(VisualContextTree::from_bytes(&encode_tree(&anchor)).is_none());
+        assert!(VisualContextTree::from_bytes(&encode_tree(&anchor)).is_err());
         let scroller = tree_with_tombstoned_target(&|target| {
             SpatialData::Sticky(StickyData::unconstrained(
                 target,
@@ -1526,7 +1220,7 @@ mod tests {
                 NodeSlotId::INVALID,
             ))
         });
-        assert!(VisualContextTree::from_bytes(&encode_tree(&scroller)).is_none());
+        assert!(VisualContextTree::from_bytes(&encode_tree(&scroller)).is_err());
     }
 
     #[test]
@@ -1538,7 +1232,7 @@ mod tests {
         );
         child_under_tombstone.append_spatial(SpatialData::Transform(transform(FloatMatrix4x4::identity())), parent);
         assert!(child_under_tombstone.tombstone_spatial_slot(parent));
-        assert!(VisualContextTree::from_bytes(&encode_tree(&child_under_tombstone)).is_none());
+        assert!(VisualContextTree::from_bytes(&encode_tree(&child_under_tombstone)).is_err());
 
         let effects = || {
             EffectNodeData::Effects(EffectsData {
@@ -1553,7 +1247,7 @@ mod tests {
         let fresh = || VisualContextTree::create(transform(FloatMatrix4x4::identity()));
         let rejected = |tree: &VisualContextTree| {
             assert!(!tree.node_references_are_consistent());
-            assert!(VisualContextTree::from_bytes(&encode_tree(tree)).is_none());
+            assert!(VisualContextTree::from_bytes(&encode_tree(tree)).is_err());
         };
 
         let mut effect_under_tombstone = fresh();
@@ -1620,7 +1314,7 @@ mod tests {
         let bytes = tree_with_every_node_kind().to_bytes();
         for length in 0..bytes.len() {
             assert!(
-                VisualContextTree::from_bytes(&bytes[..length]).is_none(),
+                VisualContextTree::from_bytes(&bytes[..length]).is_err(),
                 "a prefix of {length} bytes decoded"
             );
         }
@@ -1630,22 +1324,17 @@ mod tests {
     fn trailing_bytes_are_rejected() {
         let mut bytes = tree_with_every_node_kind().to_bytes();
         bytes.push(0);
-        assert!(VisualContextTree::from_bytes(&bytes).is_none());
-    }
-
-    #[test]
-    fn a_wrong_magic_or_format_is_rejected() {
-        let bytes = tree_with_every_node_kind().to_bytes();
-        let mut wrong_magic = bytes.clone();
-        wrong_magic[0] ^= 0xff;
-        assert!(VisualContextTree::from_bytes(&wrong_magic).is_none());
-        let mut wrong_format = bytes;
-        wrong_format[4] ^= 0xff;
-        assert!(VisualContextTree::from_bytes(&wrong_format).is_none());
+        assert!(VisualContextTree::from_bytes(&bytes).is_err());
     }
 
     fn encode_tree(tree: &VisualContextTree) -> Vec<u8> {
         tree.to_bytes()
+    }
+
+    fn encoded_size<T: Encode>(value: &T) -> usize {
+        let mut encoder = Encoder::new();
+        encoder.encode(value).unwrap();
+        encoder.finish().0.len()
     }
 
     fn hostile_tree() -> VisualContextTree {
@@ -1729,10 +1418,9 @@ mod tests {
         assert_eq!(decoded.clip_dependency_order(), vec![1, 0]);
         assert_eq!(decoded.effect_dependency_order(), vec![1, 0]);
         assert_eq!(
-            decoded.transform_rect_to_viewport(
+            super::super::WorldTransforms::new(&decoded, &[], None).transform_rect_to_viewport(
                 SpatialNodeIndex(1),
                 FloatRect::new(0.0, 0.0, 10.0, 10.0),
-                &[],
                 super::super::IncludeVisualViewportTransform::Yes
             ),
             FloatRect::new(5.0, 5.0, 10.0, 10.0)
@@ -1743,15 +1431,15 @@ mod tests {
     fn reference_cycles_self_references_and_wrong_kinds_are_rejected() {
         let mut parent_cycle = hostile_tree();
         parent_cycle.spatial_nodes[1].parent = SpatialNodeIndex(2);
-        assert!(VisualContextTree::from_bytes(&encode_tree(&parent_cycle)).is_none());
+        assert!(VisualContextTree::from_bytes(&encode_tree(&parent_cycle)).is_err());
 
         let mut self_parented = hostile_tree();
         self_parented.spatial_nodes[1].parent = SpatialNodeIndex(1);
-        assert!(VisualContextTree::from_bytes(&encode_tree(&self_parented)).is_none());
+        assert!(VisualContextTree::from_bytes(&encode_tree(&self_parented)).is_err());
 
         let mut root_with_a_parent = hostile_tree();
         root_with_a_parent.spatial_nodes[0].parent = SpatialNodeIndex(1);
-        assert!(VisualContextTree::from_bytes(&encode_tree(&root_with_a_parent)).is_none());
+        assert!(VisualContextTree::from_bytes(&encode_tree(&root_with_a_parent)).is_err());
 
         let mut sticky_parent_cycle = hostile_tree();
         sticky_parent_cycle.spatial_nodes[1] = SpatialNode {
@@ -1772,39 +1460,39 @@ mod tests {
             )),
             parent: VISUAL_VIEWPORT_NODE_INDEX,
         };
-        assert!(VisualContextTree::from_bytes(&encode_tree(&sticky_parent_cycle)).is_none());
+        assert!(VisualContextTree::from_bytes(&encode_tree(&sticky_parent_cycle)).is_err());
 
         let mut parent_out_of_range = hostile_tree();
         parent_out_of_range.spatial_nodes[1].parent = SpatialNodeIndex(7);
-        assert!(VisualContextTree::from_bytes(&encode_tree(&parent_out_of_range)).is_none());
+        assert!(VisualContextTree::from_bytes(&encode_tree(&parent_out_of_range)).is_err());
 
         let mut plane_root_out_of_range = hostile_tree();
         plane_root_out_of_range.spatial_nodes[1].data = SpatialData::BackfaceVisibility(BackfaceVisibilityData {
             plane_root_index: SpatialNodeIndex(9),
             flattens_inherited_transform: false,
         });
-        assert!(VisualContextTree::from_bytes(&encode_tree(&plane_root_out_of_range)).is_none());
+        assert!(VisualContextTree::from_bytes(&encode_tree(&plane_root_out_of_range)).is_err());
 
         let mut root_is_not_a_transform = hostile_tree();
         root_is_not_a_transform.spatial_nodes[0].data = SpatialData::Scroll(ScrollData {
             state_slot: NO_SCROLL_STATE_SLOT,
             owner_paintable: NodeSlotId::INVALID,
         });
-        assert!(VisualContextTree::from_bytes(&encode_tree(&root_is_not_a_transform)).is_none());
+        assert!(VisualContextTree::from_bytes(&encode_tree(&root_is_not_a_transform)).is_err());
 
         let mut sorting_root_cycle = hostile_tree();
         sorting_root_cycle.spatial_nodes[0].data = SpatialData::Transform(TransformData {
             sorting_context_root_index: Some(SpatialNodeIndex(1)),
             ..transform(FloatMatrix4x4::identity())
         });
-        assert!(VisualContextTree::from_bytes(&encode_tree(&sorting_root_cycle)).is_none());
+        assert!(VisualContextTree::from_bytes(&encode_tree(&sorting_root_cycle)).is_err());
 
         let mut sticky_scroller_is_not_a_scroll_node = hostile_tree();
         sticky_scroller_is_not_a_scroll_node.spatial_nodes[1].data = SpatialData::Perspective(PerspectiveData {
             matrix: FloatMatrix4x4::identity(),
             flattens_inherited_transform: false,
         });
-        assert!(VisualContextTree::from_bytes(&encode_tree(&sticky_scroller_is_not_a_scroll_node)).is_none());
+        assert!(VisualContextTree::from_bytes(&encode_tree(&sticky_scroller_is_not_a_scroll_node)).is_err());
 
         let mut sticky_parent_is_not_sticky = hostile_tree();
         sticky_parent_is_not_sticky.spatial_nodes[2].data = SpatialData::Sticky(StickyData::unconstrained(
@@ -1813,14 +1501,14 @@ mod tests {
             NO_SCROLL_STATE_SLOT,
             NodeSlotId::INVALID,
         ));
-        assert!(VisualContextTree::from_bytes(&encode_tree(&sticky_parent_is_not_sticky)).is_none());
+        assert!(VisualContextTree::from_bytes(&encode_tree(&sticky_parent_is_not_sticky)).is_err());
 
         let mut plane_root_cycle = hostile_tree();
         plane_root_cycle.spatial_nodes[1].data = SpatialData::BackfaceVisibility(BackfaceVisibilityData {
             plane_root_index: SpatialNodeIndex(2),
             flattens_inherited_transform: false,
         });
-        assert!(VisualContextTree::from_bytes(&encode_tree(&plane_root_cycle)).is_none());
+        assert!(VisualContextTree::from_bytes(&encode_tree(&plane_root_cycle)).is_err());
 
         let mut plane_root_on_another_branch = hostile_tree();
         plane_root_on_another_branch.spatial_nodes[2].parent = VISUAL_VIEWPORT_NODE_INDEX;
@@ -1828,14 +1516,14 @@ mod tests {
             plane_root_index: SpatialNodeIndex(1),
             flattens_inherited_transform: false,
         });
-        assert!(VisualContextTree::from_bytes(&encode_tree(&plane_root_on_another_branch)).is_none());
+        assert!(VisualContextTree::from_bytes(&encode_tree(&plane_root_on_another_branch)).is_err());
 
         let mut plane_root_on_the_root_path = hostile_tree();
         plane_root_on_the_root_path.spatial_nodes[2].data = SpatialData::BackfaceVisibility(BackfaceVisibilityData {
             plane_root_index: SpatialNodeIndex(1),
             flattens_inherited_transform: false,
         });
-        assert!(VisualContextTree::from_bytes(&encode_tree(&plane_root_on_the_root_path)).is_some());
+        assert!(VisualContextTree::from_bytes(&encode_tree(&plane_root_on_the_root_path)).is_ok());
 
         let mut anchor_node_names_itself = hostile_tree();
         anchor_node_names_itself.spatial_nodes[1].data = SpatialData::AnchorScrollShift(AnchorScrollShift {
@@ -1844,12 +1532,12 @@ mod tests {
             compensate_horizontal_scroll: true,
             compensate_vertical_scroll: true,
         });
-        assert!(VisualContextTree::from_bytes(&encode_tree(&anchor_node_names_itself)).is_none());
+        assert!(VisualContextTree::from_bytes(&encode_tree(&anchor_node_names_itself)).is_err());
     }
 
     #[test]
     fn clip_and_effect_reference_cycles_and_ranges_are_rejected() {
-        let rejected = |tree: &VisualContextTree| assert!(VisualContextTree::from_bytes(&encode_tree(tree)).is_none());
+        let rejected = |tree: &VisualContextTree| assert!(VisualContextTree::from_bytes(&encode_tree(tree)).is_err());
 
         let mut clip_parent_cycle = hostile_tree();
         clip_parent_cycle.clip_nodes[0].parent = ClipNodeIndex(1);
@@ -1900,43 +1588,44 @@ mod tests {
 
         let mut isolation_effect_at_the_root = hostile_tree();
         isolation_effect_at_the_root.root_isolation_effect = Some(EffectNodeIndex(0));
-        assert!(VisualContextTree::from_bytes(&encode_tree(&isolation_effect_at_the_root)).is_some());
+        assert!(VisualContextTree::from_bytes(&encode_tree(&isolation_effect_at_the_root)).is_ok());
     }
 
     #[test]
     fn out_of_range_discriminants_and_absurd_counts_are_rejected() {
         let tree = hostile_tree();
         let bytes = tree.to_bytes();
-        let header_size = 4 + 4 + 8 + 4 + 4 + 4 + 4;
-        let root_spatial_kind_offset = header_size + 4;
+        let count_size = size_of::<u32>();
+        let index_size = size_of::<u32>();
+        let spatial_count_offset = encoded_size(&tree.structural_epoch) + encoded_size(&tree.root_isolation_effect);
+        let clip_count_offset = spatial_count_offset + encoded_size(&tree.spatial_nodes);
+        let effect_count_offset = clip_count_offset + encoded_size(&tree.clip_nodes);
+
+        let root_spatial_kind_offset = spatial_count_offset + count_size + index_size;
         let mut bad_spatial_kind = bytes.clone();
         bad_spatial_kind[root_spatial_kind_offset] = 200;
-        assert!(VisualContextTree::from_bytes(&bad_spatial_kind).is_none());
+        assert_eq!(
+            VisualContextTree::from_bytes(&bad_spatial_kind).err(),
+            Some(DecodeError::InvalidValue("SpatialData"))
+        );
 
-        let count_offset = |slot: usize| header_size - 12 + slot * 4;
-        for slot in 0..3 {
+        for count_offset in [spatial_count_offset, clip_count_offset, effect_count_offset] {
             let mut absurd_count = bytes.clone();
-            absurd_count[count_offset(slot)..count_offset(slot) + 4].copy_from_slice(&u32::MAX.to_ne_bytes());
-            assert!(
-                VisualContextTree::from_bytes(&absurd_count).is_none(),
-                "an absurd count in slot {slot} decoded"
+            absurd_count[count_offset..count_offset + count_size].copy_from_slice(&u32::MAX.to_ne_bytes());
+            assert_eq!(
+                VisualContextTree::from_bytes(&absurd_count).err(),
+                Some(DecodeError::UnexpectedEnd),
+                "an absurd count at byte {count_offset} decoded"
             );
         }
 
-        // The first clip node starts right after the spatial nodes; its kind byte follows its
-        // parent and spatial indices.
-        let spatial_nodes_size = {
-            let mut probe = tree.clone();
-            probe.clip_nodes.clear();
-            probe.effect_nodes.clear();
-            probe.root_isolation_effect = None;
-            probe.clear_visual_animations();
-            let animation_count_size = 4;
-            probe.to_bytes().len() - header_size - animation_count_size
-        };
-        let first_clip_kind_offset = header_size + spatial_nodes_size + 4 + 4;
+        // A clip node's kind follows its parent and spatial indices.
+        let first_clip_kind_offset = clip_count_offset + count_size + 2 * index_size;
         let mut bad_clip_kind = bytes.clone();
         bad_clip_kind[first_clip_kind_offset] = 200;
-        assert!(VisualContextTree::from_bytes(&bad_clip_kind).is_none());
+        assert_eq!(
+            VisualContextTree::from_bytes(&bad_clip_kind).err(),
+            Some(DecodeError::InvalidValue("ClipNodeData"))
+        );
     }
 }

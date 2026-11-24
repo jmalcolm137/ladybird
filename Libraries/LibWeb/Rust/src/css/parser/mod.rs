@@ -5,6 +5,7 @@
  */
 
 pub(crate) mod arbitrary_substitution;
+pub(crate) mod block;
 pub(crate) mod calc_parser;
 pub(crate) mod color_parser;
 pub(crate) mod component_value;
@@ -12,10 +13,13 @@ pub(crate) mod descriptor_parser;
 pub(crate) mod fonts_parser;
 pub(crate) mod grid_parser;
 pub(crate) mod images_gradients_parser;
+pub(crate) mod lexer;
 #[cfg(test)]
 mod memory_tests;
 pub(crate) mod positions_shapes_parser;
 pub(crate) mod query_parser;
+pub(crate) mod rows;
+pub(crate) mod sheet_source_text;
 mod stylesheet_cache;
 pub(crate) mod syntax;
 pub(crate) mod syntax_parser;

@@ -37,11 +37,8 @@ pub struct FfiExistingTransition {
     pub reversing_shortening_factor: f64,
 }
 
-#[repr(C)]
+/// The target of a transition step.
 pub struct FfiTransitionInput {
-    /// The transitions the target holds, each for a different property.
-    pub existing_transitions: *const FfiExistingTransition,
-    pub existing_transition_count: usize,
     /// The target's style node.
     pub target_node: u32,
     /// The target's pseudo-element kind, or `u8::MAX` for an element.
@@ -733,11 +730,10 @@ fn same_custom_properties(
 /// A transition an element runs, as it stands at the time a step decides at: one the host runs, as the engine's
 /// description of its effect says, or one a lane's hover started, as the lane runs it.
 struct RunningTransitionAt {
-    /// The identity and generation of its effect, which a sample of it composes: the host's, or the lane's own.
-    identity: u64,
-    generation: u64,
+    /// The description of its effect, which a sample of it composes: the host's, or the lane's own.
+    description: std::sync::Arc<crate::css::style::effect_descriptions::EffectDescription>,
     /// The identity of the host's effect, where the host runs it.
-    host_identity: Option<u64>,
+    host_identity: Option<crate::animations::effect::AnimationEffectId>,
     property_id: u16,
     /// The key its keyframes are sampled at then, or none once it has ended.
     key: Option<f64>,
@@ -754,9 +750,6 @@ struct RunningTransitionAt {
     /// where a lane's hover started it.
     started_at: f64,
 }
-
-/// The key a published keyframe at 100% sits at: `KeyframeEffect::AnimationKeyFrameKeyScaleFactor` times 100.
-const FULL_KEY: f64 = 100.0 * 1000.0;
 
 /// The transitions the host runs on the element `node` names, as they stand at `at`, the time a step decides at, in
 /// the document timeline's milliseconds. The CSS animations the host runs on it are not among them: the ticks sample
@@ -775,14 +768,14 @@ fn host_transitions_at(
     effects
         .iter()
         .filter_map(|effect| {
-            if !effect.is_transition {
+            if !effect.is_transition() {
                 return None;
             }
-            let Some(timing) = effect.timing.clone() else {
+            let Some(timing) = effect.effect_timing() else {
                 return Some(Err("a transition the host has not sampled"));
             };
             // An idle transition, one with neither a start time nor a hold time, runs nothing.
-            if timing.timing.decidable && !timing.timing.has_start_time && !timing.timing.has_hold_time {
+            if timing.has_no_time() {
                 return None;
             }
             Some(host_transition_at(effect, timing, samples, at))
@@ -800,27 +793,23 @@ fn host_transition_at(
     samples: crate::css::style::animations::AnimationTimelineSamples<'_>,
     at: f64,
 ) -> Result<RunningTransitionAt, &'static str> {
-    if timing.timing.paused {
+    if timing.is_paused() {
         return Err("a paused transition");
     }
-    if timing.timing.playback_rate != 1.0 {
+    if timing.timing.playback().playback_rate != 1.0 {
         return Err("a transition that runs at another rate");
     }
-    let reversing = effect
-        .reversing
-        .as_ref()
-        .ok_or("a transition the host has not described")?;
+    let reversing = effect.reversing().ok_or("a transition the host has not described")?;
     let key = timing
         .key_at(samples)
-        .ok_or("a transition whose timing the engine cannot decide")?;
+        .ok_or("a transition on a timeline a tick does not move")?;
     let local_time = timing
         .local_time_at(samples)
-        .ok_or("a transition whose timing the engine cannot decide")?;
+        .ok_or("a transition on a timeline a tick does not move")?;
     let (property_id, start_value, end_value) =
         transition_values(effect).ok_or("a transition the host has not described")?;
     Ok(RunningTransitionAt {
-        identity: effect.identity,
-        generation: effect.generation,
+        description: effect.description().clone(),
         host_identity: Some(effect.identity),
         property_id,
         key,
@@ -840,16 +829,19 @@ fn host_transition_at(
 fn transition_values(
     effect: &crate::css::style::effect_descriptions::PublishedEffect,
 ) -> Option<(u16, *const StyleValueData, *const StyleValueData)> {
-    use crate::css::style::effect_descriptions::PublishedValue;
+    use crate::animations::keyframes::KeyframeValue;
     let [start, end] = effect.keyframes() else {
         return None;
     };
-    let value = |keyframe| match effect.declarations_of(keyframe) {
-        [declaration] => match &declaration.value {
-            PublishedValue::Declared(value) => Some((declaration.property_id, value.pointer())),
-            PublishedValue::ElementValue => None,
-        },
-        _ => None,
+    let value = |keyframe| {
+        let mut declarations = effect.declarations_of(keyframe);
+        match (declarations.next(), declarations.next()) {
+            (Some(declaration), None) => match &declaration.value {
+                KeyframeValue::Declared(value) => Some((declaration.property_id, value.pointer())),
+                KeyframeValue::ElementValue => None,
+            },
+            _ => None,
+        }
     };
     let (property_id, start_value) = value(start)?;
     let (end_property_id, end_value) = value(end)?;
@@ -981,7 +973,7 @@ impl RowTransitions {
                 end_value: transition.end_value,
                 reversing_adjusted_start_value: transition.reversing_adjusted_start_value,
                 // The output of the timing function of a running transition at the time of the style change event.
-                timing_function_output: transition.key.map_or(0.0, |key| key / FULL_KEY),
+                timing_function_output: transition.key.map_or(0.0, crate::animations::keyframes::offset_of_key),
                 reversing_shortening_factor: transition.reversing_shortening_factor,
             })
             .collect();
@@ -989,15 +981,11 @@ impl RowTransitions {
         // record the host installed holds them.
         let after_overlay = match (running.is_empty(), at) {
             (false, Some(at)) => {
-                use crate::css::animation::{FfiAnimationPreparationEffect, FfiSampledAnimationEffect};
                 let mut composed = crate::css::style_compute::SampledEffects::new();
                 for transition in &running {
                     if let Some(current_key) = transition.key {
-                        composed.push(FfiSampledAnimationEffect {
-                            effect: FfiAnimationPreparationEffect {
-                                identity: transition.identity,
-                                generation: transition.generation,
-                            },
+                        composed.push(crate::css::animation::SampledAnimationEffect {
+                            description: transition.description.clone(),
                             current_key,
                         });
                     }
@@ -1021,8 +1009,9 @@ impl RowTransitions {
         let ended: smallvec::SmallVec<[u16; 4]> = running
             .iter()
             .filter(|transition| {
-                let timing = &transition.timing.timing;
-                transition.key.is_none() && transition.local_time >= timing.start_delay + timing.iteration_duration
+                let timing = transition.timing.timing.effect();
+                transition.key.is_none()
+                    && transition.local_time >= timing.start_delay.value + timing.iteration_duration.value
             })
             .map(|transition| transition.property_id)
             .collect();
@@ -1057,10 +1046,10 @@ impl RowTransitions {
 #[derive(Clone, Default)]
 pub(crate) struct HostTransitionsSeen {
     /// Those a step ended as they ran, in place of which the host runs what the steps decided.
-    pub(crate) cancelled: smallvec::SmallVec<[u64; 2]>,
+    pub(crate) cancelled: smallvec::SmallVec<[crate::animations::effect::AnimationEffectId; 2]>,
     /// Every one a step decided beside, whether it ran then, ended by itself, or a step ended it: one the steps neither
     /// ended nor left running ended by itself.
-    pub(crate) seen: smallvec::SmallVec<[u64; 2]>,
+    pub(crate) seen: smallvec::SmallVec<[crate::animations::effect::AnimationEffectId; 2]>,
 }
 
 /// The transitions a lane's hover started on an element, which the lane runs in place of those the host runs on it,
@@ -1156,17 +1145,12 @@ impl FreshTransitionSample {
         after: &std::sync::Arc<crate::css::style::pipeline::Record>,
         actions: &[FfiTransitionAction],
     ) -> Option<Self> {
-        use crate::css::animation::{FfiAnimationPreparationEffect, FfiSampledAnimationEffect};
-
         let fresh = started_transition_effects(actions)?;
         let mut composed = crate::css::style_compute::SampledEffects::new();
         for effect in &fresh {
-            composed.push(FfiSampledAnimationEffect {
-                effect: FfiAnimationPreparationEffect {
-                    identity: effect.identity,
-                    generation: 0,
-                },
-                current_key: effect.timing.as_ref()?.key(Some(0.0))?,
+            composed.push(crate::css::animation::SampledAnimationEffect {
+                description: effect.description().clone(),
+                current_key: effect.key()?,
             });
         }
         if composed.is_empty() {
@@ -1214,35 +1198,23 @@ impl FreshTransitionSample {
         {
             return None;
         }
-        let effects = input.effects.as_slice();
+        let effects = &input.effects;
         if effects.len() != self.keys.len() {
             return None;
         }
-        let timings: Box<[_]> = effects
-            .iter()
-            .map(|effect| {
-                (
-                    effect.identity,
-                    crate::css::style::animations::EffectTiming {
-                        timing: effect.timing,
-                        // SAFETY: The host's easings are live for as long as its effects are borrowed.
-                        easing: unsafe { crate::css::easing::Easing::from_descriptor(&effect.easing) },
-                    },
-                )
-            })
-            .collect();
-        let samples_alike = timings
-            .iter()
-            .zip(effects)
-            .zip(&self.keys)
-            .all(|(((_, timing), effect), key)| {
-                timing
-                    .key(effect.current_key.into())
-                    .is_some_and(|host_key| host_key.to_bits() == key.to_bits())
-            });
+        let samples_alike = effects.iter().zip(&self.keys).all(|(effect, key)| {
+            effect
+                .timing
+                .key(effect.description.timing_function.as_easing())
+                .is_some_and(|sampled_key| sampled_key.to_bits() == key.to_bits())
+        });
         if !samples_alike {
             return None;
         }
+        let timings = effects
+            .iter()
+            .map(|effect| (effect.description.identity, effect.timing))
+            .collect();
         if self.result.outcome == crate::css::style_compute::FfiHostAnimationSampleOutcome::Evaluated {
             *host.overlay_for_mutation() = self.overlay;
         }
@@ -1270,16 +1242,16 @@ fn started_transition_effects(
         let easing = crate::css::style::effect_descriptions::easing_from_computed_timing_function(unsafe {
             &*action.timing_function
         })?;
-        let identity = effects.len() as u64 + 1;
+        let identity = crate::animations::effect::AnimationEffectId(effects.len() as u64 + 1);
         // SAFETY: The decision compared live values, which the records it decided over hold.
         let [start, end] = [action.start_value, action.end_value]
             .map(|value| unsafe { RetainedStyleValueData::from_retained_pointer(retain_style_value(value)) });
-        effects.push(PublishedEffect::transition(
+        effects.push(PublishedEffect::lane_transition(
             identity,
             action.property_id,
             start,
             end,
-            Some(started_transition_timing(action, easing)),
+            started_transition_timing(action, easing),
         ));
     }
     Some(effects)
@@ -1326,7 +1298,7 @@ struct HoverTransitionRun {
     /// The timing function it eases with, where a hover started it.
     timing_function: Option<crate::css::style_value::RetainedStyleValueData>,
     /// The identity of the host's effect, where the host runs it.
-    host_identity: Option<u64>,
+    host_identity: Option<crate::animations::effect::AnimationEffectId>,
     /// The time it started at, in the document timeline's milliseconds: that of the style change event that started it,
     /// where a hover started it.
     started_at: f64,
@@ -1337,35 +1309,27 @@ fn started_transition_timing(
     action: &FfiTransitionAction,
     easing: crate::css::easing::Easing,
 ) -> crate::css::style::animations::EffectTiming {
+    use crate::animations::snapshot::{CompactEffectTiming, EffectTimingSnapshot};
+    use crate::animations::timing::{
+        AnimationEffectTiming, AnimationPlayback, FillMode, OptionalTimeValue, PlaybackDirection, TimeValue,
+    };
     crate::css::style::animations::EffectTiming {
-        timing: crate::css::style_compute::FfiEffectTiming {
-            is_relevant: true,
-            is_removed: false,
-            decidable: true,
-            has_timeline_time: false,
-            has_timeline_origin_time: false,
-            has_timeline_scroller: false,
-            scroll_timeline: 0,
-            has_timeline_boundaries: false,
-            minimum_timeline_time: 0.0,
-            maximum_timeline_time: 0.0,
-            has_start_time: false,
-            has_hold_time: true,
-            paused: false,
-            // `Bindings::FillMode::Backwards` and `Bindings::PlaybackDirection::Normal`.
-            fill_mode: 2,
-            playback_direction: 0,
-            timeline_time: 0.0,
-            timeline_origin_time: 0.0,
-            start_time: 0.0,
-            hold_time: 0.0,
-            playback_rate: 1.0,
-            start_delay: action.delay,
-            end_delay: 0.0,
-            iteration_duration: action.active_duration,
-            iteration_count: 1.0,
-            iteration_start: 0.0,
-        },
+        timing: CompactEffectTiming::from(&EffectTimingSnapshot {
+            effect: AnimationEffectTiming {
+                start_delay: TimeValue::milliseconds(action.delay),
+                end_delay: TimeValue::milliseconds(0.0),
+                iteration_duration: TimeValue::milliseconds(action.active_duration),
+                iteration_start: 0.0,
+                iteration_count: 1.0,
+                fill_mode: FillMode::Backwards,
+                playback_direction: PlaybackDirection::Normal,
+            },
+            playback: AnimationPlayback {
+                hold_time: OptionalTimeValue::from(Some(TimeValue::milliseconds(0.0))),
+                ..AnimationPlayback::default()
+            },
+            ..EffectTimingSnapshot::default()
+        }),
         easing,
     }
 }
@@ -1396,7 +1360,7 @@ fn hover_transition_effects(
             .running
             .iter()
             .find(|transition| transition.property_id == action.property_id);
-        let identity = effects.len() as u64 + 1;
+        let identity = crate::animations::effect::AnimationEffectId(effects.len() as u64 + 1);
         match action.kind {
             Kind::None => {
                 // A running transition the step leaves runs on as it ran. So does one a hover started that has ended,
@@ -1405,13 +1369,14 @@ fn hover_transition_effects(
                     running.filter(|transition| transition.key.is_some() || transition.host_identity.is_none())
                 {
                     let mut timing = transition.timing.clone();
-                    timing.timing.has_hold_time = true;
-                    effects.push(PublishedEffect::transition(
+                    let hold_time = timing.timing.playback().hold_time.value;
+                    timing.timing.set_hold_time(Some(hold_time));
+                    effects.push(PublishedEffect::lane_transition(
                         identity,
                         action.property_id,
                         retain(transition.start_value).ok_or("a transition without values")?,
                         retain(transition.end_value).ok_or("a transition without values")?,
-                        Some(timing.clone()),
+                        timing.clone(),
                     ));
                     runs.push(HoverTransitionRun {
                         timing,
@@ -1435,12 +1400,12 @@ fn hover_transition_effects(
         })
         .ok_or("a timing function the engine cannot read")?;
         let timing = started_transition_timing(action, easing);
-        effects.push(PublishedEffect::transition(
+        effects.push(PublishedEffect::lane_transition(
             identity,
             action.property_id,
             retain(action.start_value).ok_or("a transition without values")?,
             retain(action.end_value).ok_or("a transition without values")?,
-            Some(timing.clone()),
+            timing.clone(),
         ));
         runs.push(HoverTransitionRun {
             timing,
@@ -1467,7 +1432,7 @@ unsafe impl Sync for HoverTransitions {}
 pub struct FfiLaneTransition {
     pub property_id: u16,
     /// The identity of the effect of the host's transition it is, which the host keeps, or 0 for one the lane started.
-    pub host_identity: u64,
+    pub host_identity: crate::animations::effect::AnimationEffectId,
     /// The time it started at, in the document timeline's milliseconds: that of the style change event that started it,
     /// where the lane started it, and where the lane took one the host runs to start, which the host takes in where its
     /// play is still pending.
@@ -1514,17 +1479,20 @@ impl HoverTransitions {
         if engine
             .element_animation_effects(node, 0)
             .iter()
-            .any(|effect| !effect.is_transition)
+            .any(|effect| !effect.is_transition())
         {
             return Err("transitions beside animations");
         }
         let duration = runs
             .iter()
-            .map(|run| run.timing.timing.start_delay + run.timing.timing.iteration_duration - run.local_time)
+            .map(|run| {
+                let timing = run.timing.timing.effect();
+                timing.start_delay.value + timing.iteration_duration.value - run.local_time
+            })
             .fold(0.0, f64::max);
         let properties = effects
             .iter()
-            .filter_map(|effect| effect.declarations_of(effect.keyframes().first()?).first())
+            .filter_map(|effect| effect.declarations_of(effect.keyframes().first()?).next())
             .map(|declaration| declaration.property_id)
             .collect();
         // A running transition of the host's the step leaves no run of ended with the step.
@@ -1569,13 +1537,12 @@ impl HoverTransitions {
                     transition_values(effect).ok_or("a transition without values")?;
                 let local_time = run.local_time + elapsed;
                 let mut timing = run.timing.clone();
-                timing.timing.hold_time = local_time;
+                timing.hold_at(local_time);
                 let key = timing
                     .key_at(Default::default())
-                    .ok_or("a transition whose timing the engine cannot decide")?;
+                    .expect("the host's samples move every timeline");
                 Ok(RunningTransitionAt {
-                    identity: effect.identity,
-                    generation: 0,
+                    description: effect.description().clone(),
                     host_identity: run.host_identity,
                     property_id,
                     key,
@@ -1601,10 +1568,10 @@ impl HoverTransitions {
             let (property_id, start_value, end_value) = transition_values(effect)?;
             Some(FfiLaneTransition {
                 property_id,
-                host_identity: run.host_identity.unwrap_or(0),
+                host_identity: run.host_identity.unwrap_or_default(),
                 start_time: run.started_at,
-                delay: run.timing.timing.start_delay,
-                duration: run.timing.timing.iteration_duration,
+                delay: run.timing.timing.effect().start_delay.value,
+                duration: run.timing.timing.effect().iteration_duration.value,
                 start_value,
                 end_value,
                 reversing_adjusted_start_value: run.reversing_adjusted_start_value.pointer(),
@@ -1667,20 +1634,19 @@ impl HoverTransitions {
         ),
         crate::css::style::engine_sample::NeedsHost,
     > {
-        use crate::css::animation::{FfiAnimationPreparationEffect, FfiSampledAnimationEffect};
         use crate::css::style::engine_sample::NeedsHost;
         let mut composed = crate::css::style_compute::SampledEffects::new();
         for (effect, run) in self.effects.iter().zip(&self.runs) {
             let mut timing = run.timing.clone();
-            timing.timing.hold_time = run.local_time + elapsed;
-            let Some(current_key) = timing.key_at(Default::default()).ok_or(NeedsHost)? else {
+            timing.hold_at(run.local_time + elapsed);
+            let Some(current_key) = timing
+                .key_at(Default::default())
+                .expect("the host's samples move every timeline")
+            else {
                 continue;
             };
-            composed.push(FfiSampledAnimationEffect {
-                effect: FfiAnimationPreparationEffect {
-                    identity: effect.identity,
-                    generation: 0,
-                },
+            composed.push(crate::css::animation::SampledAnimationEffect {
+                description: effect.description().clone(),
                 current_key,
             });
         }
@@ -1912,11 +1878,12 @@ mod tests {
                 timing_function: easing.pointer(),
             };
             let mut timing = started_transition_timing(&action, Default::default());
-            timing.timing.hold_time = local_time;
+            timing.hold_at(local_time);
             let running = if kind == Kind::None {
                 vec![RunningTransitionAt {
-                    identity: 1,
-                    generation: 0,
+                    description: std::sync::Arc::new(crate::css::style::effect_descriptions::EffectDescription::new(
+                        crate::animations::effect::AnimationEffectId(1),
+                    )),
                     host_identity: None,
                     property_id: action.property_id,
                     key: Some(key),
@@ -1950,12 +1917,12 @@ mod tests {
             let (effects, runs) = hover_transition_effects(&decision).unwrap();
             let published_timing = effects[0].timing.as_ref().unwrap();
             assert!(published_timing.implies_will_change(Default::default()));
-            assert_eq!(published_timing.timing, timing.timing);
+            assert_eq!(*published_timing, timing.timing);
             assert_eq!(runs[0].timing.timing, timing.timing);
             assert_eq!(runs[0].local_time, local_time);
             assert_eq!(runs[0].timing.key_at(Default::default()), Some(Some(key)));
             let mut sampled_timing = runs[0].timing.clone();
-            sampled_timing.timing.hold_time = local_time + 250.0;
+            sampled_timing.hold_at(local_time + 250.0);
             assert_eq!(sampled_timing.key_at(Default::default()), Some(Some(next_key)));
         }
     }

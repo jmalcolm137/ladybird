@@ -52,17 +52,18 @@
 #include <QMenuBar>
 #include <QMouseEvent>
 #include <QPainter>
+#include <QPainterPath>
 #include <QPlatformSurfaceEvent>
 #include <QPropertyAnimation>
 #include <QPushButton>
 #include <QScreen>
 #include <QShortcut>
+#include <QSurfaceFormat>
 #include <QTabBar>
 #include <QTimer>
 #include <QVBoxLayout>
 #include <QWheelEvent>
 #include <QWidget>
-#include <QWidgetAction>
 #include <QWindow>
 
 namespace Ladybird {
@@ -72,6 +73,7 @@ static constexpr auto TAB_CLOSE_BUTTON_POSITION = QTabBar::RightSide;
 static constexpr int LADYBIRD_MENU_WIDTH = 280;
 static constexpr int WINDOW_RESIZE_BORDER_WIDTH = 6;
 static constexpr int WINDOW_RESIZE_CORNER_WIDTH = WINDOW_RESIZE_BORDER_WIDTH * 2;
+static constexpr int WINDOW_CORNER_RADIUS = 6;
 static constexpr int MENU_BAR_LEADING_ROOM = 8;
 #if defined(AK_OS_MACOS)
 // NB: AppKit puts the traffic lights 10 px in, so they move this far to sit NATIVE_MACOS_WINDOW_CONTROLS_INSET in.
@@ -348,8 +350,6 @@ BrowserWindow::BrowserWindow(Vector<URL::URL> const& initial_urls, IsPopupWindow
     // NB: The toolbar is made before the rest of the window, so it learns of the session's downloads once it is all here.
     toolbar().update_downloads_button();
 
-    auto const& browser_options = Application::browser_options();
-
     // A restored window keeps the session row the store re-adopted for it.
     if (restored_session_window_id.has_value())
         m_session_window_id = restored_session_window_id;
@@ -362,8 +362,25 @@ BrowserWindow::BrowserWindow(Vector<URL::URL> const& initial_urls, IsPopupWindow
     setAttribute(Qt::WA_ContentsMarginsRespectsSafeArea, false);
 #else
     setWindowFlag(Qt::FramelessWindowHint, uses_client_side_decorations());
+
+    // Wayland uses the window mask for input only, so the corners also need a transparent background.
+    if (QGuiApplication::platformName().startsWith("wayland"))
+        setAttribute(Qt::WA_TranslucentBackground);
 #endif
-    setAttribute(Qt::WA_OpaquePaintEvent);
+    setAttribute(Qt::WA_OpaquePaintEvent, !testAttribute(Qt::WA_TranslucentBackground));
+#if defined(AK_OS_MACOS)
+    // NB: Qt would otherwise keep up to three window-sized surfaces for this window, and copy each whole surface from
+    //     the previous one, while the page's own layer covers nearly all of them. With one surface, Qt repaints what
+    //     the window server is reading, so the chrome above the page is shown from snapshots of the surface.
+    setAttribute(Qt::WA_NativeWindow);
+    auto surface_format = windowHandle()->format();
+    surface_format.setSwapBehavior(QSurfaceFormat::SingleBuffer);
+    windowHandle()->setFormat(surface_format);
+    m_window_chrome_snapshots.emplace(*this, [this] {
+        auto* tab = current_tab();
+        return tab && tab->view().isVisible() ? tab->view().mapTo(this, QPoint {}).y() : 0;
+    });
+#endif
     setWindowIcon(app_icon(is_private));
     qApp->installEventFilter(this);
     update_window_border();
@@ -378,7 +395,7 @@ BrowserWindow::BrowserWindow(Vector<URL::URL> const& initial_urls, IsPopupWindow
     };
     m_screen_observer->on_display_metadata_change = [this] {
         for_each_tab([this](auto& tab) {
-            tab.view().set_display_metadata(m_screen_observer->display_id(), m_screen_observer->refresh_rate());
+            tab.view().set_display_metadata(m_screen_observer->display_id(), m_screen_observer->refresh_rate(), m_screen_observer->screen_shows_high_dynamic_range());
         });
     };
 
@@ -450,7 +467,7 @@ BrowserWindow::BrowserWindow(Vector<URL::URL> const& initial_urls, IsPopupWindow
     if (m_current_tab)
         focus_widget_for_tab(*m_current_tab).setFocus();
 
-    if (browser_options.devtools_port.has_value())
+    if (Application::the().devtools_port().has_value())
         on_devtools_enabled();
 }
 
@@ -527,7 +544,6 @@ void BrowserWindow::initialize_ladybird_menu()
     m_ladybird_menu = new QMenu(this);
     m_ladybird_menu->setObjectName("LadybirdMenu");
     m_ladybird_menu->setMinimumWidth(LADYBIRD_MENU_WIDTH);
-    QObject::connect(m_ladybird_menu, &QMenu::aboutToShow, this, &BrowserWindow::update_ladybird_menu_zoom_level);
 
     m_ladybird_menu->addAction(application.new_tab_action());
     m_ladybird_menu->addAction(application.new_window_action());
@@ -558,7 +574,8 @@ void BrowserWindow::initialize_ladybird_menu()
     });
     m_ladybird_menu->addSeparator();
 
-    m_ladybird_menu->addAction(create_ladybird_menu_zoom_row());
+    m_ladybird_menu_zoom_row = new MenuZoomRow(*m_ladybird_menu, *application.zoom_out_action(), *application.reset_zoom_action(), *application.zoom_in_action(), toolbar().zoom_level_action());
+    m_ladybird_menu->addAction(m_ladybird_menu_zoom_row);
     m_ladybird_menu->addAction(application.find_in_page_action());
     m_ladybird_menu->addSeparator();
 
@@ -572,60 +589,6 @@ void BrowserWindow::initialize_ladybird_menu()
 #endif
 
     m_tabs_container->ladybird_button().setMenu(m_ladybird_menu);
-}
-
-// The menu's zoom row: its label like an item's, and the page's zoom level between buttons to zoom out and in.
-QAction* BrowserWindow::create_ladybird_menu_zoom_row()
-{
-    auto& application = Application::the();
-
-    auto* row = new QWidget(m_ladybird_menu);
-    row->setObjectName("LadybirdMenuZoomRow");
-    row->setStyleSheet(ChromeStyle::menu_zoom_row_style_sheet());
-    m_ladybird_menu_zoom_row = row;
-    auto* layout = new QHBoxLayout(row);
-    layout->setContentsMargins(10, 3, 10, 3);
-    layout->setSpacing(2);
-    layout->addWidget(new QLabel("Zoom", row), 1);
-
-    auto add_button = [&](char const* object_name, QString const& tooltip, QAction* action) {
-        auto* button = new QPushButton(row);
-        button->setObjectName(object_name);
-        button->setToolTip(tooltip);
-        button->setAccessibleName(tooltip);
-        button->setFocusPolicy(Qt::NoFocus);
-        QObject::connect(button, &QPushButton::clicked, action, &QAction::trigger);
-        QObject::connect(action, &QAction::triggered, this, &BrowserWindow::update_ladybird_menu_zoom_level);
-        layout->addWidget(button);
-        return button;
-    };
-    m_ladybird_menu_zoom_out = add_button("LadybirdMenuZoomButton", "Zoom Out", application.zoom_out_action());
-    m_ladybird_menu_zoom_level = add_button("LadybirdMenuZoomLevel", "Reset Zoom", application.reset_zoom_action());
-    // NB: The level is drawn in figures of one width, so it doesn't shift as it changes.
-    auto level_font = m_ladybird_menu_zoom_level->font();
-    level_font.setFeature(QFont::Tag("tnum"), 1);
-    m_ladybird_menu_zoom_level->setFont(level_font);
-    m_ladybird_menu_zoom_in = add_button("LadybirdMenuZoomButton", "Zoom In", application.zoom_in_action());
-    update_ladybird_menu_zoom_icons();
-
-    auto* action = new QWidgetAction(m_ladybird_menu);
-    action->setDefaultWidget(row);
-    return action;
-}
-
-void BrowserWindow::update_ladybird_menu_zoom_icons()
-{
-    if (!m_ladybird_menu_zoom_out || !m_ladybird_menu_zoom_in)
-        return;
-    m_ladybird_menu_zoom_out->setIcon(create_chrome_icon(ChromeIcon::ZoomOut, Theme::panel().body));
-    m_ladybird_menu_zoom_in->setIcon(create_chrome_icon(ChromeIcon::NewTab, Theme::panel().body));
-}
-
-void BrowserWindow::update_ladybird_menu_zoom_level()
-{
-    if (!m_current_tab || !m_ladybird_menu_zoom_level)
-        return;
-    m_ladybird_menu_zoom_level->setText(qformatted("{}%", round_to<int>(m_current_tab->view().zoom_level() * 100)));
 }
 
 enum class TabLayoutChoice : u8 {
@@ -718,7 +681,7 @@ void BrowserWindow::rebuild_bookmarks_menu()
 
 void BrowserWindow::on_devtools_enabled()
 {
-    m_devtools_banner->set_port(Application::browser_options().devtools_port.value_or(0));
+    m_devtools_banner->set_port(*Application::the().devtools_port());
     m_devtools_banner->show();
 }
 
@@ -812,7 +775,9 @@ Tab& BrowserWindow::create_restored_tab(RestoredSessionTab const& restored, int 
             .session_tab_id = restored.tab_id,
             .url = restored.url,
             .title = entry.has_value() && entry->title.has_value() ? qstring_from_ak_string(*entry->title) : qstring_from_ak_string(restored.url.serialize()),
-            .favicon = entry.has_value() && entry->favicon_png.has_value() ? icon_from_png(entry->favicon_png->bytes(), TAB_ICON_SIZE) : QIcon {},
+            .favicon = entry.has_value() && entry->favicon_png.has_value() ? favicon_from_png(entry->favicon_png->bytes(), TAB_ICON_SIZE) : QIcon {},
+            .history = {},
+            .discarded_tab_state_id = {},
         };
         auto* tab = new Tab(this, AK::move(deferred_tab));
         tab->set_pinned(restored.pinned);
@@ -938,7 +903,7 @@ void BrowserWindow::initialize_tab(Tab* tab)
 
     QObject::connect(tab, &Tab::title_changed, this, &BrowserWindow::tab_title_changed);
     QObject::connect(tab, &Tab::favicon_changed, this, &BrowserWindow::tab_favicon_changed);
-    QObject::connect(tab, &Tab::playing_audio_indicator_changed, this, &BrowserWindow::tab_playing_audio_indicator_changed);
+    QObject::connect(tab, &Tab::audio_state_changed, this, &BrowserWindow::tab_audio_state_changed);
     QObject::connect(tab, &Tab::microphone_in_use_changed, this, [this] {
         m_tabs_container->tab_bar()->update_microphone_indicators();
     });
@@ -975,10 +940,9 @@ void BrowserWindow::initialize_tab_view(Tab* tab)
             WindowConfiguration configuration {
                 .x = hints.screen_x.has_value() ? hints.screen_x : cascaded_configuration.x,
                 .y = hints.screen_y.has_value() ? hints.screen_y : cascaded_configuration.y,
-                .width = hints.width,
-                .height = hints.height,
             };
-            Application::the().new_window({}, configuration, IsPopupWindow::Yes, m_is_private, hub_view_id);
+            auto& window = Application::the().new_window({}, configuration, IsPopupWindow::Yes, m_is_private, hub_view_id);
+            window.place_popup_window(hints, *screen());
             return;
         }
         create_new_tab(activate_tab, hub_view_id);
@@ -1028,7 +992,7 @@ void BrowserWindow::adopt_tab(Tab& tab, int index)
 
     if (tab.is_loaded()) {
         tab.view().set_device_pixel_ratio(m_screen_observer->device_pixel_ratio());
-        tab.view().set_display_metadata(m_screen_observer->display_id(), m_screen_observer->refresh_rate());
+        tab.view().set_display_metadata(m_screen_observer->display_id(), m_screen_observer->refresh_rate(), m_screen_observer->screen_shows_high_dynamic_range());
     }
 
     m_tabs_container->set_current_tab(&tab);
@@ -1120,6 +1084,7 @@ void BrowserWindow::set_current_tab(Tab* tab)
     if (m_current_tab) {
         m_current_tab->close_popovers();
         m_current_tab->view().set_system_visibility_state(Web::HTML::VisibilityState::Hidden);
+        m_current_tab->view().set_current_tab_of_window(false);
     }
 
     m_current_tab = tab;
@@ -1128,12 +1093,56 @@ void BrowserWindow::set_current_tab(Tab* tab)
     if (m_current_tab) {
         m_current_tab->clear_attention();
         m_current_tab->view().set_system_visibility_state(Web::HTML::VisibilityState::Visible);
+        m_current_tab->view().set_current_tab_of_window(true);
 
         if (auto session_tab_id = m_current_tab->session_tab_id(); session_tab_id.has_value())
             session().active_tab_changed(*session_tab_id);
     }
 
+    reposition_page_cards();
     Application::the().report_active_view();
+}
+
+void BrowserWindow::show_page_card(PageCardSlot slot, QString const& title, QString const& text, Vector<PageCard::Button> buttons)
+{
+    auto& card = m_page_cards[to_underlying(slot)];
+    if (card)
+        card->deleteLater();
+    card = new PageCard(*m_tabs_container, title, text, AK::move(buttons));
+    QObject::connect(card, &QObject::destroyed, this, [this] {
+        QTimer::singleShot(0, this, [this] { reposition_page_cards(); });
+    });
+    if (m_page_cards_view)
+        m_page_cards_view->add_floating_surface(*card);
+    card->show();
+    // The shadow of a card follows where the card moves while it is shown, so the card only moves once it is.
+    reposition_page_cards();
+}
+
+// The cards stack from the top of the page down, in the order of their slots.
+void BrowserWindow::reposition_page_cards()
+{
+    static constexpr int CARD_SPACING = 10;
+
+    // The cards float over the page of the current tab alone.
+    auto* view = m_current_tab ? &m_current_tab->view() : nullptr;
+    if (m_page_cards_view != view) {
+        for (auto& card : m_page_cards) {
+            if (card && m_page_cards_view)
+                m_page_cards_view->remove_floating_surface(*card);
+            if (card && view)
+                view->add_floating_surface(*card);
+        }
+        m_page_cards_view = view;
+    }
+
+    int top_offset = 0;
+    for (auto& card : m_page_cards) {
+        if (!card || !view)
+            continue;
+        card->reposition(*view, top_offset);
+        top_offset += card->height() + CARD_SPACING;
+    }
 }
 
 void BrowserWindow::activate_tab(int index)
@@ -1190,6 +1199,67 @@ bool BrowserWindow::close_tab(int index, SessionStore::KeepForReopening keep_for
         close();
 
     return true;
+}
+
+// A discarded tab stands in the tab strip as one that a restored session hasn't loaded yet, which it is replaced with.
+// Closing the tab's view closes its pages, and so lets the processes that hosted them exit if they host nothing else.
+void BrowserWindow::discard_tab(Tab& tab)
+{
+    // NB: The Hub decides which tabs to discard. The user may have selected or pinned the tab while the request was on
+    //     its way, or its window may have stopped keeping its history, which the Hub learns of soon after. A tab that
+    //     reviews a report would lose the report, which only its page holds, and one with an unfinished edit of its
+    //     address would lose the edit.
+    auto index = tab_index(&tab);
+    if (index < 0 || &tab == m_current_tab || tab.is_pinned() || tab.is_in_report_review() || tab.location_edit_with_parked_editing()) {
+        tab.view().decline_discard();
+        return;
+    }
+    if (!tab.is_loaded() || !tab.session_tab_id().has_value()) {
+        dbgln("Unable to discard tab {}", tab.url());
+        if (tab.is_loaded())
+            tab.view().decline_discard();
+        return;
+    }
+
+    // NB: The Hub has the final say, as the tab may have started to do something the user would miss since it asked.
+    auto discarded_tab_state_id = tab.view().keep_state_for_discarding();
+    if (!discarded_tab_state_id.has_value())
+        return;
+
+    DeferredTab deferred_tab {
+        .session_tab_id = *tab.session_tab_id(),
+        .url = tab.url(),
+        .title = tab.title(),
+        .favicon = tab.favicon(),
+        .history = tab.view().session_history_snapshot(),
+        .discarded_tab_state_id = discarded_tab_state_id,
+    };
+    auto* discarded_tab = new Tab(this, AK::move(deferred_tab));
+    discarded_tab->set_needs_attention(tab.needs_attention());
+    // NB: The tab that stands in for the discarded one takes its place among the tabs that the window and other tabs
+    //     refer to, such as the background tabs opened from the current tab, which new ones open after.
+    for (auto& background_tab : m_background_tabs_from_current_tab) {
+        if (background_tab == &tab)
+            background_tab = discarded_tab;
+    }
+    for (int i = 0; i < m_tabs_container->count(); ++i) {
+        if (auto* other_tab = m_tabs_container->tab(i))
+            other_tab->did_replace_tab(tab, *discarded_tab);
+    }
+
+    // NB: The tab bar only hides a tab button that another takes the place of, and the old one refers to the old tab.
+    uninitialize_tab(&tab);
+    auto* tab_bar = m_tabs_container->tab_bar();
+    if (auto* close_button = tab_bar->tabButton(index, TAB_CLOSE_BUTTON_POSITION)) {
+        tab_bar->setTabButton(index, TAB_CLOSE_BUTTON_POSITION, nullptr);
+        close_button->deleteLater();
+    }
+
+    m_tabs_container->replace_tab(index, discarded_tab);
+    initialize_tab(discarded_tab);
+    tab_title_changed(index, discarded_tab->title());
+    tab_favicon_changed(index, discarded_tab->favicon());
+    tab.deleteLater();
 }
 
 void BrowserWindow::move_tab(int old_index, int new_index)
@@ -1302,11 +1372,6 @@ void BrowserWindow::request_to_close_tab(int index)
     tab->request_close();
 }
 
-void BrowserWindow::request_to_close_current_tab()
-{
-    request_to_close_tab(m_tabs_container->current_index());
-}
-
 int BrowserWindow::tab_index(Tab* tab)
 {
     return m_tabs_container->index_of(tab);
@@ -1340,8 +1405,7 @@ void BrowserWindow::update_chrome_style()
 {
     menuBar()->setStyleSheet(ChromeStyle::menu_bar_style_sheet(Theme::chrome_palette(*this)));
     if (m_ladybird_menu_zoom_row)
-        m_ladybird_menu_zoom_row->setStyleSheet(ChromeStyle::menu_zoom_row_style_sheet());
-    update_ladybird_menu_zoom_icons();
+        m_ladybird_menu_zoom_row->update_style();
 }
 
 TabBarButton* BrowserWindow::create_tab_close_button(Tab& tab)
@@ -1406,13 +1470,20 @@ void BrowserWindow::create_menu_bar_window_controls()
         m_menu_bar_minimize_window_button = window_control_buttons.minimize;
         m_menu_bar_maximize_window_button = window_control_buttons.maximize;
         m_menu_bar_close_window_button = window_control_buttons.close;
-        menuBar()->setCornerWidget(m_menu_bar_window_controls, Qt::TopRightCorner);
+        auto on_left = window_controls_on_left();
+        if (!on_left)
+            menuBar()->setCornerWidget(m_menu_bar_window_controls, Qt::TopRightCorner);
 
         // NB: A menu bar insets its corner widgets by its leading padding, so the room before the first menu comes from
         //     a corner widget of its own, and the window controls can reach the window's edge.
         auto* leading_room = new QWidget(menuBar());
         auto* leading_room_layout = new QHBoxLayout(leading_room);
-        leading_room_layout->setContentsMargins(MENU_BAR_LEADING_ROOM, 0, 0, 0);
+        leading_room_layout->setContentsMargins(on_left ? 0 : MENU_BAR_LEADING_ROOM, 0, 0, 0);
+        if (on_left) {
+            leading_room_layout->setSpacing(0);
+            leading_room_layout->addWidget(m_menu_bar_window_controls);
+            leading_room_layout->addSpacing(MENU_BAR_LEADING_ROOM);
+        }
         menuBar()->setCornerWidget(leading_room, Qt::TopLeftCorner);
 
         connect(m_menu_bar_minimize_window_button, &QToolButton::clicked, this, [this] {
@@ -1432,11 +1503,14 @@ void BrowserWindow::create_menu_bar_window_controls()
 void BrowserWindow::update_menu_bar_visibility()
 {
     auto show_menu_bar = show_menu_bar_option_available() && Application::settings().appearance().show_menu_bar;
-    menuBar()->setVisible(show_menu_bar);
 
+    // Update the controls first so the menu bar measures its corner widgets with the controls visible when shown.
     if (m_menu_bar_window_controls)
         m_menu_bar_window_controls->setVisible(show_menu_bar && uses_client_side_decorations());
-    // NB: A full-screen window has no window controls of its own on display, so the chrome leaves no room for them.
+
+    menuBar()->setVisible(show_menu_bar);
+
+    // A full-screen window has no window controls of its own on display, so the chrome leaves no room for them.
     m_tabs_container->set_window_controls_visible(!show_menu_bar && has_chrome_in_titlebar() && !isFullScreen());
 }
 
@@ -1450,6 +1524,16 @@ void BrowserWindow::update_menu_bar_window_control_icons()
     m_menu_bar_maximize_window_button->setIcon(create_chrome_icon(is_maximized ? ChromeIcon::WindowRestore : ChromeIcon::WindowMaximize, Theme::chrome_palette(*this)));
     m_menu_bar_maximize_window_button->setToolTip(is_maximized ? "Restore" : "Maximize");
     m_menu_bar_close_window_button->setIcon(create_chrome_icon(ChromeIcon::WindowClose, Theme::chrome_palette(*this)));
+}
+
+void BrowserWindow::window_control_buttons_changed()
+{
+    // A menu bar measures its corner widgets only when they are set, shown or hidden.
+    if (m_menu_bar_window_controls) {
+        for (auto corner : { Qt::TopLeftCorner, Qt::TopRightCorner })
+            menuBar()->setCornerWidget(menuBar()->cornerWidget(corner), corner);
+    }
+    m_tabs_container->window_control_buttons_changed();
 }
 
 void BrowserWindow::update_window_decoration_state()
@@ -1512,7 +1596,7 @@ void BrowserWindow::set_always_on_top(bool always_on_top)
         handle->setFlags(flags);
 }
 
-void BrowserWindow::tab_playing_audio_indicator_changed(int index)
+void BrowserWindow::tab_audio_state_changed(int index)
 {
     if (index < 0)
         return;
@@ -1529,10 +1613,11 @@ void BrowserWindow::update_tab_audio_button(Tab& tab)
 
     if (!tab.is_loaded() || (!shows_playing_audio && tab.view().page_mute_state() == Web::HTML::MuteState::Unmuted)) {
         // The tab bar only hides the button it lets go of.
-        if (auto* button = tab_bar->tabButton(index, AUDIO_STATE_BUTTON_POSITION))
+        if (auto* button = tab_bar->tabButton(index, AUDIO_STATE_BUTTON_POSITION)) {
             button->deleteLater();
-        tab_bar->setTabButton(index, AUDIO_STATE_BUTTON_POSITION, nullptr);
-        m_tabs_container->update_tab_button_visibility();
+            tab_bar->setTabButton(index, AUDIO_STATE_BUTTON_POSITION, nullptr);
+            m_tabs_container->update_tab_button_visibility();
+        }
         return;
     }
 
@@ -1540,9 +1625,8 @@ void BrowserWindow::update_tab_audio_button(Tab& tab)
     if (!button) {
         button = new TabBarButton(icon_for_page_mute_state(tab), TabBarButton::Role::Audio);
         button->setObjectName("LadybirdAudioState");
-        connect(button, &QPushButton::clicked, this, [this, &tab]() {
+        connect(button, &QPushButton::clicked, this, [&tab]() {
             tab.view().toggle_page_mute_state();
-            update_tab_audio_button(tab);
         });
         tab_bar->setTabButton(index, AUDIO_STATE_BUTTON_POSITION, button);
         m_tabs_container->update_tab_button_visibility();
@@ -1632,13 +1716,57 @@ void BrowserWindow::set_window_rect(Optional<Web::DevicePixels> x, Optional<Web:
     setGeometry(x.value().value(), y.value().value(), width.value().value(), height.value().value());
 }
 
+QRect BrowserWindow::rect_fitted_into(QRect rect, QRect const& bounds)
+{
+    rect.setSize(rect.size().boundedTo(bounds.size()));
+    rect.moveLeft(clamp(rect.left(), bounds.left(), bounds.right() - rect.width() + 1));
+    rect.moveTop(clamp(rect.top(), bounds.top(), bounds.bottom() - rect.height() + 1));
+    return rect;
+}
+
+void BrowserWindow::place_popup_window(Web::HTML::WebViewHints const& hints, QScreen const& opener_screen)
+{
+    // NB: The window must be shown, as Qt does not lay out a hidden window, so the size of the tab bar and toolbar is not
+    //     known before that.
+    VERIFY(isVisible());
+
+    // A page asks for the position of the window's frame, as that is the position it sees.
+    auto position = pos();
+    if (hints.screen_x.has_value())
+        position.setX(hints.screen_x->value());
+    if (hints.screen_y.has_value())
+        position.setY(hints.screen_y->value());
+
+    // NB: A Wayland compositor decides where a window goes and does not tell where that is. The window is then taken to
+    //     be on the screen of the window it was opened from.
+    static bool const is_wayland = QGuiApplication::platformName().startsWith(QStringLiteral("wayland"));
+    auto const* target_screen = is_wayland ? nullptr : QGuiApplication::screenAt(position);
+    if (!target_screen)
+        target_screen = &opener_screen;
+    auto available_geometry = target_screen->availableGeometry();
+
+    // A page asks for the size of its viewport, so the window is larger than that by the size of what is around the
+    // viewport. A size of 0 leaves the size of the window as it is.
+    auto size_around_viewport = size() - view().size();
+    auto frame_size = frameGeometry().size() - size();
+    auto window_size = size();
+    if (hints.width.has_value() && hints.width->value() > 0)
+        window_size.setWidth(min(hints.width->value(), available_geometry.width()) + size_around_viewport.width());
+    if (hints.height.has_value() && hints.height->value() > 0)
+        window_size.setHeight(min(hints.height->value(), available_geometry.height()) + size_around_viewport.height());
+    resize(window_size.boundedTo(available_geometry.size() - frame_size));
+
+    move(rect_fitted_into({ position, frameGeometry().size() }, available_geometry).topLeft());
+}
+
 void BrowserWindow::enter_fullscreen()
 {
     m_tabs_container->set_tab_bar_visible(false);
 
-    // NB: Only the full-screen state changes, so the window comes back maximized if it was. And a window the user
-    //     already made full screen stays so after the page leaves full screen.
+    // The window comes back in the state it had: A window the user already made full screen stays so after the page
+    // leaves full screen, and a maximized one is maximized again.
     m_window_was_fullscreen_before_page = isFullScreen();
+    m_window_was_maximized_before_page = isMaximized();
     setWindowState(windowState() | Qt::WindowFullScreen);
 
     m_tabs_container->update_bookmarks_bar_visibility();
@@ -1651,8 +1779,14 @@ void BrowserWindow::exit_fullscreen()
 
     m_tabs_container->set_tab_bar_visible(true);
 
-    if (!m_window_was_fullscreen_before_page)
-        setWindowState(windowState() & ~Qt::WindowFullScreen);
+    // A full-screen window is no longer maximized, so it has to ask to be maximized again. On macOS, the window is
+    // zoomed again as it leaves full screen, and asking for the normal state would then unzoom it.
+    if (!m_window_was_fullscreen_before_page) {
+        auto state = windowState() & ~Qt::WindowFullScreen;
+        if (m_window_was_maximized_before_page)
+            state |= Qt::WindowMaximized;
+        setWindowState(state);
+    }
 
     m_tabs_container->update_bookmarks_bar_visibility();
 }
@@ -1743,12 +1877,12 @@ bool BrowserWindow::eventFilter(QObject* object, QEvent* event)
 
     auto is_button = qobject_cast<QAbstractButton*>(object) != nullptr;
 
-    // The window controls run to the window's right edge. While the window can be resized, that edge still resizes it.
+    // The window controls run to the window's edge. While the window can be resized, that edge still resizes it.
     if (is_button && uses_client_side_decorations() && !isMaximized() && !isFullScreen()) {
         auto is_press = event->type() == QEvent::MouseButtonPress || event->type() == QEvent::MouseButtonDblClick;
         auto is_mouse_event = is_press || event->type() == QEvent::MouseMove;
         auto position = is_mouse_event ? widget->mapTo(this, static_cast<QMouseEvent*>(event)->position().toPoint()) : mapFromGlobal(QCursor::pos());
-        if (auto edges = resize_edges_for_position(position); edges.testFlag(Qt::RightEdge)) {
+        if (auto edges = resize_edges_for_position(position); edges & (Qt::LeftEdge | Qt::RightEdge)) {
             // NB: Even if the resize does not start, a press here must not reach the button and close the window.
             if (is_press) {
                 auto* handle = windowHandle();
@@ -1916,6 +2050,7 @@ void BrowserWindow::clear_resize_cursor()
 void BrowserWindow::resizeEvent(QResizeEvent* event)
 {
     QWidget::resizeEvent(event);
+    update_window_border();
 
     for_each_tab([&](auto& tab) {
         tab.view().set_window_size({ width(), height() });
@@ -1979,8 +2114,21 @@ bool BrowserWindow::should_draw_window_border() const
 
 void BrowserWindow::update_window_border()
 {
-    auto border_width = should_draw_window_border() ? 1 : 0;
-    setContentsMargins(border_width, border_width, border_width, border_width);
+    auto draw_border = should_draw_window_border();
+
+    // The rectangular contents must fit inside the inner edge of the rounded outline. Child widgets paint after us,
+    // and native page surfaces on Wayland are not clipped by the window mask.
+    auto contents_inset = draw_border ? qCeil(WINDOW_CORNER_RADIUS - ((WINDOW_CORNER_RADIUS - 1) / AK::sqrt(2.0))) : 0;
+    setContentsMargins(contents_inset, contents_inset, contents_inset, contents_inset);
+
+    if (draw_border) {
+        QPainterPath outline;
+        outline.addRoundedRect(QRectF(rect()), WINDOW_CORNER_RADIUS, WINDOW_CORNER_RADIUS);
+        setMask(QRegion(outline.toFillPolygon().toPolygon()));
+    } else {
+        clearMask();
+    }
+
     update();
 }
 
@@ -1988,16 +2136,22 @@ void BrowserWindow::paintEvent(QPaintEvent* event)
 {
     QMainWindow::paintEvent(event);
 
-    if (!should_draw_window_border())
-        return;
-
     QPainter painter(this);
+    if (!should_draw_window_border()) {
+#if !defined(AK_OS_MACOS)
+        painter.fillRect(rect(), palette().window());
+#endif
+        return;
+    }
+
+    if (testAttribute(Qt::WA_OpaquePaintEvent))
+        painter.fillRect(rect(), palette().window());
+    painter.setRenderHint(QPainter::Antialiasing);
+
     auto color = ChromeStyle::chrome_window_outline(Theme::chrome_palette(*this));
-    auto frame = rect();
-    painter.fillRect(QRect(frame.left(), frame.top(), frame.width(), 1), color);
-    painter.fillRect(QRect(frame.left(), frame.bottom(), frame.width(), 1), color);
-    painter.fillRect(QRect(frame.left(), frame.top(), 1, frame.height()), color);
-    painter.fillRect(QRect(frame.right(), frame.top(), 1, frame.height()), color);
+    painter.setPen(QPen(color, 1));
+    painter.setBrush(palette().window());
+    painter.drawRoundedRect(QRectF(rect()).adjusted(0.5, 0.5, -0.5, -0.5), WINDOW_CORNER_RADIUS - 0.5, WINDOW_CORNER_RADIUS - 0.5);
 }
 
 void BrowserWindow::moveEvent(QMoveEvent* event)
@@ -2122,8 +2276,9 @@ void BrowserWindow::bring_to_front()
 Tab* BrowserWindow::tab_for_view(RemoteView const& view) const
 {
     for (int index = 0; index < m_tabs_container->count(); ++index) {
+        // A restored tab that hasn't loaded yet has no view, so it can't be the tab of this one.
         auto* tab = m_tabs_container->tab(index);
-        if (tab && &tab->view() == &view)
+        if (tab && tab->is_loaded() && &tab->view() == &view)
             return tab;
     }
     return nullptr;

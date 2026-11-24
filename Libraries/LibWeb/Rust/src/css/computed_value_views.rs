@@ -79,7 +79,7 @@ impl LengthPercentageRef<'_> {
         };
         let ratio = crate::css::style_compute::LENGTH_UNIT_CANONICAL_PX_RATIOS[*unit as usize];
         assert!(ratio.is_finite(), "computed length is not absolute");
-        CssPixels::nearest_value_for(value * ratio)
+        CssPixels::truncated_value_for(f64::from((value * ratio) as f32))
     }
 
     /// Matches Percentage::as_fraction(); the multiplication order is
@@ -115,6 +115,24 @@ impl LengthPercentageRef<'_> {
                 })
             }
             _ => unreachable!("computed length-percentage holds a non-length-percentage style value"),
+        }
+    }
+
+    /// The percentage the value is, as a fraction, when it is a percentage or a calculation that simplified to one,
+    /// as `calc(10% + 15%)` does.
+    pub(crate) fn percentage_fraction(self) -> Option<f64> {
+        match self.value {
+            StyleValueData::Percentage { .. } => Some(self.as_fraction()),
+            StyleValueData::Calculated(calculated_payload) => {
+                let CalculatedPayload { rust_calculation, .. } = &**calculated_payload;
+                match rust_calculation.node() {
+                    crate::css::calc::CalcNode::Numeric(crate::css::calc::CalcNumericValue::Percentage(value)) => {
+                        Some(value * 0.01)
+                    }
+                    _ => None,
+                }
+            }
+            _ => None,
         }
     }
 
@@ -161,7 +179,7 @@ impl InlineLengthPercentage {
                 let ratio = crate::css::style_compute::LENGTH_UNIT_CANONICAL_PX_RATIOS[*unit as usize];
                 ratio
                     .is_finite()
-                    .then(|| Self::Length(CssPixels::nearest_value_for(value * ratio)))
+                    .then(|| Self::Length(CssPixels::truncated_value_for(f64::from((value * ratio) as f32))))
             }
             StyleValueData::Percentage { value } => {
                 let narrowed = *value as f32;
@@ -289,6 +307,16 @@ impl ComputedSize {
         self.value
             .length_percentage()
             .expect("computed length-percentage size lost its style value")
+    }
+
+    /// The percentage the size is, as a fraction, when it is a percentage or a calculation that simplified to one.
+    pub(crate) fn percentage_fraction(&self) -> Option<f64> {
+        match self.kind {
+            ComputedSizeKind::Percentage | ComputedSizeKind::Calculated => {
+                self.length_percentage().percentage_fraction()
+            }
+            _ => None,
+        }
     }
 
     /// The fit-content argument; None for the keyword-only form.
@@ -603,6 +631,7 @@ scalar_accessors! {
     misc_layout: {
         appearance: u8 => appearance,
         native_appearance_disabled: bool => native_appearance_disabled,
+        user_agent_margin_sides: u8 => user_agent_margin_sides,
         column_fill: u8 => column_fill,
         column_span: u8 => column_span,
         column_rule_style: u8 => column_rule_style,
@@ -644,11 +673,15 @@ scalar_accessors! {
     }
     alignment: {
         webkit_box_orient: u8 => webkit_box_orient,
+        webkit_box_align: u8 => webkit_box_align,
+        webkit_box_pack: u8 => webkit_box_pack,
         flex_direction: u8 => flex_direction,
         flex_wrap: u8 => flex_wrap,
         flex_grow: f64 => flex_grow,
         flex_shrink: f64 => flex_shrink,
         order: i32 => order,
+        webkit_box_ordinal_group: i32 => webkit_box_ordinal_group,
+        webkit_box_flex: f64 => webkit_box_flex,
         align_items: u8 => align_items,
         align_self: u8 => align_self,
         align_items_is_last_baseline: bool => align_items_is_last_baseline,
@@ -663,6 +696,7 @@ scalar_accessors! {
         align_self_overflow: u8 => align_self_overflow,
         justify_self_overflow: u8 => justify_self_overflow,
         align_content_overflow: u8 => align_content_overflow,
+        justify_content_overflow: u8 => justify_content_overflow,
         flex_basis_is_content: bool => flex_basis.is_content,
     }
 }
@@ -936,7 +970,7 @@ impl<'a> ComputedValuesView<'a> {
     }
 
     #[inline]
-    fn alignment(self) -> &'a AlignmentValues {
+    pub(crate) fn alignment(self) -> &'a AlignmentValues {
         self.native_group(group_index::ALIGNMENT)
     }
 
@@ -1044,6 +1078,16 @@ impl<'a> ComputedValuesView<'a> {
     #[inline]
     pub(crate) fn word_break(self) -> u8 {
         self.bit(StyleBitField::WordBreak)
+    }
+
+    #[inline]
+    pub(crate) fn text_align_last(self) -> u8 {
+        self.bit(StyleBitField::TextAlignLast)
+    }
+
+    #[inline]
+    pub(crate) fn hyphens(self) -> u8 {
+        self.bit(StyleBitField::Hyphens)
     }
 
     #[inline]
@@ -1283,6 +1327,34 @@ impl<'a> ComputedValuesView<'a> {
         )
     }
 
+    /// Whether this box's own style forces it to establish an independent formatting context even where it would
+    /// otherwise share one with its parent, as a subgrid does.
+    ///
+    /// https://drafts.csswg.org/css-grid-2/#subgrid-listing
+    /// If there is no parent grid, or if the grid container is otherwise forced to establish an independent formatting
+    /// context (for example, due to layout containment [CSS-CONTAIN-2] or absolute positioning [CSS-POSITION-3]), the
+    /// used value is the initial value, none, and the grid container is not a subgrid.
+    pub(crate) fn is_forced_to_establish_independent_formatting_context(self) -> bool {
+        if self.is_absolutely_positioned() {
+            return true;
+        }
+        let box_values = self.box_values();
+        // https://drafts.csswg.org/css-contain-2/#containment-types
+        // 1. The layout containment box establishes an independent formatting context.
+        // 4. The paint containment box establishes an independent formatting context.
+        let content_visibility_forces_containment =
+            self.misc_layout().content_visibility == crate::css::css_enums::content_visibility::AUTO;
+        if (box_values.layout_containment || box_values.paint_containment || content_visibility_forces_containment)
+            && containment_applies_to_principal_box(box_values.display)
+        {
+            return true;
+        }
+        // https://drafts.csswg.org/css-conditional-5/#valdef-container-type-size
+        // Applies style containment and size containment to the principal box, and establishes an independent
+        // formatting context.
+        box_values.is_size_container || box_values.is_inline_size_container
+    }
+
     // https://developer.mozilla.org/en-US/docs/Web/Guide/CSS/Block_formatting_context
     // The computed-style-only half of the block-formatting-context predicate;
     // node_creates_block_formatting_context adds the terms that need the node
@@ -1327,21 +1399,7 @@ impl<'a> ComputedValuesView<'a> {
             return true;
         }
 
-        // https://drafts.csswg.org/css-contain-2/#containment-types
-        // 1. The layout containment box establishes an independent formatting context.
-        // 4. The paint containment box establishes an independent formatting context.
-        let content_visibility_forces_containment =
-            self.misc_layout().content_visibility == crate::css::css_enums::content_visibility::AUTO;
-        if (box_values.layout_containment || box_values.paint_containment || content_visibility_forces_containment)
-            && containment_applies_to_principal_box(display)
-        {
-            return true;
-        }
-
-        // https://drafts.csswg.org/css-conditional-5/#valdef-container-type-size
-        // Applies style containment and size containment to the principal box, and establishes an independent
-        // formatting context.
-        if box_values.is_size_container || box_values.is_inline_size_container {
+        if self.is_forced_to_establish_independent_formatting_context() {
             return true;
         }
 

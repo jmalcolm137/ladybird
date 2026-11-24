@@ -20,6 +20,13 @@
 
 namespace WebView {
 
+struct DocumentStateLocalFileRoot {
+    Web::HTML::CrossProcessId document_state_id;
+    LocalFileRoot root;
+
+    bool operator==(DocumentStateLocalFileRoot const&) const = default;
+};
+
 inline constexpr size_t MAX_NESTED_HISTORY_DEPTH = 16;
 
 // NB: The UI process holds the traversable's session history, so that it survives WebContent process swaps and crash
@@ -46,7 +53,7 @@ public:
     size_t current_top_level_entry_index() const;
 
     bool initialize_for_testing(Vector<Web::HTML::SessionHistoryEntryDescriptor>, Vector<i32> used_steps, size_t current_used_step_index);
-    [[nodiscard]] ErrorOr<void> restore_from_ui_snapshot(Vector<Web::HTML::SessionHistoryEntryDescriptor> entries, Vector<i32> used_steps, size_t current_used_step_index, Function<Web::HTML::CrossProcessId()> allocate_cross_process_id);
+    [[nodiscard]] ErrorOr<void> restore_from_ui_snapshot(Vector<Web::HTML::SessionHistoryEntryDescriptor> entries, Vector<i32> used_steps, size_t current_used_step_index, Function<Web::HTML::CrossProcessId()> allocate_cross_process_id, Vector<DocumentStateLocalFileRoot> const& local_file_roots_of_document_states = {});
     Optional<i32> append_nested_history(CanonicalNavigable const& parent_navigable, CanonicalDocumentState& parent_document_state, Web::HTML::CrossProcessId child_navigable_id, NonnullRefPtr<CanonicalSessionHistoryEntry> history_entry);
     bool remove_nested_history(CanonicalNavigable const& parent_navigable, Web::HTML::CrossProcessId parent_document_state_id, Web::HTML::CrossProcessId child_navigable_id);
     void clear_the_forward_session_history();
@@ -58,13 +65,14 @@ public:
     bool replace_session_history_entry(CanonicalNavigable const&, CanonicalSessionHistoryEntry const& entry_to_replace, NonnullRefPtr<CanonicalSessionHistoryEntry>);
     void update_directive_state_value(Web::HTML::CrossProcessId, Optional<String>);
     Vector<Web::HTML::SessionHistoryEntryDescriptor> entries() const;
+    Vector<DocumentStateLocalFileRoot> local_file_roots_of_document_states() const;
     // https://html.spec.whatwg.org/multipage/browsing-the-web.html#getting-all-used-history-steps
     Vector<i32> used_steps() const;
 
     [[nodiscard]] bool has_only_top_level_used_steps() const;
     [[nodiscard]] Optional<TraversalTarget> traversal_target_for_step(i32 step) const;
     [[nodiscard]] Optional<Vector<NonnullRefPtr<CanonicalSessionHistoryEntry>> const&> get_session_history_entries(CanonicalNavigable const&) const;
-    [[nodiscard]] Optional<i32> get_the_used_step(i32 step) const;
+    [[nodiscard]] i32 get_the_used_step(i32 step) const;
     [[nodiscard]] CanonicalSessionHistoryEntry* get_the_target_history_entry(CanonicalNavigable const&, i32 step) const;
     [[nodiscard]] Web::HTML::HistoryObjectLengthAndIndex get_the_history_object_length_and_index(i32 step) const;
     [[nodiscard]] Optional<Vector<Web::HTML::SessionHistoryEntryDescriptor>> get_session_history_entries_for_the_navigation_api(CanonicalNavigable const&, i32 target_step) const;
@@ -94,6 +102,9 @@ struct SessionHistorySnapshot {
     Vector<Web::HTML::SessionHistoryEntryDescriptor> entries;
     Vector<i32> used_steps;
     size_t current_used_step_index { 0 };
+    // NB: The roots saved for document states that held local file content, used when a history step populates them
+    //     again. A renderer reports entries, but cannot supply these roots.
+    Vector<DocumentStateLocalFileRoot> local_file_roots_of_document_states;
 };
 
 WEBVIEW_API ErrorOr<void> validate_snapshot_is_restorable(Vector<Web::HTML::SessionHistoryEntryDescriptor> const& entries, Vector<i32> const& used_steps, size_t current_used_step_index);

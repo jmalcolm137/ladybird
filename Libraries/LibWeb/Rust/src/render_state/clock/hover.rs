@@ -14,17 +14,17 @@
 //! as it handles the move. The host hovers the move in its own state as it handles it, or as the lanes' report says.
 
 use super::{Lane, RenderState, TickRecording, WaitsForTickRecording};
+use crate::animations::snapshot::EffectTimingSnapshot;
 use crate::css::css_pixels::{CssPixelPoint, CssPixels};
 use crate::css::style::hover_lane::{HoverBoxRebuild, HoverInstall, hover_row_generated_for};
 use crate::css::style::style_job::SealedStyleInputs;
 use crate::css::style::tree::StyleNodeID;
-use crate::css::style_compute::FfiEffectTiming;
 use crate::layout::node_data::{NodeFlag, NodeKind, NodeSlotId};
 use crate::layout::tree_mutation::{HostCalls, OwedHostWork};
 use crate::painting::ffi::FfiChromeMetrics;
-use crate::painting::hit_test::{HitTestItemKind, HitTestList};
+use crate::painting::hit_test::HitTestItemKind;
+use crate::painting::hit_test::walk::{PointQuery, topmost_hit};
 use crate::painting::host::FfiHitTestQueryCallbacks;
-use crate::painting::record::PublishedHitTestItems;
 use crate::painting::visual_context::VisualContextTree;
 use crate::stage_thread::Riding;
 use libgfx_rust::FloatPoint;
@@ -34,18 +34,15 @@ use std::sync::Arc;
 #[repr(C)]
 pub struct FfiHoverPlanInputs {
     pub device_pixels_per_css_pixel: f64,
-    /// The scroll offsets of the frame the rendering update presented, in device pixels, by scroll frame.
-    pub scroll_offsets: *const libgfx_rust::FloatPoint,
-    pub scroll_offset_count: usize,
     pub chrome_metrics: FfiChromeMetrics,
     /// The cursor of the document's page, which the hover asks to show the cursor of what it hovers.
     pub page_cursor: FfiPageCursor,
     /// What tells the document's page the link the hover is over.
     pub link_reporter: FfiHoverLinkReporter,
     /// The timings the host runs the effects of elements on without sampling them, as the compositor runs them: the
-    /// element's style node, the effect's identity, and the timing, an `FfiEffectTiming`, by effect.
+    /// element's style node, the effect's identity, and the timing, an `EffectTimingSnapshot`, by effect.
     pub effect_timing_nodes: *const u32,
-    pub effect_timing_identities: *const u64,
+    pub effect_timing_identities: *const crate::animations::effect::AnimationEffectId,
     pub effect_timings: *const std::ffi::c_void,
     pub effect_timing_count: usize,
     /// Where a drag selecting text the lane may follow is anchored, if one runs: the style node of a text node or an
@@ -210,9 +207,15 @@ impl Drop for HoverLinkReporter {
     }
 }
 
+/// A frame paints the overlays of its stacking contexts, the scrollbars among them, which a hit test of what the
+/// frame shows finds.
+pub(super) const FRAMES_PAINT_OVERLAYS: bool = true;
+
 /// The immutable inputs needed to hit test the presented frame and resolve its predefined cursors.
 struct ReadOnlyHoverFrame {
     rows: crate::painting::published_frame::PublishedRows,
+    /// The row the frame's paint order starts at.
+    viewport: NodeSlotId,
     bound_rows: crate::layout::PublishedBoundRows,
     cursors: Arc<crate::css::style::hover_lane::HoverCursorFacts>,
     image_map_areas: crate::painting::image_map_areas::ImageMapAreaColumn,
@@ -235,26 +238,25 @@ pub(crate) struct HoverPlan {
     link_reporter: Option<HoverLinkReporter>,
     /// The timings the host runs effects on without sampling them, which the descriptions of their elements' effects
     /// hold from before: the step a hover decides over the transitions they run reads them.
-    effect_timings: Vec<(StyleNodeID, u64, FfiEffectTiming)>,
+    effect_timings: Vec<(
+        StyleNodeID,
+        crate::animations::effect::AnimationEffectId,
+        EffectTimingSnapshot,
+    )>,
     /// The drag selecting text the ticks show, until the button goes up.
     selection_drag: Option<super::selection::SelectionDrag>,
 }
 
 impl HoverPlan {
-    /// The plan `inputs` describes.
+    /// The plan `inputs` describes, with `scroll_offsets`, the scroll offsets of the frame the rendering update
+    /// presented, in device pixels, by scroll frame.
     ///
     /// # Safety
     ///
-    /// `inputs.scroll_offsets` must point at `inputs.scroll_offset_count` offsets, or be null, the effect timing
-    /// arrays at `inputs.effect_timing_count` entries each, or be null, `inputs.page_cursor` must name a live page
-    /// cursor, or none, and `inputs.link_reporter` a live link reporter, or none.
-    pub(crate) unsafe fn from_ffi(inputs: &FfiHoverPlanInputs) -> Self {
-        let scroll_offsets = if inputs.scroll_offsets.is_null() {
-            Vec::new()
-        } else {
-            // SAFETY: Guaranteed by the caller.
-            unsafe { ak::slice_from_raw_parts(inputs.scroll_offsets, inputs.scroll_offset_count) }.to_vec()
-        };
+    /// The effect timing arrays of `inputs` must point at `inputs.effect_timing_count` entries each, or be null,
+    /// `inputs.page_cursor` must name a live page cursor, or none, and `inputs.link_reporter` a live link reporter, or
+    /// none.
+    pub(crate) unsafe fn from_ffi(inputs: &FfiHoverPlanInputs, scroll_offsets: Vec<FloatPoint>) -> Self {
         let effect_timings = if inputs.effect_timing_count == 0 {
             Vec::new()
         } else {
@@ -264,7 +266,7 @@ impl HoverPlan {
                     ak::slice_from_raw_parts(inputs.effect_timing_nodes, inputs.effect_timing_count),
                     ak::slice_from_raw_parts(inputs.effect_timing_identities, inputs.effect_timing_count),
                     ak::slice_from_raw_parts(
-                        inputs.effect_timings.cast::<FfiEffectTiming>(),
+                        inputs.effect_timings.cast::<EffectTimingSnapshot>(),
                         inputs.effect_timing_count,
                     ),
                 )
@@ -351,12 +353,16 @@ impl HoverPlan {
                 .all(|&record| record == 0 || state.engine_ref().style_record_is_held(record)),
             "a row of a hover frame names a record nothing holds"
         );
+        // A hit test of the frame skips the boxes whose ink overflow the pointer misses.
+        state.arena.arena_mut().settle_ink_overflow();
+        let viewport = state.arena.arena().layout_root();
         let rows = state.arena.arena_mut().publish_rows();
         let style_records = state
             .engine_mut()
             .lease_hover_frame_style_records(rows.paint_nodes().clone());
         self.read_only_frame = Some(ReadOnlyHoverFrame {
             rows,
+            viewport,
             bound_rows: state.arena.arena_mut().bound_rows_mut().publish(),
             cursors: state.engine_mut().hover_cursor_facts(),
             image_map_areas: state.arena.arena().image_map_areas().clone(),
@@ -1319,9 +1325,7 @@ impl Lane {
             }
             let frame = plan.read_only_frame.as_ref()?;
             let tree = frame.visual_context.tree.as_ref()?;
-            let published = self.published_hit_test_items();
-            let published = published?;
-            if published.structural_epoch != tree.structural_epoch {
+            if self.structural_epoch_on_screen() != Some(tree.structural_epoch) {
                 return None;
             }
             // The screen shows the compositor's animations sampled at the frame's time, where the hit test finds them.
@@ -1335,21 +1339,27 @@ impl Lane {
             };
             let absolute_rects = std::cell::RefCell::default();
             let source = PaintSource::over_rows(&frame.rows, &absolute_rects);
-            let mut list = HitTestList {
-                items: Arc::clone(&published.items),
-                ..HitTestList::default()
-            };
-            list.build_spatial_indexes_if_needed();
             let offsets = self.scroll_offsets_on_screen(&source, &frame.visual_context, &plan);
             let callbacks =
                 FfiHitTestQueryCallbacks::sealed(plan.device_pixels_per_css_pixel, &offsets, plan.chrome_metrics);
+            let world = callbacks.build_world_transforms(tree);
+            let callbacks = callbacks.with_world_transforms(&world);
             let ratio = plan.device_pixels_per_css_pixel as f32;
             let point = CssPixelPoint::new(
                 CssPixels::nearest_value_for_f32(position.x / ratio),
                 CssPixels::nearest_value_for_f32(position.y / ratio),
             );
-            let hit = list.find_topmost_item(&source, tree, &callbacks, point)?;
-            let item = &list.items[hit.index];
+            let hit = topmost_hit(
+                &source,
+                PointQuery {
+                    tree,
+                    callbacks: &callbacks,
+                    viewport: frame.viewport,
+                    paint_overlay: FRAMES_PAINT_OVERLAYS,
+                    point,
+                },
+            )?;
+            let item = &hit.item;
             if item.kind == HitTestItemKind::ChromeWidget {
                 return None;
             }
@@ -1375,7 +1385,7 @@ impl Lane {
             if kind == NodeKind::ImageBox && frame.image_map_areas.has_areas(item.paintable) {
                 return None;
             }
-            let resolved = list.resolve_hit(&source, hit.index, hit.local_point);
+            let resolved = crate::painting::hit_test::resolve::resolve_hit(&source, &hit.item, hit.local_point);
             let target = if kind == NodeKind::Viewport {
                 plan.style.as_ref().map(|&(root, _)| root)
             } else {
@@ -1442,30 +1452,30 @@ impl Lane {
         }
     }
 
-    /// The hit-test items of the frame the lane presented last, which come back with its recording.
-    fn published_hit_test_items(&mut self) -> Option<Arc<PublishedHitTestItems>> {
+    /// The structural epoch of the visual context tree of the frame on screen, which comes back with the lane's
+    /// recording: the frame a tick presented last, or else the lane's own. None once the lane left a frame to the host.
+    fn structural_epoch_on_screen(&mut self) -> Option<u64> {
         let recorder = self.recording.0.take(WaitsForTickRecording(()));
-        let presented = recorder
-            .presented_hit_test_items
-            .clone()
-            .or_else(|| recorder.recorder.published_hit_test_items.clone());
+        let structural_epoch = recorder.structural_epoch_on_screen;
         self.recording = TickRecording(Riding::landed(recorder));
-        presented
+        structural_epoch
     }
 
-    /// The hit-test items of the frame the lane presented last, with the tree of visual contexts of `state` they name as
-    /// the screen shows them at `frame_time_nanoseconds`, or why a hit test cannot read them.
-    pub(super) fn presented_hit_test_items(
+    /// The tree of visual contexts of `state` as the screen shows it at `frame_time_nanoseconds`, where the frame on
+    /// screen was recorded against it, or why a hit test cannot place what the screen shows.
+    pub(super) fn tree_on_screen(
         &mut self,
         state: &RenderState,
         frame_time_nanoseconds: i64,
-    ) -> Result<(Arc<VisualContextTree>, Arc<PublishedHitTestItems>), &'static str> {
-        let published = self.published_hit_test_items().ok_or("no hit-test list")?;
+    ) -> Result<Arc<VisualContextTree>, &'static str> {
+        let structural_epoch_on_screen = self.structural_epoch_on_screen().ok_or("no frame on screen")?;
+        if state.arena.arena().has_boxes_removed_ahead_of_layout() {
+            return Err("boxes the host removed ahead of its layout");
+        }
         let visual_context = &state.arena.arena().paint_state().visual_context;
         let tree = visual_context.tree.clone().ok_or("no visual context tree")?;
-        // The items name the visual contexts of the tree they were recorded against, which a hit test of the host's may
-        // have built anew since without presenting it.
-        if published.structural_epoch != tree.structural_epoch {
+        // A hit test of the host's may have built the tree anew since without presenting it.
+        if structural_epoch_on_screen != tree.structural_epoch {
             return Err("visual contexts the frame does not show");
         }
         // The screen shows the compositor's animations sampled at the frame's time, where the hit test finds them.
@@ -1473,7 +1483,7 @@ impl Lane {
             true => Arc::new(tree.with_visual_animation_samples(frame_time_nanoseconds)),
             false => tree,
         };
-        Ok((tree, published))
+        Ok(tree)
     }
 
     /// Hit tests `position`, in device pixels, in the frame the lane presented last.
@@ -1484,27 +1494,35 @@ impl Lane {
         position: FloatPoint,
         frame_time_nanoseconds: i64,
     ) -> Result<HoverTarget, HoverDeclined> {
-        let (tree, published) = self
-            .presented_hit_test_items(state, frame_time_nanoseconds)
+        let tree = self
+            .tree_on_screen(state, frame_time_nanoseconds)
             .map_err(HoverDeclined::Unplaced)?;
+        // The walk skips the boxes whose ink overflow the pointer misses.
+        state.arena.arena_mut().settle_ink_overflow();
         let arena = state.arena.arena();
-        let mut list = HitTestList {
-            items: std::sync::Arc::clone(&published.items),
-            ..HitTestList::default()
-        };
-        list.build_spatial_indexes_if_needed();
         let scroll_offsets = self.scroll_offsets_on_screen(arena, &arena.paint_state().visual_context, plan);
         let callbacks =
             FfiHitTestQueryCallbacks::sealed(plan.device_pixels_per_css_pixel, &scroll_offsets, plan.chrome_metrics);
+        let world = callbacks.build_world_transforms(&tree);
+        let callbacks = callbacks.with_world_transforms(&world);
         let pixel_ratio = plan.device_pixels_per_css_pixel as f32;
         let point = CssPixelPoint::new(
             CssPixels::nearest_value_for_f32(position.x / pixel_ratio),
             CssPixels::nearest_value_for_f32(position.y / pixel_ratio),
         );
-        let Some(topmost) = list.find_topmost_item(arena, &tree, &callbacks, point) else {
+        let Some(topmost) = topmost_hit(
+            arena,
+            PointQuery {
+                tree: &tree,
+                callbacks: &callbacks,
+                viewport: arena.layout_root(),
+                paint_overlay: FRAMES_PAINT_OVERLAYS,
+                point,
+            },
+        ) else {
             return Ok(HoverTarget::Unchanged);
         };
-        let item = &list.items[topmost.index];
+        let item = &topmost.item;
         // A scrollbar or a resizer hovers nothing the host would hover without asking it.
         if item.kind == HitTestItemKind::ChromeWidget {
             return Err(HoverDeclined::Unmoved("a scrollbar or resizer"));
@@ -1538,7 +1556,7 @@ impl Lane {
         if paintable_kind == NodeKind::ImageBox && arena.image_map_areas().has_areas(paintable) {
             return Err(HoverDeclined::Unmoved("an image map"));
         }
-        let resolved = list.resolve_hit(arena, topmost.index, topmost.local_point);
+        let resolved = crate::painting::hit_test::resolve::resolve_hit(arena, item, topmost.local_point);
         let identity = if paintable_kind == NodeKind::Viewport {
             // The viewport stands for the document, and a hit that falls through to it hits the root element, the root
             // of the style updates the hover takes its own with. The cursor is the viewport's, as the host's is.
@@ -1692,36 +1710,6 @@ fn cursor_for_hit(state: &mut RenderState, hit: CursorHit) -> Option<u8> {
         cursor_predefined::AUTO => cursor_predefined::DEFAULT,
         predefined => predefined,
     })
-}
-
-/// Hands the clock lane `ticks` belong to where the pointer went: to `x`, `y` in device pixels where `has_position`,
-/// or out of the context, beside the mouse event with the input event id `input_event_id`, and answers what the lane
-/// wants next, as a `PointerAnswer`.
-///
-#[unsafe(no_mangle)]
-pub extern "C" fn clock_ticks_pointer_moved(
-    ticks: &super::ClockTicks,
-    has_position: bool,
-    x: f32,
-    y: f32,
-    buttons: u32,
-    scrolled_since_frame: bool,
-    input_event_id: u64,
-) -> u8 {
-    ticks.pointer_moved(PendingPointer {
-        position: has_position.then_some(FloatPoint { x, y }),
-        buttons,
-        scrolled_since_frame,
-        input_event_id,
-    }) as u8
-}
-
-/// Hands the clock lane `ticks` belong to that the pointer rests where the compositor's animations move what is under
-/// it, which the next tick hovers again in the frame as the screen shows it, and answers what the lane wants next, as a
-/// `PointerAnswer`.
-#[unsafe(no_mangle)]
-pub extern "C" fn clock_ticks_pointer_rests_on_moving_content(ticks: &super::ClockTicks) -> u8 {
-    ticks.pointer_rests_on_moving_content() as u8
 }
 
 /// Hands the clock lanes of `host`'s document that the pointer rests where the compositor's animations move what is

@@ -17,10 +17,17 @@
 #include <LibWeb/Fetch/Infrastructure/HTTP/MIME.h>
 #include <LibWeb/HTML/Parser/HTMLEncodingDetection.h>
 #include <LibWeb/HTML/Parser/RustFFI.h>
+#include <LibWeb/HTML/Parser/RustUtf16View.h>
 #include <LibWeb/HTMLTokenizerRustFFI.h>
 #include <LibWebCommon/Infra/CharacterTypes.h>
 
 namespace Web::HTML {
+
+extern "C" {
+
+// Called by Bindings/Rust/src/xhr/xml_http_request.rs.
+void web_html_get_an_xml_encoding(ReadonlyBytes input, void* label, void (*on_label)(void*, ReadonlyBytes));
+}
 
 static Utf16FlyString prescan_attribute_name(Utf16StringBuilder const& attribute_name)
 {
@@ -620,10 +627,19 @@ EncodingDeclarationPrescan::~EncodingDeclarationPrescan()
 EncodingDeclarationPrescan::Result EncodingDeclarationPrescan::scan(ReadonlyBytes bytes, bool input_complete)
 {
     auto result = rust_html_meta_charset_scanner_scan(m_scanner, bytes, input_complete, &m_encoding,
-        [](void* context, u8 const* value, size_t value_length, bool is_content) {
-            StringView value_view { value, value_length };
+        [](void* context, RustFfiHtmlUtf16View value, bool is_content) {
             auto& encoding = *static_cast<Optional<StringView>*>(context);
-            encoding = is_content ? extract_character_encoding_from_meta_element(ByteString { value_view }) : TextCodec::get_standardized_encoding(value_view);
+            // NB: The scanner reads bytes that haven't been decoded yet, so the value is a byte per code unit unless
+            //     a character reference put something else in it. An encoding label with such a code unit in it names
+            //     no encoding, but a content attribute may still have a charset next to one.
+            auto value_view = utf16_view_from_ffi(value);
+            if (is_content) {
+                encoding = extract_character_encoding_from_meta_element(MUST(value_view.to_byte_string()));
+            } else if (value_view.has_latin1_storage()) {
+                encoding = TextCodec::get_standardized_encoding(StringView { value_view.latin1_span() });
+            } else {
+                encoding = {};
+            }
             return encoding.has_value();
         });
 
@@ -740,6 +756,12 @@ EncodingSniffingResult sniff_encoding_after_prescan(DOM::Document& document, Rea
     //    In controlled environments or in environments where the encoding of documents can be prescribed (for example, for user agents intended for dedicated use in new
     //    networks), the comprehensive UTF-8 encoding is suggested.
     return { "UTF-8", EncodingConfidence::Tentative };
+}
+
+void web_html_get_an_xml_encoding(ReadonlyBytes input, void* label, void (*on_label)(void*, ReadonlyBytes))
+{
+    if (auto encoding = get_an_xml_encoding(input); encoding.has_value())
+        on_label(label, encoding->bytes());
 }
 
 }

@@ -7,10 +7,9 @@
 
 #include <AK/StringView.h>
 #include <AK/kmalloc.h>
+#include <LibURL/InternalURLs.h>
 #include <LibURL/URL.h>
-#include <LibWebView/Application.h>
 #include <LibWebView/URL.h>
-#include <UI/Qt/Application.h>
 #include <UI/Qt/Autocomplete.h>
 #include <UI/Qt/ChromeStyle.h>
 #include <UI/Qt/Icon.h>
@@ -18,7 +17,6 @@
 #include <UI/Qt/Menu.h>
 #include <UI/Qt/Motion.h>
 #include <UI/Qt/StringUtils.h>
-#include <UI/Qt/SuggestionProvider.h>
 #include <UI/Qt/SystemAppearance.h>
 #include <UI/Qt/Theme.h>
 
@@ -47,6 +45,26 @@ namespace Ladybird {
 
 static constexpr qreal LOCATION_BUTTON_RADIUS = 5;
 static constexpr int SITE_SETTINGS_KNOB_SLIDE_DURATION_MS = 240;
+
+// A button in the field looks pressed while the panel it opened is up. The property also selects that look in the style
+// sheet of the site settings button.
+static constexpr char const* PANEL_OPEN_PROPERTY = "panelOpen";
+
+// The popover or menu that a button in the field opened knows that button by this property.
+static constexpr char const* PANEL_BUTTON_PROPERTY = "ladybirdPanelButton";
+
+// A button in the field, or the "Not secure" pill in place of the site settings button, looks pressed for as long as
+// its panel is open.
+// NB: It is not a checkable button, as a click would toggle it on its own while the panel closes on that same press.
+static void set_panel_open(QToolButton& button, bool open)
+{
+    if (button.property(PANEL_OPEN_PROPERTY).toBool() == open)
+        return;
+    button.setProperty(PANEL_OPEN_PROPERTY, open);
+    button.style()->unpolish(&button);
+    button.style()->polish(&button);
+    button.update();
+}
 
 class LocationActionButton final : public QToolButton {
 public:
@@ -80,9 +98,10 @@ private:
         QPainter painter(this);
         painter.setRenderHint(QPainter::Antialiasing, true);
 
-        if (isDown() || underMouse()) {
+        auto looks_pressed = isDown() || property(PANEL_OPEN_PROPERTY).toBool();
+        if (looks_pressed || underMouse()) {
             painter.setPen(Qt::NoPen);
-            painter.setBrush(isDown() ? Theme::panel().pressed : Theme::chrome(*this).hover);
+            painter.setBrush(looks_pressed ? Theme::panel().pressed : Theme::chrome(*this).hover);
             painter.drawRoundedRect(QRectF(rect()), LOCATION_BUTTON_RADIUS, LOCATION_BUTTON_RADIUS);
         }
 
@@ -176,11 +195,16 @@ static int qstring_offset_for_byte_offset(String const& text, size_t byte_offset
     return static_cast<int>(qstring_from_ak_string(prefix).length());
 }
 
-// The field's content is inset more on its leading side than on its trailing side.
-static constexpr int LOCATION_LEADING_EDGE_MARGIN = 2;
+// The leading icon and the text start this far in from the field's leading edge, so the text stays in place, except
+// after the wider "Not secure" pill, which the text follows. The suggestion rows draw their icons and titles on the
+// same columns.
+static constexpr int LOCATION_LEADING_ICON_X = 10;
+static constexpr int LOCATION_TEXT_X = 36;
 static constexpr int LOCATION_TRAILING_EDGE_MARGIN = 3;
-// The text starts this far in when nothing comes before it. The style sheet pads the field by as much.
+// The style sheet pads the field by this much.
 static constexpr int LOCATION_TEXT_PADDING = 8;
+// NB: QLineEdit draws its text inside its 1 px border, its padding and its text margins, and 2 px further in.
+static constexpr int LOCATION_TEXT_MARGIN_FOR_TEXT_X = LOCATION_TEXT_X - 1 - LOCATION_TEXT_PADDING - 2;
 static constexpr int LOCATION_TRAILING_ITEM_GAP = 6;
 static constexpr int LOCATION_LEADING_ITEM_GAP = 6;
 static constexpr int LOCATION_TRAILING_ACTION_WIDTH = 24;
@@ -303,10 +327,11 @@ private:
     bool m_words_fit { true };
 };
 
-LocationEdit::LocationEdit(QWidget* parent, WebView::IsPrivate is_private)
+LocationEdit::LocationEdit(QWidget* parent, WebView::Settings& settings, NonnullOwnPtr<WebView::OmniboxSuggestionProvider> suggestion_provider)
     : NativeTextEditingLineEdit(parent)
-    , WebView::SettingsObserver(Application::settings())
-    , m_omnibox(make<SuggestionProvider>(is_private))
+    , WebView::SettingsObserver(settings)
+    , m_settings(settings)
+    , m_omnibox(AK::move(suggestion_provider))
     , m_autocomplete(new Autocomplete(this))
 {
     setObjectName("LadybirdLocationEdit");
@@ -347,7 +372,7 @@ LocationEdit::LocationEdit(QWidget* parent, WebView::IsPrivate is_private)
     m_trailing_action_button->setCursor(Qt::ArrowCursor);
     m_trailing_action_button->hide();
 
-    m_translate_button = new QToolButton(this);
+    m_translate_button = new LocationActionButton(this);
     m_translate_button->setObjectName("LadybirdLocationTranslate");
     m_translate_button->setToolButtonStyle(Qt::ToolButtonIconOnly);
     m_translate_button->setIconSize({ 16, 16 });
@@ -452,15 +477,20 @@ LocationEdit::LocationEdit(QWidget* parent, WebView::IsPrivate is_private)
 
     m_omnibox.on_suggestions_change = [this] {
         update_completion_title();
-        if (!m_omnibox.is_popup_visible()) {
+    };
+
+    m_omnibox.on_popup_change = [this] {
+        auto const& popup = m_omnibox.popup();
+        if (!popup.is_visible) {
             m_autocomplete->close();
             return;
         }
-        m_autocomplete->show_with_suggestions(m_omnibox.suggestions(), m_omnibox.selected_suggestion());
+        m_autocomplete->show_with_suggestions(popup.suggestions, popup.selected_suggestion);
     };
 
     m_omnibox.on_selection_change = [this] {
-        m_autocomplete->set_selected_suggestion(m_omnibox.selected_suggestion());
+        m_autocomplete->set_selected_suggestion(m_omnibox.popup().selected_suggestion);
+        update_location_icon();
     };
 
     m_omnibox.on_commit = [this](String const& input) {
@@ -474,7 +504,7 @@ LocationEdit::LocationEdit(QWidget* parent, WebView::IsPrivate is_private)
         auto ctrl_held = QApplication::keyboardModifiers() & Qt::ControlModifier;
         auto append_tld = ctrl_held ? WebView::AppendTLD::Yes : WebView::AppendTLD::No;
 
-        auto url = WebView::sanitize_url(input, Application::settings().search_engine_settings().engine, append_tld);
+        auto url = WebView::url_for_omnibox_destination(input, destination_kind, m_settings.search_engine_settings().engine, append_tld);
         auto classified_input = WebView::classify_user_input(input, append_tld);
         if (destination_kind == WebView::OmniboxDestinationKind::Search
             || classified_input.classification != WebView::UserInputClassification::ExternalURL)
@@ -553,6 +583,25 @@ void LocationEdit::follow_site_settings_popover(QWidget& popover)
     popover.installEventFilter(this);
 }
 
+static void follow_panel(LocationEdit& edit, QWidget& panel, QToolButton& button)
+{
+    if (panel.property(PANEL_BUTTON_PROPERTY).value<QObject*>() == &button)
+        return;
+    panel.setProperty(PANEL_BUTTON_PROPERTY, QVariant::fromValue<QObject*>(&button));
+    panel.installEventFilter(&edit);
+    set_panel_open(button, panel.isVisible());
+}
+
+void LocationEdit::follow_bookmark_popover(QWidget& popover)
+{
+    follow_panel(*this, popover, *m_trailing_action_button);
+}
+
+void LocationEdit::follow_translation_menu(QWidget& menu)
+{
+    follow_panel(*this, menu, *m_translate_button);
+}
+
 void LocationEdit::slide_site_settings_knobs(qreal travel)
 {
     if (!m_site_settings_knob_animation) {
@@ -583,6 +632,7 @@ void LocationEdit::update_trailing_action_visibility()
 {
     m_trailing_action_button->setVisible(m_trailing_action_button->defaultAction() && !m_is_editing_location && !m_url_is_hidden);
     update_translate_button();
+    update_zoom_indicator();
     update_text_margins();
     update_trailing_item_positions();
 }
@@ -598,6 +648,7 @@ void LocationEdit::update_completion_title()
         m_completion_title->adjustSize();
     }
     m_completion_title->setVisible(title.has_value());
+    update_location_icon();
     update_text_margins();
     update_trailing_item_positions();
 }
@@ -724,10 +775,21 @@ bool LocationEdit::event(QEvent* event)
 bool LocationEdit::eventFilter(QObject* watched, QEvent* event)
 {
     if (watched == m_site_settings_popover) {
-        if (event->type() == QEvent::Show)
+        if (event->type() == QEvent::Show) {
+            set_panel_open(*m_leading_icon_button, !m_is_editing_location);
             slide_site_settings_knobs(1);
-        else if (event->type() == QEvent::Hide)
+        } else if (event->type() == QEvent::Hide) {
+            set_panel_open(*m_leading_icon_button, false);
             slide_site_settings_knobs(0);
+        }
+        return QLineEdit::eventFilter(watched, event);
+    }
+
+    if (auto* button = qobject_cast<QToolButton*>(watched->property(PANEL_BUTTON_PROPERTY).value<QObject*>())) {
+        if (event->type() == QEvent::Show)
+            set_panel_open(*button, true);
+        else if (event->type() == QEvent::Hide)
+            set_panel_open(*button, false);
         return QLineEdit::eventFilter(watched, event);
     }
 
@@ -768,7 +830,7 @@ void LocationEdit::contextMenuEvent(QContextMenuEvent* event)
     auto qt_clipboard_text = QGuiApplication::clipboard()->text();
     auto clipboard_text = ak_string_from_qstring(qt_clipboard_text);
 
-    bool has_search_engine = Application::settings().search_engine_settings().engine.has_value();
+    bool has_search_engine = m_settings.search_engine_settings().engine.has_value();
     auto paste_and_go_text = WebView::Omnibox::text_for_paste_and_go_action(clipboard_text, has_search_engine);
     // Escape any &s so Qt doesn't treat them as mnemonics.
     paste_and_go_text = MUST(paste_and_go_text.replace("&"sv, "&&"sv, ReplaceMode::All));
@@ -828,7 +890,6 @@ void LocationEdit::focusInEvent(QFocusEvent* event)
     if (auto parked = m_parked_editing_session; parked.has_value()) {
         m_parked_editing_session.clear();
         NativeTextEditingLineEdit::focusInEvent(event);
-        m_omnibox.set_suspended(false);
 
         // Restore the selection with the cursor at the end it was on.
         if (parked->selection_length > 0) {
@@ -839,8 +900,12 @@ void LocationEdit::focusInEvent(QFocusEvent* event)
         } else {
             setCursorPosition(parked->cursor_position);
         }
-        if (m_omnibox.is_popup_visible())
-            m_autocomplete->show_with_suggestions(m_omnibox.suggestions(), m_omnibox.selected_suggestion());
+
+        // NB: Resuming shows rows that arrived while parked, which may complete the text, so the parked selection is
+        //     restored first. Those rows may already have shown the popup.
+        m_omnibox.set_suspended(false);
+        if (auto const& popup = m_omnibox.popup(); popup.is_visible && !m_autocomplete->is_visible())
+            m_autocomplete->show_with_suggestions(popup.suggestions, popup.selected_suggestion);
         show_focus_ring();
         return;
     }
@@ -922,6 +987,7 @@ void LocationEdit::show_focus_ring()
         emit editing_location_changed();
     }
     update_trailing_action_visibility();
+    update_location_icon();
     animate_focus_ring();
 }
 
@@ -1096,12 +1162,13 @@ void LocationEdit::fit_in_use_chips()
         chip->set_words_fit(width() >= width_for_words);
 }
 
-// The "Not secure" pill is inset as far from the field's leading edge as from its top and bottom.
-static int leading_indicator_inset(QWidget const& field, QWidget const& indicator)
+// The "Not secure" pill is inset as far from the field's leading edge as from its top and bottom. Any other indicator
+// is an icon, centered in its button.
+static int leading_indicator_inset(QWidget const& field, QToolButton const& indicator)
 {
     if (indicator.property("notSecure").toBool())
         return (field.height() - indicator.height()) / 2;
-    return LOCATION_LEADING_EDGE_MARGIN;
+    return LOCATION_LEADING_ICON_X - ((indicator.width() - indicator.iconSize().width()) / 2);
 }
 
 void LocationEdit::update_trailing_item_positions()
@@ -1199,6 +1266,8 @@ void LocationEdit::schedule_chrome_style_update()
         update_chrome_style();
         m_autocomplete->schedule_chrome_style_update();
         update_focus_ring(m_focus_ring_opacity);
+        // NB: The editing icon's color follows the appearance.
+        m_editing_icon_kind = {};
         update_location_icon();
         update_zoom_indicator();
         highlight_location();
@@ -1207,12 +1276,40 @@ void LocationEdit::schedule_chrome_style_update()
     });
 }
 
+// While the address is being edited, the icon says where Return would go. It is rebuilt only when that changes.
+void LocationEdit::update_editing_icon()
+{
+    auto icon = m_omnibox.editing_icon();
+    auto favicon_png = icon.favicon_png.has_value() ? icon.favicon_png->bytes() : ReadonlyBytes {};
+    if (m_editing_icon_kind == icon.kind && favicon_png == m_editing_favicon_png.bytes())
+        return;
+
+    m_editing_icon_kind = icon.kind;
+    m_editing_favicon_png = MUST(ByteBuffer::copy(favicon_png));
+
+    auto muted = Theme::chrome(*this).muted;
+    if (icon.kind == WebView::Omnibox::EditingIcon::Kind::Search) {
+        m_leading_icon_button->setIcon(create_chrome_icon(ChromeIcon::Search, muted));
+        return;
+    }
+
+    auto favicon = favicon_from_png(favicon_png, 16);
+    m_leading_icon_button->setIcon(favicon.isNull() ? create_chrome_icon(ChromeIcon::Globe, muted) : favicon);
+}
+
 // Before the address, the field shows a button for the site's information, or a warning when the connection is not
-// secure. While the address is being edited, nothing comes before the text.
+// secure. While the address is being edited, an icon for where it would go stands in the place of the site's button.
 void LocationEdit::update_location_icon()
 {
     if (!m_leading_icon_button)
         return;
+
+    // OPTIMIZATION: This runs several times per key press. While the editing icon is up and set for the current
+    //               appearance, only the icon itself can change, so the button is not set up and laid out again.
+    if (m_is_editing_location && m_shows_editing_icon && m_editing_icon_kind.has_value()) {
+        update_editing_icon();
+        return;
+    }
 
     auto update_indicator_style = [this](bool not_secure) {
         if (m_leading_icon_button->property("notSecure").toBool() == not_secure)
@@ -1223,25 +1320,17 @@ void LocationEdit::update_location_icon()
         m_leading_icon_button->style()->polish(m_leading_icon_button);
     };
 
-    auto show_indicator = [&](int width) {
+    auto show_indicator = [&](int text_leading_margin) {
         m_leading_icon_button->show();
         auto inset = leading_indicator_inset(*this, *m_leading_icon_button);
         m_leading_icon_button->move(inset, (height() - m_leading_icon_button->height()) / 2);
-        m_text_leading_margin = inset + width + LOCATION_LEADING_ITEM_GAP - LOCATION_TEXT_PADDING;
+        m_text_leading_margin = text_leading_margin;
         update_text_margins();
     };
 
     m_shows_site_settings_button = false;
-
-    auto hide_indicator = [&] {
-        update_indicator_style(false);
-        m_leading_icon_button->hide();
-        m_leading_icon_button->setText({});
-        m_leading_icon_button->setIcon({});
-        m_leading_icon_button->setToolTip({});
-        m_text_leading_margin = 0;
-        update_text_margins();
-    };
+    m_shows_editing_icon = false;
+    m_leading_icon_button->setAttribute(Qt::WA_TransparentForMouseEvents, false);
 
     auto show_site_settings_button = [&] {
         update_indicator_style(false);
@@ -1252,7 +1341,7 @@ void LocationEdit::update_location_icon()
         m_leading_icon_button->setIconSize({ 16, 16 });
         m_leading_icon_button->setFixedSize(LOCATION_SITE_SETTINGS_BUTTON_WIDTH, LOCATION_PILL_HEIGHT);
         m_leading_icon_button->setToolTip("Site settings");
-        show_indicator(LOCATION_SITE_SETTINGS_BUTTON_WIDTH);
+        show_indicator(LOCATION_TEXT_MARGIN_FOR_TEXT_X);
     };
 
     auto show_not_secure_indicator = [&] {
@@ -1268,31 +1357,53 @@ void LocationEdit::update_location_icon()
         auto width = QFontMetrics(font).horizontalAdvance("Not secure") + 14 + 5 + LOCATION_PILL_HORIZONTAL_PADDING;
         m_leading_icon_button->setFixedSize(width, LOCATION_PILL_HEIGHT);
         m_leading_icon_button->setToolTip("The connection to this site is not secure");
-        show_indicator(width);
+        // NB: The pill is wider than the icon, so the text follows it.
+        show_indicator(leading_indicator_inset(*this, *m_leading_icon_button) + width + LOCATION_LEADING_ITEM_GAP - LOCATION_TEXT_PADDING);
     };
 
-    auto is_showing_current_url_for_display = !hasFocus()
-        && m_url.has_value()
-        && text() == display_url();
-
-    if (is_showing_current_url_for_display) {
-        auto scheme = m_url->scheme();
-        if (scheme == "http"sv)
-            show_not_secure_indicator();
-        else if (scheme == "https"sv)
-            show_site_settings_button();
-        else
-            hide_indicator();
+    if (m_is_editing_location) {
+        update_indicator_style(false);
+        m_leading_icon_button->setToolButtonStyle(Qt::ToolButtonIconOnly);
+        m_leading_icon_button->setText({});
+        // NB: The button showed something else until now, or the appearance changed, so the icon is set afresh.
+        m_editing_icon_kind = {};
+        update_editing_icon();
+        m_leading_icon_button->setIconSize({ 16, 16 });
+        m_leading_icon_button->setFixedSize(LOCATION_SITE_SETTINGS_BUTTON_WIDTH, LOCATION_PILL_HEIGHT);
+        m_leading_icon_button->setToolTip({});
+        // NB: The icon only shows where the text goes, so a click on it lands in the text.
+        m_leading_icon_button->setAttribute(Qt::WA_TransparentForMouseEvents, true);
+        // NB: The icon of what Return will do is not the site settings button, so it never looks pressed.
+        set_panel_open(*m_leading_icon_button, false);
+        show_indicator(LOCATION_TEXT_MARGIN_FOR_TEXT_X);
+        m_shows_editing_icon = true;
         return;
     }
 
-    hide_indicator();
+    auto is_showing_insecure_url_for_display = !hasFocus()
+        && m_url.has_value()
+        && text() == display_url()
+        && m_url->scheme() == "http"sv;
+
+    // NB: Pages without a site of their own, such as about:blank, show the icon too, so there is always one in its
+    //     place.
+    if (is_showing_insecure_url_for_display)
+        show_not_secure_indicator();
+    else
+        show_site_settings_button();
+    set_panel_open(*m_leading_icon_button, m_site_settings_popover && m_site_settings_popover->isVisible());
 }
 
 void LocationEdit::update_zoom_indicator()
 {
     if (!m_zoom_indicator_button)
         return;
+
+    if (m_is_editing_location || m_url_is_hidden) {
+        m_zoom_indicator_fade->stop();
+        m_zoom_indicator_button->hide();
+        return;
+    }
 
     // The chip fades in when the page is zoomed and out when the zoom is reset. Its number changes in place.
     auto fade_to = [this](qreal opacity) {
@@ -1436,6 +1547,8 @@ void LocationEdit::set_text_and_restart_editing(QString const& text)
     bool suspended = !hasFocus();
     m_omnibox.begin_editing(ak_string_from_qstring(text));
     m_omnibox.set_suspended(suspended);
+    // NB: Setting the text redrew the editing icon for the session that was just replaced.
+    update_location_icon();
 }
 
 void LocationEdit::set_url(Optional<URL::URL> url)
@@ -1557,22 +1670,34 @@ int LocationEdit::serialized_url_position_for_display_position(int display_posit
     return last_serialized_position;
 }
 
-bool LocationEdit::text_matches_current_url() const
+// NB: The field never shows the address of the new tab page, so that it is empty there, ready to be typed in. A website
+//     chosen as the new tab page is shown, as on any other tab.
+static bool is_new_tab_page(URL::URL const& url, WebView::Settings const& settings)
 {
-    return m_url.has_value()
-        && !m_url_is_hidden
-        && (text() == serialized_url() || text() == display_url());
+    if (url.scheme() != "about"sv)
+        return false;
+    if (url == URL::about_newtab())
+        return true;
+    // NB: Web content can write into about:blank and about:srcdoc, so an empty field there would let a page pass itself
+    //     off as a new tab, even when one of them is chosen as the new tab page.
+    if (url.serialize_path().is_one_of("blank"sv, "srcdoc"sv))
+        return false;
+    return url == settings.new_tab_page_url();
 }
 
 QString LocationEdit::serialized_url() const
 {
     VERIFY(m_url.has_value());
+    if (is_new_tab_page(*m_url, m_settings))
+        return {};
     return qstring_from_ak_string(m_url->serialize());
 }
 
 QString LocationEdit::display_url() const
 {
     VERIFY(m_url.has_value());
+    if (is_new_tab_page(*m_url, m_settings))
+        return {};
     if (m_shows_host_only && m_url->scheme().is_one_of("http"sv, "https"sv))
         return qstring_from_ak_string(WebView::authority_for_display(*m_url));
     return qstring_from_ak_string(WebView::url_for_display(*m_url));
@@ -1589,13 +1714,6 @@ void LocationEdit::set_shows_host_only(bool shows_host_only)
         setCursorPosition(0);
         highlight_location();
     }
-}
-
-QString LocationEdit::current_query() const
-{
-    if (m_omnibox.is_editing())
-        return qstring_from_ak_string(m_omnibox.query());
-    return text();
 }
 
 void LocationEdit::set_suggestions_host(QWidget* host)

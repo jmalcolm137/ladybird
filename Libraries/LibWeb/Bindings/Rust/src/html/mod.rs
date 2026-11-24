@@ -7,7 +7,8 @@
 //! The 2D canvas contexts, with the attributes and operations of each of their mixins in the module of its IDL file,
 //! the objects that they draw with, the images that they and WebGL read and write the pixels of, and the operations of
 //! a path that Path2D and the contexts share. The state that the contexts share is in crate::canvas_2d. The message
-//! ports and channels of web messaging, the broadcast channels and Web Storage are here as well.
+//! ports and channels of web messaging, the broadcast channels, server-sent events, Web Storage and the cues of text
+//! tracks are here as well.
 
 pub(crate) mod canvas_path;
 pub(crate) mod color_stops;
@@ -55,15 +56,39 @@ pub(crate) mod canvas_text_drawing_styles;
 #[cfg(not(test))]
 pub(crate) mod canvas_transform;
 #[cfg(not(test))]
+pub(crate) mod data_transfer;
+#[cfg(not(test))]
+pub(crate) mod data_transfer_item;
+#[cfg(not(test))]
+pub(crate) mod data_transfer_item_list;
+#[cfg(not(test))]
+pub(crate) mod dom_string_list;
+#[cfg(not(test))]
+pub(crate) mod dom_string_map;
+#[cfg(not(test))]
+pub(crate) mod event_source;
+#[cfg(not(test))]
 pub(crate) mod exports;
 #[cfg(not(test))]
+pub(crate) mod global_event_handlers;
+#[cfg(not(test))]
+pub(crate) mod html_form_element;
+#[cfg(not(test))]
 pub(crate) mod image_bitmap;
+#[cfg(not(test))]
+pub(crate) mod image_bitmap_rendering_context;
 #[cfg(not(test))]
 pub(crate) mod image_data;
 #[cfg(not(test))]
 pub(crate) mod message_channel;
 #[cfg(not(test))]
+pub(crate) mod message_event;
+#[cfg(not(test))]
 pub(crate) mod message_port;
+#[cfg(not(test))]
+pub(crate) mod navigable;
+#[cfg(not(test))]
+pub(crate) mod navigator;
 #[cfg(not(test))]
 pub(crate) mod numbers;
 #[cfg(not(test))]
@@ -75,6 +100,10 @@ pub(crate) mod path2d;
 #[cfg(not(test))]
 pub(crate) mod port_channel;
 #[cfg(not(test))]
+pub(crate) mod sanitizer;
+#[cfg(not(test))]
+pub(crate) mod sanitizer_configuration;
+#[cfg(not(test))]
 pub(crate) mod storage;
 #[cfg(not(test))]
 pub(crate) mod storage_event;
@@ -82,6 +111,12 @@ pub(crate) mod storage_event;
 pub(crate) mod structured_serialize;
 #[cfg(not(test))]
 pub(crate) mod text_metrics;
+#[cfg(not(test))]
+pub(crate) mod text_track_cue;
+#[cfg(not(test))]
+pub(crate) mod visibility_state;
+#[cfg(not(test))]
+pub(crate) mod visibility_state_entry;
 #[cfg(not(test))]
 pub(crate) mod window;
 #[cfg(not(test))]

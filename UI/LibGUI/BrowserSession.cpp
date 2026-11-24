@@ -18,6 +18,7 @@
 #include <LibCore/File.h>
 #include <LibCore/StandardPaths.h>
 #include <WaylandClient.h>
+#include <WaylandSeat.h>
 #include <LibCore/System.h>
 #include <AK/StringBuilder.h>
 #include <LibCore/Timer.h>
@@ -142,7 +143,7 @@ ErrorOr<void> BrowserSession::initialize(Vector<String> initial_urls, bool priva
 {
     // The desktop's input method talks to the focused LibGUI window over text-input-v3. Committed text belongs to the
     // active tab's web view.
-    LibWM::WaylandClient::the().set_text_input_callbacks(
+    LibWM::WaylandClient::the().seat().set_text_input_callbacks(
         [this](String const& text) {
             if (auto* window = active_window()) {
                 if (auto* focused = window->focused_widget(); focused && is<GUI::TextEditor>(*focused)) {

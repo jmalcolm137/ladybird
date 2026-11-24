@@ -549,6 +549,37 @@ fn paint_image_layer<O: Observer>(
         );
     };
 
+    let scroll_node = recorder.data(paintable).own_scroll_node_index;
+    if layer.attachment == css_enums::background_attachment::LOCAL
+        && recorder.source.node_kind_if_live(paintable) != Some(NodeKind::Viewport)
+        && scroll_node != VISUAL_VIEWPORT_NODE_INDEX
+        && !recorder.recorder.is_recording_inside_group()
+        && let Some(scrollable_area) =
+            crate::painting::paintable_geometry::scrollable_overflow_rect(recorder.source, paintable)
+    {
+        // https://drafts.csswg.org/css-backgrounds-3/#valdef-background-attachment-local
+        // "the background scrolls with the box's contents"
+        // NB: Keep the box's clips outside its scrolling space, and record every part scrolling can reveal.
+        let previous_context = recorder.recorder.accumulated_visual_context();
+        let previous_inline_clips = recorder
+            .recorder
+            .move_ambient_inline_clips_to_space(previous_context.spatial);
+        recorder.recorder.set_accumulated_visual_context(ContextRef {
+            spatial: scroll_node,
+            clip: recorder.data(paintable).accumulated_visual_context_for_descendants.clip,
+            ..previous_context
+        });
+        paint_in_current_space(
+            recorder,
+            scrollable_area,
+            recorder.converter.enclosing_device_rect(scrollable_area),
+            None,
+        );
+        recorder.recorder.set_accumulated_visual_context(previous_context);
+        recorder.recorder.replace_ambient_inline_clips(previous_inline_clips);
+        return;
+    }
+
     if layer.attachment != css_enums::background_attachment::FIXED
         || recorder.recorder.is_recording_inside_group()
         || !background_has_fixed_attachment(
@@ -638,7 +669,9 @@ fn paint_image_layer_in_current_space<O: Observer>(
 
     match layer.attachment {
         css_enums::background_attachment::LOCAL
-            if recorder.source.node_kind_if_live(paintable) != Some(NodeKind::Viewport) =>
+            if recorder.source.node_kind_if_live(paintable) != Some(NodeKind::Viewport)
+                && recorder.recorder.accumulated_visual_context().spatial
+                    != recorder.data(paintable).own_scroll_node_index =>
         {
             let scroll_offset = recorder.own_scroll_container_offset(paintable);
             background_positioning_area = background_positioning_area.translated(-scroll_offset.x, -scroll_offset.y);
@@ -730,6 +763,18 @@ fn paint_image_layer_in_current_space<O: Observer>(
         )
     });
 
+    let tile_device_rect = |rect: CssPixelRect| -> IntRect {
+        let mut rect = converter.rounded_device_rect(rect);
+        // If the image's dimensions were rounded to zero then they need to be restored to avoid a crash.
+        if rect.width == 0 {
+            rect.width = 1;
+        }
+        if rect.height == 0 {
+            rect.height = 1;
+        }
+        rect
+    };
+
     let device_rects = |image_rect: CssPixelRect| -> Vec<IntRect> {
         let mut rects = Vec::new();
         let mut rect = image_rect;
@@ -739,14 +784,7 @@ fn paint_image_layer_in_current_space<O: Observer>(
             let mut image_x = initial_image_x;
             while image_x < css_clip_rect.right() {
                 rect.x = image_x;
-                let mut image_device_rect = converter.rounded_device_rect(rect);
-                // If the image's dimensions were rounded to zero then they need to be restored to avoid a crash.
-                if image_device_rect.width == 0 {
-                    image_device_rect.width = 1;
-                }
-                if image_device_rect.height == 0 {
-                    image_device_rect.height = 1;
-                }
+                let image_device_rect = tile_device_rect(rect);
                 if visible_device_rect.is_none_or(|visible| !visible.intersected(image_device_rect).is_empty()) {
                     rects.push(image_device_rect);
                 }
@@ -777,27 +815,35 @@ fn paint_image_layer_in_current_space<O: Observer>(
 
     let inline_operator = compositing_and_blending_operator;
 
-    if let (None, Some(single_pixel_color)) = (&resolved_gradient, facts.single_pixel_color) {
-        // OPTIMIZATION: If the image is a single pixel, we can just fill the whole area with it.
-        //               However, we must first figure out the real coverage area, taking repeat etc into account.
-
-        // FIXME: This could be written in a far more efficient way.
-        let mut fill_rect: Option<IntRect> = None;
-        for image_device_rect in device_rects(image_rect) {
-            fill_rect = Some(match fill_rect {
-                None => image_device_rect,
-                Some(current) => current.united(image_device_rect),
-            });
+    if let (None, Some(single_pixel_color)) = (&resolved_gradient, facts.single_pixel_color)
+        && !repeat_x_has_gap
+        && !repeat_y_has_gap
+    {
+        // OPTIMIZATION: The first and last tiles bound the fill, without enumerating every tile in the scrollable area.
+        // Round both tiles separately to preserve the one-device-pixel minimum size at the end of each repeated axis.
+        let mut fill_rect = IntRect::default();
+        if image_rect.x < css_clip_rect.right() && image_rect.y < css_clip_rect.bottom() {
+            let mut last_tile = image_rect;
+            if repeat_x {
+                last_tile.x =
+                    first_css_tile_start(image_rect.x, css_clip_rect.right() - CssPixels::from_raw(1), x_step);
+            }
+            if repeat_y {
+                last_tile.y =
+                    first_css_tile_start(image_rect.y, css_clip_rect.bottom() - CssPixels::from_raw(1), y_step);
+            }
+            fill_rect = tile_device_rect(image_rect).united(tile_device_rect(last_tile));
+            if let Some(visible) = visible_device_rect {
+                fill_rect = fill_rect.intersected(visible);
+            }
         }
         if inline_operator == CompositingAndBlendingOperator::Normal {
-            recorder.recorder.fill_rect(
-                fill_rect.unwrap_or_default(),
-                single_pixel_color,
-                ForceDarkRole::Background,
-            );
+            recorder
+                .recorder
+                .fill_rect(fill_rect, single_pixel_color, ForceDarkRole::Background);
         } else {
             recorder.recorder.fill_rect_with_compositing_and_blending_operator(
-                fill_rect.unwrap_or_default(),
+                fill_rect,
                 single_pixel_color,
                 inline_operator,
                 ForceDarkRole::Background,
@@ -837,6 +883,9 @@ fn paint_image_layer_in_current_space<O: Observer>(
             }
         }
         if let crate::painting::image_content::ImageContent::Vector { content_identity, .. } = &facts.content {
+            use crate::painting::record::vector_images::{
+                VectorImageRenderGeometry, VectorImageRenderRequest, vector_image_render_geometry,
+            };
             if clip_rect.is_empty() {
                 return;
             }
@@ -845,20 +894,6 @@ fn paint_image_layer_in_current_space<O: Observer>(
                 (dest_rect.width, dest_rect.height),
                 (dest_rect.width, dest_rect.height),
             );
-            let display_list_id = recorder.resources.vector_image_placeholder(
-                crate::painting::record::vector_images::VectorImageRenderRequest::new(
-                    vector_image_source,
-                    CssPixels::from_integer(i64::from(dest_rect.width)),
-                    CssPixels::from_integer(i64::from(dest_rect.height)),
-                    1.0,
-                    *content_identity,
-                    recorder.vector_image_color_scheme(vector_image_source.owner()),
-                ),
-            );
-            let tile_size = IntSize {
-                width: dest_rect.width,
-                height: dest_rect.height,
-            };
             let tree = recorder.paint_state.visual_context_tree.as_ref().unwrap();
             let mut spatial = recorder.recorder.accumulated_visual_context().spatial;
             let mut is_untransformed = recorder.recorder.ambient_inline_transform().is_none();
@@ -867,19 +902,71 @@ fn paint_image_layer_in_current_space<O: Observer>(
                 is_untransformed = !matches!(node.data, SpatialData::Transform(_) | SpatialData::Perspective(_));
                 spatial = node.parent;
             }
+            let destination_size = IntSize {
+                width: dest_rect.width,
+                height: dest_rect.height,
+            };
+            // The tile is rasterized before its transforms apply, so it is recorded at the scale they accumulate to,
+            // the way other vector images are, but never smaller than its destination. Otherwise, a transform that
+            // enlarges the tile enlarges the pixels of its raster. Nearest-neighbor scaling shows the pixels of a tile
+            // that has the size of its destination.
+            let scaled_tile_size = if is_untransformed || scaling_mode == ScalingMode::NearestNeighbor {
+                None
+            } else {
+                scaled_size_of_repeated_vector_tile(
+                    destination_size,
+                    recorder.accumulated_2d_scale_at(recorder.recorder.accumulated_visual_context().spatial),
+                )
+            };
+            // The image is rendered at one scale in both axes, in a viewport of the size of the destination, since a
+            // viewport of other proportions can change how the image is laid out.
+            let geometry = match scaled_tile_size {
+                Some(tile_size) => {
+                    let scale = tile_size.width as f32 / dest_rect.width as f32;
+                    vector_image_render_geometry(
+                        FloatRect::new(0.0, 0.0, dest_rect.width as f32, dest_rect.height as f32),
+                        FloatSize {
+                            width: scale,
+                            height: scale,
+                        },
+                        false,
+                    )
+                }
+                None => VectorImageRenderGeometry {
+                    css_width: CssPixels::from_integer(i64::from(dest_rect.width)),
+                    css_height: CssPixels::from_integer(i64::from(dest_rect.height)),
+                    raster_scale: 1.0,
+                    list_size: destination_size,
+                },
+            };
+            let tile_size = scaled_tile_size.unwrap_or(destination_size);
+            let display_list_id = recorder.vector_image_placeholder(VectorImageRenderRequest::new(
+                vector_image_source,
+                geometry.css_width,
+                geometry.css_height,
+                geometry.raster_scale,
+                *content_identity,
+                recorder.vector_image_color_scheme(vector_image_source.owner()),
+                recorder.vector_image_force_dark(),
+            ));
             // OPTIMIZATION: Paint a single untransformed SVG tile directly to keep filters clipped to the background.
             //               Rasterize other tiles to preserve placement, subpixel opacity and seamless boundaries.
             if inline_operator == CompositingAndBlendingOperator::Normal && tile_count == 1.0 && is_untransformed {
                 recorder
                     .recorder
-                    .paint_nested_display_list(display_list_id, dest_rect.to_float(), tile_size);
+                    .paint_vector_image_records(display_list_id, dest_rect.to_float(), tile_size);
                 return;
             }
             let group = recorder.recorder.begin_repeated_tile();
-            recorder.recorder.paint_nested_display_list(
+            recorder.recorder.paint_vector_image_records(
                 display_list_id,
-                FloatRect::new(0.0, 0.0, dest_rect.width as f32, dest_rect.height as f32),
-                tile_size,
+                FloatRect::new(
+                    0.0,
+                    0.0,
+                    geometry.list_size.width as f32,
+                    geometry.list_size.height as f32,
+                ),
+                geometry.list_size,
             );
             recorder.recorder.finish_repeated_tile(
                 group,
@@ -1072,6 +1159,40 @@ fn fraction_to_int(numerator: CssPixels, denominator: CssPixels) -> i32 {
     numerator.div_as_fraction(denominator).to_int()
 }
 
+/// The most device pixels that the tile of a repeated vector image is recorded with, where its transforms enlarge it,
+/// and the most along one side.
+const MAXIMUM_SCALED_VECTOR_TILE_AREA: f32 = 2048.0 * 2048.0;
+const MAXIMUM_SCALED_VECTOR_TILE_DIMENSION: f32 = 8192.0;
+
+/// The size to record the tile of a repeated vector image at, for the scale that its transforms accumulate to. The tile
+/// is scaled by the larger of the two axes, as far as the limits on its size allow. And a tile scaled to a fraction of
+/// a pixel would be cut off there, or left partly covered, so the scale is lowered to the nearest one that gives the
+/// tile a whole number of pixels on each side. None where that leaves the tile at the size of its destination, which it
+/// is never recorded smaller than.
+fn scaled_size_of_repeated_vector_tile(destination_size: IntSize, accumulated_scale: FloatSize) -> Option<IntSize> {
+    let width = destination_size.width as f32;
+    let height = destination_size.height as f32;
+    let scale = accumulated_scale.width.max(accumulated_scale.height);
+    if !scale.is_finite() {
+        return None;
+    }
+    let scale = scale
+        .min((MAXIMUM_SCALED_VECTOR_TILE_AREA / (width * height)).sqrt())
+        .min(MAXIMUM_SCALED_VECTOR_TILE_DIMENSION / width.max(height));
+    let mut divisor = destination_size.width;
+    let mut remainder = destination_size.height;
+    while remainder != 0 {
+        (divisor, remainder) = (remainder, divisor % remainder);
+    }
+    // A scale within 1/64 of a step below one counts as that step, since a scale read back from a matrix can fall
+    // just short of the scale that the matrix was made with.
+    let steps = (scale * divisor as f32 + 1.0 / 64.0) as i32;
+    (steps > divisor).then(|| IntSize {
+        width: destination_size.width / divisor * steps,
+        height: destination_size.height / divisor * steps,
+    })
+}
+
 /// Moves a tile start by whole steps to the last position at or before the clip start. Integer math keeps this exact: a
 /// fixed point quotient truncates a gap below 1/64 of a step to zero steps.
 fn first_tile_start(tile_start: i32, clip_start: i32, step: i32) -> i32 {
@@ -1127,29 +1248,42 @@ fn append_text_clip_paths<O: Observer>(recorder: &mut PaintRecorder<'_, O>, frag
             fragment_absolute_device_rect,
             scale,
         );
-        recorder.recorder.draw_glyph_run(
-            emission.baseline_start,
-            crate::painting::display_list::recorder::GlyphRunForRecording {
-                font_smoothing: recorder
-                    .source
-                    .node_style_if_live(fragment.style_source)
-                    .unwrap()
-                    .inherited_text()
-                    .font_smoothing,
-                font_id: crate::painting::display_list::commands::FontResourceId(font_id),
-                glyphs: run
-                    .glyphs
-                    .placed()
-                    .filter(|placed| placed.glyph.should_paint())
-                    .map(crate::painting::display_list::commands::DisplayListGlyph::from),
-            },
-            libgfx_rust::Color::from_rgb(0, 0, 0),
-            fragment_absolute_device_rect,
-            scale,
-            emission.orientation,
-            emission.glyph_bounding_rect,
-            ForceDarkRole::None,
-        );
+        let stroke_width = recorder
+            .source
+            .node_style_if_live(fragment.style_source)
+            .unwrap()
+            .inherited_text()
+            .webkit_text_stroke_width
+            * scale;
+        for width in [0.0, stroke_width as f32]
+            .into_iter()
+            .take(if stroke_width > 0.0 { 2 } else { 1 })
+        {
+            recorder.recorder.draw_glyph_run(
+                emission.baseline_start,
+                crate::painting::display_list::recorder::GlyphRunForRecording {
+                    font_smoothing: recorder
+                        .source
+                        .node_style_if_live(fragment.style_source)
+                        .unwrap()
+                        .inherited_text()
+                        .font_smoothing,
+                    font_id: crate::painting::display_list::commands::FontResourceId(font_id),
+                    glyphs: run
+                        .glyphs
+                        .placed()
+                        .filter(|placed| placed.glyph.should_paint())
+                        .map(crate::painting::display_list::commands::DisplayListGlyph::from),
+                },
+                libgfx_rust::Color::from_rgb(0, 0, 0),
+                width,
+                fragment_absolute_device_rect,
+                scale,
+                emission.orientation,
+                emission.glyph_bounding_rect,
+                ForceDarkRole::None,
+            );
+        }
     }
 }
 
@@ -1215,4 +1349,55 @@ fn text_clip_fragments<O: Observer>(
         }
     }
     fragments
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tile_size(width: i32, height: i32, scale_x: f32, scale_y: f32) -> Option<(i32, i32)> {
+        scaled_size_of_repeated_vector_tile(
+            IntSize { width, height },
+            FloatSize {
+                width: scale_x,
+                height: scale_y,
+            },
+        )
+        .map(|size| (size.width, size.height))
+    }
+
+    #[test]
+    fn repeated_vector_tile_is_recorded_at_the_larger_scale_of_its_transforms() {
+        assert_eq!(tile_size(24, 24, 4.0, 4.0), Some((96, 96)));
+        assert_eq!(tile_size(24, 24, 2.0, 3.0), Some((72, 72)));
+        assert_eq!(tile_size(24, 24, 2.0, 0.5), Some((48, 48)));
+        assert_eq!(tile_size(24, 12, 1.5, 1.5), Some((36, 18)));
+
+        assert_eq!(tile_size(24, 24, 1.0, 1.0), None);
+        assert_eq!(tile_size(24, 24, 0.5, 0.75), None);
+        assert_eq!(tile_size(24, 24, f32::NAN, f32::NAN), None);
+        assert_eq!(tile_size(24, 24, f32::INFINITY, 1.0), None);
+    }
+
+    #[test]
+    fn repeated_vector_tile_is_recorded_at_a_whole_number_of_pixels() {
+        assert_eq!(tile_size(24, 12, 3.7, 3.7), Some((88, 44)));
+        assert_eq!(tile_size(24, 24, 4.3, 4.3), Some((103, 103)));
+        assert_eq!(tile_size(24, 1, 1.5, 1.5), None);
+        assert_eq!(tile_size(24, 1, 2.5, 2.5), Some((48, 2)));
+        assert_eq!(tile_size(24, 24, 1.03, 1.0), None);
+        // A scale just short of a whole size gives that size.
+        assert_eq!(tile_size(24, 24, 3.9999998, 3.9999998), Some((96, 96)));
+    }
+
+    #[test]
+    fn repeated_vector_tile_stays_within_its_limits() {
+        assert_eq!(tile_size(1024, 1024, 4.0, 4.0), Some((2048, 2048)));
+        assert_eq!(tile_size(1024, 1024, 1.0, 100.0), Some((2048, 2048)));
+        assert_eq!(tile_size(4096, 16, 4.0, 4.0), Some((8192, 32)));
+        assert_eq!(tile_size(16, 4096, 4.0, 4.0), Some((32, 8192)));
+
+        assert_eq!(tile_size(4096, 4096, 4.0, 4.0), None);
+        assert_eq!(tile_size(10000, 16, 4.0, 4.0), None);
+    }
 }

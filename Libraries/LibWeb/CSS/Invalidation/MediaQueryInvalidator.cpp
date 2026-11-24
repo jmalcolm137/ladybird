@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <LibWeb/CSS/FontFaceSet.h>
 #include <LibWeb/CSS/Invalidation/MediaQueryInvalidator.h>
 #include <LibWeb/CSS/StyleComputer.h>
 #include <LibWeb/CSS/StyleEngineInput.h>
@@ -12,6 +13,7 @@
 #include <LibWeb/CSS/StyleSheetState.h>
 #include <LibWeb/DOM/Document.h>
 #include <LibWeb/DOM/ShadowRoot.h>
+#include <LibWeb/HTML/EventLoop/EventLoop.h>
 
 namespace Web::CSS::Invalidation {
 
@@ -23,10 +25,15 @@ namespace Web::CSS::Invalidation {
 // conditions, and drop the scope's cached rule set.
 void evaluate_media_rules_and_publish_conditions(DOM::Document& document)
 {
-    ++document.style_invalidation_counters().media_rule_evaluations;
+    HTML::note_rendering_trace_event("media rules evaluated"sv);
 
     HashTable<StyleScope*> scopes_with_changed_layer_order;
+    // OPTIMIZATION: A sheet that many shadow roots adopt is evaluated once, not once per root. Its evaluation is the
+    //               same for every scope that owns it, and the changes it finds go to all of them below.
+    HashTable<StyleSheetState*> evaluated_author_sheets;
     Function<void(StyleSheetState&)> evaluate_author_sheet = [&](StyleSheetState& style_sheet) {
+        if (evaluated_author_sheets.set(&style_sheet) != HashSetResult::InsertedNewEntry)
+            return;
         Parser::ValueParserFFI::NativeStyleSheetMediaEvaluation result {};
         if (!style_sheet.evaluate_media_queries(document, result))
             return;
@@ -75,6 +82,8 @@ void evaluate_media_rules_and_publish_conditions(DOM::Document& document)
 
     for (auto* style_scope : scopes_with_changed_layer_order)
         style_scope->publish_cascade_layer_order();
+    if (scopes_with_changed_layer_order.contains(&document.style_scope()))
+        document.fonts()->synchronize_css_connected_font_order();
 }
 
 }

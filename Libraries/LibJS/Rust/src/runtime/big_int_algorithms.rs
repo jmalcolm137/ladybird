@@ -23,18 +23,8 @@ pub enum CompareResult {
     DoubleGreaterThanBigInt,
 }
 
-/// The number of bits in a libtommath digit on 64-bit targets. Crypto's mod_power_of_two() returns positive numbers
-/// unchanged when they occupy no more digits than the modulus has bits.
-const TOMMATH_DIGIT_BIT: u64 = 60;
-
 const DOUBLE_MANTISSA_BITS: u32 = 52;
 const DOUBLE_EXPONENT_BIAS: u64 = 1023;
-
-/// Crypto's pow() passes its u32 exponent to mp_expt_n(), which takes an int. Exponents of 2^31 and above become
-/// negative there, and mp_expt_n() then returns 1 without multiplying, so this returns the exponent actually applied.
-fn exponent_applied_by_crypto_pow(exponent: u32) -> u32 {
-    if i32::try_from(exponent).is_ok() { exponent } else { 0 }
-}
 
 fn power_of_two_double(exponent: u64) -> f64 {
     debug_assert!(exponent < 1024);
@@ -172,8 +162,7 @@ pub fn number_to_bigint(number: f64) -> Result<BigInt, NumericOperationError> {
     Ok(BigInt::from_biguint(sign, floor_of_magnitude(number)))
 }
 
-/// Crypto::SignedBigInteger::to_u64, which is libtommath's mp_get_u64: the low 64 bits of the magnitude, negated
-/// modulo 2^64 for negative values, which is ℝ(value) modulo 2^64.
+/// The low 64 bits of the magnitude, negated modulo 2^64 for negative values, which is ℝ(value) modulo 2^64.
 pub fn to_u64(value: &BigInt) -> u64 {
     let low_bits = value.magnitude().iter_u64_digits().next().unwrap_or(0);
     if value.sign() == Sign::Minus {
@@ -190,7 +179,7 @@ pub fn to_base(value: &BigInt, radix: u32) -> String {
     value.to_str_radix(radix)
 }
 
-/// The low bits of a magnitude, as libtommath's mp_mod_2d() keeps them.
+/// The low `bit_count` bits of a magnitude.
 fn low_bits(value: &BigUint, bit_count: u64) -> BigUint {
     if value.bits() <= bit_count {
         return value.clone();
@@ -215,14 +204,13 @@ pub fn mod_power_of_two(value: &BigInt, power_of_two: u64) -> Result<BigInt, Num
     let is_negative = value.sign() == Sign::Minus;
 
     // If the number is positive and smaller than the modulus, we can just return it.
-    let tommath_digit_count = value.magnitude().bits().div_ceil(TOMMATH_DIGIT_BIT);
-    if !is_negative && tommath_digit_count * TOMMATH_DIGIT_BIT <= power_of_two {
+    if !is_negative && value.magnitude().bits() <= power_of_two {
         return Ok(value.clone());
     }
 
-    // If the power of two overflows the int type, we don't have enough memory to compute it.
+    // AD-HOC: A power of two that overflows the int type is too large to compute, as for BigInt::leftShift.
     if i32::try_from(power_of_two).is_err() {
-        return Err(NumericOperationError::OutOfMemory);
+        return Err(NumericOperationError::BigIntSizeExceeded);
     }
 
     let magnitude_modulo = low_bits(value.magnitude(), power_of_two);
@@ -240,7 +228,7 @@ fn bitwise_not_fill_to_one_based_index(value: &BigUint, index: u64) -> Result<Bi
         return Ok(BigUint::zero());
     }
     if i32::try_from(index).is_err() {
-        return Err(NumericOperationError::OutOfMemory);
+        return Err(NumericOperationError::BigIntSizeExceeded);
     }
     debug_assert!(value.bits() <= index);
     Ok((BigUint::one() << index) - 1u32 - value)
@@ -287,21 +275,12 @@ pub fn as_uint_n(bits: u64, bigint: &BigInt) -> Result<BigInt, NumericOperationE
 
 /// 6.1.6.2.9 BigInt::leftShift ( x, y ), https://tc39.es/ecma262/#sec-numeric-types-bigint-leftShift
 pub fn left_shift(x: &BigInt, y: &BigInt) -> Result<BigInt, NumericOperationError> {
-    // AD-HOC: Prevent allocating huge amounts of memory.
-    let rhs_bigint = y.magnitude();
-    if rhs_bigint.bits() > 32 {
-        return Err(NumericOperationError::BigIntSizeExceeded);
-    }
-
-    // x is multiplied or divided by 2^|y| as Crypto's pow() computes it.
-    let shift = u64::from(exponent_applied_by_crypto_pow(
-        rhs_bigint.to_u32().expect("at most 32 bits"),
-    ));
-
     // 1. If y < 0ℤ, then
     if y.sign() == Sign::Minus {
         // a. Return the BigInt value that represents ℝ(x) / 2^-y, rounding down to the nearest integer, including for negative numbers.
         // NOTE: Since y is negative we can just do ℝ(x) / 2^|y|
+        // NB: Shifting past the last bit of x leaves nothing of it, however far.
+        let shift = y.magnitude().to_u64().map_or(x.bits(), |shift| shift.min(x.bits()));
         let quotient = BigInt::from_biguint(x.sign(), x.magnitude() >> shift);
         let remainder_is_zero = x.magnitude().trailing_zeros().is_none_or(|zeros| zeros >= shift);
 
@@ -314,7 +293,14 @@ pub fn left_shift(x: &BigInt, y: &BigInt) -> Result<BigInt, NumericOperationErro
     }
 
     // 2. Return the BigInt value that represents ℝ(x) × 2^y.
-    Ok(x << shift)
+    if x.is_zero() {
+        return Ok(BigInt::zero());
+    }
+    // AD-HOC: Prevent allocating huge amounts of memory.
+    let Some(shift) = y.magnitude().to_u32() else {
+        return Err(NumericOperationError::BigIntSizeExceeded);
+    };
+    Ok(x << u64::from(shift))
 }
 
 /// 6.1.6.2.10 BigInt::signedRightShift ( x, y ), https://tc39.es/ecma262/#sec-numeric-types-bigint-signedRightShift
@@ -330,13 +316,29 @@ pub fn exponentiate(base: &BigInt, exponent: &BigInt) -> Result<BigInt, NumericO
         return Err(NumericOperationError::NegativeExponent);
     }
 
-    // AD-HOC: Prevent allocating huge amounts of memory.
-    if exponent.magnitude().bits() > 32 {
-        return Err(NumericOperationError::BigIntSizeExceeded);
-    }
-
     // 2. If base is 0ℤ and exponent is 0ℤ, return 1ℤ.
     // 3. Return the BigInt value that represents ℝ(base) raised to the power ℝ(exponent).
-    let exponent = exponent_applied_by_crypto_pow(exponent.magnitude().to_u32().expect("at most 32 bits"));
+    // NB: The powers of 0, 1 and -1 are known without computing them, however large the exponent.
+    if base.is_zero() {
+        return Ok(if exponent.is_zero() {
+            BigInt::one()
+        } else {
+            BigInt::zero()
+        });
+    }
+    if base.magnitude().is_one() {
+        return Ok(if exponent.magnitude().bit(0) {
+            base.clone()
+        } else {
+            BigInt::one()
+        });
+    }
+    // AD-HOC: Prevent allocating huge amounts of memory.
+    let Some(exponent) = exponent.magnitude().to_u32() else {
+        return Err(NumericOperationError::BigIntSizeExceeded);
+    };
+    if u64::from(exponent).saturating_mul(base.bits() - 1) > u64::from(u32::MAX) {
+        return Err(NumericOperationError::BigIntSizeExceeded);
+    }
     Ok(base.pow(exponent))
 }

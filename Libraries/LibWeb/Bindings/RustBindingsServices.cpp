@@ -6,6 +6,7 @@
 
 #include <LibJS/HostClassBuilder.h>
 #include <LibJS/Runtime/HostObject.h>
+#include <LibJS/Runtime/Promise.h>
 #include <LibJS/Runtime/Realm.h>
 #include <LibURL/RustIntegration.h>
 #include <LibWeb/Bindings/DOMException.h>
@@ -15,19 +16,26 @@
 #include <LibWeb/Bindings/Wrappable.h>
 #include <LibWeb/Bindings/WrapperWorld.h>
 #include <LibWeb/DOM/Document.h>
+#include <LibWeb/DOM/DocumentObserver.h>
+#include <LibWeb/HTML/BrowsingContext.h>
 #include <LibWeb/HTML/CrossOrigin/AbstractOperations.h>
 #include <LibWeb/HTML/CustomElements/CustomElementReactions.h>
 #include <LibWeb/HTML/EventLoop/EventLoop.h>
 #include <LibWeb/HTML/Scripting/Agent.h>
 #include <LibWeb/HTML/Scripting/Environments.h>
+#include <LibWeb/HTML/Scripting/ExceptionReporter.h>
 #include <LibWeb/HTML/Scripting/SimilarOriginWindowAgent.h>
 #include <LibWeb/HTML/Scripting/TemporaryExecutionContext.h>
 #include <LibWeb/HTML/StructuredSerialize.h>
 #include <LibWeb/HTML/Window.h>
+#include <LibWeb/HTML/WindowOrWorkerGlobalScope.h>
 #include <LibWeb/HTML/WindowProxy.h>
 #include <LibWeb/HTML/WorkerGlobalScope.h>
+#include <LibWeb/HighResolutionTime/TimeOrigin.h>
+#include <LibWeb/NavigationTiming/PerformanceNavigationTiming.h>
 #include <LibWeb/Page/Page.h>
 #include <LibWeb/Platform/EventLoopPlugin.h>
+#include <LibWeb/ServiceWorker/ServiceWorkerGlobalScope.h>
 #include <LibWeb/WebIDL/AbstractOperations.h>
 #include <LibWeb/WebIDL/CallbackType.h>
 #include <LibWeb/WebIDL/DOMException.h>
@@ -83,32 +91,66 @@ void web_bindings_set_rust_wrapper(void* realm, void* cell, JSObject* wrapper);
 void web_bindings_queue_a_microtask(void* realm, JSObject* function);
 void web_bindings_deferred_invoke(void* cell, void (*steps)(JSVM*, void*));
 void web_bindings_run_in_parallel(void* realm, void* cell, void (*steps)(JSVM*, void*));
-void web_bindings_queue_a_task(void* realm, u8 task_source, void* cell, void (*steps)(JSVM*, void*));
+void web_bindings_queue_a_task(u8 task_source, void* cell, void (*steps)(JSVM*, void*));
 u64 web_bindings_queue_a_global_task(JSObject* global_object, u8 task_source, void* cell, void (*steps)(JSVM*, void*));
 void web_bindings_remove_tasks(void* realm, ReadonlySpan<u64> task_ids);
 u64 web_bindings_currently_running_task(void* realm);
+void web_bindings_spin_until_promise_is_settled(JSObject* promise);
 void* web_bindings_create_callback_function(JSObject* callable, bool returns_promise);
 JSCompletion web_bindings_invoke_callback_function(void* callback, bool has_this_value, JSValue this_value, ReadonlySpan<JSValue> arguments);
+void web_bindings_invoke_callback_function_and_report(void* callback, ReadonlySpan<JSValue> arguments);
+JSObject* web_bindings_callback_function_callback(void* callback);
 void* web_bindings_invoke_promise_callback_function(void* callback, bool has_this_value, JSValue this_value, ReadonlySpan<JSValue> arguments);
 void web_bindings_push_element_queue();
 void web_bindings_pop_element_queue_and_invoke_reactions();
 bool web_bindings_realm_is_window(void* realm);
 bool web_bindings_realm_is_secure_context(void* realm);
+void web_bindings_report_an_exception(void* realm, JSValue exception);
 HTML::Window* web_bindings_window_from_global_object(JSObject* global_object);
 void web_bindings_for_each_active_window(void* ctx, void (*on_window)(void*, HTML::Window*));
 DOM::Document* web_bindings_window_associated_document(HTML::Window*);
+JS::Realm* web_bindings_window_realm(HTML::Window*);
 u64 web_bindings_window_page_id(HTML::Window*);
+bool web_bindings_window_has_transient_activation(HTML::Window*);
+void web_bindings_window_consume_user_activation(HTML::Window*);
+void web_bindings_window_set_last_activation_timestamp_to_now(HTML::Window*);
+bool web_bindings_is_service_worker_global_scope(JSObject* global_object);
 DOM::EventTarget* web_bindings_window_as_event_target(HTML::Window*);
-bool web_bindings_document_has_navigable(DOM::Document*);
+HTML::LocalNavigable* web_bindings_document_navigable(DOM::Document*);
 bool web_bindings_document_is_fully_active(DOM::Document*);
+bool web_bindings_document_is_allowed_to_use_feature(DOM::Document*, u8 feature);
+u8 web_bindings_document_visibility_state(DOM::Document*);
+void web_bindings_document_origin(DOM::Document*, void* origin, void (*on_origin)(void*, URL::FFI::FfiOrigin const*));
+bool web_bindings_document_has_focus(DOM::Document*);
+bool web_bindings_document_is_fully_active_descendant_of_a_top_level_traversable_with_user_attention(DOM::Document*);
+DOM::DocumentObserver* web_bindings_document_observe_visibility_state(DOM::Document*, GC::Cell*, void (*steps)(JSVM*, GC::Cell*, bool visible));
+bool web_bindings_document_has_been_destroyed(DOM::Document*);
 URL::FFI::RustUrl web_bindings_document_url(DOM::Document*);
+void web_bindings_document_load_timing_info(DOM::Document const*, DOM::DocumentLoadTimingInfo*);
+void web_bindings_document_previous_document_unload_timing(DOM::Document const*, DOM::DocumentUnloadTimingInfo*);
+NavigationTiming::PerformanceNavigationTiming* web_bindings_document_navigation_timing_entry(DOM::Document const*);
+void web_bindings_document_set_navigation_timing_entry(DOM::Document*, NavigationTiming::PerformanceNavigationTiming*);
+bool web_bindings_is_a_registrable_domain_suffix_of_or_is_equal_to(FlatPtr host_suffix_string, URL::FFI::FfiUrlHost const* original_host);
 HTML::WorkerGlobalScope* web_bindings_worker_global_scope_from_global_object(JSObject* global_object);
 HTML::EnvironmentSettingsObject* web_bindings_relevant_settings_object(JSObject* global_object);
+HTML::EnvironmentSettingsObject* web_bindings_principal_realm_settings_object(void* realm);
 JSObject* web_bindings_environment_settings_object_global_object(HTML::EnvironmentSettingsObject*);
+JS::Realm* web_bindings_environment_settings_object_realm(HTML::EnvironmentSettingsObject*);
+double web_bindings_environment_settings_object_time_origin(HTML::EnvironmentSettingsObject*);
+bool web_bindings_environment_settings_object_is_secure_context(HTML::EnvironmentSettingsObject*);
 void web_bindings_environment_settings_object_id(HTML::EnvironmentSettingsObject*, void* ctx, void (*on_id)(void*, ReadonlyBytes));
 bool web_bindings_worker_global_scope_is_closing(HTML::WorkerGlobalScope*);
+void web_bindings_set_has_pending_activity(void* realm, DOM::EventTarget*, bool has_pending_activity);
+void web_bindings_environment_settings_object_origin(HTML::EnvironmentSettingsObject*, void* origin, void (*on_origin)(void*, URL::FFI::FfiOrigin const*));
+void web_bindings_environment_settings_object_creation_url(HTML::EnvironmentSettingsObject*, void* url, void (*on_url)(void*, URL::FFI::RustUrl const*));
+bool web_bindings_environment_settings_object_top_level_origin(HTML::EnvironmentSettingsObject*, void* origin, void (*on_origin)(void*, URL::FFI::FfiOrigin const*));
+void web_bindings_environment_settings_object_api_base_url(HTML::EnvironmentSettingsObject*, void* url, void (*on_url)(void*, URL::FFI::RustUrl const*));
+double web_bindings_environment_settings_object_current_wall_time(HTML::EnvironmentSettingsObject*);
+void web_bindings_environment_settings_object_encoding_parse_url(HTML::EnvironmentSettingsObject*, FlatPtr url, void* parsed_url, void (*on_url)(void*, URL::FFI::RustUrl const*));
 void web_bindings_with_temporary_execution_context(void* realm, bool callbacks_enabled, void* context, void (*steps)(void*));
 bool web_bindings_object_implements_interface(JSObject* object, u16 interface_name);
+bool web_bindings_object_is_window_proxy(JSObject* object);
+JSObject* web_bindings_window_proxy_object_in_realm(JSObject* object, void* realm);
 JSObject* web_bindings_create_dom_exception(void* realm, ReadonlyBytes name, FlatPtr message);
 JSCompletion web_bindings_perform_a_security_check(void* realm, JSValue platform_object, ReadonlyBytes identifier, u8 type);
 bool web_bindings_extract_an_origin(JSObject* object, void* ctx, void (*on_origin)(void*, URL::FFI::FfiOrigin const*));
@@ -154,6 +196,11 @@ bool web_bindings_realm_is_secure_context(void* realm)
     return HTML::is_secure_context(principal_host_defined_environment_settings_object(*static_cast<JS::Realm*>(realm)));
 }
 
+void web_bindings_report_an_exception(void* realm, JSValue exception)
+{
+    HTML::report_exception(JS::throw_completion(JS::HostABI::value_from_abi(exception)), *static_cast<JS::Realm*>(realm));
+}
+
 void web_bindings_push_element_queue()
 {
     main_thread_similar_origin_window_agent().custom_element_reactions_stack.element_queue_stack.append({});
@@ -183,6 +230,11 @@ void web_bindings_for_each_active_window(void* ctx, void (*on_window)(void*, HTM
     });
 }
 
+JS::Realm* web_bindings_window_realm(HTML::Window* window)
+{
+    return &HTML::relevant_realm(*window);
+}
+
 DOM::Document* web_bindings_window_associated_document(HTML::Window* window)
 {
     return &window->associated_document();
@@ -193,14 +245,35 @@ u64 web_bindings_window_page_id(HTML::Window* window)
     return window->page().client().id().value();
 }
 
+bool web_bindings_window_has_transient_activation(HTML::Window* window)
+{
+    return window->has_transient_activation();
+}
+
+void web_bindings_window_consume_user_activation(HTML::Window* window)
+{
+    window->consume_user_activation();
+}
+
+void web_bindings_window_set_last_activation_timestamp_to_now(HTML::Window* window)
+{
+    window->set_last_activation_timestamp(HighResolutionTime::current_high_resolution_time(HTML::relevant_realm(*window).global_object()));
+}
+
+bool web_bindings_is_service_worker_global_scope(JSObject* global_object)
+{
+    auto* worker_global_scope = Bindings::worker_global_scope_from_global_object(*JS::HostABI::object_from_abi(global_object));
+    return worker_global_scope && is<ServiceWorker::ServiceWorkerGlobalScope>(*worker_global_scope);
+}
+
 DOM::EventTarget* web_bindings_window_as_event_target(HTML::Window* window)
 {
     return window;
 }
 
-bool web_bindings_document_has_navigable(DOM::Document* document)
+HTML::LocalNavigable* web_bindings_document_navigable(DOM::Document* document)
 {
-    return document->navigable() != nullptr;
+    return document->navigable().ptr();
 }
 
 bool web_bindings_document_is_fully_active(DOM::Document* document)
@@ -208,9 +281,81 @@ bool web_bindings_document_is_fully_active(DOM::Document* document)
     return document->is_fully_active();
 }
 
+static_assert(to_underlying(DOM::PolicyControlledFeature::EncryptedMedia) == 3);
+static_assert(to_underlying(DOM::PolicyControlledFeature::Geolocation) == 7);
+
+bool web_bindings_document_is_allowed_to_use_feature(DOM::Document* document, u8 feature)
+{
+    return document->is_allowed_to_use_feature(static_cast<DOM::PolicyControlledFeature>(feature));
+}
+
+static_assert(to_underlying(HTML::VisibilityState::Visible) == 0);
+static_assert(to_underlying(HTML::VisibilityState::Hidden) == 1);
+
+u8 web_bindings_document_visibility_state(DOM::Document* document)
+{
+    return to_underlying(document->visibility_state());
+}
+
+void web_bindings_document_origin(DOM::Document* document, void* origin, void (*on_origin)(void*, URL::FFI::FfiOrigin const*))
+{
+    URL::RustIntegration::lend_origin_to_ffi(document->origin(), [&](URL::FFI::FfiOrigin const& ffi_origin) {
+        on_origin(origin, &ffi_origin);
+    });
+}
+
+bool web_bindings_document_has_focus(DOM::Document* document)
+{
+    return document->has_focus();
+}
+
+bool web_bindings_document_is_fully_active_descendant_of_a_top_level_traversable_with_user_attention(DOM::Document* document)
+{
+    return document->is_fully_active_descendant_of_a_top_level_traversable_with_user_attention();
+}
+
+DOM::DocumentObserver* web_bindings_document_observe_visibility_state(DOM::Document* document, GC::Cell* cell, void (*steps)(JSVM*, GC::Cell*, bool visible))
+{
+    auto observer = DOM::DocumentObserver::create(*document);
+    observer->set_document_visibility_state_observer(GC::create_function(GC::Heap::the(), GC::captures(GC::Ref { *cell }, steps), [](auto& cell, auto& steps, HTML::VisibilityState state) {
+        steps(JS::HostABI::vm_to_abi(JS::VM::the()), cell.ptr(), state == HTML::VisibilityState::Visible);
+    }));
+    return observer.ptr();
+}
+
+bool web_bindings_document_has_been_destroyed(DOM::Document* document)
+{
+    return document->has_been_destroyed();
+}
+
 URL::FFI::RustUrl web_bindings_document_url(DOM::Document* document)
 {
     return document->url().to_rust();
+}
+
+void web_bindings_document_load_timing_info(DOM::Document const* document, DOM::DocumentLoadTimingInfo* load_timing_info)
+{
+    *load_timing_info = document->load_timing_info();
+}
+
+void web_bindings_document_previous_document_unload_timing(DOM::Document const* document, DOM::DocumentUnloadTimingInfo* unload_timing)
+{
+    *unload_timing = document->previous_document_unload_timing();
+}
+
+NavigationTiming::PerformanceNavigationTiming* web_bindings_document_navigation_timing_entry(DOM::Document const* document)
+{
+    return document->navigation_timing_entry().ptr();
+}
+
+void web_bindings_document_set_navigation_timing_entry(DOM::Document* document, NavigationTiming::PerformanceNavigationTiming* entry)
+{
+    document->set_navigation_timing_entry(*entry);
+}
+
+bool web_bindings_is_a_registrable_domain_suffix_of_or_is_equal_to(FlatPtr host_suffix_string, URL::FFI::FfiUrlHost const* original_host)
+{
+    return DOM::is_a_registrable_domain_suffix_of_or_is_equal_to(Utf16String::from_raw(host_suffix_string), URL::RustIntegration::host_from_ffi(*original_host).value());
 }
 
 HTML::EnvironmentSettingsObject* web_bindings_relevant_settings_object(JSObject* global_object)
@@ -218,9 +363,29 @@ HTML::EnvironmentSettingsObject* web_bindings_relevant_settings_object(JSObject*
     return &HTML::relevant_settings_object(*JS::HostABI::object_from_abi(global_object));
 }
 
+HTML::EnvironmentSettingsObject* web_bindings_principal_realm_settings_object(void* realm)
+{
+    return &HTML::principal_realm_settings_object(*static_cast<JS::Realm*>(realm));
+}
+
 JSObject* web_bindings_environment_settings_object_global_object(HTML::EnvironmentSettingsObject* settings_object)
 {
     return JS::HostABI::object_to_abi(&settings_object->global_object());
+}
+
+JS::Realm* web_bindings_environment_settings_object_realm(HTML::EnvironmentSettingsObject* settings_object)
+{
+    return &settings_object->realm();
+}
+
+double web_bindings_environment_settings_object_time_origin(HTML::EnvironmentSettingsObject* settings_object)
+{
+    return settings_object->time_origin();
+}
+
+bool web_bindings_environment_settings_object_is_secure_context(HTML::EnvironmentSettingsObject* settings_object)
+{
+    return HTML::is_secure_context(*settings_object);
 }
 
 void web_bindings_environment_settings_object_id(HTML::EnvironmentSettingsObject* settings_object, void* ctx, void (*on_id)(void*, ReadonlyBytes))
@@ -238,6 +403,54 @@ bool web_bindings_worker_global_scope_is_closing(HTML::WorkerGlobalScope* worker
     return worker_global_scope->is_closing();
 }
 
+void web_bindings_environment_settings_object_origin(HTML::EnvironmentSettingsObject* settings_object, void* origin, void (*on_origin)(void*, URL::FFI::FfiOrigin const*))
+{
+    URL::RustIntegration::lend_origin_to_ffi(settings_object->origin(), [&](URL::FFI::FfiOrigin const& ffi_origin) {
+        on_origin(origin, &ffi_origin);
+    });
+}
+
+void web_bindings_environment_settings_object_creation_url(HTML::EnvironmentSettingsObject* settings_object, void* url, void (*on_url)(void*, URL::FFI::RustUrl const*))
+{
+    auto rust_url = settings_object->creation_url.to_rust();
+    on_url(url, &rust_url);
+}
+
+bool web_bindings_environment_settings_object_top_level_origin(HTML::EnvironmentSettingsObject* settings_object, void* origin, void (*on_origin)(void*, URL::FFI::FfiOrigin const*))
+{
+    if (!settings_object->top_level_origin.has_value())
+        return false;
+    URL::RustIntegration::lend_origin_to_ffi(*settings_object->top_level_origin, [&](URL::FFI::FfiOrigin const& ffi_origin) {
+        on_origin(origin, &ffi_origin);
+    });
+    return true;
+}
+
+void web_bindings_environment_settings_object_api_base_url(HTML::EnvironmentSettingsObject* settings_object, void* url, void (*on_url)(void*, URL::FFI::RustUrl const*))
+{
+    auto rust_url = settings_object->api_base_url().to_rust();
+    on_url(url, &rust_url);
+}
+
+double web_bindings_environment_settings_object_current_wall_time(HTML::EnvironmentSettingsObject* settings_object)
+{
+    return settings_object->current_wall_time();
+}
+
+void web_bindings_environment_settings_object_encoding_parse_url(HTML::EnvironmentSettingsObject* settings_object, FlatPtr url, void* parsed_url, void (*on_url)(void*, URL::FFI::RustUrl const*))
+{
+    auto result = settings_object->encoding_parse_url(Utf16String::from_raw(url));
+    if (!result.has_value())
+        return;
+    auto rust_url = result->to_rust();
+    on_url(parsed_url, &rust_url);
+}
+
+void web_bindings_set_has_pending_activity(void* realm, DOM::EventTarget* event_target, bool has_pending_activity)
+{
+    HTML::relevant_window_or_worker_global_scope(static_cast<JS::Realm*>(realm)->global_object()).set_has_pending_activity(*event_target, has_pending_activity);
+}
+
 void web_bindings_with_temporary_execution_context(void* realm, bool callbacks_enabled, void* context, void (*steps)(void*))
 {
     HTML::TemporaryExecutionContext execution_context { *static_cast<JS::Realm*>(realm), callbacks_enabled ? HTML::TemporaryExecutionContext::CallbacksEnabled::Yes : HTML::TemporaryExecutionContext::CallbacksEnabled::No };
@@ -248,6 +461,20 @@ bool web_bindings_object_implements_interface(JSObject* object, u16 interface_na
 {
     auto* wrappable = wrappable_impl_from(JS::HostABI::object_from_abi(object));
     return wrappable && wrappable->implements_interface(static_cast<InterfaceName>(interface_name));
+}
+
+bool web_bindings_object_is_window_proxy(JSObject* object)
+{
+    return HTML::WindowProxy::from_object(*JS::HostABI::object_from_abi(object));
+}
+
+JSObject* web_bindings_window_proxy_object_in_realm(JSObject* object, void* realm)
+{
+    auto& js_realm = *static_cast<JS::Realm*>(realm);
+    auto& window_proxy = *HTML::WindowProxy::from_object(*JS::HostABI::object_from_abi(object));
+    if (auto browsing_context = window_proxy.associated_browsing_context())
+        return JS::HostABI::object_to_abi(&browsing_context->window_proxy_for(host_defined_wrapper_world(js_realm), js_realm)->object());
+    return object;
 }
 
 JSObject* web_bindings_create_dom_exception(void* realm, ReadonlyBytes name, FlatPtr message)
@@ -319,20 +546,34 @@ void web_bindings_run_in_parallel(void* realm, void* cell, void (*steps)(JSVM*, 
     }));
 }
 
+void web_bindings_spin_until_promise_is_settled(JSObject* promise)
+{
+    auto& js_promise = as<JS::Promise>(*JS::HostABI::object_from_abi(promise));
+    HTML::main_thread_event_loop().spin_until(GC::create_function(GC::Heap::the(), GC::captures(js_promise), [](auto& js_promise) {
+        return js_promise.state() != JS::Promise::State::Pending;
+    }));
+}
+
 // NB: The task sources of the Rust bindings' TaskSource.
 static_assert(to_underlying(HTML::Task::Source::Unspecified) == 0);
+static_assert(to_underlying(HTML::Task::Source::UserInteraction) == 2);
 static_assert(to_underlying(HTML::Task::Source::Networking) == 3);
+static_assert(to_underlying(HTML::Task::Source::Geolocation) == 10);
+static_assert(to_underlying(HTML::Task::Source::TimerTask) == 8);
 static_assert(to_underlying(HTML::Task::Source::FileReading) == 13);
+static_assert(to_underlying(HTML::Task::Source::PerformanceTimeline) == 15);
+static_assert(to_underlying(HTML::Task::Source::Clipboard) == 17);
+static_assert(to_underlying(HTML::Task::Source::Permissions) == 18);
+static_assert(to_underlying(HTML::Task::Source::RemoteEvent) == 20);
+static_assert(to_underlying(HTML::Task::Source::WebGL) == 26);
 static_assert(to_underlying(HTML::Task::Source::Crypto) == 27);
 static_assert(to_underlying(HTML::Task::Source::Storage) == 29);
 
-void web_bindings_queue_a_task(void* realm, u8 task_source, void* cell, void (*steps)(JSVM*, void*))
+void web_bindings_queue_a_task(u8 task_source, void* cell, void (*steps)(JSVM*, void*))
 {
-    GC::Ref<JS::Realm> js_realm = *static_cast<JS::Realm*>(realm);
     // NB: The task's captures, which the collector traces, keep the cell alive until the steps run.
-    HTML::queue_a_task(static_cast<HTML::Task::Source>(task_source), nullptr, nullptr, GC::create_function(GC::Heap::the(), GC::captures(js_realm, GC::Ref { *static_cast<GC::Cell*>(cell) }, steps), [](auto& js_realm, auto& cell, auto& steps) {
-        HTML::TemporaryExecutionContext execution_context { js_realm, HTML::TemporaryExecutionContext::CallbacksEnabled::Yes };
-        steps(JS::HostABI::vm_to_abi(js_realm->vm()), cell.ptr());
+    HTML::queue_a_task(static_cast<HTML::Task::Source>(task_source), nullptr, nullptr, GC::create_function(GC::Heap::the(), GC::captures(GC::Ref { *static_cast<GC::Cell*>(cell) }, steps), [](auto& cell, auto& steps) {
+        steps(JS::HostABI::vm_to_abi(JS::VM::the()), cell.ptr());
     }));
 }
 
@@ -385,6 +626,16 @@ JSCompletion web_bindings_invoke_callback_function(void* callback, bool has_this
     if (completion.is_error())
         return JS::HostABI::throw_completion_to_abi(completion.value());
     return JS::HostABI::normal_completion_to_abi(JS::HostABI::value_to_abi(completion.value()));
+}
+
+void web_bindings_invoke_callback_function_and_report(void* callback, ReadonlySpan<JSValue> arguments)
+{
+    (void)WebIDL::invoke_callback(*static_cast<WebIDL::CallbackType*>(callback), {}, WebIDL::ExceptionBehavior::Report, callback_arguments(arguments));
+}
+
+JSObject* web_bindings_callback_function_callback(void* callback)
+{
+    return JS::HostABI::object_to_abi(static_cast<WebIDL::CallbackType*>(callback)->callback.ptr());
 }
 
 void* web_bindings_invoke_promise_callback_function(void* callback, bool has_this_value, JSValue this_value, ReadonlySpan<JSValue> arguments)

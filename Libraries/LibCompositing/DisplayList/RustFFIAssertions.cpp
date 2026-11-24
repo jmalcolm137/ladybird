@@ -5,7 +5,7 @@
  */
 
 #include <AK/StdLibExtras.h>
-#include <LibCompositing/DisplayList/AccumulatedVisualContext.h>
+#include <LibCompositing/CanvasSize.h>
 #include <LibCompositing/DisplayList/ContextRef.h>
 #include <LibCompositing/DisplayList/DisplayListCommand.h>
 #include <LibCompositing/DisplayList/DisplayListResourceIds.h>
@@ -25,10 +25,13 @@
 #include <LibGfx/ScalingMode.h>
 #include <LibGfx/Size.h>
 #include <LibGfx/WindingRule.h>
+#include <LibMedia/VideoSinkHandle.h>
 
 // The Rust side mirrors these LibGfx value types field for field; the checks keep the two in step.
 
 namespace Compositing {
+
+static_assert(Compositing::RustFFI::MAX_CANVAS_AREA == max_canvas_area);
 
 static_assert(sizeof(Compositing::RustFFI::IntPoint) == sizeof(Gfx::IntPoint));
 static_assert(alignof(Compositing::RustFFI::IntPoint) == alignof(Gfx::IntPoint));
@@ -76,6 +79,10 @@ static_assert(to_underlying(Compositing::RustFFI::ScalingMode::None) == to_under
 static_assert(to_underlying(Compositing::RustFFI::ScalingMode::Bilinear) == to_underlying(Gfx::ScalingMode::Bilinear));
 static_assert(to_underlying(Compositing::RustFFI::ScalingMode::BilinearMipmap) == to_underlying(Gfx::ScalingMode::BilinearMipmap));
 static_assert(to_underlying(Compositing::RustFFI::ScalingMode::NearestNeighbor) == to_underlying(Gfx::ScalingMode::NearestNeighbor));
+static_assert(sizeof(Compositing::RustFFI::SnapSelectionStrategyType) == sizeof(Compositing::SnapSelectionStrategy::Type));
+static_assert(to_underlying(Compositing::RustFFI::SnapSelectionStrategyType::EndPosition) == to_underlying(Compositing::SnapSelectionStrategy::Type::EndPosition));
+static_assert(to_underlying(Compositing::RustFFI::SnapSelectionStrategyType::Direction) == to_underlying(Compositing::SnapSelectionStrategy::Type::Direction));
+static_assert(to_underlying(Compositing::RustFFI::SnapSelectionStrategyType::EndPositionAndDirection) == to_underlying(Compositing::SnapSelectionStrategy::Type::EndPositionAndDirection));
 static_assert(sizeof(Compositing::RustFFI::CompositingAndBlendingOperator) == sizeof(Gfx::CompositingAndBlendingOperator));
 static_assert(to_underlying(Compositing::RustFFI::CompositingAndBlendingOperator::Normal) == to_underlying(Gfx::CompositingAndBlendingOperator::Normal));
 static_assert(to_underlying(Compositing::RustFFI::CompositingAndBlendingOperator::Multiply) == to_underlying(Gfx::CompositingAndBlendingOperator::Multiply));
@@ -163,7 +170,7 @@ static_assert(to_underlying(Compositing::RustFFI::ColorFilterType::Saturate) == 
 static_assert(to_underlying(Compositing::RustFFI::ColorFilterType::Sepia) == to_underlying(Gfx::ColorFilterType::Sepia));
 static_assert(sizeof(Compositing::RustFFI::FontResourceId) == sizeof(FontResourceId));
 static_assert(sizeof(Compositing::RustFFI::ImageFrameResourceId) == sizeof(ImageFrameResourceId));
-static_assert(sizeof(Compositing::RustFFI::VideoSinkResourceId) == sizeof(VideoSinkResourceId));
+static_assert(sizeof(Compositing::RustFFI::VideoSinkHandle) == sizeof(Media::VideoSinkHandle));
 static_assert(sizeof(Compositing::RustFFI::DisplayListResourceId) == sizeof(DisplayListResourceId));
 static_assert(sizeof(Compositing::RustFFI::CanvasId) == sizeof(CanvasId));
 static_assert(sizeof(Compositing::RustFFI::CompositorContextId) == sizeof(Web::CompositorContextId));

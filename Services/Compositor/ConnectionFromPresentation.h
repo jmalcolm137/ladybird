@@ -25,29 +25,27 @@ public:
 
     void set_on_death(Function<void()> on_death) { m_on_death = move(on_death); }
 
+    virtual PresentationId presentation_id() const override { return m_presentation_id; }
+
 private:
     ConnectionFromPresentation(NonnullOwnPtr<IPC::Transport>, NonnullRefPtr<CompositorState>, CompositorState::PresentationCapabilities);
 
     virtual void die() override;
-
+    virtual void post_message_to_presentation(IPC::MessageBuffer&) override;
     virtual void did_allocate_backing_stores(Web::CompositorContextId, Vector<i32> bitmap_ids, Vector<Gfx::SharedImage>&& backing_stores) override;
     virtual void did_add_backing_stores(Web::CompositorContextId, Vector<i32> bitmap_ids, Vector<Gfx::SharedImage>&& backing_stores) override;
     virtual void did_retire_backing_stores(Web::CompositorContextId, Vector<i32> bitmap_ids) override;
-    virtual void did_present_frame(Web::CompositorContextId, Gfx::IntRect content_rect, Gfx::IntRect damage_rect, i32 bitmap_id, double device_pixel_ratio) override;
-    virtual void did_consume_input_event(Web::CompositorContextId, u64 event_id) override;
-    virtual void did_not_dispatch_input_event(Web::CompositorContextId, u64 event_id) override;
-    virtual void did_dispatch_input_event(Web::CompositorContextId, u64 event_id, bool performed_default_action) override;
 
-    virtual void handle_and_dispatch_key_event(Web::CompositorContextId, Web::KeyEvent, bool allow_keyboard_scroll) override;
-    virtual void handle_and_dispatch_pinch_event(Web::CompositorContextId, Web::PinchEvent) override;
-    virtual void handle_and_dispatch_mouse_event(Web::CompositorContextId, Web::MouseEvent) override;
+    virtual ErrorOr<OwnPtr<IPC::MessageBuffer>> handle_raw(IPC::RawMessage&) override;
     virtual void presented_bitmap_ready_to_paint(Web::CompositorContextId, i32 bitmap_id) override;
+    virtual void take_frame_snapshot(Web::CompositorContextId, u64 request_id) override;
     virtual void set_client_gpu_presentation_capability(bool supported, u64 adapter_luid) override;
     virtual void set_scrollbar_track_press_jumps(bool jumps) override;
 
     bool is_bound_to(Web::CompositorContextId) const;
 
     NonnullRefPtr<CompositorState> m_compositor_state;
+    PresentationId m_presentation_id;
     Function<void()> m_on_death;
 };
 

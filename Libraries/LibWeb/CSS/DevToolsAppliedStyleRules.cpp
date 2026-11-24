@@ -6,7 +6,6 @@
 
 #include <AK/Array.h>
 #include <AK/BinarySearch.h>
-#include <AK/Bitmap.h>
 #include <AK/BuiltinWrappers.h>
 #include <AK/Debug.h>
 #include <AK/Error.h>
@@ -25,16 +24,11 @@
 #include <LibGC/Heap.h>
 #include <LibGfx/Font/FontDatabase.h>
 #include <LibWeb/Animations/AnimationEffect.h>
-#include <LibWeb/Animations/DocumentTimeline.h>
-#include <LibWeb/Animations/ScrollTimeline.h>
-#include <LibWeb/Animations/ViewTimeline.h>
 #include <LibWeb/Bindings/PrincipalHostDefined.h>
-#include <LibWeb/CSS/CSSAnimation.h>
 #include <LibWeb/CSS/CSSImportRule.h>
 #include <LibWeb/CSS/CSSNestedDeclarations.h>
 #include <LibWeb/CSS/CSSStyleProperties.h>
 #include <LibWeb/CSS/CSSStyleRule.h>
-#include <LibWeb/CSS/CSSTransition.h>
 #include <LibWeb/CSS/ComputedStyleWorkingSet.h>
 #include <LibWeb/CSS/ContainerQuery.h>
 #include <LibWeb/CSS/CustomPropertyData.h>
@@ -49,7 +43,6 @@
 #include <LibWeb/CSS/SelectorMatching.h>
 #include <LibWeb/CSS/StyleComputeFFI.h>
 #include <LibWeb/CSS/StyleComputer.h>
-#include <LibWeb/CSS/StyleEngineEffectTiming.h>
 #include <LibWeb/CSS/StyleEngineInput.h>
 #include <LibWeb/CSS/StyleProperty.h>
 #include <LibWeb/CSS/StyleScope.h>

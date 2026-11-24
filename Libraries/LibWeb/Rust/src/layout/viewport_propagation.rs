@@ -17,6 +17,7 @@ use crate::css::style::bridge::{element_adjustment_fact, element_construction_fa
 use crate::css::style::tree::StyleNodeID;
 use crate::layout::LayoutNodeArena;
 use crate::layout::node_data::NodeSlotId;
+use crate::painting::record::change_ticks::RowPaintChange;
 
 /// What the propagation reads of the document element and its first HTML body child element.
 #[derive(Clone, Copy)]
@@ -51,11 +52,19 @@ fn published_style(engine: &RetainedState, node: StyleNodeID) -> Option<Computed
 
 fn has_any_containment(style: ComputedValuesView<'_>) -> bool {
     let values = style.box_values();
+    // https://drafts.csswg.org/css-conditional-5/#valdef-container-type-size
+    // Applies style containment and size containment to the principal box, and establishes an independent formatting
+    // context.
+    // https://drafts.csswg.org/css-conditional-5/#valdef-container-type-inline-size
+    // Applies style containment and inline-size containment to the principal box, and establishes an independent
+    // formatting context.
     values.size_containment
         || values.inline_size_containment
         || values.layout_containment
         || values.style_containment
         || values.paint_containment
+        || values.is_size_container
+        || values.is_inline_size_container
 }
 
 /// The document element, which is the first DOM child of the style node the viewport box was
@@ -318,6 +327,11 @@ pub(crate) fn propagate_root_styles_to_viewport(
 ) {
     assert!(!viewport.is_invalid());
     let apply_overflow = |arena: &mut LayoutNodeArena, node: NodeSlotId, (x, y): (u8, u8)| {
+        let (x, y) = if node == viewport && arena.suppresses_viewport_scrolling {
+            (overflow::HIDDEN, overflow::HIDDEN)
+        } else {
+            (x, y)
+        };
         arena.update_layout_style(host_calls, node, |style, _| style.set_overflow(x, y));
     };
     let apply_writing_mode_and_direction =
@@ -335,7 +349,7 @@ pub(crate) fn propagate_root_styles_to_viewport(
         // The viewport's scroll node records what the viewport does at its boundary, and a new style for the
         // viewport box does not get it recorded again by itself.
         if changed {
-            arena.push_paint_damage(viewport, crate::painting::record::damage::PaintDamage::SCROLL_METADATA);
+            arena.note_paint_change(viewport, RowPaintChange::SCROLL_METADATA);
         }
     };
 

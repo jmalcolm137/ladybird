@@ -1397,9 +1397,12 @@ impl<'a> Checker<'a> {
             let symbol = self.lookup(name)?;
             if matches!(
                 symbol.ty,
-                Type::EnvironmentCoordinateCacheIndex | Type::GlobalVariableCacheIndex | Type::PropertyLookupCacheIndex
+                Type::EnvironmentCoordinateCacheIndex
+                    | Type::GlobalVariableCacheIndex
+                    | Type::PropertyLookupCacheIndex
+                    | Type::ProfiledPropertyLookupCacheIndex
             ) {
-                return Some((symbol.ty.clone(), Type::U32, BytecodeOperation::Load(FieldWidth::U32)));
+                return Some((symbol.ty.clone(), Type::U32, BytecodeOperation::Load(FieldWidth::U16)));
             }
             if matches!(
                 symbol.ty,
@@ -1950,8 +1953,12 @@ impl<'a> Checker<'a> {
                     return self.error(operand.span, format!("unknown binding '{name}'"));
                 };
                 let return_type = if symbol.ty == Type::EnvironmentCoordinate {
-                    Type::EnvironmentCoordinateEntry
-                } else if self.bytecode_fields.contains(&symbol.id) && matches!(symbol.ty, Type::Sequence(_)) {
+                    Type::BytecodeEnvironmentCoordinate
+                } else if (self.bytecode_fields.contains(&symbol.id) || symbol.parameter_mode.is_some())
+                    && matches!(symbol.ty, Type::Sequence(_))
+                {
+                    // NB: A sequence parameter of an inline function is a bytecode field of the handler
+                    //     that calls it; lowering rejects any other argument.
                     symbol.ty.clone()
                 } else {
                     return self.error(operand.span, format!("cannot take the address of {}", symbol.ty));
@@ -2713,7 +2720,10 @@ impl<'a> Checker<'a> {
                     return Ok(Value::new(ValueKind::Integer(value), Type::Bool, expression.span));
                 }
                 if let Some(symbol) = self.lookup(name) {
-                    if &symbol.ty != expected {
+                    // NB: A property lookup cache index that also indexes value feedback is one still.
+                    let is_property_lookup_cache_index = symbol.ty == Type::ProfiledPropertyLookupCacheIndex
+                        && *expected == Type::PropertyLookupCacheIndex;
+                    if &symbol.ty != expected && !is_property_lookup_cache_index {
                         return self.error(
                             expression.span,
                             format!("expected {expected}, found {} for '{name}'", symbol.ty),
@@ -3037,6 +3047,7 @@ fn field_width(ty: &Type, allow_pointer: bool) -> Option<FieldWidth> {
         | Type::EnvironmentShape
         | Type::DeclarativeEnvironmentRareData
         | Type::GlobalVariableCache
+        | Type::CallCache
         | Type::PropertyLookupCache
         | Type::ObjectPropertyIteratorCacheData
         | Type::ObjectPropertyIteratorCache
@@ -3249,6 +3260,152 @@ struct InlineCallSummary {
 enum InlineOperationArgument {
     Function(InlineFunctionId),
     Parameter(VariableId),
+}
+
+/// A handler's operand array is a bytecode field: as a value, it is the field's offset in the instruction, and only
+/// its address (`&operands`) finds the operands. Inline functions cannot tell an operand array from a sequence
+/// that holds an address, so a handler may only pass its operand arrays to parameters that are not used as values.
+fn validate_operand_array_uses(
+    filename: &str,
+    inline_functions: &[InlineFunction],
+    handlers: &[Handler],
+) -> Result<(), Diagnostic> {
+    // Visits every use of a variable as a value, with the call and the argument's index for a call argument.
+    fn for_each_use(statements: &[Statement], visit: &mut impl FnMut(VariableId, Option<(&Call, usize)>, SourceSpan)) {
+        for statement in statements {
+            let mut uses = Vec::new();
+            match &statement.kind {
+                StatementKindIr::Call(_, call) => {
+                    for (argument_index, argument) in call.arguments.iter().enumerate() {
+                        match argument.kind {
+                            ValueKind::Variable(variable) => {
+                                visit(variable, Some((call, argument_index)), statement.span)
+                            }
+                            _ => uses.extend(value_variable_ids(argument)),
+                        }
+                    }
+                }
+                StatementKindIr::MachineAssign { arguments, .. } => {
+                    uses.extend(arguments.iter().flat_map(value_variable_ids));
+                }
+                StatementKindIr::ValueRefinement { value, .. } | StatementKindIr::ValueMatch { value, .. } => {
+                    uses.extend(value_variable_ids(value));
+                }
+                StatementKindIr::ScalarMatch { value, arms, .. } => {
+                    uses.extend(value_variable_ids(value));
+                    for arm in arms {
+                        add_scalar_pattern_variables(&mut uses, &arm.pattern);
+                    }
+                }
+                StatementKindIr::Assert(condition)
+                | StatementKindIr::Guard { condition, .. }
+                | StatementKindIr::If { condition, .. }
+                | StatementKindIr::While { condition, .. } => {
+                    uses.extend(condition_uses_and_defs(condition).0);
+                }
+                StatementKindIr::Continuation { .. } => {}
+            }
+            for variable in uses {
+                visit(variable, None, statement.span);
+            }
+            statement.kind.for_each_nested_body(|body| for_each_use(body, visit));
+        }
+    }
+    fn takes_address(call: &Call) -> bool {
+        call.target == CallTarget::Intrinsic(Intrinsic::Address(AddressOperation::BytecodeField))
+    }
+
+    // The sequence parameters that an inline function uses as values, directly or through the inline functions
+    // that it passes them to.
+    let mut used_as_value = HashSet::default();
+    let mut forwards = Vec::new();
+    for (function_index, function) in inline_functions.iter().enumerate() {
+        // NB: The arguments of a call leave out the parameters that the return value becomes.
+        let parameter_indices = function
+            .parameters
+            .iter()
+            .filter(|parameter| !function.body.variables[**parameter].name.starts_with("__return_value"))
+            .enumerate()
+            .filter(|(_, parameter)| matches!(function.body.variables[**parameter].ty, Type::Sequence(_)))
+            .map(|(index, parameter)| (*parameter, index))
+            .collect::<HashMap<_, _>>();
+        for_each_use(&function.body.statements, &mut |variable, argument, _| {
+            let Some(&parameter_index) = parameter_indices.get(&variable) else {
+                return;
+            };
+            match argument {
+                Some((call, argument_index)) => match call.target {
+                    CallTarget::InlineFunction(callee) => {
+                        forwards.push(((function_index, parameter_index), (callee.index(), argument_index)));
+                    }
+                    _ if takes_address(call) => {}
+                    _ => {
+                        used_as_value.insert((function_index, parameter_index));
+                    }
+                },
+                None => {
+                    used_as_value.insert((function_index, parameter_index));
+                }
+            }
+        });
+    }
+    loop {
+        let before = used_as_value.len();
+        for (parameter, forwarded_to) in &forwards {
+            if used_as_value.contains(forwarded_to) {
+                used_as_value.insert(*parameter);
+            }
+        }
+        if used_as_value.len() == before {
+            break;
+        }
+    }
+
+    for handler in handlers {
+        let body = &handler.body;
+        let mut error = None;
+        for_each_use(&body.statements, &mut |variable, argument, span| {
+            if error.is_some()
+                || !body.bytecode_fields.contains(&variable)
+                || !matches!(body.variables[variable].ty, Type::Sequence(_))
+            {
+                return;
+            }
+            let name = &body.variables[variable].name;
+            let value_use_error = || {
+                Diagnostic::new(
+                    filename,
+                    span,
+                    format!(
+                        "the operand array '{name}' as a value is the field's offset; use '&{name}' for its address"
+                    ),
+                )
+            };
+            let Some((call, argument_index)) = argument else {
+                error = Some(value_use_error());
+                return;
+            };
+            match call.target {
+                CallTarget::InlineFunction(callee) if used_as_value.contains(&(callee.index(), argument_index)) => {
+                    let callee = &inline_functions[callee.index()].name;
+                    error = Some(Diagnostic::new(
+                        filename,
+                        span,
+                        format!(
+                            "'{callee}' uses its parameter for the operand array '{name}' as a value, which is the field's offset; it has to take the address with '&'"
+                        ),
+                    ));
+                }
+                CallTarget::InlineFunction(_) => {}
+                _ if takes_address(call) => {}
+                _ => error = Some(value_use_error()),
+            }
+        });
+        if let Some(error) = error {
+            return Err(error);
+        }
+    }
+    Ok(())
 }
 
 struct InlineCallSite {
@@ -3646,6 +3803,7 @@ pub(crate) fn check_with_layouts(
         }
     }
     validate_inline_call_graph(filename, &inline_functions)?;
+    validate_operand_array_uses(filename, &inline_functions, &handlers)?;
     Ok(Program {
         inline_functions,
         handlers,

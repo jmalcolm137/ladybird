@@ -10,9 +10,11 @@
 #include <AK/NonnullRefPtr.h>
 #include <AK/OwnPtr.h>
 #include <AK/RefPtr.h>
+#include <AK/StringView.h>
 #include <AK/Vector.h>
 #include <Compositor/PaintingSurface.h>
-#include <LibCompositing/WebGL/GLFunctions.h>
+#include <Compositor/PresentableSurface.h>
+#include <LibCompositing/WebGL/Types.h>
 #include <LibGfx/Forward.h>
 #include <LibGfx/Size.h>
 
@@ -24,7 +26,7 @@ class SkImage;
 
 namespace Compositor {
 
-class OpenGLContext : public Compositing::WebGL::GLFunctions {
+class OpenGLContext {
 public:
     AK_ALLOC_WITH_KMALLOC;
 
@@ -37,8 +39,8 @@ public:
     };
 
     static OwnPtr<OpenGLContext> create(RefPtr<Gfx::SkiaBackendContext>, WebGLVersion, DrawingBufferOptions);
+    static void const* address_of_function(char const* name);
 
-    void clear_buffer_to_default_values();
     void allocate_painting_surface_if_needed();
 
     struct Impl;
@@ -58,21 +60,18 @@ public:
 
     RefPtr<Gfx::PaintingSurface> drawing_buffer_surface();
     RefPtr<Gfx::PaintingSurface> presented_surface();
+    // Null where the window server cannot show the presented buffer as it is.
+    RefPtr<PresentableSurface> presented_presentable_surface();
 
     u32 default_framebuffer() const;
     u32 default_renderbuffer() const;
 
-    Vector<String> get_supported_opengl_extensions();
-
-    // Keeps the errors WebGL has yet to collect apart from those of the Compositor's own GL work.
-    GLenum get_error();
-    bool stash_errors();
-    void discard_errors();
-
     WebGLVersion webgl_version() const { return m_webgl_version; }
+    bool supports_pixel_buffer_objects() const;
+    bool supports_pack_subimage_parameters() const;
     bool can_copy_images_into_textures();
     // The source size is the part of the image to copy, which can be smaller than the image.
-    bool copy_image_into_bound_texture(SkImage const&, Gfx::IntSize source_size, Gfx::IntSize, GLenum target, GLint level, GLint xoffset, GLint yoffset, bool flip_y, bool premultiply_alpha);
+    bool copy_image_into_bound_texture(SkImage const&, Gfx::IntSize source_size, Gfx::IntSize, u32 target, i32 level, i32 xoffset, i32 yoffset, bool flip_y, bool premultiply_alpha);
 
 private:
     struct ColorBuffer;
@@ -83,15 +82,16 @@ private:
     NonnullOwnPtr<Impl> m_impl;
     WebGLVersion m_webgl_version;
     [[maybe_unused]] DrawingBufferOptions m_drawing_buffer_options;
-    Vector<GLenum> m_stashed_errors;
 
     void free_surface_resources();
     void free_color_buffer(ColorBuffer&);
     bool allocate_color_buffer(ColorBuffer&);
+    size_t next_color_buffer_index_after(size_t presented_index) const;
     bool allocate_shared_color_buffer(ColorBuffer&, Gfx::IntSize, Gfx::PaintingSurface::Origin);
     void attach_color_buffer_to_default_framebuffer(ColorBuffer const&);
     u32 color_buffer_texture_target() const;
     bool supports_copy_texture();
+    bool is_webgl2_or_has_enabled_extension(StringView) const;
 #if defined(AK_OS_MACOS)
     void allocate_iosurface_color_buffer(ColorBuffer&, Gfx::IntSize, Gfx::PaintingSurface::Origin);
 #endif

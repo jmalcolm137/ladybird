@@ -14,6 +14,7 @@
 #include <AK/Types.h>
 #include <LibCore/File.h>
 #include <LibCore/Notifier.h>
+#include <LibHTTP/Cache/CacheKey.h>
 #include <LibHTTP/Cache/Version.h>
 #include <LibHTTP/Forward.h>
 #include <LibHTTP/HeaderList.h>
@@ -31,7 +32,8 @@ struct CacheHeader {
     u32 magic { CACHE_MAGIC };
     u32 version { CACHE_VERSION };
 
-    u32 key_hash { 0 };
+    CacheDigest cache_key;
+    CacheDigest vary_key;
 
     u32 url_size { 0 };
     u32 url_hash { 0 };
@@ -66,7 +68,7 @@ public:
 
     virtual ~CacheEntry() = default;
 
-    u64 cache_key() const { return m_cache_key; }
+    CacheDigest const& cache_key() const { return m_cache_key; }
     u64 body_size() const { return m_cache_footer.data_size; }
 
     void remove();
@@ -74,15 +76,15 @@ public:
     void mark_for_deletion(Badge<DiskCache>) { m_marked_for_deletion = true; }
 
 protected:
-    CacheEntry(DiskCache&, CacheIndex&, u64 cache_key, u64 vary_key, String url, Optional<LexicalPath>, CacheHeader);
+    CacheEntry(DiskCache&, CacheIndex&, CacheDigest const& cache_key, CacheDigest const& vary_key, String url, Optional<LexicalPath>, CacheHeader);
 
     void close_and_destroy_cache_entry();
 
     DiskCache& m_disk_cache;
     CacheIndex& m_index;
 
-    u64 m_cache_key { 0 };
-    u64 m_vary_key { 0 };
+    CacheDigest m_cache_key;
+    CacheDigest m_vary_key;
 
     String m_url;
     Optional<LexicalPath> m_path;
@@ -95,7 +97,7 @@ protected:
 
 class CacheEntryWriter final : public CacheEntry {
 public:
-    static ErrorOr<NonnullOwnPtr<CacheEntryWriter>> create(DiskCache&, CacheIndex&, u64 cache_key, String url, UnixDateTime request_time, AK::Duration current_time_offset_for_testing);
+    static ErrorOr<NonnullOwnPtr<CacheEntryWriter>> create(DiskCache&, CacheIndex&, CacheDigest const& cache_key, String url, UnixDateTime request_time, AK::Duration current_time_offset_for_testing);
     virtual ~CacheEntryWriter() override = default;
 
     ErrorOr<void> write_status_and_reason(u32 status_code, Optional<String> reason_phrase, HeaderList const& request_headers, HeaderList const& response_headers);
@@ -105,7 +107,7 @@ public:
     void remove_incomplete_entry();
 
 private:
-    CacheEntryWriter(DiskCache&, CacheIndex&, u64 cache_key, String url, CacheHeader, UnixDateTime request_time, AK::Duration current_time_offset_for_testing);
+    CacheEntryWriter(DiskCache&, CacheIndex&, CacheDigest const& cache_key, String url, CacheHeader, UnixDateTime request_time, AK::Duration current_time_offset_for_testing);
 
     ErrorOr<void> flush_impl(NonnullRefPtr<HeaderList> request_headers, CacheEntryBodyFile*);
     void remove_incomplete_temporary_file();
@@ -123,7 +125,7 @@ private:
 
 class CacheEntryReader final : public CacheEntry {
 public:
-    static ErrorOr<NonnullOwnPtr<CacheEntryReader>> create(DiskCache&, CacheIndex&, u64 cache_key, u64 vary_key, NonnullRefPtr<HeaderList>, u64 data_size);
+    static ErrorOr<NonnullOwnPtr<CacheEntryReader>> create(DiskCache&, CacheIndex&, CacheDigest const& cache_key, CacheDigest const& vary_key, String const& url, NonnullRefPtr<HeaderList>, u64 data_size);
     virtual ~CacheEntryReader() override = default;
 
     enum class RevalidationType {
@@ -134,7 +136,7 @@ public:
     RevalidationType revalidation_type() const { return m_revalidation_type; }
     void set_revalidation_type(RevalidationType revalidation_type) { m_revalidation_type = revalidation_type; }
 
-    void revalidation_succeeded(HeaderList const&);
+    void revalidation_succeeded(HeaderList const&, UnixDateTime request_time, UnixDateTime response_time);
     void revalidation_failed();
 
     void send_to(int socket_fd, Function<void(u64 bytes_sent)> on_complete, Function<void(u64 bytes_sent)> on_error);
@@ -149,7 +151,7 @@ public:
     HeaderList const& response_headers() const { return m_response_headers; }
 
 private:
-    CacheEntryReader(DiskCache&, CacheIndex&, u64 cache_key, u64 vary_key, String url, LexicalPath, NonnullOwnPtr<Core::File>, int fd, CacheHeader, Optional<String> reason_phrase, NonnullRefPtr<HeaderList>, u64 data_offset, u64 data_size);
+    CacheEntryReader(DiskCache&, CacheIndex&, CacheDigest const& cache_key, CacheDigest const& vary_key, String url, LexicalPath, NonnullOwnPtr<Core::File>, int fd, CacheHeader, Optional<String> reason_phrase, NonnullRefPtr<HeaderList>, u64 data_offset, u64 data_size);
 
     void send_without_blocking();
     void send_complete();

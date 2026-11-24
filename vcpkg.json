@@ -1,5 +1,5 @@
 {
-  "builtin-baseline": "20ceb8adbf0504d4b0d5e4058a32f9d4fc896391",
+  "builtin-baseline": "8f363bdc11359ede4bc51e5eb32a2617538049c8",
   "dependencies": [
     {
       "name": "angle",
@@ -93,16 +93,11 @@
         "apng"
       ]
     },
-    {
-      "name": "libproxy",
-      "platform": "!(android | bsd)"
-    },
     "libpsl",
     {
       "name": "libedit",
       "platform": "!windows & !android"
     },
-    "libtommath",
     {
       "name": "libwebp",
       "features": [
@@ -111,7 +106,6 @@
         "simd"
       ]
     },
-    "libxml2",
     "llvm-libc",
     {
       "name": "mman",
@@ -273,6 +267,59 @@
     "zlib",
     "zmij"
   ],
+  "features": {
+    "qt": {
+      "description": "Build Qt for Linux distributions",
+      "dependencies": [
+        {
+          "name": "qtbase",
+          "platform": "linux",
+          "default-features": false,
+          "features": [
+            "dbus",
+            "doubleconversion",
+            "egl",
+            "fontconfig",
+            "freetype",
+            "harfbuzz",
+            "icu",
+            "jpeg",
+            "network",
+            "opengl",
+            "openssl",
+            "pcre2",
+            "png",
+            "thread",
+            "vulkan",
+            "wayland",
+            "widgets",
+            "xcb",
+            "xcb-xlib",
+            "zstd"
+          ]
+        },
+        {
+          "name": "qtpositioning",
+          "platform": "linux",
+          "default-features": false
+        },
+        {
+          "name": "qtsvg",
+          "platform": "linux",
+          "default-features": false
+        }
+      ]
+    },
+    "sparkle": {
+      "description": "Update the macOS app with Sparkle",
+      "dependencies": [
+        {
+          "name": "sparkle",
+          "platform": "osx"
+        }
+      ]
+    }
+  },
   "overrides": [
     {
       "name": "angle",
@@ -280,7 +327,7 @@
     },
     {
       "name": "brotli",
-      "version": "1.2.0#0"
+      "version": "1.2.1#0"
     },
     {
       "name": "cpptrace",
@@ -288,7 +335,7 @@
     },
     {
       "name": "curl",
-      "version": "8.23.0#1"
+      "version": "8.23.0#2"
     },
     {
       "name": "dav1d",
@@ -296,7 +343,7 @@
     },
     {
       "name": "dbus",
-      "version": "1.16.2#5"
+      "version": "1.16.4#0"
     },
     {
       "name": "dirent",
@@ -304,7 +351,7 @@
     },
     {
       "name": "fast-float",
-      "version": "8.3.1#0"
+      "version": "8.3.3#0"
     },
     {
       "name": "ffmpeg",
@@ -326,7 +373,7 @@
     },
     {
       "name": "icu",
-      "version": "78.3#2"
+      "version": "78.3#4"
     },
     {
       "name": "libavif",
@@ -342,31 +389,19 @@
     },
     {
       "name": "libjpeg-turbo",
-      "version": "3.2.0#1"
+      "version": "3.2.1#0"
     },
     {
       "name": "libpng",
       "version": "1.6.59#0"
     },
     {
-      "name": "libproxy",
-      "version": "0.4.18#3"
-    },
-    {
       "name": "libpsl",
-      "version": "0.21.5#1"
-    },
-    {
-      "name": "libtommath",
-      "version": "1.3.0#3"
+      "version": "0.23.3#1"
     },
     {
       "name": "libwebp",
       "version": "1.6.0#3"
-    },
-    {
-      "name": "libxml2",
-      "version": "2.15.4#0"
     },
     {
       "name": "llvm-libc",
@@ -387,7 +422,7 @@
     },
     {
       "name": "nghttp2",
-      "version": "1.70.0#0"
+      "version": "1.71.0#0"
     },
     {
       "name": "openssl",
@@ -395,7 +430,7 @@
     },
     {
       "name": "pdfjs",
-      "version": "6.4.299#0"
+      "version": "6.5.438#0"
     },
     {
       "name": "pthread",
@@ -403,39 +438,52 @@
     },
     {
       "name": "qtbase",
-      "version": "6.11.2#0"
+      "version": "6.11.3#1"
     },
     {
       "name": "qtpositioning",
-      "version": "6.11.2#0"
+      "version": "6.11.3#0"
     },
     {
       "name": "qtserialport",
-      "version": "6.11.2#0"
+      "version": "6.11.3#0"
+    },
+    {
+      "name": "qtsvg",
+      "version": "6.11.3#0"
     },
     {
       "name": "sdl3",
-      "version": "3.4.18#0"
+      "version": "3.4.20#0"
     },
     {
       "name": "simdjson",
-      "version": "5.0.2#0"
+      "version": "5.1.1#0"
     },
     {
       "name": "simdutf",
-      "version": "9.1.1#0"
+      "version": "9.3.3#0"
     },
     {
       "name": "skia",
       "version": "148#0"
     },
     {
+      "name": "sparkle",
+      "version": "2.10.1#0"
+    },
+    {
       "name": "sqlite3",
-      "version": "3.53.4#2"
+      "version": "3.54.1#0"
     },
     {
       "name": "tiff",
       "version": "4.7.2#0"
+    },
+    {
+      "name": "vcpkg-tool-meson",
+      "version": "1.9.0#10",
+      "$comment": "Meson 1.12 builds harfbuzz 10.2.0 with -std=c++11 under clang-cl, which MSVC's headers reject."
     },
     {
       "name": "vulkan",
@@ -443,11 +491,11 @@
     },
     {
       "name": "vulkan-headers",
-      "version": "1.4.350.1#0"
+      "version": "1.4.363.0#0"
     },
     {
       "name": "vulkan-memory-allocator",
-      "version": "3.4.0#0"
+      "version": "3.5.0#0"
     },
     {
       "name": "woff2",
@@ -459,7 +507,7 @@
     },
     {
       "name": "zlib",
-      "version": "1.3.2#2"
+      "version": "1.4#0"
     },
     {
       "name": "zmij",

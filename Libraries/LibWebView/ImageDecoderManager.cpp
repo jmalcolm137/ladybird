@@ -4,7 +4,6 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-#include <LibWebCommon/WebView/SiteIsolation.h>
 #include <LibWebView/Application.h>
 #include <LibWebView/HelperProcess.h>
 #include <LibWebView/ImageDecoderControlClient.h>
@@ -22,7 +21,7 @@ ImageDecoderManager::~ImageDecoderManager() = default;
 
 ErrorOr<IPC::TransportHandle> ImageDecoderManager::connect_new_client(u64 client_child_id, RefPtr<BrowsingSession> const& session, Optional<Utf16String> site)
 {
-    if (site_isolation_mode() != SiteIsolationMode::IFrame || !session)
+    if (Application::the().tab_processes() == TabProcesses::PerTabWithoutSiteIsolation || !session)
         site.clear();
 
     // NB: A decoder that died is of no use to anyone, whether or not its clients have noticed yet.
@@ -40,7 +39,7 @@ ErrorOr<IPC::TransportHandle> ImageDecoderManager::connect_new_client(u64 client
     });
     auto channel = TRY(IPC::TransportHandle::create_pair());
     if (!instance.has_value()) {
-        auto control_client = TRY(launch_image_decoder_process(client_child_id, site));
+        auto control_client = TRY(launch_image_decoder_process(client_child_id, session ? session->is_private() : IsPrivate::No, site));
         m_instances.append({ .control_client = move(control_client), .session = session, .site = move(site), .client_counts = {} });
         instance = m_instances.last();
     }

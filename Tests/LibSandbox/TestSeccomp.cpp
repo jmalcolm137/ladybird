@@ -7,15 +7,16 @@
 #include <AK/Array.h>
 #include <AK/Atomic.h>
 #include <AK/OwnPtr.h>
+#include <AK/StringBuilder.h>
 #include <AK/Time.h>
 #include <LibCore/DirIterator.h>
 #include <LibSandbox/ConnectBroker.h>
+#include <LibSandbox/LinuxFcntl.h>
 #include <LibSandbox/Sandbox.h>
 #include <LibSandbox/Seccomp.h>
 #include <LibTest/TestCase.h>
 #include <dirent.h>
 #include <errno.h>
-#include <fcntl.h>
 #include <ifaddrs.h>
 #include <linux/filter.h>
 #include <linux/landlock.h>
@@ -26,6 +27,7 @@
 #include <poll.h>
 #include <pthread.h>
 #include <signal.h>
+#include <spawn.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
@@ -121,6 +123,26 @@ static int run_with_policy(Configure configure, Body body)
     int status = 0;
     VERIFY(waitpid(child, &status, 0) == child);
     return status;
+}
+
+TEST_CASE(file_descriptor_policy_allows_open_file_description_queries)
+{
+    auto body = [] {
+        int descriptors[2];
+        VERIFY(pipe(descriptors) == 0);
+        auto result = fcntl(descriptors[0], F_DUPFD_QUERY, descriptors[0]);
+        if (result == -1) {
+            // Kernels before Linux 6.10 don't implement F_DUPFD_QUERY.
+            VERIFY(errno == EINVAL);
+            return;
+        }
+        VERIFY(result == 1);
+        VERIFY(fcntl(descriptors[0], F_DUPFD_QUERY, descriptors[1]) == 0);
+    };
+    auto status = run_with_policy([](auto&) { }, body);
+    EXPECT(WIFEXITED(status));
+    if (WIFEXITED(status))
+        EXPECT_EQ(WEXITSTATUS(status), 0);
 }
 
 TEST_CASE(runtime_policy_refuses_other_processes_and_resource_limit_changes)
@@ -227,6 +249,54 @@ TEST_CASE(filesystem_metadata_policy_answers_the_statvfs_that_mesa_uses)
         EXPECT_EQ(WEXITSTATUS(status), 0);
 }
 
+TEST_CASE(sandbox_debugging_logs_refused_syscalls)
+{
+    for (auto debugging : { false, true }) {
+        int fds[2];
+        VERIFY(pipe(fds) == 0);
+        auto status = run_with_policy(
+            [&](auto& policy) {
+                VERIFY(dup2(fds[1], STDERR_FILENO) == STDERR_FILENO);
+                close(fds[0]);
+                close(fds[1]);
+                if (debugging)
+                    VERIFY(setenv("LADYBIRD_SANDBOX_DEBUG", "1", 1) == 0);
+                else
+                    VERIFY(unsetenv("LADYBIRD_SANDBOX_DEBUG") == 0);
+                policy.allow_gpu_device_operations();
+            },
+            [] {
+                // No group asks for packet sockets or for new processes, so the end of the policy refuses them.
+                VERIFY(socket(AF_PACKET, SOCK_RAW, 0) == -1);
+                VERIFY(errno == EAFNOSUPPORT);
+                VERIFY(syscall(__NR_clone, SIGCHLD, nullptr, nullptr, nullptr, nullptr) == -1);
+                VERIFY(errno == EPERM);
+                // A group's own refusal, not the end of the policy.
+                VERIFY(chmod("/", 0755) == -1);
+                VERIFY(errno == EPERM);
+            });
+        close(fds[1]);
+        StringBuilder output;
+        char buffer[4096];
+        ssize_t received = 0;
+        while ((received = read(fds[0], buffer, sizeof(buffer))) > 0)
+            output.append(StringView { buffer, static_cast<size_t>(received) });
+        close(fds[0]);
+
+        EXPECT(WIFEXITED(status));
+        if (WIFEXITED(status))
+            EXPECT_EQ(WEXITSTATUS(status), 0);
+        auto log = output.string_view();
+        if (!debugging) {
+            EXPECT(!log.contains("Sandbox refusal"sv));
+            continue;
+        }
+        EXPECT(log.contains("for syscall socket ("sv));
+        EXPECT(log.contains("for syscall clone ("sv));
+        EXPECT(log.contains("for syscall chmod ("sv) || log.contains("for syscall fchmodat ("sv) || log.contains("for syscall fchmodat2 ("sv));
+    }
+}
+
 TEST_CASE(gpu_policy_allows_graphics_ioctl_families)
 {
     auto status = run_with_policy(
@@ -255,6 +325,48 @@ TEST_CASE(gpu_policy_does_not_allow_unrelated_ioctls)
     }
 }
 
+TEST_CASE(process_creation_is_refused_without_killing_the_process)
+{
+    // NVIDIA's EGL library calls posix_spawn() when it loads, and must see an error that it can recover from.
+    auto child = fork();
+    VERIFY(child >= 0);
+    if (child == 0) {
+        rlimit limit { 0, 0 };
+        setrlimit(RLIMIT_CORE, &limit);
+        MUST(Sandbox::install_no_new_privileges());
+        Sandbox::SeccompPolicy policy;
+        policy.allow_gpu_device_operations();
+        policy.allow_file_descriptor_operations();
+        policy.allow_common_runtime();
+        MUST(policy.install());
+
+        pid_t pid = 0;
+        char const* arguments[] = { "/bin/true", nullptr };
+        VERIFY(posix_spawn(&pid, "/bin/true", nullptr, nullptr, const_cast<char**>(arguments), nullptr) == EPERM);
+        VERIFY(syscall(__NR_clone, SIGCHLD, nullptr, nullptr, nullptr, nullptr) == -1);
+        VERIFY(errno == EPERM);
+#ifdef __NR_fork
+        VERIFY(syscall(__NR_fork) == -1);
+        VERIFY(errno == EPERM);
+#endif
+#ifdef __NR_vfork
+        VERIFY(syscall(__NR_vfork) == -1);
+        VERIFY(errno == EPERM);
+#endif
+
+        pthread_t thread;
+        VERIFY(pthread_create(&thread, nullptr, [](void*) -> void* { return nullptr; }, nullptr) == 0);
+        VERIFY(pthread_join(thread, nullptr) == 0);
+        _exit(0);
+    }
+
+    int status = 0;
+    VERIFY(waitpid(child, &status, 0) == child);
+    EXPECT(WIFEXITED(status));
+    if (WIFEXITED(status))
+        EXPECT_EQ(WEXITSTATUS(status), 0);
+}
+
 TEST_CASE(filesystem_write_policy_refuses_timestamp_changes_outside_landlock)
 {
     if (syscall(__NR_landlock_create_ruleset, nullptr, 0, LANDLOCK_CREATE_RULESET_VERSION) < 1) {
@@ -271,7 +383,7 @@ TEST_CASE(filesystem_write_policy_refuses_timestamp_changes_outside_landlock)
     auto status = run_with_policy(
         [&](auto& policy) {
             VERIFY(close(fd) == 0);
-            MUST(Sandbox::restrict_filesystem_with_landlock());
+            MUST(Sandbox::restrict_filesystem());
             policy.allow_filesystem_writes();
         },
         [&] {
@@ -387,7 +499,7 @@ TEST_CASE(pulseaudio_client_policy_allows_directory_creation_and_record_locks)
     auto status = run_with_policy(
         [&](auto& policy) {
             if (has_landlock)
-                MUST(Sandbox::restrict_filesystem_with_landlock());
+                MUST(Sandbox::restrict_filesystem());
             policy.allow_pulseaudio_client_file_operations();
         },
         [&] {

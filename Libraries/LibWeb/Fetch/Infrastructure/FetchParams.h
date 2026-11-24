@@ -12,6 +12,8 @@
 #include <AK/Weakable.h>
 #include <LibGC/Ptr.h>
 #include <LibWeb/Export.h>
+#include <LibWeb/Fetch/Engine/FetchEngineRecord.h>
+#include <LibWeb/Fetch/Engine/StartFetchInput.h>
 #include <LibWeb/Fetch/Infrastructure/FetchAlgorithms.h>
 #include <LibWeb/Fetch/Infrastructure/FetchController.h>
 #include <LibWeb/Fetch/Infrastructure/FetchTimingInfo.h>
@@ -62,6 +64,24 @@ public:
     [[nodiscard]] Optional<FileAPI::SerializedBlobURLEntry> const& blob_url_entry() const { return m_blob_url_entry; }
     void set_blob_url_entry(Optional<FileAPI::SerializedBlobURLEntry> blob_url_entry) { m_blob_url_entry = move(blob_url_entry); }
 
+    [[nodiscard]] Engine::StartFetchInput start_fetch_input(Engine::FetchId, NonnullOwnPtr<Engine::EngineEventSink>) const;
+
+    // Set by the fetch engine when it runs main fetch's in-parallel steps, and shared with copies made after that. A
+    // CORS preflight's fetch params share the record of the fetch the preflight is for.
+    [[nodiscard]] Engine::FetchEngineRecord* engine_record() const { return m_engine_record; }
+    void set_engine_record(NonnullRefPtr<Engine::FetchEngineRecord> engine_record) const { m_engine_record = move(engine_record); }
+
+    [[nodiscard]] bool is_cors_preflight() const { return m_is_cors_preflight; }
+    void set_is_cors_preflight() { m_is_cors_preflight = true; }
+
+    // The transport of the response body these fetch params receive, which the fetch's engine record keeps.
+    void set_body_transport(Engine::FetchBodyDeliveryGate::Transport&) const;
+    // Stops that transport, if there is one, without ending the fetch.
+    void stop_body_transport() const;
+
+    // Ends the delivery of a response's body that the fetch will not read.
+    void discard_response_body(Response const&) const;
+
 private:
     FetchParams(NonnullRefPtr<Request>, GC::Ref<FetchAlgorithms const>, FetchController&, NonnullRefPtr<FetchTimingInfo>, NonnullRefPtr<LoaderConfigSnapshot const>);
     FetchParams(FetchParams const&);
@@ -104,6 +124,10 @@ private:
 
     // The loader configuration as it was when the fetch started.
     NonnullRefPtr<LoaderConfigSnapshot const> m_loader_config;
+
+    mutable RefPtr<Engine::FetchEngineRecord> m_engine_record;
+
+    bool m_is_cors_preflight { false };
 };
 
 }

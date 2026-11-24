@@ -16,13 +16,21 @@ interface Navigator {
     [SameObject] readonly attribute UserActivation userActivation;
 
     // https://w3c.github.io/ServiceWorker/#navigator-serviceworker
-    [SecureContext, SameObject] readonly attribute ServiceWorkerContainer serviceWorker;
+    [SecureContext, SameObject, Experimental] readonly attribute ServiceWorkerContainer serviceWorker;
 
     // https://w3c.github.io/media-capabilities/#dom-navigator-mediacapabilities
     [SameObject] readonly attribute MediaCapabilities mediaCapabilities;
 
+    // https://w3c.github.io/mediasession/#dom-navigator-mediasession
+    [SameObject] readonly attribute MediaSession mediaSession;
+
     // https://w3c.github.io/mediacapture-main/#dom-navigator-mediadevices
     [SecureContext, SameObject] readonly attribute MediaDevices mediaDevices;
+
+    // https://w3c.github.io/mediacapture-main/#dom-navigator-getusermedia
+    // AD-HOC: The spec names this legacy method getUserMedia. Pages that tell a Chrome-like browser by its prefixed names
+    //         look for webkitGetUserMedia, and otherwise take us for an old Safari (WebRTC adapter libraries, e.g.).
+    [SecureContext] undefined webkitGetUserMedia(MediaStreamConstraints constraints, NavigatorUserMediaSuccessCallback successCallback, NavigatorUserMediaErrorCallback errorCallback);
 
     // https://w3c.github.io/webappsec-credential-management/#framework-credential-management
     [SecureContext, SameObject] readonly attribute CredentialsContainer credentials;
@@ -73,3 +81,9 @@ Navigator includes NavigatorAutomationInformation;
 Navigator includes NavigatorStorage;
 Navigator includes NavigatorLocks;
 Navigator includes NavigatorDeviceMemory;
+
+// https://w3c.github.io/mediacapture-main/#dom-navigatorusermediasuccesscallback
+callback NavigatorUserMediaSuccessCallback = undefined (MediaStream stream);
+
+// https://w3c.github.io/mediacapture-main/#dom-navigatorusermediaerrorcallback
+callback NavigatorUserMediaErrorCallback = undefined (DOMException error);

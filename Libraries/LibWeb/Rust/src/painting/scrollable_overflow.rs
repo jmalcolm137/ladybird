@@ -99,7 +99,6 @@ pub(crate) struct ScrollableOverflowState {
     pub(crate) scroll_offset_clamp_candidates: Vec<NodeSlotId>,
     pub(crate) geometry_changed: bool,
     pub(crate) scrollability_changed: bool,
-    pub(crate) recalculations: u64,
 }
 
 impl ScrollableOverflowState {
@@ -116,25 +115,25 @@ impl LayoutNodeArena {
         has_scrollable_overflow: bool,
         changed_outside_layout: bool,
     ) {
-        use crate::painting::record::damage::PaintDamage;
+        use crate::painting::record::change_ticks::RowPaintChange;
         if changed_outside_layout {
             self.scrollable_overflow.geometry_changed = true;
         }
-        self.push_paint_damage(
+        self.note_paint_change(
             node,
-            PaintDamage::SCROLL_METADATA | PaintDamage::DRAW_OVERLAY | PaintDamage::HIT_OVERLAY,
+            RowPaintChange::SCROLL_METADATA | RowPaintChange::DRAWING | RowPaintChange::HIT_TESTING,
         );
         // The root background covers the viewport united with the overflow of the viewport box.
         if self.node_kind_if_live(node) == Some(NodeKind::Viewport)
             && let Some(source) = self.paint_state().root_background_source
         {
-            self.push_paint_damage(source.root_layout_node, PaintDamage::DRAW_BACKGROUND);
+            self.note_paint_change(source.root_layout_node, RowPaintChange::DRAWING);
         }
         if had_scrollable_overflow != has_scrollable_overflow {
             self.scrollable_overflow.scrollability_changed = true;
-            self.push_paint_damage(node, PaintDamage::ALL_PRODUCERS);
+            self.note_paint_change(node, RowPaintChange::EVERYTHING_IT_PAINTS);
             self.paintable_rows_mut()
-                .push_paint_damage_to_paint_subtree(node, PaintDamage::SCROLL_METADATA);
+                .note_paint_change_in_paint_subtree(node, RowPaintChange::SCROLL_METADATA);
             self.note_visual_context_box_dirty(node, VisualContextBoxDirtyKind::ScrollableOverflowFlipped);
         }
     }
@@ -283,6 +282,10 @@ impl LayoutNodeArena {
         if !self.paintable_row_is_populated(slot) {
             return;
         }
+        self.request_ink_overflow_recalculation(slot);
+        self.request_inline_ink_overflow_recalculation(slot);
+        // A style decides whether a box can be hit, its corners, its writing mode and its stroke.
+        self.note_hit_test_items_changed();
         let Some(style) = self.node_style_if_live(slot) else {
             return;
         };
@@ -295,6 +298,9 @@ impl LayoutNodeArena {
             });
         let overflow_style = OverflowStyle::new(style);
         self.paintable_side_data_mut(slot).overflow_style = Some(overflow_style);
+        if transform_changed {
+            self.request_containing_block_ink_overflow_recalculation(slot);
+        }
         if !transform_changed && !overflow_changed {
             return;
         }

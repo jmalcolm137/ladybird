@@ -24,6 +24,17 @@ from Utils.host_platform import HostArchitecture  # noqa: E402
 from Utils.host_platform import HostSystem  # noqa: E402
 from Utils.host_platform import Platform  # noqa: E402
 
+# The features of vcpkg.json, with the CMake options and their defaults. All options for a feature must be on
+# to select it. Keep in sync with Meta/CMake/environment.cmake.
+MANIFEST_FEATURE_OPTIONS = {
+    "qt": {"LADYBIRD_BUILD_QT": False, "ENABLE_GUI_TARGETS": True},
+    "sparkle": {"LADYBIRD_ENABLE_UPDATE_CHECK": True, "LADYBIRD_ENABLE_SPARKLE": True},
+}
+
+# The lists in Meta/CMake of the ports that distribution builds link dynamically. Keep in sync with
+# Meta/CMake/vcpkg/distribution-triplets/distribution.cmake.
+DYNAMIC_LIBRARY_LISTS = ("lgpl-libraries.txt", "dynamic-libraries.txt")
+
 DEPEND_INFO_REGEX = re.compile(r"^([a-zA-Z0-9-]+)(?:\[([^]]*)\])?(:host)?:\s*(.*)$")
 
 
@@ -95,7 +106,9 @@ def overlay_ports_dir() -> Path:
 
 
 def binary_cache_dir() -> Path:
-    return LADYBIRD_SOURCE_DIR / "Build" / "caches" / "vcpkg-binary-cache"
+    # Keep in sync with LADYBIRD_CACHE_DIR in Meta/CMake/environment.cmake.
+    main_source_dir = os.environ.get("LADYBIRD_MAIN_SOURCE_DIR") or LADYBIRD_SOURCE_DIR
+    return Path(main_source_dir) / "Build" / "caches" / "vcpkg-binary-cache"
 
 
 def write_if_changed(path: Path, content: str) -> bool:
@@ -149,6 +162,27 @@ def common_vcpkg_arguments(triplet: str, preset: str) -> list[str]:
     ]
 
 
+def cmake_option_is_on(cache: str, option: str, default: bool) -> bool:
+    # The values that count as off are the constants that CMake's if() takes as false.
+    match = re.search(rf"^{option}:[A-Z]+=(.*)$", cache, re.MULTILINE)
+    if not match:
+        return default
+    value = match.group(1).strip().upper()
+    return value not in ("", "0", "OFF", "NO", "FALSE", "N", "IGNORE", "NOTFOUND") and not value.endswith("-NOTFOUND")
+
+
+def manifest_feature_arguments(build_dir: Path) -> list[str]:
+    # Only a build directory that CMake configured before has options to go by.
+    cache_path = build_dir / "CMakeCache.txt"
+    cache = cache_path.read_text() if cache_path.exists() else ""
+
+    return [
+        f"--x-feature={feature}"
+        for feature, options in MANIFEST_FEATURE_OPTIONS.items()
+        if all(cmake_option_is_on(cache, option, default) for option, default in options.items())
+    ]
+
+
 def vcpkg_install_arguments(vcpkg: Path, triplet: str, preset: str) -> list[str]:
     return [str(vcpkg), "install", *common_vcpkg_arguments(triplet, preset), "--no-print-usage"]
 
@@ -160,9 +194,19 @@ class PortNode:
         self.dependencies: set[str] = set()
 
 
-def query_dependency_graph(vcpkg: Path, triplet: str, preset: str) -> dict[str, PortNode]:
+def query_dependency_graph(
+    vcpkg: Path, triplet: str, preset: str, install_root: Path, feature_arguments: list[str]
+) -> dict[str, PortNode]:
+    # NOTE: depend-info still takes the install root's lock, so keep it out of the source tree.
     result = subprocess.run(
-        [str(vcpkg), "depend-info", *common_vcpkg_arguments(triplet, preset), "--format=list"],
+        [
+            str(vcpkg),
+            "depend-info",
+            *common_vcpkg_arguments(triplet, preset),
+            *feature_arguments,
+            f"--x-install-root={install_root}",
+            "--format=list",
+        ],
         cwd=LADYBIRD_SOURCE_DIR,
         env=vcpkg_environment(),
         capture_output=True,
@@ -254,6 +298,7 @@ def generate_build_files(
         overlay_triplets_dir(preset).parent / "base-triplets",
     ):
         triplet_inputs.extend(sorted(str(f) for f in triplet_dir.glob("*.cmake")))
+    triplet_inputs.extend(str(LADYBIRD_SOURCE_DIR / "Meta" / "CMake" / name) for name in DYNAMIC_LIBRARY_LISTS)
 
     lines = [
         "ninja_required_version = 1.5",
@@ -265,13 +310,10 @@ def generate_build_files(
         "",
     ]
 
-    heavy_ports = set(SEED_HEAVY_PORTS) | historically_heavy_ports(deps_dir)
-
     for name in sorted(graph):
         node_dir = deps_dir / name
         write_if_changed(node_dir / "vcpkg.json", solo_manifest(graph, name, baseline, overrides))
         write_if_changed(node_dir / "build-vcpkg-variables.cmake", variables)
-        write_if_changed(node_dir / ".weight", "heavy\n" if name in heavy_ports else "light\n")
 
         inputs = [
             str(node_dir / "vcpkg.json"),
@@ -303,68 +345,84 @@ def extra_vcpkg_variables_path(build_dir: Path) -> Path:
     return build_dir / "build-vcpkg-variables.cmake"
 
 
-def historically_heavy_ports(deps_dir: Path) -> set[str]:
-    heavy = set()
-    log_path = deps_dir / ".ninja_log"
-    if not log_path.exists():
-        return heavy
-    for line in log_path.read_text().splitlines():
-        if line.startswith("#"):
-            continue
-        fields = line.split("\t")
-        if len(fields) < 4:
-            continue
-        try:
-            duration = int(fields[1]) - int(fields[0])
-        except ValueError:
-            continue
-        if duration >= HEAVY_THRESHOLD_MS:
-            heavy.add(Path(fields[3]).parent.name)
-    return heavy
+# Without ladybird.py's shared pool, each port gets a private pool this large.
+PRIVATE_POOL_SIZE = 2
+# Builds that pass VCPKG_CONCURRENCY as their own -j run outside the pool.
+UNPOOLED_JOBS = 2
 
 
-# Large enough that the configure time is insignificant compared to build time, build parallelism will determine build time if on the critical path.
-SEED_HEAVY_PORTS = {
-    "abseil",
-    "angle",
-    "curl",
-    "ffmpeg",
-    "harfbuzz",
-    "icu",
-    "libjxl",
-    "libvpx",
-    "openssl",
-    "qtbase",
-    "sdl3",
-    "skia",
-}
-HEAVY_THRESHOLD_MS = 45_000
+# GNU Make takes a jobserver FIFO from 4.4 on, and Ninja from 1.13.
+FIFO_JOBSERVER_MAKE_VERSION = (4, 4)
+FIFO_JOBSERVER_NINJA_VERSION = (1, 13)
 
 
-def acquire_build_tokens(fifo_fd: int, pool: int, heavy: bool) -> int:
-    # For light nodes, a single token is sufficient, so they get dispatched as soon as there's one free and run at whatever parallelism is there.
-    # heavy nodes need guaranteed available compute to not thrash on the build, so they hold off until there are enough tokens to guarantee a parallel build.
-    held = len(os.read(fifo_fd, 1))
-    if not heavy:
-        return held
-
-    target = min(pool, max(2, pool // 4))
-    while held < target:
-        held += len(os.read(fifo_fd, 1))
-
-    cap = max(target, pool - 8)
-    os.set_blocking(fifo_fd, False)
+def tool_version(executable: str, version_pattern: str) -> Optional[tuple[int, int]]:
     try:
-        while held < cap:
-            extra = os.read(fifo_fd, cap - held)
-            if not extra:
-                break
-            held += len(extra)
-    except BlockingIOError:
+        output = subprocess.run([executable, "--version"], capture_output=True, text=True).stdout
+    except OSError:
+        return None
+    match = re.match(version_pattern, output)
+    if not match:
+        return None
+    return (int(match[1]), int(match[2]))
+
+
+def make_takes_jobserver_fifo(make: str) -> bool:
+    version = tool_version(make, r"GNU Make (\d+)\.(\d+)")
+    return version is not None and version >= FIFO_JOBSERVER_MAKE_VERSION
+
+
+def jobserver_make_directory(deps_dir: Path) -> Optional[Path]:
+    make = shutil.which("make")
+    if make and make_takes_jobserver_fifo(make):
+        return None
+
+    # vcpkg's make helpers look for plain `make` in PATH, so offer a newer gmake (e.g. Homebrew's) under that name.
+    gmake = shutil.which("gmake")
+    if gmake and make_takes_jobserver_fifo(gmake):
+        directory = deps_dir / "gnu-make"
+        directory.mkdir(exist_ok=True)
+        link = directory / "make"
+        link.unlink(missing_ok=True)
+        link.symlink_to(gmake)
+        return directory
+
+    print(
+        f"warning: GNU Make 4.4 or newer wasn't found, so ports built with make are limited to {UNPOOLED_JOBS} jobs."
+        " On macOS, install it with `brew install make`."
+    )
+    return None
+
+
+def warn_if_ninja_lacks_jobserver(vcpkg: Path, environment: dict[str, str]):
+    # This is the ninja that vcpkg will build ports with, which is the system's if VCPKG_FORCE_SYSTEM_BINARIES is set.
+    fetch = subprocess.run([str(vcpkg), "fetch", "ninja"], capture_output=True, text=True, env=environment)
+    output_lines = fetch.stdout.strip().splitlines()
+    if fetch.returncode != 0 or not output_lines:
+        return
+    version = tool_version(output_lines[-1], r"(\d+)\.(\d+)")
+    if version is not None and version < FIFO_JOBSERVER_NINJA_VERSION:
+        print(
+            f"warning: vcpkg's Ninja is older than 1.13, so ports built with Ninja are limited to {UNPOOLED_JOBS} jobs."
+            " Install Ninja 1.13 or newer."
+        )
+
+
+def warn_once_about_private_pools(deps_dir: Path):
+    # Every node of one ninja run shares a parent, so warn once per ninja run.
+    marker = deps_dir / ".private-pool-warning"
+    ninja_pid = str(os.getppid())
+    try:
+        if marker.read_text() == ninja_pid:
+            return
+    except FileNotFoundError:
         pass
-    finally:
-        os.set_blocking(fifo_fd, True)
-    return held
+    marker.write_text(ninja_pid)
+    print(
+        f"warning: vcpkg dependencies are being built without Meta/ladybird.py, so each port is limited to"
+        f" {PRIVATE_POOL_SIZE} jobs. Run `Meta/ladybird.py deps` instead.",
+        file=sys.stderr,
+    )
 
 
 def run_node(arguments: argparse.Namespace):
@@ -385,32 +443,37 @@ def run_node(arguments: argparse.Namespace):
 
     environment = vcpkg_environment()
 
-    fifo_fd = None
-    held = 0
-    heavy = False
+    private_fifo = None
     token_fifo = environment.get("LADYBIRD_VCPKG_TOKEN_FIFO")
     if token_fifo and Path(token_fifo).exists():
-        pool = int(environment.get("LADYBIRD_VCPKG_TOKEN_POOL", "0")) or (os.cpu_count() or 2) + 2
-        heavy = (node_dir / ".weight").exists() and (node_dir / ".weight").read_text().strip() == "heavy"
+        pool = int(environment["LADYBIRD_VCPKG_TOKEN_POOL"])
         fifo_fd = os.open(token_fifo, os.O_RDWR)
-        held = acquire_build_tokens(fifo_fd, pool, heavy)
-        environment["VCPKG_MAX_CONCURRENCY"] = str(held if heavy else 2)
+    else:
+        warn_once_about_private_pools(node_dir.parent)
+        pool = PRIVATE_POOL_SIZE
+        private_fifo = node_dir / ".tokens"
+        private_fifo.unlink(missing_ok=True)
+        os.mkfifo(private_fifo)
+        token_fifo = str(private_fifo)
+        fifo_fd = os.open(token_fifo, os.O_RDWR)
+        os.write(fifo_fd, b"x" * pool)
+
+    # This token is the node's own job; the make and ninja under vcpkg take any more from the pool as jobserver clients.
+    own_token = os.read(fifo_fd, 1)
+    environment["MAKEFLAGS"] = f" --jobserver-auth=fifo:{token_fifo}"
+    environment["VCPKG_MAX_CONCURRENCY"] = str(UNPOOLED_JOBS)
 
     log_path = node_dir / "build.log"
     try:
         with open(log_path, "w") as log:
-            if held:
-                weight = "heavy" if heavy else "light"
-                log.write(
-                    f"[vcpkg-deps] {weight}, {held} of {environment.get('LADYBIRD_VCPKG_TOKEN_POOL')}"
-                    f" build tokens, -j{environment['VCPKG_MAX_CONCURRENCY']}\n"
-                )
-                log.flush()
+            log.write(f"[vcpkg-deps] Taking build jobs from a pool of {pool} at {token_fifo}\n")
+            log.flush()
             result = subprocess.run(install_arguments, env=environment, stdout=log, stderr=subprocess.STDOUT)
     finally:
-        if fifo_fd is not None:
-            os.write(fifo_fd, b"x" * held)
-            os.close(fifo_fd)
+        os.write(fifo_fd, own_token)
+        os.close(fifo_fd)
+        if private_fifo:
+            private_fifo.unlink(missing_ok=True)
 
     if result.returncode != 0:
         log_lines = log_path.read_text().splitlines()
@@ -437,9 +500,17 @@ def run_quietly(arguments: list[str], log_path: Path, environment: dict[str, str
         raise subprocess.CalledProcessError(result.returncode, arguments)
 
 
-def install_is_stale(deps_dir: Path, graph: dict[str, PortNode], install_root: Path) -> bool:
+def restore_stamp_content(features: list[str]) -> str:
+    return "features: " + " ".join(features) + "\n"
+
+
+def install_is_stale(deps_dir: Path, graph: dict[str, PortNode], install_root: Path, features: list[str]) -> bool:
     restore_stamp = deps_dir / ".restore-stamp"
     if not restore_stamp.exists() or not (install_root / "vcpkg").is_dir():
+        return True
+
+    # The stamp names the features that were installed, which change with the options of the build.
+    if restore_stamp.read_text() != restore_stamp_content(features):
         return True
 
     restore_time = restore_stamp.stat().st_mtime
@@ -480,7 +551,11 @@ def build_dependencies(
 
         write_if_changed(extra_vcpkg_variables_path(build_dir), extra_vcpkg_variables(platform, cc, cxx))
 
+        # CMake can rewrite its cache while this runs, so everything below goes by one reading of the features.
+        feature_arguments = manifest_feature_arguments(build_dir)
+
         manifest_arguments = vcpkg_install_arguments(vcpkg, triplet, preset)
+        manifest_arguments.extend(feature_arguments)
         manifest_arguments.append(f"--x-install-root={build_dir / 'vcpkg_installed'}")
 
         if fetch_only:
@@ -491,7 +566,7 @@ def build_dependencies(
             )
             return triplet
 
-        graph = query_dependency_graph(vcpkg, triplet, preset)
+        graph = query_dependency_graph(vcpkg, triplet, preset, build_dir / "vcpkg_installed", feature_arguments)
         generate_build_files(platform, preset, build_dir, vcpkg, triplet, graph)
 
         # Wipe the stamps if the binary cache is gone.
@@ -518,6 +593,11 @@ def build_dependencies(
             os.write(fifo_fd, b"x" * tokens)
 
             ninja_environment = os.environ.copy()
+            # Only the nodes take jobs from the pool; ninja joining it as well would count each node twice.
+            ninja_environment.pop("MAKEFLAGS", None)
+            if make_directory := jobserver_make_directory(deps_dir):
+                ninja_environment["PATH"] = os.pathsep.join([str(make_directory), ninja_environment.get("PATH", "")])
+            warn_if_ninja_lacks_jobserver(vcpkg, environment)
             ninja_environment["LADYBIRD_VCPKG_TOKEN_FIFO"] = str(token_fifo)
             ninja_environment["LADYBIRD_VCPKG_TOKEN_POOL"] = str(tokens)
 
@@ -530,10 +610,12 @@ def build_dependencies(
                 os.close(fifo_fd)
                 token_fifo.unlink(missing_ok=True)
 
-        if install_is_stale(deps_dir, graph, build_dir / "vcpkg_installed"):
+        if install_is_stale(deps_dir, graph, build_dir / "vcpkg_installed", feature_arguments):
             print("Installing dependencies from the binary cache...")
+            # A restore that stops halfway must not leave a stamp that vouches for what it removed.
+            (deps_dir / ".restore-stamp").unlink(missing_ok=True)
             run_quietly(manifest_arguments, deps_dir / "restore.log", environment)
-            (deps_dir / ".restore-stamp").touch()
+            (deps_dir / ".restore-stamp").write_text(restore_stamp_content(feature_arguments))
     finally:
         os.close(lock_fd)
 

@@ -57,7 +57,7 @@ void HTMLIFrameElement::attribute_changed(Utf16FlyString const& name, Optional<U
 
     if (name == HTML::AttributeNames::sandbox) {
         if (m_sandbox)
-            m_sandbox->associated_attribute_changed(value.has_value() ? value->utf16_view() : u""sv);
+            m_sandbox->associated_attribute_changed(value);
     }
 
     // https://html.spec.whatwg.org/multipage/iframe-embed-object.html#the-iframe-element:process-the-iframe-attributes-2
@@ -307,7 +307,7 @@ void run_iframe_load_event_steps(HTMLIFrameElement& element)
         // 4. Mark resource timing given fallbackTimingInfo, the result of parsing element's pending resource-timing
         //    URL, "iframe", global, the empty string, a new response body info, and 0.
         // FIXME: Our URL is already parsed, how are we supposed to parse it?
-        ResourceTiming::PerformanceResourceTiming::mark_resource_timing(
+        ResourceTiming::mark_resource_timing(
             fallback_timing_info,
             utf16_string_from_url_ascii(element.pending_resource_timing_url()->to_string()),
             "iframe"_utf16_fly_string,

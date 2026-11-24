@@ -6,6 +6,7 @@
 
 #include <AK/Array.h>
 #include <LibMedia/DemuxerScanState.h>
+#include <LibMedia/PlaybackManager.h>
 #include <LibMedia/TimeRanges.h>
 #include <LibTest/TestCase.h>
 
@@ -15,6 +16,15 @@ static AK::Duration ms(i64 milliseconds)
 {
     return AK::Duration::from_milliseconds(milliseconds);
 }
+
+// Frames at 60 fps whose timestamps are rounded to whole milliseconds while their duration isn't, as in a WebM stream,
+// so that most of them don't quite reach the next frame.
+static AK::Duration rounded_frame_start(i64 index)
+{
+    return ms((index * 1000 + 30) / 60);
+}
+
+static constexpr auto rounded_frame_duration = AK::Duration::from_nanoseconds(16'666'667);
 
 TEST_CASE(buffered_sources_without_sources_are_not_complete)
 {
@@ -310,6 +320,115 @@ TEST_CASE(remove_range_across_multiple_ranges)
     EXPECT_EQ(ranges, (TimeRanges { { ms(0), ms(100) }, { ms(900), ms(1000) } }));
 }
 
+// add_range() with a maximum gap
+
+TEST_CASE(add_range_bridges_gaps_up_to_the_maximum)
+{
+    TimeRanges ranges;
+    ranges.add_range(ms(0), ms(100));
+    ranges.add_range(ms(300), ms(400));
+    ranges.add_range(ms(150), ms(250), ms(50));
+    EXPECT_EQ(ranges, (TimeRanges { { ms(0), ms(400) } }));
+}
+
+TEST_CASE(add_range_keeps_gaps_over_the_maximum)
+{
+    TimeRanges ranges;
+    ranges.add_range(ms(0), ms(100));
+    ranges.add_range(ms(160), ms(200), ms(50));
+    EXPECT_EQ(ranges, (TimeRanges { { ms(0), ms(100) }, { ms(160), ms(200) } }));
+}
+
+TEST_CASE(adding_with_a_maximum_gap_matches_coalescing_afterwards)
+{
+    auto maximum_gap = rounded_frame_duration + rounded_frame_duration;
+    TimeRanges exact;
+    TimeRanges bridged;
+    for (i64 index = 0; index < 6000; index++) {
+        // A real gap, which nothing bridges.
+        if (index >= 3000 && index < 3010)
+            continue;
+        auto start = rounded_frame_start(index);
+        exact.add_range(start, start + rounded_frame_duration);
+        bridged.add_range(start, start + rounded_frame_duration, maximum_gap);
+    }
+    EXPECT(exact.size() > 3000);
+    EXPECT_EQ(bridged.size(), 2u);
+    EXPECT_EQ(bridged, exact.coalesced(maximum_gap));
+}
+
+// add_ranges()
+
+TEST_CASE(add_ranges_to_empty_in_descending_order)
+{
+    TimeRanges ranges;
+    ranges.add_ranges({ { ms(500), ms(600) }, { ms(300), ms(400) }, { ms(100), ms(200) } });
+    EXPECT_EQ(ranges, (TimeRanges { { ms(100), ms(200) }, { ms(300), ms(400) }, { ms(500), ms(600) } }));
+}
+
+TEST_CASE(add_ranges_merges_with_existing_ranges)
+{
+    TimeRanges ranges;
+    ranges.add_range(ms(0), ms(100));
+    ranges.add_range(ms(400), ms(500));
+    ranges.add_ranges({ { ms(450), ms(700) }, { ms(100), ms(200) }, { ms(800), ms(900) }, { ms(150), ms(250) } });
+    EXPECT_EQ(ranges, (TimeRanges { { ms(0), ms(250) }, { ms(400), ms(700) }, { ms(800), ms(900) } }));
+}
+
+TEST_CASE(add_ranges_bridges_existing_ranges)
+{
+    TimeRanges ranges;
+    ranges.add_range(ms(0), ms(100));
+    ranges.add_range(ms(200), ms(300));
+    ranges.add_ranges({ { ms(150), ms(250) }, { ms(50), ms(150) } });
+    EXPECT_EQ(ranges, (TimeRanges { { ms(0), ms(300) } }));
+}
+
+TEST_CASE(add_ranges_ignores_invalid_ranges)
+{
+    TimeRanges ranges;
+    ranges.add_range(ms(100), ms(200));
+    ranges.add_ranges({ { ms(300), ms(300) }, { ms(500), ms(400) } });
+    EXPECT_EQ(ranges, (TimeRanges { { ms(100), ms(200) } }));
+}
+
+TEST_CASE(add_ranges_bridges_gaps_up_to_the_maximum)
+{
+    TimeRanges ranges;
+    ranges.add_range(ms(0), ms(100));
+    ranges.add_range(ms(300), ms(400));
+    ranges.add_ranges({ { ms(150), ms(250) } }, ms(50));
+    EXPECT_EQ(ranges, (TimeRanges { { ms(0), ms(400) } }));
+}
+
+TEST_CASE(add_ranges_keeps_gaps_over_the_maximum)
+{
+    TimeRanges ranges;
+    ranges.add_range(ms(0), ms(100));
+    ranges.add_ranges({ { ms(160), ms(200) } }, ms(50));
+    EXPECT_EQ(ranges, (TimeRanges { { ms(0), ms(100) }, { ms(160), ms(200) } }));
+}
+
+TEST_CASE(adding_ranges_with_a_maximum_gap_matches_coalescing_afterwards)
+{
+    auto maximum_gap = rounded_frame_duration + rounded_frame_duration;
+    TimeRanges exact;
+    Vector<TimeRanges::Range> frame_intervals;
+    for (i64 index = 6000; index-- > 0;) {
+        // A real gap, which nothing bridges.
+        if (index >= 3000 && index < 3010)
+            continue;
+        auto start = rounded_frame_start(index);
+        exact.add_range(start, start + rounded_frame_duration);
+        frame_intervals.append({ start, start + rounded_frame_duration });
+    }
+    TimeRanges bridged;
+    bridged.add_ranges(move(frame_intervals), maximum_gap);
+    EXPECT(exact.size() > 3000);
+    EXPECT_EQ(bridged.size(), 2u);
+    EXPECT_EQ(bridged, exact.coalesced(maximum_gap));
+}
+
 // highest_end_time()
 
 TEST_CASE(highest_end_time_empty)
@@ -444,4 +563,48 @@ TEST_CASE(range_at_or_after_at_range_boundary)
     EXPECT_EQ(ranges.range_at_or_after(ms(0)), (TimeRanges::Range { ms(0), ms(500) }));
     EXPECT_EQ(ranges.range_at_or_after(ms(500)), (TimeRanges::Range { ms(0), ms(500) }));
     EXPECT_EQ(ranges.range_at_or_after(ms(501)), (TimeRanges::Range { ms(700), ms(1000) }));
+}
+
+TEST_CASE(seekable_range_follows_the_duration_and_the_live_seekable_range)
+{
+    Media::MediaTimeline timeline;
+    timeline.duration = ms(12000);
+    auto buffered = TimeRanges { { ms(2000), ms(10000) } };
+    EXPECT_EQ(Media::PlaybackManager::seekable_time_range(buffered, timeline), (TimeRanges::Range { ms(0), ms(12000) }));
+
+    // An unbounded duration ends the range where the buffered ranges end.
+    timeline.duration = AK::Duration::max();
+    EXPECT_EQ(Media::PlaybackManager::seekable_time_range(buffered, timeline), (TimeRanges::Range { ms(0), ms(10000) }));
+    EXPECT(!Media::PlaybackManager::seekable_time_range({}, timeline).has_value());
+
+    // A live seekable range is joined with the buffered ranges.
+    timeline.live_seekable_range = TimeRanges::Range { ms(5000), ms(20000) };
+    buffered = TimeRanges { { ms(8000), ms(25000) } };
+    EXPECT_EQ(Media::PlaybackManager::seekable_time_range(buffered, timeline), (TimeRanges::Range { ms(5000), ms(25000) }));
+}
+
+TEST_CASE(seekable_range_starts_at_the_earliest_possible_position)
+{
+    Media::MediaTimeline timeline { .duration = ms(12000), .live_seekable_range = {}, .earliest_possible_position = ms(10000) };
+    auto buffered = TimeRanges { { ms(0), ms(12000) } };
+    EXPECT_EQ(Media::PlaybackManager::seekable_time_range(buffered, timeline), (TimeRanges::Range { ms(10000), ms(12000) }));
+
+    timeline.duration = AK::Duration::max();
+    EXPECT_EQ(Media::PlaybackManager::seekable_time_range(buffered, timeline), (TimeRanges::Range { ms(10000), ms(12000) }));
+}
+
+TEST_CASE(buffered_ranges_are_clamped_to_the_seekable_range)
+{
+    Array<Media::CombinedScanState, 1> sources;
+    sources[0].time_ranges = TimeRanges { { ms(0), ms(10500) }, { ms(11000), ms(12000) } };
+    sources[0].duration = ms(12000);
+
+    Media::MediaTimeline timeline { .duration = ms(12000), .live_seekable_range = {}, .earliest_possible_position = ms(10000) };
+    auto report = Media::PlaybackManager::buffered_time_ranges_of_sources(sources, timeline);
+    EXPECT_EQ(report.time_ranges, (TimeRanges { { ms(10000), ms(10500) }, { ms(11000), ms(12000) } }));
+
+    // A source with its earliest possible position at zero, as a MediaSource's is, reports its ranges as they are.
+    timeline.earliest_possible_position = {};
+    report = Media::PlaybackManager::buffered_time_ranges_of_sources(sources, timeline);
+    EXPECT_EQ(report.time_ranges, sources[0].time_ranges);
 }

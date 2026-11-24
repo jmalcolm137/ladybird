@@ -53,14 +53,16 @@ impl ContainerVerdict {
 
 /// One physical axis' basis for a subject's container-relative lengths, as
 /// `Length::container_relative_length_to_px_without_rounding` finds it: the content size of the
-/// nearest flat-tree ancestor that accepts size queries on that axis as of the last layout commit,
-/// zero while that container has no box, and the viewport's size when there is no such container.
+/// nearest flat-tree ancestor that accepts size queries on that axis and has a box as of the last
+/// layout commit, and the viewport's size when there is no such container. A rendered container
+/// that no layout has reached yet has a basis of 0 until one gives it a box.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct ContainerUnitBasis {
     basis: f64,
     /// The container the basis is read from, or none for the viewport.
     container: Option<StyleNodeID>,
-    container_has_no_box: bool,
+    /// The outermost container below that one that accepts size queries on the axis but had no box.
+    boxless_container: Option<StyleNodeID>,
 }
 
 impl ContainerUnitBasis {
@@ -69,10 +71,10 @@ impl ContainerUnitBasis {
         self.container
     }
 
-    /// Whether the container has no box as of the last layout commit, so its queries are evaluated again after the
-    /// next layout gives it one.
-    pub(crate) fn container_has_no_box(&self) -> bool {
-        self.container_has_no_box
+    /// The outermost container the basis skipped for having no box as of the last layout commit, which the units are
+    /// evaluated against again once a layout gives it one. A container below it can only get a box after it does.
+    pub(crate) fn boxless_container(&self) -> Option<StyleNodeID> {
+        self.boxless_container
     }
 }
 
@@ -218,10 +220,9 @@ impl RetainedState {
             viewport_width: document.viewport_width,
             viewport_height: document.viewport_height,
             font_metrics: crate::css::style_compute::FfiFontMetrics {
-                font_size: font.font_size.to_double(),
+                font_size: font.font_size_for_lengths(),
                 x_height: super::pipeline::drive::drive_font_metric(first_available.x_height),
-                // The C++ metrics approximate the cap height with the ascent.
-                cap_height: super::pipeline::drive::drive_font_metric(first_available.ascent),
+                cap_height: super::pipeline::drive::drive_font_metric(first_available.cap_height),
                 zero_advance: super::pipeline::drive::drive_font_metric(first_available.zero_advance),
                 line_height: font.line_height_used().to_double(),
             },
@@ -283,6 +284,7 @@ impl RetainedState {
         } else {
             self.projection.flat_tree_parent(subject)
         };
+        let mut boxless_container = None;
         while let Some(node) = ancestor {
             ancestor = self.projection.flat_tree_parent(node);
             let Some(inputs) = records.query_row(node) else {
@@ -301,19 +303,37 @@ impl RetainedState {
                 continue;
             }
             let snapshot = self.layout_style_snapshot(node).unwrap_or_default();
+            if !snapshot.has_committed_box {
+                // A rendered container no layout has reached yet has no box only until the next one gives it one, and
+                // its units are evaluated again against that box. Its size is meant not to follow its content, so the
+                // units start out as small as that content can be. Starting from a larger basis can make content that
+                // still moves the container's size, as content in a grid item with a preferred aspect ratio does
+                // through its row, grow the container without ever settling.
+                let is_not_rendered = self.size_container_queries.is_awaiting_box(node)
+                    || records.record_view(node, inputs).is_some_and(|view| {
+                        view.dependency_flags & crate::css::computed_longhand_table::IN_DISPLAY_NONE_SUBTREE != 0
+                    });
+                if !is_not_rendered {
+                    return ContainerUnitBasis {
+                        basis: 0.0,
+                        container: Some(node),
+                        boxless_container: Some(node),
+                    };
+                }
+                // A container a layout left without a box, as one under an element that is not rendered has, is not
+                // eligible: Its size queries are unknown, so the units resolve against the next eligible container out.
+                boxless_container = Some(node);
+                continue;
+            }
             let raw = if axis_is_horizontal {
                 snapshot.content_width_raw
             } else {
                 snapshot.content_height_raw
             };
             return ContainerUnitBasis {
-                basis: if snapshot.has_committed_box {
-                    crate::css::css_pixels::CssPixels::from_raw(raw).to_double()
-                } else {
-                    0.0
-                },
+                basis: crate::css::css_pixels::CssPixels::from_raw(raw).to_double(),
                 container: Some(node),
-                container_has_no_box: !snapshot.has_committed_box,
+                boxless_container,
             };
         }
         let document = &self.document_style_computation_inputs;
@@ -324,7 +344,7 @@ impl RetainedState {
                 document.viewport_height
             },
             container: None,
-            container_has_no_box: false,
+            boxless_container,
         }
     }
 
@@ -372,19 +392,21 @@ impl RetainedState {
             }
             let basis = self.container_unit_basis(self, node, axis_is_horizontal, subject_is_pseudo_element);
             match basis.container {
-                Some(container) => {
-                    verdict
-                        .effects
-                        .push((container, FfiContainerEffectKind::SizeContainerUsage));
-                    if basis.container_has_no_box {
-                        verdict
-                            .effects
-                            .push((container, FfiContainerEffectKind::UnitsNeedEvaluationAfterLayout));
-                    }
-                }
+                Some(container) => verdict
+                    .effects
+                    .push((container, FfiContainerEffectKind::SizeContainerUsage)),
                 None => verdict
                     .effects
                     .push((node, FfiContainerEffectKind::SubjectViewportDependency)),
+            }
+            if let Some(boxless_container) = basis.boxless_container {
+                verdict
+                    .effects
+                    .push((boxless_container, FfiContainerEffectKind::SizeContainerUsage));
+                verdict.effects.push((
+                    boxless_container,
+                    FfiContainerEffectKind::UnitsNeedEvaluationAfterLayout,
+                ));
             }
         }
         self.note_container_effects_for_host(node, &std::sync::Arc::new(verdict));
@@ -518,6 +540,31 @@ impl RetainedState {
             let snapshot = self.layout_style_snapshot(candidate).unwrap_or_default();
             let document = &self.document_style_computation_inputs;
             let view = records.record_view(candidate, inputs)?;
+            // https://drafts.csswg.org/css-values-4/#font-relative-lengths
+            // NB: A length in the query relative to a metric of the container's first available font reads that font,
+            //     so the faces still loading ahead of it start loading, as they do for a length in a style.
+            let font_metric_reads = query.container_query_font_metric_reads();
+            if font_metric_reads.own {
+                // SAFETY: The view's font group is live while the query is evaluated.
+                let font = unsafe {
+                    view.payloads[crate::css::table_group_builder::group_index::FONT]
+                        .cast::<crate::css::computed_value_types::FontValues>()
+                        .as_ref()
+                };
+                if let Some(list) = font.and_then(|font| font.frozen_font_list.list()) {
+                    list.want_first_available_font_loads();
+                }
+            }
+            if font_metric_reads.root {
+                self.want_first_available_font_loads_for(
+                    candidate,
+                    None,
+                    crate::css::animation::FontMetricReads {
+                        root: true,
+                        ..Default::default()
+                    },
+                );
+            }
             let mut length = self.record_length_resolution_context(view.payloads, view.dependency_flags)?;
             if let Some(root_font) = records.root_font() {
                 (
@@ -607,18 +654,21 @@ impl RetainedState {
                     .push((candidate, FfiContainerEffectKind::SizeContainerUsage));
             }
             for basis in bases.0 {
-                let Some(container) = basis.container else {
-                    continue;
-                };
-                verdict
-                    .effects
-                    .push((container, FfiContainerEffectKind::SizeContainerUsage));
-                // A container-relative length against a container without a box resolved to
-                // zero, as it does for the host, which evaluates it again after layout.
-                if basis.container_has_no_box {
+                if let Some(container) = basis.container {
                     verdict
                         .effects
-                        .push((container, FfiContainerEffectKind::UnitsNeedEvaluationAfterLayout));
+                        .push((container, FfiContainerEffectKind::SizeContainerUsage));
+                }
+                // A container-relative length skipped a container without a box, as it does for the host, which
+                // evaluates it again after layout.
+                if let Some(boxless_container) = basis.boxless_container {
+                    verdict
+                        .effects
+                        .push((boxless_container, FfiContainerEffectKind::SizeContainerUsage));
+                    verdict.effects.push((
+                        boxless_container,
+                        FfiContainerEffectKind::UnitsNeedEvaluationAfterLayout,
+                    ));
                 }
             }
             if requirements & CONTAINER_QUERY_REQUIRES_STYLE != 0 {

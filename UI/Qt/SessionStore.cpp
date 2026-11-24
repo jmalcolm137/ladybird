@@ -27,6 +27,9 @@ static constexpr u32 SESSIONS_SCHEMA_SESSION_LIFECYCLE_VERSION = 6u;
 static constexpr u32 SESSIONS_SCHEMA_LAUNCH_RESTORE_VERSION = 7u;
 static constexpr u32 SESSIONS_SCHEMA_WINDOW_GEOMETRY_VERSION = 8u;
 static constexpr u32 SESSIONS_SCHEMA_UPGRADE_INSECURE_REQUESTS_VERSION = 9u;
+static constexpr u32 SESSIONS_SCHEMA_RESTART_VERSION = 10u;
+static constexpr u32 SESSIONS_SCHEMA_LOCAL_FILE_CONTENT_VERSION = 11u;
+static constexpr u32 SESSIONS_SCHEMA_LOCAL_FILE_ROOTS_VERSION = 12u;
 
 // After this many unclean exits in a row, launch restore stops, so a session that crashes the browser doesn't restore
 // into the same crash every time.
@@ -291,6 +294,26 @@ ErrorOr<Database::MigrationOutcome> SessionStore::PersistedStorage::migrate_sche
                 ON SessionUpgradeInsecureNavigations(container_id, tuple_ordinal);
             )#"sv,
         },
+        {
+            .version = SESSIONS_SCHEMA_RESTART_VERSION,
+            .sql = R"#(
+                ALTER TABLE SessionLifecycle ADD COLUMN restart INTEGER NOT NULL DEFAULT 0;
+            )#"sv,
+        },
+        {
+            .version = SESSIONS_SCHEMA_LOCAL_FILE_CONTENT_VERSION,
+            .sql = R"#(
+                ALTER TABLE SessionEntries ADD COLUMN held_local_file_content INTEGER NOT NULL DEFAULT 0;
+            )#"sv,
+        },
+        {
+            .version = SESSIONS_SCHEMA_LOCAL_FILE_ROOTS_VERSION,
+            .sql = R"#(
+                ALTER TABLE SessionEntries DROP COLUMN held_local_file_content;
+                ALTER TABLE SessionEntries ADD COLUMN local_file_root_path TEXT;
+                ALTER TABLE SessionEntries ADD COLUMN local_file_root_scope INTEGER;
+            )#"sv,
+        },
     });
 
     return database.migrate("Sessions"sv, migrations, mode);
@@ -335,8 +358,11 @@ ErrorOr<SessionStore::PersistedStorage> SessionStore::PersistedStorage::create(D
     statements.reopen_closed_session = TRY(database.prepare_statement("UPDATE Sessions SET kind = :open_window_kind, closed_time = 0, close_sequence = 0, source_window_id = NULL, source_tab_index = NULL, origin = :origin WHERE id = :id;"sv));
     statements.recover_open_session = TRY(database.prepare_statement("UPDATE Sessions SET kind = :closed_window_kind, closed_time = :closed_time, close_sequence = :close_sequence, source_window_id = NULL, source_tab_index = NULL, origin = :origin WHERE id = :id;"sv));
     statements.delete_empty_open_sessions = TRY(database.prepare_statement("DELETE FROM Sessions WHERE kind = :open_window_kind AND NOT EXISTS (SELECT 1 FROM SessionTabs WHERE session_id = Sessions.id);"sv));
-    statements.select_lifecycle = TRY(database.prepare_statement("SELECT clean_exit, consecutive_unclean_exits FROM SessionLifecycle WHERE id = 1;"sv));
-    statements.write_lifecycle = TRY(database.prepare_statement("INSERT INTO SessionLifecycle (id, clean_exit, consecutive_unclean_exits) VALUES (1, :clean_exit, :consecutive_unclean_exits) ON CONFLICT (id) DO UPDATE SET clean_exit = excluded.clean_exit, consecutive_unclean_exits = excluded.consecutive_unclean_exits;"sv));
+    statements.delete_closed_units_left_closed = TRY(database.prepare_statement("DELETE FROM Sessions WHERE kind != :open_window_kind AND restore_at_launch = 0;"sv));
+    statements.delete_unpinned_tabs = TRY(database.prepare_statement("DELETE FROM SessionTabs WHERE pinned = 0;"sv));
+    statements.delete_empty_sessions = TRY(database.prepare_statement("DELETE FROM Sessions WHERE NOT EXISTS (SELECT 1 FROM SessionTabs WHERE session_id = Sessions.id);"sv));
+    statements.select_lifecycle = TRY(database.prepare_statement("SELECT clean_exit, consecutive_unclean_exits, restart FROM SessionLifecycle WHERE id = 1;"sv));
+    statements.write_lifecycle = TRY(database.prepare_statement("INSERT INTO SessionLifecycle (id, clean_exit, consecutive_unclean_exits, restart) VALUES (1, :clean_exit, :consecutive_unclean_exits, :restart) ON CONFLICT (id) DO UPDATE SET clean_exit = excluded.clean_exit, consecutive_unclean_exits = excluded.consecutive_unclean_exits, restart = excluded.restart;"sv));
     statements.snapshot_statements = TRY(prepare_session_history_snapshot_statements(database));
 
     return PersistedStorage { database, move(statements) };
@@ -964,8 +990,12 @@ ErrorOr<SessionStore::RecoveryResult> SessionStore::PersistedStorage::recover_op
 {
     RecoveryResult result;
     TRY(database->transaction([&]() -> ErrorOr<void> {
-        result.consecutive_unclean_exits = TRY(record_run_start());
+        auto run_start = TRY(record_run_start());
+        result.consecutive_unclean_exits = run_start.consecutive_unclean_exits;
+        result.follows_restart = run_start.follows_restart;
         auto policy = result.consecutive_unclean_exits >= UNCLEAN_EXITS_THAT_STOP_LAUNCH_RESTORE ? SessionLaunchPolicy::None : write.policy;
+        if (result.follows_restart)
+            policy = SessionLaunchPolicy::Everything;
 
         // Only the windows that the last run left open count as left open. Those of the runs before it were already
         // offered back, so they are ordinary closed windows now.
@@ -1093,20 +1123,42 @@ ErrorOr<void> SessionStore::PersistedStorage::delete_session_rows(SessionWindowI
     });
 }
 
-ErrorOr<void> SessionStore::PersistedStorage::write_lifecycle(bool clean_exit, u32 consecutive_unclean_exits)
+ErrorOr<void> SessionStore::PersistedStorage::write_lifecycle(bool clean_exit, u32 consecutive_unclean_exits, bool restart)
 {
     return database->try_execute_bound_statement(statements.write_lifecycle, [&](auto& bind) -> ErrorOr<void> {
         TRY(bind("clean_exit"sv, i64 { clean_exit ? 1 : 0 }));
         TRY(bind("consecutive_unclean_exits"sv, i64 { consecutive_unclean_exits }));
+        TRY(bind("restart"sv, i64 { restart ? 1 : 0 }));
         return {};
     });
 }
 
+// Only the windows that the next launch brings back stay: those left open, and the last window closed, which counts as
+// left open. Their unpinned tabs, and every tab and window closed before, go with all of their history.
+ErrorOr<void> SessionStore::PersistedStorage::forget_all_but_pinned_tabs()
+{
+    TRY(database->transaction([&]() -> ErrorOr<void> {
+        TRY(database->try_execute_bound_statement(statements.delete_closed_units_left_closed, [&](auto& bind) -> ErrorOr<void> {
+            return bind("open_window_kind"sv, to_underlying(UnitKind::OpenWindow));
+        }));
+        TRY(database->try_execute_bound_statement(statements.delete_unpinned_tabs, [](auto&) -> ErrorOr<void> { return {}; }));
+        TRY(database->try_execute_bound_statement(statements.delete_empty_sessions, [](auto&) -> ErrorOr<void> { return {}; }));
+        return {};
+    }));
+
+    // A deleted row stays in the files, in the space that it took up and in the write-ahead log, until something writes
+    // over it. Rewriting the database leaves only what remains, which is little, and emptying the log removes the rest.
+    TRY(database->execute_raw("VACUUM;"));
+    TRY(database->execute_raw("PRAGMA wal_checkpoint(TRUNCATE);"));
+    return {};
+}
+
 // Runs inside the recovery transaction, so it opens none of its own.
-ErrorOr<u32> SessionStore::PersistedStorage::record_run_start()
+ErrorOr<SessionStore::PersistedStorage::RunStart> SessionStore::PersistedStorage::record_run_start()
 {
     // A first run has no row yet, and counts as following a clean exit.
     bool last_run_exited_cleanly = true;
+    bool last_run_restarts = false;
     u32 consecutive_unclean_exits = 0;
     TRY(database->try_execute_bound_statement(
         statements.select_lifecycle,
@@ -1117,9 +1169,11 @@ ErrorOr<u32> SessionStore::PersistedStorage::record_run_start()
             // transient store, since nothing else ever rewrites the row.
             auto clean_exit = row.read_integer<i64>("clean_exit"sv);
             auto unclean_exits = row.read_integer<u32>("consecutive_unclean_exits"sv);
-            if (clean_exit.is_error() || unclean_exits.is_error())
+            auto restart = row.read_integer<i64>("restart"sv);
+            if (clean_exit.is_error() || unclean_exits.is_error() || restart.is_error())
                 return {};
             last_run_exited_cleanly = clean_exit.value() != 0;
+            last_run_restarts = restart.value() != 0;
             consecutive_unclean_exits = unclean_exits.value();
             return {};
         }));
@@ -1129,9 +1183,10 @@ ErrorOr<u32> SessionStore::PersistedStorage::record_run_start()
     else if (consecutive_unclean_exits < NumericLimits<u32>::max())
         ++consecutive_unclean_exits;
 
-    // This run counts as unclean until mark_clean_exit() says otherwise.
+    // This run counts as unclean until mark_clean_exit() says otherwise. A run that ended to restart the browser brings
+    // back every window that it left open, and only the run right after it does.
     TRY(write_lifecycle(false, consecutive_unclean_exits));
-    return consecutive_unclean_exits;
+    return RunStart { .consecutive_unclean_exits = consecutive_unclean_exits, .follows_restart = last_run_exited_cleanly && last_run_restarts };
 }
 
 ErrorOr<void> SessionStore::PersistedStorage::prune_closed_units(UnitKind kind, u32 max_units)
@@ -1496,6 +1551,10 @@ static bool snapshots_match(Optional<WebView::SessionHistorySnapshot> const& a, 
         return true;
     if (a->current_used_step_index != b->current_used_step_index || a->used_steps != b->used_steps)
         return false;
+    auto const& a_roots = a->local_file_roots_of_document_states;
+    auto const& b_roots = b->local_file_roots_of_document_states;
+    if (a_roots.size() != b_roots.size() || !all_of(a_roots, [&](auto const& root) { return b_roots.contains_slow(root); }))
+        return false;
     return session_history_entry_descriptors_match(a->entries, b->entries);
 }
 
@@ -1527,6 +1586,7 @@ ErrorOr<void> SessionStore::run_startup_recovery(UnixDateTime recovered_at, Sess
                                                                   },
         m_session_id_allocator, m_close_sequence_allocator));
     m_consecutive_unclean_exits = recovery.consecutive_unclean_exits;
+    m_follows_restart = recovery.follows_restart;
 
     for (auto& window : recovery.windows) {
         m_transient_storage.open_window(window.id);
@@ -2217,13 +2277,43 @@ void SessionStore::application_quit_aborted()
     m_quitting = false;
 }
 
-void SessionStore::mark_clean_exit()
+// A run that the next launch doesn't bring back whole leaves nothing of itself on disk but the pinned tabs.
+void SessionStore::mark_clean_exit(AfterExit after_exit)
 {
     m_consecutive_unclean_exits = 0;
     if (!m_persisted_storage.has_value())
         return;
-    if (auto result = m_persisted_storage->write_lifecycle(true, 0); result.is_error())
+    if (after_exit == AfterExit::KeepPinnedTabs) {
+        // Which tabs are pinned has to be on disk first, or a tab that was pinned since the last write would go too.
+        if (auto result = drain_window_metadata(); result.is_error())
+            dbgln("Unable to save which tabs are pinned, so the session stays in the session store: {}", result.error());
+        else if (auto result = discard_pending_closes(); result.is_error())
+            dbgln("Unable to remove what was closed, so the session stays in the session store: {}", result.error());
+        else if (auto result = m_persisted_storage->forget_all_but_pinned_tabs(); result.is_error())
+            dbgln("Unable to remove the session from the session store: {}", result.error());
+    }
+    if (auto result = m_persisted_storage->write_lifecycle(true, 0, after_exit == AfterExit::Restart); result.is_error())
         dbgln("Unable to record a clean exit in the session store: {}", result.error());
+}
+
+// A close that failed to write leaves what it closed among the open windows and tabs, where a pinned tab would be kept,
+// and would write it back once it is tried again. Nothing closed is kept, so such a close removes its rows instead. Only
+// the window that the next launch brings back is written as it was closed, since its pending close alone holds the latest
+// state of its tabs, unless deleting browsing data took it.
+ErrorOr<void> SessionStore::discard_pending_closes()
+{
+    for (auto const& pending : m_pending_tab_closes)
+        TRY(m_persisted_storage->discard_tab({ .id = pending.tab_id, .remaining_window = remaining_window_write(pending.tab.window_id, pending.tab_id) }));
+    m_pending_tab_closes.clear();
+
+    for (auto const& pending : m_pending_window_closes) {
+        if (pending.discard || !pending.restore_at_launch)
+            TRY(m_persisted_storage->delete_session_rows(pending.window_id));
+        else
+            TRY(finish_window_close(pending));
+    }
+    m_pending_window_closes.clear();
+    return {};
 }
 
 bool SessionStore::has_closed_units() const
@@ -2311,14 +2401,6 @@ ErrorOr<Optional<ClosedSessionUnit>> SessionStore::take_closed_unit(SessionWindo
         return Optional<ClosedSessionUnit> {};
     result.active_tab_index = min(result.active_tab_index, index_as_i64(result.tabs.size() - 1));
     return Optional<ClosedSessionUnit> { move(result) };
-}
-
-Optional<SessionStore::TabStateUpdate> SessionStore::cached_tab_state_for_testing(SessionTabId tab_id) const
-{
-    auto const* tab = m_transient_storage.find_tab(tab_id);
-    if (!tab)
-        return {};
-    return TabStateUpdate { .tab_id = tab_id, .history = tab->history, .url = tab->url };
 }
 
 ErrorOr<void> SessionStore::remove_entries_accessed_since(UnixDateTime since)

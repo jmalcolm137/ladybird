@@ -64,6 +64,7 @@
 #include <LibWebView/BrowsingSession.h>
 #include <LibWebView/ChildIdentity.h>
 #include <LibWebView/Forward.h>
+#include <LibWebView/LocalFileRoot.h>
 #include <LibWebView/RequestServerSiteBindings.h>
 #include <LibWebView/StorageAreaRegistry.h>
 #include <LibWebView/WebContentPage.h>
@@ -95,13 +96,14 @@ public:
     virtual void did_retain_blob_url_token(Web::HTML::CrossProcessId navigable_id, URL::BlobURLEntry::Token token) override;
     virtual Messages::WebContentClient::DidRequestBlobUrlEntryResponse did_request_blob_url_entry(Utf16String url, Optional<URL::BlobURLEntry::Token> token) override;
 
-    WebContentClient(NonnullOwnPtr<IPC::Transport>, IsPrivate, Web::PageId initial_page_id, Web::HTML::CrossProcessId root_navigable_id);
+    WebContentClient(NonnullOwnPtr<IPC::Transport>, BrowsingSession&, Web::PageId initial_page_id, Web::HTML::CrossProcessId root_navigable_id);
     ~WebContentClient();
 
     IsPrivate is_private() const { return m_is_private; }
     BrowsingSession& session() const { return *m_session; }
 
     RequestServerSiteBindings& request_server_site_bindings() { return m_request_server_site_bindings; }
+    RequestServerSiteBindings const& request_server_site_bindings() const { return m_request_server_site_bindings; }
     void remove_blob_url_entries();
 
     void connect_test_endpoint(NonnullOwnPtr<IPC::Transport>);
@@ -122,8 +124,18 @@ public:
     Optional<i32> compositor_connection_id(Badge<Application>) const { return m_compositor_connection_id; }
 
     virtual void did_misbehave(StringView message_name, StringView reason) override;
-    static bool renderers_may_access_cookies_like_http();
-    static bool renderers_may_synthesize_input();
+    // The process is about to be ended for using more memory than the limit.
+    void did_exceed_memory_limit() { m_exceeded_memory_limit = true; }
+    // A tab that a page of this process belongs to was shown or hidden.
+    void did_change_visibility_of_a_tab();
+    enum class HTTPCookieAccess : u8 {
+        Allowed,
+        // A WebDriver cookie command runs, but for another document, which the renderer may not have heard of yet.
+        RefusedForURL,
+        Refused,
+    };
+    HTTPCookieAccess http_cookie_access_for(URL::URL const&) const;
+    static bool renderers_may_synthesize_input_for_testing();
     bool may_read_local_files() const;
     // Documents with no site, such as those of an opaque origin, come with whatever made them, so they do not count.
     void did_host_document_of_site(Utf16String site);
@@ -131,10 +143,13 @@ public:
     // Connects a client to the ImageDecoder of this process, for its main thread or for a worker on a thread of it.
     Optional<IPC::TransportHandle> connect_new_image_decoder_client(Optional<u64>& client_generation);
 
-    // A process that has hosted local file content may read local files. Site isolation gives such content processes
-    // of its own, which host nothing else.
-    bool has_hosted_local_file_content() const { return m_has_hosted_local_file_content; }
-    void set_has_hosted_local_file_content() { m_has_hosted_local_file_content = true; }
+    // The roots of the local file content the process has hosted, under which it may read local files. Site isolation
+    // gives such content processes of their own, one per root, which host nothing else.
+    Vector<LocalFileRoot> const& local_file_roots() const { return m_local_file_roots; }
+    ErrorOr<void> add_local_file_root(LocalFileRoot);
+    // A page's navigation reads a local file only under the roots of the process it came from, and grants none.
+    LocalFileAccess local_file_access() const;
+    static LocalFileAccess local_file_access_of_process_hosting(Web::HTML::EnvironmentId const&);
     // The WebUI whose documents the process has hosted, whose channel the process may have. Site isolation gives such
     // documents processes of their own, which host nothing else.
     Optional<String> const& hosted_web_ui() const { return m_hosted_web_ui; }
@@ -142,7 +157,7 @@ public:
     // A process can take in a tab of an origin only if all it has ever hosted, and so may still hold, is tabs of that
     // origin with their same-site and data: URL iframes. An origin-keyed tab keeps apart from the other origins of
     // its site, so it only joins origin-keyed tabs of its origin, in a process that has not hosted iframes of those
-    // other origins.
+    // other origins. The user may let the tabs of all origins of a site share processes, which then go by site.
     void note_hosted_document(CanonicalDocument const&);
     bool has_hosted_only_tabs_like(CanonicalDocument const&) const;
     bool has_hosted_only_tabs_unlike(CanonicalDocument const&) const;
@@ -167,6 +182,8 @@ public:
     // the same reason.
     virtual bool may_act_for_storage_area(Web::StorageAPI::StorageAreaId) const override;
 
+    // The tabs with an open page in this process, each listed once.
+    Vector<u64> performance_owners() const;
     Optional<u64> exclusive_performance_owner() const;
 
     void did_lose_process();
@@ -265,17 +282,21 @@ private:
     RequestServerSiteBindings m_request_server_site_bindings;
     bool m_requested_close { false };
     bool m_rejected_ipc { false };
+    bool m_exceeded_memory_limit { false };
     // The site of the documents this process hosts, if it has only hosted those of one.
     Optional<Utf16String> m_site_of_hosted_documents;
     Optional<u64> m_image_decoder_client_generation;
     bool m_has_hosted_documents_of_several_sites { false };
-    bool m_has_hosted_local_file_content { false };
+    Vector<LocalFileRoot> m_local_file_roots;
     Optional<String> m_hosted_web_ui;
     Optional<URL::Origin> m_origin_of_hosted_tabs;
     bool m_hosted_tabs_are_origin_keyed { false };
     bool m_has_hosted_more_than_tabs_of_one_origin { false };
+    // NB: Such a process takes in more tabs only while the tabs of a site share processes.
+    bool m_has_hosted_tabs_of_more_than_one_origin_of_a_site { false };
     Vector<u64> m_crashed_view_ids;
 
+    bool has_hosted_only_tabs_of_the_site_of(CanonicalDocument const&) const;
     WebContentPage& open_page(Web::PageId, CanonicalTraversable&);
     WebContentPage* find_page(Web::PageId) const;
 
@@ -327,6 +348,10 @@ private:
         [this] { update_audio_capture_indicators(); },
     };
     RefPtr<Core::Timer> m_detached_page_close_timer;
+
+    bool all_tabs_are_hidden() const;
+    void release_memory_of_hidden_tabs();
+    RefPtr<Core::Timer> m_release_memory_of_hidden_tabs_timer;
 
     // When this process last got a WebRTCClient, so that it can't make us spawn them in a loop.
     Vector<MonotonicTime> m_webrtc_client_launch_times;

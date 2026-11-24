@@ -139,7 +139,7 @@ BrowsingContext::BrowsingContextAndDocument BrowsingContext::create_a_new_browsi
             return browsing_context->window_proxy()->object();
         });
 
-    auto& realm = *realm_execution_context->realm;
+    auto& realm = *realm_execution_context->realm();
 
     // 11. Let topLevelCreationURL be the return value of running these steps:
     auto top_level_creation_url = [&] {
@@ -329,10 +329,7 @@ void BrowsingContext::set_opener_browsing_context(GC::Ptr<BrowsingContext> opene
 // NB: The browsing context active in a navigable another process hosts is there, and its WindowProxy stands for it.
 void BrowsingContext::set_opener_browsing_context(Navigable& navigable)
 {
-    if (auto* remote_navigable = as_if<RemoteNavigable>(navigable))
-        m_opener_browsing_context_window_proxy = remote_navigable->active_window_proxy_in_realm_of(*m_window_proxy->window());
-    else
-        m_opener_browsing_context_window_proxy = navigable.active_window_proxy();
+    m_opener_browsing_context_window_proxy = navigable.active_window_proxy();
 }
 
 void BrowsingContext::visit_edges(Cell::Visitor& visitor)

@@ -64,7 +64,7 @@ private:
     virtual void create_playback_session(u64 session_id, Audio::PlaybackGroupId audio_group) override;
     virtual void destroy_playback_session(u64 session_id) override;
     virtual void add_media_stream_source(u64 session_id, u64 stream_id) override;
-    virtual void start_playback(u64 session_id) override;
+    virtual void start_playback(u64 session_id, u64 seek_request_id) override;
     virtual void play(u64 session_id) override;
     virtual void pause(u64 session_id) override;
     virtual void seek(u64 session_id, u64 seek_request_id, AK::Duration timestamp, Media::SeekMode mode) override;
@@ -72,6 +72,7 @@ private:
     virtual void set_playback_rate(u64 session_id, float rate) override;
     virtual void set_audio_group(u64 session_id, Audio::PlaybackGroupId audio_group) override;
     virtual void set_duration(u64 session_id, AK::Duration duration) override;
+    virtual void set_live_seekable_range(u64 session_id, Optional<Media::TimeRanges::Range> range) override;
     virtual void set_audio_track_enabled(u64 session_id, u64 seek_request_id, Media::Track track, bool enabled, bool resume_ended_playback) override;
     virtual void reserve_video_sink(u64 session_id, u64 seek_request_id, Media::Track track, Media::VideoSinkHandle handle, bool resume_ended_playback) override;
     virtual void disable_video_sink(u64 session_id, u64 seek_request_id, Media::VideoSinkHandle handle) override;

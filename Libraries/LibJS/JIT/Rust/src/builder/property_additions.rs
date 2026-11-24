@@ -26,8 +26,9 @@ use crate::CompileFailure;
 use crate::bytecode::Operand;
 use crate::code::ExitKind;
 use crate::ir::Op;
+use ak::ZoneVec;
 
-impl GraphBuilder<'_> {
+impl GraphBuilder<'_, '_> {
     /// Builds `base.property = src` as `AddNamed` and `StoreNamed` nodes, if
     /// its property cache saw additions (and writes of existing own data
     /// properties) on shapes that are no dictionaries, and its object is an
@@ -75,13 +76,18 @@ impl GraphBuilder<'_> {
             return Ok(false);
         };
         let reserve = reserve.max(added_count);
-        if self.runtime.object_allocation.size_class_for(reserve).is_none() {
+        if self
+            .runtime
+            .object_allocation
+            .size_class_for(self.snapshot, reserve)
+            .is_none()
+        {
             return Ok(false);
         }
         let value = self.read(src)?;
 
-        let entries = self.entries_for_known_shape(object, &entries);
-        let shapes = entries.iter().map(|entry| entry.shape).collect::<Vec<_>>();
+        let entries = self.entries_for_known_shape(object, entries);
+        let shapes = ZoneVec::from_iter_in(entries.iter().map(|entry| entry.shape), self.work);
         self.dispatch_on_shapes(
             object,
             entries,
@@ -105,14 +111,14 @@ impl GraphBuilder<'_> {
                                 shape,
                                 property_count: offset + 1,
                             },
-                            vec![object, value, address],
+                            &[object, value, address],
                             None,
                         );
                     }
                     Action::Set { offset, .. } => {
                         builder.store_named_holding(object, offset, value, entry.property_holds_data);
                     }
-                    Action::Get { .. } => unreachable!("additions only add and set"),
+                    Action::Get { .. } | Action::GetMissing { .. } => unreachable!("additions only add and set"),
                 }
                 None
             },

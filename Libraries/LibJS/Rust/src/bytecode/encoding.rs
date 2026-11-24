@@ -6,32 +6,31 @@
 
 use core::marker::PhantomData;
 
+use crate::layout::property_lookup_cache::EnvironmentCoordinate;
+
 /// The bytes every instruction starts with.
 #[repr(C)]
 pub struct InstructionHeader {
     pub opcode: u8,
-    pub strict: bool,
 }
 
-/// An operand, encoded as a 3-bit kind above the index of its slot in the frame.
+/// An operand: the index of its slot in the frame.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[repr(transparent)]
-pub struct Operand(pub u32);
+#[repr(C, packed)]
+pub struct Operand(pub u8);
 
 impl Operand {
-    const INDEX_MASK: u32 = 0x1fff_ffff;
-
     pub fn index(self) -> usize {
-        (self.0 & Self::INDEX_MASK) as usize
+        self.0 as usize
     }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[repr(transparent)]
-pub struct OptionalOperand(pub u32);
+#[repr(C, packed)]
+pub struct OptionalOperand(pub u8);
 
 impl OptionalOperand {
-    const NONE: u32 = u32::MAX;
+    const NONE: u8 = u8::MAX;
 
     pub fn get(self) -> Option<Operand> {
         (self.0 != Self::NONE).then_some(Operand(self.0))
@@ -40,11 +39,11 @@ impl OptionalOperand {
 
 /// The bytecode offset of a basic block.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[repr(transparent)]
+#[repr(C, packed)]
 pub struct Label(pub u32);
 
 #[derive(Clone, Copy, Debug)]
-#[repr(C)]
+#[repr(C, packed)]
 pub struct OptionalLabel {
     pub label: Label,
     pub has_value: bool,
@@ -56,16 +55,44 @@ impl OptionalLabel {
     }
 }
 
+/// The coordinate of a binding as an instruction holds it: a byte of hops and two bytes of binding index. The generator
+/// looks bindings up by name where a coordinate does not fit.
+#[derive(Clone, Copy, Debug)]
+#[repr(C, packed)]
+pub struct BytecodeEnvironmentCoordinate {
+    hops: u8,
+    index: [u8; 2],
+}
+
+impl BytecodeEnvironmentCoordinate {
+    pub fn get(self) -> EnvironmentCoordinate {
+        EnvironmentCoordinate {
+            hops: u32::from(self.hops),
+            index: u32::from(u16::from_ne_bytes(self.index)),
+        }
+    }
+}
+
+/// The name table index that the field `field` of an instruction in `bytecode` holds, if it holds one. An index too
+/// large for the field is in the WideNameIndices before the instruction, which only the bytecode can reach.
+fn name_index_in(field: &[u8; 2], bytecode: &[u8]) -> Option<usize> {
+    let at = field.as_ptr().addr().wrapping_sub(bytecode.as_ptr().addr());
+    assert!(at < bytecode.len(), "the name table index is a field of the bytecode");
+    super::operand::read_optional_name_index(bytecode, at).map(|index| index as usize)
+}
+
 macro_rules! define_table_index {
     ($($name:ident),*) => {
         $(
-            #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-            #[repr(transparent)]
-            pub struct $name(pub u32);
+            /// The field of an instruction that holds an index into a name table of its executable.
+            #[derive(Debug)]
+            #[repr(C, packed)]
+            pub struct $name([u8; 2]);
 
-            impl From<u32> for $name {
-                fn from(index: u32) -> Self {
-                    Self(index)
+            impl $name {
+                /// The index the field holds, which is a field of an instruction in `bytecode`.
+                pub fn index_in(&self, bytecode: &[u8]) -> usize {
+                    name_index_in(&self.0, bytecode).expect("the field holds a name table index")
                 }
             }
         )*
@@ -74,12 +101,13 @@ macro_rules! define_table_index {
 
 define_table_index!(IdentifierTableIndex, PropertyKeyTableIndex, StringTableIndex);
 
-/// A table index that may be absent, encoded with all bits set.
-#[repr(transparent)]
-pub struct OptionalIndex<T>(pub u32, PhantomData<T>);
+/// The field of an instruction that holds an index into a name table of its executable, if it holds one.
+#[repr(C, packed)]
+pub struct OptionalIndex<T>([u8; 2], PhantomData<T>);
 
-impl<T: From<u32>> OptionalIndex<T> {
-    pub fn get(&self) -> Option<T> {
-        (self.0 != u32::MAX).then(|| T::from(self.0))
+impl<T> OptionalIndex<T> {
+    /// The index the field holds, which is a field of an instruction in `bytecode`.
+    pub fn index_in(&self, bytecode: &[u8]) -> Option<usize> {
+        name_index_in(&self.0, bytecode)
     }
 }

@@ -1,4 +1,4 @@
-$2d2a9e5a strict-global-assignment.js:1:1
+$7604b252 strict-global-assignment.js:1:1
   Registers: 8
   Blocks:    7
   Constants:
@@ -6,37 +6,36 @@ $2d2a9e5a strict-global-assignment.js:1:1
     [1] = String("use strict")
     [2] = Int32(0)
     [3] = Null
-    [4] = Int32(1)
 
 block0:
   [   0] Enter
-  [   8] Mov dst:reg5, src:Undefined
-  [  18] Mov dst:reg5, src:String("use strict")
-  [  28] ResolveGlobalBinding dst:reg6, `counter`
-  [  38] JumpIf condition:reg6, true_target:block1, false_target:block2
+  [   1] Mov dst:reg5, src:Undefined
+  [   4] Mov dst:reg5, src:String("use strict")
+  [   7] ResolveGlobalBinding dst:reg6, `counter`
+  [   d] JumpIf condition:reg6, true_target:block1, false_target:block2
 
 block1:
-  [  48] SetGlobal `counter`, src:Int32(0)
-  [  58] Jump target:block3
+  [  17] SetGlobal `counter`, src:Int32(0)
+  [  1d] Jump target:block3
 
 block2:
-  [  60] SetResolvedBinding environment:Null, `counter`, src:Int32(0)
-  [  70] Jump target:block3
+  [  22] SetResolvedBinding environment:Null, `counter`, src:Int32(0)
+  [  27] Jump target:block3
 
 block3:
-  [  78] ResolveGlobalBinding dst:reg6, `counter`
-  [  88] GetGlobal value_feedback:0, dst:reg7, `counter`
-  [  98] AddRhsInt32 arith_feedback:0, dst:reg7, lhs:reg7, rhs:1
-  [  a8] JumpIf condition:reg6, true_target:block4, false_target:block5
+  [  2c] ResolveGlobalBinding dst:reg6, `counter`
+  [  32] GetGlobal value_feedback:0, dst:reg7, `counter`
+  [  3a] AddRhsInt32 arith_feedback:0, dst:reg7, lhs:reg7, rhs:1
+  [  43] JumpIf condition:reg6, true_target:block4, false_target:block5
 
 block4:
-  [  b8] SetGlobal `counter`, src:reg7
-  [  c8] Jump target:block6
+  [  4d] SetGlobal `counter`, src:reg7
+  [  53] Jump target:block6
 
 block5:
-  [  d0] SetResolvedBinding environment:Null, `counter`, src:reg7
-  [  e0] Jump target:block6
+  [  58] SetResolvedBinding environment:Null, `counter`, src:reg7
+  [  5d] Jump target:block6
 
 block6:
-  [  e8] Mov dst:reg5, src:reg7
-  [  f8] End value:reg5
+  [  62] Mov dst:reg5, src:reg7
+  [  65] End value:reg5

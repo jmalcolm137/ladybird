@@ -46,6 +46,7 @@ RemoteView::RemoteView(Optional<u64> view_id, Hub::View::InitialState initial_st
             .device_pixel_ratio = initial_state.device_pixel_ratio,
             .maximum_frames_per_second = initial_state.maximum_frames_per_second,
             .display_id = initial_state.display_id,
+            .screen_shows_high_dynamic_range = initial_state.screen_shows_high_dynamic_range,
             .system_theme = move(initial_state.system_theme),
             .screen_rects = move(initial_state.screen_rects),
             .owner_view_id = initial_state.owner_view_id,
@@ -132,6 +133,36 @@ void RemoteView::set_device_pixel_ratio_and_viewport(double device_pixel_ratio, 
     HubConnection::the().async_view_set_viewport(view_id(), size, device_pixel_ratio);
 }
 
+void RemoteView::set_compositor_layer_hidden(u64 layer_id, bool hidden)
+{
+    HubConnection::the().async_view_set_compositor_layer_hidden(view_id(), layer_id, hidden);
+}
+
+void RemoteView::set_selected_compositor_layers(Vector<u64> layer_ids)
+{
+    HubConnection::the().async_view_set_selected_compositor_layers(view_id(), move(layer_ids));
+}
+
+void RemoteView::set_hovered_compositor_layer(Optional<u64> layer_id)
+{
+    HubConnection::the().async_view_set_hovered_compositor_layer(view_id(), layer_id);
+}
+
+void RemoteView::show_only_compositor_layers(Vector<u64> layer_ids)
+{
+    HubConnection::the().async_view_show_only_compositor_layers(view_id(), move(layer_ids));
+}
+
+void RemoteView::show_all_compositor_layers()
+{
+    HubConnection::the().async_view_show_all_compositor_layers(view_id());
+}
+
+void RemoteView::reset_compositor_layer_raster_counts()
+{
+    HubConnection::the().async_view_reset_compositor_layer_raster_counts(view_id());
+}
+
 u64 RemoteView::add_navigation_listener(NavigationListener listener)
 {
     auto id = m_next_navigation_listener_id++;
@@ -157,8 +188,15 @@ void RemoteView::did_finish_navigation_load(URL::URL const& url)
 
 void RemoteView::did_install_backing_stores(u64 page_id, Vector<i32> bitmap_ids, Vector<Gfx::SharedImage> backing_stores)
 {
+    // A publication that can't be imported is refused, so the backing stores, and the page they're from, stay as they
+    // were. Its front backing store goes straight back, since nothing here will ever present from it.
+    auto front_bitmap_id = bitmap_ids.first();
+    if (auto result = m_backing_stores.install(move(bitmap_ids), move(backing_stores)); result.is_error()) {
+        warnln("Could not install backing stores for page {}: {}", page_id, result.error());
+        release_backing_store(page_id, front_bitmap_id);
+        return;
+    }
     m_backing_stores_page_id = page_id;
-    m_backing_stores.install(move(bitmap_ids), move(backing_stores));
 }
 
 void RemoteView::did_present_backing_store(u64 page_id, i32 bitmap_id, Gfx::IntSize size, double device_pixel_ratio)
@@ -174,6 +212,29 @@ void RemoteView::did_accept_backing_store(i32 bitmap_id, Gfx::IntRect damage_rec
     did_accept_presented_backing_store(bitmap_id, damage_rect);
     if (on_ready_to_paint)
         on_ready_to_paint();
+}
+
+void RemoteView::did_present_frame_in_remote_layer(Gfx::IntSize size, double device_pixel_ratio)
+{
+    // The view shows the remote layer from now on, so the frames it was given before are of no further use.
+    m_backing_stores.clear();
+    m_backing_stores.clear_backup();
+    m_backing_stores.present_frame_shown_in_remote_layer(size, device_pixel_ratio);
+    if (on_ready_to_paint)
+        on_ready_to_paint();
+}
+
+void RemoteView::take_frame_snapshot(Function<void(Optional<Gfx::ShareableBitmap>)> callback)
+{
+    auto request_id = m_next_request_id++;
+    m_pending_frame_snapshots.set(request_id, move(callback));
+    HubConnection::the().async_view_take_frame_snapshot(view_id(), request_id);
+}
+
+void RemoteView::did_take_frame_snapshot(u64 request_id, Optional<Gfx::ShareableBitmap> snapshot)
+{
+    if (auto callback = m_pending_frame_snapshots.take(request_id); callback.has_value())
+        (*callback)(move(snapshot));
 }
 
 void RemoteView::release_backing_store_to_page(u64 page_id, i32 bitmap_id)
@@ -345,6 +406,16 @@ ErrorOr<void> RemoteView::restore_session_history_from_snapshot(WebView::Session
         return Error::from_string_literal("Unable to restore the session history");
     return {};
 }
+
+Optional<u64> RemoteView::keep_state_for_discarding()
+{
+    return HubConnection::the().view_keep_state_for_discarding(view_id());
+}
+
+void RemoteView::restore_state_of_discarded_tab(u64 discarded_tab_state_id)
+{
+    HubConnection::the().async_view_restore_state_of_discarded_tab(view_id(), discarded_tab_state_id);
+}
 #else
 Optional<i32> RemoteView::history_step_at_delta(int delta) const
 {
@@ -384,6 +455,18 @@ WebView::SessionHistorySnapshot RemoteView::session_history_snapshot() const
 ErrorOr<void> RemoteView::restore_session_history_from_snapshot(WebView::SessionHistorySnapshot snapshot)
 {
     return m_view->restore_session_history_from_snapshot(move(snapshot));
+}
+
+Optional<u64> RemoteView::keep_state_for_discarding()
+{
+    return m_view->keep_state_for_discarding();
+}
+
+// NB: The tab's pages must find their sessionStorage as they load, so this can't wait for the Hub's turn.
+void RemoteView::restore_state_of_discarded_tab(u64 discarded_tab_state_id)
+{
+    m_view->restore_state_of_discarded_tab(discarded_tab_state_id);
+    m_view->push_state_to_ui();
 }
 #endif
 

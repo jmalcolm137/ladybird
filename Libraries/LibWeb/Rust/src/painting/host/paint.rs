@@ -8,6 +8,7 @@ use crate::layout::svg_formatting_context::FfiSvgNumberPercentage;
 use crate::layout::used_values;
 use crate::painting::display_list::commands::{OptionalAffineTransform, OptionalColor};
 use crate::stage::MainThread;
+use libcompositing_rust::scrolling::scroll_snap_selection::SnapSelectionStrategyType;
 use libgfx_rust::{Color, IntRect, InterpolationColorSpace};
 use std::ffi::c_void;
 
@@ -21,6 +22,9 @@ pub struct FfiRecordingInputs {
     pub force_dark_foreground_threshold: i32,
     pub force_dark_background_threshold: i32,
     pub should_paint_overlay: bool,
+    pub records_in_finest_runs: bool,
+    pub records_whole_document: bool,
+    pub notes_record_origins: bool,
     pub has_blocking_wheel_event_region_covering_viewport: bool,
     pub has_navigable_container_with_composited_context: bool,
     pub wheel_event_listener_state_generation: u64,
@@ -43,9 +47,9 @@ pub struct FfiRecordingInputs {
     pub inactive_selection_background_light: Color,
     pub inactive_selection_background_dark: Color,
     pub palette_is_dark: bool,
-    pub document_has_supported_color_schemes: bool,
     pub document_supports_light_or_dark: bool,
     pub image_fallback_color_scheme: u8,
+    pub records_without_visual_contexts: bool,
     pub accessibility_focus_target: crate::layout::node_data::NodeSlotId,
     pub has_inspector_highlight: bool,
     pub inspector_highlight_paintable: crate::layout::node_data::NodeSlotId,
@@ -67,6 +71,44 @@ pub struct FfiRecordingInputs {
     pub text_fragment_indication_count: usize,
     pub mark_color: Color,
     pub mark_text_color: Color,
+    /// What the compositor clears the surface with below the recording, for a top-level traversable.
+    pub surface_clear_color: OptionalColor,
+    pub has_async_scrolling_metadata: bool,
+    pub async_scrolling_metadata: FfiAsyncScrollingMetadata,
+}
+
+/// What a recording's display list is stamped with for async scrolling, as the host knows it where the recording begins:
+/// `Compositing::AsyncScrollingMetadata` but for the keyboard scroll state, which each frame sets.
+#[derive(Clone, Copy, Debug)]
+#[repr(C)]
+pub struct FfiAsyncScrollingMetadata {
+    pub has_document_id: bool,
+    pub document_id: i64,
+    pub viewport_rect: IntRect,
+    pub wheel_event_listener_state_generation: u64,
+    pub has_blocking_wheel_event_listeners: bool,
+    pub has_blocking_wheel_event_region_covering_viewport: bool,
+    pub viewport_keeps_horizontal_scrolls: bool,
+    pub viewport_keeps_vertical_scrolls: bool,
+    pub device_pixels_per_css_pixel: f64,
+}
+
+impl FfiAsyncScrollingMetadata {
+    fn to_metadata(self) -> libcompositing_rust::ipc_types::Compositing_AsyncScrollingMetadata {
+        libcompositing_rust::ipc_types::Compositing_AsyncScrollingMetadata {
+            document_id: self
+                .has_document_id
+                .then_some(crate::painting::display_list::commands::UniqueNodeId(self.document_id)),
+            viewport_rect: self.viewport_rect,
+            wheel_event_listener_state_generation: self.wheel_event_listener_state_generation,
+            has_blocking_wheel_event_listeners: self.has_blocking_wheel_event_listeners,
+            has_blocking_wheel_event_region_covering_viewport: self.has_blocking_wheel_event_region_covering_viewport,
+            viewport_keeps_horizontal_scrolls: self.viewport_keeps_horizontal_scrolls,
+            viewport_keeps_vertical_scrolls: self.viewport_keeps_vertical_scrolls,
+            device_pixels_per_css_pixel: self.device_pixels_per_css_pixel,
+            keyboard_scroll_state: crate::painting::presentation::empty_keyboard_scroll_state(),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -138,10 +180,17 @@ impl FfiRecordingInputs {
                 background_brightness_threshold: self.force_dark_background_threshold,
             },
             should_paint_overlay: self.should_paint_overlay,
+            records_in_finest_runs: self.records_in_finest_runs,
+            records_whole_document: self.records_whole_document,
+            notes_record_origins: self.notes_record_origins,
             canvas_fill_rect: self.canvas_fill_rect.has_value.then_some(self.canvas_fill_rect.value),
             opaque_canvas: self.opaque_canvas,
             bitmap_rect: self.bitmap_rect,
             publishes_recording: self.publishes_recording,
+            surface_clear_color: self.surface_clear_color.get(),
+            async_scrolling_metadata: self
+                .has_async_scrolling_metadata
+                .then(|| self.async_scrolling_metadata.to_metadata()),
             window_is_focused: self.window_is_focused,
             outline_auto_color: self.outline_auto_color,
             selection_background_from_palette: self.selection_background_from_palette,
@@ -151,9 +200,9 @@ impl FfiRecordingInputs {
             inactive_selection_background_light: self.inactive_selection_background_light,
             inactive_selection_background_dark: self.inactive_selection_background_dark,
             palette_is_dark: self.palette_is_dark,
-            document_has_supported_color_schemes: self.document_has_supported_color_schemes,
             document_supports_light_or_dark: self.document_supports_light_or_dark,
             image_fallback_color_scheme: self.image_fallback_color_scheme,
+            records_without_visual_contexts: self.records_without_visual_contexts,
             accessibility_focus_target: (!self.accessibility_focus_target.is_invalid())
                 .then_some(self.accessibility_focus_target),
             inspector_highlight: self.has_inspector_highlight.then(|| {
@@ -211,7 +260,6 @@ impl FfiRecordingInputs {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
-#[expect(dead_code, reason = "C++ constructs the variants")]
 pub enum FfiCaretPaintKind {
     None,
     /// `block` paints the caret, in the fragment run owned by the self-painting inline `owner`
@@ -381,7 +429,6 @@ pub struct FfiVideoPaintFacts {
     pub has_video_frame: bool,
     pub video_src_width: i32,
     pub video_src_height: i32,
-    pub video_sink_resource_id: u64,
     pub video_sink_handle: u64,
     pub poster_frame: *const c_void,
 }
@@ -475,6 +522,9 @@ pub struct FfiVectorImageRenderRequest {
     pub css_height: crate::css::css_pixels::CssPixels,
     pub raster_scale: f32,
     pub color_scheme: u8,
+    pub force_dark_enabled: bool,
+    pub force_dark_foreground_threshold: i32,
+    pub force_dark_background_threshold: i32,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -493,7 +543,6 @@ pub struct FfiCanvasPaintFacts {
     pub content_width: i32,
     pub content_height: i32,
     pub canvas_id: u64,
-    pub content_generation: u64,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -538,44 +587,68 @@ pub struct FfiSnapAreaGeometry {
     pub always_stop: bool,
 }
 
-/// Where a recording's resources go once it is published. The fields are private: the callbacks
-/// are reached only through the methods below, which take the main thread token.
+#[derive(Clone, Copy)]
+#[repr(C)]
+pub struct FfiSnapAreaIdentity {
+    pub node_id: i64,
+    pub pseudo_element_type: u8,
+}
+
+#[repr(C)]
+pub struct FfiSnapSelectionStrategy {
+    pub r#type: SnapSelectionStrategyType,
+    pub has_start_offset: bool,
+    pub start_offset: used_values::FfiCssPixelPoint,
+    pub displacement: used_values::FfiCssPixelPoint,
+    pub has_starting_positions_boundary: bool,
+    pub starting_positions_boundary: used_values::FfiCssPixelPoint,
+}
+
+#[repr(C)]
+pub struct FfiSnapDestination<'a> {
+    pub position: used_values::FfiCssPixelPoint,
+    pub snapped_x: bool,
+    pub snapped_y: bool,
+    pub evaluated_x: bool,
+    pub evaluated_y: bool,
+    pub snapped_areas_x: ak::Span<'a, FfiSnapAreaIdentity>,
+    pub snapped_areas_y: ak::Span<'a, FfiSnapAreaIdentity>,
+}
+
+#[repr(C)]
+pub struct FfiSnapAreaDomRelations {
+    pub context: *mut c_void,
+    pub area_contains_focused_node: unsafe extern "C" fn(*mut c_void, FfiSnapAreaIdentity) -> bool,
+    pub area_contains_targeted_element: unsafe extern "C" fn(*mut c_void, FfiSnapAreaIdentity) -> bool,
+    pub element_of_area_is_ancestor_of_element_of:
+        unsafe extern "C" fn(*mut c_void, FfiSnapAreaIdentity, FfiSnapAreaIdentity) -> bool,
+}
+
+/// How a recording that is published has the host render its SVG images. The fields are private: the callback is
+/// reached only through the method below, which takes the main thread token.
 ///
-/// NB: The callbacks are typed as safe functions because the table only comes from the host through an export
-///     whose safety contract keeps them callable, and the private fields let nothing else call them.
+/// NB: The callback is typed as a safe function because the table only comes from the host through an export whose
+///     safety contract keeps it callable, and the private fields let nothing else call it.
 #[derive(Clone, Copy)]
 #[repr(C)]
 pub struct FfiRecordingPublishCallbacks {
     context: *mut c_void,
-    add_font: extern "C" fn(*mut c_void, *const c_void),
-    add_image_frame: extern "C" fn(*mut c_void, *const c_void),
-    resolve_vector_image_display_list: extern "C" fn(*mut c_void, *const FfiVectorImageRenderRequest) -> u64,
-    add_video_sink: extern "C" fn(*mut c_void, u64, u64),
+    render_vector_image:
+        extern "C" fn(*mut c_void, *const FfiVectorImageRenderRequest) -> *const crate::render_state::DocumentHost,
 }
 
 impl FfiRecordingPublishCallbacks {
-    pub(crate) fn add_font(&self, _: &MainThread, font: &libgfx_rust::font::FontHandle) {
-        // The C++ host registers the live font synchronously.
-        (self.add_font)(self.context, font.as_raw());
-    }
-
-    pub(crate) fn add_image_frame(&self, _: &MainThread, frame: &libgfx_rust::image_frame::ImageFrameHandle) {
-        // The C++ host copies the live frame synchronously.
-        (self.add_image_frame)(self.context, frame.as_raw());
-    }
-
-    pub(crate) fn resolve_vector_image_display_list(
+    /// Has the host render the SVG image `request` names, and answers the host of the image's document, which keeps
+    /// the image's display list for the request, or none where the image has nothing to show.
+    pub(crate) fn render_vector_image<'a>(
         &self,
-        _: &MainThread,
+        _: &'a MainThread,
         request: &FfiVectorImageRenderRequest,
-    ) -> u64 {
-        // The C++ host records the image's display list synchronously and reads the
-        // request only for the duration of the call.
-        (self.resolve_vector_image_display_list)(self.context, request)
-    }
-
-    pub(crate) fn add_video_sink(&self, _: &MainThread, resource_id: u64, sink_handle: u64) {
-        // The C++ host registers the sink synchronously.
-        (self.add_video_sink)(self.context, resource_id, sink_handle);
+    ) -> Option<&'a crate::render_state::DocumentHost> {
+        // The C++ host renders the image synchronously and reads the request only for the duration of the call. The
+        // image's document, and its host, outlive the recording that draws it.
+        let host = (self.render_vector_image)(self.context, request);
+        // SAFETY: The host answers a live document host or null.
+        unsafe { host.as_ref() }
     }
 }

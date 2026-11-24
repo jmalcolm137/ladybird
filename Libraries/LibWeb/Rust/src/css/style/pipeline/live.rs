@@ -10,6 +10,7 @@
 
 use super::super::component_matching::DocumentMatching;
 use super::super::index::dispatch_bloom_bit;
+use super::super::index::subtree_key_bits;
 use super::super::input_types::TransactionFactSide;
 use super::super::input_types::{
     STYLE_REACTION_FONT_INPUTS_CHANGED, STYLE_REACTION_PUBLISHED_STYLE, STYLE_REACTION_RECOMPUTE_DESCENDANT_STYLES,
@@ -53,22 +54,11 @@ pub(super) enum LiveField {
     Passes,
     FullPasses,
     StyledElements,
-    InvalidationNanoseconds,
-    StyleNanoseconds,
-    VerifiedElements,
-    MissingRecords,
-    Differences,
     HintedElements,
     HintedSubtrees,
     ChangedElements,
     InvalidationVisits,
     InvalidationTests,
-    /// How many cold passes the engine started from, on the render state and its forks.
-    ColdPasses,
-}
-
-impl LiveField {
-    pub(super) const COUNT: usize = Self::ColdPasses as usize + 1;
 }
 
 /// The engine of a document's render state. A fork of the render state takes it as it is, and
@@ -105,7 +95,6 @@ pub(in super::super) struct Live {
     /// order did, whose entries the rule index ranks again.
     reordered_scopes: HashSet<TreeScopeID>,
     layered_scopes: HashSet<TreeScopeID>,
-    report: ForkReset<[u64; LiveField::COUNT]>,
     /// What passes counted since the state last took it into its counters.
     counts: super::counters::PassCounts,
     /// How many threads passes run on.
@@ -465,6 +454,26 @@ impl MatchedDeclarationsInputs {
 }
 
 impl Live {
+    /// Lets go of what the passes and invalidations work in and keep for the next one, for a document that stopped
+    /// styling: the next pass makes it again.
+    pub(in super::super) fn trim_scratch(&mut self) {
+        for memo in self.scratch.memos.made() {
+            *memo.lock().expect("no pass holds a memo while the scratch is trimmed") = FollowScratch::default();
+        }
+        // NB: The memos measure where siblings stand again.
+        self.scratch.memos_dom_order_version = None;
+        for cache in self.scratch.groups.made() {
+            cache
+                .lock()
+                .expect("no pass holds a cache while the scratch is trimmed")
+                .trim();
+        }
+        self.scratch.invalidate = InvalidateScratch::default();
+        self.scratch.install = Default::default();
+        self.scratch.replaced = Default::default();
+        self.scratch.kept = Vec::new();
+    }
+
     /// The matched declarations cache the passes keep for the next.
     #[cfg(test)]
     pub(super) fn matched_declarations(&self) -> &super::matched_declarations::MatchedDeclarationsCache {
@@ -543,7 +552,6 @@ impl Live {
     pub(in super::super) fn note_transaction(&mut self, state: &RetainedState, transaction: &StyleUpdate) {
         #[cfg(test)]
         let _section = super::allocation_count::StyleSection::enter();
-        let started = Instant::now();
         self.generation += 1;
         // NB: An environment change or a restart can move how any element computes.
         if transaction.restyles_everything {
@@ -571,7 +579,6 @@ impl Live {
         if transaction.has_no_element_inputs() && changes.is_empty() && transaction.rule_changes.is_empty() {
             return;
         }
-        self.counts.note_transaction();
         self.kept_hidden
             .extend(transaction.style_inputs.iter().map(|&(node, _)| node));
         self.kept_hidden
@@ -592,7 +599,6 @@ impl Live {
             self.hints.reserve(state.projection.element_slot_count());
             self.invalidate(state, transaction, changes);
         }
-        self.bump(LiveField::InvalidationNanoseconds, started.elapsed().as_nanos() as u64);
     }
 
     /// Note what no pass tells of the hints: a pass styles the elements holding a record and tells
@@ -1075,7 +1081,6 @@ impl Live {
     }
 
     fn bump(&mut self, field: LiveField, value: u64) {
-        self.report[field as usize] += value;
         self.counts.note(field, value);
     }
 
@@ -2073,7 +2078,6 @@ impl Live {
         resolve: &mut ResolveWaits<'_>,
     ) -> traversal::Statistics {
         let state: &RetainedState = retained;
-        let started = Instant::now();
         self.generation += 1;
         self.note_hints_moved_kept_hidden_records();
         let slot_count = state.projection.element_slot_count();
@@ -2177,7 +2181,6 @@ impl Live {
         if hinted {
             self.mark_dirty_ancestors(&state.projection);
         }
-        let invalidated = Instant::now();
         if hinted {
             let hinted = |bits: HintBits| {
                 self.hints
@@ -2225,7 +2228,6 @@ impl Live {
                 self.owe_animation_plans(state, root, moved);
             }
             self.keep_deferred_hints(&state.projection, &[], &[]);
-            self.bump(LiveField::InvalidationNanoseconds, started.elapsed().as_nanos() as u64);
             return traversal::Statistics::default();
         }
         self.hints.sort_reasons();
@@ -2253,6 +2255,7 @@ impl Live {
                 kept_matched_declarations: Some(&self.scratch.matched_declarations),
                 waits_once: round + 1 < MAX_SUSPENDING_ROUNDS,
                 cache_audit: self.cache_audit,
+                traces: state.live_counters.is_tracing(),
                 root_font: root_font.map_or_else(Default::default, std::sync::OnceLock::from),
                 root_font_moved: root_font_moved.map_or_else(Default::default, std::sync::OnceLock::from),
                 ..PassContext::new(state, &self.index, &self.initial, &records, held_root_font)
@@ -2301,17 +2304,21 @@ impl Live {
             Some(&mut self.uninstalled),
             &mut scratch.replaced,
         );
-        self.counts
-            .note_pass(!hinted, &statistics, &self.uninstalled[changed_start..]);
-        // NB: A record holding what the one it replaces does gives way to it where that one is
-        //     installed, which it is not for an element that arrived in the place of another.
-        self.uninstalled.extend(
-            statistics
-                .styled
-                .iter()
-                .copied()
-                .filter(|&node| state.computed_group_sets.assigned_style_record(node).is_none()),
+        self.counts.note_pass(
+            !hinted,
+            &statistics,
+            &self.uninstalled[changed_start..],
+            state.live_counters.is_tracing(),
         );
+        // NB: A record holding what the one it replaces does gives way to it where that one is
+        //     installed, which it is not for an element that arrived in the place of another. Nor
+        //     is it for one whose style the host cleared below an undisplayed element, and which a
+        //     move in the flat tree, such as to another slot, displays again with that record.
+        self.uninstalled
+            .extend(statistics.styled.iter().copied().filter(|&node| {
+                state.computed_group_sets.assigned_style_record(node).is_none()
+                    || !state.held_style_records.contains(node)
+            }));
         // NB: An element moved out from below an undisplayed one may hold what it held before it moved there.
         if !self.installed_as_undisplayed.is_empty() {
             for node in &statistics.styled {
@@ -2407,20 +2414,10 @@ impl Live {
         );
         self.kept_hidden_records
             .note_moved(statistics.moved_custom_properties.iter().copied());
-        let styled = Instant::now();
         self.bump(LiveField::Passes, 1);
         self.bump(LiveField::FullPasses, u64::from(!hinted));
         self.bump(LiveField::StyledElements, statistics.styled.len() as u64);
         self.bump(LiveField::ChangedElements, statistics.changed_elements);
-
-        self.bump(
-            LiveField::InvalidationNanoseconds,
-            invalidated.duration_since(started).as_nanos() as u64,
-        );
-        self.bump(
-            LiveField::StyleNanoseconds,
-            styled.duration_since(invalidated).as_nanos() as u64,
-        );
         statistics
     }
 }
@@ -2610,10 +2607,10 @@ struct FollowScratch {
 struct CompoundMemo {
     /// The stamp of the element whose answers each slot holds: starting the next element is a new
     /// stamp, not a clearing.
-    stamps: Vec<u32>,
+    stamps: Vec<u16>,
     /// The answers of each slot, two bits per kind: none yet, unknown, false or true.
     answers: Vec<u8>,
-    stamp: u32,
+    stamp: u16,
 }
 
 /// What a memo answer of a compound is: of the element on its own or from it leftwards, after or
@@ -3068,18 +3065,41 @@ struct Level {
     /// Whether every link is a descendant combinator's, which reaches the children's descendants
     /// too.
     all_descendant: bool,
+    /// The bits of the key each link's compound requires in the summary of a subtree's keys, for the links with
+    /// such a key.
+    subtree_keys: SmallVec<[u64; 8]>,
+    /// Whether a link's compound requires no key the summary of a subtree's keys holds.
+    reaches_every_subtree: bool,
 }
 
 impl Level {
     fn of(map: &InvalidationMap, links: Links) -> Self {
         debug_assert!(links.is_sorted());
+        let mut subtree_keys: SmallVec<[u64; 8]> = SmallVec::new();
+        let mut reaches_every_subtree = false;
+        for &link in &links {
+            match map.step(link).required_key.and_then(subtree_key_bits) {
+                Some(keys) => subtree_keys.push(keys),
+                None => reaches_every_subtree = true,
+            }
+        }
+        subtree_keys.sort_unstable();
+        subtree_keys.dedup();
         Self {
             filter: LinkFilter::of(map, &links),
             all_descendant: links
                 .iter()
                 .all(|&link| map.step(link).combinator == ReachCombinator::Descendant),
             links,
+            subtree_keys,
+            reaches_every_subtree,
         }
+    }
+
+    /// Whether a link may reach an element of a subtree whose keys `summary` summarizes: an element is tested only
+    /// against the links whose key it carries.
+    fn reaches_subtree(&self, summary: u64) -> bool {
+        self.reaches_every_subtree || self.subtree_keys.iter().any(|&keys| keys & !summary == 0)
     }
 }
 
@@ -3758,7 +3778,29 @@ impl<'a> Follower<'a> {
     /// Test the children of `parent` against the links in `down`, and their descendants against
     /// the descendant combinators' among them.
     fn descend(&mut self, parent: StyleNodeID, down: &[Dependency]) {
-        let level = Level::of(self.map, down.iter().copied().collect());
+        // NB: A link whose key no element below the parent carries is tested against none of them.
+        let summary = self.projection.subtree_keys(parent);
+        let (map, mut dropped) = (self.map, Links::new());
+        let mut links: Links = down.iter().copied().collect();
+        links.retain(|link| {
+            let reaches = map
+                .step(*link)
+                .required_key
+                .and_then(subtree_key_bits)
+                .is_none_or(|keys| summary & keys == keys);
+            if !reaches && cfg!(debug_assertions) {
+                dropped.push(*link);
+            }
+            reaches
+        });
+        debug_assert!(
+            dropped.is_empty() || self.no_element_below_carries_a_key(parent, &Level::of(map, dropped)),
+            "the summary of the keys below an element lacks a key one of them carries"
+        );
+        if links.is_empty() {
+            return;
+        }
+        let level = Level::of(map, links);
         let first = self.projection.first_element_child(parent);
         self.walk_siblings(first, &level, Links::new());
     }
@@ -3803,6 +3845,16 @@ impl<'a> Follower<'a> {
                     )
                 }),
             };
+            // NB: Most elements of a walk are tested against no link, and only pass the level's on to their children.
+            if candidates.is_empty() && across.is_empty() {
+                if !continuing.links.is_empty()
+                    && let first_child @ Some(_) = tree.first_element_child(current)
+                    && self.reaches_below(current, continuing)
+                {
+                    self.walk_siblings(first_child, continuing, Links::new());
+                }
+                continue;
+            }
             let mut added = Links::new();
             let mut next_across = Links::new();
             let mut matched: SmallVec<[Step; 8]> = SmallVec::new();
@@ -3839,7 +3891,7 @@ impl<'a> Follower<'a> {
                 continue;
             }
             if added.is_empty() {
-                if !continuing.links.is_empty() {
+                if !continuing.links.is_empty() && self.reaches_below(current, continuing) {
                     self.walk_siblings(first_child, continuing, Links::new());
                 }
             } else {
@@ -3847,9 +3899,35 @@ impl<'a> Follower<'a> {
                 links.extend(added);
                 links.sort_unstable();
                 links.dedup();
-                self.walk_siblings(first_child, &Level::of(map, links), Links::new());
+                let level = Level::of(map, links);
+                if self.reaches_below(current, &level) {
+                    self.walk_siblings(first_child, &level, Links::new());
+                }
             }
         }
+    }
+
+    /// Whether a link of `level` may reach an element below `parent`, as the summary of the keys of its subtree tells.
+    fn reaches_below(&self, parent: StyleNodeID, level: &Level) -> bool {
+        let reaches = level.reaches_subtree(self.projection.subtree_keys(parent));
+        debug_assert!(
+            reaches || self.no_element_below_carries_a_key(parent, level),
+            "the summary of the keys below an element lacks a key one of them carries"
+        );
+        reaches
+    }
+
+    /// Whether no element below `parent` carries the key of a link of `level`, by reading every one of them.
+    fn no_element_below_carries_a_key(&self, parent: StyleNodeID, level: &Level) -> bool {
+        let mut carried: SmallVec<[Dependency; 8]> = SmallVec::new();
+        let mut below: Vec<StyleNodeID> = self.projection.children(parent).collect();
+        while let Some(element) = below.pop() {
+            below.extend(self.projection.children(element));
+            if let Some(row) = self.projection.row_of(element) {
+                level.filter.carried_keys(row, &mut carried);
+            }
+        }
+        carried.is_empty()
     }
 
     /// Whether `element` matches the compound right of `link` on its own.
@@ -4209,7 +4287,6 @@ impl StyleEngine {
             changed_sheets: HashSet::default(),
             reordered_scopes: HashSet::default(),
             layered_scopes: HashSet::default(),
-            report: Default::default(),
             counts: Default::default(),
             threads,
             cache_audit,
@@ -4232,14 +4309,10 @@ impl StyleEngine {
                 .collect(),
             kept_hidden_records: Default::default(),
         }));
-        self.retained
-            .cold_passes
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let started = Instant::now();
         self.live_pass(root, true);
         let nanoseconds = started.elapsed().as_nanos() as u64;
         if let Some(live) = self.retained.live_style.as_mut() {
-            *live.report = [0; LiveField::COUNT];
             // NB: The cold pass computes the records that are installed already, where it does.
             if !installs_cold_pass {
                 live.uninstalled.clear();
@@ -4284,9 +4357,37 @@ impl StyleEngine {
             .is_some_and(|live| live.released_compositions.iter().any(|(released, _)| *released == node))
     }
 
+    /// The host goes on to sample the animations of `node` and run its transition step, which composes a transition and
+    /// then takes it out again where the step ends it. What they compose is told as one move, once they are over, so
+    /// that a pair that leaves the composition as it found it restyles nothing.
+    pub(in super::super) fn begin_composition_settling(&mut self, node: StyleNodeID) {
+        debug_assert!(self.host.settling_composition.is_none());
+        self.host.settling_composition = Some(SettlingComposition { node, held: None });
+    }
+
+    pub(in super::super) fn end_composition_settling(&mut self) {
+        let settling = self
+            .host
+            .settling_composition
+            .take()
+            .expect("a composition settling ends after it began");
+        if let Some(held) = settling.held {
+            self.note_composition_moved(settling.node, held);
+        }
+    }
+
     /// Restyle the children of `node` that compute from what the composition of its animations
     /// moved since `held`, in the next pass of the engine.
     pub(in super::super) fn note_composition_moved(&mut self, node: StyleNodeID, held: HeldComposition) {
+        if let Some(settling) = self
+            .host
+            .settling_composition
+            .as_mut()
+            .filter(|settling| settling.node == node)
+        {
+            settling.held.get_or_insert(held);
+            return;
+        }
         let Some(view) = DriveRecords::assigned_record_view(&self.retained, node) else {
             return;
         };
@@ -4551,6 +4652,14 @@ fn resolve_waits(
 /// What the children of an element compute from of the view it held before the composition of
 /// its animations moved: its groups, each holding a reference, and the environment its animations
 /// sampled custom properties into, where they do.
+#[derive(Clone)]
+pub(in super::super) struct SettlingComposition {
+    node: StyleNodeID,
+    /// What the element's children computed from before the first move.
+    held: Option<HeldComposition>,
+}
+
+#[derive(Clone)]
 pub(in super::super) struct HeldComposition {
     payloads: crate::css::computed_values::StyleGroups,
     custom_properties: Option<u64>,
@@ -4577,45 +4686,49 @@ impl HeldComposition {
     }
 }
 
-impl RetainedState {
-    /// Check the records the engine holds for the document under `root` against the installed
-    /// ones, when asked to, and answer one field of what it measured since it started.
-    pub(in super::super) fn live_report(&mut self, root: StyleNodeID, verify: bool, index: u32) -> u64 {
-        if verify && let Some(mut live) = self.live_style.take() {
-            let mut verified = 0;
-            let mut missing = 0;
-            for node in self.projection.style_preorder(root) {
-                if node.element_index().is_none() || self.computed_group_sets.assigned_style_record(node).is_none() {
-                    continue;
-                }
-                if live.records.get(node).is_none() {
-                    missing += 1;
-                    continue;
-                }
-                verified += 1;
-            }
-            live.report[LiveField::VerifiedElements as usize] = verified;
-            live.report[LiveField::MissingRecords as usize] = missing;
-            live.report[LiveField::Differences as usize] =
-                super::self_check::installed_differences(self, root, &live.records, &|_| String::new()).len() as u64;
-            self.live_style = Some(live);
-        }
-        if index == LiveField::ColdPasses as u32 {
-            return self.cold_passes.load(std::sync::atomic::Ordering::Relaxed);
-        }
-        self.live_style
-            .as_ref()
-            .and_then(|live| live.report.get(index as usize).copied())
-            .unwrap_or(0)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::cell::Cell;
 
     const SIBLINGS: u32 = 1000;
+
+    #[test]
+    fn a_pass_after_the_scratch_is_trimmed_styles_as_a_cold_pass_does() {
+        use super::super::test_support::*;
+        let (mut engine, nodes) = document_with_children(4);
+        let sheet = add_sheet(&mut engine, TreeScopeID::DOCUMENT);
+        add_rules(
+            &mut engine,
+            sheet,
+            ".item { width: 1px; } .item + .item { color: rgb(0, 128, 0); } .item ~ :last-child { height: 2px; }",
+        );
+        add_class(&mut engine, nodes[1], "item");
+        start_live_on(&mut engine, nodes[0], 2);
+        for node in [nodes[2], nodes[3]] {
+            engine.trim_scratch();
+            add_class(&mut engine, node, "item");
+            run_style_update(&mut engine, nodes[0]);
+            assert_live_matches_cold(&mut engine, nodes[0]);
+        }
+        engine.trim_scratch();
+        remove_class(&mut engine, nodes[2], "item");
+        run_style_update(&mut engine, nodes[0]);
+        assert_live_matches_cold(&mut engine, nodes[0]);
+    }
+
+    #[test]
+    fn compound_memo_forgets_answers_when_the_stamp_wraps() {
+        let mut memo = CompoundMemo::default();
+        let kind = MemoKind::Own { before: false };
+        memo.start(1);
+        memo.stamp = 1;
+        memo.set(0, kind, Some(true));
+
+        memo.stamp = u16::MAX;
+        memo.start(1);
+        assert!(matches!(memo.get(0, kind), MemoAnswer::Unasked));
+    }
 
     fn next_of(steps: &Cell<u32>) -> impl Fn(StyleNodeID) -> Option<StyleNodeID> + '_ {
         |node| {

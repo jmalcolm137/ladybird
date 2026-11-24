@@ -79,12 +79,16 @@ pub struct ComputedGap {
 #[derive(Clone, PartialEq)]
 pub struct AlignmentValues {
     pub webkit_box_orient: u8,
+    pub webkit_box_align: u8,
+    pub webkit_box_pack: u8,
     pub flex_direction: u8,
     pub flex_wrap: u8,
     pub flex_basis: ComputedFlexBasis,
     pub flex_grow: f64,
     pub flex_shrink: f64,
+    pub webkit_box_flex: f64,
     pub order: i32,
+    pub webkit_box_ordinal_group: i32,
     pub align_content: u8,
     pub align_items: u8,
     pub align_self: u8,
@@ -100,6 +104,7 @@ pub struct AlignmentValues {
     pub align_self_overflow: u8,
     pub justify_self_overflow: u8,
     pub align_content_overflow: u8,
+    pub justify_content_overflow: u8,
     pub column_gap: ComputedGap,
     pub row_gap: ComputedGap,
 }
@@ -273,6 +278,10 @@ pub const INHERITED_BITS_TEXT_WRAP_MODE_SHIFT: u32 = 23;
 pub const INHERITED_BITS_TEXT_WRAP_MODE_WIDTH: u32 = 1;
 pub const INHERITED_BITS_WORD_BREAK_SHIFT: u32 = 24;
 pub const INHERITED_BITS_WORD_BREAK_WIDTH: u32 = 2;
+pub const INHERITED_BITS_TEXT_ALIGN_LAST_SHIFT: u32 = 26;
+pub const INHERITED_BITS_TEXT_ALIGN_LAST_WIDTH: u32 = 3;
+pub const INHERITED_BITS_HYPHENS_SHIFT: u32 = 29;
+pub const INHERITED_BITS_HYPHENS_WIDTH: u32 = 2;
 
 /// The keywords of few values of properties that do not inherit a style holds as bits in its
 /// root beside its own groups, in place of fields of its box group: each the code of its keyword
@@ -458,6 +467,14 @@ pub struct RetainedWillChangePropertyList {
     pub length: usize,
 }
 
+/// The bits of [`MiscLayoutValues::user_agent_margin_sides`], one per physical side.
+pub mod user_agent_margin_side {
+    pub const TOP: u8 = 1 << 0;
+    pub const RIGHT: u8 = 1 << 1;
+    pub const BOTTOM: u8 = 1 << 2;
+    pub const LEFT: u8 = 1 << 3;
+}
+
 /// The non-inherited values of how a box lays out and outlines that no more specific group holds:
 /// appearance, fragmentation breaks, columns, object fitting, outlines, overflow clip margins and
 /// float shapes.
@@ -476,6 +493,9 @@ pub struct MiscLayoutValues {
     pub computed_appearance: u8,
     /// https://drafts.csswg.org/css-ui/#appearance-disabling-properties
     pub native_appearance_disabled: bool,
+    /// The physical sides whose margins the user agent's style sheet sets, as [`user_agent_margin_side`] bits.
+    /// Only a quirks-mode document records them, for its margin collapsing quirks.
+    pub user_agent_margin_sides: u8,
     pub outline_style: u8,
     pub object_fit: u8,
     pub column_height: ComputedSize,
@@ -564,6 +584,7 @@ pub struct InheritedTextValues {
     pub text_justify: u8,
     pub line_break: u8,
     pub tab_size_is_number: bool,
+    pub text_security: u8,
     pub letter_spacing: crate::css::css_pixels::CssPixels,
     pub word_spacing: crate::css::css_pixels::CssPixels,
     pub tab_size_length: crate::css::css_pixels::CssPixels,
@@ -573,6 +594,8 @@ pub struct InheritedTextValues {
     pub color_style_value: ComputedStyleValueHandle,
     pub webkit_text_fill_color: u32,
     pub webkit_text_fill_color_is_current_color: bool,
+    pub webkit_text_stroke_color: StyleColor,
+    pub webkit_text_stroke_width: f64,
     pub font_smoothing: u8,
     pub text_shadow: RetainedComputedShadowList,
     pub text_transform: u8,
@@ -671,6 +694,7 @@ pub struct FontValues {
     pub resolved_font_ascent: f32,
     pub resolved_font_descent: f32,
     pub resolved_font_x_height: f32,
+    pub resolved_font_cap_height: f32,
     pub resolved_font_zero_advance: f32,
     pub resolved_first_available_font: *const std::ffi::c_void,
     pub font_cascade_list: libgfx_rust::font::FontCascadeListHandle,
@@ -712,10 +736,24 @@ pub struct FirstAvailableFontMetrics {
     pub ascent: f32,
     pub descent: f32,
     pub x_height: f32,
+    pub cap_height: f32,
     pub zero_advance: f32,
 }
 
 impl FontValues {
+    /// The computed font size, which `font_size` holds rounded to the nearest pixel fraction, as
+    /// the lengths relative to it read it: An em or rem length scales the size unrounded.
+    pub fn font_size_for_lengths(&self) -> f64 {
+        match self.font_size_value.style_value() {
+            Some(crate::css::style_value::StyleValueData::Length { value, unit })
+                if *unit == crate::css::style_compute::px_length_unit() =>
+            {
+                *value
+            }
+            _ => self.font_size.to_double(),
+        }
+    }
+
     /// https://drafts.csswg.org/css-fonts/#first-available-font
     /// The frozen cascade answers where the font computer published one: a load filling one of its
     /// faces in moves the answer without a new style. A cascade nobody published (a unit test's)
@@ -737,7 +775,9 @@ impl FontValues {
         if is_normal && let Some(font) = self.first_available_font() {
             let facts = font.facts();
             return crate::css::css_pixels::CssPixels::from_integer(
-                i64::from(facts.ascent.round() as i32) + i64::from(facts.descent.round() as i32),
+                i64::from(facts.ascent.round_ties_even() as i32)
+                    + i64::from(facts.descent.round_ties_even() as i32)
+                    + i64::from(facts.line_gap.round_ties_even() as i32),
             );
         }
         self.resolved_line_height_used
@@ -752,6 +792,7 @@ impl FontValues {
                     ascent: facts.ascent,
                     descent: facts.descent,
                     x_height: facts.x_height,
+                    cap_height: facts.cap_height,
                     zero_advance: facts.zero_advance,
                 }
             }
@@ -759,6 +800,7 @@ impl FontValues {
                 ascent: self.resolved_font_ascent,
                 descent: self.resolved_font_descent,
                 x_height: self.resolved_font_x_height,
+                cap_height: self.resolved_font_cap_height,
                 zero_advance: self.resolved_font_zero_advance,
             },
         }
@@ -901,6 +943,9 @@ pub struct SVGResetValues {
     pub flood_color: StyleColor,
     pub flood_opacity: f32,
     pub vector_effect: u8,
+    /// Whether alignment-baseline names a baseline metric, rather than being 'baseline'.
+    pub has_alignment_baseline: bool,
+    pub alignment_baseline: u8,
 }
 
 /// A Rust-owned list of computed TextDecorationLine enum codes.

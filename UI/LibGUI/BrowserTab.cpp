@@ -7,6 +7,7 @@
 #include "BrowserTab.h"
 
 #include <WaylandClient.h>
+#include <WaylandSeat.h>
 
 #include <AK/Base64.h>
 #include <AK/StringBuilder.h>
@@ -910,7 +911,7 @@ void BrowserTab::update_input_method_state(bool enabled, Optional<Gfx::IntRect> 
 
 void BrowserTab::refresh_text_input_state()
 {
-    auto& wayland = LibWM::WaylandClient::the();
+    auto& seat = LibWM::WaylandClient::the().seat();
     auto* window = m_root->window();
     auto* focused = window ? window->focused_widget() : nullptr;
 
@@ -920,13 +921,13 @@ void BrowserTab::refresh_text_input_state()
         auto& editor = static_cast<GUI::TextEditor&>(*focused);
         auto origin = editor.window_relative_rect().location();
         auto caret = editor.cursor_content_rect();
-        wayland.set_text_input_cursor_rect({
+        seat.set_text_input_cursor_rect({
             origin.x() + caret.x(),
             origin.y() + caret.y(),
             max(caret.width(), 1),
             max(caret.height(), 1),
         });
-        wayland.set_text_input_enabled(true);
+        seat.set_text_input_enabled(true);
         m_input_method_enabled = true;
         return;
     }
@@ -935,19 +936,19 @@ void BrowserTab::refresh_text_input_state()
         if (m_page_caret_rect.has_value()) {
             auto scale = device_pixel_ratio();
             auto origin = m_web_view->window_relative_rect().location();
-            wayland.set_text_input_cursor_rect({
+            seat.set_text_input_cursor_rect({
                 origin.x() + m_page_caret_rect->x() / scale,
                 origin.y() + m_page_caret_rect->y() / scale,
                 max(m_page_caret_rect->width() / scale, 1),
                 max(m_page_caret_rect->height() / scale, 1),
             });
         }
-        wayland.set_text_input_enabled(true);
+        seat.set_text_input_enabled(true);
         m_input_method_enabled = true;
         return;
     }
 
-    wayland.set_text_input_enabled(false);
+    seat.set_text_input_enabled(false);
     m_input_method_enabled = false;
 }
 

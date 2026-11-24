@@ -13,7 +13,6 @@
 #include <LibWeb/DOM/Text.h>
 #include <LibWeb/HTML/FormAssociatedElement.h>
 #include <LibWeb/HTML/HTMLAreaElement.h>
-#include <LibWeb/HTML/HTMLBRElement.h>
 #include <LibWeb/HTML/HTMLHtmlElement.h>
 #include <LibWeb/HTML/HTMLImageElement.h>
 #include <LibWeb/HTML/HTMLMapElement.h>
@@ -22,7 +21,6 @@
 #include <LibWeb/Layout/Box.h>
 #include <LibWeb/Layout/LayoutRustBridge.h>
 #include <LibWeb/Layout/Node.h>
-#include <LibWeb/Layout/TextNode.h>
 #include <LibWeb/Layout/Viewport.h>
 #include <LibWeb/Page/Page.h>
 #include <LibWeb/Painting/BoxViews.h>
@@ -158,28 +156,6 @@ BoxModelMetrics box_model(Layout::Node const& node)
     };
 }
 
-Optional<CSSPixels> anchor_resolved_size(Layout::Node const& node, CSS::PropertyID property_id)
-{
-    auto property = [&] {
-        switch (property_id) {
-        case CSS::PropertyID::MinWidth:
-            return Layout::RustFFI::FfiAnchorSizedProperty::MinWidth;
-        case CSS::PropertyID::MinHeight:
-            return Layout::RustFFI::FfiAnchorSizedProperty::MinHeight;
-        case CSS::PropertyID::MaxWidth:
-            return Layout::RustFFI::FfiAnchorSizedProperty::MaxWidth;
-        case CSS::PropertyID::MaxHeight:
-            return Layout::RustFFI::FfiAnchorSizedProperty::MaxHeight;
-        default:
-            VERIFY_NOT_REACHED();
-        }
-    }();
-    CSSPixels size;
-    if (!Layout::RustFFI::layout_script_anchor_resolved_size(node.document_host(), committed_row_slot(node), property, &size))
-        return {};
-    return size;
-}
-
 CSSPixels border_box_width(Layout::Node const& node)
 {
     auto border_box = box_model(node).border_box();
@@ -291,11 +267,6 @@ static bool is_inline_paintable(Layout::Node const& node)
     return has_committed_box(node) && node.is_fragmented_inline();
 }
 
-bool is_svg_svg_paintable(Layout::Node const& node)
-{
-    return has_committed_box(node) && node.kind() == Layout::RustFFI::NodeKind::SVGSVGBox;
-}
-
 bool has_accumulated_visual_context(Layout::Node const& node)
 {
     auto row = committed_row(node);
@@ -320,12 +291,12 @@ Compositing::SpatialNodeIndex own_scroll_node_index(Layout::Node const& node)
     return row.has_value() ? row->own_scroll_node_index : Compositing::VISUAL_VIEWPORT_NODE_INDEX;
 }
 
-Optional<Gfx::FloatRect> committed_svg_path_bounding_box(Layout::Node const& node)
+Optional<Layout::RustFFI::SvgGeometry> svg_geometry(Layout::Node const& node)
 {
-    Gfx::FloatRect bounding_box;
-    if (!Layout::RustFFI::render_state_paintable_computed_svg_path_bounding_box(node.document_host(), committed_row_slot(node), &bounding_box))
+    Layout::RustFFI::SvgGeometry geometry;
+    if (!Layout::RustFFI::render_state_svg_geometry(node.document_host(), committed_row_slot(node), &geometry))
         return {};
-    return bounding_box;
+    return geometry;
 }
 
 // The glyph cells a text content element's box committed for its own characters, one per code unit, copied out
@@ -338,13 +309,6 @@ Vector<Layout::RustFFI::FfiSvgTextCharacterCell> svg_text_character_cells(Layout
     for (size_t index = 0; index < result.count; ++index)
         cells.unchecked_append(result.cells[index]);
     return cells;
-}
-
-CSSPixelSize svg_viewport_size(Layout::Node const& node)
-{
-    CSSPixelSize size;
-    Layout::RustFFI::render_state_paintable_svg_viewport_size(node.document_host(), committed_row_slot(node), &size);
-    return size;
 }
 
 Optional<Gfx::AffineTransform> svg_viewport_transform(Layout::Node const& node)
@@ -385,230 +349,71 @@ CSSPixelPoint box_type_agnostic_position(Layout::Node const& node)
     return absolute_position(node);
 }
 
-static bool has_content(Layout::Node const& node)
+Optional<Layout::RustFFI::FfiCaretPosition> layout_caret_position(Layout::BegunRead const& read, DOM::Node const& node, size_t offset, TextAffinity affinity)
 {
-    // Interrupting block-in-inline children produce only placeholder pieces, so any child
-    // paintable also counts as content.
-    return Layout::RustFFI::render_state_inline_paintable_has_content_pieces(node.document_host(), committed_row_slot(node))
-        || Layout::RustFFI::layout_row_paintable_has_child_paintables(node.document_host(), committed_row_slot(node));
+    auto const* layout_node = node.unsafe_layout_node(read);
+    if (!layout_node)
+        return {};
+    auto slot_of = [&](DOM::Node const* child) {
+        auto const* child_layout_node = child ? child->unsafe_layout_node(read) : nullptr;
+        return child_layout_node ? Layout::Node::slot_id(child_layout_node) : Compositing::RustFFI::NodeSlotId { Compositing::RustFFI::INVALID_NODE_SLOT_INDEX };
+    };
+    auto const* child_before = offset > 0 ? node.child_at_index(offset - 1) : nullptr;
+    return Layout::RustFFI::FfiCaretPosition {
+        .node = Layout::Node::slot_id(layout_node),
+        .offset = offset,
+        .downstream = affinity == TextAffinity::Downstream,
+        .child_before = slot_of(child_before),
+        .child_before_length = child_before ? child_before->length() : 0,
+        .child_after = slot_of(node.child_at_index(offset)),
+    };
 }
 
-static CSSPixelRect caret_rect_for_empty_line(Layout::NodeWithStyle const& node, CSSPixelPoint position)
+Layout::RustFFI::FfiCaret caret_at_position(Layout::BegunRead const& read, DOM::Position const& position, Layout::RustFFI::FfiViewportMapping viewport_mapping)
 {
-    // NB: Match the font-height caret used by text fragments, centered in the empty line's line-height box.
-    auto const& font_metrics = node.first_available_font().pixel_metrics();
-    auto line_height = node.line_height();
-    auto caret_height = min(line_height, CSSPixels::nearest_value_for(font_metrics.ascent + font_metrics.descent));
-    return { position.x(), position.y() + (line_height - caret_height) / 2, 1, caret_height };
-}
-
-static Optional<Layout::RustFFI::FfiCaretRectResult> caret_at_atomic_child(Layout::Node const& layout_node, size_t offset)
-{
-    auto const& read = layout_node.held_read();
-    auto* node = layout_node.dom_node();
-    if (!node)
-        return {};
-    auto resolve = [&](size_t child_offset) -> Optional<Layout::RustFFI::FfiCaretRectResult> {
-        auto const* child = node->child_at_index(child_offset);
-        auto* child_layout_node = child ? child->unsafe_layout_node(read) : nullptr;
-        if (!child_layout_node || !child_layout_node->is_atomic_inline())
-            return {};
-        Layout::RustFFI::FfiCaretRectResult result;
-        Layout::RustFFI::layout_script_atomic_inline_caret_rect_for_position(
-            layout_node.document_host(), Layout::Node::slot_id(child_layout_node), child_offset < offset, &result);
-        if (!result.found)
-            return {};
-        return result;
-    };
-    if (offset > 0) {
-        if (auto result = resolve(offset - 1); result.has_value())
-            return result;
-    }
-    return resolve(offset);
-}
-
-// Caret rect for a cursor parked on this paintable's DOM node at the given child offset, e.g. on an empty line
-// rendered by a <br> child or in an empty editable element.
-CSSPixelRect caret_rect_for_child_offset(Layout::BegunRead const& read, Layout::Node const& block, size_t offset)
-{
-    if (!has_committed_box(block))
-        return {};
-    auto const& styled_block = as<Layout::NodeWithStyle>(block);
-
-    auto content_box = absolute_padding_box_rect(block);
-    auto line_height = styled_block.line_height();
-    auto rect = caret_rect_for_empty_line(styled_block, content_box.location());
-    auto caret_offset_in_line = rect.y() - content_box.y();
-
-    auto dom_node = block.dom_node();
-    if (!dom_node)
-        return rect;
-
-    if (auto atomic_caret = caret_at_atomic_child(block, offset); atomic_caret.has_value())
-        return atomic_caret->rect;
-
-    // NB: A boundary beside a text child has the same geometry as the corresponding text offset.
-    //     Editors can leave the selection on the parent after inserting their first character.
-    //     Use the text fragment's position and font metrics instead of the empty-block fallback.
-    auto caret_rect_in_text = [&](DOM::Node const* node, size_t text_offset) -> Optional<CSSPixelRect> {
-        auto const* text = as_if<DOM::Text>(node);
-        auto const* layout_node = text ? text->unsafe_layout_node(read) : nullptr;
-        if (!layout_node)
-            return {};
-        Layout::RustFFI::FfiCaretRectResult result;
-        Layout::RustFFI::layout_script_text_caret_rect_for_position(
-            block.document_host(), Layout::Node::slot_id(layout_node), text_offset, true, &result);
-        if (result.found)
-            return result.rect;
-        return {};
-    };
-    if (offset > 0) {
-        auto const* previous_child = dom_node->child_at_index(offset - 1);
-        if (auto text_rect = caret_rect_in_text(previous_child, previous_child ? previous_child->length() : 0); text_rect.has_value())
-            return *text_rect;
-    }
-    if (auto text_rect = caret_rect_in_text(dom_node->child_at_index(offset), 0); text_rect.has_value())
-        return *text_rect;
-
-    auto* child = dom_node->child_at_index(offset);
-    if (!child || !is<HTML::HTMLBRElement>(*child))
-        return rect;
-
-    if (auto const* break_layout_node = child->unsafe_layout_node(read)) {
-        CSSPixelPoint line_position;
-        if (Layout::RustFFI::layout_script_empty_line_ended_by_forced_break_position(block.document_host(), committed_row_slot(block), Layout::Node::slot_id(break_layout_node), &line_position))
-            return caret_rect_for_empty_line(styled_block, line_position);
-    }
-
-    // A caret parked before a <br> sits on the line below the content preceding the <br>. Layout produces no
-    // fragments for <br>, so start below the fragments of any preceding content, and add one line height for each
-    // empty line rendered by earlier <br>s.
-    struct PrecedingContentContext {
-        GC::Ref<DOM::Node> child;
-        Layout::BegunRead const& read;
-        Optional<CSSPixels> preceding_content_bottom;
-    } preceding_context {
-        .child = const_cast<DOM::Node&>(*child),
-        .read = read,
-        .preceding_content_bottom = {},
-    };
-    Layout::RustFFI::render_state_for_each_subtree_fragment_rect(
-        block.document_host(), committed_row_slot(block), &preceding_context,
-        [](void* context_pointer, Compositing::RustFFI::NodeSlotId fragment_slot, CSSPixelRect rect) {
-            auto& context = *static_cast<PrecedingContentContext*>(context_pointer);
-            auto const* fragment_layout_node = context.child->document().layout_node_arena().node_if_live(context.read, fragment_slot);
-            auto* fragment_dom_node = fragment_layout_node ? const_cast<DOM::Node*>(fragment_layout_node->dom_node()) : nullptr;
-            if (!fragment_dom_node || !(context.child->compare_document_position(fragment_dom_node) & DOM::Node::DOCUMENT_POSITION_PRECEDING))
-                return;
-            auto bottom = rect.bottom();
-            if (!context.preceding_content_bottom.has_value() || bottom > *context.preceding_content_bottom)
-                context.preceding_content_bottom = bottom;
-        });
-    auto& preceding_content_bottom = preceding_context.preceding_content_bottom;
-
-    size_t preceding_empty_lines = 0;
-    dom_node->for_each_in_subtree_of_type<HTML::HTMLBRElement>([&](auto& br) {
-        if (&br == child)
-            return TraversalDecision::Break;
-        if (br.represents_empty_line(read))
-            ++preceding_empty_lines;
-        return TraversalDecision::Continue;
-    });
-
-    rect.set_y(preceding_content_bottom.value_or(content_box.y()) + line_height * preceding_empty_lines + caret_offset_in_line);
-    return rect;
+    Layout::RustFFI::FfiCaret caret {};
+    auto ffi_position = layout_caret_position(read, *position.node(), position.offset(), position.affinity());
+    if (!ffi_position.has_value())
+        return caret;
+    Layout::RustFFI::layout_script_caret(position.node()->unsafe_layout_node(read)->document_host(), *ffi_position, viewport_mapping, &caret);
+    return caret;
 }
 
 Layout::RustFFI::FfiCaretPaint resolve_document_caret_paint(Layout::BegunRead const& read, DOM::Document& document)
 {
-    Layout::RustFFI::FfiCaretPaint caret {};
+    Layout::RustFFI::FfiCaretPaint caret_paint {};
     Compositing::RustFFI::NodeSlotId const no_slot { Compositing::RustFFI::INVALID_NODE_SLOT_INDEX };
-    caret.kind = Layout::RustFFI::FfiCaretPaintKind::None;
-    caret.block = no_slot;
-    caret.owner = no_slot;
+    caret_paint.kind = Layout::RustFFI::FfiCaretPaintKind::None;
+    caret_paint.block = no_slot;
+    caret_paint.owner = no_slot;
 
     auto cursor_position = document.cursor_position();
     if (!cursor_position)
-        return caret;
+        return caret_paint;
     // The caret paints only while the cursor node is editable (or a mutable text control has focus), and the recorder
-    // paints it only while the window has focus; every candidate box below has a committed box.
-    auto const* cursor_node = cursor_position->node().ptr();
-    if (!cursor_node)
-        return caret;
+    // paints it only while the window has focus.
     bool cursor_is_editable = false;
     if (auto const* text_control = as_if<HTML::FormAssociatedTextControlElement>(document.focused_area().ptr()); text_control && text_control->text_control_to_html_element().is_mutable())
         cursor_is_editable = true;
     else
-        cursor_is_editable = cursor_node->is_editable_or_editing_host();
+        cursor_is_editable = cursor_position->node()->is_editable_or_editing_host();
     if (!cursor_is_editable)
-        return caret;
+        return caret_paint;
 
-    auto fill = [&](Layout::RustFFI::FfiCaretPaintKind kind, Compositing::RustFFI::NodeSlotId block, Compositing::RustFFI::NodeSlotId owner, CSSPixelRect rect, Color color) {
-        caret.kind = kind;
-        caret.block = block;
-        caret.owner = owner;
-        caret.rect = rect;
-        caret.color = color;
-        caret.blink_cycle_start_time_ns = document.cursor_blink_cycle_start_time_ns();
-        caret.should_blink = !HTML::Window::in_test_mode();
-    };
-
-    if (auto const* text = as_if<DOM::Text>(cursor_node)) {
-        auto const* text_layout_node = text->unsafe_layout_node(read);
-        if (!text_layout_node)
-            return caret;
-        auto* host = text_layout_node->document_host();
-        Layout::RustFFI::FfiCaretRectResult result;
-        Layout::RustFFI::layout_script_text_caret_rect_for_position(
-            host, Layout::Node::slot_id(text_layout_node), cursor_position->offset(),
-            cursor_position->affinity() == TextAffinity::Downstream, &result);
-        if (result.found) {
-            auto const* style_source = static_cast<Layout::NodeWithStyle const*>(text_layout_node->node_arena().node_if_live(read, result.style_source));
-            if (style_source && layout_node_is_visible(*style_source))
-                fill(Layout::RustFFI::FfiCaretPaintKind::InBlock, result.owner_paintable, result.nearest_self_painting_inline, result.rect, style_source->caret_color());
-            return caret;
-        }
-        // No fragment holds the position: the caret sits on an empty line of the block that lays the text out.
-        for (auto const* block = text_layout_node->parent(); block; block = block->parent()) {
-            if (!has_committed_box(*block) || !is_visible(*block))
-                continue;
-            Layout::RustFFI::FfiEmptyLineCaretRect empty_line;
-            Layout::RustFFI::layout_script_paintable_empty_line_caret_rect(
-                host, committed_row_slot(*block), Layout::Node::slot_id(text_layout_node), cursor_position->offset(), &empty_line);
-            if (!empty_line.has_value)
-                continue;
-            auto const* style_source = static_cast<Layout::NodeWithStyle const*>(text_layout_node->node_arena().node_if_live(read, empty_line.style_source));
-            if (!style_source)
-                return caret;
-            auto empty_line_rect = empty_line.rect;
-            fill(Layout::RustFFI::FfiCaretPaintKind::InBlock, committed_row_slot(*block), no_slot, CSSPixelRect { empty_line_rect.x(), empty_line_rect.y(), 1, empty_line_rect.height() }, style_source->caret_color());
-            return caret;
-        }
-        return caret;
-    }
-
-    // The cursor is parked on an element: its own box paints the caret at the child offset, or, for an
-    // empty editable inline, at the box's position.
-    auto const* layout_node = cursor_node->layout_node(read);
-    if (!layout_node || !has_committed_box(*layout_node))
-        return caret;
-    auto const& styled_node = as<Layout::NodeWithStyle>(*layout_node);
-    if (is_inline_paintable(*layout_node)) {
-        if (auto atomic_caret = caret_at_atomic_child(*layout_node, cursor_position->offset()); atomic_caret.has_value()) {
-            if (layout_node_is_visible(styled_node))
-                fill(Layout::RustFFI::FfiCaretPaintKind::InBlock, atomic_caret->owner_paintable, atomic_caret->nearest_self_painting_inline, atomic_caret->rect, styled_node.caret_color());
-            return caret;
-        }
-        if (has_content(*layout_node))
-            return caret;
-        auto position = box_type_agnostic_position(*layout_node);
-        fill(Layout::RustFFI::FfiCaretPaintKind::EmptyInline, committed_row_slot(*layout_node), no_slot, caret_rect_for_empty_line(styled_node, position), styled_node.caret_color());
-        return caret;
-    }
-    if (!is_visible(*layout_node))
-        return caret;
-    fill(Layout::RustFFI::FfiCaretPaintKind::InBlock, committed_row_slot(*layout_node), no_slot, caret_rect_for_child_offset(read, *layout_node, cursor_position->offset()), styled_node.caret_color());
-    return caret;
+    auto caret = caret_at_position(read, *cursor_position, {});
+    if (!caret.found)
+        return caret_paint;
+    auto const* style_source = static_cast<Layout::NodeWithStyle const*>(document.layout_node_arena().node_if_live(read, caret.style_source));
+    if (!style_source || !layout_node_is_visible(*style_source))
+        return caret_paint;
+    caret_paint.kind = caret.paint;
+    caret_paint.block = caret.block;
+    caret_paint.owner = caret.owner;
+    caret_paint.rect = caret.rect;
+    caret_paint.color = style_source->caret_color();
+    caret_paint.blink_cycle_start_time_ns = document.cursor_blink_cycle_start_time_ns();
+    caret_paint.should_blink = !HTML::Window::in_test_mode();
+    return caret_paint;
 }
 
 Layout::RustFFI::FfiFocusedTextControlSelection resolve_focused_text_control_selection(Layout::BegunRead const& read, DOM::Document const& document)
@@ -667,58 +472,70 @@ CSSPixelRect transform_reference_box(Layout::Node const& node)
     return rect;
 }
 
-// NB: Taking the document's visual context tree brings it up to date, which can compact it and move a box's visual
-//     context to other nodes. The functions below read a box's visual context only once they have the tree.
-CSSPixelRect transform_rect_to_viewport(Layout::Node const& node, CSSPixelRect const& rect, Compositing::AccumulatedVisualContextTree::IncludeVisualViewportTransform include_visual_viewport_transform)
+Layout::RustFFI::FfiViewportMapping viewport_mapping(DOM::Document const& document)
 {
-    if (!has_committed_box(node))
-        return {};
-    auto const& document = node.document();
     if (!document.has_committed_viewport_box())
-        return rect;
-    auto pixel_ratio = static_cast<float>(document.page().client().device_pixels_per_css_pixel());
-    auto visual_context_tree = document.visual_context_tree();
-    auto result = visual_context_tree.transform_rect_to_viewport(
-        accumulated_visual_context(node).spatial, rect.to_type<float>() * pixel_ratio,
-        document.scroll_state_snapshot(), include_visual_viewport_transform);
-    return (result * (1.f / pixel_ratio)).to_type<CSSPixels>();
+        return {};
+    return document.paint_state().viewport_mapping(document, {}, document.page().client().device_pixels_per_css_pixel());
 }
 
-static Optional<CSSPixelPoint> transform_point_to_local(Layout::Node const& node, CSSPixelPoint position)
+Layout::RustFFI::FfiViewportMapping viewport_mapping_with_visual_animations_sampled_at(DOM::Document const& document, MonotonicTime sample_time)
 {
-    if (!has_committed_box(node))
-        return {};
-    auto const& document = node.document();
     if (!document.has_committed_viewport_box())
-        return position;
-    auto pixel_ratio = static_cast<float>(document.page().client().device_pixels_per_css_pixel());
-    auto visual_context_tree = document.visual_context_tree();
-    auto result = visual_context_tree.transform_point_for_hit_test(
-        accumulated_visual_context(node), position.to_type<float>() * pixel_ratio,
-        document.scroll_state_snapshot());
-    if (!result.has_value())
         return {};
-    return (*result / pixel_ratio).to_type<CSSPixels>();
+    return document.paint_state().viewport_mapping(document, sample_time, document.page().client().device_pixels_per_css_pixel());
 }
 
-CSSPixelPoint inverse_transform_point(Layout::Node const& node, CSSPixelPoint position)
+// NB: Making a viewport mapping brings the document's visual context tree up to date, which can compact it and move a
+//     box's visual context to other nodes. The functions below read a box's visual context only once they have the
+//     mapping.
+CSSPixelRect rect_to_viewport(Layout::Node const& node, CSSPixelRect const& rect, Layout::RustFFI::ViewportSpace space)
 {
     if (!has_committed_box(node))
         return {};
-    auto const& document = node.document();
-    if (!document.has_committed_viewport_box())
-        return position;
-    auto pixel_ratio = static_cast<float>(document.page().client().device_pixels_per_css_pixel());
-    auto visual_context_tree = document.visual_context_tree();
-    auto result = visual_context_tree.inverse_transform_point(accumulated_visual_context(node).spatial, position.to_type<float>() * pixel_ratio);
-    return (result / pixel_ratio).to_type<CSSPixels>();
+    auto mapping = viewport_mapping(node.document());
+    CSSPixelRect result;
+    Layout::RustFFI::viewport_mapping_rect_in_space_to_viewport(mapping, accumulated_visual_context(node).spatial, rect, space, &result);
+    return result;
 }
 
-CSSPixelPoint transform_to_local_coordinates(Layout::Node const& node, CSSPixelPoint position)
+CSSPixelRect visible_rect_in_containing_blocks(Layout::Node const& node, CSSPixelRect const& rect, Layout::RustFFI::ViewportSpace space)
+{
+    auto mapping = viewport_mapping(node.document());
+    CSSPixelRect visible;
+    Layout::RustFFI::render_state_visible_rect_in_containing_blocks(node.document_host(), committed_row_slot(node), mapping, rect, space, &visible);
+    return visible;
+}
+
+CSSPixelPoint point_to_local(Layout::Node const& node, CSSPixelPoint point, Layout::RustFFI::ViewportSpace space)
 {
     if (!has_committed_box(node))
         return {};
-    return transform_point_to_local(node, position).value_or(position);
+    auto mapping = viewport_mapping(node.document());
+    CSSPixelPoint local;
+    if (!Layout::RustFFI::viewport_mapping_point_to_local(mapping, accumulated_visual_context(node), point, space, &local))
+        return point;
+    return local;
+}
+
+// https://drafts.csswg.org/cssom-view/#dom-mouseevent-offsetx
+CSSPixelPoint mouse_event_offset(Layout::Node const& node, CSSPixelPoint viewport_position)
+{
+    // The position where the event occurred, ignoring the transforms that apply to the element and its ancestors,
+    // relative to the origin of the padding edge of the target node.
+    return point_to_local(node, viewport_position, Layout::RustFFI::ViewportSpace::LayoutViewport) - box_type_agnostic_position(node);
+}
+
+CSSPixelPoint presented_scroll_offset(Layout::Node const& node, CSSPixelPoint scroll_offset)
+{
+    auto const& document = node.document();
+    if (!has_committed_box(node) || !document.has_committed_viewport_box())
+        return scroll_offset;
+    if (!document.paint_state().translations_snap_to_device_pixels(document, committed_row_slot(node)))
+        return scroll_offset;
+    auto pixel_ratio = document.page().client().device_pixels_per_css_pixel();
+    auto snap = [&](CSSPixels value) { return CSSPixels::nearest_value_for(round(value.to_double() * pixel_ratio) / pixel_ratio); };
+    return { snap(scroll_offset.x()), snap(scroll_offset.y()) };
 }
 
 Optional<String> grid_layout_json(Layout::Node const& node, UniqueNodeID container_node_id)
@@ -842,29 +659,11 @@ void repaint_after_style_change(Layout::Node const& node, CSS::RequiredInvalidat
         const_cast<DOM::Document&>(node.document()).schedule_accumulated_visual_context_update(node, DOM::Document::AccumulatedVisualContextUpdateScope::Structure);
 }
 
-Layout::RustFFI::FfiRectToViewportTransform identity_rect_to_viewport_transform()
-{
-    return {};
-}
-
-Layout::RustFFI::FfiRectToViewportTransform rect_to_viewport_transform(DOM::Document const& document, Compositing::AccumulatedVisualContextTree const& visual_context_tree)
-{
-    if (!document.has_committed_viewport_box())
-        return identity_rect_to_viewport_transform();
-    auto scroll_offsets = document.scroll_state_snapshot().device_offsets();
-    return {
-        .visual_context_tree = visual_context_tree.rust_handle(),
-        .scroll_offsets = scroll_offsets.data(),
-        .scroll_offsets_len = scroll_offsets.size(),
-        .device_pixels_per_css_pixel = static_cast<float>(document.page().client().device_pixels_per_css_pixel()),
-    };
-}
-
-Vector<CSSPixelRect> client_rects(Layout::Node const& node, Layout::RustFFI::FfiRectToViewportTransform const& rect_to_viewport_transform)
+Vector<CSSPixelRect> client_rects(Layout::Node const& node, Layout::RustFFI::FfiViewportMapping const& viewport_mapping)
 {
     Vector<CSSPixelRect> rects;
     Layout::RustFFI::layout_script_client_rects(
-        node.document_host(), committed_row_slot(node), rect_to_viewport_transform, &rects,
+        node.document_host(), committed_row_slot(node), viewport_mapping, &rects,
         [](void* context, CSSPixelRect rect) {
             static_cast<Vector<CSSPixelRect>*>(context)->append(rect);
         });
@@ -876,29 +675,25 @@ bool has_sticky_positioned_inclusive_ancestor(Layout::Node const& node)
     return Layout::RustFFI::layout_script_has_sticky_positioned_inclusive_ancestor(node.document_host(), committed_row_slot(node));
 }
 
-CSSPixelPoint accumulated_sticky_offset(Layout::Node const& node, Layout::RustFFI::FfiRectToViewportTransform const& rect_to_viewport_transform)
+CSSPixelPoint accumulated_sticky_offset(Layout::Node const& node)
 {
-    Layout::RustFFI::FfiOptionalCssPixelPoint result;
-    Layout::RustFFI::layout_script_accumulated_sticky_offset(node.document_host(), committed_row_slot(node), rect_to_viewport_transform, &result);
-    if (!result.has_value)
-        return {};
-    return { result.x, result.y };
+    CSSPixelPoint offset;
+    Layout::RustFFI::layout_script_accumulated_sticky_offset(node.document_host(), committed_row_slot(node), viewport_mapping(node.document()), &offset);
+    return offset;
 }
 
-CSSPixelRect bounding_client_rect(Layout::Node const& node, Layout::RustFFI::FfiRectToViewportTransform const& rect_to_viewport_transform)
+CSSPixelRect bounding_client_rect(Layout::Node const& node, Layout::RustFFI::FfiViewportMapping const& viewport_mapping)
 {
     CSSPixelRect rect;
-    Layout::RustFFI::layout_script_bounding_client_rect(node.document_host(), committed_row_slot(node), rect_to_viewport_transform, &rect);
+    Layout::RustFFI::layout_script_bounding_client_rect(node.document_host(), committed_row_slot(node), viewport_mapping, &rect);
     return rect;
 }
 
-CSSPixelPoint offset_to_viewport_ignoring_transforms(Layout::Node const& node, Layout::RustFFI::FfiRectToViewportTransform const& rect_to_viewport_transform)
+CSSPixelPoint offset_to_viewport_ignoring_transforms(Layout::Node const& node)
 {
-    Layout::RustFFI::FfiOptionalCssPixelPoint result;
-    Layout::RustFFI::layout_script_offset_to_viewport_ignoring_transforms(node.document_host(), committed_row_slot(node), rect_to_viewport_transform, &result);
-    if (!result.has_value)
-        return {};
-    return { result.x, result.y };
+    CSSPixelPoint offset;
+    Layout::RustFFI::layout_script_offset_to_viewport_ignoring_transforms(node.document_host(), committed_row_slot(node), viewport_mapping(node.document()), &offset);
+    return offset;
 }
 
 }

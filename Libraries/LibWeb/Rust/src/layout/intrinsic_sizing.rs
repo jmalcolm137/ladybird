@@ -59,15 +59,14 @@ impl ContentSizingScope {
             self.node,
             pass.in_flow_containing_block(self.node),
             |state, pass| {
-                size_content(&FormattingContextRun {
+                size_content(&FormattingContextRun::new(
                     state,
-                    box_: self.node,
+                    self.node,
                     pass,
-                    should_collect_devtools_layout_data: false,
-                    treat_block_axis_percentage_insets_as_auto_beyond_root: false,
-                    fragments: None,
-                    fragmentainer: None,
-                })
+                    formatting_context::RunMode::Measure,
+                    false,
+                    None,
+                ))
             },
         )
     }
@@ -122,7 +121,7 @@ pub(super) fn content_sizes_of_inline_content(
                 child_constraints,
                 ParticipationInParentFormattingContext::BlockLevel,
             );
-            let parent = block_formatting_context::BlockFormattingContext::new(run, scope.root_cells(), None);
+            let parent = block_formatting_context::BlockFormattingContext::new(run, scope.root_cells(), None, None);
             let mut context = inline_formatting_context::InlineFormattingContext::new_with_rust_parent(
                 run,
                 block_formatting_context::BlockContainer::root_of(run, scope.root_cells()),

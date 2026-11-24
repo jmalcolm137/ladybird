@@ -16,14 +16,13 @@ use crate::asm::Gpr;
 use crate::asm::Label;
 use crate::asm::NegativeZero;
 use crate::asm::PortableMacroAssembler;
-use crate::ir::NodeId;
 use crate::ir::value;
 
 /// How many floating point registers lowerings compute with (see
 /// `Codegen::lowering_fpr()`).
 pub const LOWERING_FPRS: usize = 3;
 
-impl<M: PortableMacroAssembler> Codegen<'_, M> {
+impl<M: PortableMacroAssembler> Codegen<'_, '_, M> {
     /// Floating point register `index` (below `LOWERING_FPRS`), which
     /// lowerings may clobber: the register allocator puts no values there.
     pub(super) fn lowering_fpr(index: usize) -> Fpr {
@@ -137,9 +136,5 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
         let scratch = self.pinned.scratch;
         self.branch_on_tag(Condition::NotEqual, value, value::OBJECT_TAG, scratch, fail);
         self.emit_unbox_cell(dst, value);
-    }
-
-    pub(super) fn temp(&self, node: NodeId, index: usize) -> Gpr {
-        Gpr(self.allocation.node(node).temps[index])
     }
 }

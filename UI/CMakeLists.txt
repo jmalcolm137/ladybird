@@ -16,6 +16,31 @@ if (APPLE)
         set(LADYBIRD_ICON_COMPOSER_PLIST_ENTRY "")
         message(STATUS "actool is older than Xcode 26, so the app bundle only gets the flat icon")
     endif()
+
+    set(LADYBIRD_SPARKLE_PLIST_ENTRIES "")
+endif()
+
+if (APPLE AND LADYBIRD_ENABLE_SPARKLE)
+    set(LADYBIRD_SPARKLE_FEED_URL "https://download.ladybird.org/macos/appcast.xml" CACHE STRING "The appcast that Sparkle finds updates in")
+    set(LADYBIRD_SPARKLE_PUBLIC_KEY "30mib/1Ke84cNc8KkKajhTkCP9Zu3iZRgophONX53Ik=" CACHE STRING "The public EdDSA key, in base64, that the appcast and its updates are signed with")
+
+    # The feed URL goes into the Info.plist as XML text, so a query string's & has to be escaped.
+    set(sparkle_feed_url_xml "${LADYBIRD_SPARKLE_FEED_URL}")
+    string(REPLACE "&" "&amp;" sparkle_feed_url_xml "${sparkle_feed_url_xml}")
+    string(REPLACE "<" "&lt;" sparkle_feed_url_xml "${sparkle_feed_url_xml}")
+    string(REPLACE ">" "&gt;" sparkle_feed_url_xml "${sparkle_feed_url_xml}")
+
+    # Sparkle verifies the appcast, and each update before it unpacks it, with the key. It only looks for updates when
+    # the user asks, and so never asks whether it may look by itself.
+    foreach (entry IN ITEMS
+        "<key>SUFeedURL</key>\n        <string>${sparkle_feed_url_xml}</string>"
+        "<key>SUPublicEDKey</key>\n        <string>${LADYBIRD_SPARKLE_PUBLIC_KEY}</string>"
+        "<key>SURequireSignedFeed</key>\n        <true/>"
+        "<key>SUVerifyUpdateBeforeExtraction</key>\n        <true/>"
+        "<key>SUEnableAutomaticChecks</key>\n        <false/>"
+    )
+        string(APPEND LADYBIRD_SPARKLE_PLIST_ENTRIES "${entry}\n        ")
+    endforeach()
 endif()
 
 function(create_ladybird_bundle target_name)
@@ -76,13 +101,44 @@ function(create_ladybird_bundle target_name)
             )
         endif()
 
+        if (LADYBIRD_ENABLE_SPARKLE)
+            # Sparkle installs updates with programs of its own in its framework, which are signed before the app.
+            get_target_property(sparkle_framework unofficial::sparkle::Sparkle IMPORTED_LOCATION)
+            set(bundled_sparkle_framework "${bundle_dir}/Contents/Frameworks/Sparkle.framework")
+            set_property(TARGET ${target_name} APPEND PROPERTY BUILD_RPATH "@executable_path/../Frameworks")
+            set_property(TARGET ${target_name} APPEND PROPERTY INSTALL_RPATH "@executable_path/../Frameworks")
+
+            ladybird_codesign_command(sparkle_autoupdate_codesign_command "${target_name}-sparkle-autoupdate" -o runtime "${bundled_sparkle_framework}/Versions/B/Autoupdate")
+            ladybird_codesign_command(sparkle_updater_codesign_command "${target_name}-sparkle-updater" -o runtime "${bundled_sparkle_framework}/Versions/B/Updater.app")
+            ladybird_codesign_command(sparkle_codesign_command "${target_name}-sparkle" "${bundled_sparkle_framework}")
+
+            add_custom_command(TARGET ${target_name} POST_BUILD
+                COMMAND "${CMAKE_COMMAND}" -E rm -rf "${bundled_sparkle_framework}"
+                COMMAND "${CMAKE_COMMAND}" -E make_directory "${bundle_dir}/Contents/Frameworks"
+                COMMAND ditto "${sparkle_framework}" "${bundled_sparkle_framework}"
+                COMMAND "${CMAKE_COMMAND}" -E rm -rf
+                    "${bundled_sparkle_framework}/Headers" "${bundled_sparkle_framework}/Versions/B/Headers"
+                    "${bundled_sparkle_framework}/PrivateHeaders" "${bundled_sparkle_framework}/Versions/B/PrivateHeaders"
+                    "${bundled_sparkle_framework}/Modules" "${bundled_sparkle_framework}/Versions/B/Modules"
+                COMMAND ${sparkle_autoupdate_codesign_command}
+                COMMAND ${sparkle_updater_codesign_command}
+                COMMAND ${sparkle_codesign_command}
+                VERBATIM
+            )
+        else()
+            add_custom_command(TARGET ${target_name} POST_BUILD
+                COMMAND "${CMAKE_COMMAND}" -E rm -rf "${bundle_dir}/Contents/Frameworks/Sparkle.framework"
+                VERBATIM
+            )
+        endif()
+
         # Note: This symlink is removed in the install commands
         # This makes the bundle in the build directory *NOT* relocatable
         add_custom_command(TARGET ${target_name} POST_BUILD
             COMMAND "${CMAKE_COMMAND}" -E create_symlink "${CMAKE_LIBRARY_OUTPUT_DIRECTORY}" "${bundle_dir}/Contents/lib"
         )
 
-        ladybird_codesign_command(codesign_command "${target_name}" "${LADYBIRD_ENTITLEMENTS_FILE}" -v "${bundle_dir}")
+        ladybird_codesign_command(codesign_command "${target_name}" --entitlements "${LADYBIRD_ENTITLEMENTS_FILE}" -v "${bundle_dir}")
         add_custom_command(TARGET ${target_name} POST_BUILD COMMAND ${codesign_command} VERBATIM)
     endif()
 
@@ -95,11 +151,7 @@ function(create_ladybird_bundle target_name)
     copy_resources_to_build(${resource_base_dir} ${target_name})
 endfunction()
 
-if (ANDROID OR VCPKG_TARGET_ANDROID)
-    add_subdirectory("Android")
-else()
-    add_subdirectory("Qt")
-endif()
+add_subdirectory("Qt")
 
 # The LibGUI port's headless Ladybird process. It is an alternative UI-process
 # backend, not part of Ladybird's own Qt UI, so it needs the resource and helper
@@ -177,7 +229,7 @@ if (APPLE)
     # WebDriver and the helpers can link into the bundle after ladybird has signed it — and that leaves the seal stale
     # until something later relinks ladybird. Sign once more with everything in place.
     set(bundle_signed_stamp "${CMAKE_CURRENT_BINARY_DIR}/ladybird_bundle_signed.stamp")
-    ladybird_codesign_command(codesign_command ladybird-bundle "${LADYBIRD_ENTITLEMENTS_FILE}" -v "$<TARGET_BUNDLE_DIR:ladybird>")
+    ladybird_codesign_command(codesign_command ladybird-bundle --entitlements "${LADYBIRD_ENTITLEMENTS_FILE}" -v "$<TARGET_BUNDLE_DIR:ladybird>")
 
     add_custom_command(
         OUTPUT "${bundle_signed_stamp}"

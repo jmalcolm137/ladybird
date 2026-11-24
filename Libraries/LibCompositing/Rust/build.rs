@@ -7,6 +7,14 @@
 use std::env;
 use std::error::Error;
 use std::path::{Path, PathBuf};
+use std::process::Command;
+
+#[path = "generate/webgl_wire.rs"]
+mod webgl_wire;
+
+#[allow(dead_code, reason = "the model is for the generators of the other crates as well")]
+#[path = "generate/webgl_wire_model.rs"]
+mod webgl_wire_model;
 
 // AK::Optional is not trivial for calls under every C++ ABI: Apple clang returns it through memory, where Rust
 // returns the matching #[repr(C)] struct in registers. Keep it out of extern "C" signatures; pass a plain
@@ -102,12 +110,15 @@ fn expose_shared_abi_types_as_cpp_types(config: &mut cbindgen::Config) {
             "ReplayClip",
             "ReplayLayer",
             "ReplayMask",
-            "FfiVisualViewportTransform",
             "CanvasId",
-            "VideoSinkResourceId",
+            "VideoSinkHandle",
             "Canvas2DPaintKind",
             "Canvas2DPatternRepetition",
             "PathGeometryData",
+            "CompositorScrollNodeKind",
+            "CompositorScrollNodeRecord",
+            "CompositorSnapContainerRecord",
+            "CompositorSnapAreaRecord",
         ]
         .map(String::from),
     );
@@ -153,14 +164,20 @@ fn expose_shared_abi_types_as_cpp_types(config: &mut cbindgen::Config) {
         ("ReplayClip", "Compositing::ReplayClip"),
         ("ReplayLayer", "Compositing::ReplayLayer"),
         ("ReplayMask", "Compositing::ReplayMask"),
-        ("FfiVisualViewportTransform", "Compositing::TransformWithOrigin"),
         ("CanvasId", "Compositing::CanvasId"),
-        ("VideoSinkResourceId", "Compositing::VideoSinkResourceId"),
+        ("VideoSinkHandle", "Media::VideoSinkHandle"),
         ("Canvas2DPaintKind", "Compositing::Canvas2DPaintKind"),
         ("Canvas2DPatternRepetition", "Compositing::Canvas2DPatternRepetition"),
         ("CapStyle", "Gfx::CapStyle"),
         ("JoinStyle", "Gfx::JoinStyle"),
         ("PathGeometryData", "Gfx::FFI::PathGeometryData"),
+        ("CompositorScrollNodeKind", "Compositing::CompositorScrollNodeKind"),
+        ("CompositorScrollNodeRecord", "Compositing::CompositorScrollNodeRecord"),
+        (
+            "CompositorSnapContainerRecord",
+            "Compositing::CompositorSnapContainerRecord",
+        ),
+        ("CompositorSnapAreaRecord", "Compositing::CompositorSnapAreaRecord"),
     ] {
         config.export.rename.insert(rust_name.to_string(), cpp_name.to_string());
     }
@@ -184,7 +201,7 @@ fn expose_shared_abi_types_as_cpp_types(config: &mut cbindgen::Config) {
             "LibGfx/StrokeStyle.h",
             "LibGfx/Vector3.h",
             "LibGfx/WindingRule.h",
-            "LibCompositing/DisplayList/AccumulatedVisualContext.h",
+            "LibCompositing/DisplayList/ContextRef.h",
             "LibCompositing/Forward.h",
             "LibCompositing/DisplayList/DisplayListCommandsGenerated.h",
         ]
@@ -259,9 +276,109 @@ fn display_list_payload_alignment(path: &Path) -> Result<String, Box<dyn Error>>
     Ok(value.to_string())
 }
 
+fn generate_ipc_definitions(manifest_dir: &Path, out_dir: &Path) -> Result<(), Box<dyn Error>> {
+    let source_dir = manifest_dir.join("../../..");
+    let generator = source_dir.join("Meta/Generators/generate_ipc_definitions.py");
+    println!("cargo:rerun-if-changed={}", generator.display());
+    for module in ["lexer.py", "utils.py"] {
+        println!(
+            "cargo:rerun-if-changed={}",
+            source_dir.join("Meta/Utils").join(module).display()
+        );
+    }
+
+    println!("cargo:rerun-if-env-changed=PYTHON");
+    let python = env::var_os("PYTHON").unwrap_or_else(|| if cfg!(windows) { "python" } else { "python3" }.into());
+    for (definition, generated_file) in [
+        (
+            "Libraries/LibCompositing/DisplayList/DisplayListProperties.ipc",
+            "DisplayListProperties.rs",
+        ),
+        ("Libraries/LibCompositing/Types.ipc", "Types.rs"),
+        ("Libraries/LibWebCommon/UIEvents/KeyCode.ipc", "KeyCode.rs"),
+        ("Libraries/LibWebCommon/UIEvents/MouseButton.ipc", "MouseButton.rs"),
+        (
+            "Libraries/LibWebCommon/Page/AsyncScrollNodeStableID.ipc",
+            "AsyncScrollNodeStableID.rs",
+        ),
+        ("Libraries/LibWebCommon/Page/InputEvent.ipc", "InputEvent.rs"),
+        (
+            "Libraries/LibWebCommon/Page/InputRoutingDecision.ipc",
+            "InputRoutingDecision.rs",
+        ),
+        ("Libraries/LibWebCommon/Page/InputTrace.ipc", "InputTrace.rs"),
+        (
+            "Libraries/LibWebCommon/Page/TextEditingCommand.ipc",
+            "TextEditingCommand.rs",
+        ),
+        (
+            "Services/Compositor/CompositorWebContentClient.ipc",
+            "CompositorWebContentClientEndpoint.rs",
+        ),
+        (
+            "Services/Compositor/CompositorWebContentServer.ipc",
+            "CompositorWebContentServerEndpoint.rs",
+        ),
+        (
+            "Services/Compositor/CompositorControlServer.ipc",
+            "CompositorControlServerEndpoint.rs",
+        ),
+        (
+            "Services/Compositor/CompositorPresentationClient.ipc",
+            "CompositorPresentationClientEndpoint.rs",
+        ),
+        (
+            "Services/Compositor/CompositorPresentationServer.ipc",
+            "CompositorPresentationServerEndpoint.rs",
+        ),
+        (
+            "Services/Compositor/RenderClockClient.ipc",
+            "RenderClockClientEndpoint.rs",
+        ),
+        (
+            "Services/Compositor/RenderClockServer.ipc",
+            "RenderClockServerEndpoint.rs",
+        ),
+    ] {
+        let definition = source_dir.join(definition);
+        println!("cargo:rerun-if-changed={}", definition.display());
+        let status = Command::new(&python)
+            .arg(&generator)
+            .arg("--input")
+            .arg(&definition)
+            .arg("--rust-output")
+            .arg(out_dir.join(generated_file))
+            .status()?;
+        if !status.success() {
+            return Err(format!("IPC compiler failed for {}", definition.display()).into());
+        }
+    }
+    Ok(())
+}
+
+/// The vocabulary of the WebGL command stream, which src/webgl/vocabulary.rs includes.
+fn generate_webgl_wire_vocabulary(manifest_dir: &Path, out_dir: &Path) -> Result<(), Box<dyn Error>> {
+    let functions_path = manifest_dir.join("../WebGL/GLFunctions.json");
+    println!("cargo:rerun-if-changed={}", functions_path.display());
+    println!("cargo:rerun-if-changed=generate");
+    let json = std::fs::read_to_string(&functions_path)?;
+    let generate = |json: &str| -> Result<String, String> {
+        let functions = webgl_wire_model::parse_functions(json)?;
+        Ok(webgl_wire::write_wire_vocabulary(&webgl_wire_model::vocabulary(
+            &functions,
+        )?))
+    };
+    let vocabulary = generate(&json).map_err(|error| format!("{}: {error}", functions_path.display()))?;
+    std::fs::write(out_dir.join("webgl_wire.rs"), vocabulary)?;
+    Ok(())
+}
+
 fn main() -> Result<(), Box<dyn Error>> {
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR")?);
     let out_dir = PathBuf::from(env::var("OUT_DIR")?);
+
+    generate_ipc_definitions(&manifest_dir, &out_dir)?;
+    generate_webgl_wire_vocabulary(&manifest_dir, &out_dir)?;
 
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=cbindgen.toml");
@@ -274,41 +391,56 @@ fn main() -> Result<(), Box<dyn Error>> {
     ffi_config.namespaces = Some(vec!["Compositing".to_string(), "RustFFI".to_string()]);
     expose_css_pixel_types_as_web_types(&mut ffi_config);
     expose_shared_abi_types_as_cpp_types(&mut ffi_config);
+    ffi_config.export.exclude.extend([
+        "MOMENTUM_DISTANCE_SHARE_PER_FRAME".to_string(),
+        "MOMENTUM_FRAME_DURATION_IN_SECONDS".to_string(),
+        "MAXIMUM_MOMENTUM_DURATION_IN_SECONDS".to_string(),
+    ]);
     // An ak::Span is laid out as an AK ReadonlySpan, which C++ passes it as.
     ffi_config
         .export
         .rename
         .insert("Span".to_string(), "AK::ReadonlySpan".to_string());
+    ffi_config
+        .export
+        .rename
+        .insert("EncodedValue".to_string(), "AK::ReadonlyBytes".to_string());
+    // The IPC compiler checks that these enums have the numbers in C++ that they have in Rust.
+    for (rust_name, cpp_name) in [
+        ("ScrollAnimationKind", "Compositing::ScrollAnimationKind"),
+        ("InputRoutingDecision", "Web::InputRoutingDecision"),
+        ("AsyncScrollNodeKind", "Web::AsyncScrollNodeKind"),
+    ] {
+        ffi_config
+            .export
+            .rename
+            .insert(rust_name.to_string(), cpp_name.to_string());
+    }
+    ffi_config.after_includes = Some(
+        "\nnamespace Compositing { enum class ScrollAnimationKind : uint8_t; }\nnamespace Web { enum class \
+         InputRoutingDecision : uint8_t; enum class AsyncScrollNodeKind : uint8_t; }"
+            .to_string(),
+    );
     ffi_config.includes.push("AK/Span.h".to_string());
-    // The values WebContent's own entry points take and return, which its headers refer to here.
+    // The values the entry points of WebContent and of the compositor's scroll logic take and return, which their
+    // headers refer to here.
     ffi_config.export.include = [
         "NodeSlotId",
         "FfiFilterFunction",
         "FfiFilterFunctionKind",
         "FfiVisualContextTreeInputs",
         "FfiVisualAnimationTargetKind",
-        "FfiVisualAnimationPlaybackDirection",
-        "FfiVisualAnimationFillMode",
         "FfiVisualAnimationTransformOperationKind",
         "FfiCompositorAnimationPublishOutcome",
         "FfiVisualAnimationSummary",
-        "FfiAnimatedContentViewportEffect",
-        "FfiTestStickyConstraints",
-        "FfiDisplayListReplayCallbacks",
+        "FfiRasterPainter",
         "FfiEasingDescriptor",
         "FfiEasingKind",
         "FfiLinearEasingPoint",
+        "SnapSelectionStrategyType",
     ]
     .map(String::from)
     .to_vec();
-    let mut test_builder_config = ffi_config.clone();
-    test_builder_config.export.include.clear();
-    generate_ffi_header(
-        test_builder_config,
-        &[manifest_dir.join("src/test_builder.rs")],
-        &out_dir,
-        Path::new("TestBuilderRustFFI.h"),
-    );
     generate_ffi_header(
         ffi_config,
         &[
@@ -318,9 +450,12 @@ fn main() -> Result<(), Box<dyn Error>> {
             manifest_dir.join("src/filter_bytes.rs"),
             manifest_dir.join("src/visual_context/ffi_types.rs"),
             manifest_dir.join("src/host/replay.rs"),
+            manifest_dir.join("src/overlays.rs"),
             manifest_dir.join("src/display_list/storage.rs"),
             manifest_dir.join("src/display_list/canvas_2d.rs"),
             manifest_dir.join("src/display_list/canvas_2d_recorder.rs"),
+            manifest_dir.join("src/scrolling/smooth_scroll_animation.rs"),
+            manifest_dir.join("src/scrolling/scroll_snap_selection.rs"),
             manifest_dir.join("src/ffi.rs"),
         ],
         &out_dir,
@@ -342,6 +477,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         libgfx_src_dir.join("paint_enums.rs"),
     ];
     let commands_source = manifest_dir.join("src/display_list/commands.rs");
+    let scroll_table_source = manifest_dir.join("src/visual_context/scroll_table.rs");
     let types_sources: Vec<PathBuf> = libgfx_type_sources
         .iter()
         .cloned()
@@ -360,7 +496,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             "OptionalAffineTransform",
             "FontResourceId",
             "ImageFrameResourceId",
-            "VideoSinkResourceId",
+            "VideoSinkHandle",
             "DisplayListResourceId",
             "CanvasId",
             "CompositorContextId",
@@ -381,7 +517,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         "ContextRef",
         "FontResourceId",
         "ImageFrameResourceId",
-        "VideoSinkResourceId",
+        "VideoSinkHandle",
         "DisplayListResourceId",
         "CanvasId",
         "CompositorContextId",
@@ -398,6 +534,11 @@ fn main() -> Result<(), Box<dyn Error>> {
         .into_iter()
         .filter(|name| !types_with_existing_cpp_definitions.contains(&name.as_str()))
         .collect();
+    commands_config.export.include.extend(
+        public_type_names(&scroll_table_source)?
+            .into_iter()
+            .filter(|name| name != "CompositorScrollTable"),
+    );
     commands_config.export.exclude = types_with_existing_cpp_definitions
         .iter()
         .map(|name| name.to_string())
@@ -440,6 +581,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         ("OptionalAffineTransform", "Optional<Gfx::AffineTransform>"),
         ("CompositorContextId", "Web::CompositorContextId"),
         ("UniqueNodeId", "Web::UniqueNodeID"),
+        ("VideoSinkHandle", "Media::VideoSinkHandle"),
     ];
     for (rust_name, cpp_name) in references_renamed_to_real_types {
         commands_config
@@ -470,6 +612,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         "LibCompositing/DisplayList/ContextRef.h",
         "LibCompositing/DisplayList/DisplayListResourceIds.h",
         "LibCompositing/Forward.h",
+        "LibMedia/VideoSinkHandle.h",
         "LibWebCommon/PixelUnits.h",
         "LibCompositing/Types.h",
     ]
@@ -479,12 +622,35 @@ fn main() -> Result<(), Box<dyn Error>> {
     // The commands of the canvas 2D stream go into a list of their own, as only the canvas player plays them.
     let variants = display_list_command_type_variants(&commands_source)?;
     let mut after_includes = String::new();
-    for (macro_name, canvas_2d) in [
-        ("ENUMERATE_DISPLAY_LIST_COMMANDS", false),
-        ("ENUMERATE_CANVAS_2D_COMMANDS", true),
+    // The replay resolves these commands for the frame and hands the painter what they draw, or plays them itself.
+    let commands_the_replay_resolves = [
+        "FillRect",
+        "FillRectWithRoundedCorners",
+        "PaintScrollBar",
+        "DrawCompositedContext",
+        "DeclareMaskContent",
+        "DrawIsolatedGroup",
+        "PaintVectorImage",
+    ];
+    let belongs_to_list = |macro_name: &str, name: &str| {
+        let is_canvas_2d_command = name.starts_with("Canvas2D");
+        match macro_name {
+            "ENUMERATE_CANVAS_2D_COMMANDS" => is_canvas_2d_command,
+            "ENUMERATE_DISPLAY_LIST_COMMANDS_PLAYED_AS_RECORDED" => {
+                !is_canvas_2d_command
+                    && !name.starts_with("Compositor")
+                    && !commands_the_replay_resolves.contains(&name)
+            }
+            _ => !is_canvas_2d_command,
+        }
+    };
+    for macro_name in [
+        "ENUMERATE_DISPLAY_LIST_COMMANDS",
+        "ENUMERATE_DISPLAY_LIST_COMMANDS_PLAYED_AS_RECORDED",
+        "ENUMERATE_CANVAS_2D_COMMANDS",
     ] {
         after_includes.push_str(&format!("\n#define {macro_name}(V)"));
-        for name in variants.iter().filter(|name| name.starts_with("Canvas2D") == canvas_2d) {
+        for name in variants.iter().filter(|name| belongs_to_list(macro_name, name)) {
             after_includes.push_str(&format!(" \\\n    V({name})"));
         }
         after_includes.push('\n');
@@ -502,7 +668,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
     generate_ffi_header_strict(
         commands_config,
-        &[commands_source],
+        &[commands_source, scroll_table_source],
         &out_dir,
         Path::new("DisplayList/DisplayListCommandsGenerated.h"),
     );

@@ -13,20 +13,20 @@ use core::ptr;
 use core::sync::atomic::{AtomicU64, Ordering};
 use std::rc::Rc;
 
-use super::transport::{SharedMemory, Transport};
-use super::vocabulary::{CommandType, MAX_COMMAND_STRUCT_SIZE};
-use super::wire::{
+use libcompositing_rust::webgl::vocabulary::{CommandType, MAX_COMMAND_STRUCT_SIZE};
+use libcompositing_rust::webgl::wire::{
     Command, DataSpan, HEADER_SIZE, InlineData, Record, SyncReply, SyncRequest, encode_sync_request,
     padded_record_size, resolve_data_span,
 };
+use libcompositing_rust::webgl::{DEFAULT_SHARED_DATA_REGION_CAPACITY, SHARED_DATA_REGION_OFFSET};
+
+use super::transport::{SharedMemory, Transport};
 use crate::web_gl::constants::GL_OUT_OF_MEMORY;
 
-/// The `u64` that the replayer stores the sequence number of the last executed flush in is at the start of the shared
-/// command buffer, before the region of records.
-pub(crate) const SHARED_DATA_REGION_OFFSET: usize = 128;
-pub(crate) const DEFAULT_SHARED_DATA_REGION_CAPACITY: usize = 32 * 1024 * 1024;
-
 pub(crate) const MAX_PENDING_COMMAND_BYTES: usize = 4 * 1024 * 1024;
+
+/// Each frame that waits for a flush holds the descriptor of its pixels.
+pub(crate) const MAX_PENDING_FRAMES: usize = 64;
 
 /// What is kept free in the region of records for the command that names a frame, before the frame is added to the
 /// pending ones. Making room only when the command is recorded could flush in between, and that flush would publish
@@ -59,13 +59,16 @@ pub(crate) struct Proxy<T: Transport> {
     sync_reply_bytes: Cell<Vec<u8>>,
     /// By GL name. The strings do not change while a context lives.
     string_cache: RefCell<Vec<(u32, Rc<[u8]>)>>,
-    max_frames_per_message: Cell<usize>,
 
     transport_calls_are_deferred: Cell<bool>,
     deferred_record_count: Cell<usize>,
     deferred_flush_is_due: Cell<bool>,
     /// The record that had no room at the cursor while the calls of the transport that make room were deferred.
     deferred_record: Cell<Vec<u8>>,
+    /// Memory made before the data of a record was borrowed, for a record that the region is too small for.
+    memory_for_deferred_oversized_record: Cell<Option<T::SharedMemory>>,
+    /// That memory, with the record written to it, and the size of the record.
+    deferred_oversized_record: Cell<Option<(T::SharedMemory, usize)>>,
 }
 
 impl<T: Transport> Proxy<T> {
@@ -75,7 +78,6 @@ impl<T: Transport> Proxy<T> {
 
     pub(super) fn with_shared_data_capacity(transport: T, shared_data_capacity: usize) -> Self {
         let proxy = Self {
-            max_frames_per_message: Cell::new(transport.max_frames_per_message()),
             transport: RefCell::new(Rc::new(transport)),
             lost: Cell::new(false),
             pending_local_error: Cell::new(0),
@@ -96,6 +98,8 @@ impl<T: Transport> Proxy<T> {
             deferred_record_count: Cell::new(0),
             deferred_flush_is_due: Cell::new(false),
             deferred_record: Cell::new(Vec::new()),
+            memory_for_deferred_oversized_record: Cell::new(None),
+            deferred_oversized_record: Cell::new(None),
         };
         proxy.initialize_shared_command_buffer();
         proxy
@@ -103,7 +107,6 @@ impl<T: Transport> Proxy<T> {
 
     /// Nothing that was recorded for the lost context reaches the new one.
     pub(crate) fn restore(&self, transport: T) {
-        self.max_frames_per_message.set(transport.max_frames_per_message());
         self.transport.replace(Rc::new(transport));
         self.lost.set(false);
         self.out_of_line_commands.take();
@@ -224,11 +227,21 @@ impl<T: Transport> Proxy<T> {
         if transport_calls_are_deferred {
             self.rewind_shared_data_cursor_if_all_published_commands_executed();
             if record.size() > self.shared_data_capacity.get() - self.shared_data_cursor.get() {
+                let memory = self
+                    .memory_for_deferred_oversized_record
+                    .take()
+                    .filter(|memory| record.size() > self.shared_data_capacity.get() && record.size() <= memory.len());
+                if let Some(memory) = memory {
+                    // SAFETY: The memory has room for the record, and holds neither its payload nor its data.
+                    unsafe { record.write_to(memory.as_ptr()) };
+                    self.deferred_oversized_record.set(Some((memory, record.size())));
+                    return;
+                }
                 self.deferred_record.set(record.encoded());
                 return;
             }
         } else if record.size() > self.shared_data_capacity.get() {
-            self.send_oversized_record(&record.encoded());
+            self.send_oversized_record(&record);
             return;
         } else {
             self.rewind_shared_data_cursor_if_all_published_commands_executed();
@@ -248,7 +261,8 @@ impl<T: Transport> Proxy<T> {
             return;
         }
         if record.len() > self.shared_data_capacity.get() {
-            self.send_oversized_record(record);
+            self.flush_commands();
+            self.transport().send_commands(record, &[]);
             return;
         }
         self.rewind_shared_data_cursor_if_all_published_commands_executed();
@@ -289,9 +303,16 @@ impl<T: Transport> Proxy<T> {
         }
     }
 
-    fn send_oversized_record(&self, record: &[u8]) {
+    fn send_oversized_record(&self, record: &Record<'_>) {
         self.flush_commands();
-        self.transport().send_commands(record, &[]);
+        let transport = self.transport();
+        let Some(memory) = transport.create_shared_memory(record.size()) else {
+            transport.send_commands(&record.encoded(), &[]);
+            return;
+        };
+        // SAFETY: The memory has room for the record, and holds neither its payload nor its data.
+        unsafe { record.write_to(memory.as_ptr()) };
+        transport.send_commands_written_to(&memory, record.size(), &[]);
     }
 
     /// Runs `record`, which records one command with data that is borrowed from memory of script, without a call of
@@ -312,10 +333,14 @@ impl<T: Transport> Proxy<T> {
                 .checked_add(1)
                 .and_then(|data_size| padded_record_size(MAX_COMMAND_STRUCT_SIZE, data_size));
             if let (Some(smallest_record_size), Some(largest_record_size)) = (smallest_record_size, largest_record_size)
-                && smallest_record_size <= capacity
             {
-                self.rewind_shared_data_cursor_if_all_published_commands_executed();
-                self.ensure_shared_data_capacity(largest_record_size.min(capacity));
+                if smallest_record_size <= capacity {
+                    self.rewind_shared_data_cursor_if_all_published_commands_executed();
+                    self.ensure_shared_data_capacity(largest_record_size.min(capacity));
+                } else {
+                    self.memory_for_deferred_oversized_record
+                        .set(self.transport().create_shared_memory(largest_record_size));
+                }
             }
         }
 
@@ -326,6 +351,11 @@ impl<T: Transport> Proxy<T> {
             record()
         };
 
+        self.memory_for_deferred_oversized_record.take();
+        if let Some((memory, size)) = self.deferred_oversized_record.take() {
+            self.flush_commands();
+            self.transport().send_commands_written_to(&memory, size, &[]);
+        }
         let deferred_record = self.deferred_record.take();
         if !deferred_record.is_empty() {
             self.record_encoded(&deferred_record);
@@ -408,7 +438,7 @@ impl<T: Transport> Proxy<T> {
 
     /// Returns the index that the command which uses the frame names it by.
     pub(super) fn append_pending_frame(&self, frame: T::Frame) -> u32 {
-        if self.with_pending_frames(|frames| frames.len()) >= self.max_frames_per_message.get() {
+        if self.with_pending_frames(|frames| frames.len()) >= MAX_PENDING_FRAMES {
             self.flush_commands();
         }
         if self.has_shared_command_buffer() {
@@ -482,7 +512,13 @@ impl<T: Transport> Proxy<T> {
         self.transport().clear_drawing_buffer();
     }
 
-    pub(crate) fn read_back_drawing_buffer(&self, x: i32, y: i32, width: i32, height: i32) -> Option<T::Bitmap> {
+    pub(crate) fn read_back_drawing_buffer(
+        &self,
+        x: i32,
+        y: i32,
+        width: i32,
+        height: i32,
+    ) -> Option<T::DrawingBufferPixels> {
         if self.lost.get() {
             return None;
         }

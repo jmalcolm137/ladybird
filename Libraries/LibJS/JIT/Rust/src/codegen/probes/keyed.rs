@@ -26,7 +26,16 @@ use crate::ir::NodeId;
 use crate::ir::value;
 use crate::snapshot::PropertyCacheKind;
 
-impl<M: PortableMacroAssembler> Codegen<'_, M> {
+/// The name a lookup in a VM-wide keyed cache is for: the string in a
+/// register, or a name whose identity (the storage word of its fly string)
+/// is known when compiling.
+#[derive(Debug, Clone, Copy)]
+pub(in crate::codegen) enum KeyName {
+    Value(Gpr),
+    Identity(u64),
+}
+
+impl<M: PortableMacroAssembler> Codegen<'_, '_, M> {
     /// Looks up the own data property that the string `key` names on the
     /// object in `base` in the VM's keyed property lookup cache, like the
     /// runtime's keyed get does when the access's own cache has nothing for
@@ -48,7 +57,7 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
         let missing = (layout.keyed_lookup_cache_prototype_chain_validity != 0).then(|| self.masm.new_label());
         let Some(property) = self.emit_vm_keyed_cache_probe(
             base,
-            key,
+            KeyName::Value(key),
             &registers,
             layout.keyed_lookup_cache_entries,
             entry_type,
@@ -84,18 +93,18 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
         self.masm.jump(done);
     }
 
-    /// Stores `source` into the writable own data property that the string
-    /// `key` names on the object in `base`, or adds it, if the VM's keyed
+    /// Stores `source` into the writable own data property that `key` names
+    /// on the object in `base`, or adds it, if the VM's keyed
     /// property store cache has the change or the addition (see
     /// `RuntimeLayout::keyed_store_cache_entries`), and jumps to `done`, or
     /// jumps to `miss`. Uses `storage` for additions, and clobbers the cache
     /// registers and the scratch register.
     #[allow(clippy::too_many_arguments)]
-    fn emit_keyed_store_cache_put(
+    pub(super) fn emit_keyed_store_cache_put(
         &mut self,
         node: NodeId,
         base: Gpr,
-        key: Gpr,
+        key: KeyName,
         source: Gpr,
         registers: CacheRegisters,
         storage: Gpr,
@@ -140,7 +149,7 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
         self.masm.jump(done);
     }
 
-    /// Finds the entry for the string `key` and the shape of the object in
+    /// Finds the entry for `key` and the shape of the object in
     /// `base` in a VM-wide keyed cache with `entries` (laid out like the
     /// keyed property lookup cache's), with `entry_type` and the shape's
     /// dictionary generation, and returns the address of the named property
@@ -154,7 +163,7 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
     fn emit_vm_keyed_cache_probe(
         &mut self,
         base: Gpr,
-        key: Gpr,
+        key: KeyName,
         registers: &CacheRegisters,
         entries: u64,
         entry_type: u32,
@@ -187,7 +196,7 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
         Some(Address::indexed(shape, scratch, Scale::Eight, 0))
     }
 
-    /// Finds the entry for the string `key` and the shape of the object in
+    /// Finds the entry for `key` and the shape of the object in
     /// `base` in a VM-wide keyed cache with `entries` (laid out like the
     /// keyed property lookup cache's), for the shape's dictionary
     /// generation, and puts its address in the object register and the
@@ -197,7 +206,7 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
     pub(in crate::codegen) fn emit_vm_keyed_cache_entry(
         &mut self,
         base: Gpr,
-        key: Gpr,
+        key: KeyName,
         registers: &CacheRegisters,
         entries: u64,
         miss: Label,
@@ -212,10 +221,15 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
         // The identity of a string's name is the word of its storage, if that is a fly string; no entry has the
         // storage word of another string.
         let name = entry;
-        self.branch_on_tag(Condition::NotEqual, key, value::STRING_TAG, scratch, miss);
-        self.emit_unbox_cell(name, key);
-        self.masm
-            .load64(name, &Address::new(name, layout.primitive_string_storage as i32));
+        match key {
+            KeyName::Value(key) => {
+                self.branch_on_tag(Condition::NotEqual, key, value::STRING_TAG, scratch, miss);
+                self.emit_unbox_cell(name, key);
+                self.masm
+                    .load64(name, &Address::new(name, layout.primitive_string_storage as i32));
+            }
+            KeyName::Identity(identity) => self.masm.move_imm64(name, identity),
+        }
         self.emit_unbox_cell(object, base);
         self.emit_load_compressed_cell(shape, &Address::new(object, self.runtime.offsets.object_shape as i32));
         // The entry: the top bits of the Fibonacci hash of the shape and the name.
@@ -274,8 +288,7 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
         let not_polymorphic = self.masm.new_label();
         self.property_cache_address(entry, executable, cache_index)?;
         self.masm.load64(entry, &Address::new(entry, 0));
-        let was_megamorphic = self.executables[executable as usize]
-            .property_caches
+        let was_megamorphic = self.snapshot[self.snapshot.executables[executable as usize].property_caches]
             .get(cache_index as usize)
             .is_some_and(|cache| cache.kind == PropertyCacheKind::Megamorphic);
         if was_megamorphic {
@@ -367,7 +380,7 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
     }
 }
 
-impl<M: PortableMacroAssembler> Codegen<'_, M> {
+impl<M: PortableMacroAssembler> Codegen<'_, '_, M> {
     /// Where a cache probe branches when it finds nothing: the target of the
     /// branch on its result that follows it, if code generation fused them,
     /// or a new label. Returns whether it is fused.
@@ -397,6 +410,61 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
         self.masm.bind(done);
     }
 
+    /// For a probe of a for-in loop's key at an index (whose inputs 2 and 3
+    /// are the loop's property iterator cache and that index): goes to `hit`
+    /// with the property's value in `output` (or `true`, unless `load`) where
+    /// the object (decoded in `cell`) has the cache's shape and the cache has
+    /// the offset of the own property the key names, and the property holds
+    /// data if `load`. Goes to `miss` otherwise, having changed only `temps`
+    /// and the scratch register.
+    #[allow(clippy::too_many_arguments)]
+    pub(in crate::codegen) fn emit_enumerated_property(
+        &mut self,
+        node: NodeId,
+        cell: Gpr,
+        temps: [Gpr; 2],
+        load: bool,
+        output: Gpr,
+        hit: Label,
+        miss: Label,
+    ) {
+        let (keys, index) = (self.input(node, 2), self.input(node, 3));
+        let scratch = self.pinned.scratch;
+        let layout = self.runtime.layout;
+        let [cache, offset] = temps;
+        self.emit_unbox_cell(cache, keys);
+        // NB: Both shapes are compressed.
+        self.masm
+            .load32(scratch, &Address::new(cell, self.runtime.offsets.object_shape as i32));
+        self.masm
+            .load32(offset, &Address::new(cache, layout.property_iterator_shape as i32));
+        self.masm.branch32(Condition::NotEqual, scratch, offset, miss);
+        self.masm.load64(
+            cache,
+            &Address::new(cache, layout.property_iterator_property_offsets as i32),
+        );
+        self.masm.branch64_imm(Condition::Equal, cache, 0, miss);
+        // NB: Int32 values only have their low 32 bits defined.
+        self.masm.move32(offset, index);
+        self.masm
+            .load32(offset, &Address::indexed(cache, offset, Scale::Four, 0));
+        self.masm.branch32_imm(Condition::Equal, offset, -1, miss);
+        if !load {
+            self.masm.move_imm64(output, value::TRUE);
+            self.masm.jump(hit);
+            return;
+        }
+        self.masm.load64(
+            cache,
+            &Address::new(cell, self.runtime.offsets.object_named_properties as i32),
+        );
+        self.masm
+            .load64(scratch, &Address::indexed(cache, offset, Scale::Eight, 0));
+        self.branch_on_tag(Condition::Equal, scratch, value::ACCESSOR_TAG, offset, miss);
+        self.masm.move64(output, scratch);
+        self.masm.jump(hit);
+    }
+
     /// A `ProbeKeyedCache` node: an entry of the property lookup cache for
     /// an own data property or a missing property, or the VM's keyed lookup
     /// cache.
@@ -413,6 +481,11 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
         let (failure, done) = (self.probe_failure_label(), self.masm.new_label());
         let fail = failure.0;
         self.unbox_object_or_branch(object, base, fail);
+        if self.graph.node(node).inputs.len() == 4 {
+            let probe = self.masm.new_label();
+            self.emit_enumerated_property(node, object, [shape, entry], true, output, done, probe);
+            self.masm.bind(probe);
+        }
         let lookup_cache = self.masm.new_label();
         self.probe_keyed_cache_entry(object, key, shape, entry, executable, cache, lookup_cache)?;
         let missing = self.masm.new_label();
@@ -494,7 +567,16 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
         self.masm.jump(stored);
 
         self.masm.bind(store_cache);
-        self.emit_keyed_store_cache_put(node, base, key, source, registers, storage, fail, stored);
+        self.emit_keyed_store_cache_put(
+            node,
+            base,
+            KeyName::Value(key),
+            source,
+            registers,
+            storage,
+            fail,
+            stored,
+        );
         self.masm.bind(stored);
         self.masm.move_imm32(output, 1);
         self.bind_probe_failure(output, 0, failure, done);
@@ -528,10 +610,30 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
             miss: failure.0,
         });
         self.branch_on_tag(Condition::NotEqual, object, value::OBJECT_TAG, scratch, failure.0);
+        if own && self.graph.node(node).inputs.len() == 4 {
+            let probe_cache = self.masm.new_label();
+            self.emit_unbox_cell(registers.object, object);
+            self.emit_enumerated_property(
+                node,
+                registers.object,
+                [registers.shape, registers.entry],
+                false,
+                output,
+                done,
+                probe_cache,
+            );
+            self.masm.bind(probe_cache);
+        }
         if !own {
             self.emit_has_element(object, key, &registers, output, probe, done);
         }
-        if self.emit_vm_keyed_cache_entry(object, key, &registers, layout.keyed_lookup_cache_entries, probe) {
+        if self.emit_vm_keyed_cache_entry(
+            object,
+            KeyName::Value(key),
+            &registers,
+            layout.keyed_lookup_cache_entries,
+            probe,
+        ) {
             let (entry, absent) = (registers.object, self.masm.new_label());
             self.masm.branch32_memory_imm(
                 Condition::NotEqual,

@@ -15,10 +15,7 @@ use core::ptr::NonNull;
 use std::collections::{HashMap, HashSet};
 
 use ak::Utf16String;
-use libjs_rust::api::{
-    Array, Gc, GcRefCell, MarkedVec, Must, Object, PrimitiveString, PropertyKey, Realm, Set, Trace, Value, Visitor, Vm,
-    length_of_array_like,
-};
+use libjs_rust::api::{Array, Gc, GcRefCell, MarkedVec, Object, Realm, Set, Trace, Value, Visitor, Vm};
 use libweb_rust::typed_om::font_family_names;
 
 use super::css_rule::wrap_cpp_cell;
@@ -31,8 +28,8 @@ use crate::bindings::interface::{
     with_temporary_execution_context_and_callbacks,
 };
 use crate::bindings::promise::{
-    TaskSource, WebIdlPromise, create_promise, get_promise_for_wait_for_all, in_parallel, is_promise_fulfilled,
-    promise_from_abi, queue_a_task, react_to_promise, reject_promise, reject_promise_with_exception, resolve_promise,
+    TaskSource, WebIdlPromise, create_promise, get_promise_for_wait_for_all, promise_from_abi, queue_a_task,
+    react_to_promise, reject_promise, reject_promise_with_exception, resolve_promise,
 };
 use crate::bindings::setlike::context_of_set;
 use crate::bindings::setlike::{Setlike, WorldEntries};
@@ -59,7 +56,7 @@ unsafe extern "C" {
     fn web_css_font_face_set_for_each_font_face_rule(
         set: *mut c_void,
         context: *mut c_void,
-        callback: unsafe extern "C" fn(*mut c_void, u64),
+        callback: unsafe extern "C" fn(*mut c_void, u64, usize),
     ) -> bool;
     fn web_css_font_face_set_synchronize_font_computer(set: *mut c_void, font_faces: *const *mut c_void, count: usize);
 }
@@ -201,9 +198,11 @@ pub(crate) struct FontFaceSet {
     #[gc(untraced)]
     status: Cell<FontFaceSetLoadStatus>,
     is_pending_on_the_environment: Cell<bool>,
+    ready_promise_is_resolved: Cell<bool>,
 }
 
 impl Wrappable for FontFaceSet {
+    const TRACED_ON_OWNER_THREAD_ONLY: bool = true;
     fn relevant_realm(&self) -> Option<Gc<Realm>> {
         Some(self.realm)
     }
@@ -234,6 +233,7 @@ impl FontFaceSet {
             failed_fonts: GcRefCell::new(Vec::new()),
             status: Cell::new(FontFaceSetLoadStatus::Loaded),
             is_pending_on_the_environment: Cell::new(true),
+            ready_promise_is_resolved: Cell::new(false),
         });
         object.this.set(Some(object));
         object.event_target.set_owner(object);
@@ -363,13 +363,16 @@ impl FontFaceSet {
     // document order. As @font-face rules are added or removed, the corresponding objects must be added or removed and
     // maintain this ordering. Any manually-added FontFace objects must be ordered after the CSS-connected ones.
     pub(crate) fn synchronize_css_connected_font_order(&self, vm: &Vm) {
-        unsafe extern "C" fn append_identity(context: *mut c_void, identity: u64) {
+        unsafe extern "C" fn append_identity(context: *mut c_void, identity: u64, layer_rank: usize) {
             // SAFETY: The context is the list below, which outlives the call.
-            unsafe { &mut *context.cast::<Vec<u64>>() }.push(identity);
+            unsafe { &mut *context.cast::<Vec<(u64, usize)>>() }.push((identity, layer_rank));
         }
 
         let font_faces = self.entries(vm);
         let font_faces = font_faces.values();
+        if font_faces.len() < 2 {
+            return;
+        }
         let mut connected_font_faces = HashMap::new();
         for (index, font_face) in font_faces.iter().enumerate() {
             if let Some(identity) = font_face.css_rule_identity() {
@@ -378,7 +381,7 @@ impl FontFaceSet {
         }
 
         // Every sheet added or removed asks again. Without a face from a rule the walk over their rules finds nothing.
-        let mut rule_identities = Vec::new();
+        let mut rule_identities: Vec<(u64, usize)> = Vec::new();
         if !connected_font_faces.is_empty() {
             // SAFETY: The set is live, and the list outlives the call.
             let has_window = unsafe {
@@ -395,11 +398,16 @@ impl FontFaceSet {
 
         let ordered_font_faces = MarkedVec::with_capacity(vm, font_faces.len());
         let mut seen = HashSet::new();
-        for identity in rule_identities {
+        let mut layer_ranks = HashMap::new();
+        for (identity, rank) in rule_identities {
             if let Some(index) = connected_font_faces.get(&identity)
                 && seen.insert(font_faces[*index].as_ptr())
             {
-                ordered_font_faces.push(font_faces[*index].clone());
+                let face = &font_faces[*index];
+                if rank != usize::MAX {
+                    layer_ranks.insert(face.as_ptr(), rank);
+                }
+                ordered_font_faces.push(face.clone());
             }
         }
         for font_face in font_faces.iter() {
@@ -419,24 +427,26 @@ impl FontFaceSet {
                 .iter()
                 .zip(font_faces.iter())
                 .any(|(ordered, entry)| !ordered.is(entry));
-        if !order_changed {
-            return;
+        if order_changed {
+            *self.font_faces.borrow_mut(vm) = ordered_font_faces.to_vec();
+            let cx = CallContext::new(vm, self.realm);
+            self.set_entries.for_each_live(vm, |set| {
+                set.set_clear(vm);
+                let cx = context_of_set(&cx, set);
+                for font_face in ordered_font_faces.values().iter() {
+                    set.set_add(vm, font_face.wrapper(&cx));
+                }
+            });
         }
-
-        *self.font_faces.borrow_mut(vm) = ordered_font_faces.to_vec();
-        let cx = CallContext::new(vm, self.realm);
-        self.set_entries.for_each_live(vm, |set| {
-            set.set_clear(vm);
-            let cx = context_of_set(&cx, set);
-            for font_face in ordered_font_faces.values().iter() {
-                set.set_add(vm, font_face.wrapper(&cx));
-            }
-        });
-        let cells: Vec<*mut c_void> = ordered_font_faces
+        let mut cells: Vec<*mut c_void> = ordered_font_faces
             .values()
             .iter()
             .map(CppFontFaceState::as_ptr)
             .collect();
+        // Layer precedence affects rendering. FontFaceSet iteration keeps its document order.
+        if !layer_ranks.is_empty() {
+            cells.sort_by_key(|cell| layer_ranks.get(cell).copied().unwrap_or(usize::MAX));
+        }
         // SAFETY: The set and the FontFaces are live, and the list outlives the call.
         unsafe { web_css_font_face_set_synchronize_font_computer(self.as_abi(), cells.as_ptr(), cells.len()) };
     }
@@ -594,80 +604,48 @@ impl FontFaceSet {
         //    promise object.
         let promise = create_promise(vm, realm);
 
-        // NB: What steps capture is copied, so the strings travel as JS strings.
-        let font = PrimitiveString::create(vm, font);
-        let text = PrimitiveString::create(vm, text);
-        in_parallel(
-            vm,
-            realm,
-            (self.this(), promise, font, text),
-            |vm, (this, promise, font, text)| {
-                let realm = this.realm;
+        // 3. Find the matching font faces from font face set using the font and text arguments passed to the function,
+        //    and let font face list be the return value (ignoring the found faces flag). If a syntax error was
+        //    returned, reject promise with a SyntaxError exception and terminate these steps.
+        let font_face_list = match self.find_matching_font_faces(vm, &font, &text) {
+            Ok(font_face_list) => font_face_list,
+            Err(exception) => {
+                reject_promise_with_exception(vm, promise, exception);
+                return Ok(promise);
+            }
+        };
 
-                // 3. Find the matching font faces from font face set using the font and text arguments passed to the
-                //    function, and let font face list be the return value (ignoring the found faces flag). If a syntax
-                //    error was returned, reject promise with a SyntaxError exception and terminate these steps.
-                let font_face_list = match this.find_matching_font_faces(vm, &font.utf16_string(), &text.utf16_string())
-                {
-                    Ok(font_face_list) => font_face_list,
-                    Err(exception) => {
-                        with_temporary_execution_context_and_callbacks(realm, || {
-                            reject_promise_with_exception(vm, promise, exception);
-                        });
-                        return;
-                    }
-                };
+        // 4. Queue a task to run the following steps synchronously:
+        // AD-HOC: Firefox and Chromium both match faces and start loading them in the current task. The web relies on
+        //         this behavior, e.g. Instagram's story viewer. See the following spec issue for more details:
+        //         https://github.com/w3c/csswg-drafts/issues/14804
+        {
+            // 1. For all of the font faces in the font face list, call their load() method.
+            let wrappers = MarkedVec::with_capacity(vm, font_face_list.len());
+            let promises = MarkedVec::with_capacity(vm, font_face_list.len());
+            let cx = CallContext::new(vm, realm);
+            for font_face in font_face_list.values().iter() {
+                wrappers.push(font_face.wrapper(&cx));
+                promises.push(font_face.load());
+            }
+            let font_face_list = Array::create_from(vm, realm, &wrappers.to_vec());
 
-                // NB: The list travels as the array that promise is resolved with, of the wrappers of the font faces.
-                let cx = CallContext::new(vm, realm);
-                let wrappers = MarkedVec::with_capacity(vm, font_face_list.len());
-                for font_face in font_face_list.values().iter() {
-                    wrappers.push(font_face.wrapper(&cx));
-                }
-                let font_face_list = Array::create_from(vm, realm, &wrappers.to_vec());
-
-                // 4. Queue a task to run the following steps synchronously:
-                queue_a_task(
-                    vm,
-                    realm,
-                    TaskSource::FontLoading,
-                    (realm, promise, font_face_list),
-                    |vm, (realm, promise, font_face_list)| {
-                        // 1. For all of the font faces in the font face list, call their load() method.
-                        let promises = MarkedVec::new(vm);
-                        let font_face_list_object = font_face_list.upcast::<Object>();
-                        let length = length_of_array_like(vm, &font_face_list_object).must();
-                        for index in 0..length {
-                            let wrapper =
-                                font_face_list_object.get_without_side_effects(vm, &PropertyKey::from(index as u32));
-                            promises.push(CppFontFaceState::of_wrapper(wrapper.as_object()).load());
-                        }
-
-                        // 2. Resolve promise with the result of waiting for all of the [[FontStatusPromise]]s of each font
-                        //    face in the font face list, in order.
-                        with_temporary_execution_context_and_callbacks(realm, || {
-                            react_to_promise(
-                                vm,
-                                get_promise_for_wait_for_all(vm, realm, &promises.values()),
-                                (promise, font_face_list),
-                                Some(|cx, (promise, font_face_list), _| {
-                                    resolve_promise(
-                                        cx.vm(),
-                                        promise,
-                                        Value::from_object(font_face_list.upcast::<Object>()),
-                                    );
-                                    Ok(Value::UNDEFINED)
-                                }),
-                                Some(|cx, (promise, _), reason| {
-                                    reject_promise(cx.vm(), promise, reason);
-                                    Ok(Value::UNDEFINED)
-                                }),
-                            );
-                        });
-                    },
-                );
-            },
-        );
+            // 2. Resolve promise with the result of waiting for all of the [[FontStatusPromise]]s of each font face in
+            //    the font face list, in order.
+            react_to_promise(
+                vm,
+                get_promise_for_wait_for_all(vm, realm, &promises.values()),
+                (promise, font_face_list),
+                Some(|cx, (promise, font_face_list), _| {
+                    resolve_promise(cx.vm(), promise, Value::from_object(font_face_list.upcast::<Object>()));
+                    Ok(Value::UNDEFINED)
+                }),
+                Some(|cx, (promise, _), reason| {
+                    reject_promise(cx.vm(), promise, reason);
+                    Ok(Value::UNDEFINED)
+                }),
+            );
+        }
 
         // 2. Return promise. Complete the rest of these steps asynchronously.
         Ok(promise)
@@ -692,7 +670,7 @@ impl FontFaceSet {
     pub(crate) fn ready(&self, _: &mut CallContext) -> WebIdlResult<WebIdlPromise> {
         // Pending style or layout changes can start a deferred font load. Flush them before returning an already
         // fulfilled promise so switching the FontFaceSet to loading can replace it with a new pending promise.
-        if is_promise_fulfilled(self.ready_promise()) {
+        if self.ready_promise_is_resolved.get() {
             // SAFETY: The set is live.
             unsafe { web_css_font_face_set_update_layout(self.as_abi(), false) };
         }
@@ -760,7 +738,9 @@ impl FontFaceSet {
 
         // 3. If font face set’s [[ReadyPromise]] slot currently holds a fulfilled promise, replace it with a fresh
         //    pending promise.
-        if is_promise_fulfilled(self.ready_promise()) {
+        // AD-HOC: A promise that was resolved with a set whose "then" lookup may run script is fulfilled later, so
+        //         we check whether the promise was resolved instead.
+        if self.ready_promise_is_resolved.replace(false) {
             let realm = self.realm;
             self.ready_promise.set(Some(with_temporary_execution_context(realm, || {
                 create_promise(vm, realm)
@@ -768,8 +748,10 @@ impl FontFaceSet {
         }
 
         // 4. Queue a task to fire a font load event named loading at font face set.
-        queue_a_task(vm, self.realm, TaskSource::FontLoading, self.this(), |vm, this| {
-            this.fire_a_font_load_event(vm, "loading", &MarkedVec::new(vm));
+        queue_a_task(vm, TaskSource::FontLoading, self.this(), |vm, this| {
+            with_temporary_execution_context_and_callbacks(this.realm, || {
+                this.fire_a_font_load_event(vm, "loading", &MarkedVec::new(vm));
+            });
         });
     }
 
@@ -795,6 +777,7 @@ impl FontFaceSet {
 
         // 4. Fulfill font face set’s [[ReadyPromise]] attribute’s value with font face set.
         let realm = self.realm;
+        self.ready_promise_is_resolved.set(true);
         with_temporary_execution_context_and_callbacks(realm, || {
             let cx = CallContext::new(vm, realm);
             let value = self.this().to_js(&cx).expect("wrapping a FontFaceSet can't throw");
@@ -808,21 +791,23 @@ impl FontFaceSet {
         }
 
         // 5. Queue a task to perform the following steps synchronously:
-        queue_a_task(vm, realm, TaskSource::FontLoading, self.this(), |vm, this| {
-            // 1. Let loaded fonts be the (possibly empty) contents of font face set’s [[LoadedFonts]] slot.
-            // 2. Let failed fonts be the (possibly empty) contents of font face set’s [[FailedFonts]] slot.
-            // 3. Reset the [[LoadedFonts]] and [[FailedFonts]] slots to empty lists.
-            let loaded_fonts = take_font_faces(vm, &this.loaded_fonts);
-            let failed_fonts = take_font_faces(vm, &this.failed_fonts);
+        queue_a_task(vm, TaskSource::FontLoading, self.this(), |vm, this| {
+            with_temporary_execution_context_and_callbacks(this.realm, || {
+                // 1. Let loaded fonts be the (possibly empty) contents of font face set’s [[LoadedFonts]] slot.
+                // 2. Let failed fonts be the (possibly empty) contents of font face set’s [[FailedFonts]] slot.
+                // 3. Reset the [[LoadedFonts]] and [[FailedFonts]] slots to empty lists.
+                let loaded_fonts = take_font_faces(vm, &this.loaded_fonts);
+                let failed_fonts = take_font_faces(vm, &this.failed_fonts);
 
-            // 4. Fire a font load event named loadingdone at font face set with loaded fonts.
-            this.fire_a_font_load_event(vm, "loadingdone", &loaded_fonts);
+                // 4. Fire a font load event named loadingdone at font face set with loaded fonts.
+                this.fire_a_font_load_event(vm, "loadingdone", &loaded_fonts);
 
-            // 5. If font face set’s failed fonts is non-empty, fire a font load event named loadingerror at font face
-            //    set with failed fonts.
-            if !failed_fonts.is_empty() {
-                this.fire_a_font_load_event(vm, "loadingerror", &failed_fonts);
-            }
+                // 5. If font face set’s failed fonts is non-empty, fire a font load event named loadingerror at font face
+                //    set with failed fonts.
+                if !failed_fonts.is_empty() {
+                    this.fire_a_font_load_event(vm, "loadingerror", &failed_fonts);
+                }
+            });
         });
     }
 }

@@ -14,10 +14,12 @@ use std::rc::{Rc, Weak};
 
 use super::custom::FrameUpload;
 use super::generated::GetActiveAttribOutputs;
-use super::recorder::{MAX_PENDING_COMMAND_BYTES, Proxy, SHARED_DATA_REGION_OFFSET, bytes_of};
+use libcompositing_rust::webgl::SHARED_DATA_REGION_OFFSET;
+use libcompositing_rust::webgl::vocabulary::{CommandType, SyncCallType, commands, sync_calls};
+use libcompositing_rust::webgl::wire::{Command, DataSpan, HEADER_SIZE, WireStruct};
+
+use super::recorder::{MAX_PENDING_COMMAND_BYTES, MAX_PENDING_FRAMES, Proxy, bytes_of};
 use super::transport::{ReadPixelsResult, SharedMemory, Transport};
-use super::vocabulary::{CommandType, SyncCallType, commands, sync_calls};
-use super::wire::{DataSpan, HEADER_SIZE, WireStruct};
 use crate::web_gl::constants::{GL_ARRAY_BUFFER, GL_INVALID_ENUM, GL_OUT_OF_MEMORY, GL_RGBA, GL_UNSIGNED_BYTE};
 
 #[derive(Clone)]
@@ -77,7 +79,7 @@ fn records_in(mut bytes: &[u8]) -> Vec<Record> {
     records
 }
 
-fn record_of<C: super::wire::Command>(command: &C) -> Record {
+fn record_of<C: Command>(command: &C) -> Record {
     let mut payload = command.as_bytes().to_vec();
     payload.resize((HEADER_SIZE + payload.len()).next_multiple_of(16) - HEADER_SIZE, 0);
     Record {
@@ -100,6 +102,10 @@ enum Call {
     },
     WaitUntilPublishedCommandsExecuted,
     SendCommands {
+        records: Vec<Record>,
+        frames: Vec<u32>,
+    },
+    SendCommandsWrittenToSharedMemory {
         records: Vec<Record>,
         frames: Vec<u32>,
     },
@@ -129,7 +135,6 @@ struct MockReplayer {
     refuses_shared_memory: Cell<bool>,
     executes_at_once: Cell<bool>,
     wait_succeeds: Cell<bool>,
-    max_frames_per_message: Cell<usize>,
     sync_replies: RefCell<VecDeque<Vec<u8>>>,
     read_data: RefCell<Vec<u8>>,
     read_pixels_result: Cell<ReadPixelsResult>,
@@ -147,7 +152,6 @@ impl MockReplayer {
             refuses_shared_memory: Cell::new(false),
             executes_at_once: Cell::new(true),
             wait_succeeds: Cell::new(true),
-            max_frames_per_message: Cell::new(16),
             sync_replies: RefCell::new(VecDeque::new()),
             read_data: RefCell::new(Vec::new()),
             read_pixels_result: Cell::new(ReadPixelsResult::default()),
@@ -234,11 +238,7 @@ struct MockTransport {
 impl Transport for MockTransport {
     type SharedMemory = MockMemory;
     type Frame = u32;
-    type Bitmap = (i32, i32, i32, i32);
-
-    fn max_frames_per_message(&self) -> usize {
-        self.replayer.max_frames_per_message.get()
-    }
+    type DrawingBufferPixels = (i32, i32, i32, i32);
 
     fn create_shared_memory(&self, size: usize) -> Option<MockMemory> {
         (!self.replayer.refuses_shared_memory.get()).then(|| MockMemory::new(size))
@@ -299,6 +299,13 @@ impl Transport for MockTransport {
     fn send_commands(&self, commands: &[u8], frames: &[u32]) {
         self.replayer.called(Call::SendCommands {
             records: records_in(commands),
+            frames: frames.to_vec(),
+        });
+    }
+
+    fn send_commands_written_to(&self, memory: &MockMemory, size_in_bytes: usize, frames: &[u32]) {
+        self.replayer.called(Call::SendCommandsWrittenToSharedMemory {
+            records: records_in(&memory.bytes(0, size_in_bytes)),
             frames: frames.to_vec(),
         });
     }
@@ -577,7 +584,7 @@ fn a_record_larger_than_the_region_is_sent_on_its_own() {
     let data = vec![5u8; SMALL_CAPACITY];
     recorder.buffer_sub_data(GL_ARRAY_BUFFER, 8, data.len() as i64, &data);
     let calls = replayer.take_calls();
-    let [first, Call::SendCommands { records, frames }] = calls.as_slice() else {
+    let [first, Call::SendCommandsWrittenToSharedMemory { records, frames }] = calls.as_slice() else {
         panic!("{} calls", calls.len());
     };
     assert_eq!(*first, sent_from_shared_buffer(0, vec![record_of(&VIEWPORT)], 1));
@@ -601,6 +608,29 @@ fn a_record_larger_than_the_region_is_sent_on_its_own() {
     assert_eq!(
         replayer.take_calls(),
         [sent_from_shared_buffer(0, vec![record_of(&VIEWPORT)], 2)]
+    );
+}
+
+#[test]
+fn a_flush_comes_before_the_frame_that_would_exceed_the_pending_frames() {
+    let replayer = MockReplayer::new();
+    let recorder = replayer.recorder(SMALL_CAPACITY * 1024);
+    replayer.take_calls();
+
+    for frame in 0..=MAX_PENDING_FRAMES as u32 {
+        upload_frame(&recorder, frame);
+    }
+    let calls = replayer.take_calls();
+    let [Call::SendFromSharedBuffer { records, frames, .. }] = calls.as_slice() else {
+        panic!("{} calls", calls.len());
+    };
+    assert_eq!(records.len(), MAX_PENDING_FRAMES);
+    assert_eq!(*frames, (0..MAX_PENDING_FRAMES as u32).collect::<Vec<_>>());
+
+    recorder.flush_commands();
+    let calls = replayer.take_calls();
+    assert!(
+        matches!(calls.as_slice(), [Call::SendFromSharedBuffer { frames, .. }] if *frames == [MAX_PENDING_FRAMES as u32])
     );
 }
 
@@ -686,37 +716,6 @@ fn a_frame_is_published_with_the_command_that_names_it() {
             records: vec![frame_record(0)],
             flush_sequence_number: 2,
             frames: vec![80],
-        }]
-    );
-}
-
-#[test]
-fn a_message_carries_no_more_frames_than_the_transport_allows() {
-    let replayer = MockReplayer::new();
-    replayer.max_frames_per_message.set(2);
-    let recorder = replayer.recorder(SMALL_CAPACITY);
-    replayer.take_calls();
-
-    for frame in [70, 80, 90] {
-        upload_frame(&recorder, frame);
-    }
-    assert_eq!(
-        replayer.take_calls(),
-        [Call::SendFromSharedBuffer {
-            offset: 0,
-            records: vec![frame_record(0), frame_record(1)],
-            flush_sequence_number: 1,
-            frames: vec![70, 80],
-        }]
-    );
-    recorder.flush_commands();
-    assert_eq!(
-        replayer.take_calls(),
-        [Call::SendFromSharedBuffer {
-            offset: 0,
-            records: vec![frame_record(0)],
-            flush_sequence_number: 2,
-            frames: vec![90],
         }]
     );
 }
@@ -1045,7 +1044,7 @@ fn the_transport_is_not_called_while_data_is_borrowed() {
     record_viewport(&recorder);
     record_with_borrowed_data(&[5; 1024]);
     let calls = replayer.take_calls();
-    let [first, Call::SendCommands { records, .. }] = calls.as_slice() else {
+    let [first, Call::SendCommandsWrittenToSharedMemory { records, .. }] = calls.as_slice() else {
         panic!("{} calls", calls.len());
     };
     assert_eq!(*first, sent_from_shared_buffer(0, vec![record_of(&VIEWPORT)], 3));

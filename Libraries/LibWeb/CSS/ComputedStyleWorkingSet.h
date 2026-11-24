@@ -91,6 +91,8 @@ public:
 
     [[nodiscard]] CSSPixels line_height(FontComputer const&) const;
     [[nodiscard]] CSSPixels font_size() const;
+    // The computed font size, unrounded, which em and rem lengths scale.
+    [[nodiscard]] double font_size_for_lengths() const;
     [[nodiscard]] Optional<FontSizeAdjust> font_size_adjust() const;
     Vector<ComputedFontFamily> computed_font_families() const;
     FontOpticalSizing font_optical_sizing() const;
@@ -181,8 +183,5 @@ NonnullRefPtr<StyleValue const> wrap_computed_longhand_slot(void const* value_da
 // How many C++ longhand wrappers have been minted process-wide, counting the on-demand mints
 // property() performs and the specified-value wrappers the drive's side effects still need.
 // Exposed through internals for the laziness measurements.
-u64 longhand_wrappers_minted();
-void reset_longhand_wrappers_minted();
-void count_longhand_wrapper_mint();
 
 }

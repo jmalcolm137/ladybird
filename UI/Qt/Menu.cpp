@@ -8,15 +8,20 @@
 #include <LibWebView/Application.h>
 #include <LibWebView/HistoryStore.h>
 #include <UI/Qt/Application.h>
+#include <UI/Qt/ChromeStyle.h>
 #include <UI/Qt/Icon.h>
 #include <UI/Qt/Menu.h>
 #include <UI/Qt/StringUtils.h>
 #include <UI/Qt/Tab.h>
+#include <UI/Qt/Theme.h>
 #include <UI/Qt/WebContentView.h>
 
 #include <QAction>
+#include <QHBoxLayout>
+#include <QLabel>
 #include <QMenu>
 #include <QPointer>
+#include <QPushButton>
 #include <QTimer>
 #include <QToolButton>
 #include <QWidget>
@@ -25,6 +30,8 @@ namespace Ladybird {
 
 static constexpr auto DYNAMIC_HISTORY_MENU_ITEM_PROPERTY = "LadybirdDynamicHistoryMenuItem";
 static constexpr size_t RECENT_HISTORY_MENU_ITEM_LIMIT = 15;
+
+static void set_action_shortcuts(QAction&, ActionID);
 
 class ActionObserver final : public Action::Observer {
 public:
@@ -105,6 +112,12 @@ public:
         }
     }
 
+    virtual void on_checked_state_changed(Action& action) override
+    {
+        if (m_action)
+            m_action->setChecked(action.checked());
+    }
+
     // QAction has no busy state, so it's a property, and the buttons that show it learn of a change as of any other.
     virtual void on_busy_state_changed(Action& action) override
     {
@@ -114,10 +127,16 @@ public:
         Q_EMIT m_action->changed();
     }
 
-    virtual void on_checked_state_changed(Action& action) override
+    virtual void on_shortcut_hint_changed(Action& action) override
     {
-        if (m_action)
-            m_action->setChecked(action.checked());
+        if (!m_action)
+            return;
+
+        auto hint = action.shortcut_hint();
+        set_action_shortcuts(*m_action, hint.value_or(action.id()));
+
+        // A hint leaves the window shortcut with the action that owns it.
+        m_action->setShortcutContext(hint.has_value() ? Qt::WidgetShortcut : Qt::WindowShortcut);
     }
 
 private:
@@ -182,24 +201,18 @@ static void add_properties(QObject& object, T& menu_or_action)
         object.setProperty(key.to_byte_string().characters(), qstring_from_ak_string(value));
 }
 
-static Action::Observer& initialize_native_control(Action& action, QAction& qaction, QPalette const& palette, IncludeActionIcon include_action_icon)
+static void set_action_shortcuts(QAction& qaction, ActionID id)
 {
-    static constexpr int const MENU_ICON_SIZE = 16;
+    qaction.setShortcuts({});
 
-    switch (action.id()) {
+    switch (id) {
     case ActionID::NavigateBack:
-        if (include_action_icon == IncludeActionIcon::Yes)
-            qaction.setIcon(create_chrome_icon(ChromeIcon::Back, palette));
         qaction.setShortcuts(QKeySequence::keyBindings(QKeySequence::StandardKey::Back));
         break;
     case ActionID::NavigateForward:
-        if (include_action_icon == IncludeActionIcon::Yes)
-            qaction.setIcon(create_chrome_icon(ChromeIcon::Forward, palette));
         qaction.setShortcuts(QKeySequence::keyBindings(QKeySequence::StandardKey::Forward));
         break;
     case ActionID::Reload:
-        if (include_action_icon == IncludeActionIcon::Yes)
-            qaction.setIcon(create_chrome_icon(ChromeIcon::Reload, palette));
         qaction.setShortcuts({ QKeySequence(Qt::CTRL | Qt::Key_R), QKeySequence(Qt::Key_F5) });
         break;
     case ActionID::ReloadBypassingCache:
@@ -210,8 +223,6 @@ static Action::Observer& initialize_native_control(Action& action, QAction& qact
 #endif
         break;
     case ActionID::ViewDownloads:
-        if (include_action_icon == IncludeActionIcon::Yes)
-            qaction.setIcon(create_chrome_icon(ChromeIcon::Download, palette));
 #if defined(AK_OS_MACOS)
         qaction.setShortcut(QKeySequence(Qt::CTRL | Qt::ALT | Qt::Key_L));
 #else
@@ -246,20 +257,10 @@ static Action::Observer& initialize_native_control(Action& action, QAction& qact
         break;
 
     case ActionID::ToggleBookmark:
-        if (include_action_icon == IncludeActionIcon::Yes)
-            qaction.setIcon(create_chrome_icon(action.engaged() ? ChromeIcon::StarFilled : ChromeIcon::Star, palette));
         qaction.setShortcut(QKeySequence(Qt::CTRL | Qt::Key_D));
-        break;
-    case ActionID::ToggleBookmarkViaToolbar:
-        if (include_action_icon == IncludeActionIcon::Yes)
-            qaction.setIcon(create_chrome_icon(action.engaged() ? ChromeIcon::StarFilled : ChromeIcon::Star, palette));
         break;
     case ActionID::ToggleBookmarksBar:
         qaction.setShortcut(QKeySequence(Qt::CTRL | Qt::SHIFT | Qt::Key_B));
-        break;
-    case ActionID::TranslatePage:
-        if (include_action_icon == IncludeActionIcon::Yes)
-            qaction.setIcon(create_translate_icon(palette, action.engaged()));
         break;
     case ActionID::ToggleVerticalTabsExpanded:
 #if defined(AK_OS_MACOS)
@@ -271,13 +272,6 @@ static Action::Observer& initialize_native_control(Action& action, QAction& qact
     case ActionID::AddBookmarkAllTabs:
         qaction.setShortcut(QKeySequence(Qt::CTRL | Qt::SHIFT | Qt::Key_D));
         break;
-    case ActionID::BookmarkItem:
-        if (auto icon = action.png_icon(); icon.has_value())
-            qaction.setIcon(favicon_with_rounded_corners(icon_from_png(icon->bytes(), MENU_ICON_SIZE), MENU_ICON_SIZE));
-        else
-            qaction.setIcon(create_chrome_icon(ChromeIcon::Globe, palette));
-        break;
-
     case ActionID::ViewHistory:
 #if defined(AK_OS_MACOS)
         qaction.setShortcut(QKeySequence(Qt::CTRL | Qt::Key_Y));
@@ -344,6 +338,47 @@ static Action::Observer& initialize_native_control(Action& action, QAction& qact
     default:
         break;
     }
+}
+
+static Action::Observer& initialize_native_control(Action& action, QAction& qaction, QPalette const& palette, IncludeActionIcon include_action_icon)
+{
+    static constexpr int const MENU_ICON_SIZE = 16;
+
+    switch (action.id()) {
+    case ActionID::NavigateBack:
+        if (include_action_icon == IncludeActionIcon::Yes)
+            qaction.setIcon(create_chrome_icon(ChromeIcon::Back, palette));
+        break;
+    case ActionID::NavigateForward:
+        if (include_action_icon == IncludeActionIcon::Yes)
+            qaction.setIcon(create_chrome_icon(ChromeIcon::Forward, palette));
+        break;
+    case ActionID::Reload:
+        if (include_action_icon == IncludeActionIcon::Yes)
+            qaction.setIcon(create_chrome_icon(ChromeIcon::Reload, palette));
+        break;
+    case ActionID::ViewDownloads:
+        if (include_action_icon == IncludeActionIcon::Yes)
+            qaction.setIcon(create_chrome_icon(ChromeIcon::Download, palette));
+        break;
+    case ActionID::ToggleBookmark:
+    case ActionID::ToggleBookmarkViaToolbar:
+        if (include_action_icon == IncludeActionIcon::Yes)
+            qaction.setIcon(create_chrome_icon(action.engaged() ? ChromeIcon::StarFilled : ChromeIcon::Star, palette));
+        break;
+    case ActionID::TranslatePage:
+        if (include_action_icon == IncludeActionIcon::Yes)
+            qaction.setIcon(create_translate_icon(palette, action.engaged()));
+        break;
+    case ActionID::BookmarkItem:
+        if (auto icon = action.png_icon(); icon.has_value())
+            qaction.setIcon(favicon_from_png(icon->bytes(), MENU_ICON_SIZE));
+        else
+            qaction.setIcon(create_chrome_icon(ChromeIcon::Globe, palette));
+        break;
+    default:
+        break;
+    }
 
     qaction.setShortcutVisibleInContextMenu(true);
 
@@ -390,7 +425,7 @@ static QAction* create_session_history_traversal_menu_action(QMenu& menu, Remote
     auto* action = new QAction(qstring_from_ak_string(item.title), &menu);
     action->setToolTip(qstring_from_ak_string(item.url));
     if (item.favicon_png.has_value())
-        action->setIcon(icon_from_png(item.favicon_png->bytes(), MENU_ICON_SIZE));
+        action->setIcon(favicon_from_png(item.favicon_png->bytes(), MENU_ICON_SIZE));
     else
         action->setIcon(create_chrome_icon(ChromeIcon::Globe, menu.palette()));
     action->setData(item.step);
@@ -492,7 +527,7 @@ static QAction* create_recent_history_menu_action(QMenu& menu, WebContentView& v
     auto* action = new QAction(qstring_from_ak_string(title), &menu);
     action->setToolTip(qstring_from_ak_string(entry.url));
     if (entry.favicon_png.has_value())
-        action->setIcon(icon_from_png(entry.favicon_png->bytes(), MENU_ICON_SIZE));
+        action->setIcon(favicon_from_png(entry.favicon_png->bytes(), MENU_ICON_SIZE));
     else
         action->setIcon(create_chrome_icon(ChromeIcon::Globe, menu.palette()));
 
@@ -544,6 +579,53 @@ QAction* create_application_action(QWidget& parent, Action& action, IncludeActio
     auto* qaction = new QAction(&parent);
     initialize_native_control(action, *qaction, parent.palette(), include_action_icon);
     return qaction;
+}
+
+// The menu's zoom row: its label like an item's, and the page's zoom level between buttons to zoom out and in.
+MenuZoomRow::MenuZoomRow(QMenu& menu, QAction& zoom_out, QAction& reset_zoom, QAction& zoom_in, QAction& zoom_level)
+    : QWidgetAction(&menu)
+{
+    auto* row = new QWidget(&menu);
+    row->setObjectName("LadybirdMenuZoomRow");
+    auto* layout = new QHBoxLayout(row);
+    layout->setContentsMargins(10, 3, 10, 3);
+    layout->setSpacing(2);
+    layout->addWidget(new QLabel("Zoom", row), 1);
+
+    auto add_button = [&](char const* object_name, QString const& tooltip, QAction& action) {
+        auto* button = new QPushButton(row);
+        button->setObjectName(object_name);
+        button->setToolTip(tooltip);
+        button->setAccessibleName(tooltip);
+        button->setFocusPolicy(Qt::NoFocus);
+        QObject::connect(button, &QPushButton::clicked, &action, &QAction::trigger);
+        layout->addWidget(button);
+        return button;
+    };
+    m_zoom_out = add_button("LadybirdMenuZoomButton", "Zoom Out", zoom_out);
+    auto* level = add_button("LadybirdMenuZoomLevel", "Reset Zoom", reset_zoom);
+    // NB: The level is drawn in figures of one width, so it doesn't shift as it changes.
+    auto level_font = level->font();
+    level_font.setFeature(QFont::Tag("tnum"), 1);
+    level->setFont(level_font);
+    m_zoom_in = add_button("LadybirdMenuZoomButton", "Zoom In", zoom_in);
+
+    auto update_level = [&zoom_level, level] {
+        // The address bar hides its zoom action at the default level and keeps its last text.
+        level->setText(zoom_level.isVisible() && !zoom_level.text().isEmpty() ? zoom_level.text() : QStringLiteral("100%"));
+    };
+    QObject::connect(&zoom_level, &QAction::changed, level, update_level);
+    update_level();
+
+    setDefaultWidget(row);
+    update_style();
+}
+
+void MenuZoomRow::update_style()
+{
+    defaultWidget()->setStyleSheet(ChromeStyle::menu_zoom_row_style_sheet());
+    m_zoom_out->setIcon(create_chrome_icon(ChromeIcon::ZoomOut, Theme::panel().body));
+    m_zoom_in->setIcon(create_chrome_icon(ChromeIcon::NewTab, Theme::panel().body));
 }
 
 ActionBinding::ActionBinding(QWidget& parent, IncludeActionIcon include_action_icon)

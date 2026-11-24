@@ -22,6 +22,7 @@
 #include <LibRequests/NetworkError.h>
 #include <LibRequests/RequestTimingInfo.h>
 #include <LibRequests/RequestTransferLease.h>
+#include <LibURL/URL.h>
 
 namespace Requests {
 
@@ -92,9 +93,14 @@ public:
     ~Request();
 
     u64 id() const { return m_request_id; }
+    // The transport epoch of the client that created the request, kept once the client is gone.
+    u64 transport_epoch() const { return m_transport_epoch; }
     int request_server_client_id() const;
     int fd() const { return m_fd; }
     ByteString const& http_version() const { return m_http_version; }
+    // The URL that RequestServer requested, which is the response's URL, as RequestServer follows no redirects. It is
+    // known once the response's headers have been received.
+    Optional<URL::URL> const& response_url() const { return m_response_url; }
     bool stop();
     void set_body_delivery_paused(bool);
     void resume_body_delivery();
@@ -143,10 +149,9 @@ public:
 
     void did_finish(Badge<RequestClient>, u64 total_size, RequestTimingInfo const& timing_info, Optional<NetworkError> const& network_error);
     void did_receive_certificate_info(Badge<RequestClient>, CertificateInfo);
-    void did_receive_headers(Badge<RequestClient>, NonnullRefPtr<HTTP::HeaderList> response_headers, Optional<u32> response_code, Optional<String> const& reason_phrase, CacheState cache_state, ByteString http_version);
+    void did_receive_headers(Badge<RequestClient>, URL::URL url, NonnullRefPtr<HTTP::HeaderList> response_headers, Optional<u32> response_code, Optional<String> const& reason_phrase, CacheState cache_state, ByteString http_version);
     void did_transfer(Badge<RequestClient>);
 
-    RefPtr<Core::Notifier>& write_notifier(Badge<RequestClient>) { return m_write_notifier; }
     void set_request_fd(Badge<RequestClient>, int fd);
     void set_request_body_file(Badge<RequestClient>, int fd, u64 offset, u64 size);
     void set_request_cached_body_file(Badge<RequestClient>, int fd, u64 offset, u64 size);
@@ -164,8 +169,8 @@ private:
 
     WeakPtr<RequestClient> m_client;
     u64 m_request_id { 0 };
+    u64 m_transport_epoch { 0 };
     Optional<RequestTransferLeaseKey> m_transfer_lease;
-    RefPtr<Core::Notifier> m_write_notifier;
     int m_fd { -1 };
     bool m_fd_is_owned_by_read_stream { false };
 
@@ -223,6 +228,7 @@ private:
     bool m_finished { false };
     ByteString m_http_version;
     Optional<CertificateInfo> m_certificate_info;
+    Optional<URL::URL> m_response_url;
 };
 
 }
