@@ -37,7 +37,7 @@ jobs:
       # job only needs the harness, so it takes the default checkout: the merge commit the run was created for, which
       # stays put while the build job runs — and still exists once a PR has picked up a conflict, when GH drops the
       # merge ref, and a checkout of it fails.
-      - uses: actions/checkout@v7.0.1
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
 

@@ -13,7 +13,7 @@ jobs:
       image: ghcr.io/ladybirdbrowser/ladybird-ci:2026.11.21
 
     steps:
-      - uses: actions/checkout@v7.0.1
+      - uses: actions/checkout@v7
 
       - name: Set Up Environment
         uses: ./.github/actions/setup
@@ -38,7 +38,7 @@ jobs:
       image: ghcr.io/ladybirdbrowser/ladybird-ci:2026.11.21
 
     steps:
-      - uses: actions/checkout@v7.0.1
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
 
