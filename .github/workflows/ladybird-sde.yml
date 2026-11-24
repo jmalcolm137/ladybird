@@ -1,0 +1,108 @@
+name: Ladybird SDE CI
+
+on:
+  push:
+    branches:
+      - master
+      - sde-libgui
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ladybird-sde-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  lint-and-checks:
+    name: Script & Structure Checks
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Check shell scripts syntax
+        run: |
+          for script in scripts/*.sh; do
+            bash -n "$script"
+          done
+
+      - name: Check Python test scripts syntax
+        run: |
+          python3 -m py_compile scripts/*.py
+
+      - name: Verify upstream-diff cleanliness
+        run: |
+          test ! -e Libraries/LibRequests/CertificateInfo.h
+          test ! -e Libraries/LibRequests/CertificateInfo.cpp
+          test ! -e vcpkg_installed/vcpkg/vcpkg-running.lock
+
+  build-and-test-engine:
+    name: Build LadybirdEngine & Run Regression Suite
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            autoconf \
+            autoconf-archive \
+            automake \
+            build-essential \
+            ccache \
+            clang-20 \
+            cmake \
+            curl \
+            git \
+            libdrm-dev \
+            libgl1-mesa-dev \
+            libtool \
+            nasm \
+            ninja-build \
+            openssl \
+            pkg-config \
+            python3 \
+            tar \
+            unzip \
+            zip
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache vcpkg & ccache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/vcpkg
+            ~/.cache/ccache
+          key: ladybird-sde-vcpkg-${{ hashFiles('vcpkg.json', 'Meta/CMake/vcpkg/**') }}
+          restore-keys: |
+            ladybird-sde-vcpkg-
+
+      - name: Configure LadybirdEngine (Release)
+        env:
+          CC: clang-20
+          CXX: clang++-20
+          CMAKE_C_COMPILER_LAUNCHER: ccache
+          CMAKE_CXX_COMPILER_LAUNCHER: ccache
+        run: |
+          cmake --preset Release -DBUILD_TESTING=OFF
+
+      - name: Build LadybirdEngine
+        run: |
+          cmake --build Build/release --target LadybirdEngine --parallel "$(nproc)"
+
+      - name: Run LadybirdEngine regression tests
+        run: |
+          ./scripts/test-stage1-safety.py
+          ./scripts/test-stage2-perf.py
+          ./scripts/test-stage3-security.py
+          ./scripts/test-stage4-structure.py
+          ./scripts/test-memfd-frames.py
+          ./scripts/test-engine-features.py
