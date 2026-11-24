@@ -542,11 +542,20 @@ void BrowserSession::clear_all_permissions()
     save_permissions();
 }
 
-ByteString BrowserSession::permissions_path() const
+static ByteString sanitized_profile_name()
 {
     auto profile = Core::Environment::get("LADYBIRD_SDE_PROFILE"sv);
-    auto profile_name = profile.has_value() ? profile->to_byte_string() : ByteString { "libgui" };
-    return LexicalPath::join(Core::StandardPaths::config_directory(), "ladybird-sde"sv, ByteString::formatted("permissions-{}.json", profile_name)).string();
+    if (!profile.has_value() || profile->is_empty())
+        return "libgui";
+    auto view = *profile;
+    if (view == "."sv || view == ".."sv || view.contains('/') || view.contains('\0'))
+        return "libgui";
+    return view.to_byte_string();
+}
+
+ByteString BrowserSession::permissions_path() const
+{
+    return LexicalPath::join(Core::StandardPaths::config_directory(), "ladybird-sde"sv, ByteString::formatted("permissions-{}.json", sanitized_profile_name())).string();
 }
 
 void BrowserSession::load_permissions()
@@ -602,20 +611,23 @@ void BrowserSession::save_permissions() const
     }
 
     auto path = permissions_path();
-    if (auto result = Core::Directory::create(LexicalPath::dirname(path), Core::Directory::CreateDirectories::Yes); result.is_error())
+    if (auto result = Core::Directory::create(LexicalPath::dirname(path), Core::Directory::CreateDirectories::Yes, 0700); result.is_error())
         return;
 
     JsonObject root;
     root.set("version"sv, 1);
     root.set("origins"sv, move(origins));
 
-    auto temporary_path = ByteString::formatted("{}.tmp", path);
-    auto file = Core::File::open(temporary_path, Core::File::OpenMode::Write | Core::File::OpenMode::Truncate);
+    auto temporary_path = ByteString::formatted("{}.{}.tmp", path, ::getpid());
+    auto file = Core::File::open(temporary_path, Core::File::OpenMode::Write | Core::File::OpenMode::Truncate, 0600);
     if (file.is_error())
         return;
     auto serialized = root.to_byte_string();
-    if (file.value()->write_until_depleted(serialized.bytes()).is_error())
+    if (file.value()->write_until_depleted(serialized.bytes()).is_error()) {
+        file.value()->close();
+        (void)Core::System::unlink(temporary_path);
         return;
+    }
     file.value()->close();
     if (Core::System::rename(temporary_path, path).is_error())
         (void)Core::System::unlink(temporary_path);
@@ -854,16 +866,12 @@ void BrowserSession::window_will_close(BrowserWindow& window)
 
 ByteString BrowserSession::session_path() const
 {
-    auto profile = Core::Environment::get("LADYBIRD_SDE_PROFILE"sv);
-    auto profile_name = profile.has_value() ? profile->to_byte_string() : ByteString { "libgui" };
-    return LexicalPath::join(Core::StandardPaths::config_directory(), "ladybird-sde"sv, ByteString::formatted("session-{}.json", profile_name)).string();
+    return LexicalPath::join(Core::StandardPaths::config_directory(), "ladybird-sde"sv, ByteString::formatted("session-{}.json", sanitized_profile_name())).string();
 }
 
 bool BrowserSession::should_restore_session() const
 {
-    auto profile = Core::Environment::get("LADYBIRD_SDE_PROFILE"sv);
-    auto profile_name = profile.has_value() ? profile->to_byte_string() : ByteString { "libgui" };
-    auto settings_path = LexicalPath::join(Core::StandardPaths::config_directory(), "Ladybird"sv, "Profiles"sv, profile_name, "Settings.json"sv).string();
+    auto settings_path = LexicalPath::join(Core::StandardPaths::config_directory(), "Ladybird"sv, "Profiles"sv, sanitized_profile_name(), "Settings.json"sv).string();
     auto file = Core::File::open(settings_path, Core::File::OpenMode::Read);
     if (file.is_error())
         return false;
@@ -924,20 +932,23 @@ void BrowserSession::save_session()
         return;
 
     auto path = session_path();
-    if (auto result = Core::Directory::create(LexicalPath::dirname(path), Core::Directory::CreateDirectories::Yes); result.is_error())
+    if (auto result = Core::Directory::create(LexicalPath::dirname(path), Core::Directory::CreateDirectories::Yes, 0700); result.is_error())
         return;
 
     JsonObject session;
     session.set("windows"sv, move(windows));
 
-    auto temporary_path = ByteString::formatted("{}.tmp", path);
-    auto file = Core::File::open(temporary_path, Core::File::OpenMode::Write | Core::File::OpenMode::Truncate);
+    auto temporary_path = ByteString::formatted("{}.{}.tmp", path, ::getpid());
+    auto file = Core::File::open(temporary_path, Core::File::OpenMode::Write | Core::File::OpenMode::Truncate, 0600);
     if (file.is_error())
         return;
 
     auto serialized = session.to_byte_string();
-    if (file.value()->write_until_depleted(serialized.bytes()).is_error())
+    if (file.value()->write_until_depleted(serialized.bytes()).is_error()) {
+        file.value()->close();
+        (void)Core::System::unlink(temporary_path);
         return;
+    }
     file.value()->close();
     if (Core::System::rename(temporary_path, path).is_error())
         (void)Core::System::unlink(temporary_path);

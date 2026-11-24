@@ -10,6 +10,7 @@
 #include <WaylandSeat.h>
 
 #include <AK/Base64.h>
+#include <AK/LexicalPath.h>
 #include <AK/StringBuilder.h>
 #include <LibCore/Environment.h>
 #include <LibCore/EventLoop.h>
@@ -177,35 +178,71 @@ struct SiteIdentity {
     String origin;
 };
 
+static String escape_menu_ampersands(StringView text)
+{
+    if (!text.contains('&'))
+        return String::from_utf8_with_replacement_character(text);
+    StringBuilder builder;
+    for (char ch : text) {
+        if (ch == '&')
+            builder.append("&&"sv);
+        else
+            builder.append(ch);
+    }
+    return MUST(builder.to_string());
+}
+
+static String truncate_dialog_text(StringView text, size_t max_bytes)
+{
+    if (text.length() <= max_bytes)
+        return String::from_utf8_with_replacement_character(text);
+    // Avoid splitting a multi-byte UTF-8 sequence.
+    size_t cut = max_bytes;
+    while (cut > 0 && (static_cast<u8>(text[cut]) & 0xC0) == 0x80)
+        --cut;
+    StringBuilder builder;
+    builder.append(text.substring_view(0, cut));
+    builder.append("…"sv);
+    return MUST(builder.to_string());
+}
+
 static SiteIdentity site_identity_for_url(String const& url)
 {
     SiteIdentity identity { "Site information"_string, {}, {} };
 
-    auto url_view = url.bytes_as_string_view();
-    if (url_view.starts_with("https:"sv))
+    auto parsed = URL::URL(url.to_byte_string());
+    if (!parsed.is_valid()) {
+        auto url_view = url.bytes_as_string_view();
+        if (url_view.starts_with("about:"sv))
+            identity.security = "Browser page"_string;
+        else if (url_view.starts_with("view-source:"sv))
+            identity.security = "View source"_string;
+        return identity;
+    }
+
+    auto scheme = parsed.scheme();
+    if (scheme == "https"sv)
         identity.security = "Secure connection"_string;
-    else if (url_view.starts_with("http:"sv))
+    else if (scheme == "http"sv)
         identity.security = "Not secure"_string;
-    else if (url_view.starts_with("file:"sv))
+    else if (scheme == "file"sv)
         identity.security = "Local file"_string;
-    else if (url_view.starts_with("about:"sv))
+    else if (scheme == "about"sv)
         identity.security = "Browser page"_string;
-    else if (url_view.starts_with("view-source:"sv))
+    else if (scheme == "view-source"sv)
         identity.security = "View source"_string;
 
-    auto view = url_view;
-    auto scheme_separator = view.find("://"sv);
-    if (scheme_separator.has_value()) {
-        auto rest = view.substring_view(*scheme_separator + 3);
-        size_t end = 0;
-        while (end < rest.length() && rest[end] != '/' && rest[end] != '?' && rest[end] != '#')
-            ++end;
-        if (end > 0) {
-            identity.host = String::from_utf8(rest.substring_view(0, end)).release_value();
-            if (url_view.starts_with("https:"sv) || url_view.starts_with("http:"sv)) {
-                identity.origin = String::formatted("{}{}", url_view.substring_view(0, *scheme_separator + 3), identity.host).release_value();
-            }
-        }
+    if (auto host = parsed.serialized_host(); !host.is_error() && !host.value().is_empty()) {
+        auto host_str = host.release_value();
+        auto port = parsed.port();
+        bool default_port = (scheme == "https"sv && port == 443) || (scheme == "http"sv && port == 80);
+        if (port.has_value() && !default_port)
+            identity.host = String::formatted("{}:{}", host_str, *port).release_value();
+        else
+            identity.host = move(host_str);
+
+        if (scheme == "https"sv || scheme == "http"sv)
+            identity.origin = String::formatted("{}://{}", scheme, identity.host).release_value();
     }
 
     return identity;
@@ -697,11 +734,12 @@ void BrowserTab::hide_find_bar()
 void BrowserTab::add_bookmark_menu_items(GUI::Menu& menu, Vector<BookmarkEntry> const& items)
 {
     for (auto const& item : items) {
+        auto safe_title = escape_menu_ampersands(item.title.bytes_as_string_view());
         if (item.is_folder) {
-            auto submenu = menu.add_submenu(item.title);
+            auto submenu = menu.add_submenu(safe_title);
             add_bookmark_menu_items(*submenu, item.children);
         } else {
-            menu.add_action(GUI::Action::create(item.title.bytes_as_string_view(), [this, url = item.url](auto&) {
+            menu.add_action(GUI::Action::create(safe_title.bytes_as_string_view(), [this, url = item.url](auto&) {
                 navigate(url);
             }));
         }
@@ -1480,7 +1518,15 @@ void BrowserTab::set_favicon(StringView path)
         return;
     }
 
-    auto bitmap = Gfx::Bitmap::load_from_file(path, 1, Gfx::IntSize { 16, 16 });
+    auto runtime_dir = LexicalPath::canonicalized_path(m_engine.runtime_directory());
+    auto canonical_path = LexicalPath::canonicalized_path(path);
+    auto prefix = ByteString::formatted("{}/", runtime_dir);
+    if (!canonical_path.starts_with(prefix)) {
+        warnln("Ladybird: rejected favicon path outside runtime directory: '{}'", path);
+        return;
+    }
+
+    auto bitmap = Gfx::Bitmap::load_from_file(canonical_path, 1, Gfx::IntSize { 16, 16 });
     if (bitmap.is_error())
         return;
     m_favicon = bitmap.value();
@@ -1766,7 +1812,7 @@ void BrowserTab::add_select_dropdown_items(GUI::Menu& menu, JsonArray const& ite
         }
 
         if (auto group_items = object.get_array("items"sv); group_items.has_value()) {
-            auto group_label = String::from_byte_string(object.get_byte_string("group"sv).value_or({})).release_value();
+            auto group_label = escape_menu_ampersands(object.get_byte_string("group"sv).value_or({}));
             auto group_action = GUI::Action::create(group_label.to_byte_string(), [](auto&) {});
             group_action->set_enabled(false);
             menu.add_action(group_action);
@@ -1774,7 +1820,7 @@ void BrowserTab::add_select_dropdown_items(GUI::Menu& menu, JsonArray const& ite
             continue;
         }
 
-        auto label = String::from_byte_string(object.get_byte_string("label"sv).value_or({})).release_value();
+        auto label = escape_menu_ampersands(object.get_byte_string("label"sv).value_or({}));
         if (in_group)
             label = String::formatted("    {}", label).release_value();
         auto id = object.get_u64("id"sv);
@@ -1822,9 +1868,12 @@ void BrowserTab::show_select_dropdown(Gfx::IntPoint position, i32 minimum_width,
 
 void BrowserTab::show_dialog(StringView kind, StringView message, StringView default_text)
 {
+    static constexpr size_t max_dialog_message_bytes = 2048;
+    static constexpr size_t max_dialog_default_bytes = 1024;
+
     auto kind_copy = String::from_utf8_with_replacement_character(kind);
-    auto text_copy = String::from_utf8_with_replacement_character(message);
-    auto default_copy = String::from_utf8_with_replacement_character(default_text);
+    auto text_copy = truncate_dialog_text(message, max_dialog_message_bytes);
+    auto default_copy = truncate_dialog_text(default_text, max_dialog_default_bytes);
     auto weak_this = make_weak_ptr();
     Core::deferred_invoke([weak_this, kind = move(kind_copy), text = move(text_copy), default_value = move(default_copy)]() mutable {
         auto* tab = weak_this.ptr();
@@ -1836,23 +1885,33 @@ void BrowserTab::show_dialog(StringView kind, StringView message, StringView def
             return;
         }
 
+        auto identity = site_identity_for_url(tab->current_url());
+        auto make_title = [&](StringView base) -> ByteString {
+            if (!identity.host.is_empty())
+                return ByteString::formatted("{} — {}", base, identity.host);
+            return base;
+        };
+
         if (kind == "alert"sv) {
-            GUI::MessageBox::show(window, text, "Alert"sv, GUI::MessageBox::Type::Information, GUI::MessageBox::InputType::OK);
+            auto title = make_title("Alert"sv);
+            GUI::MessageBox::show(window, text, title.view(), GUI::MessageBox::Type::Information, GUI::MessageBox::InputType::OK);
             if (auto* live = weak_this.ptr(); live && live->is_attached())
                 live->m_engine.dialog_response(live->m_tab_id, "alert"sv, true);
             return;
         }
 
         if (kind == "confirm"sv) {
-            auto result = GUI::MessageBox::show(window, text, "Confirm"sv, GUI::MessageBox::Type::Question, GUI::MessageBox::InputType::YesNo);
+            auto title = make_title("Confirm"sv);
+            auto result = GUI::MessageBox::show(window, text, title.view(), GUI::MessageBox::Type::Question, GUI::MessageBox::InputType::YesNo);
             if (auto* live = weak_this.ptr(); live && live->is_attached())
                 live->m_engine.dialog_response(live->m_tab_id, "confirm"sv, result == GUI::Dialog::ExecResult::Yes);
             return;
         }
 
         if (kind == "prompt"sv) {
+            auto title = make_title("Prompt"sv);
             auto value = move(default_value);
-            auto result = GUI::InputBox::show(window, value, text, "Prompt"sv, GUI::InputType::Text);
+            auto result = GUI::InputBox::show(window, value, text, title.view(), GUI::InputType::Text);
             if (auto* live = weak_this.ptr(); live && live->is_attached())
                 live->m_engine.dialog_response(live->m_tab_id, "prompt"sv, result == GUI::Dialog::ExecResult::OK, value);
         }

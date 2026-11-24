@@ -7,6 +7,7 @@
 #include "EngineClient.h"
 
 #include <AK/Array.h>
+#include <AK/Checked.h>
 #include <AK/JsonParser.h>
 #include <AK/LexicalPath.h>
 #include <AK/StringBuilder.h>
@@ -26,9 +27,28 @@
 #include <fcntl.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 namespace LadybirdSDE {
+
+static constexpr size_t max_ipc_buffer_bytes = 64 * MiB;
+static constexpr i64 max_frame_dimension = 16384;
+static constexpr i64 max_frame_slots = 8;
+static constexpr size_t max_frame_mapping_bytes = 256 * MiB;
+
+static ByteString sanitized_profile_name()
+{
+    auto profile = Core::Environment::get("LADYBIRD_SDE_PROFILE"sv);
+    if (!profile.has_value() || profile->is_empty())
+        return "libgui";
+    auto view = *profile;
+    if (view == "."sv || view == ".."sv || view.contains('/') || view.contains('\0'))
+        return "libgui";
+    return view.to_byte_string();
+}
 
 EngineClient::EngineClient(ByteString runtime_directory, ByteString socket_path)
     : m_runtime_directory(move(runtime_directory))
@@ -52,6 +72,12 @@ EngineClient::~EngineClient()
     m_server = nullptr;
     (void)Core::System::unlink(m_socket_path);
     (void)Core::System::rmdir(m_runtime_directory);
+
+    if (m_engine_pid > 0) {
+        int status = 0;
+        (void)::waitpid(m_engine_pid, &status, WNOHANG);
+        m_engine_pid = -1;
+    }
 }
 
 ErrorOr<NonnullOwnPtr<EngineClient>> EngineClient::launch(ByteString engine_path, Optional<u16> devtools_port)
@@ -90,8 +116,7 @@ ErrorOr<void> EngineClient::spawn_engine(ByteString const& engine_path)
     // otherwise share its settings database and profile lock. Set
     // LADYBIRD_SDE_PROFILE=default to share the default Ladybird profile, or to
     // a name to pick another profile.
-    auto profile = Core::Environment::get("LADYBIRD_SDE_PROFILE"sv);
-    auto profile_name = profile.has_value() ? profile->to_byte_string() : ByteString { "libgui" };
+    auto profile_name = sanitized_profile_name();
     if (profile_name != "default"sv) {
         arguments.append("--profile"sv);
         arguments.append(profile_name);
@@ -115,7 +140,7 @@ ErrorOr<void> EngineClient::spawn_engine(ByteString const& engine_path)
     // The engine host inherits the environment. It finds WebContent and the
     // resource tree relative to its own path, so the wheel does not need a
     // special prefix here.
-    TRY(Core::Process::spawn(engine_path, arguments, {}, Core::Process::KeepAsChild::Yes));
+    m_engine_pid = TRY(Core::Process::spawn(engine_path, arguments, {}, Core::Process::KeepAsChild::Yes));
     return {};
 }
 
@@ -127,6 +152,18 @@ void EngineClient::accept_connection(NonnullOwnPtr<Core::LocalSocket> socket)
         return;
     }
 
+    if (auto fd = socket->fd(); fd.has_value()) {
+        struct ucred cred {};
+        socklen_t cred_len = sizeof(cred);
+        if (::getsockopt(*fd, SOL_SOCKET, SO_PEERCRED, &cred, &cred_len) != 0
+            || cred.uid != ::getuid()
+            || (m_engine_pid > 0 && cred.pid != m_engine_pid)) {
+            warnln("Ladybird: rejected unauthorized peer on engine socket (pid={}, uid={})", cred.pid, cred.uid);
+            socket->close();
+            return;
+        }
+    }
+
     // Events are read in a loop until the socket would block, so it must not block.
     if (auto result = socket->set_blocking(false); result.is_error()) {
         warnln("Ladybird: could not configure the engine socket: {}", result.error());
@@ -135,6 +172,7 @@ void EngineClient::accept_connection(NonnullOwnPtr<Core::LocalSocket> socket)
     }
 
     m_socket = move(socket);
+    m_server = nullptr;
     m_disconnect_scheduled = false;
     m_socket->on_ready_to_read = [this] {
         read_available();
@@ -189,6 +227,12 @@ void EngineClient::read_available_impl()
 
         auto bytes = result.release_value();
         if (bytes.is_empty()) {
+            schedule_disconnect();
+            return;
+        }
+
+        if (m_read_buffer.size() - m_read_offset + bytes.size() > max_ipc_buffer_bytes) {
+            warnln("Ladybird: engine IPC read buffer limit exceeded");
             schedule_disconnect();
             return;
         }
@@ -330,6 +374,31 @@ void EngineClient::handle_frame_buffer(JsonObject const& event)
     if (!tab_id.has_value() || !name.has_value() || !slots.has_value() || !slot_size.has_value() || !width.has_value() || !height.has_value())
         return;
 
+    if (*slots < 1 || *slots > max_frame_slots || *width < 1 || *width > max_frame_dimension || *height < 1 || *height > max_frame_dimension || scale > 8) {
+        warnln("Ladybird: rejected invalid frame buffer geometry ({}x{}, slots={})", *width, *height, *slots);
+        return;
+    }
+
+    if (!name->starts_with("/ladybird-sde-"sv) || name->substring_view(1).contains('/')) {
+        warnln("Ladybird: rejected unexpected frame buffer name '{}'", *name);
+        return;
+    }
+
+    Checked<size_t> min_slot_size = static_cast<size_t>(*width);
+    min_slot_size *= static_cast<size_t>(*height);
+    min_slot_size *= 4;
+    if (min_slot_size.has_overflow() || *slot_size < min_slot_size.value()) {
+        warnln("Ladybird: rejected undersized frame buffer slot ({})", *slot_size);
+        return;
+    }
+
+    Checked<size_t> total_size = static_cast<size_t>(*slot_size);
+    total_size *= static_cast<size_t>(*slots);
+    if (total_size.has_overflow() || total_size.value() == 0 || total_size.value() > max_frame_mapping_bytes) {
+        warnln("Ladybird: rejected oversized frame buffer mapping");
+        return;
+    }
+
     destroy_frame_buffer(*tab_id);
 
     int fd = ::shm_open(name->characters(), O_RDWR, 0600);
@@ -338,7 +407,14 @@ void EngineClient::handle_frame_buffer(JsonObject const& event)
         return;
     }
 
-    auto size = static_cast<size_t>(*slot_size) * static_cast<size_t>(*slots);
+    struct stat st {};
+    if (::fstat(fd, &st) != 0 || st.st_size < static_cast<off_t>(total_size.value())) {
+        warnln("Ladybird: frame buffer '{}' backing size ({}) smaller than expected ({})", *name, st.st_size, total_size.value());
+        ::close(fd);
+        return;
+    }
+
+    auto size = total_size.value();
     auto mapping = Core::System::mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
     if (mapping.is_error()) {
         warnln("Ladybird: could not map frame buffer: {}", mapping.error());
@@ -377,7 +453,14 @@ void EngineClient::handle_frame(JsonObject const& event)
     if (!buffer || *slot < 0 || *slot >= buffer->slots)
         return;
 
-    if (static_cast<size_t>(*width) * 4 > *stride || static_cast<size_t>(*height) * *stride > buffer->slot_size)
+    if (*width < 1 || *width > max_frame_dimension || *height < 1 || *height > max_frame_dimension)
+        return;
+
+    Checked<size_t> row_bytes = static_cast<size_t>(*width);
+    row_bytes *= 4;
+    Checked<size_t> frame_bytes = static_cast<size_t>(*height);
+    frame_bytes *= static_cast<size_t>(*stride);
+    if (row_bytes.has_overflow() || frame_bytes.has_overflow() || row_bytes.value() > *stride || frame_bytes.value() > buffer->slot_size)
         return;
 
     auto scale = buffer->scale;
@@ -421,6 +504,11 @@ void EngineClient::send(JsonObject const& event)
         return;
 
     auto text = event.to_byte_string();
+    if (m_write_buffer.size() - m_write_offset + text.bytes().size() + 1 > max_ipc_buffer_bytes) {
+        warnln("Ladybird: engine IPC write buffer limit exceeded");
+        schedule_disconnect();
+        return;
+    }
     m_write_buffer.append(text.bytes().data(), text.bytes().size());
     m_write_buffer.append('\n');
     flush_writes();

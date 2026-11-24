@@ -60,8 +60,17 @@ if command -v patchelf >/dev/null; then
     done
 fi
 
-rm -rf "$LIVE"
-mv "$TMP" "$LIVE"
+OLD="${LIVE}.old.$$"
+if [[ -e "$LIVE" ]]; then
+    mv "$LIVE" "$OLD"
+fi
+if ! mv "$TMP" "$LIVE"; then
+    if [[ -e "$OLD" ]]; then
+        mv "$OLD" "$LIVE" || true
+    fi
+    exit 1
+fi
+rm -rf "$OLD"
 trap - EXIT
 
 echo "==> live snapshot: $LIVE"

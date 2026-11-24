@@ -1407,14 +1407,29 @@ void BrowserWindow::show_permissions()
     m_permissions_window->show();
 }
 
+static String escape_menu_ampersands(StringView text)
+{
+    if (!text.contains('&'))
+        return String::from_utf8_with_replacement_character(text);
+    StringBuilder builder;
+    for (char ch : text) {
+        if (ch == '&')
+            builder.append("&&"sv);
+        else
+            builder.append(ch);
+    }
+    return MUST(builder.to_string());
+}
+
 void BrowserWindow::add_bookmark_menu_items(GUI::Menu& menu, Vector<BookmarkEntry> const& items)
 {
     for (auto const& item : items) {
+        auto safe_title = escape_menu_ampersands(item.title.bytes_as_string_view());
         if (item.is_folder) {
-            auto submenu = menu.add_submenu(item.title);
+            auto submenu = menu.add_submenu(safe_title);
             add_bookmark_menu_items(*submenu, item.children);
         } else {
-            menu.add_action(GUI::Action::create(item.title.bytes_as_string_view(), [this, url = item.url](auto&) {
+            menu.add_action(GUI::Action::create(safe_title.bytes_as_string_view(), [this, url = item.url](auto&) {
                 navigate_active(url);
             }));
         }
@@ -2160,7 +2175,8 @@ void BrowserWindow::rebuild_tabs_menu()
                 title = tab->current_url();
             if (title.is_empty())
                 title = "New Tab"_string;
-            auto label = String::formatted("{}  {}", i + 1, title).release_value();
+            auto raw_label = String::formatted("{}  {}", i + 1, title).release_value();
+            auto label = escape_menu_ampersands(raw_label.bytes_as_string_view());
             menu.add_action(GUI::Action::create(label.bytes_as_string_view(), [this, tab](auto&) {
                 if (!tab_is_live(tab))
                     return;
@@ -2189,7 +2205,7 @@ void BrowserWindow::rebuild_history_menu()
         m_history_menu->add_action(action);
     } else {
         for (auto const& entry : m_recent_history) {
-            auto title = entry.title.is_empty() ? entry.url : entry.title;
+            auto title = escape_menu_ampersands((entry.title.is_empty() ? entry.url : entry.title).bytes_as_string_view());
             m_history_menu->add_action(GUI::Action::create(title.bytes_as_string_view(), [this, url = entry.url](auto&) {
                 navigate_active(url);
             }));

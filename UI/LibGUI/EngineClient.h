@@ -37,6 +37,7 @@ public:
     ~EngineClient();
 
     bool is_connected() const { return m_socket != nullptr; }
+    ByteString const& runtime_directory() const { return m_runtime_directory; }
 
     void create_tab(Gfx::IntSize viewport_size, String const& url, u64 request_id, bool private_tab = false, u64 window_id = 0, u64 session_tab_id = 0, u64 session_window_id = 0, int device_pixel_ratio = 1);
     void close_tab(u64 tab_id);
@@ -165,6 +166,7 @@ private:
     bool m_in_read_callback { false };
     bool m_close_pending { false };
     bool m_quitting { false };
+    pid_t m_engine_pid { -1 };
 };
 
 }

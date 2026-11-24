@@ -401,6 +401,13 @@ void EngineServer::read_available()
             return;
         }
 
+        static constexpr size_t max_ipc_buffer_bytes = 64 * MiB;
+        if (m_read_buffer.size() - m_read_offset + bytes.size() > max_ipc_buffer_bytes) {
+            warnln("LadybirdEngine: IPC read buffer limit exceeded");
+            quit(1);
+            return;
+        }
+
         m_read_buffer.append(bytes.data(), bytes.size());
 
         while (m_read_offset < m_read_buffer.size()) {
@@ -997,8 +1004,8 @@ void EngineServer::destroy_tab(u64 tab_id)
 
 void EngineServer::handle_create_tab(JsonObject const& command)
 {
-    auto width = command.get_i64("width"sv).value_or(1024);
-    auto height = command.get_i64("height"sv).value_or(768);
+    auto width = clamp(command.get_i64("width"sv).value_or(1024), static_cast<i64>(1), static_cast<i64>(16384));
+    auto height = clamp(command.get_i64("height"sv).value_or(768), static_cast<i64>(1), static_cast<i64>(16384));
     auto is_private = command.get_bool("private"sv).value_or(false);
     auto device_pixel_ratio = clamp(static_cast<int>(command.get_i64("scale"sv).value_or(1)), 1, 4);
 
@@ -1007,7 +1014,7 @@ void EngineServer::handle_create_tab(JsonObject const& command)
     auto session_tab = command.get_u64("session_tab"sv);
     auto session_window = command.get_u64("session_window"sv);
 
-    auto& tab = create_tab({ max(static_cast<int>(width), 1), max(static_cast<int>(height), 1) }, is_private, request_id, 0, window_id, device_pixel_ratio);
+    auto& tab = create_tab({ static_cast<int>(width), static_cast<int>(height) }, is_private, request_id, 0, window_id, device_pixel_ratio);
 
     auto* store = EngineApplication::the().session_store(WebView::IsPrivate::No);
 
@@ -1321,8 +1328,8 @@ void EngineServer::handle_resize(u64 tab_id, JsonObject const& command)
     if (!tab)
         return;
 
-    auto width = max(static_cast<int>(command.get_i64("width"sv).value_or(1)), 1);
-    auto height = max(static_cast<int>(command.get_i64("height"sv).value_or(1)), 1);
+    auto width = static_cast<int>(clamp(command.get_i64("width"sv).value_or(1), static_cast<i64>(1), static_cast<i64>(16384)));
+    auto height = static_cast<int>(clamp(command.get_i64("height"sv).value_or(1), static_cast<i64>(1), static_cast<i64>(16384)));
     auto size = Gfx::IntSize { width, height };
     if (tab->viewport_size == size)
         return;
@@ -1585,12 +1592,23 @@ bool EngineServer::ensure_frame_buffer(Tab& tab, Gfx::IntSize dimensions)
 {
     auto width = dimensions.width();
     auto height = dimensions.height();
-    if (width <= 0 || height <= 0)
+    if (width <= 0 || height <= 0 || width > 16384 || height > 16384)
         return false;
 
-    auto slot_size = static_cast<size_t>(width) * static_cast<size_t>(height) * 4;
+    Checked<size_t> checked_slot_size = static_cast<size_t>(width);
+    checked_slot_size *= static_cast<size_t>(height);
+    checked_slot_size *= 4;
+    if (checked_slot_size.has_overflow())
+        return false;
+    auto slot_size = checked_slot_size.value();
     if (tab.frame_mapping && tab.frame_slot_size >= slot_size && tab.frame_buffer_dimensions == dimensions)
         return true;
+
+    Checked<size_t> checked_total_bytes = slot_size;
+    checked_total_bytes *= static_cast<size_t>(tab.frame_slots);
+    if (checked_total_bytes.has_overflow() || checked_total_bytes.value() > 256 * MiB)
+        return false;
+    auto bytes = checked_total_bytes.value();
 
     // Recreate on a size change even when the old slots are large enough: the
     // in-flight slots still contain the old dimensions, and their acks refer to
@@ -1608,7 +1626,6 @@ bool EngineServer::ensure_frame_buffer(Tab& tab, Gfx::IntSize dimensions)
         return false;
     }
 
-    auto bytes = tab.frame_slot_size * static_cast<size_t>(tab.frame_slots);
     if (::ftruncate(fd, static_cast<off_t>(bytes)) < 0) {
         warnln("LadybirdEngine: could not resize frame buffer: {}", strerror(errno));
         ::close(fd);
@@ -2013,9 +2030,21 @@ void EngineServer::handle_drag(u64 tab_id, JsonObject const& command)
             if (!parsed.has_value())
                 continue;
             if (parsed->scheme() == "file"sv) {
+                static size_t const max_drop_file_bytes = [] {
+                    if (auto configured = Core::Environment::get("LADYBIRD_SDE_MAX_DROP_FILE_BYTES"sv); configured.has_value()) {
+                        if (auto parsed_limit = configured->to_number<size_t>(); parsed_limit.has_value())
+                            return *parsed_limit;
+                    }
+                    return static_cast<size_t>(64 * MiB);
+                }();
                 auto path = parsed->file_path();
                 if (path.is_empty())
                     continue;
+                auto metadata = Core::System::stat(path);
+                if (metadata.is_error() || !S_ISREG(metadata.value().st_mode) || static_cast<u64>(metadata.value().st_size) > max_drop_file_bytes) {
+                    warnln("LadybirdEngine: skipped dropped file '{}' (not a regular file or exceeds {} bytes)", path, max_drop_file_bytes);
+                    continue;
+                }
                 auto file = Core::File::open(path, Core::File::OpenMode::Read);
                 if (file.is_error())
                     continue;
@@ -3275,8 +3304,14 @@ void EngineServer::handle_frame_ack(u64 tab_id, JsonObject const& command)
 
 void EngineServer::send_event(JsonObject event)
 {
+    static constexpr size_t max_ipc_buffer_bytes = 64 * MiB;
     auto serialized = event.serialized();
     auto bytes = serialized.bytes();
+    if (m_write_buffer.size() - m_write_offset + bytes.size() + 1 > max_ipc_buffer_bytes) {
+        warnln("LadybirdEngine: IPC write buffer limit exceeded");
+        quit(1);
+        return;
+    }
     m_write_buffer.ensure_capacity(m_write_buffer.size() + bytes.size() + 1);
     m_write_buffer.append(bytes.data(), bytes.size());
     m_write_buffer.append('\n');
