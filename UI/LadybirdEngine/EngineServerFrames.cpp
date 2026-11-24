@@ -41,10 +41,6 @@ void EngineServer::destroy_frame_buffer(Tab& tab)
         ::close(tab.frame_fd);
         tab.frame_fd = -1;
     }
-    if (!tab.frame_buffer_name.is_empty()) {
-        ::shm_unlink(tab.frame_buffer_name.characters());
-        tab.frame_buffer_name = {};
-    }
     tab.frame_slot_size = 0;
     tab.frame_buffer_dimensions = {};
     tab.frame_write_slot = 0;
@@ -81,10 +77,10 @@ bool EngineServer::ensure_frame_buffer(Tab& tab, Gfx::IntSize dimensions)
     tab.frame_slot_size = slot_size;
     tab.frame_buffer_dimensions = dimensions;
 
-    auto name = ByteString::formatted("/ladybird-sde-{}-{}-{}", ::getpid(), tab.id, m_next_frame_buffer_id++);
-    int fd = ::shm_open(name.characters(), O_RDWR | O_CREAT | O_EXCL, 0600);
+    auto name = ByteString::formatted("ladybird-sde-{}-{}", tab.id, m_next_frame_buffer_id++);
+    int fd = ::memfd_create(name.characters(), MFD_CLOEXEC);
     if (fd < 0) {
-        warnln("LadybirdEngine: could not create frame buffer '{}': {}", name, strerror(errno));
+        warnln("LadybirdEngine: could not create memfd frame buffer '{}': {}", name, strerror(errno));
         tab.frame_slot_size = 0;
         return false;
     }
@@ -92,7 +88,6 @@ bool EngineServer::ensure_frame_buffer(Tab& tab, Gfx::IntSize dimensions)
     if (::ftruncate(fd, static_cast<off_t>(bytes)) < 0) {
         warnln("LadybirdEngine: could not resize frame buffer: {}", strerror(errno));
         ::close(fd);
-        ::shm_unlink(name.characters());
         tab.frame_slot_size = 0;
         return false;
     }
@@ -101,7 +96,6 @@ bool EngineServer::ensure_frame_buffer(Tab& tab, Gfx::IntSize dimensions)
     if (mapping == MAP_FAILED) {
         warnln("LadybirdEngine: could not map frame buffer: {}", strerror(errno));
         ::close(fd);
-        ::shm_unlink(name.characters());
         tab.frame_slot_size = 0;
         return false;
     }
@@ -109,19 +103,18 @@ bool EngineServer::ensure_frame_buffer(Tab& tab, Gfx::IntSize dimensions)
     tab.frame_fd = fd;
     tab.frame_mapping = mapping;
     tab.frame_mapping_size = bytes;
-    tab.frame_buffer_name = name;
     tab.frame_write_slot = 0;
 
     JsonObject event;
     event.set("type"sv, "frame_buffer"sv);
     event.set("tab"sv, tab.id);
-    event.set("name"sv, tab.frame_buffer_name.view());
+    event.set("fd"sv, true);
     event.set("slots"sv, tab.frame_slots);
     event.set("slot_size"sv, static_cast<u64>(tab.frame_slot_size));
     event.set("width"sv, width);
     event.set("height"sv, height);
     event.set("scale"sv, tab.device_pixel_ratio);
-    send_event(move(event));
+    send_event_with_fd(move(event), tab.frame_fd);
     return true;
 }
 

@@ -207,8 +207,11 @@ void EngineClient::read_available_impl()
 
     Array<u8, 64 * 1024> buffer;
     while (true) {
-        auto result = m_socket->read_some(buffer.span());
+        Vector<int> received_fds;
+        auto result = m_socket->receive_message(buffer.span(), MSG_CMSG_CLOEXEC, received_fds);
         if (result.is_error()) {
+            for (int fd : received_fds)
+                ::close(fd);
             if (result.error().is_errno() && (result.error().code() == EAGAIN || result.error().code() == EWOULDBLOCK))
                 return;
             schedule_disconnect();
@@ -217,8 +220,19 @@ void EngineClient::read_available_impl()
 
         auto bytes = result.release_value();
         if (bytes.is_empty()) {
+            for (int fd : received_fds)
+                ::close(fd);
             schedule_disconnect();
             return;
+        }
+
+        for (int fd : received_fds) {
+            if (m_received_fds.size() >= 64) {
+                ::close(fd);
+                warnln("Ladybird: dropped excess engine fd");
+            } else {
+                m_received_fds.append(fd);
+            }
         }
 
         if (m_read_buffer.size() - m_read_offset + bytes.size() > max_ipc_buffer_bytes) {
@@ -354,6 +368,7 @@ void EngineClient::destroy_frame_buffer(u64 tab_id)
 void EngineClient::handle_frame_buffer(JsonObject const& event)
 {
     auto tab_id = event.get_u64("tab"sv);
+    auto use_fd = event.get_bool("fd"sv).value_or(false);
     auto name = event.get_byte_string("name"sv);
     auto slots = event.get_i64("slots"sv);
     auto slot_size = event.get_u64("slot_size"sv);
@@ -361,16 +376,33 @@ void EngineClient::handle_frame_buffer(JsonObject const& event)
     auto height = event.get_i64("height"sv);
     auto scale = max(static_cast<int>(event.get_i64("scale"sv).value_or(1)), 1);
 
-    if (!tab_id.has_value() || !name.has_value() || !slots.has_value() || !slot_size.has_value() || !width.has_value() || !height.has_value())
-        return;
+    int passed_fd = -1;
+    if (use_fd && !m_received_fds.is_empty()) {
+        passed_fd = m_received_fds.first();
+        m_received_fds.remove(0);
+    }
 
-    if (*slots < 1 || *slots > max_frame_slots || *width < 1 || *width > max_frame_dimension || *height < 1 || *height > max_frame_dimension || scale > 8) {
-        warnln("Ladybird: rejected invalid frame buffer geometry ({}x{}, slots={})", *width, *height, *slots);
+    auto close_passed_fd = [&] {
+        if (passed_fd >= 0) {
+            ::close(passed_fd);
+            passed_fd = -1;
+        }
+    };
+
+    if (!tab_id.has_value() || (!use_fd && !name.has_value()) || !slots.has_value() || !slot_size.has_value() || !width.has_value() || !height.has_value()) {
+        close_passed_fd();
         return;
     }
 
-    if (!name->starts_with("/ladybird-sde-"sv) || name->substring_view(1).contains('/')) {
+    if (*slots < 1 || *slots > max_frame_slots || *width < 1 || *width > max_frame_dimension || *height < 1 || *height > max_frame_dimension || scale > 8) {
+        warnln("Ladybird: rejected invalid frame buffer geometry ({}x{}, slots={})", *width, *height, *slots);
+        close_passed_fd();
+        return;
+    }
+
+    if (!use_fd && (!name->starts_with("/ladybird-sde-"sv) || name->substring_view(1).contains('/'))) {
         warnln("Ladybird: rejected unexpected frame buffer name '{}'", *name);
+        close_passed_fd();
         return;
     }
 
@@ -379,6 +411,7 @@ void EngineClient::handle_frame_buffer(JsonObject const& event)
     min_slot_size *= 4;
     if (min_slot_size.has_overflow() || *slot_size < min_slot_size.value()) {
         warnln("Ladybird: rejected undersized frame buffer slot ({})", *slot_size);
+        close_passed_fd();
         return;
     }
 
@@ -386,26 +419,37 @@ void EngineClient::handle_frame_buffer(JsonObject const& event)
     total_size *= static_cast<size_t>(*slots);
     if (total_size.has_overflow() || total_size.value() == 0 || total_size.value() > max_frame_mapping_bytes) {
         warnln("Ladybird: rejected oversized frame buffer mapping");
+        close_passed_fd();
         return;
     }
 
     destroy_frame_buffer(*tab_id);
 
-    int fd = ::shm_open(name->characters(), O_RDWR, 0600);
-    if (fd < 0) {
-        warnln("Ladybird: could not open frame buffer '{}': {}", *name, strerror(errno));
-        return;
+    int fd = -1;
+    if (use_fd) {
+        fd = passed_fd;
+        passed_fd = -1;
+        if (fd < 0) {
+            warnln("Ladybird: frame_buffer event requested SCM_RIGHTS fd but none was received");
+            return;
+        }
+    } else {
+        fd = ::shm_open(name->characters(), O_RDONLY, 0600);
+        if (fd < 0) {
+            warnln("Ladybird: could not open frame buffer '{}': {}", *name, strerror(errno));
+            return;
+        }
     }
 
     struct stat st {};
     if (::fstat(fd, &st) != 0 || st.st_size < static_cast<off_t>(total_size.value())) {
-        warnln("Ladybird: frame buffer '{}' backing size ({}) smaller than expected ({})", *name, st.st_size, total_size.value());
+        warnln("Ladybird: frame buffer backing size ({}) smaller than expected ({})", st.st_size, total_size.value());
         ::close(fd);
         return;
     }
 
     auto size = total_size.value();
-    auto mapping = Core::System::mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    auto mapping = Core::System::mmap(nullptr, size, PROT_READ, MAP_SHARED, fd, 0);
     if (mapping.is_error()) {
         warnln("Ladybird: could not map frame buffer: {}", mapping.error());
         ::close(fd);
@@ -418,7 +462,8 @@ void EngineClient::handle_frame_buffer(JsonObject const& event)
     buffer->size = size;
     buffer->slots = static_cast<int>(*slots);
     buffer->slot_size = *slot_size;
-    buffer->name = *name;
+    if (!use_fd && name.has_value())
+        buffer->name = *name;
     buffer->slot_dimensions = { static_cast<int>(*width), static_cast<int>(*height) };
     buffer->scale = scale;
     buffer->bitmaps.ensure_capacity(buffer->slots);
@@ -568,6 +613,9 @@ void EngineClient::close_socket()
         m_socket->close();
         m_socket.clear();
     }
+    for (int fd : m_received_fds)
+        ::close(fd);
+    m_received_fds.clear();
     m_write_buffer.clear();
     m_write_offset = 0;
 }

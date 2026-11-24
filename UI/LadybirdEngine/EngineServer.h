@@ -105,11 +105,10 @@ private:
             Gfx::IntRect rect;
         };
 
-        // The frame buffer is one POSIX shared-memory object with a small ring
-        // of fixed-size slots. The chrome maps the same object, so presenting a
-        // frame costs one copy into the slot and one small control message. A
-        // slot stays in flight until the chrome reports that it replaced it, so
-        // the engine never overwrites pixels the frontend may still display.
+        // The frame buffer is an anonymous memfd shared-memory ring passed to
+        // the chrome over the control socket via SCM_RIGHTS. A slot stays in
+        // flight until the chrome reports that it replaced it, so the engine
+        // never overwrites pixels the frontend may still display.
         int frame_fd { -1 };
         void* frame_mapping { nullptr };
         size_t frame_mapping_size { 0 };
@@ -117,7 +116,6 @@ private:
         Gfx::IntSize frame_buffer_dimensions;
         int frame_slots { 2 };
         int frame_write_slot { 0 };
-        ByteString frame_buffer_name;
         u64 presented_sequence { 0 };
         Gfx::IntSize frame_content_size;
         bool frame_dirty { false };
@@ -257,6 +255,7 @@ private:
     void try_send_frame(Tab&);
     Gfx::IntRect damage_since(Tab&, u64 content_sequence, u64 latest_sequence, Gfx::IntSize, bool& needs_full_copy);
     void send_event(JsonObject);
+    void send_event_with_fd(JsonObject, int fd);
     void flush_writes();
     void send_simple_event(StringView type, u64 tab_id);
     void send_tab_created(Tab&);
@@ -295,8 +294,13 @@ private:
     Core::AnonymousBuffer m_theme;
     Vector<u8> m_read_buffer;
     size_t m_read_offset { 0 };
+    struct PendingWriteFd {
+        size_t offset { 0 };
+        int fd { -1 };
+    };
     Vector<u8> m_write_buffer;
     size_t m_write_offset { 0 };
+    Vector<PendingWriteFd> m_pending_write_fds;
     RefPtr<Core::Notifier> m_write_notifier;
     RefPtr<Core::Timer> m_unresponsive_timer;
     RefPtr<Core::Timer> m_crash_report_check_timer;

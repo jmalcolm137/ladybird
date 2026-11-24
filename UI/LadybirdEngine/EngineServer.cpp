@@ -58,6 +58,7 @@
 #include <fcntl.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/socket.h>
 #include <unistd.h>
 
 namespace LadybirdSDE {
@@ -140,6 +141,11 @@ EngineServer::~EngineServer()
         m_write_notifier->close();
         m_write_notifier.clear();
     }
+    for (auto const& pending : m_pending_write_fds) {
+        if (pending.fd >= 0)
+            ::close(pending.fd);
+    }
+    m_pending_write_fds.clear();
     m_certificate_request_generations.clear();
     for (auto& [id, tab] : m_tabs) {
         destroy_frame_buffer(*tab);
@@ -2226,11 +2232,49 @@ void EngineServer::send_event(JsonObject event)
     flush_writes();
 }
 
+void EngineServer::send_event_with_fd(JsonObject event, int fd)
+{
+    static constexpr size_t max_ipc_buffer_bytes = 64 * MiB;
+    auto serialized = event.serialized();
+    auto bytes = serialized.bytes();
+    if (m_write_buffer.size() - m_write_offset + bytes.size() + 1 > max_ipc_buffer_bytes) {
+        warnln("LadybirdEngine: IPC write buffer limit exceeded");
+        quit(1);
+        return;
+    }
+
+    int dup_fd = ::fcntl(fd, F_DUPFD_CLOEXEC, 0);
+    if (dup_fd < 0) {
+        warnln("LadybirdEngine: could not duplicate frame buffer fd: {}", strerror(errno));
+        return;
+    }
+
+    m_pending_write_fds.append({ m_write_buffer.size(), dup_fd });
+    m_write_buffer.ensure_capacity(m_write_buffer.size() + bytes.size() + 1);
+    m_write_buffer.append(bytes.data(), bytes.size());
+    m_write_buffer.append('\n');
+    flush_writes();
+}
+
 void EngineServer::flush_writes()
 {
     while (m_write_offset < m_write_buffer.size()) {
-        auto remaining = m_write_buffer.span().slice(m_write_offset);
-        auto result = m_socket->write_some(remaining);
+        ErrorOr<size_t> result { 0 };
+        bool sent_fd = false;
+
+        if (!m_pending_write_fds.is_empty() && m_pending_write_fds.first().offset == m_write_offset) {
+            auto chunk_end = m_pending_write_fds.size() > 1 ? m_pending_write_fds[1].offset : m_write_buffer.size();
+            auto slice = m_write_buffer.span().slice(m_write_offset, chunk_end - m_write_offset);
+            Vector<int, 1> fds;
+            fds.append(m_pending_write_fds.first().fd);
+            result = m_socket->send_message(slice, MSG_NOSIGNAL, move(fds));
+            sent_fd = true;
+        } else {
+            auto chunk_end = !m_pending_write_fds.is_empty() ? m_pending_write_fds.first().offset : m_write_buffer.size();
+            auto slice = m_write_buffer.span().slice(m_write_offset, chunk_end - m_write_offset);
+            result = m_socket->write_some(slice);
+        }
+
         if (result.is_error()) {
             if (result.error().is_errno() && (result.error().code() == EAGAIN || result.error().code() == EWOULDBLOCK)) {
                 if (m_write_notifier)
@@ -2248,12 +2292,18 @@ void EngineServer::flush_writes()
             quit();
             return;
         }
+        if (sent_fd) {
+            ::close(m_pending_write_fds.first().fd);
+            m_pending_write_fds.remove(0);
+        }
         m_write_offset += written;
         if (m_write_offset == m_write_buffer.size()) {
             m_write_buffer.clear_with_capacity();
             m_write_offset = 0;
         } else if (m_write_offset >= 64 * KiB && m_write_offset * 2 >= m_write_buffer.size()) {
             m_write_buffer.remove(0, m_write_offset);
+            for (auto& pending : m_pending_write_fds)
+                pending.offset -= m_write_offset;
             m_write_offset = 0;
         }
     }

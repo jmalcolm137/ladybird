@@ -158,6 +158,7 @@ private:
     OwnPtr<Core::LocalSocket> m_socket;
     Vector<u8> m_read_buffer;
     size_t m_read_offset { 0 };
+    Vector<int> m_received_fds;
     Vector<u8> m_write_buffer;
     size_t m_write_offset { 0 };
     RefPtr<Core::Notifier> m_write_notifier;
