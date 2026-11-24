@@ -32,13 +32,133 @@
 #include <LibGUI/JsonArrayModel.h>
 #include <LibGUI/Menu.h>
 #include <LibGUI/MessageBox.h>
+#include <LibGUI/Painter.h>
 #include <LibGUI/TableView.h>
 #include <LibGUI/TextEditor.h>
 #include <LibGUI/TextBox.h>
 #include <LibGUI/Widget.h>
 #include <LibGfx/Bitmap.h>
+#include <LibGfx/Palette.h>
+#include <LibGfx/StylePainter.h>
 
 namespace LadybirdSDE {
+
+class BrowserTabWidget final : public GUI::TabWidget {
+    C_OBJECT(BrowserTabWidget)
+public:
+    Function<void()> on_new_tab_click;
+
+private:
+    BrowserTabWidget() = default;
+
+    Gfx::IntRect new_tab_button_rect()
+    {
+        if (!is_bar_visible() || has_vertical_tabs())
+            return {};
+        constexpr int button_width = 20;
+        constexpr int button_height = 18;
+        constexpr int gap = 4;
+        int tabs_right = 2;
+        if (auto count = tab_count(); count > 0)
+            tabs_right += static_cast<int>(count) * uniform_tab_width();
+        int max_x = max(2, width() - button_width - 2);
+        int x = min(tabs_right + gap, max_x);
+        int y = (bar_height() - button_height) / 2;
+        return { x, y, button_width, button_height };
+    }
+
+    void update_tab_bar()
+    {
+        update({ 0, 0, width(), bar_height() });
+    }
+
+    virtual void paint_event(GUI::PaintEvent& event) override
+    {
+        GUI::TabWidget::paint_event(event);
+        if (!is_bar_visible() || has_vertical_tabs())
+            return;
+
+        auto rect = new_tab_button_rect();
+        if (rect.is_empty())
+            return;
+
+        GUI::Painter painter(*this);
+        painter.add_clip_rect(event.rect());
+        painter.fill_rect(rect, palette().button());
+
+        if (m_new_tab_hovered || m_new_tab_pressed) {
+            Gfx::StylePainter::paint_frame(
+                painter,
+                rect,
+                palette(),
+                m_new_tab_pressed ? Gfx::FrameStyle::SunkenPanel : Gfx::FrameStyle::RaisedPanel);
+        }
+
+        auto center = rect.center();
+        if (m_new_tab_pressed)
+            center.translate_by(1, 1);
+        constexpr int half_arm = 4;
+        auto color = palette().button_text();
+        painter.draw_line({ center.x() - half_arm, center.y() }, { center.x() + half_arm, center.y() }, color);
+        painter.draw_line({ center.x(), center.y() - half_arm }, { center.x(), center.y() + half_arm }, color);
+    }
+
+    virtual void mousedown_event(GUI::MouseEvent& event) override
+    {
+        if (event.button() == GUI::MouseButton::Primary && new_tab_button_rect().contains(event.position())) {
+            m_new_tab_pressed = true;
+            update_tab_bar();
+            return;
+        }
+        GUI::TabWidget::mousedown_event(event);
+    }
+
+    virtual void mouseup_event(GUI::MouseEvent& event) override
+    {
+        if (event.button() == GUI::MouseButton::Primary && m_new_tab_pressed) {
+            m_new_tab_pressed = false;
+            bool clicked = new_tab_button_rect().contains(event.position());
+            update_tab_bar();
+            if (clicked && on_new_tab_click) {
+                deferred_invoke([this] {
+                    if (on_new_tab_click)
+                        on_new_tab_click();
+                });
+            }
+            return;
+        }
+        GUI::TabWidget::mouseup_event(event);
+    }
+
+    virtual void mousemove_event(GUI::MouseEvent& event) override
+    {
+        bool hovered = new_tab_button_rect().contains(event.position());
+        if (hovered != m_new_tab_hovered) {
+            m_new_tab_hovered = hovered;
+            update_tab_bar();
+        }
+        GUI::TabWidget::mousemove_event(event);
+    }
+
+    virtual void leave_event(Core::Event& event) override
+    {
+        if (m_new_tab_hovered) {
+            m_new_tab_hovered = false;
+            update_tab_bar();
+        }
+        GUI::TabWidget::leave_event(event);
+    }
+
+    virtual void doubleclick_event(GUI::MouseEvent& event) override
+    {
+        if (new_tab_button_rect().contains(event.position()))
+            return;
+        GUI::TabWidget::doubleclick_event(event);
+    }
+
+    bool m_new_tab_hovered { false };
+    bool m_new_tab_pressed { false };
+};
 
 static RefPtr<Gfx::Bitmap const> load_icon(StringView path)
 {
@@ -161,7 +281,11 @@ ErrorOr<void> BrowserWindow::initialize(Vector<InitialTab> initial_tabs, Optiona
     m_devtools_label->set_preferred_width(GUI::SpecialDimension::Grow);
     m_devtools_label->set_text_alignment(Gfx::TextAlignment::CenterLeft);
 
-    m_tab_widget = main_widget->add<GUI::TabWidget>();
+    auto& tab_widget = main_widget->add<BrowserTabWidget>();
+    tab_widget.on_new_tab_click = [this] {
+        add_tab(String {}, true);
+    };
+    m_tab_widget = tab_widget;
     m_tab_widget->set_preferred_size(GUI::SpecialDimension::Grow, GUI::SpecialDimension::Grow);
     m_tab_widget->set_container_margins(GUI::Margins {});
     m_tab_widget->set_uniform_tabs(true);
