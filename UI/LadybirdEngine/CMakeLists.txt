@@ -4,6 +4,8 @@ add_executable(LadybirdEngine
     CertificateInspector.cpp
     EngineApplication.cpp
     EngineServer.cpp
+    EngineServerFrames.cpp
+    EngineServerReports.cpp
     main.cpp
     ../Qt/BookmarkStore.cpp
     ../Qt/SessionHistorySnapshotStorage.cpp

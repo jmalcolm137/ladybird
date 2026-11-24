@@ -56,6 +56,8 @@ SOURCES := \
 	BrowserTab.cpp \
 	BrowserSession.cpp \
 	BrowserWindow.cpp \
+	BrowserWindowBookmarks.cpp \
+	BrowserWindowDialogs.cpp \
 	ClipboardBridge.cpp \
 	DownloadsWindow.cpp \
 	EngineClient.cpp \
