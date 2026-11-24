@@ -7,9 +7,13 @@ This is a port of it to the SerenityOS LibGUI library. It is meant to be part of
 > Ladybird SDE is in a pre-alpha state, and only suitable for use by developers
 >
 
-## Features
+The Ladybird SDE specific code in this repository is in UI/LIbGUI, UI/LadybirdEngine, Shared/, and scipts/
 
-We aim to build a complete, usable browser for the modern web.
+The other directories are inherited from the main Ladybird project.
+
+## Ladybird Features
+
+The aim is to build a complete, usable browser for the modern web.
 
 Ladybird uses a [multi-process architecture](Documentation/ProcessArchitecture.md) with a main UI process,
 WebContent renderer processes, and helper processes for tasks such as networking, image decoding, compositing and media.
