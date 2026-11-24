@@ -3,6 +3,8 @@
 [Ladybird](https://ladybird.org) is a truly independent web browser, using a novel engine based on web standards.
 This is a port of it to the SerenityOS LibGUI library. It is meant to be part of the [Serenity Desktop Environment](https://github.com/jmalcolm137/serenity-desktop-environment)
 
+![Ladybird for SDE displaying ladybird.org](docs/ladybird-sde.png)
+
 > [!IMPORTANT]
 > Ladybird SDE is in a pre-alpha state, and only suitable for use by developers
 >

@@ -162,7 +162,12 @@ void EngineClient::accept_connection(NonnullOwnPtr<Core::LocalSocket> socket)
     }
 
     m_socket = move(socket);
-    m_server = nullptr;
+    // Destroy the listening server after on_accept returns so we do not destroy
+    // m_server->on_accept while it is on the call stack.
+    Core::deferred_invoke([weak_this = make_weak_ptr()] {
+        if (auto* client = weak_this.ptr())
+            client->m_server = nullptr;
+    });
     m_disconnect_scheduled = false;
     m_socket->on_ready_to_read = [this] {
         read_available();
