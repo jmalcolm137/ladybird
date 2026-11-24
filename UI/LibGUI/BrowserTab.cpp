@@ -599,6 +599,9 @@ void BrowserTab::detach()
 
 void BrowserTab::navigate(String const& url)
 {
+    m_inline_completion_active = false;
+    m_inline_base_query = url;
+    m_last_location_text = url;
     hide_autocomplete();
     if (is_attached())
         m_engine.navigate(m_tab_id, url, true);

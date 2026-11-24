@@ -726,7 +726,6 @@ void EngineServer::wire_tab(Tab& tab)
     tab.view->on_load_start = [this, tab_id] {
         if (auto* tab = tab_for_id(tab_id)) {
             send_loading_state(*tab, true);
-            send_url(*tab);
         }
     };
 
