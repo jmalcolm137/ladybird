@@ -72,7 +72,7 @@ ErrorOr<int> serenity_main(Main::Arguments arguments)
         }
         if (argument.starts_with('-'))
             continue;
-        urls.append(String::from_utf8(argument).release_value());
+        urls.append(String::from_utf8_with_replacement_character(argument));
     }
 
     auto created_session = LadybirdSDE::BrowserSession::create(move(urls), private_window, devtools_port);

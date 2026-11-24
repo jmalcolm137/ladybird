@@ -98,8 +98,9 @@ public:
 
     void load_permissions();
 
-    // Called by a BrowserWindow when its native window is closing.
+    // Called by a BrowserWindow when its native window is closing or becomes active.
     void window_will_close(BrowserWindow&);
+    void window_did_activate(BrowserWindow&);
 
 private:
     BrowserSession() = default;
@@ -141,6 +142,7 @@ private:
     OwnPtr<EngineClient> m_engine;
     OwnPtr<ClipboardBridge> m_clipboard;
     Vector<NonnullOwnPtr<BrowserWindow>> m_windows;
+    BrowserWindow* m_active_window { nullptr };
     Vector<ClosedTab> m_closed_tabs;
     u64 m_next_request_id { 1 };
     u64 m_next_window_id { 1 };

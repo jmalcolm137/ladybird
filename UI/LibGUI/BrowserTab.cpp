@@ -523,6 +523,25 @@ BrowserTab::BrowserTab(EngineClient& engine, GUI::Window& window, GUI::Action& b
     update_site_button();
 }
 
+BrowserTab::~BrowserTab()
+{
+    if (m_autocomplete_timer)
+        m_autocomplete_timer->stop();
+    if (m_autocomplete_hide_timer)
+        m_autocomplete_hide_timer->stop();
+    auto close_aux_window = [](RefPtr<GUI::Window>& aux) {
+        if (!aux)
+            return;
+        aux->on_close = {};
+        aux->hide();
+        aux->close();
+        aux.clear();
+    };
+    close_aux_window(m_certificate_window);
+    close_aux_window(m_compat_report_window);
+    close_aux_window(m_compat_report_diagnostics_window);
+}
+
 StringView BrowserTab::button_name(GUI::MouseButton button)
 {
     switch (button) {
@@ -652,12 +671,12 @@ void BrowserTab::show_find_bar()
 
 void BrowserTab::hide_find_bar()
 {
+    m_find_bar->set_visible(false);
     if (auto* parent = m_find_bar->parent_widget())
         parent->invalidate_layout();
     m_root->do_layout();
     if (auto* window = m_root->window())
         window->update();
-    m_find_bar->set_visible(false);
     if (is_attached())
         m_engine.find_in_page(m_tab_id, String {});
     m_web_view->set_focus(true);
@@ -870,8 +889,9 @@ void BrowserTab::update_site_button()
                 if (m_forget_permissions_handler)
                     m_forget_permissions_handler(origin);
                 // Rebuilding the menu while it is being activated destroys the popup out of order.
-                Core::deferred_invoke([this] {
-                    update_site_button();
+                Core::deferred_invoke([weak_this = make_weak_ptr()] {
+                    if (auto* tab = weak_this.ptr())
+                        tab->update_site_button();
                 });
             }));
         }
@@ -1555,19 +1575,30 @@ void BrowserTab::show_context_menu(JsonArray const& items, Gfx::IntPoint view_po
 
 void BrowserTab::show_permission_prompt(StringView name, StringView origin, u64 request_id)
 {
-    auto message = String::formatted("Allow {} for {}?", name, origin).release_value();
-    bool remember = false;
-    auto decision = PermissionPrompt::run(m_root->window(), message, remember);
-    if (!decision.has_value()) {
-        if (is_attached())
-            m_engine.permission_response(m_tab_id, request_id, false);
-        return;
-    }
+    auto name_copy = String::from_utf8_with_replacement_character(name);
+    auto origin_copy = String::from_utf8_with_replacement_character(origin);
+    auto weak_this = make_weak_ptr();
+    Core::deferred_invoke([weak_this, name = move(name_copy), origin = move(origin_copy), request_id]() mutable {
+        auto* tab = weak_this.ptr();
+        if (!tab || !tab->is_attached())
+            return;
+        auto message = String::formatted("Allow {} for {}?", name, origin).release_value();
+        bool remember = false;
+        auto decision = PermissionPrompt::run(tab->m_root->window(), message, remember);
+        tab = weak_this.ptr();
+        if (!tab)
+            return;
+        if (!decision.has_value()) {
+            if (tab->is_attached())
+                tab->m_engine.permission_response(tab->m_tab_id, request_id, false, false);
+            return;
+        }
 
-    if (on_permission_decision)
-        on_permission_decision(String::from_utf8(origin).release_value(), String::from_utf8(name).release_value(), *decision, remember);
-    if (is_attached())
-        m_engine.permission_response(m_tab_id, request_id, *decision);
+        if (tab->on_permission_decision)
+            tab->on_permission_decision(origin, name, *decision, remember);
+        if (tab->is_attached())
+            tab->m_engine.permission_response(tab->m_tab_id, request_id, *decision, remember && !tab->m_private);
+    });
 }
 
 void BrowserTab::start_drag(JsonArray items)
@@ -1649,41 +1680,48 @@ void BrowserTab::run_drag(JsonArray const& items)
 
 void BrowserTab::show_file_picker(bool, JsonArray const& filters)
 {
-    // LibGUI's file picker exposes one path at a time, so a multiple-file
-    // request still opens a single selection. The engine accepts a list, so the
-    // dialog can become multi-select without changing the protocol.
-    Optional<Vector<GUI::FileTypeFilter>> allowed_filters;
-    Vector<GUI::FileTypeFilter> parsed_filters;
+    auto weak_this = make_weak_ptr();
+    Core::deferred_invoke([weak_this, filters]() mutable {
+        auto* tab = weak_this.ptr();
+        if (!tab || !tab->is_attached())
+            return;
+        // LibGUI's file picker exposes one path at a time, so a multiple-file
+        // request still opens a single selection. The engine accepts a list, so the
+        // dialog can become multi-select without changing the protocol.
+        Optional<Vector<GUI::FileTypeFilter>> allowed_filters;
+        Vector<GUI::FileTypeFilter> parsed_filters;
 
-    for (auto const& value : filters.values()) {
-        if (!value.is_string())
-            continue;
-        auto filter = String::from_byte_string(value.as_string()).release_value();
-        auto view = filter.bytes_as_string_view();
-        if (view == "Image files"sv)
-            parsed_filters.append(GUI::FileTypeFilter::image_files());
-        else if (view == "Audio files"sv)
-            parsed_filters.append(GUI::FileTypeFilter::audio_files());
-        else if (view == "Video files"sv || view.starts_with("video/"sv))
-            parsed_filters.append(GUI::FileTypeFilter::video_files());
-        else if (view.starts_with("audio/"sv))
-            parsed_filters.append(GUI::FileTypeFilter::audio_files());
-        else if (view.starts_with("image/"sv))
-            parsed_filters.append(GUI::FileTypeFilter::image_files());
-        else if (view.starts_with("*."sv))
-            parsed_filters.append({ "Files"sv, Vector<ByteString> { filter.bytes_as_string_view().substring_view(2) } });
-    }
-    if (!parsed_filters.is_empty())
-        allowed_filters = move(parsed_filters);
+        for (auto const& value : filters.values()) {
+            if (!value.is_string())
+                continue;
+            auto filter = String::from_utf8_with_replacement_character(value.as_string());
+            auto view = filter.bytes_as_string_view();
+            if (view == "Image files"sv)
+                parsed_filters.append(GUI::FileTypeFilter::image_files());
+            else if (view == "Audio files"sv)
+                parsed_filters.append(GUI::FileTypeFilter::audio_files());
+            else if (view == "Video files"sv || view.starts_with("video/"sv))
+                parsed_filters.append(GUI::FileTypeFilter::video_files());
+            else if (view.starts_with("audio/"sv))
+                parsed_filters.append(GUI::FileTypeFilter::audio_files());
+            else if (view.starts_with("image/"sv))
+                parsed_filters.append(GUI::FileTypeFilter::image_files());
+            else if (view.starts_with("*."sv))
+                parsed_filters.append({ "Files"sv, Vector<ByteString> { filter.bytes_as_string_view().substring_view(2) } });
+        }
+        if (!parsed_filters.is_empty())
+            allowed_filters = move(parsed_filters);
 
-    auto path = GUI::FilePicker::get_open_filepath(m_root->window(), "Select File"sv, Core::StandardPaths::home_directory(), false, GUI::Dialog::ScreenPosition::CenterWithinParent, allowed_filters);
-    if (!is_attached())
-        return;
+        auto path = GUI::FilePicker::get_open_filepath(tab->m_root->window(), "Select File"sv, Core::StandardPaths::home_directory(), false, GUI::Dialog::ScreenPosition::CenterWithinParent, allowed_filters);
+        tab = weak_this.ptr();
+        if (!tab || !tab->is_attached())
+            return;
 
-    if (path.has_value())
-        m_engine.file_picker_response(m_tab_id, String::from_byte_string(path.release_value()).release_value());
-    else
-        m_engine.file_picker_response(m_tab_id, String {});
+        if (path.has_value())
+            tab->m_engine.file_picker_response(tab->m_tab_id, String::from_utf8_with_replacement_character(path.release_value()));
+        else
+            tab->m_engine.file_picker_response(tab->m_tab_id, String {});
+    });
 }
 
 void BrowserTab::request_find()
@@ -1772,26 +1810,41 @@ void BrowserTab::show_select_dropdown(Gfx::IntPoint position, i32 minimum_width,
 
 void BrowserTab::show_dialog(StringView kind, StringView message, StringView default_text)
 {
-    auto& window = *m_root->window();
-    auto text = String::from_utf8(message).release_value();
+    auto kind_copy = String::from_utf8_with_replacement_character(kind);
+    auto text_copy = String::from_utf8_with_replacement_character(message);
+    auto default_copy = String::from_utf8_with_replacement_character(default_text);
+    auto weak_this = make_weak_ptr();
+    Core::deferred_invoke([weak_this, kind = move(kind_copy), text = move(text_copy), default_value = move(default_copy)]() mutable {
+        auto* tab = weak_this.ptr();
+        if (!tab || !tab->is_attached())
+            return;
+        auto* window = tab->m_root->window();
+        if (!window) {
+            tab->m_engine.dialog_response(tab->m_tab_id, kind.bytes_as_string_view(), false);
+            return;
+        }
 
-    if (kind == "alert"sv) {
-        GUI::MessageBox::show(&window, text, "Alert"sv, GUI::MessageBox::Type::Information, GUI::MessageBox::InputType::OK);
-        m_engine.dialog_response(m_tab_id, "alert"sv, true);
-        return;
-    }
+        if (kind == "alert"sv) {
+            GUI::MessageBox::show(window, text, "Alert"sv, GUI::MessageBox::Type::Information, GUI::MessageBox::InputType::OK);
+            if (auto* live = weak_this.ptr(); live && live->is_attached())
+                live->m_engine.dialog_response(live->m_tab_id, "alert"sv, true);
+            return;
+        }
 
-    if (kind == "confirm"sv) {
-        auto result = GUI::MessageBox::show(&window, text, "Confirm"sv, GUI::MessageBox::Type::Question, GUI::MessageBox::InputType::YesNo);
-        m_engine.dialog_response(m_tab_id, "confirm"sv, result == GUI::Dialog::ExecResult::Yes);
-        return;
-    }
+        if (kind == "confirm"sv) {
+            auto result = GUI::MessageBox::show(window, text, "Confirm"sv, GUI::MessageBox::Type::Question, GUI::MessageBox::InputType::YesNo);
+            if (auto* live = weak_this.ptr(); live && live->is_attached())
+                live->m_engine.dialog_response(live->m_tab_id, "confirm"sv, result == GUI::Dialog::ExecResult::Yes);
+            return;
+        }
 
-    if (kind == "prompt"sv) {
-        auto value = String::from_utf8(default_text).release_value();
-        auto result = GUI::InputBox::show(&window, value, text, "Prompt"sv, GUI::InputType::Text);
-        m_engine.dialog_response(m_tab_id, "prompt"sv, result == GUI::Dialog::ExecResult::OK, value);
-    }
+        if (kind == "prompt"sv) {
+            auto value = move(default_value);
+            auto result = GUI::InputBox::show(window, value, text, "Prompt"sv, GUI::InputType::Text);
+            if (auto* live = weak_this.ptr(); live && live->is_attached())
+                live->m_engine.dialog_response(live->m_tab_id, "prompt"sv, result == GUI::Dialog::ExecResult::OK, value);
+        }
+    });
 }
 
 }

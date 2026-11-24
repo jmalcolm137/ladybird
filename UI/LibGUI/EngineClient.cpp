@@ -443,9 +443,7 @@ void EngineClient::flush_writes()
 
         auto written = result.value();
         if (written == 0) {
-            close_socket();
-            if (on_disconnected)
-                on_disconnected();
+            schedule_disconnect();
             return;
         }
         m_write_buffer.remove(0, written);
@@ -1000,13 +998,14 @@ void EngineClient::context_menu_action(u64 tab_id, u64 action)
     send(event);
 }
 
-void EngineClient::permission_response(u64 tab_id, u64 request_id, bool granted)
+void EngineClient::permission_response(u64 tab_id, u64 request_id, bool granted, bool remember)
 {
     JsonObject event;
     event.set("type"sv, "permission_response"sv);
     event.set("tab"sv, tab_id);
     event.set("request"sv, request_id);
     event.set("granted"sv, granted);
+    event.set("remember"sv, remember);
     send(event);
 }
 

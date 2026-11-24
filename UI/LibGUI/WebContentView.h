@@ -71,9 +71,11 @@ private:
     WebContentView();
 
     u64 m_tab_id { 0 };
-    Gfx::Bitmap const* m_frame { nullptr };
+    RefPtr<Gfx::Bitmap const> m_frame;
     u64 m_frame_sequence { 0 };
     bool m_frame_was_painted { false };
+    Gfx::IntSize m_last_logged_frame_size;
+    Gfx::IntSize m_last_logged_widget_size;
     bool m_dragging { false };
     Gfx::IntPoint m_drag_position;
     Gfx::IntPoint m_last_mouse_position;

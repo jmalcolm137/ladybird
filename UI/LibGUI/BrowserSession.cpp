@@ -117,6 +117,9 @@ BrowserSession::~BrowserSession()
 {
     if (m_autosave_timer)
         m_autosave_timer->stop();
+    if (m_session_plan_timeout)
+        m_session_plan_timeout->stop();
+    LibWM::WaylandClient::the().seat().set_text_input_callbacks({}, {}, {});
 
     // Keep a durable reason for the process ending. Without this, a quit and a window that disappeared look the same
     // in the session log; only a SIGKILL or a crash inside the crash handler leaves no line at all.
@@ -370,8 +373,19 @@ BrowserWindow* BrowserSession::create_window_internal(Vector<String> urls, bool 
     return window_pointer;
 }
 
+void BrowserSession::window_did_activate(BrowserWindow& window)
+{
+    m_active_window = &window;
+}
+
 BrowserWindow* BrowserSession::active_window() const
 {
+    if (m_active_window) {
+        for (auto const& window : m_windows) {
+            if (window.ptr() == m_active_window)
+                return m_active_window;
+        }
+    }
     if (m_windows.is_empty())
         return nullptr;
     return m_windows.last().ptr();
@@ -816,6 +830,8 @@ void BrowserSession::window_will_close(BrowserWindow& window)
         note_exit_reason("last window closed"sv);
 
     Core::deferred_invoke([this, &window] {
+        if (m_active_window == &window)
+            m_active_window = nullptr;
         auto window_count = m_windows.size();
         m_windows.remove_first_matching([&](auto const& candidate) {
             return candidate.ptr() == &window;

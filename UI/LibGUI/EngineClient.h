@@ -103,7 +103,7 @@ public:
     void undo(u64 tab_id);
     void redo(u64 tab_id);
     void context_menu_action(u64 tab_id, u64 action);
-    void permission_response(u64 tab_id, u64 request_id, bool granted);
+    void permission_response(u64 tab_id, u64 request_id, bool granted, bool remember = false);
     void file_picker_response(u64 tab_id, String const& path);
     void file_picker_response(u64 tab_id, Vector<String> const& paths);
     void select_dropdown_closed(u64 tab_id, Optional<u32> selected);

@@ -82,6 +82,13 @@ public:
         return view;
     }
 
+    static NonnullOwnPtr<EngineHeadlessWebView> create_child(Core::AnonymousBuffer theme, Web::DevicePixelSize viewport_size, WebView::IsPrivate is_private, WebView::CanonicalTraversable& traversable)
+    {
+        auto view = adopt_own(*new EngineHeadlessWebView(move(theme), viewport_size, is_private));
+        view->initialize_tab(Web::HTML::VisibilityState::Visible, traversable);
+        return view;
+    }
+
 protected:
     EngineHeadlessWebView(Core::AnonymousBuffer theme, Web::DevicePixelSize viewport_size, WebView::IsPrivate is_private)
         : HeadlessWebView(move(theme), viewport_size, is_private)
@@ -125,6 +132,11 @@ EngineServer::~EngineServer()
         m_write_notifier->close();
         m_write_notifier.clear();
     }
+    for (auto& [id, request] : m_certificate_requests) {
+        if (request)
+            request->stop();
+    }
+    m_certificate_requests.clear();
     for (auto& [id, tab] : m_tabs) {
         destroy_frame_buffer(*tab);
         auto favicon_path = ByteString::formatted("{}/favicon-{}.png", m_frame_directory, id);
@@ -638,7 +650,7 @@ EngineServer::Tab& EngineServer::create_tab(Gfx::IntSize viewport_size, bool is_
 EngineServer::Tab& EngineServer::create_child_tab(Tab& parent, WebView::CanonicalTraversable& traversable)
 {
     auto id = m_next_tab_id++;
-    auto view = WebView::HeadlessWebView::create_child(*parent.view, traversable);
+    auto view = EngineHeadlessWebView::create_child(m_theme, parent.viewport_size.to_type<Web::DevicePixels>(), parent.view->is_private(), traversable);
 
     m_tabs.set(id, make<Tab>(id, 0, move(view), parent.viewport_size));
     auto& tab_ref = *m_tabs.find(id)->value;
@@ -933,6 +945,9 @@ void EngineServer::wire_tab(Tab& tab)
 
 void EngineServer::destroy_tab(u64 tab_id)
 {
+    if (auto pending_cert = m_certificate_requests.take(tab_id); pending_cert.has_value() && *pending_cert)
+        (*pending_cert)->stop();
+
     auto tab = m_tabs.take(tab_id);
     if (!tab.has_value())
         return;
@@ -1428,6 +1443,7 @@ void EngineServer::handle_dialog_response(u64 tab_id, JsonObject const& command)
     auto kind = command.get_string("kind"sv);
     auto kind_name = kind.has_value() ? kind->bytes_as_string_view() : ""sv;
     auto accepted = command.get_bool("accept"sv).value_or(true);
+    tab->pending_dialog_kind.clear();
 
     if (kind_name == "alert"sv) {
         tab->view->alert_closed();
@@ -1460,6 +1476,15 @@ void EngineServer::handle_close_tab(u64 tab_id)
     }
 
     tab->closing = true;
+    if (tab->pending_dialog_kind.has_value()) {
+        auto kind = tab->pending_dialog_kind.release_value();
+        if (kind == "alert"sv)
+            tab->view->alert_closed();
+        else if (kind == "confirm"sv)
+            tab->view->confirm_closed(false);
+        else if (kind == "prompt"sv)
+            tab->view->prompt_closed({});
+    }
     tab->view->request_close();
 }
 
@@ -2188,7 +2213,7 @@ void EngineServer::handle_certificate_info(u64 tab_id, JsonObject const&)
     if (auto previous = m_certificate_requests.take(tab_id); previous.has_value())
         (*previous)->stop();
 
-    auto client = WebView::Application::request_server_client();
+    auto client = WebView::Application::request_server_client(tab->view->is_private());
     if (client.is_error()) {
         send_certificate_error(tab_id, "Could not connect to RequestServer."_string);
         return;
@@ -3285,6 +3310,7 @@ void EngineServer::send_history_state(Tab& tab)
 
 void EngineServer::send_dialog(Tab& tab, StringView kind, StringView message, StringView default_text)
 {
+    tab.pending_dialog_kind = String::from_utf8_with_replacement_character(kind);
     JsonObject event;
     event.set("type"sv, "dialog"sv);
     event.set("tab"sv, tab.id);
@@ -3628,8 +3654,10 @@ void EngineServer::handle_permission_response(u64 tab_id, JsonObject const& comm
 
     auto pending = tab->pending_permissions.take(*request_id);
     if (pending.has_value()) {
-        auto outcome = command.get_bool("granted"sv).value_or(false)
-            ? Web::Permissions::PromptOutcome::AllowAlways
+        auto granted = command.get_bool("granted"sv).value_or(false);
+        auto remember = command.get_bool("remember"sv).value_or(false);
+        auto outcome = granted
+            ? (remember ? Web::Permissions::PromptOutcome::AllowAlways : Web::Permissions::PromptOutcome::AllowOnce)
             : Web::Permissions::PromptOutcome::Block;
         pending->callback(outcome);
     }

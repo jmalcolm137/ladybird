@@ -131,6 +131,7 @@ private:
         Vector<FrameDamage> frame_damage_history;
         bool focused { false };
         bool closing { false };
+        Optional<String> pending_dialog_kind;
         Optional<String> pending_navigation;
         bool pending_navigation_user_input { true };
         Vector<ContextMenuAction> context_menu_actions;

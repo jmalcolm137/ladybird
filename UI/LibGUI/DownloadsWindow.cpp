@@ -158,7 +158,7 @@ JsonArray DownloadsWindow::rows() const
         auto const& download = *download_pointer;
         LexicalPath destination { download.destination.bytes_as_string_view() };
         auto basename = destination.basename();
-        auto name = basename.is_empty() ? download.url : String::from_utf8(basename).release_value();
+        auto name = basename.is_empty() ? download.url : String::from_utf8_with_replacement_character(basename);
 
         auto status = download.status;
         if (status == "in_progress"sv)

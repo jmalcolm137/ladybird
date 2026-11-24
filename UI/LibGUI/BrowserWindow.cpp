@@ -116,7 +116,31 @@ BrowserWindow::BrowserWindow(BrowserSession& session, EngineClient& engine, u64 
 {
 }
 
-BrowserWindow::~BrowserWindow() = default;
+BrowserWindow::~BrowserWindow()
+{
+    if (m_process_timer)
+        m_process_timer->stop();
+    if (m_history_refresh_timer)
+        m_history_refresh_timer->stop();
+    m_pending_session_tab_requests.clear();
+
+    auto close_aux_window = [](RefPtr<GUI::Window>& aux) {
+        if (!aux)
+            return;
+        aux->on_close = {};
+        aux->hide();
+        aux->close();
+        aux.clear();
+    };
+    close_aux_window(m_history_results_window);
+    close_aux_window(m_bookmarks_window);
+    close_aux_window(m_crash_prompt_window);
+    close_aux_window(m_crash_report_window);
+    close_aux_window(m_crash_report_text_window);
+    close_aux_window(m_process_window);
+    m_downloads_window.clear();
+    m_permissions_window.clear();
+}
 
 ByteString BrowserWindow::string_for_key(JsonObject const& object, StringView key)
 {
@@ -199,6 +223,11 @@ ErrorOr<void> BrowserWindow::initialize(Vector<InitialTab> initial_tabs, Optiona
 
     m_window->on_close = [this] {
         m_session.window_will_close(*this);
+    };
+
+    m_window->on_active_window_change = [this](bool is_active) {
+        if (is_active)
+            m_session.window_did_activate(*this);
     };
 
     create_initial_tabs(initial_tabs, active_tab, lazy_load);
@@ -800,6 +829,10 @@ void BrowserWindow::remove_tab(BrowserTab& tab)
     auto root = tab.root();
     tab.detach();
 
+    m_pending_session_tab_requests.remove_all_matching([tab_pointer](auto const&, auto* candidate) {
+        return candidate == tab_pointer;
+    });
+
     m_tabs.remove_first_matching([tab_pointer](auto const& candidate) {
         return candidate.ptr() == tab_pointer;
     });
@@ -1176,7 +1209,7 @@ void BrowserWindow::handle_engine_tab_event(JsonObject const& event, u64 tab_id)
         bool remembered_decision = false;
         if (!m_private && m_session.remembered_permission(origin, name, remembered_decision)) {
             if (tab->is_attached())
-                m_engine->permission_response(tab->tab_id(), request_id, remembered_decision);
+                m_engine->permission_response(tab->tab_id(), request_id, remembered_decision, true);
         } else {
             tab->show_permission_prompt(name, origin, request_id);
         }
@@ -1926,6 +1959,7 @@ void BrowserWindow::update_processes(JsonObject const& event)
             auto cpu_text = String::formatted("{:.1f}%", cpu).release_value();
             auto memory_text = format_memory(memory);
             JsonObject row;
+            row.set("type"sv, type.bytes_as_string_view());
             row.set("name"sv, name.bytes_as_string_view());
             row.set("pid"sv, object.get_u64("pid"sv).value_or(0));
             row.set("cpu"sv, cpu_text.bytes_as_string_view());
@@ -2471,16 +2505,18 @@ void BrowserWindow::show_bookmark_dialog(bool edit_current)
     if (title.is_empty())
         title = url;
 
+    auto tab_id = tab->tab_id();
+    auto weak_this = make_weak_ptr();
     auto result = GUI::InputBox::show(m_window, title, edit_current ? "Edit bookmark title"sv : "Bookmark title"sv, edit_current ? "Edit Bookmark"sv : "Add Bookmark"sv, GUI::InputType::Text);
-    if (result != GUI::Dialog::ExecResult::OK)
+    if (!weak_this || result != GUI::Dialog::ExecResult::OK)
         return;
     if (title.is_empty())
         title = url;
 
     if (edit_current)
-        m_engine->edit_bookmark(tab->tab_id(), id, url, title);
+        m_engine->edit_bookmark(tab_id, id, url, title);
     else
-        m_engine->add_bookmark(tab->tab_id(), url, title);
+        m_engine->add_bookmark(tab_id, url, title);
 }
 
 void BrowserWindow::close_other_tabs(BrowserTab& keep)

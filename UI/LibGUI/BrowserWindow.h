@@ -15,6 +15,7 @@
 #include <AK/HashMap.h>
 #include <AK/NonnullOwnPtr.h>
 #include <AK/Vector.h>
+#include <AK/Weakable.h>
 #include <LibGUI/Action.h>
 #include <LibGUI/Forward.h>
 #include <LibGUI/TabWidget.h>
@@ -25,7 +26,7 @@ namespace LadybirdSDE {
 
 class BrowserSession;
 
-class BrowserWindow {
+class BrowserWindow : public Weakable<BrowserWindow> {
     AK_MAKE_NONCOPYABLE(BrowserWindow);
 
 public:

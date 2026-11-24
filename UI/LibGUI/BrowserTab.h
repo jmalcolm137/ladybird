@@ -54,7 +54,7 @@ class BrowserTab : public Weakable<BrowserTab> {
 
 public:
     BrowserTab(EngineClient&, GUI::Window&, GUI::Action& back_action, GUI::Action& forward_action, GUI::Action& reload_action, GUI::Action& stop_action, GUI::Action& bookmark_action, GUI::Action& home_action, GUI::Action& new_tab_action, GUI::Action& downloads_action);
-    ~BrowserTab() = default;
+    ~BrowserTab();
 
     NonnullRefPtr<GUI::Widget> root() const { return m_root; }
     WebContentView& web_view() const { return *m_web_view; }
