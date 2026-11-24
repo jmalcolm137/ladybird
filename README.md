@@ -9,6 +9,8 @@ This is a port of it to the SerenityOS LibGUI library. It is meant to be part of
 
 The Ladybird SDE specific code in this repository is in UI/LIbGUI, UI/LadybirdEngine, Shared/, and scipts/
 
+You can build it with scripts/build.sh
+
 The other directories are inherited from the main Ladybird project.
 
 ## Ladybird Features
@@ -36,7 +38,7 @@ At the moment, many core library support components are inherited from SerenityO
 - LibCore: Event loop, OS abstraction layer
 - LibIPC: Inter-process communication
 
-## How do I build and run this?
+## How do I build and run the real Ladybird?
 
 See [build instructions](Documentation/BuildInstructionsLadybird.md) for information on how to build Ladybird.
 
