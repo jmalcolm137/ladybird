@@ -5,6 +5,7 @@
  */
 
 #include "BrowserTab.h"
+#include "ChromeUtils.h"
 
 #include <WaylandClient.h>
 #include <WaylandSeat.h>
@@ -177,20 +178,6 @@ struct SiteIdentity {
     String host;
     String origin;
 };
-
-static String escape_menu_ampersands(StringView text)
-{
-    if (!text.contains('&'))
-        return String::from_utf8_with_replacement_character(text);
-    StringBuilder builder;
-    for (char ch : text) {
-        if (ch == '&')
-            builder.append("&&"sv);
-        else
-            builder.append(ch);
-    }
-    return MUST(builder.to_string());
-}
 
 static String truncate_dialog_text(StringView text, size_t max_bytes)
 {

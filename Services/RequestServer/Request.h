@@ -28,7 +28,6 @@
 #include <LibHTTP/NetworkIsolationKey.h>
 #include <LibHTTP/Proxy.h>
 #include <LibIPC/File.h>
-#include <LibRequests/CertificateInfo.h>
 #include <LibRequests/ExportedRequest.h>
 #include <LibRequests/NetworkError.h>
 #include <LibRequests/RequestTimingInfo.h>
@@ -66,8 +65,7 @@ public:
         HTTP::Cookie::SameSiteContext,
         Optional<Requests::RequestTransferLeaseKey>,
         Optional<u32> address_selection_hint,
-        bool notify_on_cache_miss,
-        bool force_fresh_connection = false);
+        bool notify_on_cache_miss);
 
     static NonnullOwnPtr<Request> connect(
         u64 request_id,
@@ -276,7 +274,6 @@ private:
     void request_response_storage(ControlConnectionFromClient&);
     void handle_fetch_complete(int result_code);
     void send_headers_to_client();
-    Optional<Requests::CertificateInfo> certificate_info();
     ErrorOr<void> write_queued_bytes_without_blocking();
     void write_to_disk_cache(ReadonlyBytes);
 
@@ -341,12 +338,9 @@ private:
     bool m_curl_easy_handle_is_in_multi { false };
     Vector<curl_slist*> m_curl_string_lists;
 
-    Optional<Requests::CertificateInfo> m_certificate_info;
-
     RefPtr<AIACollector> m_aia_collector;
     size_t m_aia_fetch_count { 0 };
     bool m_notify_on_cache_miss { false };
-    bool m_force_fresh_connection { false };
     bool m_informed_client_requires_network { false };
     bool m_informed_client_request_started { false };
     bool m_cache_entry_was_revalidated { false };

@@ -17,7 +17,6 @@
 #include <LibWebCommon/HTML/CrossProcessId.h>
 #include <LibWebCommon/Page/PageId.h>
 #include <LibWebView/BrowsingSession.h>
-#include <LibWebView/ChildIdentity.h>
 #include <LibWebView/Forward.h>
 #include <LibWebView/WebContentClient.h>
 #include <RequestServer/SiteBinding.h>
@@ -57,7 +56,7 @@ WEBVIEW_API void shut_down_video_decoder_servers();
 // The features are the Compositor's own, in the text form of PlatformFeatures::ProcessFeatures.
 WEBVIEW_API ErrorOr<NonnullRefPtr<WebView::CompositorClient>> launch_compositor_process(ByteString const& platform_features);
 // Serves the given site's partitions, or all partitions if site is empty.
-WEBVIEW_API ErrorOr<NonnullRefPtr<Requests::RequestControlClient>> launch_request_server_process(ByteString const& cache_path, Optional<Utf16String> const& site, IsPrivate, HTTPDiskCacheMode, ChildIdentity* identity = nullptr);
+WEBVIEW_API ErrorOr<NonnullRefPtr<Requests::RequestControlClient>> launch_request_server_process(ByteString const& cache_path, Optional<Utf16String> const& site, IsPrivate, HTTPDiskCacheMode);
 WEBVIEW_API void apply_dns_settings(Requests::RequestControlClient&);
 
 // Launches an ImageDecoder, which is listed with the given site, or with the given process if it serves no site.

@@ -6,6 +6,8 @@
 
 #pragma once
 
+#include "CertificateInspector.h"
+
 #include <AK/ByteBuffer.h>
 #include <AK/ByteString.h>
 #include <AK/Function.h>
@@ -17,14 +19,13 @@
 #include <AK/String.h>
 #include <AK/Time.h>
 #include <AK/Vector.h>
+#include <AK/Weakable.h>
 #include <LibCore/AnonymousBuffer.h>
 #include <LibCore/Forward.h>
 #include <LibGfx/Cursor.h>
 #include <LibGfx/Forward.h>
 #include <LibGfx/Rect.h>
 #include <LibGfx/Size.h>
-#include <LibRequests/CertificateInfo.h>
-#include <LibRequests/Forward.h>
 #include <LibURL/Origin.h>
 #include <LibURL/URL.h>
 #include <LibWebCommon/HTML/FileFilter.h>
@@ -44,7 +45,9 @@ namespace LadybirdSDE {
 // One engine host per LibGUI frontend process. The host owns the views; the
 // chrome owns the windows and tabs. The mapping is by id, and every event names
 // the tab it belongs to.
-class EngineServer : private WebView::FileDownloaderObserver {
+class EngineServer
+    : public Weakable<EngineServer>
+    , private WebView::FileDownloaderObserver {
     AK_MAKE_NONCOPYABLE(EngineServer);
     AK_ALLOC_WITH_KMALLOC;
 
@@ -218,7 +221,7 @@ private:
     void handle_compat_report_retry(u64 tab_id);
     void handle_compat_report_cancel(u64 tab_id);
     void handle_compat_report_close(u64 tab_id);
-    void send_certificate_info(u64 tab_id, Requests::CertificateInfo const&);
+    void send_certificate_info(u64 tab_id, CertificateDetails const&);
     void send_certificate_error(u64 tab_id, String const&);
     void handle_frame_ack(u64 tab_id, JsonObject const&);
     void note_user_input(Tab&);
@@ -308,7 +311,8 @@ private:
     u64 m_focused_tab_id { 0 };
     HashMap<u64, u64> m_window_active_tabs;
     HashMap<u64, Ladybird::SessionWindowId> m_session_windows;
-    HashMap<u64, RefPtr<Requests::Request>> m_certificate_requests;
+    HashMap<u64, u64> m_certificate_request_generations;
+    u64 m_next_certificate_generation { 1 };
     u64 m_next_frame_buffer_id { 1 };
     u64 m_next_permission_id { 1 };
     bool m_quitting { false };

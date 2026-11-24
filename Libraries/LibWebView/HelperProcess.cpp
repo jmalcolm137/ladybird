@@ -596,7 +596,7 @@ void apply_dns_settings(Requests::RequestControlClient& client)
         });
 }
 
-ErrorOr<NonnullRefPtr<Requests::RequestControlClient>> launch_request_server_process(ByteString const& cache_path, Optional<Utf16String> const& site, IsPrivate is_private, HTTPDiskCacheMode http_disk_cache_mode, ChildIdentity* identity)
+ErrorOr<NonnullRefPtr<Requests::RequestControlClient>> launch_request_server_process(ByteString const& cache_path, Optional<Utf16String> const& site, IsPrivate is_private, HTTPDiskCacheMode http_disk_cache_mode)
 {
     auto const& browser_options = Application::browser_options();
     auto const& request_server_options = Application::request_server_options();
@@ -642,15 +642,13 @@ ErrorOr<NonnullRefPtr<Requests::RequestControlClient>> launch_request_server_pro
         arguments.append("--test-mode"sv);
 
     RefPtr<Requests::RequestControlClient> client;
-    auto child_identity = TRY(launch_helper_process("RequestServer"sv, move(arguments), is_private, [&](Core::ProcessSpawnOptions const& options, bool capture_output) -> ErrorOr<Process> {
+    TRY(launch_helper_process("RequestServer"sv, move(arguments), is_private, [&](Core::ProcessSpawnOptions const& options, bool capture_output) -> ErrorOr<Process> {
         auto [process, new_client] = TRY(Process::spawn<Requests::RequestControlClient>(ProcessType::RequestServer, options, capture_output));
         if (site.has_value())
             process.set_site_url(URL::Parser::basic_parse(*site));
         client = move(new_client);
         return move(process);
     }));
-    if (identity)
-        *identity = child_identity;
 
     client->async_set_disk_cache_settings(Application::settings().disk_cache_settings());
     client->async_set_proxy_configuration(request_server_options.proxy_configuration);

@@ -1,6 +1,7 @@
 # The Ladybird engine host used by the LibGUI frontend. It is a normal Ladybird
 # UI process without a native window: a LibGUI process drives it over a socket.
 add_executable(LadybirdEngine
+    CertificateInspector.cpp
     EngineApplication.cpp
     EngineServer.cpp
     main.cpp

@@ -5,6 +5,7 @@
  */
 
 #include "EngineClient.h"
+#include "ChromeUtils.h"
 
 #include <AK/Array.h>
 #include <AK/Checked.h>
@@ -38,17 +39,6 @@ static constexpr size_t max_ipc_buffer_bytes = 64 * MiB;
 static constexpr i64 max_frame_dimension = 16384;
 static constexpr i64 max_frame_slots = 8;
 static constexpr size_t max_frame_mapping_bytes = 256 * MiB;
-
-static ByteString sanitized_profile_name()
-{
-    auto profile = Core::Environment::get("LADYBIRD_SDE_PROFILE"sv);
-    if (!profile.has_value() || profile->is_empty())
-        return "libgui";
-    auto view = *profile;
-    if (view == "."sv || view == ".."sv || view.contains('/') || view.contains('\0'))
-        return "libgui";
-    return view.to_byte_string();
-}
 
 EngineClient::EngineClient(ByteString runtime_directory, ByteString socket_path)
     : m_runtime_directory(move(runtime_directory))

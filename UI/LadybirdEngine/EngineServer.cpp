@@ -140,11 +140,7 @@ EngineServer::~EngineServer()
         m_write_notifier->close();
         m_write_notifier.clear();
     }
-    for (auto& [id, request] : m_certificate_requests) {
-        if (request)
-            request->stop();
-    }
-    m_certificate_requests.clear();
+    m_certificate_request_generations.clear();
     for (auto& [id, tab] : m_tabs) {
         destroy_frame_buffer(*tab);
         auto favicon_path = ByteString::formatted("{}/favicon-{}.png", m_frame_directory, id);
@@ -971,8 +967,7 @@ void EngineServer::wire_tab(Tab& tab)
 
 void EngineServer::destroy_tab(u64 tab_id)
 {
-    if (auto pending_cert = m_certificate_requests.take(tab_id); pending_cert.has_value() && *pending_cert)
-        (*pending_cert)->stop();
+    m_certificate_request_generations.remove(tab_id);
 
     auto tab = m_tabs.take(tab_id);
     if (!tab.has_value())
@@ -2275,81 +2270,27 @@ void EngineServer::handle_certificate_info(u64 tab_id, JsonObject const&)
         return;
     }
 
-    // A fresh HEAD request runs through the same RequestServer and TLS stack as the page, so the certificate we report
-    // is the one this profile would actually negotiate. Any previous lookup for the tab is cancelled first.
-    if (auto previous = m_certificate_requests.take(tab_id); previous.has_value())
-        (*previous)->stop();
+    auto generation = m_next_certificate_generation++;
+    m_certificate_request_generations.set(tab_id, generation);
 
-    auto client = WebView::Application::request_server_client(tab->view->is_private());
-    if (client.is_error()) {
-        send_certificate_error(tab_id, "Could not connect to RequestServer."_string);
-        return;
-    }
+    auto weak_this = make_weak_ptr();
+    inspect_certificate_async(url, [weak_this, tab_id, generation](CertificateInspectionResult result) {
+        auto* server = weak_this.ptr();
+        if (!server)
+            return;
+        auto current = server->m_certificate_request_generations.get(tab_id);
+        if (!current.has_value() || *current != generation)
+            return;
+        server->m_certificate_request_generations.remove(tab_id);
 
-    auto request = client.value()->start_request(
-        "HEAD"sv,
-        url,
-        HTTP::Cookie::SameSiteContext::same_site(),
-        {},
-        {},
-        HTTP::CacheMode::NoStore,
-        HTTP::Cookie::IncludeCredentials::No,
-        Requests::RequestClient::TransferLease::No,
-        0u,
-        Requests::RequestClient::CacheMissNotification::No,
-        0u,
-        {},
-        true);
-    if (!request) {
-        send_certificate_error(tab_id, "Could not start the certificate request."_string);
-        return;
-    }
-
-    WeakPtr<Requests::Request> weak_request = request->make_weak_ptr();
-    m_certificate_requests.set(tab_id, *request);
-
-    request->set_unbuffered_request_callbacks(
-        [this, tab_id, weak_request](auto&&, auto&&, auto&&, auto&&) {
-            auto request = weak_request.strong_ref();
-            if (!request)
-                return;
-
-            // A reused TLS connection may only expose the certificate after the transfer completes; the finish
-            // callback below retries in that case.
-            auto info = request->certificate_info();
-            if (!info.has_value())
-                return;
-
-            send_certificate_info(tab_id, *info);
-            m_certificate_requests.remove(tab_id);
-            Core::deferred_invoke([request = request.release_nonnull()]() mutable {
-                request->stop();
-            });
-        },
-        [](Requests::ResponseData) {},
-        [](Core::ImmutableBytes) {},
-        [this, tab_id, weak_request](u64, Requests::RequestTimingInfo const&, Optional<Requests::NetworkError> const& network_error) {
-            if (!m_certificate_requests.contains(tab_id))
-                return;
-            auto request = weak_request.strong_ref();
-
-            if (request) {
-                if (auto info = request->certificate_info(); info.has_value()) {
-                    send_certificate_info(tab_id, *info);
-                    m_certificate_requests.remove(tab_id);
-                    return;
-                }
-            }
-
-            if (network_error.has_value())
-                send_certificate_error(tab_id, String::formatted("Could not reach the site ({}).", Requests::network_error_to_string(*network_error)).release_value());
-            else
-                send_certificate_error(tab_id, "The server did not present a certificate."_string);
-            m_certificate_requests.remove(tab_id);
-        });
+        if (result.details.has_value())
+            server->send_certificate_info(tab_id, *result.details);
+        else
+            server->send_certificate_error(tab_id, result.error.is_empty() ? "The server did not present a certificate."_string : result.error);
+    });
 }
 
-void EngineServer::send_certificate_info(u64 tab_id, Requests::CertificateInfo const& info)
+void EngineServer::send_certificate_info(u64 tab_id, CertificateDetails const& info)
 {
     JsonObject event;
     event.set("type"sv, "certificate_info"sv);
@@ -3159,7 +3100,14 @@ void EngineServer::check_resolver_files()
         return;
 
     warnln("LadybirdEngine: resolver configuration changed; restarting RequestServers");
-    WebView::RequestServerManager::the().restart_all_for_resolver_change();
+    auto& process_manager = WebView::Application::process_manager();
+    Vector<u64> request_server_ids;
+    process_manager.for_each_process([&](WebView::Process& process) {
+        if (process.type() == WebView::ProcessType::RequestServer)
+            request_server_ids.append(process.child_id());
+    });
+    for (auto child_id : request_server_ids)
+        (void)process_manager.terminate_child(child_id, Core::Process::TerminationMode::Forceful);
 }
 
 void EngineServer::ensure_maintenance_timer_running()

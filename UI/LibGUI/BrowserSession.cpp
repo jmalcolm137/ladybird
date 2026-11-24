@@ -5,6 +5,7 @@
  */
 
 #include "BrowserSession.h"
+#include "ChromeUtils.h"
 
 #include "BrowserWindow.h"
 #include "ClipboardBridge.h"
@@ -540,17 +541,6 @@ void BrowserSession::clear_all_permissions()
         return;
     m_permissions.clear();
     save_permissions();
-}
-
-static ByteString sanitized_profile_name()
-{
-    auto profile = Core::Environment::get("LADYBIRD_SDE_PROFILE"sv);
-    if (!profile.has_value() || profile->is_empty())
-        return "libgui";
-    auto view = *profile;
-    if (view == "."sv || view == ".."sv || view.contains('/') || view.contains('\0'))
-        return "libgui";
-    return view.to_byte_string();
 }
 
 ByteString BrowserSession::permissions_path() const

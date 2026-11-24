@@ -18,7 +18,6 @@
 #include <LibCore/Notifier.h>
 #include <LibHTTP/HeaderList.h>
 #include <LibRequests/CacheState.h>
-#include <LibRequests/CertificateInfo.h>
 #include <LibRequests/NetworkError.h>
 #include <LibRequests/RequestTimingInfo.h>
 #include <LibRequests/RequestTransferLease.h>
@@ -113,11 +112,6 @@ public:
     // Whether RequestServer has reported the request finished. Its response body may still be undelivered; e.g. while
     // body delivery is paused.
     [[nodiscard]] bool is_finished() const { return m_finished; }
-    [[nodiscard]] Optional<CertificateInfo> const& certificate_info() const { return m_certificate_info; }
-
-    // Invoked just before the headers callback when RequestServer saw a TLS certificate for the request. Cache hits
-    // have no certificate to report.
-    Function<void(CertificateInfo const&)> on_certificate_info;
 
     using BufferedRequestFinished = Function<void(u64 total_size, RequestTimingInfo const& timing_info, Optional<NetworkError> const& network_error, NonnullRefPtr<HTTP::HeaderList> response_headers, Optional<u32> response_code, Optional<String> reason_phrase, CacheState cache_state, Core::ImmutableBytes payload)>;
 
@@ -148,7 +142,6 @@ public:
     Function<void(TeardownReason)> on_teardown;
 
     void did_finish(Badge<RequestClient>, u64 total_size, RequestTimingInfo const& timing_info, Optional<NetworkError> const& network_error);
-    void did_receive_certificate_info(Badge<RequestClient>, CertificateInfo);
     void did_receive_headers(Badge<RequestClient>, URL::URL url, NonnullRefPtr<HTTP::HeaderList> response_headers, Optional<u32> response_code, Optional<String> const& reason_phrase, CacheState cache_state, ByteString http_version);
     void did_transfer(Badge<RequestClient>);
 
@@ -227,7 +220,6 @@ private:
     bool m_body_delivery_paused { false };
     bool m_finished { false };
     ByteString m_http_version;
-    Optional<CertificateInfo> m_certificate_info;
     Optional<URL::URL> m_response_url;
 };
 
