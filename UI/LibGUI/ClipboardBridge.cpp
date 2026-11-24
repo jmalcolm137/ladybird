@@ -16,6 +16,9 @@
 
 namespace LadybirdSDE {
 
+static constexpr size_t max_clipboard_representation_bytes = 2 * 1024 * 1024;
+static constexpr size_t max_clipboard_total_bytes = 2560 * 1024;
+
 static bool is_textual_mime(String const& name)
 {
     auto view = name.bytes_as_string_view();
@@ -26,9 +29,11 @@ static bool is_textual_mime(String const& name)
         || view == "image/svg+xml"sv;
 }
 
-static void append_representation(JsonArray& items, ByteString const& mime_type, ReadonlyBytes data)
+static void append_representation(JsonArray& items, ByteString const& mime_type, ReadonlyBytes data, size_t& total_bytes)
 {
-    if (data.is_empty())
+    if (data.is_empty() || data.size() > max_clipboard_representation_bytes)
+        return;
+    if (total_bytes + data.size() > max_clipboard_total_bytes)
         return;
 
     auto name = String::from_utf8(mime_type.view());
@@ -43,6 +48,7 @@ static void append_representation(JsonArray& items, ByteString const& mime_type,
             object.set("name"sv, name.value().bytes_as_string_view());
             object.set("data"sv, text_string.bytes_as_string_view());
             items.must_append(move(object));
+            total_bytes += data.size();
             return;
         }
     }
@@ -52,11 +58,14 @@ static void append_representation(JsonArray& items, ByteString const& mime_type,
         return;
 
     auto encoded_string = encoded.release_value();
+    if (total_bytes + encoded_string.bytes_as_string_view().length() > max_clipboard_total_bytes)
+        return;
     JsonObject object;
     object.set("name"sv, name.value().bytes_as_string_view());
     object.set("data"sv, encoded_string.bytes_as_string_view());
     object.set("encoding"sv, "base64"sv);
     items.must_append(move(object));
+    total_bytes += encoded_string.bytes_as_string_view().length();
 }
 
 ClipboardBridge::ClipboardBridge(EngineClient& engine)
@@ -79,6 +88,7 @@ void ClipboardBridge::start()
 JsonArray ClipboardBridge::items_from_clipboard() const
 {
     JsonArray items;
+    size_t total_bytes = 0;
 
     for (auto const& entry : GUI::Clipboard::the().fetch_entries()) {
         if (entry.data.is_empty())
@@ -96,11 +106,11 @@ JsonArray ClipboardBridge::items_from_clipboard() const
             if (png.is_error())
                 continue;
 
-            append_representation(items, "image/png"sv, png.value().bytes());
+            append_representation(items, "image/png"sv, png.value().bytes(), total_bytes);
             continue;
         }
 
-        append_representation(items, entry.mime_type, entry.data.bytes());
+        append_representation(items, entry.mime_type, entry.data.bytes(), total_bytes);
     }
 
     return items;
@@ -108,17 +118,31 @@ JsonArray ClipboardBridge::items_from_clipboard() const
 
 void ClipboardBridge::send_current_clipboard()
 {
+    m_dirty = false;
     m_engine.set_clipboard_items(items_from_clipboard());
+}
+
+void ClipboardBridge::sync_if_dirty()
+{
+    if (!m_dirty)
+        return;
+    send_current_clipboard();
 }
 
 JsonArray ClipboardBridge::items_for_paste()
 {
+    m_dirty = false;
     return items_from_clipboard();
 }
 
 void ClipboardBridge::on_clipboard_change()
 {
-    m_engine.set_clipboard_items(items_from_clipboard());
+    if (m_applying_engine_clipboard)
+        return;
+    // Defer encoding and sending the desktop clipboard until a browser window
+    // is active or the user pastes, avoiding background PNG/base64 churn and
+    // preventing huge copies in other apps from hitting the engine socket.
+    m_dirty = true;
 }
 
 void ClipboardBridge::apply_engine_clipboard(JsonObject const& event)
@@ -155,13 +179,16 @@ void ClipboardBridge::apply_engine_clipboard(JsonObject const& event)
             payload = copied.release_value();
         }
 
-        if (payload.is_empty())
+        if (payload.is_empty() || payload.size() > max_clipboard_representation_bytes)
             continue;
 
         entries.append({ move(payload), name_value->as_string(), {} });
     }
 
+    m_applying_engine_clipboard = true;
+    m_dirty = false;
     GUI::Clipboard::the().set_entries(move(entries));
+    m_applying_engine_clipboard = false;
 }
 
 }

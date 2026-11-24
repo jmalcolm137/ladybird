@@ -29,6 +29,7 @@ public:
 
     void start();
     void send_current_clipboard();
+    void sync_if_dirty();
     JsonArray items_for_paste();
     void apply_engine_clipboard(JsonObject const& event);
 
@@ -37,6 +38,8 @@ private:
     void on_clipboard_change();
 
     EngineClient& m_engine;
+    bool m_applying_engine_clipboard { false };
+    bool m_dirty { false };
 };
 
 }

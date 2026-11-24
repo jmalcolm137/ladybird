@@ -112,7 +112,7 @@ private:
         size_t frame_mapping_size { 0 };
         size_t frame_slot_size { 0 };
         Gfx::IntSize frame_buffer_dimensions;
-        int frame_slots { 3 };
+        int frame_slots { 2 };
         int frame_write_slot { 0 };
         ByteString frame_buffer_name;
         u64 presented_sequence { 0 };
@@ -121,6 +121,7 @@ private:
         bool waiting_for_frame { false };
         bool has_presented_frame { false };
         bool unresponsive_reported { false };
+        Optional<MonotonicTime> hidden_since;
         u8 responsive_frame_count { 0 };
         unsigned input_events_since_frame { 0 };
         unsigned wheel_events_since_frame { 0 };
@@ -223,6 +224,9 @@ private:
     void note_user_input(Tab&);
     void note_frame_presented(Tab&, u64 sequence);
     void check_unresponsive_tabs();
+    void release_idle_hidden_frame_buffers();
+    void ensure_maintenance_timer_running();
+    void schedule_crash_report_check();
     void set_unresponsive(Tab&, bool);
     Optional<u64> web_content_cpu_ticks(pid_t);
 
@@ -287,10 +291,14 @@ private:
     ByteString m_frame_directory;
     Core::AnonymousBuffer m_theme;
     Vector<u8> m_read_buffer;
+    size_t m_read_offset { 0 };
     Vector<u8> m_write_buffer;
+    size_t m_write_offset { 0 };
     RefPtr<Core::Notifier> m_write_notifier;
     RefPtr<Core::Timer> m_unresponsive_timer;
+    RefPtr<Core::Timer> m_crash_report_check_timer;
     RefPtr<Core::Timer> m_resolver_watch_timer;
+    Optional<Vector<WebView::AutocompleteBookmark>> m_cached_autocomplete_bookmarks;
     Vector<ResolverFileState> m_resolver_files;
     HashMap<u64, NonnullOwnPtr<Tab>> m_tabs;
     OwnPtr<WebView::CrashReportReview> m_crash_report;

@@ -64,6 +64,12 @@ namespace LadybirdSDE {
 
 static JsonArray clipboard_item_to_json(Web::Clipboard::SystemClipboardItem const&);
 
+static bool trace_frames()
+{
+    static bool const enabled = getenv("LADYBIRD_SDE_TRACE_FRAMES") != nullptr;
+    return enabled;
+}
+
 // A headless view for a top-level tab. The base class turns links opened in a
 // new tab or window into child views that no chrome could see; the engine host
 // wants those requests to go through the application handlers instead, so the
@@ -126,6 +132,8 @@ EngineServer::~EngineServer()
     EngineApplication::the().set_devtools_event_handler({});
     if (m_unresponsive_timer)
         m_unresponsive_timer->stop();
+    if (m_crash_report_check_timer)
+        m_crash_report_check_timer->stop();
     if (m_resolver_watch_timer)
         m_resolver_watch_timer->stop();
     if (m_write_notifier) {
@@ -240,9 +248,11 @@ ErrorOr<void> EngineServer::start()
 
     m_unresponsive_timer = Core::Timer::create_repeating(AK::Duration::from_milliseconds(1000), [this] {
         check_unresponsive_tabs();
+        release_idle_hidden_frame_buffers();
+    });
+    m_crash_report_check_timer = Core::Timer::create_single_shot(AK::Duration::from_milliseconds(1000), [this] {
         check_crash_reports();
     });
-    m_unresponsive_timer->start();
 
     // Landlock pins /etc/resolv.conf by inode. NetworkManager replaces the file
     // when the network changes, which leaves the running RequestServers unable
@@ -393,21 +403,29 @@ void EngineServer::read_available()
 
         m_read_buffer.append(bytes.data(), bytes.size());
 
-        while (true) {
-            auto newline_index = m_read_buffer.find_first_index('\n');
-            if (!newline_index.has_value())
+        while (m_read_offset < m_read_buffer.size()) {
+            auto remaining = m_read_buffer.span().slice(m_read_offset);
+            auto const* newline = static_cast<u8 const*>(::memchr(remaining.data(), '\n', remaining.size()));
+            if (!newline)
                 break;
 
-            auto line_length = *newline_index;
-            auto line_view = StringView { reinterpret_cast<char const*>(m_read_buffer.data()), line_length };
+            auto line_length = static_cast<size_t>(newline - remaining.data());
+            auto line_view = StringView { reinterpret_cast<char const*>(remaining.data()), line_length };
             if (!line_view.is_empty() && line_view.ends_with('\r'))
                 line_view = line_view.substring_view(0, line_view.length() - 1);
 
-            // Remove the command from the buffer before dispatching it. Some
-            // commands can run nested event loops, during which the socket
-            // notifier can call read_available again.
+            // Advance past the command before dispatching it. Some commands can
+            // run nested event loops, during which the socket notifier can call
+            // read_available again.
             auto line = String::from_utf8(line_view);
-            m_read_buffer.remove(0, line_length + 1);
+            m_read_offset += line_length + 1;
+            if (m_read_offset == m_read_buffer.size()) {
+                m_read_buffer.clear_with_capacity();
+                m_read_offset = 0;
+            } else if (m_read_offset >= 4096 && m_read_offset * 2 >= m_read_buffer.size()) {
+                m_read_buffer.remove(0, m_read_offset);
+                m_read_offset = 0;
+            }
             if (line.is_error()) {
                 warnln("LadybirdEngine: could not decode command: {}", line.error());
                 continue;
@@ -415,7 +433,7 @@ void EngineServer::read_available()
             dispatch_line(line.value().bytes_as_string_view());
         }
 
-        if (m_read_buffer.size() > 4 * 1024 * 1024) {
+        if (m_read_buffer.size() - m_read_offset > 4 * 1024 * 1024) {
             warnln("LadybirdEngine: chrome sent an oversized command; disconnecting");
             quit();
             return;
@@ -860,6 +878,7 @@ void EngineServer::wire_tab(Tab& tab)
     tab.view->on_web_content_crashed = [this, tab_id](auto) {
         if (tab_for_id(tab_id))
             send_simple_event("tab_crashed"sv, tab_id);
+        schedule_crash_report_check();
     };
 
     static_cast<EngineHeadlessWebView&>(*tab.view).on_context_menu_request = [this, tab_id](WebView::ContextMenuRequest request) {
@@ -1166,6 +1185,8 @@ void EngineServer::handle_activate_tab(u64 tab_id, JsonObject const& command)
             store->active_tab_changed(*tab->session_tab_id);
     }
 
+    auto now = MonotonicTime::now();
+    bool any_hidden_with_buffer = false;
     for (auto& [id, other_tab] : m_tabs) {
         bool visible = false;
         if (other_tab->window_id != 0)
@@ -1173,7 +1194,21 @@ void EngineServer::handle_activate_tab(u64 tab_id, JsonObject const& command)
         else
             visible = id == tab_id;
         other_tab->view->set_system_visibility_state(visible ? Web::HTML::VisibilityState::Visible : Web::HTML::VisibilityState::Hidden);
+        if (visible) {
+            other_tab->hidden_since.clear();
+            if (!other_tab->frame_mapping) {
+                other_tab->frame_dirty = true;
+                try_send_frame(*other_tab);
+            }
+        } else {
+            if (!other_tab->hidden_since.has_value())
+                other_tab->hidden_since = now;
+            if (other_tab->frame_mapping)
+                any_hidden_with_buffer = true;
+        }
     }
+    if (any_hidden_with_buffer)
+        ensure_maintenance_timer_running();
 }
 
 void EngineServer::handle_navigate(u64 tab_id, JsonObject const& command)
@@ -1246,32 +1281,35 @@ void EngineServer::handle_autocomplete(u64 tab_id, JsonObject const& command)
         return;
     }
 
-    Vector<WebView::AutocompleteBookmark> bookmarks;
-    Function<void(Vector<Ladybird::BookmarkItem> const&, Optional<String>)> append_bookmarks = [&](Vector<Ladybird::BookmarkItem> const& items, Optional<String> folder) {
-        for (auto const& item : items) {
-            if (item.is_folder()) {
-                auto next_folder = folder;
-                if (item.folder().title.has_value() && !item.folder().title->is_empty()) {
-                    next_folder = folder.has_value()
-                        ? MUST(String::formatted("{} / {}", *folder, *item.folder().title))
-                        : *item.folder().title;
+    if (!m_cached_autocomplete_bookmarks.has_value()) {
+        Vector<WebView::AutocompleteBookmark> bookmarks;
+        Function<void(Vector<Ladybird::BookmarkItem> const&, Optional<String>)> append_bookmarks = [&](Vector<Ladybird::BookmarkItem> const& items, Optional<String> folder) {
+            for (auto const& item : items) {
+                if (item.is_folder()) {
+                    auto next_folder = folder;
+                    if (item.folder().title.has_value() && !item.folder().title->is_empty()) {
+                        next_folder = folder.has_value()
+                            ? MUST(String::formatted("{} / {}", *folder, *item.folder().title))
+                            : *item.folder().title;
+                    }
+                    append_bookmarks(item.folder().children, move(next_folder));
+                } else {
+                    bookmarks.append({
+                        .url = item.bookmark().url.to_string(),
+                        .title = item.bookmark().title,
+                        .folder = folder,
+                        .favicon_png = {},
+                    });
                 }
-                append_bookmarks(item.folder().children, move(next_folder));
-            } else {
-                bookmarks.append({
-                    .url = item.bookmark().url.to_string(),
-                    .title = item.bookmark().title,
-                    .folder = folder,
-                    .favicon_png = {},
-                });
             }
-        }
-    };
-    append_bookmarks(EngineApplication::the().bookmark_store().root_items(), {});
+        };
+        append_bookmarks(EngineApplication::the().bookmark_store().root_items(), {});
+        m_cached_autocomplete_bookmarks = move(bookmarks);
+    }
 
     auto suggestions = WebView::rank_bookmark_suggestions(
         query->bytes_as_string_view(),
-        bookmarks,
+        *m_cached_autocomplete_bookmarks,
         WebView::autocomplete_preliminary_limit(WebView::default_autocomplete_suggestion_limit));
 
     tab->autocomplete->query_autocomplete_engine(*request_id, *query, WebView::default_autocomplete_suggestion_limit, move(suggestions));
@@ -1390,7 +1428,7 @@ void EngineServer::handle_wheel(u64 tab_id, JsonObject const& command)
     event.wheel_tick_120ths_x = Web::wheel_tick_120ths_from_pixel_delta(event.wheel_delta_x, event.wheel_delta_precision);
     event.wheel_tick_120ths_y = Web::wheel_tick_120ths_from_pixel_delta(event.wheel_delta_y, event.wheel_delta_precision);
 
-    if (getenv("LADYBIRD_SDE_TRACE_FRAMES"))
+    if (trace_frames())
         warnln("LadybirdEngine: tab {} wheel delta {}x{}", tab_id, event.wheel_delta_x, event.wheel_delta_y);
     ++tab->wheel_events_since_frame;
     tab->view->enqueue_input_event(move(event));
@@ -2852,7 +2890,7 @@ void EngineServer::try_send_frame(Tab& tab)
         return;
 
     if (tab.last_reported_frame_size != size) {
-        if (getenv("LADYBIRD_SDE_TRACE_FRAMES"))
+        if (trace_frames())
             warnln("LadybirdEngine: tab {} viewport {}x{} frame {}x{} zoom {}", tab.id, tab.viewport_size.width(), tab.viewport_size.height(), size.width(), size.height(), tab.view->zoom_level());
         tab.last_reported_frame_size = size;
     }
@@ -2925,7 +2963,7 @@ void EngineServer::try_send_frame(Tab& tab)
     tab.frame_write_slot = (slot + 1) % tab.frame_slots;
     tab.frame_dirty = false;
 
-    if (getenv("LADYBIRD_SDE_TRACE_FRAMES"))
+    if (trace_frames())
         warnln("LadybirdEngine: tab {} frame {} slot {} full={} damage {}x{}+{},{}", tab.id, tab.presented_sequence, slot, full_copy, damage.width(), damage.height(), damage.x(), damage.y());
 
     JsonObject event;
@@ -2951,12 +2989,13 @@ void EngineServer::note_user_input(Tab& tab)
     ++tab.input_events_since_frame;
     if (tab.waiting_for_frame)
         return;
-    if (getenv("LADYBIRD_SDE_TRACE_FRAMES"))
+    if (trace_frames())
         warnln("LadybirdEngine: tab {} waiting for frame after input", tab.id);
     tab.waiting_for_frame = true;
     tab.input_wait_started = MonotonicTime::now();
     tab.last_cpu_sample_time = tab.input_wait_started;
     tab.last_cpu_ticks = web_content_cpu_ticks(tab.view->web_content_pid()).value_or(0);
+    ensure_maintenance_timer_running();
 }
 
 void EngineServer::note_frame_presented(Tab& tab, u64 sequence)
@@ -3094,14 +3133,63 @@ void EngineServer::check_resolver_files()
     WebView::RequestServerManager::the().restart_all_for_resolver_change();
 }
 
+void EngineServer::ensure_maintenance_timer_running()
+{
+    if (m_quitting || !m_unresponsive_timer)
+        return;
+    if (!m_unresponsive_timer->is_active())
+        m_unresponsive_timer->start();
+}
+
+void EngineServer::schedule_crash_report_check()
+{
+    if (m_quitting)
+        return;
+    if (!m_crash_report_check_timer) {
+        m_crash_report_check_timer = Core::Timer::create_single_shot(AK::Duration::from_milliseconds(1500), [this] {
+            check_crash_reports();
+        });
+    }
+    m_crash_report_check_timer->restart(AK::Duration::from_milliseconds(1500));
+}
+
+void EngineServer::release_idle_hidden_frame_buffers()
+{
+    static i64 const release_delay_ms = [] {
+        if (auto configured = Core::Environment::get("LADYBIRD_SDE_HIDDEN_SHM_RELEASE_MS"sv); configured.has_value()) {
+            if (auto parsed = configured->to_number<i64>(); parsed.has_value() && *parsed >= 0)
+                return *parsed;
+        }
+        return static_cast<i64>(10000);
+    }();
+
+    auto now = MonotonicTime::now();
+    for (auto& [id, tab] : m_tabs) {
+        (void)id;
+        if (!tab->frame_mapping || !tab->hidden_since.has_value())
+            continue;
+        if ((now - *tab->hidden_since).to_milliseconds() < release_delay_ms)
+            continue;
+
+        destroy_frame_buffer(*tab);
+        tab->frame_dirty = true;
+        send_simple_event("frame_buffer_release"sv, tab->id);
+    }
+}
+
 void EngineServer::check_unresponsive_tabs()
 {
     auto now = MonotonicTime::now();
     static auto const clock_ticks_per_second = static_cast<double>(::sysconf(_SC_CLK_TCK));
+    bool any_waiting = false;
+    bool any_hidden_shm = false;
     for (auto& [id, tab] : m_tabs) {
         (void)id;
+        if (tab->hidden_since.has_value() && tab->frame_mapping)
+            any_hidden_shm = true;
         if (!tab->waiting_for_frame || !tab->has_presented_frame || tab->unresponsive_reported)
             continue;
+        any_waiting = true;
 
         auto waited_ms = (now - tab->input_wait_started).to_milliseconds();
         if (waited_ms < 1500)
@@ -3121,7 +3209,7 @@ void EngineServer::check_unresponsive_tabs()
 
         auto used_ticks = *ticks >= previous_ticks ? *ticks - previous_ticks : 0;
         auto cpu_fraction = (static_cast<double>(used_ticks) / clock_ticks_per_second) * 1000.0 / static_cast<double>(sample_ms);
-        if (getenv("LADYBIRD_SDE_TRACE_FRAMES"))
+        if (trace_frames())
             warnln("LadybirdEngine: tab {} unresponsive check waited={}ms cpu={}% ticks={}", tab->id, waited_ms, static_cast<int>(cpu_fraction * 100), *ticks);
         if (waited_ms >= 2500 && cpu_fraction >= 0.5) {
             tab->unresponsive_reported = true;
@@ -3136,11 +3224,26 @@ void EngineServer::check_unresponsive_tabs()
             set_unresponsive(*tab, true);
         }
     }
+
+    if (any_hidden_shm) {
+        release_idle_hidden_frame_buffers();
+        any_hidden_shm = false;
+        for (auto const& [id, tab] : m_tabs) {
+            (void)id;
+            if (tab->hidden_since.has_value() && tab->frame_mapping) {
+                any_hidden_shm = true;
+                break;
+            }
+        }
+    }
+
+    if (!any_waiting && !any_hidden_shm && m_unresponsive_timer)
+        m_unresponsive_timer->stop();
 }
 
 void EngineServer::set_unresponsive(Tab& tab, bool unresponsive)
 {
-    if (getenv("LADYBIRD_SDE_TRACE_FRAMES"))
+    if (trace_frames())
         warnln("LadybirdEngine: tab {} unresponsive={}", tab.id, unresponsive);
     JsonObject event;
     event.set("type"sv, "tab_unresponsive"sv);
@@ -3173,18 +3276,18 @@ void EngineServer::handle_frame_ack(u64 tab_id, JsonObject const& command)
 void EngineServer::send_event(JsonObject event)
 {
     auto serialized = event.serialized();
-    StringBuilder builder;
-    builder.append(serialized.bytes_as_string_view());
-    builder.append('\n');
-    auto bytes = builder.string_view().bytes();
+    auto bytes = serialized.bytes();
+    m_write_buffer.ensure_capacity(m_write_buffer.size() + bytes.size() + 1);
     m_write_buffer.append(bytes.data(), bytes.size());
+    m_write_buffer.append('\n');
     flush_writes();
 }
 
 void EngineServer::flush_writes()
 {
-    while (!m_write_buffer.is_empty()) {
-        auto result = m_socket->write_some(m_write_buffer.span());
+    while (m_write_offset < m_write_buffer.size()) {
+        auto remaining = m_write_buffer.span().slice(m_write_offset);
+        auto result = m_socket->write_some(remaining);
         if (result.is_error()) {
             if (result.error().is_errno() && (result.error().code() == EAGAIN || result.error().code() == EWOULDBLOCK)) {
                 if (m_write_notifier)
@@ -3202,7 +3305,14 @@ void EngineServer::flush_writes()
             quit();
             return;
         }
-        m_write_buffer.remove(0, written);
+        m_write_offset += written;
+        if (m_write_offset == m_write_buffer.size()) {
+            m_write_buffer.clear_with_capacity();
+            m_write_offset = 0;
+        } else if (m_write_offset >= 64 * KiB && m_write_offset * 2 >= m_write_buffer.size()) {
+            m_write_buffer.remove(0, m_write_offset);
+            m_write_offset = 0;
+        }
     }
 
     if (m_write_notifier)
@@ -3347,6 +3457,8 @@ static void append_bookmark_items(JsonArray& items, Vector<Ladybird::BookmarkIte
 
 void EngineServer::send_bookmarks()
 {
+    m_cached_autocomplete_bookmarks.clear();
+
     JsonArray items;
     append_bookmark_items(items, EngineApplication::the().bookmark_store().root_items());
 

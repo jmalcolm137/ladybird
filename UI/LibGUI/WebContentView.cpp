@@ -68,7 +68,9 @@ void WebContentView::paint_event(GUI::PaintEvent& event)
 
     if (m_frame) {
         if (m_frame->size() == size()) {
-            painter.blit({ 0, 0 }, *m_frame, m_frame->rect());
+            auto clip = event.rect().intersected(m_frame->rect());
+            if (!clip.is_empty())
+                painter.blit(clip.location(), *m_frame, clip);
         } else {
             // A frame can briefly be a different size while the engine catches up
             // with a window resize. Scaling it to fit makes the page text grow and

@@ -195,21 +195,29 @@ void EngineClient::read_available_impl()
 
         m_read_buffer.append(bytes.data(), bytes.size());
 
-        while (true) {
-            auto newline_index = m_read_buffer.find_first_index('\n');
-            if (!newline_index.has_value())
+        while (m_read_offset < m_read_buffer.size()) {
+            auto remaining = m_read_buffer.span().slice(m_read_offset);
+            auto const* newline = static_cast<u8 const*>(::memchr(remaining.data(), '\n', remaining.size()));
+            if (!newline)
                 break;
 
-            auto line_length = *newline_index;
-            auto line_view = StringView { reinterpret_cast<char const*>(m_read_buffer.data()), line_length };
+            auto line_length = static_cast<size_t>(newline - remaining.data());
+            auto line_view = StringView { reinterpret_cast<char const*>(remaining.data()), line_length };
             if (!line_view.is_empty() && line_view.ends_with('\r'))
                 line_view = line_view.substring_view(0, line_view.length() - 1);
 
-            // Remove the command from the buffer before dispatching it. A
-            // dispatch can open a nested event loop (a file picker or a menu),
-            // during which the socket notifier can call read_available again.
+            // Advance past the command before dispatching it. A dispatch can
+            // open a nested event loop (a file picker or a menu), during which
+            // the socket notifier can call read_available again.
             auto line = String::from_utf8(line_view);
-            m_read_buffer.remove(0, line_length + 1);
+            m_read_offset += line_length + 1;
+            if (m_read_offset == m_read_buffer.size()) {
+                m_read_buffer.clear_with_capacity();
+                m_read_offset = 0;
+            } else if (m_read_offset >= 4096 && m_read_offset * 2 >= m_read_buffer.size()) {
+                m_read_buffer.remove(0, m_read_offset);
+                m_read_offset = 0;
+            }
             if (line.is_error()) {
                 warnln("Ladybird: could not decode engine event: {}", line.error());
                 continue;
@@ -267,6 +275,11 @@ void EngineClient::dispatch_line(StringView line)
 
     if (*type == "frame_buffer"sv) {
         handle_frame_buffer(event);
+        return;
+    }
+    if (*type == "frame_buffer_release"sv) {
+        if (auto tab_id = event.get_u64("tab"sv); tab_id.has_value())
+            destroy_frame_buffer(*tab_id);
         return;
     }
     if (*type == "frame"sv) {
@@ -408,11 +421,8 @@ void EngineClient::send(JsonObject const& event)
         return;
 
     auto text = event.to_byte_string();
-    StringBuilder builder;
-    builder.append(text);
-    builder.append('\n');
-    auto bytes = builder.string_view().bytes();
-    m_write_buffer.append(bytes.data(), bytes.size());
+    m_write_buffer.append(text.bytes().data(), text.bytes().size());
+    m_write_buffer.append('\n');
     flush_writes();
 }
 
@@ -420,11 +430,12 @@ void EngineClient::flush_writes()
 {
     if (!m_socket) {
         m_write_buffer.clear();
+        m_write_offset = 0;
         return;
     }
 
-    while (!m_write_buffer.is_empty()) {
-        auto result = m_socket->write_some(m_write_buffer.span());
+    while (m_write_offset < m_write_buffer.size()) {
+        auto result = m_socket->write_some(m_write_buffer.span().slice(m_write_offset));
         if (result.is_error()) {
             if (result.error().is_errno() && (result.error().code() == EAGAIN || result.error().code() == EWOULDBLOCK)) {
                 if (m_write_notifier)
@@ -446,7 +457,14 @@ void EngineClient::flush_writes()
             schedule_disconnect();
             return;
         }
-        m_write_buffer.remove(0, written);
+        m_write_offset += written;
+        if (m_write_offset == m_write_buffer.size()) {
+            m_write_buffer.clear_with_capacity();
+            m_write_offset = 0;
+        } else if (m_write_offset >= 4096 && m_write_offset * 2 >= m_write_buffer.size()) {
+            m_write_buffer.remove(0, m_write_offset);
+            m_write_offset = 0;
+        }
     }
 
     if (m_write_notifier)
@@ -465,6 +483,7 @@ void EngineClient::close_socket()
         m_socket->set_notifications_enabled(false);
         m_close_pending = true;
         m_write_buffer.clear();
+        m_write_offset = 0;
         return;
     }
     if (m_socket) {
@@ -472,6 +491,7 @@ void EngineClient::close_socket()
         m_socket.clear();
     }
     m_write_buffer.clear();
+    m_write_offset = 0;
 }
 
 void EngineClient::send_simple(StringView type, u64 tab_id)

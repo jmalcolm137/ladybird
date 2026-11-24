@@ -69,6 +69,17 @@ enum class ChromeGlyph {
 
 static RefPtr<Gfx::Bitmap const> make_chrome_glyph(ChromeGlyph glyph, Gfx::Color color)
 {
+    struct CacheEntry {
+        ChromeGlyph glyph;
+        Gfx::Color color;
+        RefPtr<Gfx::Bitmap const> bitmap;
+    };
+    static Vector<CacheEntry> s_cache;
+    for (auto const& entry : s_cache) {
+        if (entry.glyph == glyph && entry.color == color)
+            return entry.bitmap;
+    }
+
     auto bitmap = Gfx::Bitmap::create(Gfx::BitmapFormat::BGRA8888, { 16, 16 });
     if (bitmap.is_error())
         return nullptr;
@@ -105,6 +116,7 @@ static RefPtr<Gfx::Bitmap const> make_chrome_glyph(ChromeGlyph glyph, Gfx::Color
         break;
     }
 
+    s_cache.append({ glyph, color, surface });
     return surface;
 }
 

@@ -137,6 +137,9 @@ Vector<DownloadEntry const*> DownloadsWindow::visible_downloads() const
 
 void DownloadsWindow::refresh()
 {
+    if (m_window && !m_window->is_visible())
+        return;
+
     if (m_model)
         m_model->update();
 

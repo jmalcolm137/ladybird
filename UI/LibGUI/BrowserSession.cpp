@@ -376,6 +376,8 @@ BrowserWindow* BrowserSession::create_window_internal(Vector<String> urls, bool 
 void BrowserSession::window_did_activate(BrowserWindow& window)
 {
     m_active_window = &window;
+    if (m_clipboard)
+        m_clipboard->sync_if_dirty();
 }
 
 BrowserWindow* BrowserSession::active_window() const
