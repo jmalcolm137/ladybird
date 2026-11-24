@@ -1241,7 +1241,7 @@ void BrowserWindow::handle_engine_tab_event(JsonObject const& event, u64 tab_id)
         if (active_tab() == tab)
             update_action_state();
     } else if (type == "favicon"sv) {
-        tab->set_favicon(string_for_key(event, "path"sv));
+        tab->set_favicon(string_for_key(event, "data"sv));
     } else if (type == "cursor"sv) {
         tab->set_cursor(string_for_key(event, "cursor"sv));
     } else if (type == "link_hover"sv) {

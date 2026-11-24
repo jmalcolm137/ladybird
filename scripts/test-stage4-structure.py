@@ -173,7 +173,9 @@ def main():
         assert len(cert.get("sha256_fingerprint", "")) > 20, cert
         assert cert.get("protocol", "").startswith("TLS"), cert
         assert len(cert.get("cipher", "")) > 0, cert
-        print("ok: standalone OpenSSL CertificateInspector")
+        assert cert.get("verified") is False, cert
+        assert len(cert.get("verification_error", "")) > 0, cert
+        print("ok: standalone OpenSSL CertificateInspector (with verification status)")
 
         client.send({"type": "quit"})
         engine.wait(timeout=10)

@@ -361,15 +361,12 @@ void EngineClient::destroy_frame_buffer(u64 tab_id)
         (void)Core::System::munmap((*buffer)->data, (*buffer)->size);
     if ((*buffer)->fd >= 0)
         ::close((*buffer)->fd);
-    if (!(*buffer)->name.is_empty())
-        ::shm_unlink((*buffer)->name.characters());
 }
 
 void EngineClient::handle_frame_buffer(JsonObject const& event)
 {
     auto tab_id = event.get_u64("tab"sv);
     auto use_fd = event.get_bool("fd"sv).value_or(false);
-    auto name = event.get_byte_string("name"sv);
     auto slots = event.get_i64("slots"sv);
     auto slot_size = event.get_u64("slot_size"sv);
     auto width = event.get_i64("width"sv);
@@ -389,19 +386,13 @@ void EngineClient::handle_frame_buffer(JsonObject const& event)
         }
     };
 
-    if (!tab_id.has_value() || (!use_fd && !name.has_value()) || !slots.has_value() || !slot_size.has_value() || !width.has_value() || !height.has_value()) {
+    if (!use_fd || !tab_id.has_value() || !slots.has_value() || !slot_size.has_value() || !width.has_value() || !height.has_value()) {
         close_passed_fd();
         return;
     }
 
     if (*slots < 1 || *slots > max_frame_slots || *width < 1 || *width > max_frame_dimension || *height < 1 || *height > max_frame_dimension || scale > 8) {
         warnln("Ladybird: rejected invalid frame buffer geometry ({}x{}, slots={})", *width, *height, *slots);
-        close_passed_fd();
-        return;
-    }
-
-    if (!use_fd && (!name->starts_with("/ladybird-sde-"sv) || name->substring_view(1).contains('/'))) {
-        warnln("Ladybird: rejected unexpected frame buffer name '{}'", *name);
         close_passed_fd();
         return;
     }
@@ -425,20 +416,11 @@ void EngineClient::handle_frame_buffer(JsonObject const& event)
 
     destroy_frame_buffer(*tab_id);
 
-    int fd = -1;
-    if (use_fd) {
-        fd = passed_fd;
-        passed_fd = -1;
-        if (fd < 0) {
-            warnln("Ladybird: frame_buffer event requested SCM_RIGHTS fd but none was received");
-            return;
-        }
-    } else {
-        fd = ::shm_open(name->characters(), O_RDONLY, 0600);
-        if (fd < 0) {
-            warnln("Ladybird: could not open frame buffer '{}': {}", *name, strerror(errno));
-            return;
-        }
+    int fd = passed_fd;
+    passed_fd = -1;
+    if (fd < 0) {
+        warnln("Ladybird: frame_buffer event requested SCM_RIGHTS fd but none was received");
+        return;
     }
 
     struct stat st {};
@@ -462,8 +444,6 @@ void EngineClient::handle_frame_buffer(JsonObject const& event)
     buffer->size = size;
     buffer->slots = static_cast<int>(*slots);
     buffer->slot_size = *slot_size;
-    if (!use_fd && name.has_value())
-        buffer->name = *name;
     buffer->slot_dimensions = { static_cast<int>(*width), static_cast<int>(*height) };
     buffer->scale = scale;
     buffer->bitmaps.ensure_capacity(buffer->slots);

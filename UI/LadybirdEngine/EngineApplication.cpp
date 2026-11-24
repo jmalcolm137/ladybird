@@ -175,8 +175,13 @@ void EngineApplication::create_platform_arguments(Core::ArgsParser& args_parser)
 
 static void open_with_system(ByteString const& path)
 {
+    auto url = URL::create_with_file_scheme(path);
+    if (!url.has_value()) {
+        warnln("LadybirdEngine: could not form file URL for '{}'", path);
+        return;
+    }
     Vector<ByteString> arguments;
-    arguments.append(path);
+    arguments.append(url->serialize().to_byte_string());
     if (auto result = Core::Process::spawn("xdg-open"sv, arguments); result.is_error())
         warnln("LadybirdEngine: could not open '{}': {}", path, result.error());
 }

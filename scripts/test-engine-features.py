@@ -183,7 +183,7 @@ Native stack (binary build ID, object address):
         client = Client(stream)
 
         hello = client.wait_for("hello")
-        assert hello.get("protocol") == 18, hello
+        assert hello.get("protocol") == 19, hello
         user_agents = client.wait_for("user_agents")
         default_user_agent = next(agent["value"] for agent in user_agents["agents"] if agent["name"] == "Default")
         modes = client.wait_for("navigator_compatibility_modes")
@@ -193,7 +193,7 @@ Native stack (binary build ID, object address):
         assert preferences.get("color_scheme") == "auto", preferences
         assert preferences.get("contrast") == "auto", preferences
         assert preferences.get("motion") == "auto", preferences
-        print("ok: protocol 18, spoofing choices and view preferences")
+        print("ok: protocol 19, spoofing choices and view preferences")
 
         crash = client.wait_for("crash_report_available")
         assert crash.get("name") == crash_report_name, crash

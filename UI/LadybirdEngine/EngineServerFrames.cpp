@@ -24,12 +24,6 @@
 
 namespace LadybirdSDE {
 
-static bool trace_frames()
-{
-    static bool const enabled = getenv("LADYBIRD_SDE_TRACE_FRAMES") != nullptr;
-    return enabled;
-}
-
 void EngineServer::destroy_frame_buffer(Tab& tab)
 {
     if (tab.frame_mapping) {
@@ -78,7 +72,7 @@ bool EngineServer::ensure_frame_buffer(Tab& tab, Gfx::IntSize dimensions)
     tab.frame_buffer_dimensions = dimensions;
 
     auto name = ByteString::formatted("ladybird-sde-{}-{}", tab.id, m_next_frame_buffer_id++);
-    int fd = ::memfd_create(name.characters(), MFD_CLOEXEC);
+    int fd = ::memfd_create(name.characters(), MFD_CLOEXEC | MFD_ALLOW_SEALING);
     if (fd < 0) {
         warnln("LadybirdEngine: could not create memfd frame buffer '{}': {}", name, strerror(errno));
         tab.frame_slot_size = 0;
@@ -91,6 +85,8 @@ bool EngineServer::ensure_frame_buffer(Tab& tab, Gfx::IntSize dimensions)
         tab.frame_slot_size = 0;
         return false;
     }
+
+    (void)::fcntl(fd, F_ADD_SEALS, F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_SEAL);
 
     auto* mapping = ::mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
     if (mapping == MAP_FAILED) {

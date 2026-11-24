@@ -1496,24 +1496,23 @@ void BrowserTab::set_title(String const& title)
         on_title_change(m_title);
 }
 
-void BrowserTab::set_favicon(StringView path)
+void BrowserTab::set_favicon(StringView base64_png)
 {
-    if (path.is_empty()) {
+    if (base64_png.is_empty()) {
         m_favicon.clear();
         if (on_favicon_change)
             on_favicon_change(nullptr);
         return;
     }
 
-    auto runtime_dir = LexicalPath::canonicalized_path(m_engine.runtime_directory());
-    auto canonical_path = LexicalPath::canonicalized_path(path);
-    auto prefix = ByteString::formatted("{}/", runtime_dir);
-    if (!canonical_path.starts_with(prefix)) {
-        warnln("Ladybird: rejected favicon path outside runtime directory: '{}'", path);
+    if (base64_png.length() > 96 * KiB)
         return;
-    }
 
-    auto bitmap = Gfx::Bitmap::load_from_file(canonical_path, 1, Gfx::IntSize { 16, 16 });
+    auto decoded = AK::decode_base64(base64_png);
+    if (decoded.is_error())
+        return;
+
+    auto bitmap = Gfx::Bitmap::load_from_bytes(decoded.value().bytes(), Gfx::IntSize { 16, 16 }, "image/png"sv);
     if (bitmap.is_error())
         return;
     m_favicon = bitmap.value();

@@ -4,6 +4,7 @@
 # - Zero /dev/shm/ladybird-sde-* named shared-memory files are created.
 # - Received memfd has valid backing size and contains rendered frame pixels.
 import array
+import fcntl
 import glob
 import json
 import mmap
@@ -142,7 +143,10 @@ def main():
         expected_size = fb["slot_size"] * fb["slots"]
         st = os.fstat(fb_fd)
         assert st.st_size >= expected_size, f"memfd size {st.st_size} < expected {expected_size}"
-        print(f"ok: received SCM_RIGHTS memfd ({st.st_size} bytes, {fb['slots']} slots)")
+        seals = fcntl.fcntl(fb_fd, fcntl.F_GET_SEALS)
+        expected_seals = fcntl.F_SEAL_SHRINK | fcntl.F_SEAL_GROW | fcntl.F_SEAL_SEAL
+        assert (seals & expected_seals) == expected_seals, f"expected seals {expected_seals:#x}, got {seals:#x}"
+        print(f"ok: received sealed SCM_RIGHTS memfd ({st.st_size} bytes, {fb['slots']} slots, seals={seals:#x})")
 
         # Verify no /dev/shm/ladybird-sde-<engine_pid>-* file was created.
         shm_matches = glob.glob(f"/dev/shm/ladybird-sde-{engine.pid}-*")

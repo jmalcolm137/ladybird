@@ -59,6 +59,12 @@ public:
     void quit(int status = 0);
 
 private:
+    static bool trace_frames()
+    {
+        static bool const enabled = ::getenv("LADYBIRD_SDE_TRACE_FRAMES") != nullptr;
+        return enabled;
+    }
+
     struct ContextMenuAction {
         String text;
         bool enabled { true };

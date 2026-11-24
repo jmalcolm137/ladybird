@@ -316,7 +316,7 @@ class FakeEngine:
         if choice == 7:
             return b'{"type":"hello","protocol":17}'
         if choice == 8:
-            return b'{"type":"hello","protocol":18}'
+            return b'{"type":"hello","protocol":19}'
         return b'{"type":1,"tab":-1}'
 
     def fuzz_once(self):

@@ -127,7 +127,6 @@ private:
         size_t size { 0 };
         int slots { 0 };
         size_t slot_size { 0 };
-        ByteString name;
         Gfx::IntSize slot_dimensions;
         int scale { 1 };
         Vector<RefPtr<Gfx::Bitmap>> bitmaps;

@@ -65,12 +65,6 @@ namespace LadybirdSDE {
 
 static JsonArray clipboard_item_to_json(Web::Clipboard::SystemClipboardItem const&);
 
-static bool trace_frames()
-{
-    static bool const enabled = getenv("LADYBIRD_SDE_TRACE_FRAMES") != nullptr;
-    return enabled;
-}
-
 // A headless view for a top-level tab. The base class turns links opened in a
 // new tab or window into child views that no chrome could see; the engine host
 // wants those requests to go through the application handlers instead, so the
@@ -149,9 +143,8 @@ EngineServer::~EngineServer()
     shutdown_certificate_inspector();
     m_certificate_request_generations.clear();
     for (auto& [id, tab] : m_tabs) {
+        (void)id;
         destroy_frame_buffer(*tab);
-        auto favicon_path = ByteString::formatted("{}/favicon-{}.png", m_frame_directory, id);
-        (void)Core::System::unlink(favicon_path.view());
     }
 }
 
@@ -793,28 +786,20 @@ void EngineServer::wire_tab(Tab& tab)
         event.set("tab"sv, tab_id);
 
         if (!favicon.has_value()) {
-            event.set("path"sv, String {});
+            event.set("data"sv, String {});
             send_event(move(event));
             return;
         }
 
         auto png = Gfx::PNGWriter::encode(*favicon);
-        if (png.is_error())
+        if (png.is_error() || png.value().size() > 64 * KiB)
             return;
 
-        auto path = ByteString::formatted("{}/favicon-{}.png", m_frame_directory, tab_id);
-        auto temp_path = ByteString::formatted("{}.tmp", path);
-        auto file = Core::File::open(temp_path.view(), Core::File::OpenMode::Write | Core::File::OpenMode::Truncate, 0600);
-        if (file.is_error())
-            return;
-        auto& png_bytes = png.value();
-        if (file.value()->write_until_depleted(png_bytes.bytes()).is_error())
-            return;
-        file.value()->close();
-        if (Core::System::rename(temp_path.view(), path.view()).is_error())
+        auto encoded = AK::encode_base64(png.value().bytes());
+        if (encoded.is_error())
             return;
 
-        event.set("path"sv, path.view());
+        event.set("data"sv, encoded.release_value());
         send_event(move(event));
     };
 
@@ -982,8 +967,6 @@ void EngineServer::destroy_tab(u64 tab_id)
         return;
 
     destroy_frame_buffer(**tab);
-    auto favicon_path = ByteString::formatted("{}/favicon-{}.png", m_frame_directory, tab_id);
-    (void)Core::System::unlink(favicon_path.view());
 
     send_simple_event("tab_closed"sv, tab_id);
 

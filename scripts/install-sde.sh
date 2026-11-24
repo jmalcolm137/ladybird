@@ -52,12 +52,28 @@ EOF
 "$SUDO" chmod 0755 "$PREFIX/bin/Ladybird"
 
 echo "==> engine host and helpers"
-"$SUDO" cp -a "$LADYBIRD_BUILD/libexec/." "$PREFIX/libexec/"
+for binary in "$LADYBIRD_BUILD"/libexec/*; do
+    [[ -f "$binary" ]] || continue
+    install_file "$binary" "$PREFIX/libexec/$(basename "$binary")" 0755
+done
 
 echo "==> Ladybird libraries"
-"$SUDO" cp -a "$LADYBIRD_BUILD/lib/." "$PREFIX/lib/ladybird/"
+install_libs_dir() {
+    local src_dir="$1" dst_dir="$2"
+    for entry in "$src_dir"/*; do
+        [[ -e "$entry" || -L "$entry" ]] || continue
+        local base
+        base="$(basename "$entry")"
+        if [[ -L "$entry" ]]; then
+            "$SUDO" cp -a "$entry" "$dst_dir/$base"
+        elif [[ -f "$entry" ]]; then
+            install_file "$entry" "$dst_dir/$base" 0755
+        fi
+    done
+}
+install_libs_dir "$LADYBIRD_BUILD/lib" "$PREFIX/lib/ladybird"
 if [[ -d "$LADYBIRD_BUILD/vcpkg_installed/x64-linux-dynamic/lib" ]]; then
-    "$SUDO" cp -a "$LADYBIRD_BUILD/vcpkg_installed/x64-linux-dynamic/lib/." "$PREFIX/lib/ladybird/"
+    install_libs_dir "$LADYBIRD_BUILD/vcpkg_installed/x64-linux-dynamic/lib" "$PREFIX/lib/ladybird"
 fi
 
 # Helpers are launched with a sanitized environment, so LD_LIBRARY_PATH is not
@@ -65,9 +81,11 @@ fi
 if command -v patchelf >/dev/null; then
     echo "==> fixing RPATHs"
     while IFS= read -r -d '' binary; do
+        [[ ! -L "$binary" && "$(file -b "$binary")" == *ELF* ]] || continue
         "$SUDO" patchelf --force-rpath --set-rpath '$ORIGIN/../lib/ladybird' "$binary"
     done < <(find "$PREFIX/libexec" -maxdepth 1 -type f -perm -u+x -print0)
     while IFS= read -r -d '' library; do
+        [[ ! -L "$library" && "$(file -b "$library")" == *ELF* ]] || continue
         "$SUDO" patchelf --force-rpath --set-rpath '$ORIGIN' "$library"
     done < <(find "$PREFIX/lib/ladybird" -maxdepth 1 -type f -name '*.so*' -print0)
 else

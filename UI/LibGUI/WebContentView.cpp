@@ -6,6 +6,7 @@
 
 #include "WebContentView.h"
 
+#include <LibCore/Environment.h>
 #include <LibCore/MimeData.h>
 #include <LibGUI/Event.h>
 #include <LibGUI/Painter.h>
@@ -78,7 +79,9 @@ void WebContentView::paint_event(GUI::PaintEvent& event)
             // its native size instead (cropping or leaving an edge blank for a
             // frame); the next frame will match the view again.
             if (m_frame->size() != m_last_logged_frame_size || size() != m_last_logged_widget_size) {
-                warnln("Ladybird: painting a {}x{} frame into a {}x{} view without scaling", m_frame->size().width(), m_frame->size().height(), size().width(), size().height());
+                static bool const trace_frames = Core::Environment::has("LADYBIRD_SDE_TRACE_FRAMES"sv);
+                if (trace_frames)
+                    warnln("Ladybird: painting a {}x{} frame into a {}x{} view without scaling", m_frame->size().width(), m_frame->size().height(), size().width(), size().height());
                 m_last_logged_frame_size = m_frame->size();
                 m_last_logged_widget_size = size();
             }
@@ -234,12 +237,6 @@ void WebContentView::leave_event(Core::Event& event)
 
 void WebContentView::keydown_event(GUI::KeyEvent& event)
 {
-    auto* key_name = key_code_to_string(event.key());
-    if (on_key) {
-        auto key_view = key_name ? StringView { key_name, strlen(key_name) } : StringView { ""sv };
-        on_key("down"sv, key_view, event.code_point(), event.modifiers());
-    }
-
     // Editing shortcuts belong to the page while it has focus, so WebCore runs its own copy/paste path with the
     // full set of clipboard representations. Letting the window actions fire as well would copy the same selection
     // twice, once as plain text.
@@ -247,15 +244,28 @@ void WebContentView::keydown_event(GUI::KeyEvent& event)
     auto page_edits = event.ctrl() && !event.alt() && !event.super()
         && (key == Key_X || key == Key_V || key == Key_A || key == Key_Z || key == Key_Y
             || (key == Key_C && !event.shift()));
+
+    // Let other command modifiers and registered window shortcuts (Ctrl+T, Ctrl+W,
+    // Ctrl+L, F5, F11, ...) reach the window's actions without also forwarding
+    // them to the page.
+    auto* action = window() ? window()->action_for_shortcut(GUI::Shortcut(static_cast<u8>(event.modifiers()), event.key())) : nullptr;
+    if (!page_edits && action != nullptr) {
+        event.ignore();
+        return;
+    }
+
+    auto* key_name = key_code_to_string(event.key());
+    if (on_key) {
+        auto key_view = key_name ? StringView { key_name, strlen(key_name) } : StringView { ""sv };
+        on_key("down"sv, key_view, event.code_point(), event.modifiers());
+    }
+
     if (page_edits) {
         event.accept();
         return;
     }
 
-    // Let other command modifiers and registered window shortcuts (F5, F11, ...)
-    // reach the window's actions. A plain key press belongs to the page.
-    auto* action = window() ? window()->action_for_shortcut(GUI::Shortcut(static_cast<u8>(event.modifiers()), event.key())) : nullptr;
-    if (event.ctrl() || event.alt() || event.super() || action != nullptr)
+    if (event.ctrl() || event.alt() || event.super())
         event.ignore();
     else
         event.accept();
