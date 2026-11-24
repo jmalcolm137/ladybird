@@ -5,6 +5,7 @@ add_executable(LadybirdEngine
     EngineApplication.cpp
     EngineServer.cpp
     EngineServerFrames.cpp
+    EngineServerInput.cpp
     EngineServerReports.cpp
     main.cpp
     ../Qt/BookmarkStore.cpp

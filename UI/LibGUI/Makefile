@@ -54,6 +54,7 @@ LDLIBS += \
 
 SOURCES := \
 	BrowserTab.cpp \
+	BrowserTabDialogs.cpp \
 	BrowserSession.cpp \
 	BrowserWindow.cpp \
 	BrowserWindowBookmarks.cpp \
