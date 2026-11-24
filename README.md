@@ -4,7 +4,7 @@
 This is a port of it to the SerenityOS LibGUI library. It is meant to be part of the [Serenity Desktop Environment](https://github.com/jmalcolm137/serenity-desktop-environment)
 
 > [!IMPORTANT]
-> Ladybird is in a pre-alpha state, and only suitable for use by developers
+> Ladybird SDE is in a pre-alpha state, and only suitable for use by developers
 >
 
 ## Features
@@ -20,6 +20,7 @@ malicious content.
 
 At the moment, many core library support components are inherited from SerenityOS:
 
+- LibGUI: GUI Application Framework
 - LibWeb: Web rendering engine
 - LibJS: JavaScript engine
 - LibWasm: WebAssembly implementation
@@ -41,7 +42,7 @@ Ladybird runs on Linux, macOS, Windows (with WSL2), and many other \*Nixes.
 
 Code-related documentation can be found in the [documentation](Documentation/) folder.
 
-## Get in touch and participate!
+## Get in touch with the main Ladybird project and participate!
 
 Join [our Discord server](https://discord.gg/nvfjVJ4Svh) to participate in issue and development discussions.
 
@@ -53,4 +54,4 @@ The project participation guidelines can be found in [`CONTRIBUTING.md`](CONTRIB
 
 ## License
 
-Ladybird is licensed under a 2-clause BSD license.
+Ladybird SDE is licensed under a 2-clause BSD license.
