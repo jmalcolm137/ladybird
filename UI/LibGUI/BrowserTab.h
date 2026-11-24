@@ -57,6 +57,7 @@ public:
     ~BrowserTab();
 
     NonnullRefPtr<GUI::Widget> root() const { return m_root; }
+    NonnullRefPtr<GUI::Widget> top_chrome() const { return m_top_chrome; }
     WebContentView& web_view() const { return *m_web_view; }
 
     u64 tab_id() const { return m_tab_id; }
@@ -167,6 +168,7 @@ private:
 
     EngineClient& m_engine;
     NonnullRefPtr<GUI::Widget> m_root;
+    NonnullRefPtr<GUI::Widget> m_top_chrome;
     RefPtr<GUI::Toolbar> m_toolbar;
     RefPtr<GUI::Button> m_site_button;
     RefPtr<Gfx::Bitmap const> m_tabs_icon;

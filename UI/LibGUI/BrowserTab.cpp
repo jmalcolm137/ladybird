@@ -175,12 +175,16 @@ static SiteIdentity site_identity_for_url(String const& url)
 BrowserTab::BrowserTab(EngineClient& engine, GUI::Window& window, GUI::Action& back_action, GUI::Action& forward_action, GUI::Action& reload_action, GUI::Action& stop_action, GUI::Action& bookmark_action, GUI::Action& home_action, GUI::Action& new_tab_action, GUI::Action& downloads_action)
     : m_engine(engine)
     , m_root(GUI::Widget::construct())
+    , m_top_chrome(GUI::Widget::construct())
 {
     m_title = "New Tab"_string;
 
     m_root->set_layout<GUI::VerticalBoxLayout>(GUI::Margins { 0 }, 0);
+    m_top_chrome->set_fill_with_background_color(true);
+    m_top_chrome->set_layout<GUI::VerticalBoxLayout>(GUI::Margins { 0 }, 0);
+    m_top_chrome->set_preferred_height(GUI::SpecialDimension::Fit);
 
-    auto& toolbar_container = m_root->add<GUI::ToolbarContainer>();
+    auto& toolbar_container = m_top_chrome->add<GUI::ToolbarContainer>();
     m_toolbar = toolbar_container.add<GUI::Toolbar>();
 
     m_toolbar->add_action(back_action);
@@ -223,7 +227,8 @@ BrowserTab::BrowserTab(EngineClient& engine, GUI::Window& window, GUI::Action& b
     };
     m_site_button = site_button;
 
-    m_bookmarks_bar = m_root->add<GUI::Widget>();
+    m_bookmarks_bar = m_top_chrome->add<GUI::Widget>();
+    m_bookmarks_bar->set_fill_with_background_color(true);
     m_bookmarks_bar->set_fixed_height(28);
     m_bookmarks_bar->set_layout<GUI::HorizontalBoxLayout>(GUI::Margins { 4 }, 4);
     m_bookmarks_bar->set_visible(false);
@@ -485,13 +490,19 @@ BrowserTab::BrowserTab(EngineClient& engine, GUI::Window& window, GUI::Action& b
 
     // The suggestion list is an in-window overlay, not a separate window. It
     // cannot take keyboard focus from the location box or float above other
-    // applications when the browser is minimized or covered. Removing it from
-    // the root layout lets it float over the bookmark bar and page.
-    m_root->add_child(*m_autocomplete_overlay);
-    if (m_root->layout())
-        m_root->layout()->remove_widget(*m_autocomplete_overlay);
+    // applications when the browser is minimized or covered. Attaching it to
+    // the window's main widget and removing it from layout lets it float over
+    // the bookmark bar, tab strip, and page.
+    if (auto* overlay_parent = window.main_widget()) {
+        overlay_parent->add_child(*m_autocomplete_overlay);
+        if (overlay_parent->layout())
+            overlay_parent->layout()->remove_widget(*m_autocomplete_overlay);
+    } else {
+        m_root->add_child(*m_autocomplete_overlay);
+        if (m_root->layout())
+            m_root->layout()->remove_widget(*m_autocomplete_overlay);
+    }
 
-    (void)window;
     set_zoom_level(1.0);
     update_site_button();
 }
@@ -502,6 +513,12 @@ BrowserTab::~BrowserTab()
         m_autocomplete_timer->stop();
     if (m_autocomplete_hide_timer)
         m_autocomplete_hide_timer->stop();
+    if (m_autocomplete_overlay) {
+        if (auto* parent = m_autocomplete_overlay->parent_widget())
+            parent->remove_child(*m_autocomplete_overlay);
+    }
+    if (auto* parent = m_top_chrome->parent_widget())
+        parent->remove_child(*m_top_chrome);
     auto close_aux_window = [](RefPtr<GUI::Window>& aux) {
         if (!aux)
             return;
@@ -728,12 +745,28 @@ void BrowserTab::set_bookmarks(Vector<BookmarkEntry> const& bookmarks)
 
     m_has_bookmarks = !bookmarks.is_empty();
     m_bookmarks_bar->set_visible(m_bookmarks_bar_visible && m_has_bookmarks);
+    m_top_chrome->invalidate_layout();
+    if (auto* parent = m_top_chrome->parent_widget())
+        parent->invalidate_layout();
+    if (auto* window = m_top_chrome->window()) {
+        if (auto* main_widget = window->main_widget())
+            main_widget->do_layout();
+        window->update();
+    }
 }
 
 void BrowserTab::set_bookmarks_bar_visible(bool visible)
 {
     m_bookmarks_bar_visible = visible;
     m_bookmarks_bar->set_visible(visible && m_has_bookmarks);
+    m_top_chrome->invalidate_layout();
+    if (auto* parent = m_top_chrome->parent_widget())
+        parent->invalidate_layout();
+    if (auto* window = m_top_chrome->window()) {
+        if (auto* main_widget = window->main_widget())
+            main_widget->do_layout();
+        window->update();
+    }
 }
 
 void BrowserTab::set_bookmarked(bool bookmarked)
@@ -990,12 +1023,15 @@ void BrowserTab::set_autocomplete_results(u64 request_id, JsonArray const& items
     else
         clear_inline_completion();
 
+    auto* overlay_parent = m_autocomplete_overlay->parent_widget();
+    if (!overlay_parent)
+        overlay_parent = m_root.ptr();
     auto location_rect = m_location_box->screen_relative_rect();
-    auto root_rect = m_root->screen_relative_rect();
-    auto x = max(0, location_rect.x() - root_rect.x());
-    auto y = max(0, location_rect.bottom() - root_rect.y());
-    auto available_width = max(1, m_root->width() - x);
-    auto available_height = max(1, m_root->height() - y - (m_statusbar ? m_statusbar->height() : 0));
+    auto parent_rect = overlay_parent->screen_relative_rect();
+    auto x = max(0, location_rect.x() - parent_rect.x());
+    auto y = max(0, location_rect.bottom() - parent_rect.y());
+    auto available_width = max(1, overlay_parent->width() - x);
+    auto available_height = max(1, overlay_parent->height() - y - (m_statusbar ? m_statusbar->height() : 0));
     auto width = min(max(location_rect.width(), 420), available_width);
     auto height = min(300, m_autocomplete_model->row_count() * 24 + 4);
     height = min(height, available_height);

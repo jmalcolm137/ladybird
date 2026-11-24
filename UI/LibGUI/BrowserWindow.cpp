@@ -144,6 +144,13 @@ ErrorOr<void> BrowserWindow::initialize(Vector<InitialTab> initial_tabs, Optiona
     auto main_widget = m_window->set_main_widget<GUI::Widget>();
     main_widget->set_layout<GUI::VerticalBoxLayout>(GUI::Margins {}, 0);
 
+    // Top-level chrome sits above the tab strip: URL toolbar + bookmarks bar,
+    // followed by the tab bar right above the page content.
+    m_chrome_host = main_widget->add<GUI::Widget>();
+    m_chrome_host->set_fill_with_background_color(true);
+    m_chrome_host->set_layout<GUI::VerticalBoxLayout>(GUI::Margins {}, 0);
+    m_chrome_host->set_preferred_height(GUI::SpecialDimension::Fit);
+
     m_devtools_bar = main_widget->add<GUI::Widget>();
     m_devtools_bar->set_fixed_height(30);
     m_devtools_bar->set_fill_with_background_color(true);
@@ -777,6 +784,7 @@ BrowserTab& BrowserWindow::add_tab(String const& url, bool activate, bool reques
     if (activate)
         m_tab_widget->set_active_widget(tab_pointer->root().ptr());
 
+    sync_active_tab_chrome();
     update_action_state();
     update_window_title();
     rebuild_tabs_menu();
@@ -815,6 +823,7 @@ void BrowserWindow::remove_tab(BrowserTab& tab)
     });
     m_tab_widget->remove_widget(*root);
 
+    sync_active_tab_chrome();
     update_action_state();
     update_window_title();
     rebuild_tabs_menu();
@@ -883,11 +892,44 @@ bool BrowserWindow::tab_is_live(BrowserTab const* tab) const
     return false;
 }
 
+void BrowserWindow::sync_active_tab_chrome()
+{
+    if (!m_chrome_host)
+        return;
+
+    auto* active = active_tab();
+    auto* wanted = active ? active->top_chrome().ptr() : nullptr;
+
+    Vector<NonnullRefPtr<GUI::Widget>> existing;
+    bool already_attached = false;
+    m_chrome_host->for_each_child_widget([&](GUI::Widget& child) {
+        if (&child == wanted)
+            already_attached = true;
+        else
+            existing.append(child);
+        return IterationDecision::Continue;
+    });
+    for (auto& child : existing)
+        m_chrome_host->remove_child(*child);
+
+    if (wanted && !already_attached)
+        m_chrome_host->add_child(*wanted);
+
+    m_chrome_host->invalidate_layout();
+    if (auto* main_widget = m_window ? m_window->main_widget() : nullptr) {
+        main_widget->invalidate_layout();
+        main_widget->do_layout();
+    }
+    if (m_window)
+        m_window->update();
+}
+
 void BrowserWindow::activate_tab(BrowserTab& tab)
 {
     if (m_reordering_tabs)
         return;
     ensure_tab_loaded(tab);
+    sync_active_tab_chrome();
     if (tab.is_attached())
         m_engine->activate_tab(tab.tab_id(), m_id);
     // A background tab may have received only damage updates. Repaint the

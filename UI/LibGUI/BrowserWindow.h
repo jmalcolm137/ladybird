@@ -101,6 +101,7 @@ private:
     bool tab_is_live(BrowserTab const*) const;
 
     void activate_tab(BrowserTab&);
+    void sync_active_tab_chrome();
     void update_window_title();
     void update_action_state();
     void update_bookmark_action();
@@ -146,6 +147,7 @@ private:
     u64 m_id { 0 };
     u64 m_session_window_id { 0 };
     RefPtr<GUI::Window> m_window;
+    RefPtr<GUI::Widget> m_chrome_host;
     RefPtr<GUI::TabWidget> m_tab_widget;
 
     RefPtr<GUI::Action> m_back_action;
