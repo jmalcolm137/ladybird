@@ -143,6 +143,8 @@ Function<void()> EngineApplication::fetch_remote_suggestions(WebView::SearchEngi
         return {};
 
     auto request = client.value()->start_request("GET"sv, *url, HTTP::Cookie::SameSiteContext::same_site());
+    if (!request)
+        return {};
     request->set_buffered_request_finished_callback(
         [on_response = move(on_response)](u64, Requests::RequestTimingInfo const&, Optional<Requests::NetworkError> const& network_error, NonnullRefPtr<HTTP::HeaderList> headers, Optional<u32> response_code, Optional<String>, Requests::CacheState, Core::ImmutableBytes payload) mutable {
             WebView::AutocompleteHost::RemoteResponse response;

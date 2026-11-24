@@ -146,6 +146,7 @@ EngineServer::~EngineServer()
             ::close(pending.fd);
     }
     m_pending_write_fds.clear();
+    shutdown_certificate_inspector();
     m_certificate_request_generations.clear();
     for (auto& [id, tab] : m_tabs) {
         destroy_frame_buffer(*tab);
@@ -879,8 +880,9 @@ void EngineServer::wire_tab(Tab& tab)
     tab.view->on_close = [this, tab_id] {
         // The close callback runs inside the view's own dispatch; erase the tab
         // after the call stack unwinds.
-        Core::deferred_invoke([this, tab_id] {
-            destroy_tab(tab_id);
+        Core::deferred_invoke([weak_this = make_weak_ptr(), tab_id] {
+            if (auto* self = weak_this.ptr())
+                self->destroy_tab(tab_id);
         });
     };
 
@@ -1985,15 +1987,16 @@ void EngineServer::handle_clipboard_copy(u64 tab_id, bool cut)
         return;
 
     auto promise = cut ? tab->view->cut_selected_text() : tab->view->selected_text();
-    promise->when_resolved([this, tab_id](ByteString& text) {
-        if (text.is_empty())
+    promise->when_resolved([weak_this = make_weak_ptr(), tab_id](ByteString& text) {
+        auto* self = weak_this.ptr();
+        if (!self || text.is_empty())
             return;
 
         JsonObject event;
         event.set("type"sv, "clipboard"sv);
         event.set("tab"sv, tab_id);
         event.set("text"sv, text.view());
-        send_event(move(event));
+        self->send_event(move(event));
     });
 }
 

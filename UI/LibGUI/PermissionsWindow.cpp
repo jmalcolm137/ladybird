@@ -77,7 +77,14 @@ PermissionsWindow::PermissionsWindow(BrowserSession& session)
     refresh();
 }
 
-PermissionsWindow::~PermissionsWindow() = default;
+PermissionsWindow::~PermissionsWindow()
+{
+    if (m_window) {
+        m_window->on_close = nullptr;
+        m_window->close();
+        m_window.clear();
+    }
+}
 
 NonnullRefPtr<PermissionsWindow> PermissionsWindow::create(BrowserSession& session)
 {

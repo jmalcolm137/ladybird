@@ -67,8 +67,11 @@ void EngineServer::handle_compat_report_begin(u64 tab_id)
 
     auto* report = tab->compat_report.ptr();
     auto dumps = WebView::WebCompatReport::request_page_dumps(*tab->view);
-    dumps->when_resolved([this, tab_id](String& text) {
-        auto* tab = tab_for_id(tab_id);
+    dumps->when_resolved([weak_this = make_weak_ptr(), tab_id](String& text) {
+        auto* self = weak_this.ptr();
+        if (!self)
+            return;
+        auto* tab = self->tab_for_id(tab_id);
         if (!tab || !tab->compat_report)
             return;
         tab->compat_report->set_page_dumps(text);
@@ -76,7 +79,7 @@ void EngineServer::handle_compat_report_begin(u64 tab_id)
         JsonObject event;
         event.set("type"sv, "compat_report_page_dumps_ready"sv);
         event.set("tab"sv, tab_id);
-        send_event(move(event));
+        self->send_event(move(event));
     });
 
     JsonObject event;
@@ -262,6 +265,9 @@ void EngineServer::send_certificate_info(u64 tab_id, CertificateDetails const& i
     event.set("sha256_fingerprint"sv, info.sha256_fingerprint);
     event.set("protocol"sv, info.protocol);
     event.set("cipher"sv, info.cipher);
+    event.set("verified"sv, info.verified);
+    if (!info.verification_error.is_empty())
+        event.set("verification_error"sv, info.verification_error);
     send_event(move(event));
 }
 

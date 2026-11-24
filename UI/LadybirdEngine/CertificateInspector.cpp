@@ -9,13 +9,17 @@
 #include <AK/ByteString.h>
 #include <AK/StringBuilder.h>
 #include <LibCore/EventLoop.h>
+#include <arpa/inet.h>
+#include <atomic>
 #include <errno.h>
 #include <fcntl.h>
+#include <mutex>
 #include <netdb.h>
 #include <openssl/bio.h>
 #include <openssl/evp.h>
 #include <openssl/ssl.h>
 #include <openssl/x509.h>
+#include <openssl/x509v3.h>
 #include <poll.h>
 #include <string.h>
 #include <sys/socket.h>
@@ -25,6 +29,19 @@
 #include <unistd.h>
 
 namespace LadybirdSDE {
+
+static std::mutex s_inspector_mutex;
+static bool s_inspector_shutting_down = false;
+static std::atomic<int> s_inflight_inspections { 0 };
+static constexpr int max_inflight_inspections = 4;
+
+static bool is_ip_literal(ByteString const& host)
+{
+    struct in_addr v4 {};
+    struct in6_addr v6 {};
+    return ::inet_pton(AF_INET, host.characters(), &v4) == 1
+        || ::inet_pton(AF_INET6, host.characters(), &v6) == 1;
+}
 
 static String x509_name_to_string(X509_NAME* name)
 {
@@ -152,6 +169,9 @@ static CertificateInspectionResult inspect_certificate_sync(ByteString const& ho
         ::close(fd);
         return { {}, "Could not initialize TLS context."_string };
     }
+    (void)SSL_CTX_set_default_verify_paths(ctx);
+    // Keep SSL_VERIFY_NONE so self-signed or expired certificates can still be
+    // inspected, then report the OpenSSL verification outcome explicitly.
     SSL_CTX_set_verify(ctx, SSL_VERIFY_NONE, nullptr);
 
     auto* ssl = SSL_new(ctx);
@@ -161,7 +181,10 @@ static CertificateInspectionResult inspect_certificate_sync(ByteString const& ho
         return { {}, "Could not initialize TLS session."_string };
     }
 
-    SSL_set_tlsext_host_name(ssl, host.characters());
+    if (!is_ip_literal(host)) {
+        SSL_set_tlsext_host_name(ssl, host.characters());
+        (void)SSL_set1_host(ssl, host.characters());
+    }
     SSL_set_fd(ssl, fd);
 
     CertificateInspectionResult result;
@@ -169,6 +192,13 @@ static CertificateInspectionResult inspect_certificate_sync(ByteString const& ho
         if (auto* certificate = SSL_get0_peer_certificate(ssl)) {
             auto const* version = SSL_get_version(ssl);
             auto const* cipher = SSL_get_cipher_name(ssl);
+            long verify_result = SSL_get_verify_result(ssl);
+            bool verified = verify_result == X509_V_OK;
+            String verification_error;
+            if (!verified) {
+                if (auto const* err_str = X509_verify_cert_error_string(verify_result))
+                    verification_error = String::from_utf8_with_replacement_character(StringView { err_str, strlen(err_str) });
+            }
             result.details = CertificateDetails {
                 .subject = x509_name_to_string(X509_get_subject_name(certificate)),
                 .issuer = x509_name_to_string(X509_get_issuer_name(certificate)),
@@ -178,6 +208,8 @@ static CertificateInspectionResult inspect_certificate_sync(ByteString const& ho
                 .sha256_fingerprint = x509_fingerprint(certificate),
                 .protocol = version ? String::from_utf8_with_replacement_character(StringView { version, strlen(version) }) : String {},
                 .cipher = cipher ? String::from_utf8_with_replacement_character(StringView { cipher, strlen(cipher) }) : String {},
+                .verified = verified,
+                .verification_error = move(verification_error),
             };
         } else {
             result.error = "The server did not present a certificate."_string;
@@ -191,6 +223,12 @@ static CertificateInspectionResult inspect_certificate_sync(ByteString const& ho
     SSL_CTX_free(ctx);
     ::close(fd);
     return result;
+}
+
+void shutdown_certificate_inspector()
+{
+    std::lock_guard lock(s_inspector_mutex);
+    s_inspector_shutting_down = true;
 }
 
 void inspect_certificate_async(URL::URL url, Function<void(CertificateInspectionResult)> callback)
@@ -208,11 +246,21 @@ void inspect_certificate_async(URL::URL url, Function<void(CertificateInspection
     if (host.starts_with('[') && host.ends_with(']') && host.length() > 2)
         host = host.substring(1, host.length() - 2);
 
+    if (s_inflight_inspections.fetch_add(1) >= max_inflight_inspections) {
+        s_inflight_inspections.fetch_sub(1);
+        callback({ {}, "Too many certificate lookups are already in progress."_string });
+        return;
+    }
+
     u16 port = url.port().value_or(443);
     auto* loop = &Core::EventLoop::current();
 
     std::thread([loop, host = move(host), port, callback = move(callback)]() mutable {
         auto result = inspect_certificate_sync(host, port);
+        s_inflight_inspections.fetch_sub(1);
+        std::lock_guard lock(s_inspector_mutex);
+        if (s_inspector_shutting_down)
+            return;
         loop->deferred_invoke([callback = move(callback), result = move(result)]() mutable {
             callback(move(result));
         });

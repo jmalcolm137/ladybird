@@ -22,6 +22,8 @@ struct CertificateDetails {
     String sha256_fingerprint;
     String protocol;
     String cipher;
+    bool verified { false };
+    String verification_error;
 };
 
 struct CertificateInspectionResult {
@@ -34,5 +36,9 @@ struct CertificateInspectionResult {
 // Keeping this self-contained in UI/LadybirdEngine avoids modifying upstream
 // LibRequests and RequestServer.
 void inspect_certificate_async(URL::URL url, Function<void(CertificateInspectionResult)> callback);
+
+// Prevents any in-flight certificate worker threads from posting back to a
+// destroyed Core::EventLoop during EngineServer shutdown.
+void shutdown_certificate_inspector();
 
 }

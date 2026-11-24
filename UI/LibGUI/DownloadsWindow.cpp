@@ -99,7 +99,14 @@ DownloadsWindow::DownloadsWindow(EngineClient& engine)
     refresh();
 }
 
-DownloadsWindow::~DownloadsWindow() = default;
+DownloadsWindow::~DownloadsWindow()
+{
+    if (m_window) {
+        m_window->on_close = nullptr;
+        m_window->close();
+        m_window.clear();
+    }
+}
 
 NonnullRefPtr<DownloadsWindow> DownloadsWindow::create(EngineClient& engine)
 {
@@ -108,8 +115,8 @@ NonnullRefPtr<DownloadsWindow> DownloadsWindow::create(EngineClient& engine)
 
 void DownloadsWindow::show()
 {
-    refresh();
     m_window->show();
+    refresh();
     m_window->center_on_screen();
 }
 

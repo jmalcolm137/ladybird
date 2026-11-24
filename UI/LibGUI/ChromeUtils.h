@@ -29,6 +29,13 @@ inline String escape_menu_ampersands(StringView text)
     return MUST(builder.to_string());
 }
 
+// Converts an arbitrary UTF-8 byte sequence into a String without aborting on
+// malformed UTF-8 (replacing invalid sequences with U+FFFD).
+inline String safe_utf8_string(StringView text)
+{
+    return String::from_utf8_with_replacement_character(text);
+}
+
 // Returns the sanitized LADYBIRD_SDE_PROFILE name, rejecting path separators
 // or traversal components and falling back to "libgui".
 inline ByteString sanitized_profile_name()

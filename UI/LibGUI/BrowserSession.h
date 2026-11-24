@@ -12,6 +12,7 @@
 #include <AK/NonnullOwnPtr.h>
 #include <AK/Optional.h>
 #include <AK/Vector.h>
+#include <AK/Weakable.h>
 #include <LibCore/Forward.h>
 #include <LibGfx/Forward.h>
 #include <LibGfx/Size.h>
@@ -24,7 +25,7 @@ class ClipboardBridge;
 // Owns the one engine host for this frontend process and every LibGUI window
 // attached to it. Windows share tabs, bookmarks, settings, history, and the
 // engine profile; a window is only a view over a subset of the host's tabs.
-class BrowserSession {
+class BrowserSession : public Weakable<BrowserSession> {
     AK_MAKE_NONCOPYABLE(BrowserSession);
 
 public:

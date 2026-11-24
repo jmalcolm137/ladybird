@@ -833,22 +833,26 @@ void BrowserSession::window_will_close(BrowserWindow& window)
     if (m_windows.size() <= 1)
         note_exit_reason("last window closed"sv);
 
-    Core::deferred_invoke([this, &window] {
-        if (m_active_window == &window)
-            m_active_window = nullptr;
-        auto window_count = m_windows.size();
-        m_windows.remove_first_matching([&](auto const& candidate) {
-            return candidate.ptr() == &window;
+    Core::deferred_invoke([weak_this = make_weak_ptr(), weak_window = window.make_weak_ptr()] {
+        auto* session = weak_this.ptr();
+        auto* closing_window = weak_window.ptr();
+        if (!session || !closing_window)
+            return;
+        if (session->m_active_window == closing_window)
+            session->m_active_window = nullptr;
+        auto window_count = session->m_windows.size();
+        session->m_windows.remove_first_matching([&](auto const& candidate) {
+            return candidate.ptr() == closing_window;
         });
-        if (m_windows.size() == window_count)
+        if (session->m_windows.size() == window_count)
             return;
 
-        save_session();
+        session->save_session();
 
-        if (m_windows.is_empty()) {
-            note_exit_reason("last window closed"sv);
-            if (m_engine)
-                m_engine->quit();
+        if (session->m_windows.is_empty()) {
+            session->note_exit_reason("last window closed"sv);
+            if (session->m_engine)
+                session->m_engine->quit();
             GUI::Application::the()->quit(0);
         }
     });
