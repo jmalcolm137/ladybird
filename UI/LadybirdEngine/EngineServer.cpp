@@ -2084,11 +2084,12 @@ void EngineServer::send_tab_created(Tab& tab)
 
 void EngineServer::send_url(Tab& tab)
 {
+    auto const& url = tab.view->displayed_url();
     JsonObject event;
     event.set("type"sv, "url"sv);
     event.set("tab"sv, tab.id);
-    event.set("url"sv, tab.view->url().to_string());
-    event.set("bookmarked"sv, EngineApplication::the().bookmark_store().is_bookmarked(tab.view->url()));
+    event.set("url"sv, url.to_string());
+    event.set("bookmarked"sv, EngineApplication::the().bookmark_store().is_bookmarked(url));
     send_event(move(event));
 }
 
